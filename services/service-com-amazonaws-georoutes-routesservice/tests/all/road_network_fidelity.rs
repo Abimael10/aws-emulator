@@ -16,14 +16,21 @@
 //!   is given up at the junctions it crosses, so a journey on the local streets takes
 //!   longer than its length at any street's posted limit while a run on the
 //!   grade-separated class does not;
-//! * every position a response reports — the point read off the network and the one the
-//!   caller supplied alike — lies on the ten-millionth-of-a-degree grid this API expresses
-//!   a coordinate on, so no response carries the artefacts of the arithmetic that located
-//!   a point;
+//! * a position this service COMPUTED lies on the ten-millionth-of-a-degree grid this API
+//!   expresses a coordinate on, so no response carries the artefacts of the arithmetic that
+//!   located a point, while a position the CALLER supplied is echoed exactly as it was
+//!   received — `OriginalPosition` is "Position provided in the request", and a client joins
+//!   a returned leg or stop back to its own request by comparing it;//! * a position a response reports as the MATCHED one is a point of the road network: one of
+//!   its coordinates is a carriageway's own, it lies no further off than the nearest road,
+//!   and it is never the submitted coordinate, which no carriageway of this network runs at;
 //! * `RoadSnapSnappedTracePoint.Confidence` ("Confidence value for the correctness of this
 //!   point match") is read off how far the point had to move to reach its road: a point
 //!   already on one is a certain match, and one as far off as this network allows is a poor
-//!   one.
+//!   one — within one answer as much as across answers, so ordering a trace's points by
+//!   confidence orders them by how far each lay from its road;
+//! * `SnappedGeometry` is "interpolated geometry for the snapped route": it runs along the
+//!   roads between consecutive snapped points, so it carries a vertex wherever the road
+//!   changes and is never a shortcut through the blocks between them.
 
 use serde_json::{json, Value};
 
@@ -32,9 +39,13 @@ use serde_json::{json, Value};
 // `all/road_graph_metrics.rs` keeps of `src/state.rs`, read from there rather than kept a
 // second time here.
 use crate::road_graph_metrics::{
-    between_roads, on_a_road, KPH_TO_MPS, POSITION_PRECISION, ROAD_SPACING_DEG, STREET_SPEED_KPH,
+    between_roads, on_a_road, on_a_road_line, KPH_TO_MPS, POSITION_PRECISION, ROAD_SPACING_DEG,
+    STREET_SPEED_KPH,
 };
-use crate::routing::{great_circle_m, int, position, post, routes_service, MATRIX, OPTIMIZE, ROUTES, SNAP};
+use crate::routing::{
+    decode_flexible_polyline, great_circle_m, int, position, post, routes_service, ISOLINES, MATRIX,
+    OPTIMIZE, ROUTES, SNAP,
+};
 
 // ---------------------------------------------------------------------------
 // One traversal behind every reported metric
@@ -204,18 +215,27 @@ async fn a_journey_on_the_local_streets_takes_longer_than_its_length_at_the_stre
 // The coordinates a response carries
 // ---------------------------------------------------------------------------
 
-/// Every position a response reports lies on the ten-millionth-of-a-degree grid this API
-/// expresses a coordinate on, and a position the CALLER supplied comes back as the caller
-/// sent it: `OriginalPosition` is "the position provided in the request".
+/// Every position a response carries lies on the ten-millionth-of-a-degree grid this API
+/// expresses a computed coordinate on, and a position the CALLER supplied comes back EXACTLY
+/// as it was sent.
+///
+/// `OriginalPosition` is "Position provided in the request", and an optimized or impeding
+/// waypoint's `Position` is the stop the request submitted, so each of those is an ECHO: a
+/// client joins a returned leg or stop back to the request it answers by comparing the echo
+/// with the coordinate it sent, and reads the offset to the matched point beside it as the
+/// distance from where it said it was to the road. A step on the way out — even onto the
+/// grid the service's own positions live on — breaks both.
 ///
 /// Rows span the precision of the submitted coordinate — fewer digits than the grid, exactly
-/// as many, and more than the grid can carry — across the three operations that echo a
-/// submitted position beside a computed one.
+/// as many, and more than the grid can carry — in both hemispheres and both signs of
+/// longitude, across the three operations that echo a submitted position beside a computed
+/// one.
 #[tokio::test]
-async fn every_reported_position_is_on_the_coordinate_grid_of_the_api() {
+async fn an_echoed_position_is_the_submitted_coordinate_and_a_computed_one_is_on_the_grid() {
     let router = routes_service();
-    // name, the origin, the destination: the same place written to three precisions.
-    let cases: [(&str, [f64; 2], [f64; 2]); 3] = [
+    // name, the origin, the destination: the same places written to three precisions, and a
+    // southern-hemisphere pair east of the meridian so neither coordinate's sign is fixed.
+    let cases: [(&str, [f64; 2], [f64; 2]); 4] = [
         ("fewer digits than the grid", [-122.332, 47.606], [-122.309, 47.45]),
         (
             "exactly the digits of the grid",
@@ -224,8 +244,13 @@ async fn every_reported_position_is_on_the_coordinate_grid_of_the_api() {
         ),
         (
             "more digits than the grid can carry",
-            [-122.33210000012345, 47.60620000098765],
-            [-122.30880000054321, 47.45019990012345],
+            [-122.3321000001, 47.6062000009],
+            [-122.3088000005, 47.4501999001],
+        ),
+        (
+            "east of the meridian, south of the equator",
+            [151.2093000001, -33.8688000009],
+            [151.2086, -33.8599],
         ),
     ];
 
@@ -260,33 +285,191 @@ async fn every_reported_position_is_on_the_coordinate_grid_of_the_api() {
                 "case {case:?}: the answer reports positions, got {answer:?}"
             );
             for (member, value) in &reported {
+                if echoes_the_request(member) {
+                    // An echo is one of the submitted positions, digit for digit.
+                    assert!(
+                        echo_of(&[origin, destination], *value).is_some(),
+                        "case {case:?}: {member} is a position provided in the request, carried as \
+                         it was received, got {value:?} for a request of {origin:?} and \
+                         {destination:?}"
+                    );
+                    continue;
+                }
+                // A computed position is read off the network, so it is on the API's grid.
                 for coordinate in value {
                     let units = coordinate * 10_f64.powi(POSITION_PRECISION);
                     assert!(
                         (units - units.round()).abs() < 1e-3,
-                        "case {case:?}: {member} is carried on the coordinate grid of this API, \
-                         so it is a whole number of 1e-{POSITION_PRECISION} degrees, got \
-                         {coordinate}"
+                        "case {case:?}: {member} is computed by this service, so it is carried on \
+                         the coordinate grid of this API — a whole number of \
+                         1e-{POSITION_PRECISION} degrees — got {coordinate}"
                     );
                 }
             }
-            // An echoed position is the submitted one, on that same grid.
-            for (member, value) in &reported {
-                if !member.ends_with("OriginalPosition") {
-                    continue;
-                }
-                let submitted = [origin, destination]
-                    .into_iter()
-                    .map(on_the_grid)
-                    .find(|point| point == value);
-                assert!(
-                    submitted.is_some(),
-                    "case {case:?}: {member} is the position provided in the request, got {value:?} \
-                     for a request of {origin:?} and {destination:?}"
-                );
-            }
         }
     }
+}
+
+/// The members that report the REQUEST's own coordinate rather than one this service
+/// computed: `OriginalPosition` wherever it appears ("Position provided in the request"),
+/// and the `Position` of an optimized or an impeding waypoint, which is the stop the request
+/// submitted.
+fn echoes_the_request(member: &str) -> bool {
+    member.ends_with("OriginalPosition")
+        || member.contains("OptimizedWaypoints")
+        || member.contains("ImpedingWaypoints")
+}
+
+/// Which of `submitted` the echo `echo` reports, if any: an echo is the coordinate the
+/// request carried, so it is one of them exactly.
+fn echo_of(submitted: &[[f64; 2]], echo: [f64; 2]) -> Option<[f64; 2]> {
+    submitted.iter().copied().find(|point| *point == echo)
+}
+
+/// A place of a leg, a snapped trace point and an isoline's anchor each report the point of
+/// the ROAD NETWORK the submitted coordinate was matched onto: a coordinate of a road of the
+/// network, within the farthest a match ever moves a position, and never the submitted
+/// coordinate itself — which is not a coordinate of any road, because the carriageways of
+/// this network do not run at the round decimals a position is written in.
+///
+/// This is the pair a client reads an offset off: the echo beside it is where the caller said
+/// it was, the matched point is where the road is, and the distance between them is how far
+/// the caller was from the road. Rows span the place (three cities of two hemispheres), the
+/// travel mode — which decides WHICH roads are candidates — and the precision the coordinate
+/// was written to.
+#[tokio::test]
+async fn a_matched_position_is_a_point_of_the_road_network_and_never_the_submitted_one() {
+    let router = routes_service();
+    // name, a position, a second position a few hundred metres off: two stops of a journey.
+    let journeys: [(&str, [f64; 2], [f64; 2]); 4] = [
+        ("Seattle", [-122.3321, 47.6062], [-122.3405, 47.6097]),
+        ("Vancouver", [-123.1017, 49.2823], [-123.1067, 49.2834]),
+        ("Sydney", [151.2093, -33.8688], [151.2086, -33.8599]),
+        (
+            "written to more digits than the network carries",
+            [-122.3321000001, 47.6062000009],
+            [-122.3405000005, 47.6097000001],
+        ),
+    ];
+
+    for (place, origin, destination) in journeys {
+        for mode in ["Car", "Truck", "Pedestrian"] {
+            let case = &format!("{place}, {mode}");
+
+            // CalculateRoutes: the departure and the arrival of every leg.
+            let (status, answer, _) = post(
+                &router,
+                ROUTES,
+                &json!({ "Origin": origin, "Destination": destination, "TravelMode": mode }),
+            )
+            .await;
+            assert_eq!(status, 200, "case {case:?}: expected 200, got {status} with {answer:?}");
+            let legs = answer["Routes"][0]["Legs"]
+                .as_array()
+                .unwrap_or_else(|| panic!("case {case:?}: a route carries legs, got {answer:?}"))
+                .clone();
+            assert!(!legs.is_empty(), "case {case:?}: a route carries legs, got {answer:?}");
+            for leg in &legs {
+                let details = if mode == "Pedestrian" {
+                    &leg["PedestrianLegDetails"]
+                } else {
+                    &leg["VehicleLegDetails"]
+                };
+                for end in ["Departure", "Arrival"] {
+                    let place_of_end = &details[end]["Place"];
+                    let echo = position(&place_of_end["OriginalPosition"], case);
+                    let matched = position(&place_of_end["Position"], case);
+                    let submitted = echo_of(&[origin, destination], echo).unwrap_or_else(|| {
+                        panic!(
+                            "case {case:?}: the {end} echoes a position of the request, got {echo:?} \
+                             for a request of {origin:?} and {destination:?}"
+                        )
+                    });
+                    assert_matched_onto_a_road(&format!("{case} / {end}"), submitted, matched);
+                }
+            }
+
+            // SnapToRoads: one snapped point per trace point, beside the echo of it.
+            let (status, answer, _) = post(
+                &router,
+                SNAP,
+                &json!({
+                    "TracePoints": [{ "Position": origin }, { "Position": destination }],
+                    "TravelMode": mode,
+                }),
+            )
+            .await;
+            assert_eq!(status, 200, "case {case:?}: expected 200, got {status} with {answer:?}");
+            let points = answer["SnappedTracePoints"]
+                .as_array()
+                .unwrap_or_else(|| panic!("case {case:?}: SnappedTracePoints is required, got {answer:?}"))
+                .clone();
+            assert_eq!(
+                points.len(),
+                2,
+                "case {case:?}: one snapped point per trace point, got {points:?}"
+            );
+            for (index, point) in points.iter().enumerate() {
+                let submitted = [origin, destination][index];
+                let echo = position(&point["OriginalPosition"], case);
+                assert_eq!(
+                    echo_of(&[submitted], echo),
+                    Some(submitted),
+                    "case {case:?}: trace point {index} echoes the position it was submitted at, \
+                     {submitted:?}, got {point:?}"
+                );
+                assert_matched_onto_a_road(
+                    &format!("{case} / trace point {index}"),
+                    submitted,
+                    position(&point["SnappedPosition"], case),
+                );
+            }
+
+            // CalculateIsolines: the anchor the area was measured from is the same match.
+            let (status, answer, _) = post(
+                &router,
+                ISOLINES,
+                &json!({
+                    "Origin": origin,
+                    "Thresholds": { "Distance": [1_000] },
+                    "TravelMode": mode,
+                }),
+            )
+            .await;
+            assert_eq!(status, 200, "case {case:?}: expected 200, got {status} with {answer:?}");
+            assert_matched_onto_a_road(
+                &format!("{case} / SnappedOrigin"),
+                origin,
+                position(&answer["SnappedOrigin"], case),
+            );
+        }
+    }
+}
+
+/// `matched` is the point of the road network `submitted` was matched onto: a coordinate of a
+/// road of the grid, no further off than a match of this network ever moves a position, and
+/// not `submitted` itself.
+fn assert_matched_onto_a_road(case: &str, submitted: [f64; 2], matched: [f64; 2]) {
+    assert_ne!(
+        matched, submitted,
+        "case {case:?}: no carriageway of the network runs at the decimals a position is \
+         written in, so the matched point is not the submitted one"
+    );
+    assert!(
+        on_a_road_line(matched[0]) || on_a_road_line(matched[1]),
+        "case {case:?}: the matched point lies ON a road of the network, so one of its \
+         coordinates is a road's own, got {matched:?}"
+    );
+    // Half the grid spacing in each axis is the farthest a match ever moves a position; the
+    // diagonal of that cell quarter bounds the distance, with a tenth of a metre of slack
+    // for the precision the network carries a coordinate at.
+    let moved = great_circle_m(submitted, matched);
+    let farthest = ROAD_SPACING_DEG * 111_320.0 * std::f64::consts::SQRT_2 / 2.0 + 0.1;
+    assert!(
+        moved <= farthest,
+        "case {case:?}: a match moves a position onto the road nearest it, at most \
+         {farthest:.1} m away, got {moved:.1} m from {submitted:?} to {matched:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -344,6 +527,233 @@ async fn a_match_is_scored_by_how_far_the_point_moved_wherever_it_is() {
                 );
             }
         }
+    }
+}
+
+/// A trace is scored POINT BY POINT: inside one answer, the point that had to move less to
+/// reach its road is the more certain match, so ordering the points of a trace by confidence
+/// orders them by how far each lay from the road. A score drawn from anything but the match
+/// itself ranks them arbitrarily — and can report the point furthest from a road as the
+/// surest of them.
+///
+/// Rows span the place — three cities of two hemispheres, where the grid's blocks are of
+/// different sizes — and the travel mode. Within each row the trace's points lie at
+/// increasing offsets from ONE road of the network, which is the order their confidences must
+/// come back in.
+#[tokio::test]
+async fn within_one_trace_the_point_nearer_its_road_is_the_more_certain_match() {
+    let router = routes_service();
+    // The same carriageway positions as the suite above: on a parallel road of the network
+    // and midway between two meridian roads, so the parallel road stays the nearest road for
+    // every offset below.
+    let on_the_carriageway: [(&str, [f64; 2]); 3] = [
+        ("Seattle", [between_roads(-122.332_25), on_a_road(47.606)]),
+        ("Vancouver", [between_roads(-123.101_75), on_a_road(49.2825)]),
+        ("Sydney", [between_roads(151.209_25), on_a_road(-33.869)]),
+    ];
+    // Offsets across the road, in multiples of the grid spacing: the first point is on the
+    // carriageway and each following one is further off, short of the half-step at which a
+    // neighbouring road would be the nearer one.
+    let offsets = [0.0, 0.08, 0.16, 0.24];
+
+    for (place, anchor) in on_the_carriageway {
+        for mode in ["Car", "Truck"] {
+            let case = &format!("{place}, {mode}");
+            let trace: Vec<[f64; 2]> = offsets
+                .iter()
+                .map(|steps| [anchor[0], anchor[1] + steps * ROAD_SPACING_DEG])
+                .collect();
+            let (status, answer, _) = post(
+                &router,
+                SNAP,
+                &json!({
+                    "TracePoints": trace.iter().map(|point| json!({ "Position": point })).collect::<Vec<Value>>(),
+                    "TravelMode": mode,
+                }),
+            )
+            .await;
+            assert_eq!(status, 200, "case {case:?}: expected 200, got {status} with {answer:?}");
+            let points = answer["SnappedTracePoints"]
+                .as_array()
+                .unwrap_or_else(|| panic!("case {case:?}: SnappedTracePoints is required, got {answer:?}"))
+                .clone();
+            assert_eq!(
+                points.len(),
+                trace.len(),
+                "case {case:?}: one snapped point per trace point, got {points:?}"
+            );
+
+            let mut scored: Vec<(f64, f64)> = Vec::new();
+            for (index, point) in points.iter().enumerate() {
+                let case = &format!("{case} / point {index}");
+                let confidence = point["Confidence"]
+                    .as_f64()
+                    .unwrap_or_else(|| panic!("case {case:?}: Confidence is required, got {point:?}"));
+                assert!(
+                    (0.0..=1.0).contains(&confidence),
+                    "case {case:?}: Confidence is in 0..1, got {confidence}"
+                );
+                let moved = great_circle_m(trace[index], position(&point["SnappedPosition"], case));
+                scored.push((moved, confidence));
+            }
+
+            let (on_road_offset, certain) = scored[0];
+            assert!(
+                on_road_offset < 0.2 && certain >= 0.999,
+                "case {case:?}: the point on the carriageway was observed where the road is, so \
+                 its match is certain, got {certain} for a match that moved it \
+                 {on_road_offset:.3} m"
+            );
+            for pair in scored.windows(2) {
+                let ((nearer, higher), (further, lower)) = (pair[0], pair[1]);
+                assert!(
+                    further > nearer && lower < higher,
+                    "case {case:?}: within one answer the point moved {further:.1} m is less \
+                     certain than the one moved {nearer:.1} m, got {lower} against {higher} \
+                     (offsets and scores {scored:?})"
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The geometry of a snapped trace
+// ---------------------------------------------------------------------------
+
+/// `SnappedGeometry` is "interpolated geometry for the snapped route": the line runs ALONG
+/// the roads between consecutive snapped points, so it starts at the first snapped point,
+/// ends at the last, carries a vertex wherever the road it follows changes — more vertices
+/// than the snapped points alone — and every vertex lies on a road of the network. The two
+/// formats the request may ask for describe that one line.
+///
+/// Rows span the trace: its point count, its bearing, the span it covers and the hemisphere
+/// it is in.
+#[tokio::test]
+async fn the_snapped_geometry_runs_along_the_roads_between_the_snapped_points() {
+    let router = routes_service();
+    // name, the trace: GPS samples a few tens to a few hundred metres apart.
+    let traces: [(&str, Vec<[f64; 2]>); 4] = [
+        (
+            "four samples up one street",
+            vec![
+                [-122.3365, 47.6101],
+                [-122.3363, 47.6110],
+                [-122.3360, 47.6121],
+                [-122.3357, 47.6130],
+            ],
+        ),
+        ("two samples", vec![[-122.3421, 47.6101], [-122.3428, 47.6110]]),
+        (
+            "three samples running east",
+            vec![[-123.1017, 49.2823], [-123.0997, 49.2824], [-123.0977, 49.2825]],
+        ),
+        (
+            "three samples in the southern hemisphere",
+            vec![[151.2093, -33.8688], [151.2086, -33.8679], [151.2080, -33.8670]],
+        ),
+    ];
+
+    for (case, trace) in traces {
+        let body = |format: &str| {
+            json!({
+                "TracePoints": trace.iter().map(|point| json!({ "Position": point })).collect::<Vec<Value>>(),
+                "SnappedGeometryFormat": format,
+            })
+        };
+
+        let (status, flexible, _) = post(&router, SNAP, &body("FlexiblePolyline")).await;
+        assert_eq!(status, 200, "case {case:?}: expected 200, got {status} with {flexible:?}");
+        let (status, simple, _) = post(&router, SNAP, &body("Simple")).await;
+        assert_eq!(status, 200, "case {case:?}: expected 200, got {status} with {simple:?}");
+
+        let snapped: Vec<[f64; 2]> = flexible["SnappedTracePoints"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: SnappedTracePoints is required, got {flexible:?}"))
+            .iter()
+            .map(|point| position(&point["SnappedPosition"], case))
+            .collect();
+
+        // The encoded line, read back by the independent decoder in `all/routing.rs`.
+        let encoded = flexible["SnappedGeometry"]["Polyline"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a Polyline, got {flexible:?}"));
+        let vertices: Vec<[f64; 2]> = decode_flexible_polyline(encoded)
+            .unwrap_or_else(|| panic!("case {case:?}: the polyline must decode, got {encoded:?}"))
+            .into_iter()
+            .map(|(latitude, longitude)| [longitude, latitude])
+            .collect();
+
+        // The same line in the other format: a `LineString` of the very same vertices.
+        let line_string: Vec<[f64; 2]> = simple["SnappedGeometry"]["LineString"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a LineString, got {simple:?}"))
+            .iter()
+            .map(|vertex| position(vertex, case))
+            .collect();
+        assert_eq!(
+            vertices.len(),
+            line_string.len(),
+            "case {case:?}: the two formats carry the same line, got {vertices:?} against \
+             {line_string:?}"
+        );
+        for (index, (decoded, plain)) in vertices.iter().zip(&line_string).enumerate() {
+            assert!(
+                great_circle_m(*decoded, *plain) < 0.2,
+                "case {case:?}: vertex {index} of the polyline is vertex {index} of the \
+                 LineString, got {decoded:?} against {plain:?}"
+            );
+        }
+
+        assert!(
+            vertices.len() > snapped.len(),
+            "case {case:?}: the geometry is interpolated along the roads between the snapped \
+             points, so it carries more vertices than the {} snapped points joined, got \
+             {vertices:?}",
+            snapped.len()
+        );
+        assert!(
+            great_circle_m(vertices[0], snapped[0]) < 0.2,
+            "case {case:?}: the geometry starts at the first snapped point {:?}, got {:?}",
+            snapped[0],
+            vertices[0]
+        );
+        let last_vertex = vertices[vertices.len() - 1];
+        let last_snapped = snapped[snapped.len() - 1];
+        assert!(
+            great_circle_m(last_vertex, last_snapped) < 0.2,
+            "case {case:?}: the geometry ends at the last snapped point {last_snapped:?}, got \
+             {last_vertex:?}"
+        );
+
+        for (index, vertex) in vertices.iter().enumerate() {
+            assert!(
+                on_a_road_line(vertex[0]) || on_a_road_line(vertex[1]),
+                "case {case:?}: vertex {index} lies on a road of the network, so one of its \
+                 coordinates is a road's own, got {vertex:?}"
+            );
+        }
+        // Each step of the line runs ALONG one road, and the roads of this network run
+        // north-south or east-west: a step that changed both coordinates would cut across the
+        // block between two of them.
+        for (index, step) in vertices.windows(2).enumerate() {
+            let (from, to) = (step[0], step[1]);
+            let along_one_axis = (from[0] - to[0]).abs() < 1e-6 || (from[1] - to[1]).abs() < 1e-6;
+            assert!(
+                along_one_axis,
+                "case {case:?}: step {index} of the geometry runs along one road, so it holds one \
+                 coordinate, got {from:?} -> {to:?}"
+            );
+        }
+        // Following the roads is never a shortcut: the line is at least as long as the
+        // straight line through the snapped points it passes through.
+        let along_the_roads: f64 = vertices.windows(2).map(|step| great_circle_m(step[0], step[1])).sum();
+        let through_the_points: f64 = snapped.windows(2).map(|step| great_circle_m(step[0], step[1])).sum();
+        assert!(
+            along_the_roads >= through_the_points - 0.2,
+            "case {case:?}: the line follows the roads between the snapped points, so it covers \
+             the {through_the_points:.1} m through them at least, got {along_the_roads:.1} m"
+        );
     }
 }
 
@@ -475,15 +885,6 @@ async fn snap_one(
             .unwrap_or_else(|| panic!("case {case:?}: Confidence is required, got {snapped:?}")),
         position(&snapped["SnappedPosition"], case),
     )
-}
-
-/// `point` on the coordinate grid this API expresses a position on.
-fn on_the_grid(point: [f64; 2]) -> [f64; 2] {
-    let scale = 10_f64.powi(POSITION_PRECISION);
-    [
-        (point[0] * scale).round() / scale,
-        (point[1] * scale).round() / scale,
-    ]
 }
 
 /// Every position the answer reports, as (the member path that carries it, the position).

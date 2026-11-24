@@ -101,7 +101,7 @@ pub(crate) const ROUTES: &str = "/v2/routes";
 pub(crate) const MATRIX: &str = "/v2/route-matrix";
 pub(crate) const SNAP: &str = "/v2/snap-to-roads";
 pub(crate) const OPTIMIZE: &str = "/v2/optimize-waypoints";
-const ISOLINES: &str = "/v2/isolines";
+pub(crate) const ISOLINES: &str = "/v2/isolines";
 
 // ---------------------------------------------------------------------------
 // CalculateRoutes
@@ -594,7 +594,7 @@ const POLYLINE_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmno
 /// latitude first, five bits per character with bit 6 as the continuation flag), so it is
 /// an independent reader rather than the encoder run backwards. `None` when the string is
 /// not a 2D polyline of this format.
-fn decode_flexible_polyline(encoded: &str) -> Option<Vec<(f64, f64)>> {
+pub(crate) fn decode_flexible_polyline(encoded: &str) -> Option<Vec<(f64, f64)>> {
     let mut values = Vec::new();
     let mut accumulator: u64 = 0;
     let mut shift = 0_u32;

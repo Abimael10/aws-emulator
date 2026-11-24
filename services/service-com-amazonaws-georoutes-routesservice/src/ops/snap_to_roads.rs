@@ -331,11 +331,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 | Placement::Moved {
                     position: on_road,
                     offset_m,
-                } => (on_road, match_confidence(*position, offset_m)),
+                } => (
+                    state::position_to_vec(on_road),
+                    match_confidence(*position, offset_m),
+                ),
                 // A point the answer reports no road position for is reported where it was
-                // submitted and scores nothing: the notice is what tells it apart from a
-                // road fix.
-                Placement::Unplaced => (*position, 0.0),
+                // submitted — the request's own coordinate, carried as received — and
+                // scores nothing: the notice is what tells it apart from a road fix.
+                Placement::Unplaced => (state::echoed_position(*position), 0.0),
             };
             if let Ok(index) = i32::try_from(index) {
                 match placed {
@@ -346,8 +349,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             snapped_trace_points.push(RoadSnapSnappedTracePoint {
                 confidence,
-                original_position: state::position_to_vec(*position),
-                snapped_position: state::position_to_vec(snapped_position),
+                original_position: state::echoed_position(*position),
+                snapped_position,
             });
         }
 

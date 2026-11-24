@@ -664,7 +664,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .timestamp(clock)
                 .ok_or_else(|| internal("the departure time is not representable"))?,
             id: sequence[0].id.clone(),
-            position: state::position_to_vec(sequence[0].position),
+            position: state::echoed_position(sequence[0].position),
         });
 
         for (index, pair) in sequence.windows(2).enumerate() {
@@ -703,7 +703,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .timestamp(departure_from_to)
                     .ok_or_else(|| internal("a departure time is not representable"))?,
                 id: to.id.clone(),
-                position: state::position_to_vec(to.position),
+                position: state::echoed_position(to.position),
             });
 
             breakdown.travel_duration =
@@ -1335,7 +1335,7 @@ fn impeding_waypoint(stop: &Stop, constraint: &str, reason: String) -> WaypointO
             reason: Some(reason),
         }],
         id: stop.id.clone(),
-        position: state::position_to_vec(stop.position),
+        position: state::echoed_position(stop.position),
     }
 }
 

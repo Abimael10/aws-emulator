@@ -678,9 +678,19 @@ struct SequencePoint {
 impl SequencePoint {
     /// `Position`: the point in WGS 84 the traveller departs from or arrives at, which is
     /// the submitted position matched onto the road network. A position the network has no
-    /// road for is reported as submitted rather than moved to a road that does not exist.
-    fn reported_position(&self) -> Position {
-        self.matched_position.unwrap_or(self.position)
+    /// road for is reported as submitted rather than moved to a road that does not exist —
+    /// and then it is the request's own coordinate, so it is carried as received
+    /// ([`state::echoed_position`]) exactly like the echo beside it.
+    fn reported_position(&self) -> Vec<f64> {
+        match self.matched_position {
+            Some(matched) => state::position_to_vec(matched),
+            None => state::echoed_position(self.position),
+        }
+    }
+
+    /// `OriginalPosition`: "Position provided in the request", carried as it was received.
+    fn submitted_position(&self) -> Vec<f64> {
+        state::echoed_position(self.position)
     }
 }
 
@@ -1329,8 +1339,8 @@ fn leg_geometry(positions: &[Position], format: &str) -> Result<RouteLegGeometry
 /// The place of a vehicle leg's departure or arrival.
 fn vehicle_place(point: &SequencePoint) -> RouteVehiclePlace {
     RouteVehiclePlace {
-        position: state::position_to_vec(point.reported_position()),
-        original_position: Some(state::position_to_vec(point.position)),
+        position: point.reported_position(),
+        original_position: Some(point.submitted_position()),
         waypoint_index: point.waypoint_index.and_then(|index| i32::try_from(index).ok()),
         ..Default::default()
     }
@@ -1339,8 +1349,8 @@ fn vehicle_place(point: &SequencePoint) -> RouteVehiclePlace {
 /// The place of a pedestrian leg's departure or arrival.
 fn pedestrian_place(point: &SequencePoint) -> RoutePedestrianPlace {
     RoutePedestrianPlace {
-        position: state::position_to_vec(point.reported_position()),
-        original_position: Some(state::position_to_vec(point.position)),
+        position: point.reported_position(),
+        original_position: Some(point.submitted_position()),
         waypoint_index: point.waypoint_index.and_then(|index| i32::try_from(index).ok()),
         ..Default::default()
     }
@@ -1862,8 +1872,8 @@ fn pass_through_waypoints(leg: &MergedLeg) -> Vec<RoutePassThroughWaypoint> {
         .map(|(point, offset)| RoutePassThroughWaypoint {
             geometry_offset: i32::try_from(*offset).ok(),
             place: RoutePassThroughPlace {
-                position: state::position_to_vec(point.reported_position()),
-                original_position: Some(state::position_to_vec(point.position)),
+                position: point.reported_position(),
+                original_position: Some(point.submitted_position()),
                 waypoint_index: point.waypoint_index.and_then(|index| i32::try_from(index).ok()),
             },
         })

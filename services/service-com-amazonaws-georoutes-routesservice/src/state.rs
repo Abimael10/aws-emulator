@@ -265,13 +265,15 @@ pub const PRICING_BUCKET_ADVANCED: &str = "Advanced";
 /// at.
 pub const POLYLINE_PRECISION: u32 = 6;
 
-/// Decimal digits of a coordinate a response CARRIES, in degrees: this API expresses a
-/// `Position` to a ten-millionth of a degree — ~1 cm of ground — and reports every one of
-/// them, the position a caller supplied included, at that precision.
+/// Decimal digits of a coordinate this service COMPUTES, in degrees: this API expresses a
+/// `Position` to a ten-millionth of a degree — ~1 cm of ground — and reports every position
+/// it derives from its own network at that precision.
 ///
-/// It is the grid the service's coordinates live on, so a caller that round-trips a
-/// reported position back into a request gets the same place again, and a position read off
-/// the network cannot be reported with the artefacts of the arithmetic that located it.
+/// It is the grid the service's own coordinates live on, so a caller that round-trips a
+/// computed position back into a request gets the same place again, and a position read off
+/// the network cannot be reported with the artefacts of the arithmetic that located it. A
+/// coordinate the CALLER wrote is not on that grid and is not put onto it: a member that
+/// echoes the request's own position carries it as received ([`echoed_position`]).
 pub const POSITION_PRECISION: u32 = 7;
 
 /// Version of the Flexible Polyline format this service emits, carried as the first value
@@ -2190,14 +2192,31 @@ fn encode_unsigned_varint(mut value: u64, out: &mut String) {
     out.push(char::from(POLYLINE_ALPHABET[value as usize]));
 }
 
-/// A position as the generated members carry it, at the coordinate precision this API
-/// expresses a position in ([`POSITION_PRECISION`]).
+/// A position this service COMPUTED, as the generated members carry it: at the coordinate
+/// precision this API expresses a position in ([`POSITION_PRECISION`]).
 ///
-/// Every position a response reports goes through here — the point read off the network and
-/// the one the caller supplied alike — so a response carries no coordinate finer than the
-/// grid the service's own positions live on.
+/// Every position derived from the network goes through here — a matched point, a vertex of
+/// a geometry, the centre of a boundary — so a computed coordinate is reported on the grid
+/// the service's own positions live on rather than with the artefacts of the arithmetic
+/// that located it. A position the CALLER supplied is NOT one of them: see
+/// [`echoed_position`].
 pub fn position_to_vec(position: Position) -> Vec<f64> {
     let position = round_to_digits(position, POSITION_PRECISION);
+    vec![position[0], position[1]]
+}
+
+/// A position the CALLER supplied, as a member that reports the request's own coordinate
+/// carries it: exactly as it was received.
+///
+/// A member documented as the position provided in the request is an ECHO, so nothing is
+/// applied to it on the way out. The model carries it as a list of `Double`, which holds
+/// every digit a caller can write, and a client joins a response back to the request it
+/// answers by comparing the echo with the coordinate it sent: quantizing it — even onto the
+/// grid this service's own computed positions live on ([`position_to_vec`]) — breaks that
+/// comparison and silently moves the point the caller named. It is also what makes the
+/// offset between an echo and the matched point beside it the real distance from the
+/// submitted position to the road, rather than that distance plus a rounding step.
+pub fn echoed_position(position: Position) -> Vec<f64> {
     vec![position[0], position[1]]
 }
 
