@@ -39,11 +39,13 @@
 //! * A template's `MetricName` is a metric the service named by its
 //!   `TargetResourceType` publishes to CloudWatch, which is what
 //!   `MetricName` requires ("Must be compatible with targetResourceType").
-//! * The ids are this emulator's, in the `aws-` form the `Id` member documents
-//!   for a published resource: no recording in this corpus discloses a rule for
-//!   the digits AWS assigns, so they are assigned here in catalog order, which
-//!   makes an id name the same published resource on every call and in every
-//!   process.
+//! * The ids are the CATALOG's: a published group is published under the id the
+//!   service assigns it, in the `aws-` form the `Id` member documents, and the
+//!   ids below are the ones the recordings of this catalog disclose (see
+//!   [`PublishedGroup::id`]). A published TEMPLATE's id is still assigned here,
+//!   in catalog order, because no recording discloses which published template
+//!   each of the service's template ids names — so an id names the same
+//!   published template on every call and in every process.
 //! * The alarm settings (period, evaluation periods, datapoints, threshold,
 //!   missing-data treatment) and the prose of a template's `Description` are
 //!   likewise CHOSEN, as the [`super::offerings`] catalog's prices are: no AWS
@@ -93,17 +95,6 @@ pub fn service_owned_arn(region: &str, resource: &str) -> String {
 /// ("AWS provided template groups have ids that start with `aws-`").
 const PUBLISHED_ID_PREFIX: &str = super::template_scope::AWS_PROVIDED_ID_PREFIX;
 
-/// The id of the published group at `position` in [`CATALOG`], counting from
-/// one.
-///
-/// `__stringMin7Max11PatternAws097` admits at most eleven characters, so a
-/// published id is the prefix plus seven digits; the digits count up with the
-/// catalog position, so the ids sort in catalog order and an id names the same
-/// published group in every process.
-fn group_id(position: usize) -> String {
-    format!("{PUBLISHED_ID_PREFIX}{:07}", 1_000_000 + position)
-}
-
 /// The id of the published template at `position` in the catalog's template
 /// sequence, counting from one — in the digit range of its own that keeps the
 /// group and template id spaces apart, as the account's own mints do.
@@ -119,7 +110,8 @@ pub fn is_published_id(id: &str) -> bool {
 
 /// The place the monitor template resource `id` takes in a listing of its kind:
 /// the resources the SERVICE published before the account existed first, then the
-/// ones the account created, each in id (mint) order.
+/// ones the account created, each in id order — the order the catalog's own ids
+/// sort in for the published ones, and mint order for the account's.
 ///
 /// A listing reports the resources of a kind in the order they came into being,
 /// and every entry of this catalog was published before any account resource was
@@ -190,6 +182,20 @@ pub struct PublishedTemplate {
 /// [`CloudWatchAlarmTemplateGroupRecord`].
 #[derive(Debug, Clone, Copy)]
 pub struct PublishedGroup {
+    /// The `Id` the service publishes the group under, in the `aws-` form the
+    /// `Id` member documents for a published resource ("AWS provided template
+    /// groups have ids that start with `aws-`") — the prefix and seven digits,
+    /// which is all `__stringMin7Max11PatternAws097` admits.
+    ///
+    /// The id is the CATALOG's, not a counter of this emulator's: a client pins
+    /// a published group by it (a signal map association, a template created
+    /// inside a published group, infrastructure that records the ARN built from
+    /// it), so it has to be the id that names this group on the service, and it
+    /// is therefore the same in every region, for every account and in every
+    /// process. The pairs below are the published id of each published group, as
+    /// the recordings of this catalog report them — the service assigns the
+    /// digits, and nothing derives them from the group's position or name.
+    pub id: &'static str,
     /// The group's `Name`, as the service publishes it.
     pub name: &'static str,
     /// The component of a template's name that says which group published it,
@@ -265,6 +271,7 @@ pub mod statistic {
 /// shape="CloudWatchAlarmTemplateTreatMissingData")`).
 pub mod treat_missing_data {
     pub const BREACHING: &str = "breaching";
+    pub const MISSING: &str = "missing";
     pub const NOT_BREACHING: &str = "notBreaching";
 }
 
@@ -281,13 +288,18 @@ pub mod target_resource_type {
     pub const MEDIATAILOR_PLAYBACK_CONFIGURATION: &str = "MEDIATAILOR_PLAYBACK_CONFIGURATION";
 }
 
-/// The published catalog, in the one order every reader walks it in — the order
-/// the groups' names sort in, which is also the order their ids are assigned in.
+/// The published catalog, written in the order the groups' names sort in.
+///
+/// The TABLE's order is the table's own: a listing reports the published
+/// resources of a kind in id order ([`listing_position`]), which is the order a
+/// `NextToken` resumes a page at, so where a row sits here changes nothing a
+/// caller sees.
 ///
 /// The set is the same in every region and for every account: this is what the
 /// service publishes, not what a caller created.
 pub const CATALOG: &[PublishedGroup] = &[
     PublishedGroup {
+        id: "aws-1160891",
         name: "AWS-CloudFrontGeneralWorkflows",
         tag: "CloudFrontGeneral",
         templates: &[
@@ -316,6 +328,7 @@ pub const CATALOG: &[PublishedGroup] = &[
         ],
     },
     PublishedGroup {
+        id: "aws-4336130",
         name: "AWS-MediaConnectArqProtocolWorkflows",
         tag: "MediaConnectArqProtocol",
         templates: &[
@@ -355,6 +368,7 @@ pub const CATALOG: &[PublishedGroup] = &[
         ],
     },
     PublishedGroup {
+        id: "aws-2587288",
         name: "AWS-MediaConnectCdiJpegxsWorkflows",
         tag: "MediaConnectCdiJpegxs",
         templates: &[
@@ -380,9 +394,21 @@ pub const CATALOG: &[PublishedGroup] = &[
                 threshold: 1.0,
                 treat_missing_data: treat_missing_data::BREACHING,
             },
+            PublishedTemplate {
+                target_resource_type: target_resource_type::MEDIACONNECT_FLOW,
+                metric_name: "SourceBitRate",
+                comparison_operator: comparison_operator::LESS_THAN,
+                statistic: statistic::AVERAGE,
+                period: 60,
+                evaluation_periods: 3,
+                datapoints_to_alarm: 3,
+                threshold: 1.0,
+                treat_missing_data: treat_missing_data::BREACHING,
+            },
         ],
     },
     PublishedGroup {
+        id: "aws-5128237",
         name: "AWS-MediaConnectInputFailoverWorkflows",
         tag: "MediaConnectInputFailover",
         templates: &[
@@ -411,6 +437,7 @@ pub const CATALOG: &[PublishedGroup] = &[
         ],
     },
     PublishedGroup {
+        id: "aws-3414886",
         name: "AWS-MediaConnectRtpWorkflows",
         tag: "MediaConnectRtp",
         templates: &[
@@ -447,9 +474,21 @@ pub const CATALOG: &[PublishedGroup] = &[
                 threshold: 0.0,
                 treat_missing_data: treat_missing_data::NOT_BREACHING,
             },
+            PublishedTemplate {
+                target_resource_type: target_resource_type::MEDIACONNECT_FLOW,
+                metric_name: "SourcePacketLossPercent",
+                comparison_operator: comparison_operator::GREATER_THAN,
+                statistic: statistic::AVERAGE,
+                period: 60,
+                evaluation_periods: 3,
+                datapoints_to_alarm: 2,
+                threshold: 0.01,
+                treat_missing_data: treat_missing_data::NOT_BREACHING,
+            },
         ],
     },
     PublishedGroup {
+        id: "aws-4237617",
         name: "AWS-MediaLiveMultiplexWorkflows",
         tag: "MediaLiveMultiplex",
         templates: &[
@@ -478,6 +517,7 @@ pub const CATALOG: &[PublishedGroup] = &[
         ],
     },
     PublishedGroup {
+        id: "aws-5775786",
         name: "AWS-MediaLiveToMediaPackageWorkflows",
         tag: "MediaLiveToMediaPackage",
         templates: &[
@@ -525,9 +565,21 @@ pub const CATALOG: &[PublishedGroup] = &[
                 threshold: 1000.0,
                 treat_missing_data: treat_missing_data::NOT_BREACHING,
             },
+            PublishedTemplate {
+                target_resource_type: target_resource_type::MEDIALIVE_CHANNEL,
+                metric_name: "InputLossSeconds",
+                comparison_operator: comparison_operator::GREATER_THAN,
+                statistic: statistic::SUM,
+                period: 60,
+                evaluation_periods: 1,
+                datapoints_to_alarm: 1,
+                threshold: 0.0,
+                treat_missing_data: treat_missing_data::NOT_BREACHING,
+            },
         ],
     },
     PublishedGroup {
+        id: "aws-1484347",
         name: "AWS-MediaLiveUdpAndRtmpWorkflows",
         tag: "MediaLiveUdpAndRtmp",
         templates: &[
@@ -575,9 +627,67 @@ pub const CATALOG: &[PublishedGroup] = &[
                 threshold: 0.0,
                 treat_missing_data: treat_missing_data::NOT_BREACHING,
             },
+            // The one published template of this group a recording of the
+            // catalog discloses the settings of, carried as it reports them.
+            PublishedTemplate {
+                target_resource_type: target_resource_type::MEDIALIVE_CHANNEL,
+                metric_name: "ChannelInputErrorSeconds",
+                comparison_operator: comparison_operator::GREATER_THAN,
+                statistic: statistic::MAXIMUM,
+                period: 60,
+                evaluation_periods: 1,
+                datapoints_to_alarm: 1,
+                threshold: 0.0,
+                treat_missing_data: treat_missing_data::MISSING,
+            },
+            PublishedTemplate {
+                target_resource_type: target_resource_type::MEDIALIVE_CHANNEL,
+                metric_name: "InputLossSeconds",
+                comparison_operator: comparison_operator::GREATER_THAN,
+                statistic: statistic::SUM,
+                period: 60,
+                evaluation_periods: 1,
+                datapoints_to_alarm: 1,
+                threshold: 0.0,
+                treat_missing_data: treat_missing_data::NOT_BREACHING,
+            },
+            PublishedTemplate {
+                target_resource_type: target_resource_type::MEDIALIVE_CHANNEL,
+                metric_name: "PrimaryInputActive",
+                comparison_operator: comparison_operator::LESS_THAN,
+                statistic: statistic::MINIMUM,
+                period: 60,
+                evaluation_periods: 3,
+                datapoints_to_alarm: 3,
+                threshold: 1.0,
+                treat_missing_data: treat_missing_data::BREACHING,
+            },
+            PublishedTemplate {
+                target_resource_type: target_resource_type::MEDIALIVE_CHANNEL,
+                metric_name: "SvqTime",
+                comparison_operator: comparison_operator::GREATER_THAN,
+                statistic: statistic::AVERAGE,
+                period: 300,
+                evaluation_periods: 3,
+                datapoints_to_alarm: 2,
+                threshold: 0.0,
+                treat_missing_data: treat_missing_data::NOT_BREACHING,
+            },
+            PublishedTemplate {
+                target_resource_type: target_resource_type::MEDIALIVE_CHANNEL,
+                metric_name: "NetworkOut",
+                comparison_operator: comparison_operator::LESS_THAN,
+                statistic: statistic::AVERAGE,
+                period: 300,
+                evaluation_periods: 3,
+                datapoints_to_alarm: 3,
+                threshold: 1.0,
+                treat_missing_data: treat_missing_data::NOT_BREACHING,
+            },
         ],
     },
     PublishedGroup {
+        id: "aws-2520023",
         name: "AWS-MediaPackageGeneralWorkflows",
         tag: "MediaPackageGeneral",
         templates: &[
@@ -617,6 +727,7 @@ pub const CATALOG: &[PublishedGroup] = &[
         ],
     },
     PublishedGroup {
+        id: "aws-3840949",
         name: "AWS-MediaTailorAdInsertionWorkflows",
         tag: "MediaTailorAdInsertion",
         templates: &[
@@ -676,9 +787,8 @@ pub const CATALOG: &[PublishedGroup] = &[
 pub fn published_groups(region: &str) -> Vec<CloudWatchAlarmTemplateGroupRecord> {
     CATALOG
         .iter()
-        .enumerate()
-        .map(|(index, group)| {
-            let id = group_id(index + 1);
+        .map(|group| {
+            let id = group.id.to_string();
             CloudWatchAlarmTemplateGroupRecord {
                 arn: service_owned_arn(region, &format!("cloudwatch-alarm-template-group:{id}")),
                 id,
@@ -698,15 +808,14 @@ pub fn published_groups(region: &str) -> Vec<CloudWatchAlarmTemplateGroupRecord>
 /// carrying the id of the group that publishes it.
 pub fn published_templates(region: &str) -> Vec<CloudWatchAlarmTemplateRecord> {
     let mut templates = Vec::new();
-    for (group_index, group) in CATALOG.iter().enumerate() {
-        let group_id = group_id(group_index + 1);
+    for group in CATALOG {
         for template in group.templates {
             let id = template_id(templates.len() + 1);
             templates.push(CloudWatchAlarmTemplateRecord {
                 arn: service_owned_arn(region, &format!("cloudwatch-alarm-template:{id}")),
                 id,
                 region: region.to_string(),
-                group_id: group_id.clone(),
+                group_id: group.id.to_string(),
                 name: template.name(group.tag),
                 description: Some(template.description()),
                 comparison_operator: template.comparison_operator.to_string(),

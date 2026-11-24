@@ -18,8 +18,10 @@ use service_com_amazonaws_medialive_medialive::state::MAX_LIST_PAGE_SIZE;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cloud_watch_alarm_template_listing::required_members;
+use crate::managed_monitor_catalog::PUBLISHED_GROUPS;
 use crate::support::{
-    account_owned, account_owned_names, create_in, entry_point, get_in, timestamp, GROUPS,
+    account_owned, account_owned_names, create_in, entry_point, get_in, is_aws_provided, timestamp,
+    GROUPS,
 };
 use crate::wire::{call_in_region, error_code, medialive, ACCOUNT, DEFAULT_REGION};
 
@@ -301,6 +303,170 @@ async fn listing_pages_through_every_stored_group_in_mint_order() {
                      got {pages:?}"
                 );
             }
+        }
+    }
+}
+
+/// Every summary a listing reports in `region` under `query`, walking every page
+/// the `NextToken` hands out, so a page cut cannot hide an entry from the
+/// assertion.
+async fn every_summary(
+    router: &MultiServiceRouter,
+    case: &str,
+    region: &str,
+    query: &str,
+) -> Vec<Value> {
+    let mut all: Vec<Value> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let mut full = query.to_string();
+        if let Some(next) = &token {
+            full.push(if full.is_empty() { '?' } else { '&' });
+            full.push_str(&format!("nextToken={next}"));
+        }
+        let (status, body) = list_in(router, region, &full).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected ListCloudWatchAlarmTemplateGroups to answer 200 \
+             for {full:?}, got {status}: {body}"
+        );
+        all.extend(summaries(case, &body));
+        token = body["nextToken"].as_str().map(ToString::to_string);
+        if token.is_none() {
+            break;
+        }
+        assert!(
+            all.len() <= 512,
+            "case {case:?}: expected pagination to terminate, got {} summaries",
+            all.len()
+        );
+    }
+    all
+}
+
+/// Rule: a cloudwatch alarm template group this account created in a region is a
+/// member of that region's collection from the moment the create answers, so the
+/// very next listing that does not narrow the provenance reports it — carrying
+/// the members the create stored and a `templateCount` of the templates in it —
+/// beside the groups the SERVICE publishes, whatever page the cut puts it on.
+///
+/// This is the read-after-write rule the group collection shares with every
+/// other read of this service: a listing reports the state the writes before it
+/// committed in the region the request is signed for, so a client that creates a
+/// group and lists to confirm it sees it.
+///
+/// The rows differ along what the create supplied, how many groups the account
+/// created, the region the pair of calls is signed for, and the form the listing
+/// takes — no query string at all, each spelling of a scope that admits the
+/// account's own groups, a page size well above the collection, and one group
+/// per page.
+#[tokio::test]
+async fn a_created_group_is_reported_by_the_next_listing() {
+    // (case, the region both calls are signed for, the creates in order)
+    let rows: Vec<(&str, &str, Vec<Value>)> = vec![
+        (
+            "a name only",
+            DEFAULT_REGION,
+            vec![json!({ "name": "probe-name-only" })],
+        ),
+        (
+            "a description and an empty tag map",
+            DEFAULT_REGION,
+            vec![json!({
+                "name": "probe-described",
+                "description": "initial description",
+                "tags": {},
+            })],
+        ),
+        (
+            "three groups at once",
+            DEFAULT_REGION,
+            vec![
+                json!({ "name": "probe-a" }),
+                json!({ "name": "probe-b", "description": "the second" }),
+                json!({ "name": "probe-c", "tags": { "team": "video" } }),
+            ],
+        ),
+        (
+            "another region",
+            "eu-central-1",
+            vec![json!({ "name": "probe-eu", "description": "in eu-central-1" })],
+        ),
+        (
+            "a region of its own",
+            "ap-south-1",
+            vec![json!({ "name": "probe-ap" })],
+        ),
+    ];
+    // The listing forms that narrow none of the account's own groups away: an
+    // absent `Scope` (all scopes), the two spellings of a scope that admits
+    // them, a page larger than the collection, and a page of one.
+    let queries = [
+        "",
+        "?scope=ALL",
+        "?scope=LOCAL",
+        "?maxResults=1000",
+        "?maxResults=1",
+    ];
+
+    for (row, region, bodies) in rows {
+        let router = medialive();
+        let mut created: Vec<Value> = Vec::new();
+        for body in bodies {
+            created.push(create_group(&router, row, region, body).await);
+        }
+
+        for query in queries {
+            let case = format!("{row}, listed with {query:?}");
+            let listed = every_summary(&router, &case, region, query).await;
+
+            for create in &created {
+                let name = create["name"].as_str().unwrap_or_default();
+                let summary = listed
+                    .iter()
+                    .find(|summary| summary["name"] == create["name"])
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "case {case:?}: expected the created group {name:?} among {listed:?}"
+                        )
+                    });
+                // What the listing reports for it is what the create stored.
+                for member in ["arn", "id", "name", "description", "tags"] {
+                    assert_eq!(
+                        summary.get(member).cloned().unwrap_or(Value::Null),
+                        create.get(member).cloned().unwrap_or(Value::Null),
+                        "case {case:?}: expected the listed {member} of {name:?} to be the \
+                         created one, got {:?} vs {:?}",
+                        summary.get(member),
+                        create.get(member)
+                    );
+                }
+                assert_eq!(
+                    summary["templateCount"],
+                    json!(0),
+                    "case {case:?}: expected {name:?} to hold no template yet, got {:?}",
+                    summary["templateCount"]
+                );
+            }
+
+            // The published catalog is reported BESIDE the account's own
+            // wherever the provenance is not narrowed to one of them, so the
+            // created group is never reported instead of the catalog nor the
+            // catalog instead of it.
+            let published = listed
+                .iter()
+                .filter(|summary| is_aws_provided(summary))
+                .count();
+            let expected = if query == "?scope=LOCAL" {
+                0
+            } else {
+                PUBLISHED_GROUPS.len()
+            };
+            assert_eq!(
+                published, expected,
+                "case {case:?}: expected {expected} published groups beside the account's own, \
+                 got {published}"
+            );
         }
     }
 }

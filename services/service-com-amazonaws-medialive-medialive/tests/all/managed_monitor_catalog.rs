@@ -44,7 +44,7 @@ const TEMPLATES: &str = "/prod/cloudwatch-alarm-templates";
 /// for. This is the catalog's own data — a client resolves a published group by
 /// exactly these names — spelled here so the suite pins the published set rather
 /// than echoing the table the service builds it from.
-const PUBLISHED_GROUPS: [&str; 10] = [
+pub const PUBLISHED_GROUPS: [&str; 10] = [
     "AWS-CloudFrontGeneralWorkflows",
     "AWS-MediaConnectArqProtocolWorkflows",
     "AWS-MediaConnectCdiJpegxsWorkflows",
@@ -55,6 +55,23 @@ const PUBLISHED_GROUPS: [&str; 10] = [
     "AWS-MediaLiveUdpAndRtmpWorkflows",
     "AWS-MediaPackageGeneralWorkflows",
     "AWS-MediaTailorAdInsertionWorkflows",
+];
+
+/// The id the service publishes each group under, beside the name it publishes
+/// it under. This is the catalog's own data — a client pins a published group by
+/// this id, and by the ARN built from it — spelled here so the suite pins the
+/// published pairing rather than echoing the table the service builds it from.
+const PUBLISHED_GROUP_IDS: [(&str, &str); 10] = [
+    ("AWS-CloudFrontGeneralWorkflows", "aws-1160891"),
+    ("AWS-MediaConnectArqProtocolWorkflows", "aws-4336130"),
+    ("AWS-MediaConnectCdiJpegxsWorkflows", "aws-2587288"),
+    ("AWS-MediaConnectInputFailoverWorkflows", "aws-5128237"),
+    ("AWS-MediaConnectRtpWorkflows", "aws-3414886"),
+    ("AWS-MediaLiveMultiplexWorkflows", "aws-4237617"),
+    ("AWS-MediaLiveToMediaPackageWorkflows", "aws-5775786"),
+    ("AWS-MediaLiveUdpAndRtmpWorkflows", "aws-1484347"),
+    ("AWS-MediaPackageGeneralWorkflows", "aws-2520023"),
+    ("AWS-MediaTailorAdInsertionWorkflows", "aws-3840949"),
 ];
 
 /// Every `CloudWatchAlarmTemplateTargetResourceType` the model declares
@@ -267,6 +284,85 @@ async fn a_fresh_account_reads_every_published_group() {
                  published instant"
             );
         }
+    }
+}
+
+/// Rule: a group the SERVICE publishes is published under the id the catalog
+/// assigns it — not under an id this emulator mints — so the same name carries
+/// the same id in every region and in every process, the group's ARN is that id
+/// in the service-owned form, and the id resolves that group through every read
+/// path a client reaches a published group by.
+///
+/// The rows are the ten published name/id pairs, crossed with the regions they
+/// are read through and with the two identifier forms a get documents.
+#[tokio::test]
+async fn every_published_group_carries_its_catalog_id() {
+    // Two regions, because a published resource is read through every regional
+    // endpoint under the same id, and the ARN names the endpoint's region.
+    for region in [DEFAULT_REGION, "eu-central-1"] {
+        let router = medialive();
+        let listed = list_groups(&router, region, "").await;
+        let published = published_by_name(&listed);
+
+        for (name, id) in PUBLISHED_GROUP_IDS {
+            let case = format!("{name} in {region}");
+            let summary = published.get(name).unwrap_or_else(|| {
+                panic!("case {case:?}: expected the published group among {listed:?}")
+            });
+            assert_eq!(
+                summary["id"],
+                json!(id),
+                "case {case:?}: expected the catalog id {id:?}, got {:?}",
+                summary["id"]
+            );
+            assert_eq!(
+                summary["arn"],
+                json!(format!(
+                    "arn:aws:medialive:{region}::cloudwatch-alarm-template-group:{id}"
+                )),
+                "case {case:?}: expected the service-owned ARN of the catalog id, got {:?}",
+                summary["arn"]
+            );
+
+            // The id a client pinned resolves that group, and so does its name.
+            for identifier in [id, name] {
+                let (status, read) = get_group(&router, region, identifier).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}/{identifier}: expected the get to answer 200, \
+                     got {status}: {read}"
+                );
+                assert_eq!(
+                    read["id"],
+                    json!(id),
+                    "case {case:?}/{identifier}: expected the get to report the catalog id, \
+                     got {:?}",
+                    read["id"]
+                );
+                assert_eq!(
+                    read["name"],
+                    json!(name),
+                    "case {case:?}/{identifier}: expected the get to report the published name, \
+                     got {:?}",
+                    read["name"]
+                );
+            }
+        }
+
+        // No two published groups share an id, and the catalog publishes no id
+        // beside the ten above.
+        let ids: BTreeSet<String> = published
+            .values()
+            .map(|summary| summary["id"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            PUBLISHED_GROUP_IDS
+                .iter()
+                .map(|(_, id)| (*id).to_string())
+                .collect::<BTreeSet<String>>(),
+            "case {region:?}: expected exactly the catalog's published ids, got {ids:?}"
+        );
     }
 }
 

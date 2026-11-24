@@ -151,6 +151,61 @@ async fn repeated_reads_report_the_same_configuration_and_change_nothing() {
     }
 }
 
+/// Rule: a read answers from the SAME per-region record the update before it
+/// wrote, so each regional endpoint reports the key configured through IT, byte
+/// for byte, however much other traffic — updates and reads of other regions,
+/// repeated reads of this one — happened in between; and a region no update has
+/// configured reports no `kmsKeyId` even while another region holds one.
+///
+/// The rows are the regions, which differ along what was configured through them
+/// (a key ARN, an alias ARN, a key cleared again, nothing at all) and along the
+/// traffic that passes between the write and the read.
+#[tokio::test]
+async fn a_read_answers_from_the_region_its_update_wrote() {
+    // (region, the updates applied through it, what it must then report)
+    let regions: Vec<(&str, Vec<&str>, Value)> = vec![
+        ("us-west-2", vec![KEY_ARN], json!({ "kmsKeyId": KEY_ARN })),
+        (
+            "eu-central-1",
+            vec![ALIAS_ARN],
+            json!({ "kmsKeyId": ALIAS_ARN }),
+        ),
+        ("ap-south-1", vec![KEY_ARN, ""], unconfigured()),
+        ("sa-east-1", vec![], unconfigured()),
+    ];
+
+    let router = medialive();
+    for (region, arrangement, _) in &regions {
+        arrange(&router, region, region, arrangement).await;
+    }
+
+    // Every region is read, then written through again, then read twice more:
+    // the traffic of the other regions passes between each region's write and
+    // the read that must still report it.
+    for round in 0..3 {
+        for (region, _, expected) in &regions {
+            let case = format!("{region} on round {round}");
+            let described = reported(&router, &case, region).await;
+            assert_eq!(
+                described, *expected,
+                "case {case:?}: expected {region} to report {expected}, got {described}"
+            );
+        }
+        // One more update per round, through a region of its own, so the store
+        // holds records the reads above never wrote.
+        let (status, body) = update_in(
+            &router,
+            &format!("emulator-round-{round}"),
+            Some(json!({ "accountConfiguration": { "kmsKeyId": KEY_ARN } })),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "round {round}: expected the interleaved update to answer 200, got {status}: {body}"
+        );
+    }
+}
+
 /// Rule: a read records nothing, so it never takes room in the emulator's
 /// bounded per-region store — reading far MORE regions than the store can hold
 /// leaves it as empty as it started, which an update for a fresh region proves by
