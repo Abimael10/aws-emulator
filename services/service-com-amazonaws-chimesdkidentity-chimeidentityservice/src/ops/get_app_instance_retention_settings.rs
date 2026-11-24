@@ -156,21 +156,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A reporting operation: it reads the settings the named instance holds and
         // writes nothing, so two reads with no write between them answer the same.
         let Some(record) = state.app_instances.get(&input.app_instance_arn) else {
-            // This operation models no 404 shape, so an unknown ARN is refused with the
-            // modelled `BadRequestException` carrying the `NotFound` error code — the
-            // same refusal `DescribeAppInstance` states for an absent instance.
-            return Err(
-                GetAppInstanceRetentionSettingsErrorModeled::BadRequestException(
-                    BadRequestException {
-                        code: Some("NotFound".to_string()),
-                        message: Some(format!(
-                            "AppInstance {} does not exist",
-                            input.app_instance_arn
-                        )),
-                    },
-                )
-                .into(),
-            );
+            // An ARN this service resolves to nothing earns one of TWO answers: an
+            // `AppInstance` that has been DELETED no longer has retention settings to
+            // report, so the request is one this caller may no longer make; an ARN that
+            // never named an instance is simply absent.
+            return Err(match state.unresolved_arn(&input.app_instance_arn) {
+                crate::state::UnresolvedArn::DeletedAppInstance => {
+                    GetAppInstanceRetentionSettingsErrorModeled::ForbiddenException(
+                        ForbiddenException {
+                            code: Some("Forbidden".to_string()),
+                            message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
+                        },
+                    )
+                    .into()
+                }
+                // This operation models no 404 shape, so an ARN that never named an
+                // instance is refused with the modelled `BadRequestException` carrying
+                // the `NotFound` error code.
+                crate::state::UnresolvedArn::NeverExisted => {
+                    GetAppInstanceRetentionSettingsErrorModeled::BadRequestException(
+                        BadRequestException {
+                            code: Some("NotFound".to_string()),
+                            message: Some(format!(
+                                "AppInstance {} does not exist",
+                                input.app_instance_arn
+                            )),
+                        },
+                    )
+                    .into()
+                }
+            });
         };
 
         Ok(GetAppInstanceRetentionSettingsOutput {

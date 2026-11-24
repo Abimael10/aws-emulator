@@ -313,8 +313,10 @@ async fn a_number_of_days_outside_the_published_range_is_refused() {
 }
 
 /// RULE: both retention-settings operations are keyed by an `AppInstanceArn` this service
-/// holds; one that names no app instance it holds is refused with the modelled client
-/// error carrying the `NotFound` code, and the put writes nothing.
+/// holds, and an ARN it resolves to no live instance earns one of TWO refusals — an
+/// instance that has been DELETED is a request the caller may no longer make (403
+/// `Forbidden`), while an ARN that never named an instance is absent (400 `NotFound`) —
+/// and the put writes nothing either way.
 #[tokio::test]
 async fn an_arn_that_names_no_app_instance_is_refused() {
     let emulator = Emulator::new();
@@ -331,28 +333,41 @@ async fn an_arn_that_names_no_app_instance_is_refused() {
 
     // Rows: an ARN of the right shape naming nothing, an instance that has been deleted,
     // and the ARN of a user — a resource of another kind this service mints, which is no
-    // `AppInstance`.
+    // `AppInstance`. The DELETED instance is its own class: the instance that held the
+    // settings is gone, so the request is one this caller may no longer make, which is
+    // the answer every operation of this service keyed by a deleted instance's ARN gives.
     let user_arn = format!("{instance}/user/not-an-app-instance");
-    let rows: Vec<(&str, String)> = vec![
-        ("an instance that never existed", format!("{instance}x")),
-        ("an instance that has been deleted", deleted.clone()),
-        ("a user ARN in the app-instance space", user_arn),
+    let rows: Vec<(&str, String, u16, &str)> = vec![
+        (
+            "an instance that never existed",
+            format!("{instance}x"),
+            400,
+            "NotFound",
+        ),
+        (
+            "an instance that has been deleted",
+            deleted.clone(),
+            403,
+            "Forbidden",
+        ),
+        (
+            "a user ARN in the app-instance space",
+            user_arn,
+            400,
+            "NotFound",
+        ),
     ];
 
-    for (label, arn) in rows {
+    for (label, arn, expected_status, expected_code) in rows {
         for (operation, (status, body)) in [
             ("get", get_retention(&emulator, &arn).await),
             ("put", put_retention(&emulator, &arn, settings(30)).await),
         ] {
             assert_eq!(
-                status, 400,
-                "case {label:?} / {operation}: expected 400 for {arn:?}, got {status} \
-                 {body:?}"
-            );
-            assert_eq!(
-                body["Code"].as_str(),
-                Some("NotFound"),
-                "case {label:?} / {operation}: expected the NotFound code, got {body:?}"
+                (status, body["Code"].as_str()),
+                (expected_status, Some(expected_code)),
+                "case {label:?} / {operation}: expected {expected_status} \
+                 {expected_code:?} for {arn:?}, got {status} {body:?}"
             );
         }
     }

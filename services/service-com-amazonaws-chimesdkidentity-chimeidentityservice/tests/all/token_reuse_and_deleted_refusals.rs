@@ -39,7 +39,8 @@ use crate::app_instance_lifecycle::{uri_encode, Emulator};
 type MismatchRow = (&'static str, Box<dyn Fn(&mut Value)>);
 
 /// The `Message` AWS words the permanent refusal with, on every operation that serves it.
-const FORBIDDEN_MESSAGE: &str = "You are not allowed to make this request.";
+/// `pub(crate)` so the suites beside this one assert against this one sentence.
+pub(crate) const FORBIDDEN_MESSAGE: &str = "You are not allowed to make this request.";
 
 /// The `Message` AWS words a token already associated with a resource with.
 const TOKEN_ALREADY_ASSOCIATED_MESSAGE: &str =
@@ -411,6 +412,11 @@ struct AddressedCall {
 /// `DescribeAppInstanceAdmin` is out for the same reason: the grant it addresses is the
 /// resource it resolves, so it answers the permanent refusal for any pair of ARNs it
 /// holds no promotion for.
+///
+/// Every other operation keyed by an `AppInstanceArn` is a row, including the ones that
+/// address a SUB-RESOURCE of the instance (its administrators, its retention settings):
+/// the ARN they are scoped by is the instance's, so the instance's absence is what they
+/// answer about.
 fn calls_addressed_to(instance: &str, user: &str, bot: &str) -> Vec<AddressedCall> {
     let call = |label: &str, method: &'static str, path: String, body: Option<Value>| {
         AddressedCall {
@@ -450,6 +456,33 @@ fn calls_addressed_to(instance: &str, user: &str, bot: &str) -> Vec<AddressedCal
             "GET",
             format!("/app-instance-bots?app-instance-arn={}", uri_encode(instance)),
             None,
+        ),
+        call(
+            "ListAppInstanceAdmins",
+            "GET",
+            format!("/app-instances/{}/admins", uri_encode(instance)),
+            None,
+        ),
+        call(
+            "GetAppInstanceRetentionSettings",
+            "GET",
+            format!(
+                "/app-instances/{}/retention-settings",
+                uri_encode(instance)
+            ),
+            None,
+        ),
+        call(
+            "PutAppInstanceRetentionSettings",
+            "PUT",
+            format!(
+                "/app-instances/{}/retention-settings",
+                uri_encode(instance)
+            ),
+            Some(json!({
+                "AppInstanceRetentionSettings":
+                    crate::app_instance_retention_settings::settings(30),
+            })),
         ),
         call(
             "CreateAppInstanceUser",

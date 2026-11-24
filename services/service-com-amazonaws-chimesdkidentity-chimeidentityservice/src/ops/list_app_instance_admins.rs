@@ -168,19 +168,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // writer in this crate takes them in.
         let store = state.lock();
         if !store.app_instances.contains_key(&input.app_instance_arn) {
-            // This operation models no 404 shape, so an unknown ARN is refused with the
-            // modelled `BadRequestException` carrying the `NotFound` error code, as the
-            // rest of this service does.
-            return Err(ListAppInstanceAdminsErrorModeled::BadRequestException(
-                BadRequestException {
-                    code: Some("NotFound".to_string()),
-                    message: Some(format!(
-                        "AppInstance {} does not exist",
-                        input.app_instance_arn
-                    )),
-                },
-            )
-            .into());
+            // An ARN this service resolves to nothing earns one of TWO answers, the pair
+            // the rest of this service gives: an `AppInstance` that has been DELETED can
+            // no longer serve a listing of the administrators it held, so the request is
+            // one this caller may no longer make; an ARN that never named an instance is
+            // simply absent.
+            return Err(match store.unresolved_arn(&input.app_instance_arn) {
+                crate::state::UnresolvedArn::DeletedAppInstance => {
+                    ListAppInstanceAdminsErrorModeled::ForbiddenException(ForbiddenException {
+                        code: Some("Forbidden".to_string()),
+                        message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
+                    })
+                    .into()
+                }
+                // This operation models no 404 shape, so an ARN that never named an
+                // instance is refused with the modelled `BadRequestException` carrying
+                // the `NotFound` error code.
+                crate::state::UnresolvedArn::NeverExisted => {
+                    ListAppInstanceAdminsErrorModeled::BadRequestException(BadRequestException {
+                        code: Some("NotFound".to_string()),
+                        message: Some(format!(
+                            "AppInstance {} does not exist",
+                            input.app_instance_arn
+                        )),
+                    })
+                    .into()
+                }
+            });
         }
 
         // A reporting operation: it reads the recorded promotions of THIS app instance and

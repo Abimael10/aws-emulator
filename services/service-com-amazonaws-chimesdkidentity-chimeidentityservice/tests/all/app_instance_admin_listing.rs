@@ -14,6 +14,11 @@
 //! hold), the number of administrators against the page size (both ends of the model's
 //! `MaxResults` range), how many instances hold administrators at once, and each way a
 //! page request can be one the listing cannot honour.
+//!
+//! A second RULE is pinned at the end: an `AppInstanceArn` this service resolves to no
+//! live instance earns one of TWO refusals — the permanent one for an instance that has
+//! been DELETED, the unknown-ARN one for an ARN that never named an instance — the same
+//! pair every sibling operation scoped by that ARN answers.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -21,6 +26,7 @@ use serde_json::{json, Value};
 
 use crate::app_instance_bots::bot;
 use crate::app_instance_lifecycle::{uri_encode, Emulator};
+use crate::token_reuse_and_deleted_refusals::FORBIDDEN_MESSAGE;
 
 /// `POST /app-instances/{AppInstanceArn}/admins`.
 async fn promote(emulator: &Emulator, app_instance_arn: &str, admin_arn: &str) -> (u16, Value) {
@@ -448,4 +454,152 @@ async fn an_admin_listing_refuses_what_it_cannot_honour() {
         Some("NotFound"),
         "expected the absent-AppInstance refusal to carry the NotFound code, got {body:?}"
     );
+}
+
+/// RULE: an `AppInstanceArn` this service resolves to no live instance earns one of TWO
+/// refusals, whichever operation it was addressed to: an instance that has been DELETED
+/// can no longer serve a request scoped by it, so the answer is the modelled
+/// `ForbiddenException` (403) carrying AWS's fixed forbidden sentence, while an ARN that
+/// never named an instance is absent (400 `NotFound`).
+///
+/// The rows span what the rule generalises over: how many promotions the instance held
+/// when it was deleted, and which page request the listing carries — including a
+/// `NextToken` the very same listing issued while the instance was alive, so the
+/// instance's absence is decided before the page is.
+#[tokio::test]
+async fn listing_the_admins_of_a_deleted_app_instance_is_forbidden() {
+    let emulator = Emulator::new();
+
+    // Rows: the number of administrators recorded before the delete. Zero is included so
+    // the refusal cannot be a side effect of the directory holding records, and more than
+    // one page's worth so it cannot be a side effect of there being a single page.
+    for admins in [0_usize, 1, 3] {
+        let instance = emulator
+            .app_instance(
+                &format!("admins-doomed-{admins}"),
+                &format!("tok-ad-{admins}"),
+            )
+            .await;
+        for n in 0..admins {
+            let user = emulator
+                .user(&instance, &format!("a{n}"), &format!("tok-ad-{admins}-{n}"))
+                .await;
+            let (status, body) = promote(&emulator, &instance, &user).await;
+            assert_eq!(
+                status, 201,
+                "case \"{admins} administrators\": expected the promotion of {user} to \
+                 answer 201, got {status} {body:?}"
+            );
+        }
+
+        // A token THIS listing issued while the instance was alive, so the deleted case
+        // is asked with a page request the listing itself would otherwise honour.
+        let live_token = if admins > 1 {
+            let (_items, token) = page(&emulator, &instance, 1, None).await;
+            token
+        } else {
+            None
+        };
+
+        // Served while the instance is alive, so what follows tests the DELETE and not a
+        // request this listing never answered.
+        let listed = list_admins(&emulator, &instance).await;
+        assert_eq!(
+            listed.len(),
+            admins,
+            "case \"{admins} administrators\": expected the live listing to report \
+             {admins} of them, got {listed:?}"
+        );
+
+        let (status, body) = emulator
+            .call(
+                "DELETE",
+                &format!("/app-instances/{}", uri_encode(&instance)),
+                None,
+            )
+            .await;
+        assert_eq!(
+            status, 204,
+            "case \"{admins} administrators\": expected DeleteAppInstance to answer 204, \
+             got {status} {body:?}"
+        );
+
+        // Rows: each page request the listing takes — none at all, both published bounds
+        // of `MaxResults` (`smithy_query(query="operation",
+        // operation="ListAppInstanceAdmins")`: range 1..50), and a token this listing
+        // issued itself.
+        let mut queries: Vec<(String, String)> = vec![
+            ("no page request".to_string(), String::new()),
+            (
+                "MaxResults at the lower bound".to_string(),
+                "?max-results=1".to_string(),
+            ),
+            (
+                "MaxResults at the upper bound".to_string(),
+                "?max-results=50".to_string(),
+            ),
+        ];
+        if let Some(token) = live_token {
+            queries.push((
+                "a NextToken this listing issued before the delete".to_string(),
+                format!("?next-token={}", uri_encode(&token)),
+            ));
+        }
+
+        for (query_label, query) in &queries {
+            let (status, body) = list_admins_raw(&emulator, &instance, query).await;
+            assert_eq!(
+                (status, body["Code"].as_str(), body["Message"].as_str()),
+                (403, Some("Forbidden"), Some(FORBIDDEN_MESSAGE)),
+                "case \"{admins} administrators / {query_label}\": expected the modelled \
+                 forbidden refusal for a deleted AppInstance, got {status} {body:?}"
+            );
+
+            // The control: an ARN of the same shape that never named an instance keeps
+            // the unknown-ARN refusal, so the deleted case is a class of its own.
+            let never = format!("{instance}x");
+            let (status, body) = list_admins_raw(&emulator, &never, query).await;
+            assert_eq!(
+                (status, body["Code"].as_str()),
+                (400, Some("NotFound")),
+                "case \"{admins} administrators / {query_label}\": expected the \
+                 unknown-ARN refusal for an ARN that never named an instance, got \
+                 {status} {body:?}"
+            );
+        }
+
+        // And the two answers agree with the sibling operations scoped by the SAME ARN:
+        // one deleted instance, one refusal across the service.
+        for (sibling_label, path) in [
+            (
+                "ListAppInstanceBots",
+                format!(
+                    "/app-instance-bots?app-instance-arn={}",
+                    uri_encode(&instance)
+                ),
+            ),
+            (
+                "ListAppInstanceUsers",
+                format!(
+                    "/app-instance-users?app-instance-arn={}",
+                    uri_encode(&instance)
+                ),
+            ),
+            (
+                "GetAppInstanceRetentionSettings",
+                format!(
+                    "/app-instances/{}/retention-settings",
+                    uri_encode(&instance)
+                ),
+            ),
+        ] {
+            let (status, body) = emulator.call("GET", &path, None).await;
+            assert_eq!(
+                (status, body["Code"].as_str(), body["Message"].as_str()),
+                (403, Some("Forbidden"), Some(FORBIDDEN_MESSAGE)),
+                "case \"{admins} administrators / {sibling_label}\": expected the same \
+                 forbidden refusal the listing gives, got {status} {body:?}"
+            );
+        }
+    }
 }
