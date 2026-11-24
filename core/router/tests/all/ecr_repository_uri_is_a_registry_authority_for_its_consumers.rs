@@ -271,8 +271,8 @@ impl Derived {
 /// template declares, and the authority the published address must therefore carry.
 struct Row {
     case: &'static str,
-    /// The address this emulator is SERVED at for this row, which is the zone and the port
-    /// every address these services announce is anchored on.
+    /// The address this emulator is SERVED at for this row, which is the address every
+    /// address these services announce carries.
     served_base: &'static str,
     region: &'static str,
     stack: &'static str,
@@ -285,9 +285,13 @@ struct Row {
 }
 
 /// The authority a row's served address carries, host and port: what a caller reaches this
-/// process at, and therefore the zone and the port the registry authority Amazon ECR publishes
-/// a repository of this deployment at is anchored on. Read off the row's own served address
-/// rather than imported, so a published authority built on anything else fails these rows.
+/// process at, and therefore the address Amazon ECR publishes a repository of this deployment
+/// at — a call made to one of AWS's own endpoint hosts is answered the address this process is
+/// served at. What a client dials therefore leads back to this process, and no label is
+/// composed on top of it: a name in the zone AWS serves its own registries in resolves at
+/// genuine AWS infrastructure, and one this emulator invents in a zone of its own resolves only
+/// where a resolver implements that zone. Read off the row's own served address rather than
+/// imported, so a published authority built on anything else fails these rows.
 fn served_authority(served_base: &str) -> &str {
     served_base
         .split_once("://")
@@ -425,9 +429,9 @@ fn assert_registry_uri(case: &str, row: &Row, uri: &str, repository: &str) {
 }
 
 /// Every address a client picks the repository up at — the stack's published attribute, the
-/// registry's own read, and the image of the revision the stack registered — is the registry
-/// authority of the registry that holds it, anchored on the address this emulator is served
-/// at, and that same registry is reported beside the address.
+/// registry's own read, and the image of the revision the stack registered — is the address
+/// this emulator answers registry requests at, and the registry that HOLDS the repository is
+/// reported beside the address.
 #[tokio::test]
 async fn a_published_repository_uri_names_the_registry_that_holds_it() {
     // The registry id reported beside the address is an account id: "the 12-digit ID of the

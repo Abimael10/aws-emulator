@@ -111,8 +111,16 @@ fn assert_published_address(case: &str, uri: &str, region: &str, name: &str) {
     assert_eq!(
         authority,
         published_registry_authority(),
-        "case {case:?}: expected the host of {uri:?} to be the registry authority this \
-         emulator publishes to this caller, got {authority:?}"
+        "case {case:?}: expected the host of {uri:?} to be the address this emulator answers \
+         the caller's registry requests at, got {authority:?}"
+    );
+    // What a client does with the authority: it DIALS it, so it carries no registry name
+    // layout of its own — the account and the Region are what the response reports beside the
+    // URI.
+    assert!(
+        !authority.to_ascii_lowercase().contains(REGISTRY_LABEL_RUN),
+        "case {case:?}: expected an address this emulator answers on, got the registry name \
+         layout AWS publishes in {uri:?}"
     );
     assert_eq!(
         path, name,
@@ -296,9 +304,9 @@ async fn a_client_recovers_the_registry_the_account_and_the_region_beside_the_re
 
 #[tokio::test]
 async fn one_name_in_two_registries_is_told_apart_by_the_members_that_carry_that_identity() {
-    // One name in several Regions is several repositories, and what tells them apart is both
-    // the identity each reports — its own Region's ARN — and the authority each is published
-    // at, which names that Region's registry.
+    // One name in several Regions is several repositories, and what tells them apart is the
+    // identity each reports — its own Region's ARN — because the address each is published at
+    // is the one this emulator answers every registry's requests at.
     let router = emulator();
     let name = "shared-name";
     let mut arns: Vec<String> = Vec::new();
@@ -409,8 +417,8 @@ async fn a_pull_at_the_reported_uri_reaches_the_repository_it_names() {
             .unwrap_or_else(|| panic!("case {case:?}: expected an authorizationToken, got {issued}"))
             .to_string();
         // The login URL is the endpoint this caller reached, behind a scheme; the
-        // repository's own URI names this registry over a zone this emulator answers in. The
-        // two lead to the same listener, which is what the shared port says.
+        // repository's own URI is that same address with the repository as its path, which is
+        // what the shared port says.
         let proxy_endpoint = at(&issued, "/authorizationData/0/proxyEndpoint")
             .as_str()
             .unwrap_or_default()
@@ -587,7 +595,8 @@ async fn a_name_one_registry_holds_is_free_in_another_and_both_stay_readable() {
         );
 
         // The second Region's registry does not hold the name, so the same create succeeds
-        // there, reporting its own registry's ARN at its own registry's published authority.
+        // there, reporting its own registry's ARN at the one address this emulator answers
+        // every registry's requests at.
         let elsewhere = ok_in_region(
             &router,
             &case,
@@ -611,14 +620,8 @@ async fn a_name_one_registry_holds_is_free_in_another_and_both_stay_readable() {
             "case {case:?}: expected one name in two registries to be published at the one \
              address this emulator answers this caller at, got {other_uri:?} and {home_uri:?}"
         );
-        // What tells the two apart is the identity each reports, not the address: the ARN
-        // names the Region of the registry holding it.
-        for (region, arn) in [(pair.home, &home_arn), (pair.other, &other_arn)] {
-            assert!(
-                arn.contains(&format!(":{region}:")),
-                "case {case:?}: expected the ARN {arn:?} to name the Region of the registry \
-                 holding it, {region:?}"
-            );
+        for (region, uri) in [(pair.home, &home_uri), (pair.other, &other_uri)] {
+            assert_published_address(&case, uri, region, pair.name);
         }
         assert_ne!(
             other_arn, home_arn,
@@ -643,8 +646,8 @@ async fn a_pull_with_each_regions_credential_reaches_that_regions_own_image() {
     // What telling the two apart is FOR: with one name in two registries, the reported URI
     // is followed the way a container client follows it — split at the first '/', dialled,
     // and pulled from with the credential that Region's `docker login` token carries — and
-    // answers the manifest THAT Region's repository holds. The authority names the Region's
-    // registry and the credential was issued for it, so both say which registry the pull
+    // answers the manifest THAT Region's repository holds. The address answers for every
+    // registry this emulator serves, so the credential is what says which registry the pull
     // addresses; the two manifests differ, so a pull that reached the other registry answers
     // the wrong document rather than nothing.
     for pair in REGION_PAIRS {
@@ -707,8 +710,8 @@ async fn a_pull_with_each_regions_credential_reaches_that_regions_own_image() {
             let (authority, path) = uri
                 .split_once('/')
                 .unwrap_or_else(|| panic!("case {case:?}: {uri:?} names no repository path"));
-            // Each Region's repository is published at the authority that names that
-            // Region's registry, with the repository as the path.
+            // Each Region's repository is published at the one address this emulator answers
+            // on, with the repository as the path.
             assert_published_address(&case, uri, region, pair.name);
             // The token's own registry URL is the endpoint this caller reached, behind a
             // scheme: it is DIALLED as it is handed over, and the credential it carries is
@@ -900,9 +903,9 @@ async fn a_cached_repository_is_reported_at_the_address_it_is_published_at() {
 #[tokio::test]
 async fn one_cached_path_in_two_regions_is_told_apart_by_its_registrys_identity() {
     // What the URI is FOR: a client stores the reported value as an image reference it
-    // dials, so each Region's mirror of one cached path is published at the authority that
-    // names that Region's registry — which, with the ARN each carries, is what tells the two
-    // apart. The same rule and the same covered path are imported in each Region of a pair.
+    // dials, so each Region's mirror of one cached path is published at the one address this
+    // emulator answers on — and what tells the two apart is the ARN each carries. The same
+    // rule and the same covered path are imported in each Region of a pair.
     const PAIRS: &[(&str, &str, &str)] = &[
         ("two commercial Regions", "us-east-1", "eu-west-1"),
         ("two partitions", "us-west-2", "cn-north-1"),

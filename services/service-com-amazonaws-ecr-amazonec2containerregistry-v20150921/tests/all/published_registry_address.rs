@@ -42,7 +42,9 @@
 //! `GetAuthorizationToken` issued, so the URI is proved to address the repository in this
 //! registry rather than merely to carry the right shape, and they require the URL a
 //! `docker login` is pointed at to be dialable — and never a name in a zone AWS publishes
-//! its own endpoints in — whatever zone the call arrived from.
+//! its own endpoints in — whatever zone the call arrived from. The last one pins the two
+//! published values to ONE address and reads what carrying no Region means: the credential a
+//! pull presents is what says which registry it addresses.
 
 use std::sync::Arc;
 
@@ -52,7 +54,8 @@ use service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::EmulatedServ
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::wire::{
-    at, endpoint_host, given_layer, ok, registry_get, registry_host_in,
+    at, endpoint_host, given_layer, given_layer_in_region, ok, ok_in_region, registry_get,
+    registry_host_in,
     ANNOUNCED_REGISTRY_ENDPOINT, REGION, REGISTRY_ID,
 };
 
@@ -330,17 +333,16 @@ async fn every_reported_repository_uri_names_an_endpoint_this_emulator_answers_o
                  {created_uri:?}"
             );
 
-            // The two parts a reader splits the value into: the authority it dials and
-            // parses, and the repository path it composes a tag, a digest or a registry v2
-            // path on.
+            // The two parts a reader splits the value into: the address it dials, and the
+            // repository path it composes a tag, a digest or a registry v2 path on.
             let (authority, path) = created_uri
                 .split_once('/')
                 .unwrap_or_else(|| panic!("case {case:?}: {created_uri:?} names no path"));
             assert_eq!(
                 authority,
                 endpoint.published_authority(),
-                "case {case:?}: expected the host of {created_uri:?} to be the registry \
-                 authority this emulator publishes to this caller, got {authority:?}"
+                "case {case:?}: expected the host of {created_uri:?} to be the address this \
+                 emulator answers this caller's registry requests at, got {authority:?}"
             );
             assert_ne!(
                 authority,
@@ -431,11 +433,10 @@ async fn every_reported_repository_uri_names_an_endpoint_this_emulator_answers_o
 
 #[tokio::test]
 async fn a_repository_uri_names_the_endpoint_the_read_itself_arrived_on() {
-    // The URI is an ADDRESS a reader also parses, so every reader is handed this registry's
-    // own labels in the zone and on the port this emulator answers THAT reader at, with the
-    // repository as the path — anchored on the same endpoint the URL its own `docker login`
-    // is pointed at is. What no reader's endpoint moves is the stored
-    // record's identity: the owning account and the ARN.
+    // The URI is an ADDRESS, so every reader is handed the address this emulator answers
+    // THAT reader's registry requests at, with the repository as the path — the same
+    // endpoint the URL its own `docker login` is pointed at carries. What no reader's
+    // endpoint moves is the stored record's identity: the owning account and the ARN.
     let router = emulator();
     let endpoints = endpoints();
     let creating = &endpoints[0];
@@ -704,6 +705,12 @@ async fn the_published_address_is_the_callers_endpoint_whichever_registry_holds_
                     "case {case:?}: expected the published address {created_uri:?} to carry \
                      no registry host of its own, got {authority:?}"
                 );
+                assert_eq!(
+                    authority,
+                    endpoint.published_authority(),
+                    "case {case:?}: expected the address this emulator answers this caller's \
+                     registry requests at, got {authority:?}"
+                );
                 for suffix in AWS_ENDPOINT_DNS_SUFFIXES {
                     assert!(
                         !authority.to_ascii_lowercase().contains(suffix),
@@ -713,9 +720,9 @@ async fn the_published_address_is_the_callers_endpoint_whichever_registry_holds_
                     );
                 }
 
-                // The registry that HOLDS the repository is reported beside the address as
-                // well, off the stored record, so the two readings of the one identity
-                // agree.
+                // The registry that HOLDS the repository is what the response reports BESIDE
+                // the address, off the stored record: that is where a reader recovers the
+                // account and the Region the address carries none of.
                 let registry_id = text(&case, &created, "/repository/registryId");
                 let arn = text(&case, &created, "/repository/repositoryArn");
                 assert_eq!(
@@ -765,6 +772,130 @@ async fn the_published_address_is_the_callers_endpoint_whichever_registry_holds_
                      {authority:?}, got HTTP {status} with {answered:?}"
                 );
             }
+        }
+    }
+}
+
+/// The host half of an authority, with an IPv6 literal left as it was written: the text ahead
+/// of the LAST `:`, which is where a `host:port` carries its port.
+fn host_of(authority: &str) -> &str {
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !port.contains(']') => host,
+        _ => authority,
+    }
+}
+
+#[tokio::test]
+async fn one_published_address_is_dialled_for_every_registry_the_credential_names() {
+    // The rule the chain from a create to a push depends on: a repository is published at the
+    // very address the URL a `docker login` of that caller is pointed at carries — one
+    // `host[:port]` this emulator answers on, with no label composed on top of it — so a
+    // client that logs in where the token says and pushes where the repository URI says is
+    // talking to the one registry endpoint. Carrying no Region of its own is what makes the
+    // CREDENTIAL the thing that says which registry a request addresses: one repository name,
+    // taken in several Regions, is published at that one address, and a pull there with each
+    // Region's token answers the image THAT Region's registry holds.
+    let name = "shared/by-every-registry";
+    for endpoint in endpoints() {
+        let router = emulator();
+        let mut pushed: Vec<(&str, String, String)> = Vec::new();
+        for region in HOLDING_REGIONS {
+            let case = format!("{}, {region}", endpoint.case);
+            let created = call_at_in_region(
+                &router,
+                &endpoint,
+                region,
+                "CreateRepository",
+                &json!({"repositoryName": name}),
+            )
+            .await;
+            let created_uri = text(&case, &created, "/repository/repositoryUri");
+
+            // One image per Region, so a pull that reached another registry answers the
+            // wrong document rather than nothing.
+            let config_bytes = format!("config of {region}").into_bytes();
+            let config =
+                given_layer_in_region(&router, &case, region, name, &config_bytes).await;
+            let manifest = json!({
+                "schemaVersion": 2,
+                "mediaType": DOCKER_V2_MANIFEST,
+                "config": {
+                    "mediaType": DOCKER_CONFIG_MEDIA_TYPE,
+                    "digest": config,
+                    "size": config_bytes.len(),
+                },
+                "layers": [],
+            })
+            .to_string();
+            ok_in_region(
+                &router,
+                &case,
+                region,
+                "PutImage",
+                &json!({
+                    "repositoryName": name,
+                    "imageManifest": manifest,
+                    "imageTag": "v1",
+                }),
+            )
+            .await;
+            pushed.push((region, created_uri, manifest));
+        }
+
+        for (region, created_uri, manifest) in &pushed {
+            let case = format!("{}, {region}", endpoint.case);
+            let (authority, path) = created_uri
+                .split_once('/')
+                .unwrap_or_else(|| panic!("case {case:?}: {created_uri:?} names no path"));
+            let issued = call_at_in_region(
+                &router,
+                &endpoint,
+                region,
+                "GetAuthorizationToken",
+                &json!({}),
+            )
+            .await;
+            let proxy_endpoint = text(&case, &issued, "/authorizationData/0/proxyEndpoint");
+            let dialled = proxy_endpoint
+                .strip_prefix("https://")
+                .unwrap_or_else(|| panic!("case {case:?}: {proxy_endpoint:?} is no https URL"));
+            assert_eq!(
+                authority, dialled,
+                "case {case:?}: expected the repository to be published at the address a \
+                 `docker login` is pointed at ({dialled:?}), got {authority:?}"
+            );
+            // And that address is the endpoint itself: no label was composed in front of its
+            // host, which would make a name a resolver has to map to this process.
+            assert_eq!(
+                host_of(authority),
+                host_of(&endpoint.announced_endpoint),
+                "case {case:?}: expected the host this emulator answers this caller at, got \
+                 {authority:?}"
+            );
+            assert_eq!(
+                path, name,
+                "case {case:?}: expected the repository name as the path of {created_uri:?}, \
+                 got {path:?}"
+            );
+
+            let token = text(&case, &issued, "/authorizationData/0/authorizationToken");
+            let (status, answered) = registry_get(
+                &router,
+                authority,
+                &format!("/v2/{path}/manifests/v1"),
+                &token,
+                Some(DOCKER_V2_MANIFEST),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: a pull at {created_uri:?} with the {region:?} credential must \
+                 reach that registry, got HTTP {status} with {answered:?}"
+            );
+            assert_eq!(
+                answered, *manifest,
+                "case {case:?}: expected the manifest pushed in {region:?}, got {answered:?}"
+            );
         }
     }
 }
