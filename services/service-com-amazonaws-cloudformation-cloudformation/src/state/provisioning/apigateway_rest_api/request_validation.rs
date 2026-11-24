@@ -212,7 +212,10 @@ const MODEL_REQUIRED: &[(&str, &str)] = &[(MODEL_CONTENT_TYPE, "contentType")];
 /// that holds no model at all.
 ///
 /// "Ref returns the model name": API Gateway keys a model by its name under the api that holds
-/// it, so the name the create was made under is this resource's physical id.
+/// it, so the name the create was made under is this resource's physical id. A model the api
+/// ALREADY holds under that name is refused by the handler itself
+/// ([`super::refuse_if_already_held`]) rather than by the owning service's conflict: the name is
+/// the identity, so it is not this stack's to take over.
 async fn create_model(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -220,6 +223,15 @@ async fn create_model(
 ) -> Result<Created, Refusal> {
     refuse_unpublished(resource, MODEL_PROPERTIES)?;
     let name = model_name(resource)?;
+    let api_id = required(resource, REST_API_ID)?;
+    refuse_if_already_held(
+        ctx,
+        region,
+        APIGATEWAY_MODEL,
+        &model_uri(&api_id, &name),
+        &[(REST_API_ID, &api_id), (NAME, &name)],
+    )
+    .await?;
     let mut request = Map::new();
     for (property, member) in MODEL_MEMBERS {
         if let Some(value) = stated(resource, property) {
@@ -236,7 +248,7 @@ async fn create_model(
         API_GATEWAY_SIGNING_NAME,
         region,
         "POST",
-        &models_uri(&required(resource, REST_API_ID)?),
+        &models_uri(&api_id),
         Some(&Value::Object(request)),
     )
     .await?;

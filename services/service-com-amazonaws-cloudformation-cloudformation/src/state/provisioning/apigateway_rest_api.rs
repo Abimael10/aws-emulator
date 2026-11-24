@@ -1093,6 +1093,10 @@ const STATUS_CODE: &str = "StatusCode";
 /// How many calls that is, is bounded by the DECLARATION — one per declared response — which
 /// the template reader has already bounded ([`crate::state::template::MAX_TEMPLATE_NODES`]),
 /// so no request can make this walk run longer than the template it came in.
+///
+/// A method the resource ALREADY answers that verb with is refused by the handler itself
+/// ([`refuse_if_already_held`]), before the first put: `PutMethod` would otherwise be a method
+/// this stack took over rather than one it created.
 async fn put_method(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -1130,7 +1134,22 @@ async fn put_method(
             &[STATUS_CODE],
         )?;
     }
+    let api_id = required(resource, REST_API_ID)?;
+    let resource_id = required(resource, METHOD_RESOURCE_ID)?;
+    let http_method = required(resource, METHOD_HTTP_METHOD)?;
     let uri = method_uri(resource)?;
+    refuse_if_already_held(
+        ctx,
+        region,
+        APIGATEWAY_METHOD,
+        &uri,
+        &[
+            (REST_API_ID, &api_id),
+            (METHOD_RESOURCE_ID, &resource_id),
+            (METHOD_HTTP_METHOD, &http_method),
+        ],
+    )
+    .await?;
     let mut request = Map::new();
     for (property, member) in METHOD_MEMBERS {
         if let Some(value) = stated(resource, property) {
@@ -1384,6 +1403,11 @@ const STAGE_MEMBERS: &[(&str, &str)] = &[
 /// no member for are applied with `UpdateStage` ([`stage_patches`]), which is built BEFORE the
 /// create: a declaration carrying a setting this module cannot apply is then refused with no
 /// stage left behind.
+///
+/// A stage the api ALREADY holds under this name — one a sibling deployment's own `StageName`
+/// minted, one left behind by an earlier replacement, one a client created outside the stack —
+/// is refused by the handler itself ([`refuse_if_already_held`]): it is not this stack's to
+/// take over.
 async fn create_stage(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -1393,6 +1417,14 @@ async fn create_stage(
     refuse_unpublished(resource, STAGE_PROPERTIES)?;
     let api_id = required(resource, REST_API_ID)?;
     let stage_name = required(resource, STAGE_NAME)?;
+    refuse_if_already_held(
+        ctx,
+        region,
+        APIGATEWAY_STAGE,
+        &stage_uri(&api_id, &stage_name),
+        &[(REST_API_ID, &api_id), (STAGE_NAME, &stage_name)],
+    )
+    .await?;
     // `CreateStage` takes the declaration's tags as its own tag map ([`gateway_tags`]).
     let patches = stage_patches(&resource.properties, STAGE_MEMBERS, true)?;
     let mut request = Map::new();
@@ -1651,6 +1683,67 @@ fn stage_uri(api_id: &str, stage_name: &str) -> String {
         rest_api_uri(api_id),
         percent_encoded(stage_name)
     )
+}
+
+/// Refuse the create of a resource API Gateway ALREADY holds, before anything is asked of that
+/// service: the already-exists precondition a resource handler checks ITSELF.
+///
+/// A create whose identifier is already taken is reported by CloudFormation's resource provider
+/// as its OWN already-exists failure — the uniform sentence naming the type and the identifier
+/// the handler checked ([`crate::state::early_validation::already_exists`], the one wording of
+/// that sentence this crate has, under the plugin's `AlreadyExists` class) — and not as the
+/// owning service's conflict exception, which names neither the type nor the identifier and puts
+/// the failure in the class for a conflict a retry of the same request might clear. Which of the
+/// two a client reads decides whether it retries the template or renames the resource, so it is
+/// the handler's report that is owed.
+///
+/// The refusal's own code is that class, because nothing was CALLED to answer it: there is no
+/// error code of the owning service to classify ([`handler_error_class`] leaves the class the
+/// code falls in alone). It is the same report `super::super::provisioner`'s own
+/// `already_in_use` makes for a type whose identity is a single value; what differs is only the
+/// identifier, which here is built out of the parts the handler checked
+/// ([`reported_identifier`]).
+///
+/// `identity` is the parts of this type's primary identifier — the properties a client names one
+/// resource of it by — so the report says exactly WHICH resource was already there, and `uri` is
+/// that resource's own read. An answer of `NotFoundException` is the resource not being there; so
+/// is an api that service does not hold, whose absence the create itself then reports as the
+/// not-found it is.
+async fn refuse_if_already_held(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource_type: &str,
+    uri: &str,
+    identity: &[(&str, &str)],
+) -> Result<(), Refusal> {
+    match call_rest_json(ctx, API_GATEWAY_SIGNING_NAME, region, "GET", uri, None).await {
+        Ok(_) => Err(Refusal {
+            code: crate::state::provisioning::HANDLER_ERROR_ALREADY_EXISTS.to_string(),
+            message: crate::state::early_validation::already_exists(
+                resource_type,
+                &reported_identifier(identity),
+            ),
+        }),
+        Err(refusal) if refusal.code == API_GATEWAY_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The identifier such a report names: every part of the type's primary identifier, labelled
+/// with the property the declaration states it under and joined by a single space.
+///
+/// A type identified by MORE THAN ONE property has no single value to name, so its handler words
+/// the identifier out of the parts it checked — as the recorded `ResourceStatusReason` of an
+/// `AWS::ApiGateway::Stage` whose `StageName` a sibling deployment had already minted carries
+/// (in the behavioral corpus `simparity-behavioral-aws-v1`, check `apigateway__cloudformation.\
+/// deploy-apigateway-stage-name-collides-with-deployment-stage-rejected`, whose reason reads
+/// `… with identifier 'RestApiId: <the api> StageName: <the stage>' already exists.`).
+fn reported_identifier(identity: &[(&str, &str)]) -> String {
+    identity
+        .iter()
+        .map(|(label, value)| format!("{label}: {value}"))
+        .collect::<Vec<String>>()
+        .join(" ")
 }
 
 /// One patch operation as `PatchOperation` spells it: the op, the JSON Pointer it writes and

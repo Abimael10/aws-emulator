@@ -101,7 +101,9 @@ const RESOURCES_SECTION: &str = "Resources";
 ///
 /// The ONE wording of that sentence this crate has: the same sentence is what a resource
 /// HANDLER answers at EXECUTION time for the same collision, which the providers report it
-/// with through `super::provisioner`'s own `already_in_use`.
+/// with through `super::provisioner`'s own `already_in_use` — and, for a type identified by
+/// more than one property, through the labelled identifier
+/// [`super::provisioning::apigateway_rest_api`] builds out of the parts its handler checked.
 pub fn already_exists(resource_type: &str, identifier: &str) -> String {
     format!("Resource of type '{resource_type}' with identifier '{identifier}' already exists.")
 }
