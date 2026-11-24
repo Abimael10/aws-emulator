@@ -267,13 +267,18 @@ struct Prepared {
     /// call resolves and run against the candidate configuration before any record is
     /// written.
     validators: Vec<Validator>,
-    /// The bytes the candidate configuration version holds, as a consumer of this profile
-    /// would be served them; `None` for a profile whose configuration lives in a store
-    /// this service does not hold.
-    candidate_content: Option<Vec<u8>>,
+    /// The bytes the candidate configuration version holds in AppConfig's OWN hosted
+    /// configuration store, with the media type that version declares; `None` for a profile
+    /// whose `LocationUri` points at another store, whose content is read through
+    /// [`Prepared::external_location`] once this service's guard is released.
+    hosted_candidate: Option<(String, Vec<u8>)>,
+    /// The `LocationUri` of a profile whose configuration lives OUTSIDE the hosted store,
+    /// and `None` for one that uses it: the candidate configuration of such a profile is the
+    /// content that store holds for the version being deployed, read with no guard of this
+    /// service's store held ([`crate::state::configuration_sources`]).
+    external_location: Option<String>,
     applied_extensions: Vec<AppliedExtension>,
     targets: Vec<crate::state::extension_actions::ActionTarget>,
-    event: crate::state::extension_actions::ActionEvent,
 }
 
 /// The `StartDeployment` operation.
@@ -353,7 +358,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `PRE_START_DEPLOYMENT` invocations below cannot be made while it is held, so
         // the guard is confined to this block and the record is written from a second
         // look at the store afterwards.
-        let prepared = {
+        let (prepared, event) = {
         let mut store = state.lock();
 
         // Resolve every resource the deployment names before anything is written. Each of
@@ -456,13 +461,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The candidate configuration an extension action is handed, and the document a
         // validator of this profile checks: the bytes a consumer of this profile would be
         // served for the version being deployed, read through the same projection the data
-        // plane serves.
-        let candidate_content = hosted_version.map(|version| {
+        // plane serves. This is AppConfig's own hosted store; a profile pointing elsewhere
+        // has that version's content at the SOURCE, read below.
+        let hosted_candidate = hosted_version.map(|version| {
             (
                 version.content_type.clone(),
                 profile.served_content(&version.content),
             )
         });
+        // WHICH STORE the version being deployed lives in is the profile's own `LocationUri`
+        // (`crate::state::configuration_sources`): a profile pointing at another store — a
+        // Parameter Store parameter, say — has that version's content THERE, and it is read
+        // once this store's guard is released, so the gate below judges the bytes the
+        // deployment would actually put in service whichever store they come from.
+        let external_location =
+            match crate::state::configuration_sources::source_of(&configuration_location_uri) {
+                crate::state::configuration_sources::ConfigurationSource::Hosted => None,
+                _ => Some(configuration_location_uri.clone()),
+            };
         // "A validator provides a syntactic or semantic check to ensure the configuration
         // that you want to deploy functions as intended": the gate the profile carries at
         // the instant the deployment was asked for, so a validator added later does not
@@ -555,7 +571,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             &dynamic_parameters,
         );
-        let mut event = crate::state::extension_actions::ActionEvent::new()
+        let event = crate::state::extension_actions::ActionEvent::new()
             .resource("Application", &application_id, &application_name)
             .resource("Environment", &environment_id, &environment_name)
             .resource(
@@ -575,35 +591,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // triggered it is the caller — the same attribution the `DEPLOYMENT_STARTED`
             // event this call is about to record carries.
             .triggered_by(crate::state::TRIGGERED_BY_USER);
-        event = match &candidate_content {
-            Some((content_type, content)) => event.content(
-                content_type,
+
+        (
+            Prepared {
+                application_id,
+                environment_id,
+                configuration_profile_id,
+                configuration_name,
+                configuration_location_uri,
+                version_label,
+                strategy,
+                validators,
+                hosted_candidate,
+                external_location,
+                applied_extensions,
+                targets,
+            },
+            event,
+        )
+        };
+
+        // The candidate configuration is the content of the version being deployed as held
+        // by the store the configuration profile's `LocationUri` names: the hosted version
+        // resolved above for a profile on AppConfig's own store, and the SOURCE version's
+        // content for a profile pointing at another one — read here, with no guard of this
+        // service's store held, so the two stores are taken one at a time and never nested.
+        //
+        // A source that holds no such version yields nothing to judge: the version a
+        // deployment names is resolved at the source per READ, so what such a deployment puts
+        // in service is reported by the reader of the configuration rather than by a verdict
+        // invented here.
+        let candidate_content = match &prepared.external_location {
+            None => prepared.hosted_candidate.clone(),
+            Some(location_uri) => crate::state::configuration_sources::source_configuration(
+                &*self.engine,
+                &region,
+                location_uri,
                 &input.configuration_version,
-                content,
-            ),
-            // A configuration whose bytes this service does not hold — one stored in S3,
-            // Parameter Store or Secrets Manager — has a version but no content here,
+            )
+            .ok()
+            .map(|source| (source.content_type, source.content)),
+        };
+
+        // The candidate configuration the `PRE_START_DEPLOYMENT` action point is handed is
+        // the one resolved above, whichever store it came out of.
+        let event = match &candidate_content {
+            Some((content_type, content)) => {
+                event.content(content_type, &input.configuration_version, content)
+            }
+            // A version no store reachable here holds content for has a version but no bytes,
             // and content invented for it would be content no caller wrote.
             None => event.member(
                 "ContentVersion",
                 ::serde_json::Value::from(input.configuration_version.as_str()),
             ),
-        };
-
-        Prepared {
-            application_id,
-            environment_id,
-            configuration_profile_id,
-            configuration_name,
-            configuration_location_uri,
-            version_label,
-            strategy,
-            validators,
-            candidate_content: candidate_content.map(|(_, content)| content),
-            applied_extensions,
-            targets,
-            event,
-        }
         };
 
         // A configuration profile's validators are the deployment-time gate: "the
@@ -613,10 +654,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this call with no deployment record to roll back, and with the environment's
         // deployment number untouched.
         //
-        // A profile whose configuration lives in S3, Parameter Store or Secrets Manager
-        // has a version here but no bytes, so there is no document to check and a refusal
-        // reported for it would be a verdict no validator gave.
-        if let Some(content) = &prepared.candidate_content {
+        // A version no store reachable here holds content for has no document to check, and
+        // a refusal reported for it would be a verdict no validator gave.
+        if let Some((_, content)) = &candidate_content {
             let candidate = crate::state::validators::Candidate {
                 application_id: &prepared.application_id,
                 configuration_profile_id: &prepared.configuration_profile_id,
@@ -644,7 +684,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             match crate::state::extension_actions::invoke(
                 ctx.callback(),
                 target,
-                &prepared.event.document(target),
+                &event.document(target),
                 &region,
             )
             .await
