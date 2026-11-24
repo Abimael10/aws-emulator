@@ -907,34 +907,68 @@ async fn analyze_document_block_set_follows_the_requested_feature_types() {
     }
 }
 
-/// A line can be far wider than the page it is read off, in every feature set: the
-/// layout must saturate rather than panic, and the geometry must stay on the page.
+/// Character columns the block layout's own page grid addresses: that layout sets one
+/// character per cell of a grid whose cell is [`state::CHAR_WIDTH`] of the page's width,
+/// inside a [`state::PAGE_MARGIN`] margin, so a line longer than this many characters
+/// runs off the right edge of the page its blocks are laid out on and every box computed
+/// for what stands there has to saturate at that edge.
+///
+/// Derived from the layout's own constants rather than restated, so a change to either of
+/// them resizes the page this case draws instead of leaving it drawing a line the grid can
+/// still address. The lines below run JUST past it: one column past the page's edge is as
+/// far outside the page as a thousand are — the layout has to saturate either way — while
+/// every character drawn is a mark the recogniser has to name, so a line drawn far past
+/// the edge buys no coverage and costs recognition for every character of it.
+fn columns_per_page() -> usize {
+    ((1.0 - state::PAGE_MARGIN) / state::CHAR_WIDTH) as usize
+}
+
+/// A line can be wider than the page it is laid out on, in every feature set: the layout
+/// must saturate rather than panic, and the geometry must stay on the page.
+///
+/// Both lines of the page run past the page's last column, and between them they carry
+/// every structure the four feature sets derive a block from — a label and the value it
+/// labels, and a row of tab-separated columns — so the `KEY_VALUE_SET`, `TABLE` and `CELL`
+/// blocks are laid out from a line the grid cannot address, and so is a word that starts
+/// past the page's right edge and is longer than what is left of the page.
 #[tokio::test]
 async fn a_document_wider_than_the_page_grid_still_lays_out() {
     let router = harness();
-    let long_word = "L".repeat(300);
-    let many_words: String = (0..200)
-        .map(|i| format!("w{i}"))
+    let columns = columns_per_page();
+    // Single letters, so the line reaches past the page's last column on as few marks as
+    // a line of words can: one letter and the space after it cover two columns.
+    let spread: String = "HEXTOAWMNKRB"
+        .chars()
+        .cycle()
+        .take(columns / 2 + 1)
+        .map(String::from)
         .collect::<Vec<_>>()
         .join(" ");
-    let wide_row: String = (0..40)
+    let past_the_edge = "V".repeat(12);
+    // Each cell covers five columns — four of text and the tab that ends it — so this is
+    // the shortest row of columns that still runs past the page's last one.
+    let cell_count = columns / 5 + 2;
+    let wide_row: String = (0..cell_count)
         .map(|i| format!("c{i} x"))
         .collect::<Vec<_>>()
         .join("\t");
-    let text = format!("{long_word}\n{many_words}\nLabel: {long_word}\n{wide_row}\n{wide_row}");
-    // Drawn at the font's own size: the page is as wide as its longest line of ink, and
-    // this one is hundreds of characters long.
+    let text = format!("Label: {spread} {past_the_edge}\n{wide_row}");
+    let drawn = drawn_lines(&text);
+    assert!(
+        text.lines().all(|line| line.chars().count() > columns),
+        "every line must run past the page's last column ({columns}), got {:?} columns",
+        text.lines().map(|line| line.chars().count()).collect::<Vec<_>>()
+    );
+    // Drawn at the font's own size: the page is as wide as its longest line of ink.
     let page = crate::raster_documents::render(
-        &drawn_lines(&text)
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
+        &drawn.iter().map(String::as_str).collect::<Vec<_>>(),
         crate::raster_documents::Paper {
             scale: 1,
             ..crate::raster_documents::Paper::plain()
         },
     );
     let document = crate::raster_documents::raster_document(&page, image::ImageFormat::Png);
+    let drawn_words = text.split_whitespace().count();
 
     for features in [
         Vec::new(),
@@ -963,10 +997,41 @@ async fn a_document_wider_than_the_page_grid_still_lays_out() {
             "case {case:?}: a wide document must be laid out, got {status} with {body}"
         );
         let blocks = blocks_of(&body);
+        assert_eq!(
+            of_type(&blocks, "LINE").len(),
+            drawn.len(),
+            "case {case:?}: every line of ink must be laid out as a LINE block, got {}",
+            of_type(&blocks, "LINE").len()
+        );
         assert!(
-            blocks.len() > 200,
-            "case {case:?}: expected a block per word, got {}",
-            blocks.len()
+            of_type(&blocks, "WORD").len() >= drawn_words,
+            "case {case:?}: every one of the {drawn_words} words drawn must be laid out as a \
+             WORD block, got {}",
+            of_type(&blocks, "WORD").len()
+        );
+        // The blocks each requested feature derives from a line the grid cannot address:
+        // the labelled line's key and value, and the columns of the tab-separated row.
+        let expected_pairs = usize::from(features.contains(&"FORMS")) * 2;
+        assert_eq!(
+            of_type(&blocks, "KEY_VALUE_SET").len(),
+            expected_pairs,
+            "case {case:?}: expected {expected_pairs} KEY_VALUE_SET blocks for the labelled \
+             line, got {}",
+            of_type(&blocks, "KEY_VALUE_SET").len()
+        );
+        let expected_tables = usize::from(features.contains(&"TABLES"));
+        assert_eq!(
+            of_type(&blocks, "TABLE").len(),
+            expected_tables,
+            "case {case:?}: expected {expected_tables} TABLE blocks for the wide row, got {}",
+            of_type(&blocks, "TABLE").len()
+        );
+        assert_eq!(
+            of_type(&blocks, "CELL").len(),
+            expected_tables * cell_count,
+            "case {case:?}: expected a CELL block per column of the {cell_count}-column row, \
+             got {}",
+            of_type(&blocks, "CELL").len()
         );
         // assert_block_graph checks every bounding box stays inside 0..=1.
         assert_block_graph(&case, &body, &blocks, None);

@@ -1717,9 +1717,15 @@ fn estimated_block_count(pages: &[String]) -> usize {
 /// Left and top margin of the character grid a TEXT document is laid out on, as a
 /// page-relative fraction. Only a document whose text carries no measured geometry (see
 /// [`DocumentContent::measured`]) is laid out here.
-const PAGE_MARGIN: f32 = 0.05;
-/// Width of one character cell of that grid, as a page-relative fraction.
-const CHAR_WIDTH: f32 = 0.0075;
+///
+/// `pub` with [`CHAR_WIDTH`]: together they say how many character columns of a line this
+/// grid can address, which is the bound [`bounding_box`] saturates at, so a test that
+/// exercises that bound derives the line it draws from these rather than restating a
+/// column count of its own.
+pub const PAGE_MARGIN: f32 = 0.05;
+/// Width of one character cell of that grid, as a page-relative fraction. `pub` with
+/// [`PAGE_MARGIN`], for the reason given there.
+pub const CHAR_WIDTH: f32 = 0.0075;
 /// Height of a line of that grid, as a page-relative fraction.
 const LINE_HEIGHT: f32 = 0.018;
 /// Baseline-to-baseline distance of that grid, as a page-relative fraction.
