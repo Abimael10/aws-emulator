@@ -394,23 +394,25 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
     /// Record that the owning service has TAKEN the work this request owed, on the resource
     /// `identifier` names: the request goes on running, now following that service's own
     /// lifecycle for it — which the next call on reads.
+    ///
+    /// A record that no longer owes that work is left exactly as it is, for the reason
+    /// [`Self::still_owing`] states.
     pub fn owning_service_started(
         &mut self,
         request_token: &str,
         identifier: &str,
         now: SystemTime,
     ) {
-        let Some(record) = self.requests.get_mut(request_token) else {
+        let Some(record) = self.still_owing(request_token) else {
             return;
         };
-        let Some(pending) = record.pending.as_mut() else {
-            return;
-        };
-        let region = pending.effect.as_ref().map(region_of).unwrap_or_default();
-        pending.effect = Some(ResourceEffect::Awaiting { region });
-        // The lease the claim took is over: what is owed now is reading that service's
-        // lifecycle, which is due from here on.
-        pending.due = now;
+        if let Some(pending) = record.pending.as_mut() {
+            let region = pending.effect.as_ref().map(region_of).unwrap_or_default();
+            pending.effect = Some(ResourceEffect::Awaiting { region });
+            // The lease the claim took is over: what is owed now is reading that service's
+            // lifecycle, which is due from here on.
+            pending.due = now;
+        }
         // The resource the request acts on is the one the owning service answered to, which
         // for a type whose primary identifier that service ASSIGNS is known only once it
         // has: from here on every answer about this request names it.
@@ -419,10 +421,13 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
 
     /// Record that the owning service reports the resource STILL CHANGING: the request goes
     /// on running, and its lifecycle is due to be read again from the next call on.
+    ///
+    /// A record that no longer owes that work is left exactly as it is, for the reason
+    /// [`Self::still_owing`] states: the instant a cancellation falls due at is never moved
+    /// by an answer about the work that cancel abandoned.
     pub fn owning_service_running(&mut self, request_token: &str, now: SystemTime) {
         if let Some(pending) = self
-            .requests
-            .get_mut(request_token)
+            .still_owing(request_token)
             .and_then(|record| record.pending.as_mut())
         {
             pending.due = now;
@@ -448,12 +453,23 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
     }
 
     /// The request `request_token` names while it still owes the work a claim took, and
-    /// `None` once it owes none — the one check both recorders of an owning service's answer
-    /// make, so an answer never moves a request a cancel has already settled.
+    /// `None` once it owes none — the one check every recorder of an owning service's answer
+    /// makes, so an answer never moves a request a cancel has already acted on.
+    ///
+    /// Two records owe that work no longer: one already settled, and one a
+    /// `CancelResourceRequest` abandoned the work of, which from then on owes the
+    /// cancellation itself and nothing else ([`Self::cancel_request`]). The second is why
+    /// owing is read off the EFFECT rather than off there being anything pending at all: a
+    /// cancel that lands while the call this store made is still out leaves a record pending
+    /// the cancellation, and the answer that comes back then is about work nobody is waiting
+    /// for any more.
     fn still_owing(&mut self, request_token: &str) -> Option<&mut RequestRecord> {
-        self.requests
-            .get_mut(request_token)
-            .filter(|record| record.pending.is_some())
+        self.requests.get_mut(request_token).filter(|record| {
+            record
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.effect.is_some())
+        })
     }
 
     /// Record that the owning service would not carry the work out, or that its lifecycle
@@ -652,6 +668,13 @@ fn unanswered(type_name: &str) -> Refusal {
 mod tests {
     use super::*;
 
+    use ::std::time::Duration;
+
+    use crate::state::{
+        CancelVerdict, CANCELLATION_STATUS_MESSAGE, RESOURCE_OPERATION_SPAN,
+        STATUS_CANCEL_COMPLETE, STATUS_CANCEL_IN_PROGRESS,
+    };
+
     /// Each type this module stands behind is one it answers for, and the property it names
     /// as that type's primary identifier is the type's own.
     #[test]
@@ -692,5 +715,155 @@ mod tests {
             !owed_elsewhere(stacks::TYPE_NAME, None),
             "expected a request whose work a cancel abandoned to be owed to nobody"
         );
+    }
+
+    /// The token the record below answers to.
+    const TOKEN: &str = "a-request-token";
+
+    /// One accepted create of a type whose work an owning service's own API carries out.
+    fn stack_create(now: SystemTime) -> RequestRecord {
+        RequestRecord::accepted(
+            TOKEN.to_string(),
+            stacks::TYPE_NAME.to_string(),
+            None,
+            crate::state::OPERATION_CREATE,
+            now,
+            ResourceEffect::Create {
+                properties: ::serde_json::json!({ "StackName": "a-stack" }),
+                identifier_property: stacks::IDENTIFIER_PROPERTY.to_string(),
+                type_version_id: None,
+                region: "us-east-1".to_string(),
+            },
+            None,
+        )
+    }
+
+    /// What the call this store made comes back with, after a cancel has already landed.
+    #[derive(Debug, Clone, Copy)]
+    enum Answer {
+        /// The owning service TOOK the work.
+        Started,
+        /// It reports the resource still changing.
+        Running,
+        /// Its lifecycle carried the operation out.
+        Settled,
+        /// It would not carry the operation out.
+        Failed,
+    }
+
+    /// A cancel that lands while the call this store made is still out owns the request from
+    /// then on: whatever that call then answers moves nothing, so the request still explains
+    /// the cancellation and still reaches `CANCEL_COMPLETE` when the cancellation falls due.
+    ///
+    /// The rows are the four answers such a call comes back with, because each has a recorder
+    /// of its own and none of them may move a request a cancel has acted on.
+    #[test]
+    fn an_answer_that_arrives_after_a_cancel_moves_nothing() {
+        let native = NativeResources::for_engine(&());
+        let accepted_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let due = accepted_at + RESOURCE_OPERATION_SPAN;
+        // The cancel lands while the call a pass made at `due` is still out, which is what
+        // the claim's lease holds the record for.
+        let cancelled_at = due + Duration::from_secs(1);
+        let rows = [
+            ("the owning service took the work", Answer::Started),
+            ("it reports the resource still changing", Answer::Running),
+            ("its lifecycle carried the operation out", Answer::Settled),
+            ("it would not carry the operation out", Answer::Failed),
+        ];
+        for (case, answer) in rows {
+            let mut store = ComAmazonawsCloudcontrolCloudapiserviceState::default();
+            store
+                .record_request(stack_create(accepted_at))
+                .expect("an empty store takes one record");
+            let claimed = store.claim_work_owed_to_owning_services(due);
+            assert_eq!(
+                claimed.len(),
+                1,
+                "case {case:?}: expected the work to be claimed once, got {claimed:?}"
+            );
+
+            // The cancel: from here on the request owes the cancellation and nothing else.
+            match store.cancel_request(TOKEN, cancelled_at) {
+                CancelVerdict::Canceling(record) => assert_eq!(
+                    record.operation_status, STATUS_CANCEL_IN_PROGRESS,
+                    "case {case:?}: expected the request to report being cancelled, got {:?}",
+                    record.operation_status
+                ),
+                other => panic!("case {case:?}: expected the cancel to act, got {other:?}"),
+            }
+
+            // ...and then the answer arrives.
+            match answer {
+                Answer::Started => store.owning_service_started(
+                    TOKEN,
+                    "arn:aws:cloudformation:us-east-1:000000000000:stack/a-stack/0",
+                    cancelled_at,
+                ),
+                Answer::Running => store.owning_service_running(TOKEN, cancelled_at),
+                Answer::Settled => store.owning_service_settled(
+                    TOKEN,
+                    Some(::serde_json::json!({ "StackName": "a-stack" })),
+                ),
+                Answer::Failed => store.owning_service_failed(
+                    TOKEN,
+                    Refusal::rejected("the owning service would not".to_string()),
+                ),
+            }
+            let held = store
+                .request(TOKEN)
+                .expect("the request is still one this store holds")
+                .clone();
+            assert_eq!(
+                held.operation_status, STATUS_CANCEL_IN_PROGRESS,
+                "case {case:?}: expected the cancellation to own the status, got {held:?}"
+            );
+            assert_eq!(
+                held.status_message.as_deref(),
+                Some(CANCELLATION_STATUS_MESSAGE),
+                "case {case:?}: expected the request to keep explaining the cancellation, got \
+                 {:?}",
+                held.status_message
+            );
+            assert!(
+                held.resource_model.is_none() && held.error_code.is_none(),
+                "case {case:?}: a cancelled request reports no model and no error code, got \
+                 {held:?}"
+            );
+
+            // The cancellation keeps its own instant: nothing the answer carried makes the
+            // request over before the span the cancel started has run.
+            store.materialise_due(cancelled_at, &native);
+            assert_eq!(
+                store
+                    .request(TOKEN)
+                    .map(|record| record.operation_status.as_str()),
+                Some(STATUS_CANCEL_IN_PROGRESS),
+                "case {case:?}: expected the cancellation to still be running, got {:?}",
+                store.request(TOKEN)
+            );
+
+            // And when it falls due it is the CANCELLATION that completes.
+            store.materialise_due(cancelled_at + RESOURCE_OPERATION_SPAN, &native);
+            let settled = store
+                .request(TOKEN)
+                .expect("the request is still one this store holds")
+                .clone();
+            assert_eq!(
+                settled.operation_status, STATUS_CANCEL_COMPLETE,
+                "case {case:?}: expected the request to settle as cancelled, got {settled:?}"
+            );
+            assert_eq!(
+                settled.status_message.as_deref(),
+                Some(CANCELLATION_STATUS_MESSAGE),
+                "case {case:?}: expected the terminal event to explain the cancellation, got \
+                 {:?}",
+                settled.status_message
+            );
+            assert!(
+                settled.retry_after.is_none(),
+                "case {case:?}: a settled request names no instant to poll at, got {settled:?}"
+            );
+        }
     }
 }
