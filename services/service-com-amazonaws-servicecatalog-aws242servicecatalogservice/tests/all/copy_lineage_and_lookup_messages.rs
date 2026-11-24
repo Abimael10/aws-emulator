@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    associate_product_with_portfolio, call, create_portfolio, create_product, emulator, error_code,
+    seed_launch_path, call, create_portfolio, create_product, emulator, error_code,
     first_provisioning_artifact_id, message,
 };
 
@@ -452,7 +452,7 @@ async fn describe_provisioned_product_names_the_provisioned_product_it_cannot_re
     let portfolio_id = create_portfolio(&router, "pp-portfolio", "acme", &[], "tok-pp-port").await;
     let product_id = create_product(&router, "pp-product", "tok-pp-product").await;
     let artifact_id = first_provisioning_artifact_id(&router, &product_id).await;
-    associate_product_with_portfolio(&router, &product_id, &portfolio_id).await;
+    seed_launch_path(&router, &product_id, &portfolio_id).await;
     let stored_name = "stored-stack";
     let (status, provisioned) = call(
         &router,

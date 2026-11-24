@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    associate_product_with_portfolio, call, call_in, create_portfolio, create_product_with_info,
+    seed_launch_path, call, call_in, create_portfolio, create_product_with_info,
     create_template_bucket, emulator_with_template_services, error_code,
     first_provisioning_artifact_id, is_catalog_id, message, stage_template, staged_template_url,
     tag_list, tag_map,
@@ -180,7 +180,7 @@ async fn seed_launch(
             &format!("{slug}-portfolio-{index}"),
         )
         .await;
-        associate_product_with_portfolio(router, &product_id, &portfolio_id).await;
+        seed_launch_path(router, &product_id, &portfolio_id).await;
         portfolio_ids.push(portfolio_id);
     }
     Launch {

@@ -417,9 +417,17 @@ pub(crate) async fn first_provisioning_artifact_id(
         .to_string()
 }
 
-/// Associate a product with a portfolio: the one stored relationship every suite that
-/// needs one creates the same way.
-pub(crate) async fn associate_product_with_portfolio(
+/// Give `product_id` a LAUNCH PATH through `portfolio_id`: both halves of the triple a
+/// path is dependent on ("a specific product, porfolio, and principal").
+///
+/// `AssociateProductWithPortfolio` puts the product in the portfolio, and
+/// `AssociatePrincipalWithPortfolio` grants the principal this harness's own credential
+/// speaks for access to that portfolio — "when provisioning a product that's been added to
+/// a portfolio, you must grant your user, group, or role access to the portfolio"
+/// (`ListLaunchPaths`). Neither half alone is a path, so the one seeder every suite that
+/// needs a launchable product drives makes both, and a suite that wants only ONE of them
+/// calls that operation itself ([`grant_principal_on_portfolio`] is the principal half).
+pub(crate) async fn seed_launch_path(
     router: &MultiServiceRouter,
     product_id: &str,
     portfolio_id: &str,
@@ -434,6 +442,39 @@ pub(crate) async fn associate_product_with_portfolio(
         status, 200,
         "AssociateProductWithPortfolio({product_id}, {portfolio_id}): expected 200, got {status} \
          with {body}"
+    );
+    grant_principal_on_portfolio(router, portfolio_id, &harness_principal_arn(), "IAM").await;
+}
+
+/// The principal every call of this harness speaks for: the IAM user this emulator
+/// publishes its long-term credential as, which is what a caller reads back for itself
+/// (`sts:GetCallerIdentity`).
+pub(crate) fn harness_principal_arn() -> String {
+    ::service_common::caller_principal::ambient_user_arn()
+}
+
+/// Grant `principal_arn`, as `principal_type` (`IAM` | `IAM_PATTERN`), access to
+/// `portfolio_id` — the principal half of a launch path.
+pub(crate) async fn grant_principal_on_portfolio(
+    router: &MultiServiceRouter,
+    portfolio_id: &str,
+    principal_arn: &str,
+    principal_type: &str,
+) {
+    let (status, body) = call(
+        router,
+        "AssociatePrincipalWithPortfolio",
+        &json!({
+            "PortfolioId": portfolio_id,
+            "PrincipalARN": principal_arn,
+            "PrincipalType": principal_type,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "AssociatePrincipalWithPortfolio({portfolio_id}, {principal_arn}, {principal_type}): \
+         expected 200, got {status} with {body}"
     );
 }
 

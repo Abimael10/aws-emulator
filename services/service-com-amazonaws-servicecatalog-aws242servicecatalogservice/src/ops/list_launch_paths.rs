@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLaunchPaths
-//! Lists the launch paths of one product: one path per portfolio the product is
-//! associated with, each carrying that portfolio-product relationship's constraints.
+//! Lists the launch paths of one product: one path per portfolio that carries the product
+//! AND grants the calling principal access to it, each carrying that portfolio-product
+//! relationship's constraints.
 //!
 //! ## Shape of an operation
 //!
@@ -146,7 +147,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // WHO is asking: a path is dependent on a principal as well as on a product and a
+        // portfolio, so the paths this request resolves are the ones the CALLER has.
+        // Resolved against the account's identity records BEFORE this service's own store
+        // is locked, so no two stores are held at once.
+        let caller = crate::state::request_caller_principal(&*self.engine, ctx);
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
         // A pure read: listing a product's paths reports the portfolio associations and
@@ -170,23 +175,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        // The emulated service verifies no caller identity, so the principal half of
-        // "a path is dependent on a specific product, porfolio, and principal" cannot be
-        // evaluated here: a request carries only the access key id of its signature, and
-        // this crate holds no resolution from that to the principal ARN an association
-        // names. The paths reported are therefore the product-portfolio ones, unfiltered
-        // by the stored `Portfolio::principals`; a path that exists for one principal is
-        // reported to every caller.
-        //
-        // A launch path is a portfolio the product can be launched through, so the
-        // paths ARE the product's portfolio associations — the same stored set
-        // `DescribeProduct` reports as `LaunchPaths` and `HasDefaultPath` is derived
-        // from, so two responses of this service cannot contradict each other. A
-        // product no portfolio holds therefore resolves no path at all, and neither
-        // does a product id nothing stored carries: that is what this operation's path
-        // resolution refuses, rather than answering an empty page.
+        // A launch path is the triple "a specific product, porfolio, and principal": a
+        // portfolio is a path for this request only when it carries the product AND grants
+        // the calling principal access to the portfolio, which is the other half of
+        // "you must grant your user, group, or role access to the portfolio". The same set
+        // `DescribeProduct` reports as `LaunchPaths` and derives `HasDefaultPath` from, so
+        // two responses of this service cannot contradict each other. A product no
+        // portfolio holds resolves no path, a product whose portfolios grant this caller
+        // nothing resolves none either, and neither does a product id nothing stored
+        // carries: that is what this operation's path resolution refuses, rather than
+        // answering an empty page.
         let paths: Vec<&crate::state::Portfolio> =
-            state.launch_path_portfolios(&input.product_id);
+            state.launch_path_portfolios(&input.product_id, &caller);
         if paths.is_empty() {
             return Err(ListLaunchPathsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

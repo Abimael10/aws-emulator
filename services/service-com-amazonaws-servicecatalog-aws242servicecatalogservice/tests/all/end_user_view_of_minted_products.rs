@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    associate_product_with_portfolio, call, create_portfolio, create_product, emulator, error_code,
+    seed_launch_path, call, create_portfolio, create_product, emulator, error_code,
     message,
 };
 
@@ -235,7 +235,7 @@ async fn a_product_out_of_view_is_refused_whatever_minted_it() {
     // empty catalog, and the source a copy reads is itself in view.
     let portfolio_id = create_portfolio(&router, "minted-portfolio", "acme", &[], "tok-mp").await;
     let source_id = create_product(&router, "minted-source", "tok-mp-source").await;
-    associate_product_with_portfolio(&router, &source_id, &portfolio_id).await;
+    seed_launch_path(&router, &source_id, &portfolio_id).await;
     let source_versions = stored_version_ids(&router, &source_id).await;
     let source_arn = stored_arn(&router, &source_id).await;
 
@@ -352,7 +352,7 @@ async fn a_product_out_of_view_is_refused_whatever_minted_it() {
     // The grant is what brings each row into view, reporting the product's own versions
     // and the launch path it was reached through.
     for row in &rows {
-        associate_product_with_portfolio(&router, &row.product_id, &portfolio_id).await;
+        seed_launch_path(&router, &row.product_id, &portfolio_id).await;
         for (member, identifier) in [
             ("Id", row.product_id.clone()),
             ("Name", row.product_name.clone()),

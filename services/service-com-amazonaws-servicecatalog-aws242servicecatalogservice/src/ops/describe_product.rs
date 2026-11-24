@@ -136,7 +136,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // WHO is asking: an end user reaches a product through a launch path, and a path
+        // is dependent on a principal as well as on a product and a portfolio. Resolved
+        // against the account's identity records BEFORE this service's own store is
+        // locked, so no two stores are held at once.
+        let caller = crate::state::request_caller_principal(&*self.engine, ctx);
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
         // A pure read: this operation reports the product `CreateProduct` stored and
@@ -149,15 +153,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // This is the END-USER view of a product ("running this operation with
         // administrator access results in a failure. DescribeProductAsAdmin should be
-        // used instead"), and an end user reaches a product only through a LAUNCH PATH:
-        // a portfolio the product is associated with. A product no portfolio carries is
-        // therefore outside the catalog this operation can see, exactly as a product
-        // nothing stored carries is — and the refusal does not tell the two apart, so a
-        // caller cannot learn from it that a product it has no access to exists. The
-        // admin view, `DescribeProductAsAdmin`, is what reads a product that sits in no
-        // portfolio.
+        // used instead"), and an end user reaches a product only through a LAUNCH PATH: a
+        // portfolio that carries the product AND grants this caller access to it. A
+        // product no such portfolio carries is therefore outside the catalog this
+        // operation can see, exactly as a product nothing stored carries is — and the
+        // refusal does not tell the two apart, so a caller cannot learn from it that a
+        // product it has no access to exists. The admin view, `DescribeProductAsAdmin`, is
+        // what reads a product that sits in no portfolio.
         let reachable = |product: &&crate::state::Product| {
-            !state.launch_path_portfolios(&product.id).is_empty()
+            !state.launch_path_portfolios(&product.id, &caller).is_empty()
         };
         let product = match (
             input.id.as_deref().filter(|id| !id.is_empty()),
@@ -206,8 +210,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // The launch paths this product was reached THROUGH: one per portfolio that
+        // carries it and grants this caller access, resolved ONCE so the response's
+        // `LaunchPaths` and the `HasDefaultPath` of its summary are the same set.
+        let paths = state.launch_path_portfolios(&product.id, &caller);
+
         Ok(DescribeProductOutput {
-            product_view_summary: Some(product.view_summary()),
+            product_view_summary: Some(product.view_summary_with_paths(paths.len())),
             provisioning_artifacts: Some(
                 product
                     .provisioning_artifacts
@@ -219,13 +228,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // back from the same set a portfolio's are: one resource's associations,
             // rendered one way.
             budgets: Some(state.resource_budget_details(&product.id)),
-            // The launch paths this product was reached THROUGH: one per associated
-            // portfolio, named by that portfolio, from the same stored set
-            // `ProductViewSummary$HasDefaultPath` is derived from, so the two members of
-            // one response cannot contradict each other.
+            // Each path named by its portfolio, from the same set
+            // `ProductViewSummary$HasDefaultPath` is derived from above, so the two
+            // members of one response cannot contradict each other.
             launch_paths: Some(
-                state
-                    .launch_path_portfolios(&product.id)
+                paths
                     .into_iter()
                     .map(|portfolio| LaunchPath {
                         id: Some(portfolio.id.clone()),

@@ -27,8 +27,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    associate_product_with_portfolio, call, create_portfolio, create_product, emulator, error_code,
-    first_provisioning_artifact_id, is_catalog_id, message, tag_list,
+    call, create_portfolio, create_product, emulator, error_code, first_provisioning_artifact_id,
+    is_catalog_id, message, seed_launch_path, tag_list,
 };
 
 /// AWS's sentence for a request that names neither half of the launch-path pair when the
@@ -38,6 +38,15 @@ const PATH_REQUIRED: &str = "Either Path Id or Path Name needs to be specified";
 /// One span of a provisioning operation, plus the margin a test waits past it: the
 /// emulator settles a record 3s after the request that starts it.
 const SETTLE_WAIT: std::time::Duration = std::time::Duration::from_millis(3_500);
+
+/// How long a poll keeps looking for a condition the emulator's clock owes before it gives
+/// up. Far longer than any span this emulator settles on, so a loaded or slow host cannot
+/// fail a case a fast one passes: a loop that uses it waits for the CONDITION, never for a
+/// fixed time.
+const POLL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// How long such a poll waits between two looks.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// How a termination request addresses the provisioned product it terminates.
 #[derive(Debug, Clone, Copy)]
@@ -76,7 +85,7 @@ async fn seed_launch(router: &MultiServiceRouter) -> (String, String, String) {
     let portfolio_id = create_portfolio(router, "alpha-portfolio", "acme", &[], "portfolio").await;
     let product_id = create_product(router, "terminated-source-product", "product-token").await;
     let artifact_id = first_provisioning_artifact_id(router, &product_id).await;
-    associate_product_with_portfolio(router, &product_id, &portfolio_id).await;
+    seed_launch_path(router, &product_id, &portfolio_id).await;
     (product_id, artifact_id, portfolio_id)
 }
 
@@ -716,11 +725,11 @@ async fn the_launch_path_members_are_validated_as_parameters_of_the_launch() {
         match row.paths {
             Paths::Unknown | Paths::None => {}
             Paths::Default => {
-                associate_product_with_portfolio(&router, &stored_product, &first_portfolio).await
+                seed_launch_path(&router, &stored_product, &first_portfolio).await
             }
             Paths::Two => {
-                associate_product_with_portfolio(&router, &stored_product, &first_portfolio).await;
-                associate_product_with_portfolio(&router, &stored_product, &second_portfolio).await;
+                seed_launch_path(&router, &stored_product, &first_portfolio).await;
+                seed_launch_path(&router, &stored_product, &second_portfolio).await;
             }
         }
         let product_id = match row.paths {
@@ -871,7 +880,7 @@ async fn every_reported_timestamp_carries_the_resolution_the_protocol_serves() {
     let portfolio_id = create_portfolio(&router, "alpha-portfolio", "acme", &[], "portfolio").await;
     let product_id = create_product(&router, "timestamped-product", "product-token").await;
     let artifact_id = first_provisioning_artifact_id(&router, &product_id).await;
-    associate_product_with_portfolio(&router, &product_id, &portfolio_id).await;
+    seed_launch_path(&router, &product_id, &portfolio_id).await;
     let provision_request = json!({
         "ProductId": product_id,
         "ProvisioningArtifactId": artifact_id,
@@ -1051,9 +1060,16 @@ async fn every_reported_timestamp_carries_the_resolution_the_protocol_serves() {
     );
 
     // Once the clock settles the record, the update it reports is the completion — later
-    // than the creation, and still at the resolution above.
-    std::thread::sleep(SETTLE_WAIT);
-    let settled = provision(&router, "the replay after the record settled", &provision_request).await;
+    // than the creation, and still at the resolution above. The REPLAY of the provisioning
+    // request is looked at again until it reports the settled record, never for a fixed
+    // time: a replay answers the record its request minted, whatever its status.
+    let settled = replayed_record_settles_to(
+        &router,
+        "the replay after the record settled",
+        &provision_request,
+        "SUCCEEDED",
+    )
+    .await;
     let settled_created = timestamp("settled", &settled, &["RecordDetail", "CreatedTime"]);
     let settled_updated = timestamp("settled", &settled, &["RecordDetail", "UpdatedTime"]);
     assert_eq!(
@@ -1064,9 +1080,30 @@ async fn every_reported_timestamp_carries_the_resolution_the_protocol_serves() {
         settled_updated > settled_created && is_millisecond_resolution(settled_updated),
         "a settled record was updated after it was created, at the same resolution: {settled}"
     );
-    assert_eq!(
-        settled["RecordDetail"]["Status"].as_str(),
-        Some("SUCCEEDED"),
-        "the clock owes the completion of the record: {settled}"
-    );
+}
+
+/// Replay the provisioning request `request` until the record it answers reports `wanted`,
+/// or the deadline passes, and answer the body reported then.
+///
+/// The replay is the same request with the same `ProvisionToken`, so it provisions nothing
+/// further and reports the record its first request minted — which is what makes it a way
+/// of LOOKING at that record until the completion the clock owes has fallen due.
+async fn replayed_record_settles_to(
+    router: &MultiServiceRouter,
+    case: &str,
+    request: &Value,
+    wanted: &str,
+) -> Value {
+    let started = std::time::Instant::now();
+    loop {
+        let replayed = provision(router, case, request).await;
+        if replayed["RecordDetail"]["Status"].as_str() == Some(wanted) {
+            return replayed;
+        }
+        assert!(
+            started.elapsed() < POLL_DEADLINE,
+            "case {case:?}: expected the record to reach {wanted}, last reported {replayed}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }

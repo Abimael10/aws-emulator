@@ -179,9 +179,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         // WHO asked for this launch, as `sts:GetCallerIdentity` reports it for the
         // credential the request was signed with: one of the things the deployed stack
-        // records about the launch. Resolved against the account's identity records
-        // BEFORE this service's own store is locked, so no two stores are held at once.
-        let provisioning_principal_arn = crate::state::request_principal_arn(&*self.engine, ctx);
+        // records about the launch, and the principal whose own launch paths this product
+        // is provisioned through. Resolved against the account's identity records BEFORE
+        // this service's own store is locked, so no two stores are held at once.
+        let caller = crate::state::request_caller_principal(&*self.engine, ctx);
+        let provisioning_principal_arn = caller.arn().to_string();
 
         // Everything this request resolves and stores is done under the lock, which is
         // released before the launch itself: the stack is stood up by a call into
@@ -232,16 +234,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Provisioning resolves the product's launch paths FIRST: a path is the
-        // product's relationship with a portfolio it can be launched through, so a
-        // product that sits in no portfolio — and a product id or name nothing stored
-        // carries, which resolves no path either — has no path to launch through, and
-        // the request is refused as a not-found resource naming the product no path
-        // could be resolved for. This is NOT a parameter error about the optional
-        // `PathId`/`PathName`: no path can be named for a product that has none.
+        // product's relationship with a portfolio it can be launched through BY THIS
+        // CALLER, so a product that sits in no portfolio granting the caller access — and
+        // a product id or name nothing stored carries, which resolves no path either —
+        // has no path to launch through, and the request is refused as a not-found
+        // resource naming the product no path could be resolved for. This is NOT a
+        // parameter error about the optional `PathId`/`PathName`: no path can be named for
+        // a product that has none.
         let paths: Vec<(String, String)> = product
             .map(|product| {
                 state
-                    .launch_path_portfolios(&product.id)
+                    .launch_path_portfolios(&product.id, &caller)
                     .into_iter()
                     .map(|portfolio| (portfolio.id.clone(), portfolio.display_name.clone()))
                     .collect()

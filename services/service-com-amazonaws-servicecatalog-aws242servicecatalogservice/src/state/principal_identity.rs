@@ -93,6 +93,132 @@ pub fn request_principal_arn<Eng: Send + Sync + 'static>(
     }
 }
 
+/// The principal a request speaks for, as every ARN a portfolio-principal association can
+/// name that one caller by.
+///
+/// A grant is addressed by the ARN the association was made with, and ONE caller answers to
+/// several of them: a request signed with a temporary credential speaks for a role SESSION,
+/// whose permissions are the role's, and a request signed by a user is granted whatever the
+/// GROUPS that user belongs to are granted ("you cannot identify a user group as a
+/// `Principal`" in a policy, but `PrincipalARN` is "the principal (user, role, or group)",
+/// so a group association names its members). So the question an association answers is not
+/// "is this ARN the caller's" but "does this ARN name the caller", which is what
+/// [`Self::names`] decides.
+#[derive(Debug, Clone)]
+pub struct CallerPrincipal {
+    /// The ARN `sts:GetCallerIdentity` reports for this request's credential FIRST, then
+    /// every other ARN the account's identity records let an association name the same
+    /// caller by.
+    arns: Vec<String>,
+}
+
+impl CallerPrincipal {
+    /// The ARN `sts:GetCallerIdentity` reports for this request — what a record of who
+    /// asked for a launch carries.
+    pub fn arn(&self) -> &str {
+        // The resolution always puts the reported principal first, and the vector is
+        // never built empty.
+        self.arns.first().map(String::as_str).unwrap_or_default()
+    }
+
+    /// Whether an association made with `association_arn` under `principal_type` names
+    /// THIS caller.
+    ///
+    /// A fully defined `IAM` ARN names one principal, so it names the caller exactly when
+    /// it is one of the ARNs the caller answers to. An `IAM_PATTERN` names a SET — the type
+    /// whose ARN may omit the account and carry `*`/`?` wildcards
+    /// (`AssociatePrincipalWithPortfolio$PrincipalARN`) — so the caller is in that set when
+    /// the pattern matches one of its ARNs, with IAM's own wildcard reading
+    /// ([`::service_common::iam_authorization::wildcard_match`], `*` for any run of
+    /// characters and `?` for exactly one). An omitted account field reads as THIS
+    /// account's, the same way every other account-less IAM ARN this tree resolves does.
+    pub fn names(&self, association_arn: &str, principal_type: &str) -> bool {
+        if principal_type == PRINCIPAL_TYPE_IAM_PATTERN {
+            let pattern = account_filled_in(association_arn);
+            return self.arns.iter().any(|arn| {
+                // An identity ARN is compared case-sensitively, as every resource ARN is.
+                ::service_common::iam_authorization::wildcard_match(&pattern, arn, true)
+            });
+        }
+        self.arns.iter().any(|arn| arn == association_arn)
+    }
+}
+
+/// `pattern` with an EMPTY account field filled in with this account's id, so an
+/// account-less `IAM_PATTERN` is matched against the ARNs of the account whose portfolio
+/// carries it. A value that is not a six-field ARN, or one that already names an account,
+/// is its own pattern.
+fn account_filled_in(pattern: &str) -> String {
+    let fields: Vec<&str> = pattern.splitn(6, ':').collect();
+    let [prefix, partition, service, region, account, resource] = fields.as_slice() else {
+        return pattern.to_string();
+    };
+    if !account.is_empty() {
+        return pattern.to_string();
+    }
+    let account = ::engine::emulator_account_id();
+    format!("{prefix}:{partition}:{service}:{region}:{account}:{resource}")
+}
+
+/// The principal THIS REQUEST speaks for, as every ARN an association can name it by:
+/// [`request_principal_arn`] plus the identities the account's records put BEHIND that
+/// principal.
+///
+/// LOCK ORDER: the IAM store is taken on its own and released before this service's own
+/// store is locked, so no two stores are held at once — call it BEFORE locking this
+/// service's state.
+pub fn request_caller_principal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> CallerPrincipal {
+    let Some(iam) = iam_state::service_state(engine) else {
+        // No identity records on this engine: the only credential a request can present
+        // there is the one this emulator publishes, which speaks for the account's own
+        // principal and belongs to no group this engine holds.
+        return CallerPrincipal {
+            arns: vec![::service_common::caller_principal::ambient_user_arn()],
+        };
+    };
+    let held = iam.lock();
+    let reported = iam_state::authorization::caller_principal_arn(&held, ctx);
+    let behind = identities_behind(&held, &reported);
+    let mut arns = vec![reported];
+    arns.extend(behind);
+    CallerPrincipal { arns }
+}
+
+/// The ARNs the identity records put BEHIND the principal `principal_arn` — the other
+/// values an association can name that same caller by.
+///
+/// * A role SESSION is granted what its ROLE is granted: "the permissions in force on such
+///   a session are the role's", so an association naming the role names every session of
+///   it. The role is addressed the way IAM holds it, so a role under a path is named by the
+///   ARN that carries the path rather than by one rebuilt from the session.
+/// * A USER is granted what the groups it belongs to are granted, which is the membership
+///   IAM itself reads to collect a user's policies.
+///
+/// Nothing is invented: a principal the records hold nothing for puts no further ARN
+/// behind it.
+fn identities_behind(iam: &IamState, principal_arn: &str) -> Vec<String> {
+    if let Some(role_name) = ::service_common::iam_role::assumed_role_session_role_name(principal_arn)
+    {
+        return iam
+            .roles
+            .get(&iam_state::name_key(role_name))
+            .map(|role| vec![role.arn.clone()])
+            .unwrap_or_default();
+    }
+    if let Some(user_name) = ::service_common::iam_role::user_name(principal_arn) {
+        let member = iam_state::name_key(user_name);
+        return iam
+            .group_keys_held_by(&member)
+            .filter_map(|group_key| iam.groups.get(group_key))
+            .map(|group| group.arn.clone())
+            .collect();
+    }
+    Vec::new()
+}
+
 /// [`association_principal_identifier`] for a CONCRETE principal against identity records
 /// already locked: the unique id those records hold for the principal the ARN names.
 ///
@@ -143,6 +269,95 @@ fn held_identifier(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RULE: an association names the caller when its ARN is one the caller answers to —
+    /// exactly, for a fully defined `IAM` principal, and by IAM's `*`/`?` wildcards for an
+    /// `IAM_PATTERN`, whose empty account field reads as this account's.
+    #[test]
+    fn an_association_names_the_caller_its_arn_addresses() {
+        let account = ::engine::emulator_account_id();
+        let session = format!("arn:aws:sts::{account}:assumed-role/Launcher/launch-session");
+        let role = format!("arn:aws:iam::{account}:role/Launcher");
+        let caller = CallerPrincipal {
+            arns: vec![session.clone(), role.clone()],
+        };
+
+        // Rows differ along the TYPE of the association, the form of its ARN (a role, a
+        // session, another principal, a path, a wildcard, an account-less pattern) and
+        // which of the caller's ARNs it addresses.
+        let rows: &[(&str, String, &str, bool)] = &[
+            ("the role behind the session", role.clone(), "IAM", true),
+            ("the session itself", session.clone(), "IAM", true),
+            (
+                "another role of the account",
+                format!("arn:aws:iam::{account}:role/Other"),
+                "IAM",
+                false,
+            ),
+            (
+                "the same name under a path",
+                format!("arn:aws:iam::{account}:role/service-role/Launcher"),
+                "IAM",
+                false,
+            ),
+            (
+                "a wildcard, which is no wildcard for an IAM principal",
+                format!("arn:aws:iam::{account}:role/Launch*"),
+                "IAM",
+                false,
+            ),
+            (
+                "a pattern over the role name",
+                format!("arn:aws:iam::{account}:role/Launch*"),
+                PRINCIPAL_TYPE_IAM_PATTERN,
+                true,
+            ),
+            (
+                "an account-less pattern of this account",
+                "arn:aws:iam:::role/Launch?r".to_string(),
+                PRINCIPAL_TYPE_IAM_PATTERN,
+                true,
+            ),
+            (
+                "a pattern over another account",
+                "arn:aws:iam::999999999999:role/Launch*".to_string(),
+                PRINCIPAL_TYPE_IAM_PATTERN,
+                false,
+            ),
+            (
+                "a pattern over the sessions of the role",
+                format!("arn:aws:sts::{account}:assumed-role/Launcher/*"),
+                PRINCIPAL_TYPE_IAM_PATTERN,
+                true,
+            ),
+            (
+                "a pattern over another role's sessions",
+                format!("arn:aws:sts::{account}:assumed-role/Other/*"),
+                PRINCIPAL_TYPE_IAM_PATTERN,
+                false,
+            ),
+            (
+                "a single-character wildcard one character short of the name",
+                format!("arn:aws:iam::{account}:role/Launch?"),
+                PRINCIPAL_TYPE_IAM_PATTERN,
+                false,
+            ),
+            (
+                "a value that is not an ARN at all",
+                "Launcher".to_string(),
+                PRINCIPAL_TYPE_IAM_PATTERN,
+                false,
+            ),
+        ];
+        for (case, association_arn, principal_type, named) in rows {
+            let answered = caller.names(association_arn, principal_type);
+            assert_eq!(
+                answered, *named,
+                "case {case:?}: expected {association_arn} as {principal_type} to name the \
+                 caller = {named}, got {answered}"
+            );
+        }
+    }
 
     /// RULE: a concrete principal the identity records HOLD reports the id those records
     /// hold for it; a value they resolve to no principal is recorded as given, and nothing

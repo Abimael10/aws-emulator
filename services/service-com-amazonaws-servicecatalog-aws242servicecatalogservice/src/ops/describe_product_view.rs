@@ -133,7 +133,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // WHO is asking: an end user reaches a product through a launch path, and a path
+        // is dependent on a principal as well as on a product and a portfolio. Resolved
+        // against the account's identity records BEFORE this service's own store is
+        // locked, so no two stores are held at once.
+        let caller = crate::state::request_caller_principal(&*self.engine, ctx);
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
         // A pure read: this operation reports the product a create or a copy stored and
@@ -149,33 +153,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // view and both resolve it here.
         //
         // This is the END-USER view of a product, and an end user reaches a product only
-        // through a LAUNCH PATH: a portfolio the product is associated with. A product no
-        // portfolio carries is therefore outside the catalog this operation can see,
-        // exactly as a product nothing stored carries is — the same scoping
-        // `DescribeProduct` applies, so the two end-user reads of one product cannot
-        // disagree about whether it is visible. The ADMIN view, `DescribeProductAsAdmin`,
-        // is what reads a product that sits in no portfolio.
-        let product = state
+        // through a LAUNCH PATH: a portfolio that carries the product AND grants this
+        // caller access to it. A product no such portfolio carries is therefore outside
+        // the catalog this operation can see, exactly as a product nothing stored carries
+        // is — the same scoping `DescribeProduct` applies, so the two end-user reads of
+        // one product cannot disagree about whether it is visible. The ADMIN view,
+        // `DescribeProductAsAdmin`, is what reads a product that sits in no portfolio.
+        let found = state
             .products
             .values()
-            .find(|product| product.view_id == input.id || product.id == input.id)
-            .filter(|product| !state.launch_path_portfolios(&product.id).is_empty())
-            .ok_or_else(|| {
+            .find(|product| product.view_id == input.id || product.id == input.id);
+        // The launch paths this caller reaches the product through, resolved ONCE: both
+        // whether the view is visible at all and the `HasDefaultPath` it reports come from
+        // this one set.
+        let paths = found
+            .map(|product| state.launch_path_portfolios(&product.id, &caller))
+            .unwrap_or_default();
+        let product = match found.filter(|_| !paths.is_empty()) {
+            Some(product) => product,
+            None => {
                 // One sentence for both reasons this read can fail, so a refusal cannot be
                 // read as "this product exists but you may not see it"; it names the
                 // member the request addressed the view by, and the value that member
                 // carried is its only variable part.
-                DescribeProductViewErrorModeled::ResourceNotFoundException(
+                return Err(DescribeProductViewErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(crate::state::product_view_not_found_message(&input.id)),
                     },
                 )
-            })?;
+                .into());
+            }
+        };
 
         Ok(DescribeProductViewOutput {
             // The same stored record `DescribeProduct` and the admin views report, rendered
             // by the one function that renders it, so every reader of one product agrees.
-            product_view_summary: Some(product.view_summary()),
+            // `HasDefaultPath` is this caller's own launch paths, the same set the product
+            // was resolved through just above.
+            product_view_summary: Some(product.view_summary_with_paths(paths.len())),
             // "Information about the provisioning artifacts for the product": every version
             // the product carries, in stored order — a copy's versions are its own, so they
             // are the ids the copy minted rather than the source's.

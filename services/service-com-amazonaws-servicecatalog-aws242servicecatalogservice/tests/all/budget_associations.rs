@@ -28,7 +28,7 @@ use service_com_amazonaws_servicecatalog_aws242servicecatalogservice::state::MAX
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    associate_product_with_portfolio, call, create_portfolio, create_product, emulator, error_code,
+    seed_launch_path, call, create_portfolio, create_product, emulator, error_code,
     message,
 };
 
@@ -290,7 +290,7 @@ async fn one_budget_reaches_every_resource_it_is_associated_with() {
     let product_id = create_product(&router, "shared-product", "shared-r").await;
     // The END-USER view of a product reaches it only through a launch path, so the product
     // goes into the portfolio before that reader is asked for its budgets.
-    associate_product_with_portfolio(&router, &product_id, &portfolio_id).await;
+    seed_launch_path(&router, &product_id, &portfolio_id).await;
 
     // A budget is not consumed by an association: associating it with a second resource
     // leaves the first association standing.

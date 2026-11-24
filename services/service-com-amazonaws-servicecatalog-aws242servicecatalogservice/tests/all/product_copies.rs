@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    associate_product_with_portfolio, call, create_portfolio, create_product, emulator, error_code,
+    seed_launch_path, call, create_portfolio, create_product, emulator, error_code,
     is_catalog_id, tag_list, tag_map, ACCOUNT_ID, DEFAULT_REGION,
 };
 
@@ -746,7 +746,7 @@ async fn the_end_user_view_reaches_a_product_only_through_a_portfolio() {
     // One portfolio carries the copy: that is its launch path, and the end-user view
     // reaches it through that path — and through it alone, so the source stays out of
     // view.
-    associate_product_with_portfolio(&router, &target_id, &portfolio_id).await;
+    seed_launch_path(&router, &target_id, &portfolio_id).await;
     for (case, body) in [
         ("the carried copy by id", json!({"Id": target_id.clone()})),
         ("the carried copy by name", json!({"Name": "access-copy"})),

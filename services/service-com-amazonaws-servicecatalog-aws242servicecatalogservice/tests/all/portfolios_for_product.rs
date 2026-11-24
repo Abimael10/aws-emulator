@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    associate_product_with_portfolio, call, create_constraint, create_portfolio, create_product,
+    seed_launch_path, call, create_constraint, create_portfolio, create_product,
     emulator, error_code,
 };
 
@@ -192,10 +192,10 @@ async fn the_listed_portfolios_are_the_products_stored_associations() {
         // associations would fail every row below.
         let other_product_id = create_product(&router, "other-product", "other-token").await;
         for portfolio_id in &portfolio_ids {
-            associate_product_with_portfolio(&router, &other_product_id, portfolio_id).await;
+            seed_launch_path(&router, &other_product_id, portfolio_id).await;
         }
         for index in row.portfolios {
-            associate_product_with_portfolio(&router, &product_id, &portfolio_ids[*index]).await;
+            seed_launch_path(&router, &product_id, &portfolio_ids[*index]).await;
         }
 
         let served = list_for(&router, case, &product_id).await;
@@ -291,7 +291,7 @@ async fn a_listed_portfolio_lives_exactly_as_long_as_its_association() {
     for (case, want_held) in steps {
         let want: BTreeSet<usize> = want_held.iter().copied().collect();
         for index in want.difference(&held).copied().collect::<Vec<_>>() {
-            associate_product_with_portfolio(&router, &product_id, &portfolio_ids[index]).await;
+            seed_launch_path(&router, &product_id, &portfolio_ids[index]).await;
         }
         for index in held.difference(&want).copied().collect::<Vec<_>>() {
             let (status, body) = call(
@@ -349,7 +349,7 @@ async fn paging_walks_every_associated_portfolio_exactly_once() {
                 &format!("portfolio-{i}"),
             )
             .await;
-            associate_product_with_portfolio(&router, &product_id, &portfolio_id).await;
+            seed_launch_path(&router, &product_id, &portfolio_id).await;
             created.insert(portfolio_id);
         }
 
@@ -425,7 +425,7 @@ async fn the_default_page_size_bounds_nothing() {
                 &format!("portfolio-{i}"),
             )
             .await;
-            associate_product_with_portfolio(&router, &product_id, &portfolio_id).await;
+            seed_launch_path(&router, &product_id, &portfolio_id).await;
             created.insert(portfolio_id);
         }
 
@@ -460,7 +460,7 @@ async fn a_bad_token_and_an_unknown_product_take_their_own_refusals() {
     let router = emulator();
     let portfolio_id = create_portfolio(&router, "alpha-portfolio", "acme", &[], "portfolio").await;
     let product_id = create_product(&router, "listed-product", "product-token").await;
-    associate_product_with_portfolio(&router, &product_id, &portfolio_id).await;
+    seed_launch_path(&router, &product_id, &portfolio_id).await;
 
     // Rows differ along HOW the token is malformed: not hex at all, odd-length hex, hex
     // that is not UTF-8, and hex of a value no id form admits.
@@ -549,7 +549,7 @@ async fn listing_the_portfolios_changes_nothing() {
     let portfolio_ids = seed_portfolios(&router).await;
     let product_id = create_product(&router, "listed-product", "product-token").await;
     for portfolio_id in &portfolio_ids[..2] {
-        associate_product_with_portfolio(&router, &product_id, portfolio_id).await;
+        seed_launch_path(&router, &product_id, portfolio_id).await;
     }
 
     let request = json!({"ProductId": product_id});
@@ -590,7 +590,7 @@ async fn a_source_portfolio_narrows_a_describe_to_the_stored_association() {
     let portfolio_ids = seed_portfolios(&router).await;
     let product_id = create_product(&router, "listed-product", "product-token").await;
     for index in [0usize, 2] {
-        associate_product_with_portfolio(&router, &product_id, &portfolio_ids[index]).await;
+        seed_launch_path(&router, &product_id, &portfolio_ids[index]).await;
     }
 
     // Rows: no source portfolio, each portfolio that holds the product, and portfolios
@@ -721,7 +721,7 @@ async fn a_held_product_cannot_be_deleted_and_takes_the_same_refusal_whichever_h
         let portfolio_ids = seed_portfolios(&router).await;
         let product_id = create_product(&router, "held-product", "product-token").await;
         for index in portfolios {
-            associate_product_with_portfolio(&router, &product_id, &portfolio_ids[*index]).await;
+            seed_launch_path(&router, &product_id, &portfolio_ids[*index]).await;
         }
         for (position, (index, constraint_type)) in constraints.iter().enumerate() {
             create_constraint(

@@ -439,8 +439,10 @@ async fn a_created_resource_reads_back_through_its_describe() {
         "case \"versions\": a created version carries the default guidance, got {versions}"
     );
 
-    // Associating the product with a portfolio gives it a launch path through that
-    // portfolio, and the describe reports both halves from the same stored set.
+    // Associating the product with a portfolio puts it IN that portfolio, and granting
+    // the calling principal access to the portfolio is the other half of the launch path
+    // a path is dependent on ("a specific product, porfolio, and principal"); the describe
+    // then reports both halves from the same stored set.
     let (status, body) = call(
         &router,
         "AssociateProductWithPortfolio",
@@ -450,6 +452,21 @@ async fn a_created_resource_reads_back_through_its_describe() {
     assert_eq!(
         status, 200,
         "case \"associated product\": expected 200, got {status} with {body}"
+    );
+    let (status, body) = call(
+        &router,
+        "AssociatePrincipalWithPortfolio",
+        &json!({
+            "PortfolioId": seeded.portfolio_id,
+            "PrincipalARN": ::service_common::caller_principal::ambient_user_arn(),
+            "PrincipalType": "IAM",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"associated product\": expected the caller to be granted access, got {status} with \
+         {body}"
     );
     let (status, described) = call(
         &router,

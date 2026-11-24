@@ -25,10 +25,45 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{json, Value};
 
 use crate::harness::{
-    associate_product_with_portfolio, call, create_portfolio, create_product,
-    create_product_of_type, emulator, error_code, first_provisioning_artifact_id, is_catalog_id,
-    message, tag_list, tag_map, ACCOUNT_ID, DEFAULT_REGION,
+    call, create_portfolio, create_product, create_product_of_type, emulator, error_code,
+    first_provisioning_artifact_id, is_catalog_id, message, seed_launch_path, tag_list, tag_map,
+    ACCOUNT_ID, DEFAULT_REGION,
 };
+
+/// How long a poll keeps looking for a condition the emulator's clock owes before it gives
+/// up. Far longer than any span this emulator settles on, so a loaded or slow host cannot
+/// fail a case a fast one passes: the loop below waits for the CONDITION, never for a fixed
+/// time.
+const POLL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// How long a poll waits between two looks.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Look at the provisioned product `describe` addresses until it reports `wanted`, or the
+/// deadline passes, and answer the body reported then.
+async fn provisioned_product_settles_to(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    describe: &Value,
+    wanted: &str,
+) -> Value {
+    let started = std::time::Instant::now();
+    loop {
+        let (status, described) = call(router, "DescribeProvisionedProduct", describe).await;
+        assert_eq!(
+            status, 200,
+            "DescribeProvisionedProduct {describe}: expected 200, got {status} with {described}"
+        );
+        if described["ProvisionedProductDetail"]["Status"].as_str() == Some(wanted) {
+            return described;
+        }
+        assert!(
+            started.elapsed() < POLL_DEADLINE,
+            "expected the provisioned product {describe} to reach {wanted}, last reported \
+             {described}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
 
 /// How a request addresses a resource that takes either an id or a name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,10 +178,10 @@ async fn provisioning_a_product_with_no_launch_path_is_refused_and_has_no_effect
         // A second product that IS in the portfolio, so a path reported for the product
         // under test cannot come from another product's association.
         let other_product_id = create_product(&router, "other-product", "other-token").await;
-        associate_product_with_portfolio(&router, &other_product_id, &portfolio_id).await;
+        seed_launch_path(&router, &other_product_id, &portfolio_id).await;
 
         if row.disassociate {
-            associate_product_with_portfolio(&router, &product_id, &portfolio_id).await;
+            seed_launch_path(&router, &product_id, &portfolio_id).await;
             let (status, body) = call(
                 &router,
                 "DisassociateProductFromPortfolio",
@@ -225,7 +260,7 @@ async fn provisioning_a_product_with_no_launch_path_is_refused_and_has_no_effect
         // The positive control: once a portfolio carries the product, the SAME request
         // resolves a path and is served.
         if row.stored.is_some() {
-            associate_product_with_portfolio(&router, &product_id, &portfolio_id).await;
+            seed_launch_path(&router, &product_id, &portfolio_id).await;
             let (status, provisioned) = call(&router, "ProvisionProduct", &request).await;
             assert_eq!(
                 status, 200,
@@ -329,7 +364,7 @@ async fn provisioning_persists_the_provisioned_product_and_its_record() {
         let product_id =
             create_product_of_type(&router, product_name, row.product_type, "product-token").await;
         let artifact_id = first_provisioning_artifact_id(&router, &product_id).await;
-        associate_product_with_portfolio(&router, &product_id, &portfolio_id).await;
+        seed_launch_path(&router, &product_id, &portfolio_id).await;
 
         let provisioned_name = "pp-under-test";
         let token = "provision-token";
@@ -559,12 +594,12 @@ async fn ambiguous_or_unresolvable_references_are_refused() {
     let product_name = "provisioned-source-product";
     let product_id = create_product(&router, product_name, "product-token").await;
     let artifact_id = first_provisioning_artifact_id(&router, &product_id).await;
-    associate_product_with_portfolio(&router, &product_id, &portfolio_id).await;
+    seed_launch_path(&router, &product_id, &portfolio_id).await;
     // Another product, in another portfolio, with its own version: its path and its
     // version belong to it and must not resolve for the product under test.
     let other_product_id = create_product(&router, "other-product", "other-token").await;
     let other_artifact_id = first_provisioning_artifact_id(&router, &other_product_id).await;
-    associate_product_with_portfolio(&router, &other_product_id, &other_portfolio_id).await;
+    seed_launch_path(&router, &other_product_id, &other_portfolio_id).await;
 
     // Rows differ along WHICH pair of members is ambiguous or unresolvable, and along
     // whether the refusal is about the request (parameter) or about the store
@@ -695,8 +730,8 @@ async fn a_product_with_several_paths_needs_the_path_named() {
     let second_id = create_portfolio(&router, second_name, "globex", &[], "portfolio-2").await;
     let product_id = create_product(&router, "provisioned-source-product", "product-token").await;
     let artifact_id = first_provisioning_artifact_id(&router, &product_id).await;
-    associate_product_with_portfolio(&router, &product_id, &first_id).await;
-    associate_product_with_portfolio(&router, &product_id, &second_id).await;
+    seed_launch_path(&router, &product_id, &first_id).await;
+    seed_launch_path(&router, &product_id, &second_id).await;
 
     // Rows: no path named (ambiguous), each path named by id, and each path named by
     // its portfolio's name.
@@ -777,7 +812,7 @@ async fn the_clock_completes_the_provisioning() {
     let portfolio_id = create_portfolio(&router, "alpha-portfolio", "acme", &[], "portfolio").await;
     let product_id = create_product(&router, "provisioned-source-product", "product-token").await;
     let artifact_id = first_provisioning_artifact_id(&router, &product_id).await;
-    associate_product_with_portfolio(&router, &product_id, &portfolio_id).await;
+    seed_launch_path(&router, &product_id, &portfolio_id).await;
 
     let provisioned_name = "pp-under-change";
     let (status, provisioned) = call(
@@ -812,21 +847,11 @@ async fn the_clock_completes_the_provisioning() {
         "a caller acting straight after the request still sees the transitive status: {in_flight}"
     );
 
-    // The transition is owed by the clock, not by this read: wait the span out and the
-    // SAME read reports the stable status and the record that succeeded.
-    std::thread::sleep(std::time::Duration::from_millis(3_500));
-
-    let (status, settled) = call(&router, "DescribeProvisionedProduct", &describe).await;
-    assert_eq!(
-        status, 200,
-        "expected the second describe to be served, got {status} with {settled}"
-    );
+    // The transition is owed by the clock, not by this read: the SAME read is looked at
+    // again until it reports the stable status, never for a fixed time, so a loaded host
+    // cannot fail a case a fast one passes.
+    let settled = provisioned_product_settles_to(&router, &describe, "AVAILABLE").await;
     let detail = &settled["ProvisionedProductDetail"];
-    assert_eq!(
-        detail["Status"].as_str(),
-        Some("AVAILABLE"),
-        "the clock owes the completion, so the provisioned product must be stable: {settled}"
-    );
     assert_eq!(
         detail["LastSuccessfulProvisioningRecordId"].as_str(),
         Some(record_id.as_str()),
@@ -893,7 +918,7 @@ async fn seed_provisioned_products(
                 &format!("product-{index}"),
             )
             .await;
-            associate_product_with_portfolio(router, &product_id, &portfolio_id).await;
+            seed_launch_path(router, &product_id, &portfolio_id).await;
             product_ids.insert(seed.product.to_string(), product_id);
         }
         let product_id = &product_ids[seed.product];

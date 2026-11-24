@@ -31,9 +31,9 @@ use serde_json::json;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    associate_product_with_portfolio, call, call_signed_by, create_portfolio,
-    create_product_with_info, create_template_bucket, emulator_with_identity_services,
-    emulator_with_template_services, first_provisioning_artifact_id, stage_template,
+    call, call_signed_by, create_portfolio, create_product_with_info, create_template_bucket,
+    emulator_with_identity_services, emulator_with_template_services,
+    first_provisioning_artifact_id, grant_principal_on_portfolio, seed_launch_path, stage_template,
     staged_template_url, tag_list, ACCOUNT_ID, DEFAULT_REGION, HARNESS_ACCESS_KEY_ID,
 };
 
@@ -406,7 +406,7 @@ async fn seed_path(
     )
     .await;
     let version = first_provisioning_artifact_id(router, &product_id).await;
-    associate_product_with_portfolio(router, &product_id, &portfolio_id).await;
+    seed_launch_path(router, &product_id, &portfolio_id).await;
 
     for seed in tag_options {
         let id = create_tag_option(router, seed.key, seed.value).await;
@@ -715,6 +715,11 @@ async fn the_deployed_stack_records_the_principal_whose_credential_asked_for_the
 
     for (case, name, access_key_id, expected) in rows {
         let path = seed_path(&router, name, &[]).await;
+        // A launch is dependent on a principal as well as on a product and a portfolio, so
+        // the principal that will ask for THIS launch is granted access to its path's
+        // portfolio ([`seed_launch_path`] grants the harness's own, which is the second
+        // row's caller).
+        grant_principal_on_portfolio(&router, &path.portfolio_id, expected, "IAM").await;
         let launched = provision(&router, case, access_key_id, name, &path, &[]).await;
         let carried = tags_of_deployed_stack(&router, case, &launched.stack).await;
         let recorded = carried

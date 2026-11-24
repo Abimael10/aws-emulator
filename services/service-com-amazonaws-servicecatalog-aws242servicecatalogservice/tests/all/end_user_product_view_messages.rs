@@ -20,7 +20,7 @@
 use serde_json::{json, Value};
 
 use crate::harness::{
-    associate_product_with_portfolio, call, create_portfolio, create_product, emulator, error_code,
+    seed_launch_path, call, create_portfolio, create_product, emulator, error_code,
     first_provisioning_artifact_id, message,
 };
 
@@ -178,7 +178,7 @@ async fn a_stored_product_out_of_view_is_refused_with_the_same_sentence() {
     // above really were the view's and not a broken lookup.
     let portfolio_id =
         create_portfolio(&router, "hidden-portfolio", "acme", &[], "tok-hidden-port").await;
-    associate_product_with_portfolio(&router, &hidden_id, &portfolio_id).await;
+    seed_launch_path(&router, &hidden_id, &portfolio_id).await;
     for (case, request) in [
         ("by Id", json!({"Id": hidden_id.clone()})),
         ("by Name", json!({"Name": "hidden-product"})),
@@ -266,7 +266,7 @@ async fn emulator_with_a_reachable_product() -> smithy_server_runtime::MultiServ
     let portfolio_id =
         create_portfolio(&router, "view-portfolio", "acme", &[], "tok-view-port").await;
     let product_id = create_product(&router, "view-product", "tok-view-product").await;
-    associate_product_with_portfolio(&router, &product_id, &portfolio_id).await;
+    seed_launch_path(&router, &product_id, &portfolio_id).await;
     // The product has a version, so the view it serves is a complete one.
     let _ = first_provisioning_artifact_id(&router, &product_id).await;
     let (status, described) = call(&router, "DescribeProduct", &json!({"Id": product_id})).await;

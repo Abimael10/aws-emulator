@@ -14,8 +14,8 @@ use std::time::SystemTime;
 mod principal_identity;
 
 pub use principal_identity::{
-    association_principal_identifier, principal_identifier, request_principal_arn, IamState,
-    PRINCIPAL_TYPE_IAM_PATTERN,
+    association_principal_identifier, principal_identifier, request_caller_principal,
+    request_principal_arn, CallerPrincipal, IamState, PRINCIPAL_TYPE_IAM_PATTERN,
 };
 
 /// What the stack behind a provisioned product is TAGGED with: its own concern, in its
@@ -182,6 +182,21 @@ impl Portfolio {
             self.principals.iter().collect();
         associations.sort_by_key(|(_, association)| association.sequence);
         associations
+    }
+
+    /// Whether this portfolio GRANTS `caller` access to what it carries.
+    ///
+    /// "When provisioning a product that's been added to a portfolio, you must grant your
+    /// user, group, or role access to the portfolio" (`ListLaunchPaths`): the grant IS one
+    /// of the stored associations, and it is in force for a caller one of them names
+    /// ([`CallerPrincipal::names`]). A portfolio that holds no association grants nobody,
+    /// and a grant removed by `DisassociatePrincipalFromPortfolio` stops being in force at
+    /// once — the decision is read from the associations the store holds NOW, so it is
+    /// never a latch.
+    pub fn grants(&self, caller: &CallerPrincipal) -> bool {
+        self.principals
+            .iter()
+            .any(|(arn, association)| caller.names(arn, &association.principal_type))
     }
 }
 
@@ -529,8 +544,21 @@ impl Product {
         }
     }
 
-    /// This record as the modelled `ProductViewSummary`.
+    /// This record as the modelled `ProductViewSummary`, with `HasDefaultPath` derived
+    /// from the portfolios that carry the product — the reading an ADMIN view takes,
+    /// which is about the product rather than about one caller's access.
     pub fn view_summary(&self) -> ProductViewSummary {
+        self.view_summary_with_paths(self.portfolio_ids.len())
+    }
+
+    /// This record as the modelled `ProductViewSummary` for a reader that has already
+    /// resolved how many launch paths it can see — the END-USER views, whose paths are
+    /// the portfolios that grant the calling principal access
+    /// ([`ComAmazonawsServicecatalogAws242servicecatalogserviceState::launch_path_portfolios`]).
+    ///
+    /// Reported from the same count the response's own `LaunchPaths` is built from, so one
+    /// response cannot say a product has a default path and then report no path at all.
+    pub fn view_summary_with_paths(&self, launch_paths: usize) -> ProductViewSummary {
         ProductViewSummary {
             id: Some(self.view_id.clone()),
             product_id: Some(self.id.clone()),
@@ -541,11 +569,9 @@ impl Product {
             distributor: self.distributor.clone(),
             // "If the product does not have a default path, call ListLaunchPaths to
             // disambiguate between paths" — a product reachable through exactly one
-            // portfolio needs no disambiguation, so that one path is its default;
-            // zero or several portfolios leave it without one. Derived from the same
-            // stored set `DescribeProduct` reports as `LaunchPaths`, so one response
-            // cannot contradict itself.
-            has_default_path: self.portfolio_ids.len() == 1,
+            // path needs no disambiguation, so that one path is its default; zero or
+            // several paths leave it without one.
+            has_default_path: launch_paths == 1,
             support_email: self.support_email.clone(),
             support_description: self.support_description.clone(),
             support_url: self.support_url.clone(),
@@ -1681,26 +1707,34 @@ impl ComAmazonawsServicecatalogAws242servicecatalogserviceState {
         self.provision_idempotency.insert(token, record_id);
     }
 
-    /// The portfolios `product_id` can be launched through — its launch paths.
+    /// The portfolios `product_id` can be launched through BY `caller` — its launch paths.
     ///
-    /// A launch path is a portfolio the product can be launched through, so the paths
-    /// ARE the product's stored portfolio associations: the same set `DescribeProduct`
-    /// reports as `LaunchPaths`, `ListLaunchPaths` pages over and
-    /// `ProductViewSummary$HasDefaultPath` is derived from. A product no portfolio
-    /// holds resolves no path at all, and neither does a product id nothing stored
+    /// "A path is dependent on a specific product, porfolio, and principal"
+    /// (`ListLaunchPaths`), so a path is a portfolio that satisfies BOTH halves of that
+    /// triple: it carries the product (`AssociateProductWithPortfolio`) AND it grants the
+    /// calling principal access to the portfolio ([`Portfolio::grants`], which
+    /// `AssociatePrincipalWithPortfolio` stores and
+    /// `DisassociatePrincipalFromPortfolio` removes). Either half missing is no path: a
+    /// product no portfolio holds resolves none, a product in portfolios that grant this
+    /// caller nothing resolves none either, and neither does a product id nothing stored
     /// carries.
     ///
-    /// The principal half of a path ("a path is dependent on a specific product,
-    /// portfolio, and principal") cannot be evaluated here: a request carries only the
-    /// access key id of its signature, and this crate holds no resolution from that to
-    /// the principal ARN an association names. The paths are therefore the
-    /// product-portfolio ones, unfiltered by [`Portfolio::principals`].
-    pub fn launch_path_portfolios(&self, product_id: &str) -> Vec<&Portfolio> {
+    /// The one place a launch path is resolved, so every response derived from a product's
+    /// launchability — the paths `ListLaunchPaths` pages over, `DescribeProduct`'s
+    /// `LaunchPaths`, the `HasDefaultPath` of an end-user product view, and the path a
+    /// provisioning request names — is derived from the same set and cannot contradict
+    /// another.
+    pub fn launch_path_portfolios(
+        &self,
+        product_id: &str,
+        caller: &CallerPrincipal,
+    ) -> Vec<&Portfolio> {
         self.products
             .get(product_id)
             .into_iter()
             .flat_map(|product| product.portfolio_ids.iter())
             .filter_map(|portfolio_id| self.portfolios.get(portfolio_id))
+            .filter(|portfolio| portfolio.grants(caller))
             .collect()
     }
 

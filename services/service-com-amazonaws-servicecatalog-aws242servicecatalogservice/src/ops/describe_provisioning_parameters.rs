@@ -169,6 +169,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // WHO is asking: the launch path this read is about is dependent on a principal
+        // as well as on a product and a portfolio. Resolved against the account's identity
+        // records BEFORE this service's own store is locked, so no two stores are held at
+        // once.
+        let caller = crate::state::request_caller_principal(&*self.engine, ctx);
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
 
@@ -178,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // template is read, so no store lock is held across an await.
         let launch = {
             let state = state.lock();
-            resolve(&state, &input)?
+            resolve(&state, &input, &caller)?
         };
 
         // "Information about the parameters used to provision the product": the
@@ -243,6 +248,7 @@ use crate::state::TemplateSource;
 fn resolve(
     state: &crate::state::ComAmazonawsServicecatalogAws242servicecatalogserviceState,
     input: &DescribeProvisioningParametersInput,
+    caller: &crate::state::CallerPrincipal,
 ) -> Result<Launch, DescribeProvisioningParametersError> {
     // The product is addressed by id or by name — "You must provide the product name
     // or ID, but not both" — and a request that addresses it by neither names no
@@ -263,13 +269,13 @@ fn resolve(
     };
 
     // A launch path is the product's relationship with a portfolio it can be launched
-    // through, so the paths a request's `PathId`/`PathName` is validated against are the
-    // product's stored portfolio associations — and a product id or name nothing stored
-    // carries resolves none of them.
+    // through BY THIS CALLER, so the paths a request's `PathId`/`PathName` is validated
+    // against are the product's portfolios that also grant the caller access — and a
+    // product id or name nothing stored carries resolves none of them.
     let paths: Vec<(String, String)> = product
         .map(|product| {
             state
-                .launch_path_portfolios(&product.id)
+                .launch_path_portfolios(&product.id, caller)
                 .into_iter()
                 .map(|portfolio| (portfolio.id.clone(), portfolio.display_name.clone()))
                 .collect()

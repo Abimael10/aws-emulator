@@ -3,11 +3,13 @@
 //! `ListLaunchPaths` over the wire, driven as awsJson1_1 requests through the same
 //! `MultiServiceRouter` the production emulator mounts.
 //!
-//! The rule under test: a product's launch paths ARE the portfolio associations the
-//! service holds for it — one path per carrying portfolio, identified and named by that
+//! The rule under test: a product's launch paths ARE the portfolios that carry it and
+//! grant the caller access — one path per such portfolio, identified and named by that
 //! portfolio, carrying the constraints stored for that portfolio-product pair and the
-//! portfolio's tags — and a product no portfolio carries resolves no path at all, which
-//! is the modelled 400 `ResourceNotFoundException` and never an empty page.
+//! portfolio's tags — and a product no such portfolio carries resolves no path at all,
+//! which is the modelled 400 `ResourceNotFoundException` and never an empty page. Every
+//! case here seeds BOTH halves of a path (`seed_launch_path`); the principal half is the
+//! subject of `launch_path_principal_grants.rs`.
 //!
 //! Every assertion here is about STORED state: a response is checked against what an
 //! earlier create or associate persisted, never against a value this file hands the
@@ -18,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{json, Value};
 
 use crate::harness::{
-    associate_product_with_portfolio, call, create_constraint, create_portfolio, create_product,
+    seed_launch_path, call, create_constraint, create_portfolio, create_product,
     emulator, error_code, tag_map,
 };
 
@@ -187,7 +189,7 @@ async fn launch_paths_are_the_portfolios_that_carry_the_product() {
         // test cannot come from another product's associations or constraints.
         let other_product_id = create_product(&router, "other-product", "other-token").await;
         for portfolio_id in &portfolio_ids {
-            associate_product_with_portfolio(&router, &other_product_id, portfolio_id).await;
+            seed_launch_path(&router, &other_product_id, portfolio_id).await;
         }
         create_constraint(
             &router,
@@ -200,7 +202,7 @@ async fn launch_paths_are_the_portfolios_that_carry_the_product() {
         .await;
 
         for index in row.portfolios {
-            associate_product_with_portfolio(&router, &product_id, &portfolio_ids[*index]).await;
+            seed_launch_path(&router, &product_id, &portfolio_ids[*index]).await;
         }
         for (position, (index, constraint_type, description)) in row.constraints.iter().enumerate() {
             create_constraint(
@@ -333,7 +335,7 @@ async fn a_path_lives_exactly_as_long_as_its_association() {
     for (case, want_held, expected) in steps {
         let want: BTreeSet<usize> = want_held.iter().copied().collect();
         for index in want.difference(&held).copied().collect::<Vec<_>>() {
-            associate_product_with_portfolio(&router, &product_id, &ids[index]).await;
+            seed_launch_path(&router, &product_id, &ids[index]).await;
         }
         for index in held.difference(&want).copied().collect::<Vec<_>>() {
             let (status, body) = call(
@@ -405,7 +407,7 @@ async fn paging_walks_every_launch_path_exactly_once() {
                 &format!("portfolio-{i}"),
             )
             .await;
-            associate_product_with_portfolio(&router, &product_id, &portfolio_id).await;
+            seed_launch_path(&router, &product_id, &portfolio_id).await;
             created.insert(portfolio_id);
         }
 
@@ -485,7 +487,7 @@ async fn the_default_page_size_bounds_nothing() {
                 &format!("portfolio-{i}"),
             )
             .await;
-            associate_product_with_portfolio(&router, &product_id, &portfolio_id).await;
+            seed_launch_path(&router, &product_id, &portfolio_id).await;
             created.insert(portfolio_id);
         }
 
@@ -520,7 +522,7 @@ async fn a_bad_token_and_an_unknown_product_take_their_own_refusals() {
     let router = emulator();
     let portfolio_id = create_portfolio(&router, "alpha-portfolio", "acme", &[], "portfolio").await;
     let product_id = create_product(&router, "listed-product", "product-token").await;
-    associate_product_with_portfolio(&router, &product_id, &portfolio_id).await;
+    seed_launch_path(&router, &product_id, &portfolio_id).await;
 
     // Rows differ along HOW the token is malformed: not hex at all, odd-length hex, hex
     // that is not UTF-8, and hex of a value no id form admits.
@@ -600,7 +602,7 @@ async fn listing_the_paths_changes_nothing() {
     )
     .await;
     let product_id = create_product(&router, "listed-product", "product-token").await;
-    associate_product_with_portfolio(&router, &product_id, &portfolio_id).await;
+    seed_launch_path(&router, &product_id, &portfolio_id).await;
     create_constraint(
         &router,
         &portfolio_id,

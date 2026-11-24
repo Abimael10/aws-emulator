@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    associate_product_with_portfolio, call, create_portfolio, create_product_of_type, emulator,
+    seed_launch_path, call, create_portfolio, create_product_of_type, emulator,
     error_code, is_catalog_id, message, ACCOUNT_ID, DEFAULT_REGION,
 };
 
@@ -278,7 +278,7 @@ async fn a_product_view_reports_the_stored_product_and_its_versions() {
                 &format!("tok-view-port-{index}-{portfolio}"),
             )
             .await;
-            associate_product_with_portfolio(&router, &product_id, &portfolio_id).await;
+            seed_launch_path(&router, &product_id, &portfolio_id).await;
         }
         for extra in 0..row.extra_versions {
             let token = copy_into(
@@ -411,7 +411,7 @@ async fn an_unreachable_view_is_refused_with_the_product_view_sentence() {
         "tok-refusal-visible",
     )
     .await;
-    associate_product_with_portfolio(&router, &visible_id, &portfolio_id).await;
+    seed_launch_path(&router, &visible_id, &portfolio_id).await;
     let (status, in_view) = describe_view(&router, &stored_view_id(&router, &visible_id).await).await;
     assert_eq!(
         status, 200,
@@ -493,7 +493,7 @@ async fn an_unreachable_view_is_refused_with_the_product_view_sentence() {
         Some(hidden_id.as_str()),
         "the hidden product must be stored, got {hidden_summary}"
     );
-    associate_product_with_portfolio(&router, &hidden_id, &portfolio_id).await;
+    seed_launch_path(&router, &hidden_id, &portfolio_id).await;
     for (case, identifier) in [
         ("by its view id", &hidden_view_id),
         ("by its product id", &hidden_id),
@@ -526,7 +526,7 @@ async fn a_copied_product_comes_into_view_with_its_own_versions() {
         "tok-copy-source",
     )
     .await;
-    associate_product_with_portfolio(&router, &source_id, &portfolio_id).await;
+    seed_launch_path(&router, &source_id, &portfolio_id).await;
     let source_view_id = stored_view_id(&router, &source_id).await;
     let source_versions = stored_versions(&router, &source_id).await;
     let source_arn = stored_arn(&router, &source_id).await;
@@ -587,7 +587,7 @@ async fn a_copied_product_comes_into_view_with_its_own_versions() {
     );
 
     // Giving the copy a launch path brings it into view with its own versions.
-    associate_product_with_portfolio(&router, &copy_id, &portfolio_id).await;
+    seed_launch_path(&router, &copy_id, &portfolio_id).await;
     let (status, described) = describe_view(&router, &copy_view_id).await;
     assert_eq!(
         status, 200,

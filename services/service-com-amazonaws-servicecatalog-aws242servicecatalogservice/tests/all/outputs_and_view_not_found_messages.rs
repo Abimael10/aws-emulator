@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    associate_product_with_portfolio, call, create_portfolio, create_product_of_type,
+    seed_launch_path, call, create_portfolio, create_product_of_type,
     create_product_with_info, create_template_bucket, emulator, emulator_with_template_services,
     error_code, first_provisioning_artifact_id, message, stage_template, staged_template_url,
 };
@@ -255,7 +255,7 @@ async fn launch(router: &MultiServiceRouter, slug: &str) -> (String, String) {
     let version_id = first_provisioning_artifact_id(router, &product_id).await;
     let portfolio_id =
         create_portfolio(router, &format!("{slug}-portfolio"), "acme", &[], slug).await;
-    associate_product_with_portfolio(router, &product_id, &portfolio_id).await;
+    seed_launch_path(router, &product_id, &portfolio_id).await;
 
     let name = format!("{slug}-pp");
     let (status, provisioned) = call(
@@ -414,7 +414,7 @@ async fn a_product_view_is_served_and_every_near_miss_of_its_id_is_refused() {
     let portfolio_id = create_portfolio(&router, "view-portfolio", "acme", &[], "tok-vp").await;
     let visible_id =
         create_product_of_type(&router, "view-visible", CFN_PRODUCT, "tok-view-visible").await;
-    associate_product_with_portfolio(&router, &visible_id, &portfolio_id).await;
+    seed_launch_path(&router, &visible_id, &portfolio_id).await;
     let (status, in_view) = call(&router, "DescribeProductView", &json!({"Id": visible_id})).await;
     assert_eq!(
         status, 200,

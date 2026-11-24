@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    associate_product_with_portfolio, call, constraint_parameters, create_constraint,
+    seed_launch_path, call, constraint_parameters, create_constraint,
     create_portfolio, create_product_with_info, create_template_bucket, emulator_with_template_services,
     error_code, message, stage_template, DEFAULT_REGION, TEMPLATE_BUCKET,
 };
@@ -388,7 +388,7 @@ async fn the_parameters_reported_are_the_ones_the_versions_template_declares() {
             &token(row.product),
         )
         .await;
-        associate_product_with_portfolio(&router, &product, &portfolio).await;
+        seed_launch_path(&router, &product, &portfolio).await;
         let version = only_version(&router, &product).await;
 
         let (status, body) = describe_parameters(
@@ -473,7 +473,7 @@ async fn a_version_naming_a_stack_reports_the_parameters_that_stacks_template_de
         "imported-from-stack",
     )
     .await;
-    associate_product_with_portfolio(&router, &product, &portfolio).await;
+    seed_launch_path(&router, &product, &portfolio).await;
     let version = only_version(&router, &product).await;
 
     let (status, body) = describe_parameters(
@@ -615,7 +615,7 @@ async fn the_tag_options_offered_are_the_ones_the_launchs_resources_carry() {
         "tagged-product",
     )
     .await;
-    associate_product_with_portfolio(&router, &product, &portfolio).await;
+    seed_launch_path(&router, &product, &portfolio).await;
     let version = only_version(&router, &product).await;
 
     for seed in TAG_OPTION_SEEDS {
@@ -701,8 +701,8 @@ async fn the_constraints_reported_are_the_ones_stored_on_the_launchs_path() {
         "unconstrained-product",
     )
     .await;
-    associate_product_with_portfolio(&router, &product, &portfolio).await;
-    associate_product_with_portfolio(&router, &other_product, &other_portfolio).await;
+    seed_launch_path(&router, &product, &portfolio).await;
+    seed_launch_path(&router, &other_product, &other_portfolio).await;
     let version = only_version(&router, &product).await;
     let other_version = only_version(&router, &other_product).await;
 
@@ -855,7 +855,7 @@ async fn a_launch_is_addressed_by_id_or_by_name_and_refused_otherwise() {
         "addressed-product",
     )
     .await;
-    associate_product_with_portfolio(&router, &product, &path).await;
+    seed_launch_path(&router, &product, &path).await;
     let version = only_version(&router, &product).await;
 
     let unreachable_product = create_product_with_info(
@@ -876,8 +876,8 @@ async fn a_launch_is_addressed_by_id_or_by_name_and_refused_otherwise() {
         "two-path-product",
     )
     .await;
-    associate_product_with_portfolio(&router, &two_path_product, &path).await;
-    associate_product_with_portfolio(&router, &two_path_product, &second_path).await;
+    seed_launch_path(&router, &two_path_product, &path).await;
+    seed_launch_path(&router, &two_path_product, &second_path).await;
     let two_path_version = only_version(&router, &two_path_product).await;
 
     let seed = Seed {

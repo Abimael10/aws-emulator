@@ -182,7 +182,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // plan would deploy records about the launch. Resolved against the account's
         // identity records BEFORE this service's own store is locked, so no two stores are
         // held at once.
-        let provisioning_principal_arn = crate::state::request_principal_arn(&*self.engine, ctx);
+        // WHO asked for the change this plan plans, as `sts:GetCallerIdentity` reports it
+        // for the credential the request was signed with: one of the things the stack this
+        // plan would deploy records about the launch, and the principal whose own launch
+        // paths the plan is planned through. Resolved against the account's identity
+        // records BEFORE this service's own store is locked, so no two stores are held at
+        // once.
+        let caller = crate::state::request_caller_principal(&*self.engine, ctx);
+        let provisioning_principal_arn = caller.arn().to_string();
 
         // Everything this service itself holds is resolved and stored under the lock,
         // which is RELEASED before the change set behind the plan is asked for: no store
@@ -215,11 +222,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // exactly as `ProvisionProduct` does.
             //
             // A launch path is the product's relationship with a portfolio it can be
-            // launched through, so a product that sits in no portfolio — and a product
-            // id nothing stored carries, which resolves no path either — has no path to
-            // provision through.
+            // launched through BY THIS CALLER, so a product that sits in no portfolio that
+            // grants the caller access — and a product id nothing stored carries, which
+            // resolves no path either — has no path to provision through.
             let paths: Vec<String> = state
-                .launch_path_portfolios(&input.product_id)
+                .launch_path_portfolios(&input.product_id, &caller)
                 .into_iter()
                 .map(|portfolio| portfolio.id.clone())
                 .collect();

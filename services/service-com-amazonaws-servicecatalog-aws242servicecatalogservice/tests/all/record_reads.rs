@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    associate_product_with_portfolio, call, create_portfolio, create_product_with_info,
+    seed_launch_path, call, create_portfolio, create_product_with_info,
     create_template_bucket, emulator_with_template_services, error_code, first_provisioning_artifact_id,
     message, s3, stage_template, staged_template_url,
 };
@@ -108,7 +108,7 @@ async fn launch(router: &MultiServiceRouter, name: &str) -> Launched {
     )
     .await;
     let version = first_provisioning_artifact_id(router, &product).await;
-    associate_product_with_portfolio(router, &product, &portfolio).await;
+    seed_launch_path(router, &product, &portfolio).await;
 
     let (status, provisioned) = call(
         router,
