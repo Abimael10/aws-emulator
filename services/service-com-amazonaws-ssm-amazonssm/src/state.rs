@@ -2071,6 +2071,10 @@ pub struct ParsedDocumentContent {
     pub description: Option<String>,
     /// One entry per `parameters` entry, in the content's own order.
     pub parameters: Vec<DocumentParameter>,
+    /// What each of those parameters ADMITS as a value, in the same order: the part of a
+    /// `parameters` entry the modelled `DocumentParameter` has no member for
+    /// ([`DeclaredParameterConstraints`]).
+    pub parameter_constraints: Vec<DeclaredParameterConstraints>,
     /// The platforms the content's steps leave the document compatible with, or every
     /// modelled platform when they restrict it to none
     /// ([`document_platforms::declared_platform_types`]).
@@ -2091,6 +2095,37 @@ fn content_within_size(content: &str) -> Result<(), ContentRejection> {
         )));
     }
     Ok(())
+}
+
+/// How large a regular expression a REQUEST carries may compile to, in bytes of compiled
+/// program, and how large the lazy-DFA cache a match through it may use.
+///
+/// Emulator resource guards: an expression a caller supplied — a parameter's
+/// `AllowedPattern`, a document's `allowedPattern` — builds an automaton and matches through
+/// a cache, so both are bounded explicitly rather than left to the crate's defaults, and a
+/// pattern past the first is treated as one this service cannot evaluate. The `regex` crate's
+/// matching is linear in the input and has no backtracking blowup, so with the automaton and
+/// the cache bounded here, the cost of one match grows no faster than the value the request
+/// carried.
+///
+/// ONE budget for every caller-supplied expression of this service, so no reader of one can
+/// be more generous than another ([`parameter_pattern`],
+/// `crate::ops::put_parameter`'s `AllowedPattern` reading).
+pub const COMPILED_PATTERN_LIMIT: usize = 64 * 1024;
+
+/// See [`COMPILED_PATTERN_LIMIT`].
+pub const PATTERN_DFA_LIMIT: usize = 64 * 1024;
+
+/// `pattern`, as supplied by a caller, compiled under this service's budget for one
+/// ([`COMPILED_PATTERN_LIMIT`]) — `None` for an expression this service cannot evaluate,
+/// which restricts nothing rather than making the document that carries it unusable (the
+/// framework's own treatment of a pattern it cannot compile).
+pub fn parameter_pattern(pattern: &str) -> Option<::regex::Regex> {
+    ::regex::RegexBuilder::new(pattern)
+        .size_limit(COMPILED_PATTERN_LIMIT)
+        .dfa_size_limit(PATTERN_DFA_LIMIT)
+        .build()
+        .ok()
 }
 
 /// The `PingStatus` a node that has just pinged the service carries (from the modelled

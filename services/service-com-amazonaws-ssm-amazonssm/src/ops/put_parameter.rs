@@ -338,19 +338,16 @@ struct Existing {
 }
 
 /// How large an `AllowedPattern` may compile to, in bytes of compiled program, and how
-/// large the lazy-DFA cache it may use.
+/// large the lazy-DFA cache it may use: this service's one budget for an expression a
+/// request carries ([`crate::state::COMPILED_PATTERN_LIMIT`]).
 ///
-/// Emulator resource guards: the expression comes from the request, so the automaton it
-/// builds and the cache it matches through are bounded explicitly rather than left to
-/// the crate's defaults — a cache that cannot be thrashed into the slower engine. A
-/// pattern past the first is refused as one this service cannot evaluate. The haystack
-/// is bounded too: `PutParameter` refuses a `Value` larger than the content size limit
-/// of the tier it resolved before this runs, so neither factor of the matching cost is
-/// caller-unbounded.
-const COMPILED_PATTERN_LIMIT: usize = 64 * 1024;
+/// The haystack is bounded too: `PutParameter` refuses a `Value` larger than the content
+/// size limit of the tier it resolved before this runs, so neither factor of the matching
+/// cost is caller-unbounded.
+const COMPILED_PATTERN_LIMIT: usize = crate::state::COMPILED_PATTERN_LIMIT;
 
 /// See [`COMPILED_PATTERN_LIMIT`].
-const PATTERN_DFA_LIMIT: usize = 64 * 1024;
+const PATTERN_DFA_LIMIT: usize = crate::state::PATTERN_DFA_LIMIT;
 
 /// What a put that carries both `Overwrite` and tags is refused with: entirely fixed text,
 /// with no part of it taken from the request.

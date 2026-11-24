@@ -308,7 +308,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if let Some(why) = crate::state::commands::parameter_rejection(
             &document.name,
-            &version.parsed.parameters,
+            &version.parsed,
             &named,
         ) {
             return Err(invalid_parameters(why).into());

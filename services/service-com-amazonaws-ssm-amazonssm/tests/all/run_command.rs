@@ -580,7 +580,9 @@ async fn a_node_named_more_than_once_is_refused() {
 }
 
 /// Targets are criteria: they select the registered nodes that meet them, and criteria no
-/// node meets leave the command with no invocation rather than refusing the send.
+/// node meets leave the command with no invocation rather than refusing the send. The two
+/// keys that NAME nodes instead of describing them are resolved like `InstanceIds`, which is
+/// asserted where that rule lives ([`crate::run_command_validation_order`]).
 #[tokio::test]
 async fn targets_select_the_nodes_that_meet_them_and_none_is_served() {
     let (router, engine) = service();
@@ -641,11 +643,6 @@ async fn targets_select_the_nodes_that_meet_them_and_none_is_served() {
         (
             "a tag key no node holds",
             json!([{"Key": "tag:absent", "Values": ["dev"]}]),
-            vec![],
-        ),
-        (
-            "a node id of another Region",
-            json!([{"Key": "InstanceIds", "Values": [OTHER_ONLY]}]),
             vec![],
         ),
         (
@@ -1215,21 +1212,21 @@ async fn a_read_resolves_a_command_by_the_id_its_send_minted() {
 
     // One row per way a read names something the store does not hold: a well-formed id no
     // send minted, the id of a command sent to another Region, a node id the command holds
-    // no invocation for — whether or not a node is registered under it, since the pair is
-    // resolved against the invocations the command persisted — and a step the document
-    // declares nothing of.
+    // no invocation for — the first three all resolve no invocation of the PAIR, whether or
+    // not a node is registered under the id, since the pair is resolved against the
+    // invocations the command persisted — and a step the document declares nothing of.
     let rows: Vec<(&str, Value, &str, &str)> = vec![
         (
             "an id no send minted",
             json!({"CommandId": "11111111-2222-3333-4444-555555555555", "InstanceId": LINUX}),
             REGION,
-            "InvalidCommandId",
+            "InvocationDoesNotExist",
         ),
         (
             "a command of another Region",
             json!({"CommandId": first.clone(), "InstanceId": LINUX}),
             OTHER_REGION,
-            "InvalidCommandId",
+            "InvocationDoesNotExist",
         ),
         (
             "a node that is not registered",
@@ -1343,7 +1340,7 @@ async fn a_command_is_reported_for_as_long_as_its_history_is_retained() {
         } else {
             assert_eq!(
                 (status, error_code(&reported).as_str()),
-                (400, "InvalidCommandId"),
+                (400, "InvocationDoesNotExist"),
                 "case {case:?}: expected the command to be gone, got {status} with \
                  {reported:?}"
             );
@@ -1391,7 +1388,7 @@ async fn the_command_history_the_store_keeps_is_bounded() {
     let (status, reported) = invocation(&router, &first, LINUX).await;
     assert_eq!(
         (status, error_code(&reported).as_str()),
-        (400, "InvalidCommandId"),
+        (400, "InvocationDoesNotExist"),
         "the oldest command's history is the one dropped, got {status} with {reported:?}"
     );
 }

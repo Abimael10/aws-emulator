@@ -9,11 +9,14 @@
 //! Region it was sent to, and the nodes it created an invocation for are the nodes this
 //! answers for. The pair the request names is resolved against the invocations the
 //! command PERSISTED — an invocation is a history record and outlives the node that holds
-//! it, so what a node id is registered as now is no part of resolving one. A command id
-//! the Region holds none of is `InvalidCommandId`; a well-formed node id the command
-//! holds no invocation for is `InvocationDoesNotExist` ("The command ID and managed node
-//! ID you specified didn't match any invocations"), carrying the pair that matched none,
-//! whether or not that id names a node this Region has a registration of.
+//! it, so what a node id is registered as now is no part of resolving one. A pair that
+//! matches no invocation is `InvocationDoesNotExist` ("The command ID and managed node ID
+//! you specified didn't match any invocations"), carrying the pair that matched none —
+//! which is the refusal for a command id this endpoint holds no command of as much as for
+//! a well-formed node id a command it does hold created no invocation for, since neither
+//! matches an invocation; `InvalidCommandId`, whose subject is the id alone, is what the
+//! reads that resolve a COMMAND rather than a pair answer ([`crate::ops::list_command_invocations`],
+//! [`crate::ops::cancel_command`]).
 //!
 //! Nothing in this emulator delivers a command to a node (see
 //! [`crate::state::commands`]), so an invocation reports the status it was minted with
@@ -256,22 +259,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialize_due(::std::time::SystemTime::now());
 
         // A command is reached through the endpoint it was sent to, so an id another
-        // Region holds names no command here.
-        let Some(command) = store.command(&region, &input.command_id) else {
-            // "The specified command ID isn't valid": the refusal names the id that
-            // resolved no command, the way every read of this slice words it.
-            return Err(crate::scaffolded::Scaffolded::invalid_command_id(
-                crate::state::commands::command_not_found(&input.command_id),
-            ));
-        };
-        let Some(invocation) = command.invocation(&input.instance_id) else {
-            // "The command ID and managed node ID you specified didn't match any
-            // invocations. Verify the command ID and the managed node ID and try again" —
-            // the pair is resolved against what the command holds, so a node the command
-            // created no invocation for is this refusal however the id stands with the
-            // node inventory. The modelled shape declares no message member, so the
-            // sentence naming the pair that matched none travels through the channel's own
-            // `InvocationDoesNotExist` form.
+        // Region holds names no command here. What this read resolves is the PAIR, not the
+        // command: "the command ID and managed node ID you specified didn't match any
+        // invocations" is the refusal for a pair that matches none, and an id no command of
+        // this endpoint carries matches none either — so the pair that matched nothing is
+        // what the refusal names, whether the command is missing or only the node's
+        // invocation of it is.
+        let invocation = store
+            .command(&region, &input.command_id)
+            .and_then(|command| {
+                command
+                    .invocation(&input.instance_id)
+                    .map(|invocation| (command, invocation))
+            });
+        let Some((command, invocation)) = invocation else {
             return Err(crate::scaffolded::Scaffolded::invocation_does_not_exist(
                 crate::state::commands::invocation_not_found(
                     &input.command_id,

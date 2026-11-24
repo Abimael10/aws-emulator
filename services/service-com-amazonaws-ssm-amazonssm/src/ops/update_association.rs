@@ -452,14 +452,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_default()
             .into_iter()
             .collect();
-        if let Some(why) = crate::state::commands::parameter_rejection(
-            &document.name,
-            &version.parsed.parameters,
-            &parameters,
-        ) {
+        if crate::state::commands::parameters_are_rejected(&version.parsed, &parameters)
+        {
             return Err(
                 UpdateAssociationErrorModeled::InvalidParameters(InvalidParameters {
-                    message: Some(why),
+                    message: Some(crate::state::commands::INVALID_PARAMETERS.to_string()),
                 })
                 .into(),
             );

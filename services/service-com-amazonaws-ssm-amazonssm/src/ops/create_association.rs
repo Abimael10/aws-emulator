@@ -413,7 +413,7 @@ fn refusal(rejection: AssociationCreateRejection) -> CreateAssociationError {
             })
             .into()
         }
-        AssociationCreateRejection::InvalidParameters { .. } => {
+        AssociationCreateRejection::InvalidParameters => {
             CreateAssociationErrorModeled::InvalidParameters(InvalidParameters { message }).into()
         }
         AssociationCreateRejection::InvalidSchedule { .. } => {

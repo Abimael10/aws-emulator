@@ -23,7 +23,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_ssm_amazonssm::state::{association_create, associations};
+use service_com_amazonaws_ssm_amazonssm::state::{association_create, associations, commands};
 
 use crate::state_manager_associations::{
     call, call_in_region, created, described, error_code, service, stored_associations,
@@ -283,7 +283,7 @@ fn failure_rows() -> Vec<FailureRow> {
             case: "a parameter the document doesn't declare",
             prepared: None,
             entry: json!({"Name": AGENT, "Parameters": {"nope": ["x"]}}),
-            message: format!("Document {AGENT} doesn't support a parameter named nope"),
+            message: commands::INVALID_PARAMETERS.to_string(),
             code: "InvalidParameters",
         },
         FailureRow {
@@ -292,7 +292,7 @@ fn failure_rows() -> Vec<FailureRow> {
             entry: json!({"Name": SHELL}),
             // `AWS-RunShellScript` declares `commands` with no default, so a create has to
             // supply a value for it (`state::PUBLISHED_DOCUMENTS`).
-            message: "Missing required parameters: commands".to_string(),
+            message: commands::INVALID_PARAMETERS.to_string(),
             code: "InvalidParameters",
         },
         FailureRow {

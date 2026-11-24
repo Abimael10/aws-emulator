@@ -16,7 +16,9 @@
 //! account holds.
 //!
 //! The send then resolves three things from state and refuses what
-//! it cannot resolve:
+//! it cannot resolve, IN THIS ORDER — the document and the values it declares are decided
+//! before any node is, so a parameter the document does not admit is what such a send is
+//! refused for whatever state the nodes it was addressed to are in:
 //!
 //! * the DOCUMENT, by name or by its ARN, among the documents the Region holds and the
 //!   ones Systems Manager publishes (`InvalidDocument`), at the version the request named
@@ -29,7 +31,10 @@
 //! * the nodes the request DESCRIBES in `Targets`, which are search criteria rather than
 //!   identities ([`crate::state::commands::nodes_matching_target`]): criteria that
 //!   describe no registered node select none, and the command is sent with no invocation
-//!   rather than refused.
+//!   rather than refused — except for the two keys that NAME nodes rather than describing
+//!   them (`InstanceIds`, `AWS::EC2::Instance`), whose values are node ids and are
+//!   resolved like the ones `InstanceIds` carries
+//!   ([`crate::state::commands::node_ids_a_target_names`]).
 //!
 //! The command is minted `Pending` with one `Pending` invocation per resolved node —
 //! "the command hasn't been sent to any managed nodes" — and the counts the response
@@ -441,6 +446,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The values the send supplies for the document's own parameters, read against the
+        // version that was resolved. This is decided BEFORE any node the request names or
+        // describes is resolved: what the document declares is a property of the document,
+        // so a send whose parameters that document does not admit is refused for its
+        // parameters whatever the state of the nodes it was addressed to
+        // (corpus `simparity-wire-aws-v1`, fixture
+        // `ssm-vscan-traj-send-command-validation-order` steps `task#3`, `task#4`, `task#7`,
+        // each of which names unregistered nodes and is refused about its parameters).
+        let supplied: ::std::collections::BTreeMap<String, Vec<String>> = input
+            .parameters
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        if crate::state::commands::parameters_are_rejected(&version.parsed, &supplied) {
+            return Err(
+                SendCommandErrorModeled::InvalidParameters(InvalidParameters {
+                    message: Some(crate::state::commands::INVALID_PARAMETERS.to_string()),
+                })
+                .into(),
+            );
+        }
+
         // The nodes the request NAMES, each resolved against the node inventory: "the IDs
         // of the managed nodes where the command should run" is an identity, so one that
         // names no node this Region holds, or a node that cannot take a command, is
@@ -492,6 +520,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let targets: Vec<Target> = input.targets.clone().unwrap_or_default();
         let mut described: Option<Vec<String>> = None;
         for target in &targets {
+            // A target keyed by node id NAMES its nodes instead of describing them
+            // ([`crate::state::commands::node_ids_a_target_names`]), so each value is
+            // resolved against the inventory exactly as a value of `InstanceIds` is: it is
+            // the other spelling of the same list, and an id that names no node this Region
+            // can send to is refused rather than selecting nothing.
+            if !crate::state::commands::node_ids_a_target_names(target)
+                .iter()
+                .all(|id| store.node_agent_is_responding(&region, id))
+            {
+                return Err(SendCommandErrorModeled::InvalidInstanceId(InvalidInstanceId {
+                    message: Some(crate::state::commands::NODES_NOT_IN_A_VALID_STATE.to_string()),
+                })
+                .into());
+            }
             let selected = crate::state::commands::nodes_matching_target(&store, &region, target)
                 .map_err(|_| {
                     crate::scaffolded::Scaffolded::validation(
@@ -509,30 +551,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // "Targets is required if you don't provide one or more managed node IDs in the
         // call" (`Command$Targets`), so a send that names and describes nothing names no
-        // node to run on at all.
+        // node to run on at all, and the refusal names the two ways of saying which nodes
+        // ([`crate::state::commands::NO_NODES_NAMED_OR_DESCRIBED`]).
         if named.is_empty() && targets.is_empty() {
             return Err(crate::scaffolded::Scaffolded::validation(
-                "Either InstanceIds or Targets must be specified",
+                crate::state::commands::NO_NODES_NAMED_OR_DESCRIBED,
             ));
-        }
-
-        let supplied: ::std::collections::BTreeMap<String, Vec<String>> = input
-            .parameters
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        if let Some(why) = crate::state::commands::parameter_rejection(
-            &document.name,
-            &version.parsed.parameters,
-            &supplied,
-        ) {
-            return Err(
-                SendCommandErrorModeled::InvalidParameters(InvalidParameters {
-                    message: Some(why),
-                })
-                .into(),
-            );
         }
 
         // One invocation per resolved node, in node-id order: "if a user runs SendCommand

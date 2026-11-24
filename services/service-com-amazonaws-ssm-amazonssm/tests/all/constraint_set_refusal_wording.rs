@@ -482,7 +482,7 @@ async fn a_value_the_stated_set_admits_is_not_refused_at_the_boundary() {
                 "CommandId": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
                 "InstanceId": NODE,
             }),
-            Answered::Modelled("InvalidCommandId"),
+            Answered::Modelled("InvocationDoesNotExist"),
         ),
         (
             "the shorter EC2 node id, at the band's floor",

@@ -36,7 +36,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AlarmConfiguration, CloudWatchOutputConfig, Command, CommandInvocation, CommandPlugin,
-    DocumentParameter, NotificationConfig, Target,
+    NotificationConfig, Target,
 };
 use super::ManagedNodeRecord;
 
@@ -142,6 +142,15 @@ pub fn supported_target_keys() -> Vec<&'static str> {
 pub const INVALID_TARGET_KEY: &str = "The target key is not valid. You can specify instance \
                                       IDs, or use tag:name=value, tag-key=value or \
                                       resource-groups:attribute=value.";
+
+/// How a send refuses a request that names no node to run on at all: "`Targets` is required
+/// if you don't provide one or more managed node IDs in the call" (`Command$Targets`), and
+/// the sentence names the two ways a caller may say which nodes rather than anything the
+/// request carried, so it is the same text whatever arrived (recorded behaviour — corpus
+/// `simparity-wire-aws-v1`, fixture `ssm-vscan-traj-send-command-validation-order`).
+pub const NO_NODES_NAMED_OR_DESCRIBED: &str =
+    "You must specify instance IDs or a target value. Targets can include tag-key names, tag \
+     key-pair values, or resource group names.";
 
 /// One invocation of a command: the copy of it that one managed node holds.
 #[derive(Debug, Clone)]
@@ -937,8 +946,30 @@ fn truncated_plugin_output(output: &str) -> String {
     cut_to(output, MAX_PLUGIN_OUTPUT_BYTES)
 }
 
-/// The ids of the nodes `region` holds that one target selects, or `Err(key)` when the
-/// target's key is not one a command targets nodes by ([`supported_target_keys`]).
+/// The node ids one target NAMES, as opposed to the nodes it describes.
+///
+/// Two of the keys a command targets nodes by are IDENTITIES rather than criteria:
+/// "`Key=InstanceIds,Values=i-02573cafcfEXAMPLE,i-0471e04240EXAMPLE`" and the
+/// `AWS::EC2::Instance` spelling of the same selection both name the nodes themselves — the
+/// other form `InstanceIds` takes — while a tag, a resource group or the wildcard describes
+/// whatever matches. So the values of such a target are node ids the request named and are
+/// resolved against the inventory the way a named node id is, and `*` is left out of them:
+/// it describes every node rather than naming one.
+pub fn node_ids_a_target_names(target: &Target) -> Vec<&str> {
+    let key = target.key.as_deref().unwrap_or_default();
+    if key != TARGET_KEY_INSTANCE_IDS && key != TARGET_KEY_EC2_INSTANCE {
+        return Vec::new();
+    }
+    target
+        .values
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(String::as_str)
+        .filter(|value| *value != TARGET_VALUE_ALL)
+        .collect()
+}
+
 ///
 /// A target is CRITERIA, not an identity: "an array of search criteria that targets
 /// managed nodes using a Key,Value combination that you specify" (`SendCommand`'s
@@ -999,28 +1030,56 @@ pub fn nodes_matching_target<'a>(
     }
 }
 
-/// Why the parameter values a send supplied are not the ones the document declares, or
+/// How this service words the `InvalidParameters` refusal.
+///
+/// That error states the rule in prose — "You must specify values for all required
+/// parameters in the Amazon Web Services Systems Manager document (SSM document). You can
+/// only supply values to parameters defined in the SSM document" — and the service words the
+/// refusal itself in one FIXED sentence about the parameters as a set: it names neither the
+/// document nor the parameter that was wrong, so nothing of the request is repeated into it.
+/// Every operation that answers `InvalidParameters` answers this sentence, because the
+/// refusal is about the values and not about what was being asked of the document. The
+/// operations that read the same declared parameters but answer a DIFFERENT error class —
+/// an Automation start's `InvalidAutomationExecutionParametersException`, a preview's
+/// validation refusal — word their own refusal, through [`parameter_rejection`].
+pub const INVALID_PARAMETERS: &str = "Parameters provided in document are invalid or not supported.";
+
+/// Whether the parameter values a call supplied are not the ones the document declares —
+/// the test the `InvalidParameters` refusal is answered on ([`INVALID_PARAMETERS`]).
+pub fn parameters_are_rejected(
+    document: &super::ParsedDocumentContent,
+    supplied: &BTreeMap<String, Vec<String>>,
+) -> bool {
+    parameter_mismatch(document, supplied).is_some()
+}
+
+/// How the parameter values a call supplied are not the ones the document declares, or
 /// `None` when they are.
 ///
-/// "You must specify values for all required parameters in the Amazon Web Services
-/// Systems Manager document (SSM document). You can only supply values to parameters
-/// defined in the SSM document" (`InvalidParameters`). A declared parameter is REQUIRED
-/// when the document declares no default for it: the default is the value the document
-/// runs with when the send names none, so a parameter that has one needs no value from
-/// the caller and a parameter that has none cannot be left out.
-pub fn parameter_rejection(
-    document_name: &str,
-    declared: &[DocumentParameter],
-    supplied: &BTreeMap<String, Vec<String>>,
-) -> Option<String> {
+/// Three readings of one rule, in the order a call meets them:
+///
+/// * a value supplied for a parameter the document does not declare is no value of that
+///   document at all ("You can only supply values to parameters defined in the SSM
+///   document"), and a parameter name is as the content spells it;
+/// * a declared parameter is REQUIRED when the document declares no default for it: the
+///   default is the value the document runs with when the call names none, so a parameter
+///   that has one needs no value from the caller and a parameter that has none cannot be
+///   left out ("You must specify values for all required parameters");
+/// * a value supplied for a parameter the document DOES declare has to be one that
+///   parameter admits — the enumeration, the pattern, the lengths and the counts its own
+///   declaration states ([`super::DeclaredParameterConstraints`]) — since a value outside
+///   them is not a value the document defined that parameter to take.
+fn parameter_mismatch<'a>(
+    document: &'a super::ParsedDocumentContent,
+    supplied: &'a BTreeMap<String, Vec<String>>,
+) -> Option<ParameterMismatch<'a>> {
+    let declared = &document.parameters;
     for name in supplied.keys() {
         if !declared
             .iter()
             .any(|parameter| parameter.name.as_deref() == Some(name.as_str()))
         {
-            return Some(format!(
-                "Document {document_name} doesn't support a parameter named {name}"
-            ));
+            return Some(ParameterMismatch::Undeclared(name.as_str()));
         }
     }
     let missing: Vec<&str> = declared
@@ -1029,7 +1088,106 @@ pub fn parameter_rejection(
         .filter_map(|parameter| parameter.name.as_deref())
         .filter(|name| !supplied.contains_key(*name))
         .collect();
-    (!missing.is_empty()).then(|| format!("Missing required parameters: {}", missing.join(", ")))
+    if !missing.is_empty() {
+        return Some(ParameterMismatch::Missing(missing));
+    }
+    for constraints in &document.parameter_constraints {
+        let Some(values) = supplied.get(&constraints.name) else {
+            continue;
+        };
+        if !values_a_parameter_admits(constraints, values) {
+            return Some(ParameterMismatch::Value(constraints.name.as_str()));
+        }
+    }
+    None
+}
+
+/// Whether `values` are values the parameter `constraints` describes admits.
+///
+/// Each reading is the declaration's own: a parameter of a type that is ONE value takes one
+/// ([`super::DeclaredParameterConstraints::takes_several_values`]), `minItems`/`maxItems`
+/// bound how many there may be, `allowedValues` enumerate the values themselves,
+/// `minChars`/`maxChars` bound each one's length, and `allowedPattern` is the expression
+/// each has to match. A parameter that declares a pattern this service cannot read as a
+/// regular expression restricts nothing by it, so a document is never unusable because of
+/// one.
+fn values_a_parameter_admits(
+    constraints: &super::DeclaredParameterConstraints,
+    values: &[String],
+) -> bool {
+    // A parameter NAMED with no values at all states no value for this reading to judge:
+    // a rate-controlled Automation start names its target parameter that way, since the
+    // values bound to it are the targets' rather than the call's
+    // ([`super::automation::target_rejection`]).
+    if values.is_empty() {
+        return true;
+    }
+    if !constraints.takes_several_values() && values.len() > 1 {
+        return false;
+    }
+    if constraints.min_items.is_some_and(|min| values.len() < min)
+        || constraints.max_items.is_some_and(|max| values.len() > max)
+    {
+        return false;
+    }
+    let pattern = constraints
+        .allowed_pattern
+        .as_deref()
+        .and_then(super::parameter_pattern);
+    values.iter().all(|value| {
+        if !constraints.allowed_values.is_empty()
+            && !constraints
+                .allowed_values
+                .iter()
+                .any(|allowed| allowed == value)
+        {
+            return false;
+        }
+        let length = value.chars().count();
+        if constraints.min_chars.is_some_and(|min| length < min)
+            || constraints.max_chars.is_some_and(|max| length > max)
+        {
+            return false;
+        }
+        pattern
+            .as_ref()
+            .is_none_or(|pattern| pattern.is_match(value))
+    })
+}
+
+/// One way the parameter values a call supplied are not the ones the document declares.
+enum ParameterMismatch<'a> {
+    /// A value was supplied for a parameter the document declares none of.
+    Undeclared(&'a str),
+    /// A parameter the document declares no default for was left without a value.
+    Missing(Vec<&'a str>),
+    /// A declared parameter was supplied values its own declaration does not admit.
+    Value(&'a str),
+}
+
+/// Why the parameter values a call supplied are not the ones the document declares, or
+/// `None` when they are — the DIAGNOSTIC form, naming the document and the parameter it was
+/// read against.
+///
+/// Read by the operations whose own error class words such a refusal that way; the ones that
+/// answer `InvalidParameters` answer [`INVALID_PARAMETERS`] instead, on the same reading
+/// ([`parameters_are_rejected`]).
+pub fn parameter_rejection(
+    document_name: &str,
+    document: &super::ParsedDocumentContent,
+    supplied: &BTreeMap<String, Vec<String>>,
+) -> Option<String> {
+    match parameter_mismatch(document, supplied)? {
+        ParameterMismatch::Undeclared(name) => Some(format!(
+            "Document {document_name} doesn't support a parameter named {name}"
+        )),
+        ParameterMismatch::Missing(missing) => {
+            Some(format!("Missing required parameters: {}", missing.join(", ")))
+        }
+        ParameterMismatch::Value(name) => Some(format!(
+            "Document {document_name} doesn't support the values supplied for parameter {name}"
+        )),
+    }
 }
 
 /// Why the document cannot run on a node the send NAMED, or `None` when it can.

@@ -191,22 +191,77 @@ pub(crate) fn document_as_json(
     })
 }
 
-/// The parameters a document declares: one `DocumentParameter` per `parameters` entry,
-/// in the content's own order.
+/// What one declared parameter ADMITS as a value, beyond its name, its type and its
+/// default.
 ///
-/// "A description of the parameters for a document"
-/// (`DocumentDescription$Parameters`): each entry's `type`, `description` and
-/// `default` are reported as the content declares them — the declared type is reported
-/// verbatim rather than narrowed, because an Automation document's parameters carry
-/// types (`Integer`, `StringMap`, …) beyond the two a Command document's do.
+/// A document's `parameters` entry may state what the values supplied for it have to be —
+/// the enumeration they are drawn from, the expression they match, how long each may be and
+/// how many there may be (AWS Systems Manager User Guide, "Creating SSM document content",
+/// the `parameters` top-level element). The modelled `DocumentParameter` a read reports
+/// carries none of that, so it is kept beside the reported list and read by the one place
+/// that holds a call's values to what the document declares
+/// ([`super::commands::parameter_rejection`]).
+#[derive(Debug, Clone, Default)]
+pub struct DeclaredParameterConstraints {
+    /// The parameter this constrains, as the content names it.
+    pub name: String,
+    /// The content's `type` for it: `String`, `StringList`, `Integer`, `Boolean`,
+    /// `StringMap` or `MapList` — the types that element documents.
+    pub r#type: Option<String>,
+    /// `allowedValues`: the values the parameter admits, or empty when it admits any.
+    pub allowed_values: Vec<String>,
+    /// `allowedPattern`: a regular expression every value has to match.
+    pub allowed_pattern: Option<String>,
+    /// `minChars` / `maxChars`: how long each value may be.
+    pub min_chars: Option<usize>,
+    pub max_chars: Option<usize>,
+    /// `minItems` / `maxItems`: how many values there may be.
+    pub min_items: Option<usize>,
+    pub max_items: Option<usize>,
+}
+
+/// The parameter types that are a LIST of values; every other type is one value.
+///
+/// From the `type` values the `parameters` element documents: `StringList` is "a list of
+/// strings" and `MapList` "a list of maps", while `String`, `Integer`, `Boolean` and
+/// `StringMap` are each one value.
+pub const LIST_PARAMETER_TYPES: &[&str] = &["StringList", "MapList"];
+
+impl DeclaredParameterConstraints {
+    /// Whether this parameter is one SEVERAL values may be supplied for
+    /// ([`LIST_PARAMETER_TYPES`]). A parameter that declares no type is left unrestricted,
+    /// so it takes however many were supplied.
+    pub fn takes_several_values(&self) -> bool {
+        match self.r#type.as_deref() {
+            None => true,
+            Some(declared) => LIST_PARAMETER_TYPES.contains(&declared),
+        }
+    }
+}
+
+/// A document scalar as the count it states, or `None` when it states no count.
+pub(super) fn scalar_usize(value: &::yaml_rust2::Yaml) -> Option<usize> {
+    match value {
+        ::yaml_rust2::Yaml::Integer(number) => usize::try_from(*number).ok(),
+        ::yaml_rust2::Yaml::String(text) | ::yaml_rust2::Yaml::Real(text) => text.parse().ok(),
+        _ => None,
+    }
+}
+
+/// The parameters `map` declares: the list a read REPORTS, and what each of them admits as
+/// a value ([`DeclaredParameterConstraints`]), in the content's own order.
+///
+/// The `type` is reported verbatim rather than narrowed, because an Automation document's
+/// parameters carry types (`Integer`, `StringMap`, …) beyond the two a Command document's
+/// do.
 pub(super) fn declared_parameters(
     map: &::yaml_rust2::yaml::Hash,
-) -> Result<Vec<DocumentParameter>, ContentRejection> {
+) -> Result<(Vec<DocumentParameter>, Vec<DeclaredParameterConstraints>), ContentRejection> {
     let Some(declared) = mapping_get(map, "parameters") else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     };
     if matches!(declared, ::yaml_rust2::Yaml::Null) {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let Some(declared) = declared.as_hash() else {
         return Err(ContentRejection::Content(
@@ -215,6 +270,7 @@ pub(super) fn declared_parameters(
         ));
     };
     let mut parameters = Vec::with_capacity(declared.len());
+    let mut constraints = Vec::with_capacity(declared.len());
     for (name, definition) in declared {
         let Some(name) = name.as_str() else {
             return Err(ContentRejection::Content(
@@ -230,14 +286,28 @@ pub(super) fn declared_parameters(
             None => None,
             Some(default) => Some(default_value_string(name, default, MAX_DOCUMENT_DEPTH)?),
         };
+        let declared_type = mapping_get(definition, "type").and_then(scalar_string);
+        constraints.push(DeclaredParameterConstraints {
+            name: name.to_string(),
+            r#type: declared_type.clone(),
+            allowed_values: mapping_get(definition, "allowedValues")
+                .and_then(::yaml_rust2::Yaml::as_vec)
+                .map(|values| values.iter().filter_map(scalar_string).collect())
+                .unwrap_or_default(),
+            allowed_pattern: mapping_get(definition, "allowedPattern").and_then(scalar_string),
+            min_chars: mapping_get(definition, "minChars").and_then(scalar_usize),
+            max_chars: mapping_get(definition, "maxChars").and_then(scalar_usize),
+            min_items: mapping_get(definition, "minItems").and_then(scalar_usize),
+            max_items: mapping_get(definition, "maxItems").and_then(scalar_usize),
+        });
         parameters.push(DocumentParameter {
             name: Some(name.to_string()),
-            r#type: mapping_get(definition, "type").and_then(scalar_string),
+            r#type: declared_type,
             description: mapping_get(definition, "description").and_then(scalar_string),
             default_value,
         });
     }
-    Ok(parameters)
+    Ok((parameters, constraints))
 }
 
 /// The names of the steps `content` declares, in its own order.
@@ -354,10 +424,12 @@ pub fn parse_document_content(
         }
     }
 
+    let (parameters, parameter_constraints) = declared_parameters(map)?;
     Ok(ParsedDocumentContent {
         schema_version,
         description: mapping_get(map, "description").and_then(scalar_string),
-        parameters: declared_parameters(map)?,
+        parameters,
+        parameter_constraints,
         platform_types: document_platforms::declared_platform_types(map),
         step_names: declared_step_names(map),
     })

@@ -862,12 +862,12 @@ async fn an_unknown_command_id_is_refused_by_name_whatever_resolves_it() {
     .await;
 
     // One row per operation that resolves a command id, each asked about an id no command of
-    // this Region carries.
+    // this Region carries. `GetCommandInvocation` is not one of them: what it resolves is the
+    // PAIR of command and node, so an id no command carries matches no invocation rather than
+    // no command, and that refusal is `InvocationDoesNotExist` naming the pair
+    // ([`crate::run_command_validation_order`]).
     let operations: Vec<(&str, CommandIdRequest)> = vec![
         ("CancelCommand", |id| json!({"CommandId": id})),
-        ("GetCommandInvocation", |id| {
-            json!({"CommandId": id, "InstanceId": LINUX})
-        }),
         ("ListCommands", |id| json!({"CommandId": id})),
         ("ListCommandInvocations", |id| json!({"CommandId": id})),
     ];

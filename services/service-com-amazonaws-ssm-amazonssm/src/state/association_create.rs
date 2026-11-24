@@ -139,8 +139,10 @@ pub enum AssociationCreateRejection {
     /// a version the resolved document does not hold.
     InvalidDocumentVersion { document: String, version: String },
     /// "You must specify values for all required parameters … You can only supply values to
-    /// parameters defined in the SSM document" (`InvalidParameters`).
-    InvalidParameters { why: String },
+    /// parameters defined in the SSM document" (`InvalidParameters`), which this service words
+    /// in the one fixed sentence that error carries
+    /// ([`super::commands::INVALID_PARAMETERS`]).
+    InvalidParameters,
     /// "The schedule is invalid" (`InvalidSchedule`), carrying that error's own wording
     /// ([`super::associations::schedule_rejection`]).
     InvalidSchedule { why: &'static str },
@@ -170,7 +172,7 @@ impl AssociationCreateRejection {
             Self::InvalidDocumentVersion { document, version } => {
                 format!("Document {document} has no version '{version}'")
             }
-            Self::InvalidParameters { why } => why.clone(),
+            Self::InvalidParameters => super::commands::INVALID_PARAMETERS.to_string(),
             Self::InvalidSchedule { why } => (*why).to_string(),
             Self::InvalidOutputLocation => INVALID_OUTPUT_LOCATION.to_string(),
             Self::InvalidTargetMaps => super::associations::TARGETS_AND_TARGET_MAPS.to_string(),
@@ -274,12 +276,11 @@ impl ComAmazonawsSsmAmazonssmState {
         // Systems Manager document (SSM document). You can only supply values to parameters
         // defined in the SSM document" (`InvalidParameters`) — the one reading of a
         // document's parameters this service has.
-        if let Some(why) = super::commands::parameter_rejection(
-            &document.name,
-            &document_version.parsed.parameters,
+        if super::commands::parameters_are_rejected(
+            &document_version.parsed,
             &version.parameters,
         ) {
-            return Err(AssociationCreateRejection::InvalidParameters { why });
+            return Err(AssociationCreateRejection::InvalidParameters);
         }
         // "A cron expression when the association will be applied to the targets"
         // (`ScheduleExpression`): a value in neither of the two forms such an expression is

@@ -332,6 +332,24 @@ const INSTANCE_ID: &[Constraint] = &[
     Constraint::Pattern(INSTANCE_ID_PATTERN),
 ];
 
+/// `com.amazonaws.ssm#InstanceId` at the `instanceId` of the per-node Run Command read: the
+/// expression first and the length band after it, which is the order that operation's OTHER
+/// id is stated in too ([`COMMAND_ID`]) — recorded behaviour, corpus
+/// `simparity-wire-aws-v1`, fixture `ssm-vscan-traj-send-command-validation-order` step
+/// `task#10`, where `GetCommandInvocation` with an `instanceId` that is neither inside the
+/// expression nor long enough refuses the expression first and the length second.
+///
+/// The band and the expression are the same ones every other member targeting this shape is
+/// held to ([`INSTANCE_ID`]); only the ORDER the two clauses are stated in is this row's, and
+/// it is keyed to the operation the recordings state that order for — the inventory and
+/// patch reads' recorded refusals of the same shape state the band first, which is why the
+/// shape-wide row keeps that order.
+const RUN_COMMAND_INSTANCE_ID: &[Constraint] = &[
+    Constraint::Pattern(INSTANCE_ID_PATTERN),
+    Constraint::MaxLength(crate::state::MANAGED_NODE_ID_MAX_LENGTH),
+    Constraint::MinLength(crate::state::MANAGED_NODE_ID_MIN_LENGTH),
+];
+
 /// `com.amazonaws.ssm#InstanceId` as an ELEMENT of `InstanceIdList`: the shape's own set,
 /// and the presence every element of that list has to have (recorded behaviour — fixtures
 /// `ssm-ecsm-run-command-on-an-unmanaged-instance-refusals` and
@@ -394,6 +412,22 @@ const STATED_SHAPES: &[StatedShape] = &[
         members: &["commandId"],
         operations: &[],
         constraints: COMMAND_ID,
+    },
+    StatedShape {
+        // The per-node Run Command read states this shape's two clauses the other way round
+        // ([`RUN_COMMAND_INSTANCE_ID`]), so it is matched before the shape-wide row below:
+        // the lookup takes the first row whose signature, member and operation all hold.
+        shapes: &["com.amazonaws.ssm#InstanceId"],
+        declared: Declared {
+            pattern: Some(INSTANCE_ID_PATTERN),
+            min_length: None,
+            max_length: None,
+            min_value: None,
+            max_value: None,
+        },
+        members: &["instanceId"],
+        operations: &["GetCommandInvocation"],
+        constraints: RUN_COMMAND_INSTANCE_ID,
     },
     StatedShape {
         // `NodeId` is the same managed-node id under a second name: it declares the same
