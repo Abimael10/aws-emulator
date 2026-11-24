@@ -688,6 +688,171 @@ pub const GENERAL_CONFIGURATION_OPTIONS: &[ConfigurationOption] = &[
         CHANGE_SEVERITY_NO_INTERRUPTION,
         "",
     ),
+    // The REST of what the option reference defines in the namespaces above.
+    //
+    // A namespace the catalog describes any option of STATES that namespace's
+    // option names, so a name it leaves out is reported as naming no
+    // configuration setting
+    // ([`super::configuration_setting_validation::configuration_validation_messages`]).
+    // These are therefore not optional entries: every option the published
+    // reference lists for a described namespace has to be here, or a
+    // configuration the real service accepts is refused. They are the options
+    // this service honours no BEHAVIOUR for, so each publishes its name, its
+    // namespace and its change severity and no default value — the option HAS no
+    // value here until a caller sets one — and no restriction this service
+    // cannot ground, since a restriction published without one would refuse
+    // values the platform takes.
+    ConfigurationOption::new(
+        NAMESPACE_AUTOSCALING_ASG,
+        "Custom Availability Zones",
+        CHANGE_SEVERITY_RESTART_ENVIRONMENT,
+        "",
+    ),
+    ConfigurationOption::new(
+        NAMESPACE_LAUNCH_CONFIGURATION,
+        "BlockDeviceMappings",
+        CHANGE_SEVERITY_RESTART_ENVIRONMENT,
+        "",
+    ),
+    ConfigurationOption::new(
+        NAMESPACE_LAUNCH_CONFIGURATION,
+        "DisableDefaultEC2SecurityGroup",
+        CHANGE_SEVERITY_RESTART_ENVIRONMENT,
+        BOOLEAN_FALSE,
+    )
+    .boolean(),
+    ConfigurationOption::new(
+        NAMESPACE_LAUNCH_CONFIGURATION,
+        "ImageId",
+        CHANGE_SEVERITY_RESTART_ENVIRONMENT,
+        "",
+    ),
+    ConfigurationOption::new(
+        NAMESPACE_LAUNCH_CONFIGURATION,
+        "RootVolumeIOPS",
+        CHANGE_SEVERITY_RESTART_ENVIRONMENT,
+        "",
+    ),
+    ConfigurationOption::new(
+        NAMESPACE_LAUNCH_CONFIGURATION,
+        "RootVolumeThroughput",
+        CHANGE_SEVERITY_RESTART_ENVIRONMENT,
+        "",
+    ),
+    ConfigurationOption::new(
+        NAMESPACE_LAUNCH_CONFIGURATION,
+        "SSHSourceRestriction",
+        CHANGE_SEVERITY_RESTART_ENVIRONMENT,
+        "",
+    ),
+    ConfigurationOption::new(
+        "aws:autoscaling:updatepolicy:rollingupdate",
+        "MaxBatchSize",
+        CHANGE_SEVERITY_NO_INTERRUPTION,
+        "",
+    ),
+    ConfigurationOption::new(
+        "aws:autoscaling:updatepolicy:rollingupdate",
+        "MinInstancesInService",
+        CHANGE_SEVERITY_NO_INTERRUPTION,
+        "",
+    ),
+    ConfigurationOption::new(
+        "aws:autoscaling:updatepolicy:rollingupdate",
+        "PauseTime",
+        CHANGE_SEVERITY_NO_INTERRUPTION,
+        "",
+    ),
+    ConfigurationOption::new(
+        "aws:autoscaling:updatepolicy:rollingupdate",
+        "Timeout",
+        CHANGE_SEVERITY_NO_INTERRUPTION,
+        "",
+    ),
+    ConfigurationOption::new(
+        "aws:ec2:instances",
+        "SpotFleetOnDemandBase",
+        CHANGE_SEVERITY_RESTART_ENVIRONMENT,
+        "",
+    ),
+    ConfigurationOption::new(
+        "aws:ec2:instances",
+        "SpotFleetOnDemandAboveBasePercentage",
+        CHANGE_SEVERITY_RESTART_ENVIRONMENT,
+        "",
+    ),
+    ConfigurationOption::new(
+        "aws:ec2:instances",
+        "SpotMaxPrice",
+        CHANGE_SEVERITY_RESTART_ENVIRONMENT,
+        "",
+    ),
+    ConfigurationOption::new(
+        "aws:ec2:vpc",
+        "DBSubnets",
+        CHANGE_SEVERITY_RESTART_ENVIRONMENT,
+        "",
+    ),
+    ConfigurationOption::new(
+        NAMESPACE_ENVIRONMENT,
+        "ExternalExtensionsS3Bucket",
+        CHANGE_SEVERITY_NO_INTERRUPTION,
+        "",
+    ),
+    ConfigurationOption::new(
+        NAMESPACE_ENVIRONMENT,
+        "ExternalExtensionsS3Key",
+        CHANGE_SEVERITY_NO_INTERRUPTION,
+        "",
+    ),
+    ConfigurationOption::new(
+        "aws:elasticbeanstalk:healthreporting:system",
+        "ConfigDocument",
+        CHANGE_SEVERITY_NO_INTERRUPTION,
+        "",
+    ),
+    ConfigurationOption::new(
+        "aws:elasticbeanstalk:healthreporting:system",
+        "EnhancedHealthAuthEnabled",
+        CHANGE_SEVERITY_NO_INTERRUPTION,
+        "",
+    ),
+    ConfigurationOption::new(
+        "aws:elb:healthcheck",
+        "Target",
+        CHANGE_SEVERITY_NO_INTERRUPTION,
+        "",
+    ),
+    ConfigurationOption::new(
+        "aws:elb:loadbalancer",
+        "LoadBalancerHTTPPort",
+        CHANGE_SEVERITY_NO_INTERRUPTION,
+        "",
+    ),
+    ConfigurationOption::new(
+        "aws:elb:loadbalancer",
+        "LoadBalancerHTTPSPort",
+        CHANGE_SEVERITY_NO_INTERRUPTION,
+        "",
+    ),
+    ConfigurationOption::new(
+        "aws:elb:loadbalancer",
+        "LoadBalancerPortProtocol",
+        CHANGE_SEVERITY_NO_INTERRUPTION,
+        "",
+    ),
+    ConfigurationOption::new(
+        "aws:elb:loadbalancer",
+        "LoadBalancerSSLPortProtocol",
+        CHANGE_SEVERITY_NO_INTERRUPTION,
+        "",
+    ),
+    ConfigurationOption::new(
+        "aws:elb:loadbalancer",
+        "ManagedSecurityGroup",
+        CHANGE_SEVERITY_NO_INTERRUPTION,
+        "",
+    ),
 ];
 
 /// The upper bound the option reference states for both Auto Scaling group

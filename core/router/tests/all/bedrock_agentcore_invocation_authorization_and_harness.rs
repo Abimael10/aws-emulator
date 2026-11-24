@@ -554,26 +554,14 @@ impl Probe {
         self.resource().replace("ghost", "other")
     }
 
-    /// The whole `AccessDeniedException` message this call is refused with, in the wording
-    /// the plane serving it states.
+    /// The whole `AccessDeniedException` message this call is refused with.
     ///
-    /// The MEMORY plane names the principal and nothing further; the runtime and harness
-    /// invocations state IAM's full sentence, naming the action, the resource the request
-    /// addressed and which of IAM's rules withheld the grant
-    /// ([`refusal_message`]). Each is the wording a recorded refusal of that plane carries,
-    /// which is why one service answers two.
+    /// ONE wording for every plane of this service: IAM's own sentence, naming the principal,
+    /// the action, the resource the request addressed and which of IAM's rules withheld the
+    /// grant ([`refusal_message`]) — so two operations of one service cannot be told apart by
+    /// the account a denial gives of itself.
     fn refusal(self, principal: &str, denied: bool) -> String {
-        match self {
-            Self::GetMemoryRecord
-            | Self::DeleteMemoryRecord
-            | Self::ListMemoryRecords
-            | Self::BatchCreateMemoryRecords => {
-                format!("User: {principal} is not authorized to perform this operation")
-            }
-            Self::InvokeAgentRuntime | Self::StopRuntimeSession | Self::InvokeHarness => {
-                refusal_message(principal, self.action(), &self.resource(), denied)
-            }
-        }
+        refusal_message(principal, self.action(), &self.resource(), denied)
     }
 
     /// Make the call as `access_key_id`.

@@ -214,14 +214,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         Ok(GetOpenIDConnectProviderOutput {
             // "The URL that the IAM OIDC provider resource object is associated with"
-            // (`$Url`) — an address a relying party FETCHES to read the issuer's discovery
-            // document, so it is published at the address this emulator is reached at
-            // wherever the issuer names a host AWS itself serves
-            // (`crate::state::published_open_id_connect_url`).
-            url: Some(crate::state::published_open_id_connect_url(
-                &provider.url,
-                provider.served_endpoint.as_deref(),
-            )),
+            // (`$Url`): the value the create REGISTERED, scheme-stripped, reported exactly
+            // as the account holds it — the provider's own identity, which its ARN is
+            // derived from and which a token's `iss` claim is compared against. Nothing of
+            // this emulator's own addressing goes into it.
+            url: Some(provider.url.clone()),
             client_id_list: Some(provider.client_id_list.clone()),
             thumbprint_list: Some(provider.thumbprint_list.clone()),
             create_date: Some(provider.create_date),

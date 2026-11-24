@@ -77,6 +77,35 @@ pub const CONFIGURATION_NAMESPACE_PREFIXES: &[&str] = &[
     "aws:elbv2:listenerrule:",
 ];
 
+/// The namespaces whose option NAME is a value the CALLER chooses rather than one
+/// the platform version defines a fixed set of.
+///
+/// A static-file mapping is named by the virtual path it serves — "the option
+/// name is the virtual path, and the value is the directory of the source
+/// bundle it is served from" — so one such namespace holds one option per path a
+/// configuration maps, and the option reference's own entry for it (`/static`)
+/// is the mapping a platform version ships rather than the set of names the
+/// namespace admits. Asking the catalog whether it holds a NAME of one of these
+/// would therefore refuse every mapping but that one, which the real service
+/// accepts.
+///
+/// A namespace listed in [`UNDESCRIBED_CONFIGURATION_NAMESPACES`] is already
+/// outside that question (the catalog describes no option of it), so the entry
+/// here for the proxy's own static files states the rule for the class rather
+/// than changing an answer; the runtime's namespace is described, and is the one
+/// this rule decides.
+pub const CALLER_NAMED_OPTION_NAMESPACES: &[&str] = &[
+    "aws:elasticbeanstalk:container:python:staticfiles",
+    "aws:elasticbeanstalk:environment:proxy:staticfiles",
+];
+
+/// Whether the option NAMES of `namespace` are the caller's own
+/// ([`CALLER_NAMED_OPTION_NAMESPACES`]), so no set of names can be stated for it.
+#[must_use]
+pub fn namespace_names_its_own_options(namespace: &str) -> bool {
+    CALLER_NAMED_OPTION_NAMESPACES.contains(&namespace)
+}
+
 /// Whether an Elastic Beanstalk platform version defines the configuration
 /// namespace `namespace` — the one place that question is answered, so every
 /// operation that takes option settings resolves a specification the same way.

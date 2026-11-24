@@ -1375,18 +1375,11 @@ pub struct OpenIdConnectProviderRecord {
     /// (`GetOpenIDConnectProvider$Url`), WITHOUT its scheme: the host-and-path form
     /// the provider's ARN is built from, which is also the issuer form a client
     /// compares an OIDC token's `iss` claim against.
-    pub url: String,
-    /// The `host[:port]` this emulator was reached at when the provider was registered
-    /// ([`published_endpoint_authority`]), and `None` for an emulator served on no port at
-    /// all.
     ///
-    /// A read of the provider publishes its URL under this address where the issuer names a
-    /// host AWS itself serves ([`published_open_id_connect_url`]), because `Url` is an
-    /// address a relying party FETCHES. It is recorded once, by the create, rather than read
-    /// off each later request: the endpoint an in-process call reports and the one a served
-    /// request reports need not be the same string, and a provider must not publish a
-    /// different address on every read.
-    pub served_endpoint: Option<String>,
+    /// A read reports this text exactly as the create registered it
+    /// ([`registered_open_id_connect_url`]): it is the provider's identity and caller
+    /// input, not an address this emulator mints.
+    pub url: String,
     /// "A list of client IDs (also known as audiences) that are associated with the
     /// specified IAM OIDC provider resource object"
     /// (`GetOpenIDConnectProvider$ClientIDList`), in the order they were registered.

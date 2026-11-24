@@ -419,12 +419,19 @@ async fn a_code_this_service_never_issued_is_not_redeemed() {
 /// The IAM form of the endpoint refuses what it cannot accept with the same OAuth 2.0
 /// error object, and accepts every request it can serve.
 ///
+/// This form's `grantType` is `@required` and admits exactly ONE value
+/// (`ClientCredentialsGrantType` is `^client_credentials$`), so a grant type away from it is
+/// a value the parameter does not take — `invalid_request`, the class RFC 6749 §5.2
+/// describes as "missing a required parameter, includes an invalid parameter value, or is
+/// otherwise malformed" — rather than one of several grants the server declined to
+/// implement, which is what the ANONYMOUS form's choice of grants makes possible.
+///
 /// The rows differ along both parameters the endpoint judges: the grant type away from
 /// `client_credentials` (another OAuth grant name, the wrong case, the empty value, an
-/// absent one) and the resource — absent, empty, at each published bound of
-/// `@length(min: 1, max: 2048)` and one character past the ceiling. A request that states
-/// no resource is incomplete for this grant, and what the refusal names is the first of the
-/// grant's own parameters the body supplies no value for.
+/// absent one, the name with trailing text) and the resource — absent, empty, at each
+/// published bound of `@length(min: 1, max: 2048)` and one character past the ceiling. A
+/// request that states no resource is incomplete for this grant, and what the refusal names
+/// is the first of the grant's own parameters the body supplies no value for.
 #[tokio::test]
 async fn the_iam_token_endpoint_judges_its_own_request() {
     let resource = "aws-mcp.amazonaws.com";
@@ -433,44 +440,44 @@ async fn the_iam_token_endpoint_judges_its_own_request() {
         (
             "the authorization-code grant",
             json!({"grant_type": "authorization_code", "resource": resource}),
-            UNSUPPORTED_GRANT_TYPE,
-            UNSUPPORTED_GRANT_TYPE_DESCRIPTION.to_string(),
-            JSON,
+            VALIDATION_ERROR_CODE,
+            INVALID_REQUEST_MESSAGE.to_string(),
+            JSON_WITH_CHARSET,
         ),
         (
             "the refresh-token grant",
             json!({"grant_type": "refresh_token", "resource": resource}),
-            UNSUPPORTED_GRANT_TYPE,
-            UNSUPPORTED_GRANT_TYPE_DESCRIPTION.to_string(),
-            JSON,
+            VALIDATION_ERROR_CODE,
+            INVALID_REQUEST_MESSAGE.to_string(),
+            JSON_WITH_CHARSET,
         ),
         (
             "the right grant in the wrong case",
             json!({"grant_type": "CLIENT_CREDENTIALS", "resource": resource}),
-            UNSUPPORTED_GRANT_TYPE,
-            UNSUPPORTED_GRANT_TYPE_DESCRIPTION.to_string(),
-            JSON,
+            VALIDATION_ERROR_CODE,
+            INVALID_REQUEST_MESSAGE.to_string(),
+            JSON_WITH_CHARSET,
         ),
         (
             "an empty grant type",
             json!({"grant_type": "", "resource": resource}),
-            UNSUPPORTED_GRANT_TYPE,
-            UNSUPPORTED_GRANT_TYPE_DESCRIPTION.to_string(),
-            JSON,
+            VALIDATION_ERROR_CODE,
+            INVALID_REQUEST_MESSAGE.to_string(),
+            JSON_WITH_CHARSET,
         ),
         (
             "no grant type at all",
             json!({"resource": resource}),
-            UNSUPPORTED_GRANT_TYPE,
-            UNSUPPORTED_GRANT_TYPE_DESCRIPTION.to_string(),
-            JSON,
+            VALIDATION_ERROR_CODE,
+            INVALID_REQUEST_MESSAGE.to_string(),
+            JSON_WITH_CHARSET,
         ),
         (
             "the grant name with trailing text",
             json!({"grant_type": "client_credentials_extra", "resource": resource}),
-            UNSUPPORTED_GRANT_TYPE,
-            UNSUPPORTED_GRANT_TYPE_DESCRIPTION.to_string(),
-            JSON,
+            VALIDATION_ERROR_CODE,
+            INVALID_REQUEST_MESSAGE.to_string(),
+            JSON_WITH_CHARSET,
         ),
         (
             "no resource at all",

@@ -509,6 +509,149 @@ pub(super) const OPTION_DESCRIPTIONS: &[OptionDescription] = &[
         "Target Runtime",
         "Version of the .NET runtime the IIS application pool loads.",
     ),
+    // The rest of what the option reference defines in the namespaces above —
+    // the options this service honours no behaviour for but a platform version
+    // still defines, so a configuration naming one resolves (see the comment on
+    // them in [`super::configuration_option_catalog`]).
+    (
+        NAMESPACE_AUTOSCALING_ASG,
+        "Custom Availability Zones",
+        "Availability Zones you want to run the environment's instances in.",
+    ),
+    (
+        NAMESPACE_LAUNCH_CONFIGURATION,
+        "BlockDeviceMappings",
+        "Additional Amazon EBS volumes and instance store volumes to attach to the \
+         environment's instances.",
+    ),
+    (
+        NAMESPACE_LAUNCH_CONFIGURATION,
+        "DisableDefaultEC2SecurityGroup",
+        "Whether to keep the default Amazon EC2 security group off the environment's \
+         instances, leaving them only the security groups the configuration names.",
+    ),
+    (
+        NAMESPACE_LAUNCH_CONFIGURATION,
+        "ImageId",
+        "Amazon Machine Image the environment's instances are launched from, in place of the \
+         platform version's own.",
+    ),
+    (
+        NAMESPACE_LAUNCH_CONFIGURATION,
+        "RootVolumeIOPS",
+        "Input/output operations per second to provision for the root volume attached to each \
+         of the environment's instances.",
+    ),
+    (
+        NAMESPACE_LAUNCH_CONFIGURATION,
+        "RootVolumeThroughput",
+        "Throughput, in MiB/s, to provision for the root volume attached to each of the \
+         environment's instances.",
+    ),
+    (
+        NAMESPACE_LAUNCH_CONFIGURATION,
+        "SSHSourceRestriction",
+        "Addresses that may reach the environment's instances on the SSH port.",
+    ),
+    (
+        "aws:autoscaling:updatepolicy:rollingupdate",
+        "MaxBatchSize",
+        "Number of instances in each batch a rolling update is applied to.",
+    ),
+    (
+        "aws:autoscaling:updatepolicy:rollingupdate",
+        "MinInstancesInService",
+        "Minimum number of instances that must be in service while other instances are taken \
+         out of service by a rolling update.",
+    ),
+    (
+        "aws:autoscaling:updatepolicy:rollingupdate",
+        "PauseTime",
+        "Time to wait after each batch of a rolling update before moving on to the next one.",
+    ),
+    (
+        "aws:autoscaling:updatepolicy:rollingupdate",
+        "Timeout",
+        "Maximum time to wait for a batch of a rolling update to become healthy before the \
+         update fails.",
+    ),
+    (
+        "aws:ec2:instances",
+        "SpotFleetOnDemandBase",
+        "Minimum number of On-Demand Instances the Auto Scaling group launches before it \
+         launches any Spot Instances.",
+    ),
+    (
+        "aws:ec2:instances",
+        "SpotFleetOnDemandAboveBasePercentage",
+        "Percentage of the instances above the On-Demand base that the Auto Scaling group \
+         launches as On-Demand Instances.",
+    ),
+    (
+        "aws:ec2:instances",
+        "SpotMaxPrice",
+        "Maximum price per unit hour, in US dollars, to pay for a Spot Instance.",
+    ),
+    (
+        "aws:ec2:vpc",
+        "DBSubnets",
+        "Subnets of the virtual private cloud to place the environment's database instance in.",
+    ),
+    (
+        NAMESPACE_ENVIRONMENT,
+        "ExternalExtensionsS3Bucket",
+        "Amazon S3 bucket holding the configuration files the environment applies beside the \
+         ones in the source bundle.",
+    ),
+    (
+        NAMESPACE_ENVIRONMENT,
+        "ExternalExtensionsS3Key",
+        "Amazon S3 key of the archive of configuration files the environment applies beside \
+         the ones in the source bundle.",
+    ),
+    (
+        "aws:elasticbeanstalk:healthreporting:system",
+        "ConfigDocument",
+        "Document describing the Amazon CloudWatch metrics enhanced health publishes for the \
+         environment and its instances.",
+    ),
+    (
+        "aws:elasticbeanstalk:healthreporting:system",
+        "EnhancedHealthAuthEnabled",
+        "Whether the environment's instances authenticate the enhanced health reports they \
+         send to the service.",
+    ),
+    (
+        "aws:elb:healthcheck",
+        "Target",
+        "Protocol, port and path the load balancer's health check of a registered instance \
+         addresses.",
+    ),
+    (
+        "aws:elb:loadbalancer",
+        "LoadBalancerHTTPPort",
+        "Port the load balancer listens for HTTP connections on, or OFF to listen for none.",
+    ),
+    (
+        "aws:elb:loadbalancer",
+        "LoadBalancerHTTPSPort",
+        "Port the load balancer listens for HTTPS connections on, or OFF to listen for none.",
+    ),
+    (
+        "aws:elb:loadbalancer",
+        "LoadBalancerPortProtocol",
+        "Protocol the load balancer speaks on its HTTP listener's port.",
+    ),
+    (
+        "aws:elb:loadbalancer",
+        "LoadBalancerSSLPortProtocol",
+        "Protocol the load balancer speaks on its HTTPS listener's port.",
+    ),
+    (
+        "aws:elb:loadbalancer",
+        "ManagedSecurityGroup",
+        "Security group the service manages the load balancer's own ingress rules in.",
+    ),
 ];
 
 /// The description the option reference states for the option

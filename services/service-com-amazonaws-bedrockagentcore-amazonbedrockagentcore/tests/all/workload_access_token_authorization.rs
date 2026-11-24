@@ -583,10 +583,19 @@ fn action(operation: &str) -> String {
     format!("{ACTION_PREFIX}:{operation}")
 }
 
-/// The sentence this plane refuses a memory-record call IAM does not permit with: the
-/// principal that signed, and nothing further.
-fn refusal_for(principal: &str) -> String {
-    format!("User: {principal} is not authorized to perform this operation")
+/// The sentence this service refuses a memory-record call IAM does not permit with: IAM's
+/// own, naming the principal that signed, the action it asked for, the memory container it
+/// addressed and the rule that withheld the grant — the reason here being IAM's default
+/// deny, since a conditioned Allow whose clause the call does not satisfy states nothing
+/// about it.
+///
+/// Spelled out here rather than imported, so a wrong sentence in `src` fails this test.
+fn refusal_for(principal: &str, operation: &str, resource: &str) -> String {
+    let action = action(operation);
+    format!(
+        "User: {principal} is not authorized to perform: {action} on resource: {resource} \
+         because no identity-based policy allows the {action} action"
+    )
 }
 
 /// The message a refusal carried.
@@ -776,8 +785,8 @@ async fn a_memory_record_listing_is_decided_by_the_namespace_condition_key() {
             );
             assert_eq!(
                 message_of(&answered),
-                refusal_for(&principal),
-                "case {name}: expected this plane's refusal sentence, got {answered}"
+                refusal_for(&principal, "ListMemoryRecords", &memory_arn),
+                "case {name}: expected IAM's refusal sentence, got {answered}"
             );
             assert!(
                 answered.get("memoryRecordSummaries").is_none(),
@@ -885,10 +894,18 @@ async fn a_memory_record_read_and_delete_are_decided_by_the_same_key() {
             DENIED_CODE,
             "case {case:?}: expected {DENIED_CODE}, got {answered}"
         );
+        // The two operations the rows drive, named by the method the model binds each to:
+        // a read is a `GET` of the record and a delete is a `DELETE` of it, and the action
+        // IAM was asked about is that operation's.
+        let operation = if method == "DELETE" {
+            "DeleteMemoryRecord"
+        } else {
+            "GetMemoryRecord"
+        };
         assert_eq!(
             message_of(&answered),
-            refusal_for(&principal),
-            "case {case:?}: expected this plane's refusal sentence, got {answered}"
+            refusal_for(&principal, operation, &memory_arn),
+            "case {case:?}: expected IAM's refusal sentence, got {answered}"
         );
         assert!(
             answered.get("memoryRecord").is_none() && answered.get("memoryRecordId").is_none(),

@@ -91,11 +91,12 @@
 //!
 //! ## How a refusal is worded
 //!
-//! Two sentences, each where a recording of THIS service's own refusal shows it: a call of
-//! the memory plane names the principal and nothing further, and the identity plane's mints
-//! name the principal, the action, the resource and which of IAM's rules withheld the grant.
-//! The decision itself is one function either way, so the two cannot diverge in anything but
-//! the wording.
+//! ONE sentence, the one IAM states an authorization failure with: the principal that signed,
+//! the action it asked for, the resource it addressed and which of IAM's rules withheld the
+//! grant ([`::service_common::iam_authorization::not_authorized_by_identity_policy`]). Every
+//! gate of this service answers in it — the identity plane's token mints and the memory
+//! plane's record calls alike — so two operations cannot diverge in the account they give of
+//! one decision, and every value in it comes from the request and from the stored policies.
 
 use std::time::SystemTime;
 
@@ -222,13 +223,11 @@ pub fn authorize<Eng: Send + Sync + 'static>(
 /// allowing the action on the container only for one namespace (or one namespace prefix)
 /// grants exactly the calls whose namespace the clause covers, and refuses every other one.
 ///
-/// The refusal is this PLANE's own sentence rather than IAM's full one: a recorded refusal
-/// of a memory-record call names the principal and nothing further
-/// ([`::service_common::iam_authorization::not_authorized_to_perform_this_operation`]), so
-/// every call of this plane states it alike — a caller must not be able to tell two
-/// operations of one plane apart by the wording of a denial. The identity plane's mints keep
-/// IAM's full sentence, which is what a recording of THEIR refusal carries, and that is the
-/// split [`authorize`] serves.
+/// The refusal is IAM's own full sentence, as [`authorize`]'s is: the principal that signed,
+/// the action it asked for, the resource it addressed — the memory container, which is the
+/// resource this plane's actions are scoped to — and which of IAM's rules withheld the
+/// grant. One wording for every gate of this service, so a caller reads the same account of
+/// a denial whichever plane it called.
 pub fn authorize_memory<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
@@ -236,17 +235,16 @@ pub fn authorize_memory<Eng: Send + Sync + 'static>(
     memory_arn: &str,
     namespace: AddressedNamespace<'_>,
 ) -> Result<(), AccessDeniedException> {
+    let action = action_of(operation);
     decide(
         engine,
         ctx,
-        &action_of(operation),
+        &action,
         memory_arn,
         &PublishedConditions::of_memory_call(namespace),
     )
-    .map_err(|refused| AccessDeniedException {
-        message: Some(iam::not_authorized_to_perform_this_operation(
-            &refused.principal,
-        )),
+    .map_err(|refused| {
+        not_authorized(&refused.principal, &action, memory_arn, &refused.reason)
     })
 }
 

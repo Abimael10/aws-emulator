@@ -215,39 +215,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The URL must begin with https:// and should correspond to the iss claim in the
         // provider's OpenID Connect ID tokens. Per the OIDC standard, path components are
-        // allowed but query parameters are not" (`$Url`). A value failing either is "an
-        // invalid … value … supplied for an input parameter".
+        // allowed but query parameters are not" (`$Url`). A value failing any of those is
+        // "an invalid … value … supplied for an input parameter", and the reading is the
+        // store's one (`crate::state::registered_open_id_connect_url`), which answers the
+        // host-and-path form the provider is stored and reported under.
         //
         // The refusal of a Url outside that published form carries NO `Message` member:
         // recorded behaviour for this class, where IAM answers the code alone. A sentence
         // written here instead would be text AWS never emits, which a client comparing the
-        // refusal against AWS's reads as a different refusal — so the three readings of the
-        // form below all answer the bare code
+        // refusal against AWS's reads as a different refusal — so it answers the bare code
         // (`crate::state::OPEN_ID_CONNECT_URL_FORM_REFUSAL`).
-        let Some(host_and_path) = input
-            .url
-            .strip_prefix(crate::state::OPEN_ID_CONNECT_URL_SCHEME)
-        else {
+        let Some(host_and_path) = crate::state::registered_open_id_connect_url(&input.url) else {
             return Err(CreateOpenIDConnectProviderErrorModeled::InvalidInputException(
                 crate::state::OPEN_ID_CONNECT_URL_FORM_REFUSAL,
             )
             .into());
         };
-        if host_and_path.contains('?') {
-            return Err(CreateOpenIDConnectProviderErrorModeled::InvalidInputException(
-                crate::state::OPEN_ID_CONNECT_URL_FORM_REFUSAL,
-            )
-            .into());
-        }
-        // The URL "typically consists of only a hostname" and "should correspond to the iss
-        // claim": a value whose first path segment is empty names no host at all, so there
-        // is no provider for it to identify.
-        if host_and_path.split('/').next().unwrap_or_default().is_empty() {
-            return Err(CreateOpenIDConnectProviderErrorModeled::InvalidInputException(
-                crate::state::OPEN_ID_CONNECT_URL_FORM_REFUSAL,
-            )
-            .into());
-        }
 
         // Web identity federation hosted inside the partition is OUTBOUND only: the issuer
         // an account of this partition is given mints tokens for its principals to present
@@ -409,14 +392,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn.clone(),
             crate::state::OpenIdConnectProviderRecord {
                 url,
-                // The address this emulator is reached at, recorded with the provider: a read
-                // publishes the issuer's path under it where the issuer names a host AWS
-                // itself serves, so the discovery document a relying party fetches next is
-                // one this emulator answers (`crate::state::published_open_id_connect_url`).
-                served_endpoint: crate::state::published_endpoint_authority(
-                    ctx.parts(),
-                    ctx.endpoint().as_str(),
-                ),
                 client_id_list,
                 thumbprint_list,
                 create_date: crate::state::now(),

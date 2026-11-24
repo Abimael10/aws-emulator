@@ -177,9 +177,15 @@ async fn the_update_ceiling_is_the_quota_less_what_the_key_portion_is_charged() 
 
 /// RULE: `TransactWriteItems`' `Update` is bound by the standalone `UpdateItem`'s ceiling —
 /// the ceiling is the ITEM's and does not move with the surface the change arrived through —
-/// and a change one byte past it is a failure the transaction's own change made, so the
-/// transaction is CANCELLED with that action's reason carrying the single-item path's
-/// sentence, at exactly the byte `UpdateItem` stops at.
+/// and WHOSE failure a crossing of it is follows whether the item the change leaves is past
+/// the QUOTA in the bytes it stores. A key portion below the floor is charged more than it
+/// holds, so the item one byte past that charged ceiling still fits the quota: nothing became
+/// too large and the CALL is refused, in the class and the sentence the single-item path
+/// states. A key portion that FILLS the floor is charged its own bytes, so one byte past the
+/// charged ceiling is one byte past the quota — the change really made the item too large,
+/// which is a circumstance `TransactionCanceledException` documents, so the transaction is
+/// cancelled with that action's reason. Either way the byte the change stops at is the one
+/// `UpdateItem` stops at, and nothing is applied.
 #[tokio::test]
 async fn a_transactional_update_shares_the_single_item_ceiling() {
     let router = emulator();
@@ -210,22 +216,69 @@ async fn a_transactional_update_shares_the_single_item_ceiling() {
             transact(&table, shape, largest + 1),
         )
         .await;
-        // An item the change would grow past the ceiling is a change no item could be left
-        // by, so the CALL is refused with the single-item path's sentence and none of the
-        // transaction is applied.
-        assert_eq!(
-            (status, error_code(&body).as_str(), message(&body).as_str()),
-            (400, "ValidationException", UPDATE_TOO_BIG),
-            "case {:?}: expected the call refused one byte past the ceiling, got \
-             {status} with {body}",
-            shape.case
-        );
+        // The item this action would leave holds its key portion's own bytes plus the value
+        // it writes: past the QUOTA only where the key fills the floor, since below it the
+        // charge exceeds what the key holds.
+        let past_the_quota = shape.key_bytes() >= KEY_PORTION_FLOOR;
+        if past_the_quota {
+            // The change made the item too large, so the TRANSACTION is cancelled and this
+            // action is the one the reason list names.
+            assert_eq!(
+                (status, error_code(&body).as_str(), message(&body).as_str()),
+                (
+                    400,
+                    "TransactionCanceledException",
+                    "Transaction cancelled, please refer cancellation reasons for specific \
+                     reasons [ValidationError]"
+                ),
+                "case {:?}: expected the transaction cancelled one byte past the quota, got \
+                 {status} with {body}",
+                shape.case
+            );
+            let reasons: Vec<(Option<&str>, Option<&str>)> = body["CancellationReasons"]
+                .as_array()
+                .map(|reasons| {
+                    reasons
+                        .iter()
+                        .map(|reason| {
+                            (
+                                reason["Code"].as_str(),
+                                reason.get("Message").and_then(Value::as_str),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                reasons,
+                vec![(Some("ValidationError"), Some(UPDATE_TOO_BIG))],
+                "case {:?}: expected the action named with the size sentence, got {body}",
+                shape.case
+            );
+        } else {
+            // The item still fits the quota; what crossed is what the request's own
+            // accounting charges, so the CALL is refused with the single-item path's
+            // sentence and no action is graded for it.
+            assert_eq!(
+                (status, error_code(&body).as_str(), message(&body).as_str()),
+                (400, "ValidationException", UPDATE_TOO_BIG),
+                "case {:?}: expected the call refused one byte past the charged ceiling, got \
+                 {status} with {body}",
+                shape.case
+            );
+            assert!(
+                body.get("CancellationReasons").is_none(),
+                "case {:?}: a refused call grades no action, so it reports no reason list, got \
+                 {body}",
+                shape.case
+            );
+        }
         let stored = stored_length(&router, &table, shape).await;
         assert_eq!(
             stored,
             Some(largest),
-            "case {:?}: a refused transactional update must leave the stored item where it \
-             was, got {stored:?} byte(s)",
+            "case {:?}: a refused or cancelled transactional update must leave the stored item \
+             where it was, got {stored:?} byte(s)",
             shape.case
         );
     }

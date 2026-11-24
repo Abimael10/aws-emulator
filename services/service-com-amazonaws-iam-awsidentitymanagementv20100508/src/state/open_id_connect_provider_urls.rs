@@ -1,158 +1,105 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The URL an OIDC provider of this account is PUBLISHED under, as a read of the provider
-//! reports it.
+//! The URL an OIDC provider of this account is REGISTERED and REPORTED under.
 //!
-//! A provider's URL is not only a value the account stored: it is an ADDRESS a relying party
-//! FETCHES. "The URL ... should correspond to the iss claim in the provider's OpenID Connect
-//! ID tokens" (`CreateOpenIDConnectProvider$Url`), and an OIDC client bootstraps a federation
-//! by resolving that issuer and reading the two documents it publishes about itself
-//! (`<issuer>/.well-known/openid-configuration` and the key set it names,
-//! [`::service_common::openid_discovery`]). So the address a read of the provider publishes
-//! has to lead back to this emulator, which is the rule every URL this emulator announces
-//! follows — the account's own outbound web identity issuer is built the same way
-//! ([`super::outbound_web_identity_federation`]).
+//! A provider's URL is a value its registration CARRIED: "the URL of the identity provider.
+//! The URL must begin with https:// and should correspond to the iss claim in the provider's
+//! OpenID Connect ID tokens. Per the OIDC standard, path components are allowed but query
+//! parameters are not" (`CreateOpenIDConnectProvider$Url`). IAM stores it with the scheme
+//! removed — the host-and-path form the provider's ARN is built from
+//! ([`super::open_id_connect_provider_arn`]) and the form a relying party compares a token's
+//! `iss` claim against — and a read of the provider reports exactly that stored text
+//! (`GetOpenIDConnectProvider$Url`).
 //!
-//! An issuer hosted by AWS ITSELF is exactly where the two part company: a user pool's issuer
-//! is `cognito-idp.<region>.amazonaws.com/<pool-id>`, a host no client of this emulator
-//! resolves and that this emulator does not answer on — while the SERVICE behind it is
-//! emulated here, at this emulator's own endpoint, where that pool publishes its discovery
-//! documents under the same path. Such a URL is therefore published under the address this
-//! emulator is reached at, with the issuer's own path kept, so the fetch a client makes next
-//! lands on the service that serves it. An issuer under any other host is an address outside
-//! this emulator either way and is published exactly as it was registered.
+//! So nothing of this emulator's own addressing goes into it. The `Url` is CALLER input
+//! echoed back, not an address this emulator mints for the caller to fetch: rewriting it to
+//! the host this process answers on would report a provider the account never registered,
+//! and a client matching the issuer of a token against the provider it registered would not
+//! find it. The addresses this emulator does publish — the account's own outbound web
+//! identity issuer among them ([`super::outbound_web_identity_federation`]) — are the ones
+//! this emulator ISSUES, and they are built from its endpoint for that reason.
 //!
-//! What the account STORES is untouched: the provider's URL is its identity — its ARN is
-//! derived from it and "you cannot register the same provider multiple times in a single
-//! Amazon Web Services account" (`$Url`) — so the registered text is what the store keys,
-//! what a token's `iss` claim is compared against, and what a second create collides with.
-//! Only the published REPORT is addressed at this emulator.
+//! Split out of [`super`] so the one reading of a registered URL lives beside the record it
+//! is stored in.
 
 #[allow(unused_imports)]
 use super::*;
 
-/// The address this emulator is reached at, as a registered provider records it: the endpoint
-/// the registering request itself reached when that endpoint is the emulator's own
-/// ([`::service_common::data_plane_addressing::reached_emulator_endpoint_of_parts`]), which is
-/// a client that resolves nothing else, and otherwise the one address this process answers on
-/// ([`::service_common::data_plane_addressing::served_endpoint_authority`]), so a provider
-/// registered by an in-process call of another service publishes an address that service's
-/// caller can reach too.
+/// The host-and-path form of the registered URL `url` — what the account STORES for a
+/// provider and what a read of it reports — or `None` for a value outside the published form
+/// of `CreateOpenIDConnectProvider$Url`.
 ///
-/// Both readings are the workspace's shared ones, so this service writes no second rule for
-/// which host is the emulator's own. `None` only for an emulator served on no port at all,
-/// where there is no address to publish.
+/// Three readings, each the doc sentence's own: the value has to begin with the scheme the
+/// URL "must begin with" ([`OPEN_ID_CONNECT_URL_SCHEME`]), it may not carry the query the
+/// standard does not allow, and it has to name a host, since a URL "typically consists of
+/// only a hostname" and one whose first path segment is empty identifies no provider.
+///
+/// The ONE place a registered URL is read into its stored form, so the text the ARN is
+/// derived from, the text a second create collides with and the text a read reports cannot
+/// diverge.
 #[must_use]
-pub fn published_endpoint_authority(
-    parts: &::http::request::Parts,
-    served_base: &str,
-) -> Option<String> {
-    ::service_common::data_plane_addressing::reached_emulator_endpoint_of_parts(parts)
-        .or_else(|| ::service_common::data_plane_addressing::served_endpoint_authority(served_base))
-}
-
-/// The `Url` a read of an OIDC provider reports: the registered host-and-path for a provider
-/// whose issuer is hosted outside this emulator, and the same path under `served_endpoint`
-/// for one whose issuer names a host AWS itself publishes an endpoint at
-/// ([`::service_common::data_plane_addressing::addresses_an_aws_endpoint`]) — the services
-/// this emulator answers for.
-///
-/// `served_endpoint` is the `host[:port]` this emulator is reached at, recorded when the
-/// provider was registered ([`OpenIdConnectProviderRecord::served_endpoint`]) so one provider
-/// publishes ONE address however its later callers address this emulator. `None` is an
-/// emulator with no address to publish at all, where the registered text is all there is to
-/// report.
-///
-/// The URL carries no scheme in either form, because a provider is "stored and reported
-/// WITHOUT the scheme" (`crate::ops::create_open_id_connect_provider`): the host-and-path
-/// form the ARN is built from and a token's `iss` claim is compared against.
-#[must_use]
-pub fn published_open_id_connect_url(url: &str, served_endpoint: Option<&str>) -> String {
-    let Some(endpoint) = served_endpoint else {
-        return url.to_string();
-    };
-    let (host, path) = match url.split_once('/') {
-        Some((host, path)) => (host, Some(path)),
-        None => (url, None),
-    };
-    if !::service_common::data_plane_addressing::addresses_an_aws_endpoint(host) {
-        return url.to_string();
+pub fn registered_open_id_connect_url(url: &str) -> Option<&str> {
+    let host_and_path = url.strip_prefix(OPEN_ID_CONNECT_URL_SCHEME)?;
+    if host_and_path.contains('?') {
+        return None;
     }
-    match path {
-        Some(path) => format!("{endpoint}/{path}"),
-        None => endpoint.to_string(),
-    }
+    let host = host_and_path.split('/').next().unwrap_or_default();
+    (!host.is_empty()).then_some(host_and_path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// RULE: a provider whose issuer names a host AWS publishes an endpoint at is published
-    /// under the address this emulator is reached at, keeping the issuer's path; every other
-    /// issuer is published as it was registered.
+    /// RULE: a registered URL inside the published form is stored as its host-and-path, with
+    /// the scheme removed and every other character kept; one outside that form is read as
+    /// naming no provider.
     #[test]
-    fn an_aws_hosted_issuer_is_published_at_this_emulators_address() {
-        let endpoint = "127.0.0.1:9297";
-        // The rows differ along what the rule generalises over: whether the host is one AWS
-        // publishes an endpoint at, which partition's DNS suffix it is under, how many path
-        // segments the issuer carries, whether it carries a path at all, and the case the
-        // host is written in.
-        let rows: [(&str, &str, &str); 8] = [
+    fn a_registered_url_is_stored_as_its_host_and_path() {
+        // The rows differ along what the rule generalises over: whether the scheme is the
+        // one the URL must begin with, how many path segments the issuer carries, whether it
+        // carries a path at all, whether it names a host, and whether it carries a query.
+        let rows: [(&str, &str, Option<&str>); 9] = [
             (
-                "a user pool issuer, host and pool path",
-                "cognito-idp.us-west-2.amazonaws.com/us-west-2_A1b2C3d4E",
-                "127.0.0.1:9297/us-west-2_A1b2C3d4E",
+                "a host alone",
+                "https://server.example.org",
+                Some("server.example.org"),
             ),
             (
-                "an issuer of another AWS service, with a longer path",
-                "oidc.eks.eu-west-1.amazonaws.com/id/7A1B2C3D/extra",
-                "127.0.0.1:9297/id/7A1B2C3D/extra",
+                "a host and one path segment",
+                "https://server.example.org/oidc",
+                Some("server.example.org/oidc"),
             ),
             (
-                "an AWS host under another partition's suffix",
-                "cognito-idp.cn-north-1.amazonaws.com.cn/cn-north-1_pool",
-                "127.0.0.1:9297/cn-north-1_pool",
+                "a host and several path segments",
+                "https://oidc.eks.eu-west-1.amazonaws.com/id/7A1B2C3D/extra",
+                Some("oidc.eks.eu-west-1.amazonaws.com/id/7A1B2C3D/extra"),
             ),
             (
-                "an AWS host written in another case",
-                "COGNITO-IDP.US-WEST-2.AMAZONAWS.COM/us-west-2_pool",
-                "127.0.0.1:9297/us-west-2_pool",
+                "an issuer of a service AWS itself hosts, which is stored as registered",
+                "https://cognito-idp.us-west-2.amazonaws.com/us-west-2_A1b2C3d4E",
+                Some("cognito-idp.us-west-2.amazonaws.com/us-west-2_A1b2C3d4E"),
             ),
             (
-                "an AWS host carrying no path at all",
-                "oidc.eks.eu-west-1.amazonaws.com",
-                "127.0.0.1:9297",
+                "a host with a port, kept as written",
+                "https://server.example.org:8443/oidc",
+                Some("server.example.org:8443/oidc"),
             ),
+            ("the other scheme", "http://server.example.org", None),
+            ("no scheme at all", "server.example.org", None),
             (
-                "a third-party issuer",
-                "server.example.com/oidc",
-                "server.example.com/oidc",
+                "a query, which the standard does not allow",
+                "https://server.example.org/oidc?audience=a",
+                None,
             ),
-            (
-                "a third-party issuer whose host merely contains the suffix",
-                "amazonaws.com.example.net/oidc",
-                "amazonaws.com.example.net/oidc",
-            ),
-            (
-                "an issuer already addressed at this emulator",
-                "127.0.0.1:9297/us-west-2_pool",
-                "127.0.0.1:9297/us-west-2_pool",
-            ),
+            ("no host at all", "https:///oidc", None),
         ];
 
-        for (case, stored, expected) in rows {
-            let published = published_open_id_connect_url(stored, Some(endpoint));
+        for (case, registered, expected) in rows {
+            let stored = registered_open_id_connect_url(registered);
             assert_eq!(
-                published, expected,
-                "case {case:?}: expected {expected:?}, got {published:?}"
-            );
-            // An emulator with no address to publish reports the registered text itself.
-            let unserved = published_open_id_connect_url(stored, None);
-            assert_eq!(
-                unserved, stored,
-                "case {case:?}: expected the registered URL {stored:?} with no address to \
-                 publish, got {unserved:?}"
+                stored, expected,
+                "case {case:?}: expected {expected:?}, got {stored:?}"
             );
         }
     }

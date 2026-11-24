@@ -383,7 +383,8 @@ async fn a_change_that_would_grow_the_item_past_it_is_the_update_sentence() {
             // A VALUE an action CARRIES that no item could hold is a fact of the REQUEST,
             // settled before any table is looked up, so it refuses the call — in the sentence
             // the update path words that quota with, because the value is one this change
-            // would leave in the stored item.
+            // would leave in the stored item. The cases where the item the change LEAVES is
+            // what crosses the quota are driven below.
             "one action of a transaction carrying a value no item could hold",
             "TransactWriteItems",
             json!({"TransactItems": [{"Update": {"TableName": TABLE, "Key": key(),
@@ -398,36 +399,13 @@ async fn a_change_that_would_grow_the_item_past_it_is_the_update_sentence() {
         );
     }
 
-    // The TRANSACTIONAL surface states the same sentence in the same class wherever the
-    // crossing is found: a change that would leave the item past the ceiling is a change no
-    // item could be left by, so it is a defect of the REQUEST — the whole call is refused and
-    // no action is graded. The first case asks to store a value the ceiling admits on its own
-    // over an item the change would take past it; the second drives a small value over an item
-    // already near the ceiling.
-    let case = "one action of a transaction asking for an item past the ceiling";
-    let (status, answered) = call(
-        &router,
-        "TransactWriteItems",
-        json!({"TransactItems": [{"Update": {"TableName": TABLE, "Key": key(),
-               "UpdateExpression": "SET body = :b",
-               "ExpressionAttributeValues": {":b": {"S": filler(MAX_ITEM_BYTES)}}}}]}),
-    )
-    .await;
-    assert_eq!(
-        (
-            status,
-            error_code(&answered).as_str(),
-            message(&answered).as_str()
-        ),
-        (400, "ValidationException", UPDATE_TOO_BIG),
-        "case {case:?}: expected the call refused with the update-path sentence, got {status} \
-         with {answered}"
-    );
-    assert!(
-        answered.get("CancellationReasons").is_none(),
-        "case {case:?}: a refused call grades no action, so it reports no reason list, got \
-         {answered}"
-    );
+    // The TRANSACTIONAL surface states the same sentence as the REASON the crossing action
+    // reports wherever the item the change LEAVES is past the quota in the bytes it stores —
+    // "an item size becomes too large [...] because of changes made by the transaction", one
+    // of the circumstances a cancellation documents — so the transaction is cancelled with
+    // that action named. The rows differ in where those bytes came from: a value the ceiling
+    // admits on its own that only crosses it together with the key it is written beside, and
+    // a small value over an item already near the ceiling.
 
     let near_the_ceiling = json!({"pk": {"S": "near-the-ceiling"}, "sk": {"S": "a"}});
     ok(
@@ -438,30 +416,46 @@ async fn a_change_that_would_grow_the_item_past_it_is_the_update_sentence() {
                "held": {"S": filler(MAX_ITEM_BYTES - 1024)}}}),
     )
     .await;
-    let (status, answered) = call(
-        &router,
-        "TransactWriteItems",
-        json!({"TransactItems": [{"Update": {"TableName": TABLE,
-               "Key": near_the_ceiling.clone(),
-               "UpdateExpression": "SET body = :b",
-               "ExpressionAttributeValues": {":b": {"S": filler(2048)}}}}]}),
-    )
-    .await;
-    assert_eq!(
+    for (case, request) in [
         (
-            status,
-            error_code(&answered).as_str(),
-            message(&answered).as_str()
+            "a value the ceiling admits on its own, one byte past it beside its key",
+            json!({"TransactItems": [{"Update": {"TableName": TABLE, "Key": key(),
+                   "UpdateExpression": "SET body = :b",
+                   "ExpressionAttributeValues": {":b": {"S": filler(MAX_ITEM_BYTES)}}}}]}),
         ),
-        (400, "ValidationException", UPDATE_TOO_BIG),
-        "case \"a transactional change past the ceiling\": expected the call refused with the \
-         update-path sentence, got {status} with {answered}"
-    );
-    assert!(
-        answered.get("CancellationReasons").is_none(),
-        "case \"a transactional change past the ceiling\": a refused call grades no action, so \
-         it reports no reason list, got {answered}"
-    );
+        (
+            "a small value over an item already near the ceiling",
+            json!({"TransactItems": [{"Update": {"TableName": TABLE,
+                   "Key": near_the_ceiling.clone(),
+                   "UpdateExpression": "SET body = :b",
+                   "ExpressionAttributeValues": {":b": {"S": filler(2048)}}}}]}),
+        ),
+    ] {
+        let (status, answered) = call(&router, "TransactWriteItems", request).await;
+        assert_eq!(
+            (
+                status,
+                error_code(&answered).as_str(),
+                message(&answered).as_str()
+            ),
+            (
+                400,
+                "TransactionCanceledException",
+                "Transaction cancelled, please refer cancellation reasons for specific reasons \
+                 [ValidationError]"
+            ),
+            "case {case:?}: expected the transaction cancelled over that action, got {status} \
+             with {answered}"
+        );
+        assert_eq!(
+            (
+                answered["CancellationReasons"][0]["Code"].as_str(),
+                answered["CancellationReasons"][0]["Message"].as_str(),
+            ),
+            (Some("ValidationError"), Some(UPDATE_TOO_BIG)),
+            "case {case:?}: expected that action's reason to word the ceiling, got {answered}"
+        );
+    }
 
     // The seeded item is where it was: a change that did not go through writes nothing.
     let read = ok(&router, "GetItem", json!({"TableName": TABLE, "Key": key()})).await;

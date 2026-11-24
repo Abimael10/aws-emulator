@@ -1010,6 +1010,7 @@ async fn options_restricts_the_descriptions_to_the_options_it_names() {
             expected: vec![
                 ("aws:elb:healthcheck", "HealthyThreshold"),
                 ("aws:elb:healthcheck", "Interval"),
+                ("aws:elb:healthcheck", "Target"),
                 ("aws:elb:healthcheck", "Timeout"),
                 ("aws:elb:healthcheck", "UnhealthyThreshold"),
             ],

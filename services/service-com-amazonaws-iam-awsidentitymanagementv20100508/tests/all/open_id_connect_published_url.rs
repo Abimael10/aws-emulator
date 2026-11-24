@@ -1,29 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The `Url` a read of an IAM OIDC provider PUBLISHES, end to end over the awsQuery wire.
+//! The `Url` a read of an IAM OIDC provider REPORTS, end to end over the awsQuery wire.
 //!
-//! RULE: a provider's URL is an address a relying party FETCHES — it "should correspond to
-//! the iss claim in the provider's OpenID Connect ID tokens"
-//! (`CreateOpenIDConnectProvider$Url`), and an OIDC client bootstraps a federation by
-//! resolving that issuer and reading the discovery document published under it — so an
-//! issuer hosted at one of AWS's own endpoints, which this emulator serves rather than the
-//! real service, is published under the address THIS emulator is reached at, with the
-//! issuer's own path kept. An issuer under any other host is an address outside this
-//! emulator either way and is published exactly as it was registered. Neither form carries a
-//! scheme, which is the host-and-path form IAM stores and reports.
+//! RULE: a provider's URL is the value its registration carried — "the URL of the identity
+//! provider … should correspond to the iss claim in the provider's OpenID Connect ID tokens"
+//! (`CreateOpenIDConnectProvider$Url`) — stored with its `https://` scheme removed and
+//! reported back exactly as stored, whatever host it names. It is caller input echoed back,
+//! so no address of the emulator serving the request goes into it: a read made against a
+//! router SERVED at a loopback address reports the registered issuer, not that address.
 //!
-//! What the account holds is untouched: the URL is the provider's identity and its ARN is
-//! derived from it, so the ARN a create answers with still names the registered issuer and a
-//! second create for the same issuer still collides.
+//! The URL is also the provider's identity: its ARN is derived from it, and "you cannot
+//! register the same provider multiple times in a single Amazon Web Services account", so the
+//! second create for one issuer collides on the text the request carried.
 //!
 //! The suite is a TABLE whose rows differ along what the rule generalises over: whether the
-//! host is one AWS publishes an endpoint at, which service's endpoint it is, how many path
-//! segments the issuer carries, whether it carries a path at all, and whether the host is a
-//! third-party one.
+//! host is one AWS itself publishes an endpoint at, which service's endpoint it is, how many
+//! path segments the issuer carries, whether it carries a path or a port at all, and whether
+//! the host is a third-party one.
 //!
 //! The awsQuery harness is `tests/all/user_lifecycle.rs`'s, driven here against a router
-//! SERVED at an address — which is what the production router is, and what makes the
-//! endpoint this emulator publishes a real one.
+//! SERVED at an address — which is what the production router is, and what would give a
+//! rewrite a host to name.
 
 use std::sync::Arc;
 
@@ -35,12 +32,12 @@ use crate::user_lifecycle::{account_id, call, element};
 /// form a client on this machine can reach.
 const SERVED_BASE: &str = "https://127.0.0.1:9297";
 
-/// Its `host:port`, which is what a published URL carries.
+/// Its `host:port` — the authority no reported `Url` may carry, since none of these
+/// providers was registered under it.
 const SERVED_AUTHORITY: &str = "127.0.0.1:9297";
 
 /// A router serving only this service over one shared engine, SERVED at [`SERVED_BASE`] —
-/// the state the production router is in once the data port is bound, which is what gives a
-/// published address a host to name.
+/// the state the production router is in once the data port is bound.
 fn served_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -52,50 +49,54 @@ fn served_router() -> MultiServiceRouter {
     router
 }
 
-/// One row: the issuer URL the create registers, and the `Url` every read must publish.
-struct Published {
+/// One row: the issuer URL the create registers, and the `Url` every read must report.
+struct Reported {
     case: &'static str,
     /// The `Url` the create carries, scheme included, as a caller supplies one.
     registered: &'static str,
-    /// What a read must publish, with no scheme.
-    published: &'static str,
+    /// What a read must report, with no scheme.
+    reported: &'static str,
 }
 
 /// Rows spanning the hosts an issuer is registered under.
-const PUBLISHED: &[Published] = &[
-    Published {
-        case: "a user-pool issuer of a service this emulator serves",
+const REPORTED: &[Reported] = &[
+    Reported {
+        case: "a user-pool issuer of a service this emulator also emulates",
         registered: "https://cognito-idp.us-west-2.amazonaws.com/us-west-2_A1b2C3d4E",
-        published: "127.0.0.1:9297/us-west-2_A1b2C3d4E",
+        reported: "cognito-idp.us-west-2.amazonaws.com/us-west-2_A1b2C3d4E",
     },
-    Published {
+    Reported {
         case: "an issuer of another AWS service, with several path segments",
         registered: "https://oidc.eks.eu-west-1.amazonaws.com/id/7A1B2C3D4E5F",
-        published: "127.0.0.1:9297/id/7A1B2C3D4E5F",
+        reported: "oidc.eks.eu-west-1.amazonaws.com/id/7A1B2C3D4E5F",
     },
-    Published {
+    Reported {
         case: "an AWS-hosted issuer carrying no path at all",
         registered: "https://oidc.eks.us-east-1.amazonaws.com",
-        published: "127.0.0.1:9297",
+        reported: "oidc.eks.us-east-1.amazonaws.com",
     },
-    Published {
-        case: "a third-party issuer, which this emulator does not serve",
+    Reported {
+        case: "a third-party issuer",
         registered: "https://server.example.com/oidc",
-        published: "server.example.com/oidc",
+        reported: "server.example.com/oidc",
     },
-    Published {
+    Reported {
         case: "a third-party host that merely ends in an AWS zone's label",
         registered: "https://amazonaws.com.example.net/oidc",
-        published: "amazonaws.com.example.net/oidc",
+        reported: "amazonaws.com.example.net/oidc",
+    },
+    Reported {
+        case: "an issuer whose host carries a port",
+        registered: "https://server.example.com:8443/oidc",
+        reported: "server.example.com:8443/oidc",
     },
 ];
 
-/// RULE: the `Url` a read publishes leads back to this emulator for an issuer hosted at one
-/// of AWS's own endpoints, and is the registered host-and-path for any other issuer — while
-/// the provider's ARN keeps naming the issuer as it was registered.
+/// RULE: the `Url` a read reports is the registered host-and-path, and the provider's ARN
+/// names that same issuer.
 #[tokio::test]
-async fn a_read_publishes_an_aws_hosted_issuer_at_this_emulators_address() {
-    for row in PUBLISHED {
+async fn a_read_reports_the_registered_issuer() {
+    for row in REPORTED {
         // One account per row, so the provider a read reports is this row's.
         let router = served_router();
         let (status, created) = call(
@@ -110,16 +111,13 @@ async fn a_read_publishes_an_aws_hosted_issuer_at_this_emulators_address() {
             row.case
         );
 
-        // The provider's identity is the URL as it was REGISTERED: the ARN is derived from
-        // it, so the rewrite reaches the published address and nothing else.
+        // The provider's identity is the URL as it was REGISTERED, and the ARN is derived
+        // from it.
         let arn = element(&created, "OpenIDConnectProviderArn");
-        let registered_path = row
-            .registered
-            .strip_prefix("https://")
-            .expect("the row registers an https issuer");
         let expected_arn = format!(
-            "arn:aws:iam::{}:oidc-provider/{registered_path}",
-            account_id()
+            "arn:aws:iam::{}:oidc-provider/{}",
+            account_id(),
+            row.reported
         );
         assert_eq!(
             arn, expected_arn,
@@ -128,8 +126,8 @@ async fn a_read_publishes_an_aws_hosted_issuer_at_this_emulators_address() {
             row.case
         );
 
-        // Two reads, because the published address must not move under a caller that read
-        // the provider twice.
+        // Two reads, because what a provider reports must not move under a caller that read
+        // it twice.
         for attempt in 1..=2 {
             let (status, body) = call(
                 &router,
@@ -144,45 +142,35 @@ async fn a_read_publishes_an_aws_hosted_issuer_at_this_emulators_address() {
             );
             let url = element(&body, "Url");
             assert_eq!(
-                url, row.published,
-                "case {:?}: expected read {attempt} to publish {:?}, got {url:?}",
-                row.case, row.published
+                url, row.reported,
+                "case {:?}: expected read {attempt} to report {:?}, got {url:?}",
+                row.case, row.reported
             );
-            // Whatever the host is, it is never one of AWS's own endpoints unless the
-            // emulator is not the one serving it: a published address a client cannot reach
-            // is what the rule exists to prevent.
-            let host = url.split('/').next().unwrap_or(&url);
-            let aws_hosted = ::service_common::data_plane_addressing::addresses_an_aws_endpoint(
-                registered_path.split('/').next().unwrap_or(registered_path),
+            // The address this emulator is served at is no part of a value the caller
+            // supplied, so it appears in none of them.
+            assert!(
+                !url.contains(SERVED_AUTHORITY),
+                "case {:?}: expected read {attempt} to carry none of this emulator's own \
+                 address {SERVED_AUTHORITY:?}, got {url:?}",
+                row.case
             );
-            if aws_hosted {
-                assert_eq!(
-                    host, SERVED_AUTHORITY,
-                    "case {:?}: expected the published host to be this emulator's \
-                     {SERVED_AUTHORITY:?}, got {host:?}",
-                    row.case
-                );
-            }
         }
     }
 }
 
-/// RULE: the registered URL stays the provider's identity, so registering the SAME issuer
-/// twice collides on the issuer the request named — the published rewrite is a property of
-/// the report and of nothing else.
+/// RULE: the registered URL is the provider's identity, so registering the SAME issuer twice
+/// collides on the issuer the request named.
 #[tokio::test]
-async fn the_registered_issuer_is_still_the_providers_identity() {
+async fn the_registered_issuer_is_the_providers_identity() {
     let router = served_router();
     let issuer = "https://cognito-idp.us-west-2.amazonaws.com/us-west-2_Z9y8X7w6V";
-    let (status, created) =
-        call(&router, "CreateOpenIDConnectProvider", &[("Url", issuer)]).await;
+    let (status, created) = call(&router, "CreateOpenIDConnectProvider", &[("Url", issuer)]).await;
     assert_eq!(
         status, 200,
         "the first create must succeed, got {status}: {created}"
     );
 
-    let (status, refused) =
-        call(&router, "CreateOpenIDConnectProvider", &[("Url", issuer)]).await;
+    let (status, refused) = call(&router, "CreateOpenIDConnectProvider", &[("Url", issuer)]).await;
     assert_eq!(
         status, 409,
         "a second create for the same issuer must be refused, got {status}: {refused}"

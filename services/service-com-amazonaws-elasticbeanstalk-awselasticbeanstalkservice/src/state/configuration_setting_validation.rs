@@ -346,11 +346,19 @@ pub fn configuration_validation_messages(
 /// namespace `namespace` — true where it publishes a description of any option
 /// in it, which is what makes the set of names it publishes for that namespace
 /// the platform's own set.
+///
+/// A namespace whose option NAMES are the caller's own states none whatever the
+/// catalog describes of it
+/// ([`super::configuration_option_namespaces::namespace_names_its_own_options`]):
+/// its options are one entry per value the caller chose, so the catalog's
+/// entries for it are mappings a platform version ships rather than the names
+/// the namespace admits.
 fn catalog_states_option_names(
     catalog: &[&'static ConfigurationOption],
     namespace: &str,
 ) -> bool {
-    catalog.iter().any(|option| option.namespace == namespace)
+    !namespace_names_its_own_options(namespace)
+        && catalog.iter().any(|option| option.namespace == namespace)
 }
 
 /// The requirement `value` fails of the ones `option`'s published description
