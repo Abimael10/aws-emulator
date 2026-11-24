@@ -39,9 +39,21 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## The OAuth 2.0 token endpoints
+//!
+//! Two of this service's operations are the two forms of `POST /v1/token`, and both are
+//! served behind [`oauth2_token_endpoint`], which owns that endpoint's wire contract: how a
+//! token request's parameters are read, and the RFC 6749 §5.2 error object a request it
+//! cannot accept is refused with. The anonymous form is also what the claim below reaches:
+//! `CreateOAuth2Token` lists NO auth scheme, so its request carries no SigV4 credential
+//! scope and names no service at all, and is claimed by the route its model binds.
 
+pub mod oauth2_token_endpoint;
+
+use oauth2_token_endpoint::{Endpoint, OAuth2TokenEndpoint};
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, OperationRoutingTable, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
@@ -52,6 +64,11 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The two `/v1/token` operations the generated table also holds, each wrapped in
+    /// [`OAuth2TokenEndpoint`] as the form of the endpoint it serves. Keyed by the routing
+    /// key the protocol resolves — the key the generated table uses — and built from the
+    /// SAME shared engine, so a wrapped operation reads and writes the one store.
+    token_endpoints: OperationRoutingTable,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -59,8 +76,26 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        let mut token_endpoints = OperationRoutingTable::new();
+        token_endpoints.add_operation(
+            "CreateOAuth2Token",
+            Box::new(OAuth2TokenEndpoint::new(
+                crate::ops::create_o_auth2_token::CreateOAuth2Token::new(Arc::clone(&engine)),
+                Endpoint::ClientAuthenticated,
+            )) as Box<dyn ErasedOperation>,
+        );
+        token_endpoints.add_operation(
+            "CreateOAuth2TokenWithIAM",
+            Box::new(OAuth2TokenEndpoint::new(
+                crate::ops::create_o_auth2_token_with_iam::CreateOAuth2TokenWithIAM::new(
+                    Arc::clone(&engine),
+                ),
+                Endpoint::IamSigned,
+            )) as Box<dyn ErasedOperation>,
+        );
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            token_endpoints,
         }
     }
 }
@@ -74,25 +109,34 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // A request whose resolved route key is this service's signing name, as every
+        // service claims its own traffic — PLUS a request that names no service at all and
+        // addresses an operation this model serves UNSIGNED. `CreateOAuth2Token` is that
+        // operation: it lists no auth scheme (it is authenticated by the OAuth 2.0 client
+        // credentials in its body), so it carries no credential scope to resolve a service
+        // from, and without this claim the anonymous `POST /v1/token` reaches nobody. The
+        // rule is `service_common`'s, so every service that publishes an anonymous
+        // operation takes the same one; it is as narrow as the model makes it — a request
+        // naming another service is that service's, and a route this model does not bind,
+        // or one whose operation the model requires a signature for, is not claimed here.
+        ::service_common::routes_to(parts, self.entry.identity().signing_name())
+            || ::service_common::anonymous_route_claim::claims_anonymous_modeled_route(
+                parts,
+                &self.entry,
+            )
     }
 
     fn override_operation(
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // NOT a re-route: the key is the one the generated table's own protocol resolves,
+        // and the operation it names is the one served — wrapped in `OAuth2TokenEndpoint`
+        // for the two `/v1/token` forms, so a token request is read and refused the way
+        // that endpoint's OAuth 2.0 wire contract states. Every other key resolves to
+        // `None` here and is served by the generated table, exactly as before.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.token_endpoints.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

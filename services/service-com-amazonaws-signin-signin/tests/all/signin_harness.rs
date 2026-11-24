@@ -215,6 +215,20 @@ impl Answer {
     pub fn error_member(&self) -> &str {
         self.body["error"].as_str().unwrap_or_default()
     }
+
+    /// The `error_description` member an OAuth 2.0 error object carries, or the empty
+    /// string.
+    pub fn error_description(&self) -> &str {
+        self.body["error_description"].as_str().unwrap_or_default()
+    }
+
+    /// The media type the answer announces, or the empty string when it announces none.
+    pub fn content_type(&self) -> &str {
+        self.headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+    }
 }
 
 /// `POST uri` with `body`, signed for `region` and addressed to `host`.
@@ -274,4 +288,19 @@ async fn answer_of(
 /// `POST uri` with `body` from the default region and host the other suites use.
 pub async fn post(router: &MultiServiceRouter, uri: &str, body: Value) -> Answer {
     dispatch(router, uri, body, "us-east-1", "signin.us-east-1.amazonaws.com").await
+}
+
+/// `POST uri` with `body` and NO routing signal at all: no SigV4 credential scope, no
+/// `X-Amz-Target`, and a loopback `Host` that names no service — the only way a client of
+/// an operation the model serves unsigned can address it.
+pub async fn post_unsigned(router: &MultiServiceRouter, uri: &str, body: Value) -> Answer {
+    let request = ::http::Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("host", "127.0.0.1:9297")
+        .header("content-type", "application/json")
+        .body(Bytes::from(body.to_string()))
+        .expect("the test request is well formed");
+
+    answer_of(router, &format!("POST {uri} (unsigned)"), request).await
 }

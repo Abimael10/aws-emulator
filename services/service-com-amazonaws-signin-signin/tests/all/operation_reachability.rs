@@ -15,6 +15,11 @@
 //! and never by a routing failure (404 `UnknownService`, 500 `AmbiguousService`), since
 //! an operation the emulator does not serve on the endpoint it is reached on is exactly
 //! what leaves a client resolving some other address.
+//!
+//! The anonymous `/v1/token` row is signed like every other here, so what it pins is that
+//! the route is served when the request DOES name this service. That it is served when the
+//! request names none — which is the only way its client can address it, since the
+//! operation lists no auth scheme — is `oauth2_token_acceptance.rs`' subject.
 
 use serde_json::{json, Value};
 
@@ -66,9 +71,9 @@ const SERVED_OR_REFUSED_BY_THIS_SERVICE: &[(u16, Option<&str>)] = &[
 /// Source: the service's 11 bound operations and their `@http` routes, as
 /// `OPERATIONS.md` lists them — 12 rows, because `GetConsoleAuthorizationConfiguration`
 /// is called on both sides of the put. `CreateOAuth2Token` (the anonymous `/v1/token`
-/// route) is still a scaffold stub filed as its own issue, so the answer it owes is
-/// this service's own 501 — which is still this service answering, which is what this
-/// suite is about. The resource-policy rows owe a modelled REFUSAL rather than a
+/// route) is reached with a refresh token this service never issued, so the answer it
+/// owes is its own modelled `AccessDeniedException`, at the HTTP 401 that shape's
+/// documentation maps `TOKEN_EXPIRED` to. The resource-policy rows owe a modelled REFUSAL rather than a
 /// success: the account has no SignIn resource-based policy (both readers answer 404)
 /// and writing one is an action AWS grants no caller (the put answers
 /// `AccessDeniedException`). Each is this service answering, which is the rule here.
@@ -141,12 +146,12 @@ fn sequence() -> Vec<Call<'static>> {
             accepted: SERVED,
         },
         Call {
-            operation: "CreateOAuth2Token (a scaffold stub: this service's own 501)",
+            operation: "CreateOAuth2Token (a refresh token this service never issued)",
             uri: "/v1/token",
             body: json!({"clientId": "arn:aws:signin:::devtools/same-device",
                          "grantType": "refresh_token",
                          "refreshToken": "ASORaaaaaaaaaaaaaaaaaaaa"}),
-            accepted: &[(501, Some("NotImplemented"))],
+            accepted: &[(401, Some("AccessDeniedException"))],
         },
     ]
 }

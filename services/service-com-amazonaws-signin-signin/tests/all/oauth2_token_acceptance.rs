@@ -2,8 +2,8 @@
 
 //! The OAuth 2.0 token operations' own acceptance of a request, end to end over HTTP.
 //!
-//! One rule, in two halves, and both are about WHO judges the request — the operation,
-//! never the framework's generic constraint walk:
+//! One rule, in three halves, and each is about WHO judges the request — the operation or
+//! the endpoint it is served behind, never the framework's generic constraint walk:
 //!
 //! * `RevokeOAuth2TokenWithIAM` owns acceptance of its token: revocation is
 //!   idempotent-safe, so ANY value — the empty string, an access-token-shaped value, a
@@ -11,21 +11,28 @@
 //!   revokes only a refresh token the store actually holds. The model says exactly this:
 //!   "revoking an already-revoked, expired, or otherwise invalid token still returns
 //!   200 OK with an empty body", and "only the refresh_token type is accepted".
-//! * `CreateOAuth2TokenWithIAM` and `IntrospectOAuth2TokenWithIAM` own rejection of
-//!   theirs: each refuses with `ValidationException` naming the SINGLE condition that
-//!   failed — the OAuth 2.0 `invalid_request` description the model documents for
-//!   `INVALID_REQUEST`, or the token's own `token is required` / `token has invalid
-//!   format` — never the framework's multi-constraint report.
+//! * `IntrospectOAuth2TokenWithIAM` owns rejection of its own: it refuses with
+//!   `ValidationException` naming the SINGLE condition that failed — the token's own
+//!   `token is required` / `token has invalid format` — never the framework's
+//!   multi-constraint report.
+//! * The two forms of `POST /v1/token` are judged by the ENDPOINT, which answers an
+//!   RFC 6749 §5.2 error object: the `error` code a client branches on, the
+//!   `error_description` sentence for that class, and the same sentence as `message`. The
+//!   anonymous form establishes its OAuth 2.0 client first (the body is what authenticates
+//!   it), the IAM form is authenticated by its signature and judges the grant type first,
+//!   and both report a parameter the request supplied no value for by the OAuth 2.0 name
+//!   the endpoint publishes it under.
 //!
-//! What a minted token then reports, and what a revocation does to a chain, is
-//! `oauth2_token_lifecycle.rs`.
+//! What a minted token then reports, what a revocation does to a chain, and what the
+//! anonymous endpoint vends for a refresh token it holds are `oauth2_token_lifecycle.rs`.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::signin_harness::{emulator, post, Answer};
+use crate::signin_harness::{emulator, post, post_unsigned, Answer};
 
-/// The description an OAuth 2.0 request is refused with.
+/// The description an OAuth 2.0 request whose VALUE the endpoint cannot accept is refused
+/// with.
 ///
 /// Spelled out here rather than imported from the crate, so a wrong message in `src`
 /// fails this test. Source: the model documents the `INVALID_REQUEST` member of
@@ -34,6 +41,29 @@ use crate::signin_harness::{emulator, post, Answer};
 /// description of `invalid_request`.
 const INVALID_REQUEST_MESSAGE: &str = "The request is missing a required parameter, \
      includes an invalid parameter value, or is otherwise malformed.";
+
+/// What a `/v1/token` endpoint states about a grant type it does not implement: RFC 6749
+/// §5.2's own description of `unsupported_grant_type`.
+const UNSUPPORTED_GRANT_TYPE_DESCRIPTION: &str =
+    "The authorization grant type is not supported by the authorization server.";
+
+/// The OAuth 2.0 error code that class carries. Not a member of `OAuth2ErrorCode`: it is
+/// the RFC's code, which is what these endpoints answer.
+const UNSUPPORTED_GRANT_TYPE: &str = "unsupported_grant_type";
+
+/// What the anonymous endpoint states about a request whose OAuth 2.0 client it could not
+/// establish.
+const CLIENT_AUTHENTICATION_FAILED: &str = "Client authentication failed.";
+
+/// The fixed half of what either endpoint states about a parameter the request supplied no
+/// value for.
+const MISSING_PARAMETER: &str = "Missing required parameter: ";
+
+/// The media type an OAuth 2.0 error object is rendered in.
+const JSON: &str = "application/json";
+
+/// The media type the endpoint's own PARAMETER validation renders its refusal in.
+const JSON_WITH_CHARSET: &str = "application/json;charset=UTF-8";
 
 /// `IntrospectOAuth2TokenWithIAM`'s refusal of a request with no token value.
 const TOKEN_REQUIRED_MESSAGE: &str = "token is required";
@@ -50,12 +80,30 @@ const VALIDATION_ERROR_CODE: &str = "INVALID_REQUEST";
 /// `^client_credentials$`.
 const CLIENT_CREDENTIALS: &str = "client_credentials";
 
+/// The two clients the anonymous endpoint knows: `ClientId` is
+/// `^arn:aws:signin:::devtools/(cross-device|same-device)$`.
+const DEVTOOLS_CLIENTS: [&str; 2] = [
+    "arn:aws:signin:::devtools/cross-device",
+    "arn:aws:signin:::devtools/same-device",
+];
+
+/// The OAuth 2.0 client of the IAM client-credentials grant, which every token that grant
+/// mints reports as its `client_id` claim. Spelled out here rather than imported, so a
+/// wrong value in `src` fails this test.
+const IAM_CLIENT_CREDENTIALS_CLIENT_ID: &str = "arn:aws:signin:::client-credentials/sigv4";
+
 /// A text the framework's generic constraint reporter puts in every message it writes.
 /// No message under test may contain it: that is the difference this suite pins.
 const FRAMEWORK_CONSTRAINT_REPORT: &str = "failed to satisfy constraint";
 
 async fn create_token(router: &MultiServiceRouter, request: Value) -> Answer {
     post(router, "/v1/token?x-amz-client-auth-method=iam", request).await
+}
+
+/// The anonymous endpoint, addressed the only way its client can address it: with no
+/// routing signal at all, since the operation lists no auth scheme.
+async fn create_token_anonymously(router: &MultiServiceRouter, request: Value) -> Answer {
+    post_unsigned(router, "/v1/token", request).await
 }
 
 async fn introspect_token(router: &MultiServiceRouter, request: Value) -> Answer {
@@ -177,49 +225,287 @@ async fn revocation_leaves_an_access_token_active() {
     }
 }
 
-/// A mint refuses a request the operation does not accept with its own single-condition
-/// description, and accepts every request it does.
+/// Every refusal of a `/v1/token` request is an OAuth 2.0 error object, and the one shape
+/// of answer this suite pins: HTTP 400, the `error` code, the `error_description` sentence
+/// and the same sentence as `message`, in the media type that class is rendered in — never
+/// the framework's constraint report.
+fn assert_oauth2_error(
+    case: &str,
+    answer: &Answer,
+    expected: (&str, &str, &str),
+    media_type: &str,
+) {
+    let (code, description, message) = expected;
+    assert_eq!(
+        (answer.status, answer.error_code()),
+        (400, "ValidationException"),
+        "case {case:?}: expected 400 ValidationException, got {} with {:?}",
+        answer.status,
+        answer.body
+    );
+    assert_eq!(
+        (
+            answer.error_member(),
+            answer.error_description(),
+            answer.message()
+        ),
+        (code, description, message),
+        "case {case:?}: expected the endpoint's own OAuth 2.0 error object, got {:?}",
+        answer.body
+    );
+    assert_eq!(
+        answer.content_type(),
+        media_type,
+        "case {case:?}: expected the media type {media_type:?}, got {:?}",
+        answer.content_type()
+    );
+    assert!(
+        !answer.message().contains(FRAMEWORK_CONSTRAINT_REPORT),
+        "case {case:?}: the message must come from the endpoint, not the generic \
+         constraint reporter, got {:?}",
+        answer.message()
+    );
+}
+
+/// The anonymous `POST /v1/token` is REACHED — a request that names no service at all is
+/// resolved to this service by the route its model binds, because the operation lists no
+/// auth scheme — and refused with the endpoint's own OAuth 2.0 error object.
 ///
-/// The rows differ along both members the operation judges: `grantType` away from
-/// `client_credentials` (another OAuth grant name, the wrong case, the empty value) and
-/// `resource` outside its modelled `@length(min: 1, max: 2048)` — tested at each
-/// published bound and one character past the ceiling.
+/// The rows differ along what the endpoint judges, in the order it judges it: the OAuth 2.0
+/// client (absent, empty, not a client this endpoint knows, each of the two it does know),
+/// then the grant type (absent, another grant, the right name in the wrong case), then the
+/// parameters the named grant requires — each of the authorization-code grant's three and
+/// the refresh grant's one, every one of which the model requires "only when" that grant is
+/// named, so the refusal states the `invalid_request` description rather than the parameter.
 #[tokio::test]
-async fn a_mint_judges_its_own_request() {
-    let refused: Vec<(&str, Value)> = vec![
+async fn the_anonymous_token_endpoint_is_reached_and_judges_its_own_request() {
+    let known = DEVTOOLS_CLIENTS[0];
+    // (case, request, the error code, the sentence, the media type)
+    let cases: Vec<(&str, Value, &str, String, &str)> = vec![
+        (
+            "no parameter at all",
+            json!({}),
+            VALIDATION_ERROR_CODE,
+            CLIENT_AUTHENTICATION_FAILED.to_string(),
+            JSON,
+        ),
+        (
+            "a grant but no client",
+            json!({"grantType": "refresh_token", "refreshToken": "ASORaaaa"}),
+            VALIDATION_ERROR_CODE,
+            CLIENT_AUTHENTICATION_FAILED.to_string(),
+            JSON,
+        ),
+        (
+            "a client ARN this endpoint does not know",
+            json!({"clientId": "arn:aws:signin:::devtools/other-device",
+                   "grantType": "refresh_token"}),
+            VALIDATION_ERROR_CODE,
+            CLIENT_AUTHENTICATION_FAILED.to_string(),
+            JSON,
+        ),
+        (
+            "an empty client id",
+            json!({"clientId": "", "grantType": "refresh_token"}),
+            VALIDATION_ERROR_CODE,
+            CLIENT_AUTHENTICATION_FAILED.to_string(),
+            JSON,
+        ),
+        (
+            "the second known client, with no grant type",
+            json!({"clientId": DEVTOOLS_CLIENTS[1]}),
+            UNSUPPORTED_GRANT_TYPE,
+            UNSUPPORTED_GRANT_TYPE_DESCRIPTION.to_string(),
+            JSON,
+        ),
+        (
+            "a known client and the client-credentials grant, which this form does not serve",
+            json!({"clientId": known, "grantType": CLIENT_CREDENTIALS}),
+            UNSUPPORTED_GRANT_TYPE,
+            UNSUPPORTED_GRANT_TYPE_DESCRIPTION.to_string(),
+            JSON,
+        ),
+        (
+            "the refresh grant in the wrong case",
+            json!({"clientId": known, "grantType": "REFRESH_TOKEN"}),
+            UNSUPPORTED_GRANT_TYPE,
+            UNSUPPORTED_GRANT_TYPE_DESCRIPTION.to_string(),
+            JSON,
+        ),
+        (
+            "the refresh grant with no token",
+            json!({"clientId": known, "grantType": "refresh_token"}),
+            VALIDATION_ERROR_CODE,
+            INVALID_REQUEST_MESSAGE.to_string(),
+            JSON_WITH_CHARSET,
+        ),
+        (
+            "the authorization-code grant with none of its parameters",
+            json!({"clientId": known, "grantType": "authorization_code"}),
+            VALIDATION_ERROR_CODE,
+            INVALID_REQUEST_MESSAGE.to_string(),
+            JSON_WITH_CHARSET,
+        ),
+        (
+            "the authorization-code grant with no redirect URI",
+            json!({"clientId": known, "grantType": "authorization_code", "code": "abc"}),
+            VALIDATION_ERROR_CODE,
+            INVALID_REQUEST_MESSAGE.to_string(),
+            JSON_WITH_CHARSET,
+        ),
+        (
+            "the authorization-code grant with no code verifier",
+            json!({"clientId": known, "grantType": "authorization_code", "code": "abc",
+                   "redirectUri": "http://127.0.0.1:1234/callback"}),
+            VALIDATION_ERROR_CODE,
+            INVALID_REQUEST_MESSAGE.to_string(),
+            JSON_WITH_CHARSET,
+        ),
+    ];
+
+    let router = emulator();
+    for (case, request, code, description, media_type) in cases {
+        let answer = create_token_anonymously(&router, request).await;
+        assert_oauth2_error(
+            case,
+            &answer,
+            (code, description.as_str(), description.as_str()),
+            media_type,
+        );
+    }
+}
+
+/// An authorization code is redeemed against the Sign-In authorization endpoint's own
+/// issuance, which this service's model does not bind: no code it issued can exist, so
+/// every presented one is answered the modelled `AccessDeniedException` with
+/// `AUTHCODE_EXPIRED` — at the HTTP 401 that shape's own documentation maps that code to,
+/// since it declares no status of its own — and nothing is minted for it.
+///
+/// The rows differ in the code, the redirect URI and the verifier presented, which the
+/// answer does not depend on: a code that was never issued cannot be told apart by its
+/// shape.
+#[tokio::test]
+async fn a_code_this_service_never_issued_is_not_redeemed() {
+    let verifier = "a".repeat(43);
+    let cases: Vec<(&str, Value)> = vec![
+        (
+            "a short code",
+            json!({"clientId": DEVTOOLS_CLIENTS[0], "grantType": "authorization_code",
+                   "code": "abc", "redirectUri": "http://127.0.0.1:1234/cb",
+                   "codeVerifier": verifier}),
+        ),
+        (
+            "a code at the modelled 512-character ceiling",
+            json!({"clientId": DEVTOOLS_CLIENTS[1], "grantType": "authorization_code",
+                   "code": "c".repeat(512), "redirectUri": "https://example.com/cb",
+                   "codeVerifier": "b".repeat(128)}),
+        ),
+    ];
+
+    let router = emulator();
+    for (case, request) in cases {
+        let answer = create_token_anonymously(&router, request).await;
+        assert_eq!(
+            (answer.status, answer.error_code(), answer.error_member()),
+            (401, "AccessDeniedException", "AUTHCODE_EXPIRED"),
+            "case {case:?}: expected the modelled refusal of a code this service never \
+             issued, at the status its code is documented to carry, got {} with {:?}",
+            answer.status,
+            answer.body
+        );
+    }
+}
+
+/// The IAM form of the endpoint refuses what it cannot accept with the same OAuth 2.0
+/// error object, and accepts every request it can serve.
+///
+/// The rows differ along both parameters the endpoint judges: the grant type away from
+/// `client_credentials` (another OAuth grant name, the wrong case, the empty value, an
+/// absent one) and the resource — absent, empty, at each published bound of
+/// `@length(min: 1, max: 2048)` and one character past the ceiling. A request that states
+/// no resource is incomplete for this grant, and what the refusal names is the first of the
+/// grant's own parameters the body supplies no value for.
+#[tokio::test]
+async fn the_iam_token_endpoint_judges_its_own_request() {
+    let resource = "aws-mcp.amazonaws.com";
+    // (case, request, the error code, the sentence, the media type)
+    let refused: Vec<(&str, Value, &str, String, &str)> = vec![
         (
             "the authorization-code grant",
-            json!({"grant_type": "authorization_code", "resource": "aws-mcp.amazonaws.com"}),
+            json!({"grant_type": "authorization_code", "resource": resource}),
+            UNSUPPORTED_GRANT_TYPE,
+            UNSUPPORTED_GRANT_TYPE_DESCRIPTION.to_string(),
+            JSON,
         ),
         (
             "the refresh-token grant",
-            json!({"grant_type": "refresh_token", "resource": "aws-mcp.amazonaws.com"}),
+            json!({"grant_type": "refresh_token", "resource": resource}),
+            UNSUPPORTED_GRANT_TYPE,
+            UNSUPPORTED_GRANT_TYPE_DESCRIPTION.to_string(),
+            JSON,
         ),
         (
             "the right grant in the wrong case",
-            json!({"grant_type": "CLIENT_CREDENTIALS", "resource": "aws-mcp.amazonaws.com"}),
+            json!({"grant_type": "CLIENT_CREDENTIALS", "resource": resource}),
+            UNSUPPORTED_GRANT_TYPE,
+            UNSUPPORTED_GRANT_TYPE_DESCRIPTION.to_string(),
+            JSON,
         ),
         (
             "an empty grant type",
-            json!({"grant_type": "", "resource": "aws-mcp.amazonaws.com"}),
+            json!({"grant_type": "", "resource": resource}),
+            UNSUPPORTED_GRANT_TYPE,
+            UNSUPPORTED_GRANT_TYPE_DESCRIPTION.to_string(),
+            JSON,
+        ),
+        (
+            "no grant type at all",
+            json!({"resource": resource}),
+            UNSUPPORTED_GRANT_TYPE,
+            UNSUPPORTED_GRANT_TYPE_DESCRIPTION.to_string(),
+            JSON,
         ),
         (
             "the grant name with trailing text",
-            json!({"grant_type": "client_credentials_extra", "resource": "aws-mcp.amazonaws.com"}),
+            json!({"grant_type": "client_credentials_extra", "resource": resource}),
+            UNSUPPORTED_GRANT_TYPE,
+            UNSUPPORTED_GRANT_TYPE_DESCRIPTION.to_string(),
+            JSON,
+        ),
+        (
+            "no resource at all",
+            json!({"grant_type": CLIENT_CREDENTIALS}),
+            VALIDATION_ERROR_CODE,
+            format!("{MISSING_PARAMETER}client_id"),
+            JSON_WITH_CHARSET,
         ),
         (
             "an empty resource, below the modelled length floor",
             json!({"grant_type": CLIENT_CREDENTIALS, "resource": ""}),
+            VALIDATION_ERROR_CODE,
+            format!("{MISSING_PARAMETER}client_id"),
+            JSON_WITH_CHARSET,
+        ),
+        (
+            "no resource, from a body that does name a client",
+            json!({"grant_type": CLIENT_CREDENTIALS,
+                   "clientId": IAM_CLIENT_CREDENTIALS_CLIENT_ID}),
+            VALIDATION_ERROR_CODE,
+            format!("{MISSING_PARAMETER}resource"),
+            JSON_WITH_CHARSET,
         ),
         (
             "a resource one character past the modelled ceiling",
             json!({"grant_type": CLIENT_CREDENTIALS, "resource": "r".repeat(2049)}),
+            VALIDATION_ERROR_CODE,
+            INVALID_REQUEST_MESSAGE.to_string(),
+            JSON_WITH_CHARSET,
         ),
     ];
     let accepted: Vec<(&str, Value)> = vec![
         (
             "the documented example resource",
-            json!({"grant_type": CLIENT_CREDENTIALS, "resource": "aws-mcp.amazonaws.com"}),
+            json!({"grant_type": CLIENT_CREDENTIALS, "resource": resource}),
         ),
         (
             "a one-character resource, at the modelled length floor",
@@ -232,27 +518,13 @@ async fn a_mint_judges_its_own_request() {
     ];
 
     let router = emulator();
-    for (case, request) in refused {
+    for (case, request, code, description, media_type) in refused {
         let answer = create_token(&router, request).await;
-        assert_eq!(
-            (answer.status, answer.error_code()),
-            (400, "ValidationException"),
-            "case {case:?}: expected 400 ValidationException, got {} with {:?}",
-            answer.status,
-            answer.body
-        );
-        assert_eq!(
-            (answer.error_member(), answer.message()),
-            (VALIDATION_ERROR_CODE, INVALID_REQUEST_MESSAGE),
-            "case {case:?}: expected the operation's own invalid_request description, \
-             got {:?}",
-            answer.body
-        );
-        assert!(
-            !answer.message().contains(FRAMEWORK_CONSTRAINT_REPORT),
-            "case {case:?}: the message must come from the operation, not the generic \
-             constraint reporter, got {:?}",
-            answer.message()
+        assert_oauth2_error(
+            case,
+            &answer,
+            (code, description.as_str(), description.as_str()),
+            media_type,
         );
     }
 
@@ -262,6 +534,39 @@ async fn a_mint_judges_its_own_request() {
             answer.status, 200,
             "case {case:?}: the mint must be accepted, got {} with {:?}",
             answer.status, answer.body
+        );
+    }
+}
+
+/// A token the IAM client-credentials grant minted reports THAT grant's client as its
+/// `client_id` claim: the grant has one client — the one its SigV4 signature
+/// authenticates — so the claim is the same for every token it mints, whatever the token
+/// is scoped to.
+#[tokio::test]
+async fn an_iam_minted_token_reports_the_grants_own_client() {
+    let resources = [
+        ("the documented example resource", "aws-mcp.amazonaws.com".to_string()),
+        ("a one-character resource", "r".to_string()),
+        ("another service resource", "lakeformation.amazonaws.com".to_string()),
+        ("a resource at the length ceiling", "r".repeat(2048)),
+    ];
+
+    let router = emulator();
+    for (case, resource) in resources {
+        let token = mint(&router, case, &resource).await;
+        let answer = introspect_token(&router, json!({"token": token})).await;
+        assert_eq!(
+            (answer.status, answer.body["active"].as_bool()),
+            (200, Some(true)),
+            "case {case:?}: the minted token must introspect as active, got {} with {:?}",
+            answer.status,
+            answer.body
+        );
+        assert_eq!(
+            answer.body["client_id"].as_str(),
+            Some(IAM_CLIENT_CREDENTIALS_CLIENT_ID),
+            "case {case:?}: expected the grant's own client, got {:?}",
+            answer.body
         );
     }
 }

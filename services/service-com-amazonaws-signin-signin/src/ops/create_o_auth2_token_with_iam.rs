@@ -4,24 +4,26 @@
 //! Exchanges the calling IAM principal's credentials for an OAuth 2.0 access token
 //! scoped to the requested resource.
 //!
-//! Input rejection is this operation's own, not the generic constraint walk's: a
-//! `grantType` other than `client_credentials`, or a `resource` outside its modelled
-//! length, is answered with the OAuth 2.0 `invalid_request` description the model
-//! documents for `INVALID_REQUEST`.
+//! Input rejection is the ENDPOINT's, not the generic constraint walk's: `/v1/token`
+//! reads the parameters of a client-credentials request in its own wire vocabulary and
+//! refuses one with the OAuth 2.0 error object RFC 6749 §5.2 fixes — see
+//! [`crate::service::oauth2_token_endpoint`], which owns that contract for both forms of
+//! the endpoint. A request that reaches this handler carries a `client_credentials` grant
+//! type and a `resource` inside its modelled length.
 //!
 //! ## What a call does
 //!
 //! The grant mints ONE token per call: a fresh opaque token value, and a record in
 //! [`crate::state::ComAmazonawsSigninSigninState::oauth_tokens`] holding the claims
-//! `IntrospectOAuth2TokenWithIAM` reports for it — the principal the request was signed
-//! as, the SignIn session the token is bound to, the resource it is scoped to, and the
-//! instants it was issued at and expires at. Nothing is reused between calls, so two
-//! calls with the same arguments yield two different tokens (the access token
-//! "rotates") and expiring or revoking one leaves the other alone.
+//! `IntrospectOAuth2TokenWithIAM` reports for it — the OAuth 2.0 client of the grant, the
+//! principal the request was signed as, the SignIn session the token is bound to, the
+//! resource it is scoped to, and the instants it was issued at and expires at. Nothing is
+//! reused between calls, so two calls with the same arguments yield two different tokens
+//! (the access token "rotates") and expiring or revoking one leaves the other alone.
 //!
 //! `grantType` is modelled `@pattern("^client_credentials$")` and `resource`
-//! `@required` with `@length(min: 1, max: 2048)`, so the centralized walk has already
-//! refused anything else before this handler runs.
+//! `@required` with `@length(min: 1, max: 2048)`; both are judged by the endpoint before
+//! this handler runs.
 //!
 //! ## Why the token is opaque
 //!
@@ -184,23 +186,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // This operation's own acceptance rules, each answered with the one description
-        // the model gives `INVALID_REQUEST` rather than the generic constraint walk's
-        // report (its `grantType`/`resource` constraints carry `skip_validation`, so
-        // this handler is what judges them): `grantType` is `^client_credentials$` —
-        // the only grant this operation implements — and `resource` is a non-empty
-        // value within `@length(min: 1, max: 2048)`, counted in CHARACTERS, which is
-        // what Smithy's `@length` bounds on a string.
-        let grant_type_accepted = input.grant_type == crate::state::GRANT_TYPE_CLIENT_CREDENTIALS;
-        let resource_accepted = !input.resource.is_empty()
-            && input.resource.chars().count() <= crate::state::MAX_RESOURCE_LENGTH;
-        if !grant_type_accepted || !resource_accepted {
-            return Err(CreateOAuth2TokenWithIAMErrorModeled::ValidationException(
-                crate::state::validation_failed(crate::state::INVALID_REQUEST_MESSAGE),
-            )
-            .into());
-        }
-
+        // This operation's own acceptance rules are the ENDPOINT's: `/v1/token` judges the
+        // parameters of a client-credentials request in its own wire vocabulary and
+        // answers an OAuth 2.0 error object for one it cannot accept
+        // (`crate::service::oauth2_token_endpoint`), so a request that reaches here names
+        // the `client_credentials` grant and a `resource` inside its modelled length.
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
@@ -220,10 +210,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::NewToken {
                 token_type: crate::state::TOKEN_TYPE_ACCESS,
                 resource: input.resource,
-                // The IAM flow authenticates an IAM principal with SigV4; no
-                // OAuth 2.0 client takes part, so the token carries no client
-                // identifier to report as the `clientId` claim.
-                client_id: None,
+                // The OAuth 2.0 client of this grant. No client secret takes part —
+                // the caller's SigV4 signature is what authenticates the client — so
+                // the grant has ONE client, identified by the fixed, account- and
+                // region-less ARN of the client-credentials grant itself, and that is
+                // the `clientId` claim introspection reports for every token it mints.
+                client_id: Some(crate::state::IAM_CLIENT_CREDENTIALS_CLIENT_ID.to_string()),
                 region,
                 expires_in: crate::state::ACCESS_TOKEN_EXPIRES_IN,
                 // This token heads its own chain: the client-credentials grant

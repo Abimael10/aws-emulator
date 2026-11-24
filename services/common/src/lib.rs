@@ -331,6 +331,11 @@ pub mod agentcore_resources;
 /// the gate that decides which request names none, for every service whose authorization of
 /// a caller-supplied resource comes before the modelled walk.
 pub mod addressed_resource;
+/// The ONE claim a REST service makes on a request that names no service at all and
+/// addresses an operation its own model serves UNSIGNED — so an anonymous endpoint is
+/// reachable by its HTTP route, the way AWS dispatches a call that carries no credential to
+/// name its service by.
+pub mod anonymous_route_claim;
 /// The registry of which resources are registered with Amazon Application Recovery
 /// Controller for zonal shift, written by the service that OWNS the resource — ARC models
 /// no operation that registers one — and read by ARC, which reports a managed resource it

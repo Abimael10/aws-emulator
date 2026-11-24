@@ -84,6 +84,16 @@ pub const CONFLICT_ERROR_CODE: &str = "CONFLICT";
 /// "Insufficient permissions to perform this operation".
 pub const INSUFFICIENT_PERMISSIONS_ERROR_CODE: &str = "INSUFFICIENT_PERMISSIONS";
 
+/// The `error` code `AccessDeniedException` carries when the subject principal's
+/// credentials have changed since the token was issued: `OAuth2ErrorCode`'s
+/// `USER_CREDENTIALS_CHANGED`, documented "User credentials have been changed".
+///
+/// Nothing in this service answers it yet; it is named because
+/// `AccessDeniedException`'s documented status mapping places it
+/// (`crate::service::oauth2_token_endpoint`), so the mapping states the code rather than
+/// a literal.
+pub const USER_CREDENTIALS_CHANGED_ERROR_CODE: &str = "USER_CREDENTIALS_CHANGED";
+
 /// The `error` code the model documents for `ServiceQuotaExceededException`:
 /// "Will be SERVICE_QUOTA_EXCEEDED".
 pub const QUOTA_ERROR_CODE: &str = "SERVICE_QUOTA_EXCEEDED";
@@ -191,6 +201,30 @@ pub const REFRESH_TOKEN_PREFIX: &str = "ASOR";
 /// is modelled `^Bearer$` — "Always "Bearer" per OAuth 2.1 specification".
 pub const BEARER_TOKEN_TYPE: &str = "Bearer";
 
+/// The `tokenType` the anonymous `/v1/token` endpoint answers with: `TokenType`
+/// is modelled `^aws_sigv4$`, documented 'Value is "aws_sigv4" (instead of
+/// typical "Bearer" for other OAuth systems) to indicate that the client must
+/// de-serialize the token and use it to generate a signature'.
+pub const SIGV4_TOKEN_TYPE: &str = "aws_sigv4";
+
+/// The `error` code `AccessDeniedException` carries for an authorization code
+/// that cannot be redeemed: `OAuth2ErrorCode`'s `AUTHCODE_EXPIRED`.
+pub const AUTHCODE_EXPIRED_ERROR_CODE: &str = "AUTHCODE_EXPIRED";
+
+/// What that refusal states — the description the model gives that member,
+/// "Authorization code has expired". Fixed text: it quotes no part of the code
+/// the request presented.
+pub const AUTHCODE_EXPIRED_MESSAGE: &str = "Authorization code has expired";
+
+/// The `error` code `AccessDeniedException` carries for a token the service
+/// cannot act on any more: `OAuth2ErrorCode`'s `TOKEN_EXPIRED`.
+pub const TOKEN_EXPIRED_ERROR_CODE: &str = "TOKEN_EXPIRED";
+
+/// What that refusal states — the description the model gives that member,
+/// "Token has expired and needs to be refreshed". Fixed text: it quotes no part
+/// of the token the request presented.
+pub const TOKEN_EXPIRED_MESSAGE: &str = "Token has expired and needs to be refreshed";
+
 /// The only grant `CreateOAuth2TokenWithIAMRequest$grantType` admits:
 /// `ClientCredentialsGrantType` is modelled `^client_credentials$`, documented
 /// 'OAuth 2.0 grant type. Must be "client_credentials"'.
@@ -199,6 +233,45 @@ pub const BEARER_TOKEN_TYPE: &str = "Bearer";
 /// the value it accepts is named here rather than left to the generic
 /// constraint walk.
 pub const GRANT_TYPE_CLIENT_CREDENTIALS: &str = "client_credentials";
+
+/// The authorization-code grant of the anonymous `/v1/token` endpoint:
+/// `GrantType` is modelled `^(authorization_code|refresh_token)$` and
+/// `CreateOAuth2Token` documents this alternative as "Authorization code
+/// redemption (grant_type=authorization_code)".
+pub const GRANT_TYPE_AUTHORIZATION_CODE: &str = "authorization_code";
+
+/// The refresh-token grant of the same endpoint — the other alternative of
+/// `GrantType`, documented "Token refresh (grant_type=refresh_token)".
+pub const GRANT_TYPE_REFRESH_TOKEN: &str = "refresh_token";
+
+/// The OAuth 2.0 clients the anonymous `/v1/token` endpoint knows.
+///
+/// `ClientId` is modelled `^arn:aws:signin:::devtools/(cross-device|same-device)$`
+/// and documents exactly these two values — the public AWS Sign-In devtools CLI
+/// clients, for which `CreateOAuth2Token` documents that "authn/authz [is]
+/// skipped based on client_id & grant_type", so naming one IS how such a client
+/// authenticates. The ARNs carry no account and no region: they identify the
+/// client program, not a resource of any account.
+pub const DEVTOOLS_CLIENT_IDS: [&str; 2] = [
+    "arn:aws:signin:::devtools/cross-device",
+    "arn:aws:signin:::devtools/same-device",
+];
+
+/// The OAuth 2.0 client of the IAM client-credentials grant
+/// (`CreateOAuth2TokenWithIAM`), reported as the `clientId` claim of every token
+/// that grant mints.
+///
+/// Like [`DEVTOOLS_CLIENT_IDS`] it carries neither account nor region: it
+/// identifies the grant itself — the one whose client is authenticated by the
+/// caller's SigV4 signature rather than by a client secret — so it is a constant
+/// of that grant and the same for every token minted through it.
+pub const IAM_CLIENT_CREDENTIALS_CLIENT_ID: &str = "arn:aws:signin:::client-credentials/sigv4";
+
+/// Whether `client_id` names an OAuth 2.0 client the anonymous `/v1/token`
+/// endpoint knows — one of [`DEVTOOLS_CLIENT_IDS`].
+pub fn is_known_oauth_client(client_id: &str) -> bool {
+    DEVTOOLS_CLIENT_IDS.contains(&client_id)
+}
 
 /// `CreateOAuth2TokenWithIAMRequest$resource`'s modelled `@length(min: 1, max:
 /// 2048)` ceiling, likewise judged by that operation's own handler. Smithy bounds a
@@ -213,6 +286,16 @@ pub const MAX_RESOURCE_LENGTH: usize = 2048;
 /// `TokenExpiresIn` is `@range(min: 1, max: 3600)`. This emulator's sign-in
 /// sessions do not expire sooner than an hour, so the minimum is the hour.
 pub const ACCESS_TOKEN_EXPIRES_IN: i64 = 3600;
+
+/// The lifetime, in seconds, of the scoped-down AWS credentials the anonymous
+/// `/v1/token` endpoint vends.
+///
+/// `CreateOAuth2TokenResponseBody$expiresIn` is "Time to expiry in seconds
+/// (maximum 900)" over `ExpiresIn`'s `@range(min: 1, max: 900)`, and
+/// `AccessToken` documents "Scoped, temporary AWS credentials with a 15-minute
+/// duration" — the same 900 seconds, which is therefore the lifetime and not a
+/// chosen one.
+pub const SCOPED_CREDENTIALS_EXPIRES_IN: u64 = 900;
 
 /// How many OAuth 2.0 tokens the store holds before
 /// `CreateOAuth2TokenWithIAM` refuses to mint another one.
@@ -408,11 +491,11 @@ pub struct OAuth2Token {
     /// [`TOKEN_TYPE_ACCESS`] or [`TOKEN_TYPE_REFRESH`] — which kind of token
     /// this is, reported as the `tokenType` claim.
     pub token_type: String,
-    /// The OAuth 2.0 client that requested the token, for the `clientId` claim.
-    /// `None` for a token minted through the IAM flow
-    /// (`CreateOAuth2TokenWithIAM`), where an IAM principal authenticated with
-    /// SigV4 and no OAuth client took part, so there is no client identifier to
-    /// report.
+    /// The OAuth 2.0 client that requested the token, for the `clientId` claim:
+    /// one of [`DEVTOOLS_CLIENT_IDS`] for a token the anonymous `/v1/token`
+    /// endpoint minted, and [`IAM_CLIENT_CREDENTIALS_CLIENT_ID`] for one
+    /// `CreateOAuth2TokenWithIAM` minted — every grant this service implements
+    /// has a client, so the claim identifies which grant a token came from.
     pub client_id: Option<String>,
     /// The OAuth resource the token is scoped to: the `aud` claim of an access
     /// token and the `resource` claim of a refresh token.
@@ -439,6 +522,15 @@ pub struct OAuth2Token {
     /// token invalidates "the entire token chain"
     /// (`RevokeOAuth2TokenWithIAM`), which is every token sharing this value.
     pub chain: String,
+    /// The scoped-down AWS credentials the anonymous `/v1/token` endpoint last
+    /// vended for this token, while they are still live.
+    ///
+    /// Only a REFRESH token carries any: `CreateOAuth2Token` documents its
+    /// refresh flow as "Idempotent within token validity window — multiple calls
+    /// with same refresh_token return consistent results", so the credentials a
+    /// refresh vended are held on the token they were vended for and reported
+    /// again while they last, rather than a second set being minted per call.
+    pub credentials: Option<ScopedCredentials>,
     /// Whether a revocation has invalidated this token.
     pub revoked: bool,
 }
@@ -511,6 +603,59 @@ impl OAuth2Token {
             signin_session: Some(self.session_arn.clone()),
             resource: refresh.then(|| self.resource.clone()),
         }
+    }
+}
+
+/// The scoped-down, temporary AWS credentials the anonymous `/v1/token`
+/// endpoint vends as its access token.
+///
+/// `CreateOAuth2TokenResponseBody$accessToken` targets `AccessToken`, a
+/// STRUCTURE of `accessKeyId`/`secretAccessKey`/`sessionToken` documented
+/// "Scoped, temporary AWS credentials with a 15-minute duration" — so this
+/// endpoint's access token is an AWS SigV4 credential (its `tokenType` is
+/// `aws_sigv4`), not a bearer token. The id and both secrets are MINTED BY THE
+/// EMULATOR's credential store, never constructed here, so credentials a caller
+/// is handed are ones this emulator accepts for signing.
+#[derive(Clone)]
+pub struct ScopedCredentials {
+    /// The access key id the credentials were minted under — the credential
+    /// store's own id, which is also what deletes them.
+    pub access_key_id: String,
+    /// The signing secret. SENSITIVE: left out of [`std::fmt::Debug`] below.
+    pub secret_access_key: String,
+    /// The session token the credentials are presented with. SENSITIVE.
+    pub session_token: String,
+    /// When the credentials stop being usable.
+    pub expires_at: SystemTime,
+}
+
+/// Prints which credential this is but neither of its secrets.
+impl std::fmt::Debug for ScopedCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScopedCredentials")
+            .field("access_key_id", &self.access_key_id)
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ScopedCredentials {
+    /// Whether the credentials are still usable at `now`.
+    pub fn is_live(&self, now: SystemTime) -> bool {
+        now < self.expires_at
+    }
+
+    /// How many whole seconds of life the credentials have left at `now`, as
+    /// `CreateOAuth2TokenResponseBody$expiresIn` reports it: `ExpiresIn` is
+    /// `@range(min: 1, max: 900)`, so the remaining lifetime is reported inside
+    /// those published bounds.
+    pub fn expires_in(&self, now: SystemTime) -> i32 {
+        let remaining = self
+            .expires_at
+            .duration_since(now)
+            .map(|left| left.as_secs())
+            .unwrap_or_default();
+        i32::try_from(remaining.clamp(1, SCOPED_CREDENTIALS_EXPIRES_IN)).unwrap_or(i32::MAX)
     }
 }
 
@@ -731,10 +876,56 @@ impl ComAmazonawsSigninSigninState {
             jti,
             issued_at: now,
             expires_in: new.expires_in,
+            // Credentials are vended against a token, never minted with it: a
+            // refresh token carries the set the anonymous endpoint last vended
+            // for it (see [`Self::refreshed_credentials`]).
+            credentials: None,
             revoked: false,
         };
         self.oauth_tokens.insert(token.token.clone(), token.clone());
         token
+    }
+
+    /// The scoped-down AWS credentials the refresh token `refresh_token` is good
+    /// for at `now`, and the credential the caller must DELETE afterwards.
+    ///
+    /// `CreateOAuth2Token`'s refresh flow is "Idempotent within token validity
+    /// window", so the credentials already vended for this refresh token are
+    /// reported again while they are still live and `minted` — the set the caller
+    /// minted for this call — is handed back as the one to delete, unused. Once
+    /// they have run out, `minted` becomes the token's credentials and the set it
+    /// replaced is the one to delete, so one refresh token holds at most one
+    /// credential however often it is presented.
+    ///
+    /// `None` when `refresh_token` names no refresh token this store holds that
+    /// is active for `caller_account` — the caller then deletes the credential it
+    /// minted itself, since nothing was vended.
+    ///
+    /// The refresh token is NOT consumed: that is what lets a repeated refresh
+    /// answer consistently, where an authorization code "can only be used ONCE".
+    pub fn refreshed_credentials(
+        &mut self,
+        refresh_token: &str,
+        caller_account: &str,
+        now: SystemTime,
+        minted: ScopedCredentials,
+    ) -> Option<(ScopedCredentials, Option<String>)> {
+        let record = self
+            .oauth_tokens
+            .get_mut(refresh_token)
+            .filter(|token| token.is_refresh_token() && token.is_active(now, caller_account))?;
+        if let Some(live) = record
+            .credentials
+            .as_ref()
+            .filter(|credentials| credentials.is_live(now))
+        {
+            return Some((live.clone(), Some(minted.access_key_id)));
+        }
+        let superseded = record
+            .credentials
+            .replace(minted.clone())
+            .map(|credentials| credentials.access_key_id);
+        Some((minted, superseded))
     }
 
     /// Revokes the refresh token `value` names and the whole chain minted from

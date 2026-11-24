@@ -12,12 +12,14 @@
 //!   account answers the RFC 7662 §2.2 body and nothing else — `{"active": false}`;
 //! * `RevokeOAuth2TokenWithIAM` invalidates the refresh token it names together with
 //!   the whole chain minted from it, and answers 200 with an empty body however many
-//!   times it is called with however invalid a token.
+//!   times it is called with however invalid a token;
+//! * `CreateOAuth2Token`'s refresh flow vends the scoped-down AWS credentials the refresh
+//!   token it is presented carries, and vends nothing for a token it cannot act on.
 //!
-//! A refresh token enters the store only through `CreateOAuth2Token` (the Human OAuth
-//! flow), which is still a scaffold stub, so the refresh-token rows below seed the store
-//! through the same `state::ComAmazonawsSigninSigninState::issue_token` the handlers
-//! mint with, over the one shared engine the router serves from.
+//! A refresh token enters the store through the Sign-In AUTHORIZATION endpoint, which this
+//! service's model does not bind, so the refresh-token rows below seed the store through
+//! the same `state::ComAmazonawsSigninSigninState::issue_token` the handlers mint with,
+//! over the one shared engine the router serves from.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -55,6 +57,22 @@ const SUBJECT: &str = "arn:aws:iam::000000000000:user/emulator";
 /// `CreateOAuth2TokenWithIAM`'s only grant type: `ClientCredentialsGrantType` is
 /// modelled `^client_credentials$`.
 const CLIENT_CREDENTIALS: &str = "client_credentials";
+
+/// The OAuth 2.0 client of the IAM client-credentials grant, reported as the `client_id`
+/// claim of every token it mints. Spelled out here rather than imported from the crate, so
+/// a wrong value in `src` fails this test: the ARN names the grant itself and carries
+/// neither account nor region.
+const IAM_CLIENT_CREDENTIALS_CLIENT_ID: &str = "arn:aws:signin:::client-credentials/sigv4";
+
+/// The anonymous `/v1/token` endpoint's two public clients: `ClientId` is
+/// `^arn:aws:signin:::devtools/(cross-device|same-device)$`.
+const DEVTOOLS_CLIENT_ID: &str = "arn:aws:signin:::devtools/cross-device";
+
+/// The `tokenType` that endpoint answers with: `TokenType` is `^aws_sigv4$`.
+const SIGV4_TOKEN_TYPE: &str = "aws_sigv4";
+
+/// The refresh grant of `GrantType`'s `^(authorization_code|refresh_token)$`.
+const REFRESH_TOKEN_GRANT: &str = "refresh_token";
 
 /// Every claim `IntrospectOAuth2TokenWithIAMResponse` declares beside `active`, by its
 /// wire name — the members RFC 7662 §2.2 says are "omitted" from an inactive answer.
@@ -342,9 +360,11 @@ async fn a_minted_access_token_introspects_to_the_claims_it_carries() {
             "case {case:?}: the resource claim is only present for refresh tokens, got {:?}",
             answer.body["resource"]
         );
-        assert!(
-            !answer.has("client_id"),
-            "case {case:?}: the IAM flow has no OAuth client to report, got {:?}",
+        assert_eq!(
+            answer.string("client_id"),
+            IAM_CLIENT_CREDENTIALS_CLIENT_ID,
+            "case {case:?}: the client the IAM client-credentials grant mints for is its \
+             own, got {:?}",
             answer.body["client_id"]
         );
         assert_eq!(
@@ -835,4 +855,155 @@ async fn the_token_store_is_bounded_and_reclaims_expired_tokens() {
         "expected TooManyRequestsError, got {:?}",
         refused.body
     );
+}
+
+/// `POST uri` with no SigV4 credential scope and no service-naming host — how a client of
+/// the ANONYMOUS `/v1/token` endpoint addresses it, since that operation lists no auth
+/// scheme and is authenticated by the OAuth 2.0 client credentials in its body.
+///
+/// The request itself is the shared harness's (`signin_harness::post_unsigned`), so this
+/// suite and `oauth2_token_acceptance.rs` cannot drift about what "no routing signal"
+/// means; only the answer is narrowed to what this suite's assertions read.
+async fn call_unsigned(router: &MultiServiceRouter, uri: &str, body: Value) -> Answer {
+    let answered = crate::signin_harness::post_unsigned(router, uri, body).await;
+    Answer {
+        status: answered.status,
+        body: answered.body,
+    }
+}
+
+/// A refresh of the refresh token `token`, as the anonymous endpoint takes one: the body
+/// binds each parameter under the `jsonName` the model gives its member
+/// (`CreateOAuth2TokenRequestBody`), which is the key the operation receives it under.
+async fn refresh(em: &Emulator, token: &str) -> Answer {
+    call_unsigned(
+        &em.router,
+        "/v1/token",
+        json!({
+            "clientId": DEVTOOLS_CLIENT_ID,
+            "grantType": REFRESH_TOKEN_GRANT,
+            "refreshToken": token,
+        }),
+    )
+    .await
+}
+
+/// A refresh is served from the store: the token the request presents has to name a
+/// refresh token this service holds that is still active, and the call vends the
+/// scoped-down AWS credentials that token carries — the SAME ones while they are still
+/// live, which is what makes the flow "idempotent within token validity window", and the
+/// refresh token back unchanged, since a refresh does not consume it.
+#[tokio::test]
+async fn a_refresh_vends_the_credentials_its_refresh_token_carries() {
+    let em = emulator();
+    let seeded = em.seed(
+        new_token(TOKEN_TYPE_REFRESH, "aws-mcp.amazonaws.com", 3600),
+        SystemTime::now(),
+    );
+
+    let first = refresh(&em, &seeded).await;
+    assert_eq!(
+        first.status, 200,
+        "a refresh of a live refresh token must be served, got {} with {:?}",
+        first.status, first.body
+    );
+    assert_eq!(
+        first.string("tokenType"),
+        SIGV4_TOKEN_TYPE,
+        "the endpoint vends AWS SigV4 credentials, got {:?}",
+        first.body
+    );
+    assert_eq!(
+        first.string("refreshToken"),
+        seeded.as_str(),
+        "the refresh token is reported back unchanged, got {:?}",
+        first.body
+    );
+    let expires_in = first.number("expiresIn").unwrap_or_default();
+    assert!(
+        (1..=900).contains(&expires_in),
+        "expiresIn is inside ExpiresIn's published 1..900, got {expires_in}"
+    );
+    let credential = &first.body["accessToken"];
+    for member in ["accessKeyId", "secretAccessKey", "sessionToken"] {
+        assert!(
+            credential[member].as_str().is_some_and(|v| !v.is_empty()),
+            "case {member:?}: the vended credential carries every member AccessToken \
+             declares, got {credential:?}"
+        );
+    }
+
+    // The same refresh token, presented again inside the window the first call's
+    // credentials live for: the same credential, not a second one.
+    let again = refresh(&em, &seeded).await;
+    assert_eq!(
+        (again.status, &again.body["accessToken"]),
+        (200, credential),
+        "a repeated refresh inside the validity window must answer consistently, got {} \
+         with {:?}",
+        again.status,
+        again.body
+    );
+
+    // And what it vended is held ON the refresh token, so revoking the token's chain
+    // takes the refresh with it.
+    let revoked = revoke(&em, &seeded).await;
+    assert_eq!(
+        revoked.status, 200,
+        "revocation must answer 200, got {} with {:?}",
+        revoked.status, revoked.body
+    );
+    let after = refresh(&em, &seeded).await;
+    assert_eq!(
+        (after.status, after.string("error")),
+        (401, "TOKEN_EXPIRED"),
+        "a revoked refresh token vends nothing, got {} with {:?}",
+        after.status,
+        after.body
+    );
+}
+
+/// A refresh that names no refresh token this service holds that is usable vends nothing:
+/// the rows differ along WHY it is unusable — a value the store never held, an
+/// access-token-shaped value, a refresh token whose own lifetime has run out, and one
+/// belonging to another account. Each is the modelled `AccessDeniedException` carrying
+/// `TOKEN_EXPIRED`, at the HTTP 401 that shape's documentation maps that code to.
+#[tokio::test]
+async fn a_refresh_vends_nothing_for_a_token_it_cannot_act_on() {
+    let em = emulator();
+    let expired = em.seed(
+        new_token(TOKEN_TYPE_REFRESH, "aws-mcp.amazonaws.com", 3600),
+        SystemTime::now() - Duration::from_secs(7200),
+    );
+    let access = em.seed(
+        new_token(TOKEN_TYPE_ACCESS, "aws-mcp.amazonaws.com", 3600),
+        SystemTime::now(),
+    );
+    let other_account = em.seed(
+        new_token(TOKEN_TYPE_REFRESH, "aws-mcp.amazonaws.com", 3600),
+        SystemTime::now(),
+    );
+    em.reassign_account(&other_account, "210987654321");
+
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "a value the store never held",
+            format!("ASOR{}", "a".repeat(32)),
+        ),
+        ("an access token of this store", access),
+        ("a refresh token past its lifetime", expired),
+        ("a refresh token of another account", other_account),
+        ("a value no Sign-In token could have", "not-a-token".to_string()),
+    ];
+
+    for (case, token) in cases {
+        let answer = refresh(&em, &token).await;
+        assert_eq!(
+            (answer.status, answer.string("error")),
+            (401, "TOKEN_EXPIRED"),
+            "case {case:?}: expected the modelled refusal, got {} with {:?}",
+            answer.status,
+            answer.body
+        );
+    }
 }
