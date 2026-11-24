@@ -556,7 +556,11 @@ struct PublishRow {
 }
 
 /// `onPublish` handlers the rows use, each a module as AppSync's own handlers are written.
-const FILTER_HANDLER: &str =
+///
+/// The filtering one is shared with the suite that drives a namespace from the addresses the
+/// inventory published ([`crate::api_published_endpoint_reachability`]), so a handler that
+/// decides what is published is written once.
+pub(crate) const FILTER_HANDLER: &str =
     "export function onPublish(ctx) { return ctx.events.filter((e) => e.payload.keep === true) }";
 const TRANSFORM_HANDLER: &str = "export function onPublish(ctx) {\n  \
      return ctx.events.map((e) => ({id: e.id, payload: {seen: e.payload.m, \
