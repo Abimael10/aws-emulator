@@ -115,11 +115,19 @@ pub async fn publish_due_artifact<Eng: Send + Sync + 'static>(
     // into Amazon S3.
     let gate = ::std::sync::Arc::clone(&state.lock().artifact_publications);
     let _publishing = gate.lock().await;
-    let (claimed, checkpoints) = {
+    let (claimed, checkpoints, output_kms_key_id) = {
         let mut store = state.lock();
         match store.training_jobs.get_mut(job_name) {
-            Some(job) => (job.claim_due_artifact(now), job.claim_due_checkpoints(now)),
-            None => (None, Vec::new()),
+            Some(job) => (
+                job.claim_due_artifact(now),
+                job.claim_due_checkpoints(now),
+                // The artifact is the job's OUTPUT, so it is written under the key its output
+                // configuration declared ("the … KMS key that SageMaker uses to encrypt the
+                // model artifacts at rest using Amazon S3 server-side encryption",
+                // `OutputDataConfig$KmsKeyId`).
+                job.request.output_data_config.kms_key_id.clone(),
+            ),
+            None => (None, Vec::new(), None),
         }
     };
     let client = s3_client_through(callback, region);
@@ -128,7 +136,9 @@ pub async fn publish_due_artifact<Eng: Send + Sync + 'static>(
     // publication there: the job has failed on that leg, so the later legs never happen and the
     // artifact of a failed job is not left behind either.
     for checkpoint in checkpoints {
-        let written = write_object(&client, &checkpoint.location, checkpoint.archive).await;
+        // A checkpoint goes to `CheckpointConfig$S3Uri`, and that configuration declares no
+        // key of its own, so the destination bucket's own default encryption applies to it.
+        let written = write_object(&client, &checkpoint.location, checkpoint.archive, None).await;
         if let Err(detail) = written {
             let reason = checkpoint_upload_failed(&checkpoint.location.uri(), &detail);
             if let Some(job) = state.lock().training_jobs.get_mut(job_name) {
@@ -140,7 +150,13 @@ pub async fn publish_due_artifact<Eng: Send + Sync + 'static>(
     let Some(artifact) = claimed else {
         return;
     };
-    let written = write_object(&client, &artifact.location, artifact.archive).await;
+    let written = write_object(
+        &client,
+        &artifact.location,
+        artifact.archive,
+        output_kms_key_id.as_deref(),
+    )
+    .await;
     if let Err(detail) = written {
         // The upload leg of the run failed, which is the JOB's own failure: the reason names
         // that leg, the same way a read the run could not make names the download leg.

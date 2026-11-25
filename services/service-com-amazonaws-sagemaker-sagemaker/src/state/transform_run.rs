@@ -154,6 +154,9 @@ pub struct TransformTarget {
     /// `TransformOutput$Accept`: "the MIME type used to specify the output data", which is the
     /// media type the predictions are rendered in.
     pub accept: Option<String>,
+    /// `TransformOutput$KmsKeyId`, when the job declared a key for its output: the key every
+    /// object the job writes under `S3OutputPath` is encrypted with.
+    pub output_kms_key_id: Option<String>,
 }
 
 /// Run one accepted batch transform job: read its input objects, score every record each holds
@@ -253,7 +256,16 @@ pub async fn run_transform_job(
                 &access_denied_detail(),
             ));
         }
-        if let Err(detail) = write_object(&client, &written, body).await {
+        // The object is the job's own output, so it is written under the key the job's output
+        // declared (`TransformOutput$KmsKeyId`).
+        if let Err(detail) = write_object(
+            &client,
+            &written,
+            body,
+            target.output_kms_key_id.as_deref(),
+        )
+        .await
+        {
             return TransformRunOutcome::failed(transform_upload_failed(&written.uri(), &detail));
         }
         outputs.push(written.uri());

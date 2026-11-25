@@ -132,6 +132,10 @@ service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # callback step's whole work is the message it hands the caller's own queue, so the suite
 # creates that queue through SQS's own API and reads the message back off it.
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+# KMS, mounted beside SageMaker and Amazon S3 on one engine by the output-encryption suite:
+# the key a job's output configuration declares is a KMS key, minted through that service's
+# own `CreateKey`, so the SSE-KMS write a job's output makes names a key KMS really holds.
+service-com-amazonaws-kms-trentservice = { workspace = true }
 
 [lints]
 workspace = true

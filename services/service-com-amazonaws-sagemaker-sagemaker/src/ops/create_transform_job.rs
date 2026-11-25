@@ -357,6 +357,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 content_type: input.transform_input.content_type.clone(),
                 output_path: input.transform_output.s3_output_path.clone(),
                 accept: input.transform_output.accept.clone(),
+                output_kms_key_id: input.transform_output.kms_key_id.clone(),
             },
         )
         .await;

@@ -1183,33 +1183,43 @@ pub async fn read_object(
     Ok(body.into_iter().take(ceiling).collect())
 }
 
-/// Write the model archive as one object, or answer what Amazon S3 answered.
+/// Write one object of this service's own output, or answer what Amazon S3 answered.
+///
+/// `output_kms_key_id` is the `KmsKeyId` the output configuration this object belongs to
+/// declared, which decides the server-side encryption the object is stored under
+/// ([`super::with_output_encryption`]): a declared key makes it an SSE-KMS write under that
+/// key, so a later `HeadObject` or `GetObject` reports `aws:kms` and that key, and a
+/// configuration declaring none leaves the destination bucket's own default to apply.
 pub async fn write_object(
     client: &::aws_sdk_s3::Client,
     object: &S3Location,
     document: Vec<u8>,
+    output_kms_key_id: Option<&str>,
 ) -> Result<(), String> {
-    client
-        .put_object()
-        .bucket(&object.bucket)
-        .key(&object.key)
-        .body(::aws_sdk_s3::primitives::ByteStream::from(document))
-        .send()
-        .await
-        .map_err(|error| {
-            ::tracing::debug!(
-                bucket = ?object.bucket,
-                key = ?object.key,
-                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                "a SageMaker training run could not write its model artifact"
-            );
-            s3_answer_detail(
-                error
-                    .as_service_error()
-                    .and_then(::aws_sdk_s3::error::ProvideErrorMetadata::code),
-                UNWRITTEN_OBJECT_DETAIL,
-            )
-        })?;
+    super::with_output_encryption(
+        client
+            .put_object()
+            .bucket(&object.bucket)
+            .key(&object.key)
+            .body(::aws_sdk_s3::primitives::ByteStream::from(document)),
+        output_kms_key_id,
+    )
+    .send()
+    .await
+    .map_err(|error| {
+        ::tracing::debug!(
+            bucket = ?object.bucket,
+            key = ?object.key,
+            error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+            "a SageMaker run could not write one of its output objects"
+        );
+        s3_answer_detail(
+            error
+                .as_service_error()
+                .and_then(::aws_sdk_s3::error::ProvideErrorMetadata::code),
+            UNWRITTEN_OBJECT_DETAIL,
+        )
+    })?;
     Ok(())
 }
 

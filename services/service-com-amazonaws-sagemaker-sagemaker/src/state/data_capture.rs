@@ -103,6 +103,9 @@ pub struct CaptureSettings {
     /// IAM role that SageMaker can assume to access model artifacts and docker image for
     /// deployment", `CreateModel$ExecutionRoleArn`), and otherwise the configuration's.
     pub role_arn: Option<String>,
+    /// `DataCaptureConfig$KmsKeyId`, when the configuration declared a key: the key the
+    /// captured data is encrypted with at rest.
+    pub kms_key_id: Option<String>,
 }
 
 impl CaptureSettings {
@@ -194,6 +197,7 @@ pub fn endpoint_capture_settings(
             .and_then(|header| header.json_content_types.clone())
             .unwrap_or_default(),
         role_arn: capture_role(store, endpoint_name, variant_name),
+        kms_key_id: config.kms_key_id.clone(),
     };
     (settings.capture_input || settings.capture_output).then_some(settings)
 }
@@ -294,7 +298,10 @@ pub async fn capture_invocation(
     // One JSON record per line, so a reader takes the objects of the destination apart by
     // lines however many invocations each of them holds.
     document.push(b'\n');
-    match write_object(&client, &object, document).await {
+    // The captured data is the configuration's own output, so it is written under the key that
+    // configuration declared ("the … key that SageMaker AI uses to encrypt the captured data at
+    // rest using Amazon S3 server-side encryption", `DataCaptureConfig$KmsKeyId`).
+    match write_object(&client, &object, document, settings.kms_key_id.as_deref()).await {
         Ok(()) => true,
         Err(detail) => {
             ::tracing::debug!(
@@ -432,6 +439,7 @@ mod tests {
             csv_content_types: Vec::new(),
             json_content_types: Vec::new(),
             role_arn: None,
+            kms_key_id: None,
         }
     }
 

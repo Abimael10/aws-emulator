@@ -338,7 +338,16 @@ pub async fn upload_processing_outputs(
                     &access_denied_detail(),
                 ));
             }
-            let written = write_object(&client, &object, contents.into_bytes()).await;
+            // The object is one of THIS output configuration's, so it is written under the key
+            // that configuration declared: "the KmsKeyId is applied to all outputs"
+            // (`ProcessingOutputConfig$KmsKeyId`).
+            let written = write_object(
+                &client,
+                &object,
+                contents.into_bytes(),
+                config.kms_key_id.as_deref(),
+            )
+            .await;
             if let Err(detail) = written {
                 return Some(processing_upload_failed(name, &object.uri(), &detail));
             }

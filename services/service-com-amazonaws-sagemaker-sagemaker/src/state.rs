@@ -1218,6 +1218,11 @@ pub use training_algorithm::*;
 pub mod builtin_algorithm_metrics;
 pub use builtin_algorithm_metrics::*;
 
+/// The SERVER-SIDE ENCRYPTION this service's Amazon S3 output writes are made under — the
+/// customer managed key an output configuration declared: see `state/output_encryption.rs`.
+pub mod output_encryption;
+pub use output_encryption::*;
+
 /// The PUBLICATION of what a training run produced — the model artifact it built and the
 /// stage of the work at which it appears in Amazon S3: see `state/training_artifact.rs`.
 pub mod training_artifact;

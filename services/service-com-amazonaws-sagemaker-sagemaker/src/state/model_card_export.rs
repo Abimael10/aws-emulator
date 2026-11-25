@@ -245,7 +245,9 @@ pub async fn run_model_card_export(
         export.content,
     );
     let client = s3_client(ctx, region);
-    match write_object(&client, &object, document).await {
+    // `ModelCardExportOutputConfig` declares no key of its own — the export's only member is
+    // its `S3OutputPath` — so the destination bucket's default encryption applies.
+    match write_object(&client, &object, document, None).await {
         Ok(()) => ModelCardExportOutcome::Exported(object.uri()),
         Err(detail) => ModelCardExportOutcome::Failed(export_failed(&object.uri(), &detail)),
     }

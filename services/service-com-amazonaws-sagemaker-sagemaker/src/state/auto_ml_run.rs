@@ -434,9 +434,17 @@ pub async fn run_auto_ml_job_v2(
                 model_upload_failed(&artifact.uri(), "the model archive could not be built"),
             );
         };
-        if let Err(reason) =
-            put_artifact(ctx, &client, region, &request.role_arn, &partition, &artifact, archive)
-                .await
+        if let Err(reason) = put_artifact(
+            ctx,
+            &client,
+            region,
+            &request.role_arn,
+            &partition,
+            &artifact,
+            archive,
+            request.output_data_config.kms_key_id.as_deref(),
+        )
+        .await
         {
             return AutoMLRunOutcome::failed_in(phases, reason);
         }
@@ -471,8 +479,17 @@ pub async fn run_auto_ml_job_v2(
                 model_upload_failed(&location.uri(), "the notebook could not be built"),
             );
         };
-        if let Err(reason) =
-            put_artifact(ctx, &client, region, &request.role_arn, &partition, &location, body).await
+        if let Err(reason) = put_artifact(
+            ctx,
+            &client,
+            region,
+            &request.role_arn,
+            &partition,
+            &location,
+            body,
+            request.output_data_config.kms_key_id.as_deref(),
+        )
+        .await
         {
             return AutoMLRunOutcome::failed_in(phases, reason);
         }
@@ -496,6 +513,10 @@ pub async fn run_auto_ml_job_v2(
 
 /// Write one object of the run's own output under the execution role's grant, answering the
 /// job's `FailureReason` for a write the role may not make or Amazon S3 would not take.
+///
+/// `output_kms_key_id` is the key the job's output configuration declared
+/// (`AutoMLOutputDataConfig$KmsKeyId`), which every object of that output is encrypted with.
+#[allow(clippy::too_many_arguments)]
 async fn put_artifact(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     client: &::aws_sdk_s3::Client,
@@ -504,6 +525,7 @@ async fn put_artifact(
     partition: &str,
     object: &S3Location,
     body: Vec<u8>,
+    output_kms_key_id: Option<&str>,
 ) -> Result<(), String> {
     if ::service_common::iam_role::role_withholds_action(
         ctx,
@@ -516,7 +538,7 @@ async fn put_artifact(
     {
         return Err(model_upload_failed(&object.uri(), &access_denied_detail()));
     }
-    write_object(client, object, body)
+    write_object(client, object, body, output_kms_key_id)
         .await
         .map_err(|detail| model_upload_failed(&object.uri(), &detail))
 }
