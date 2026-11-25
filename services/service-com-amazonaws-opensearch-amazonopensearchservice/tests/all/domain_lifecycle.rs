@@ -1580,12 +1580,10 @@ async fn a_configuration_change_settles_from_processing_to_active_on_the_clock()
 }
 
 /// One repeat `CreateDomain` to drive: how the row changes the request the domain was
-/// created with, and whether the repeat therefore describes the domain the account already
-/// holds under that name.
+/// created with.
 struct Repeat {
     case: &'static str,
     change: fn(&mut Value),
-    resolves: bool,
 }
 
 /// The request every row of [`REPEATS`] is driven from: the baseline configuration plus a
@@ -1600,24 +1598,22 @@ fn tagged_create(name: &str) -> Value {
 /// The repeats driven below, differing along what the rule generalises over: a repeat that
 /// asks for exactly what the stored domain holds (identically, and by naming values the
 /// SERVICE filled in for the first create, which the stored configuration carries), and
-/// repeats that differ in one member each — a number, a string, an enum, a whole container
-/// left out, a document, a map entry and the tag set.
+/// repeats that ask for something else in one member each — a number, a string, an enum, a
+/// whole container left out, a document, a map entry and the tag set.
 const REPEATS: &[Repeat] = &[
     Repeat {
         case: "the identical request",
         change: |_| {},
-        resolves: true,
     },
     Repeat {
         case: "the same configuration, naming the gp3 performance the service provisioned",
         // The baseline volume is `gp3`, whose performance is PROVISIONED, so the stored
         // configuration carries the baseline 3,000 IOPS and 125 MiB/s the first create never
-        // named: a repeat naming them describes that same domain.
+        // named.
         change: |body| {
             body["EBSOptions"]["Iops"] = json!(3_000);
             body["EBSOptions"]["Throughput"] = json!(125);
         },
-        resolves: true,
     },
     Repeat {
         case: "the same configuration, naming the use case and engine mode the service set",
@@ -1625,27 +1621,22 @@ const REPEATS: &[Repeat] = &[
             body["UseCase"] = json!("MIXED");
             body["EngineMode"] = json!("GENERAL");
         },
-        resolves: true,
     },
     Repeat {
         case: "a different data node count",
         change: |body| body["ClusterConfig"]["InstanceCount"] = json!(3),
-        resolves: false,
     },
     Repeat {
         case: "a different instance type",
         change: |body| body["ClusterConfig"]["InstanceType"] = json!("m5.large.search"),
-        resolves: false,
     },
     Repeat {
         case: "a different engine version",
         change: |body| body["EngineVersion"] = json!("OpenSearch_2.13"),
-        resolves: false,
     },
     Repeat {
         case: "a different volume size",
         change: |body| body["EBSOptions"]["VolumeSize"] = json!(30),
-        resolves: false,
     },
     Repeat {
         case: "no cluster configuration at all",
@@ -1654,19 +1645,16 @@ const REPEATS: &[Repeat] = &[
                 members.remove("ClusterConfig");
             }
         },
-        resolves: false,
     },
     Repeat {
         case: "a different access policy",
         change: |body| body["AccessPolicies"] = json!("{\"Version\":\"2008-10-17\"}"),
-        resolves: false,
     },
     Repeat {
         case: "an advanced option the domain does not hold",
         change: |body| {
             body["AdvancedOptions"]["indices.query.bool.max_clause_count"] = json!("64");
         },
-        resolves: false,
     },
     Repeat {
         case: "a tag the domain does not carry",
@@ -1676,7 +1664,6 @@ const REPEATS: &[Repeat] = &[
                 { "Key": "tier", "Value": "gold" },
             ]);
         },
-        resolves: false,
     },
     Repeat {
         case: "no tags at all",
@@ -1685,17 +1672,26 @@ const REPEATS: &[Repeat] = &[
                 members.remove("TagList");
             }
         },
-        resolves: false,
     },
 ];
 
+/// The members of the stored configuration a repeat must leave exactly as the first create
+/// left them, whatever it asked for.
+const UNTOUCHED_MEMBERS: [&str; 5] = [
+    "ClusterConfig",
+    "EBSOptions",
+    "EngineVersion",
+    "AccessPolicies",
+    "AdvancedOptions",
+];
+
 /// RULE: a domain name is unique within the account and Region, so a create of a name the
-/// account already holds a domain under never mints a second record: it RESOLVES to the
-/// domain that is already there — answering that domain's own current status and changing
-/// nothing — when the configuration it describes is the one that domain holds, and is the
-/// modelled already-exists refusal when it describes any other.
+/// account already holds a domain under never mints a second record and never moves the one
+/// that is there: it RESOLVES to that domain — answering its own current status with HTTP 200
+/// and changing nothing — so the first call's configuration stays the domain's however the
+/// repeat's own options differ.
 #[tokio::test]
-async fn a_repeat_create_resolves_to_the_domain_it_describes_and_is_refused_otherwise() {
+async fn a_repeat_create_resolves_to_the_domain_the_account_already_holds() {
     let emulator = Emulator::new();
     for (index, repeat) in REPEATS.iter().enumerate() {
         let case = repeat.case;
@@ -1706,50 +1702,49 @@ async fn a_repeat_create_resolves_to_the_domain_it_describes_and_is_refused_othe
             "case {case:?}: expected the first create accepted, got {} with {:?}",
             created.status, created.body
         );
-        // The domain is settled first, so a resolving repeat is answered about a domain
-        // whose provisioning has landed: what it reports is that domain's state at the
-        // instant of the repeat, not the state the first create answered with.
+        // The domain is settled first, so the repeat is answered about a domain whose
+        // provisioning has landed: what it reports is that domain's state at the instant of
+        // the repeat, not the state the first create answered with.
         let settled = settled_domain(&emulator, &name).await;
 
         let mut body = tagged_create(&name);
         (repeat.change)(&mut body);
         let again = emulator.create(body).await;
-        if repeat.resolves {
+        assert_eq!(
+            again.status, 200,
+            "case {case:?}: expected the repeat to resolve to the domain with 200, got {} \
+             with {:?}",
+            again.status, again.body
+        );
+        assert_eq!(
+            string_member(&again.body["DomainStatus"], "DomainName", case),
+            name,
+            "case {case:?}: expected the repeat to answer about that domain, got {:?}",
+            again.body
+        );
+        assert_eq!(
+            again.body["DomainStatus"]["DomainId"], settled["DomainId"],
+            "case {case:?}: expected the domain that was already there, got {:?}",
+            again.body
+        );
+        assert_eq!(
+            again.body["DomainStatus"]["Processing"],
+            json!(false),
+            "case {case:?}: expected the settled domain's own state, got {:?}",
+            again.body
+        );
+        // What it answers is the stored record, member for member — not the configuration
+        // the repeat asked for.
+        for member in UNTOUCHED_MEMBERS {
             assert_eq!(
-                again.status, 200,
-                "case {case:?}: expected the repeat to resolve to the domain with 200, got {} \
-                 with {:?}",
-                again.status, again.body
-            );
-            assert_eq!(
-                string_member(&again.body["DomainStatus"], "DomainName", case),
-                name,
-                "case {case:?}: expected the repeat to answer about that domain, got {:?}",
-                again.body
-            );
-            assert_eq!(
-                again.body["DomainStatus"]["DomainId"], settled["DomainId"],
-                "case {case:?}: expected the domain that was already there, got {:?}",
-                again.body
-            );
-            assert_eq!(
-                again.body["DomainStatus"]["Processing"],
-                json!(false),
-                "case {case:?}: expected the settled domain's own state, got {:?}",
-                again.body
-            );
-        } else {
-            assert_eq!(
-                (again.status, error_code(&again)),
-                (409, "ResourceAlreadyExistsException".to_string()),
-                "case {case:?}: expected the already-exists refusal, got {} with {:?}",
-                again.status,
-                again.body
+                again.body["DomainStatus"][member], settled[member],
+                "case {case:?}: expected the repeat to answer the stored {member}, got {:?}",
+                again.body["DomainStatus"][member]
             );
         }
 
-        // Either way exactly ONE domain of that name exists, and the record the first create
-        // left is untouched.
+        // Exactly ONE domain of that name exists, and the record the first create left is
+        // untouched.
         let listed = emulator.call("GET", &format!("{PREFIX}/domain"), None).await;
         let named = listed.body["DomainNames"]
             .as_array()
@@ -1766,12 +1761,7 @@ async fn a_repeat_create_resolves_to_the_domain_it_describes_and_is_refused_othe
             listed.body
         );
         let read = emulator.describe(&name).await;
-        for member in [
-            "ClusterConfig",
-            "EBSOptions",
-            "EngineVersion",
-            "AccessPolicies",
-        ] {
+        for member in UNTOUCHED_MEMBERS {
             assert_eq!(
                 read.body["DomainStatus"][member], settled[member],
                 "case {case:?}: expected {member} untouched by the repeat, got {:?}",
@@ -1782,7 +1772,7 @@ async fn a_repeat_create_resolves_to_the_domain_it_describes_and_is_refused_othe
 }
 
 #[tokio::test]
-async fn a_duplicate_domain_name_is_refused_and_the_first_record_stands() {
+async fn a_duplicate_domain_name_answers_the_first_record_and_it_stands() {
     let emulator = Emulator::new();
     for name in ["dup-one", "dup-two", "dup-three"] {
         let first = create_baseline(&emulator, name).await;
@@ -1793,20 +1783,20 @@ async fn a_duplicate_domain_name_is_refused_and_the_first_record_stands() {
             }))
             .await;
         assert_eq!(
-            again.status, 409,
-            "case CreateDomain({name:?} twice): expected 409, got {} with {:?}",
+            again.status, 200,
+            "case CreateDomain({name:?} twice): expected 200, got {} with {:?}",
             again.status, again.body
         );
         assert_eq!(
-            error_code(&again),
-            "ResourceAlreadyExistsException",
-            "case CreateDomain({name:?} twice): expected ResourceAlreadyExistsException, got {:?}",
-            again.body
+            again.body["DomainStatus"]["ClusterConfig"], first["ClusterConfig"],
+            "case CreateDomain({name:?} twice): expected the stored cluster configuration \
+             {:?}, got {:?}",
+            first["ClusterConfig"], again.body["DomainStatus"]["ClusterConfig"]
         );
         let read = emulator.describe(name).await;
         assert_eq!(
             read.body["DomainStatus"]["ClusterConfig"], first["ClusterConfig"],
-            "case CreateDomain({name:?} twice): the refused create must not touch the record: \
+            "case CreateDomain({name:?} twice): the repeat must not touch the record: \
              expected {:?}, got {:?}",
             first["ClusterConfig"], read.body["DomainStatus"]["ClusterConfig"]
         );

@@ -189,116 +189,6 @@ fn latest_opensearch_version() -> &'static str {
         .unwrap_or(DEFAULT_ENGINE_VERSION)
 }
 
-/// Every option of a domain's configuration a create can set — the whole configuration a
-/// `CreateDomain` request describes, which is what decides whether a create of a name the
-/// account already holds describes THAT domain ([`describes_held_domain`]).
-const CONFIGURED_OPTIONS: &[&str] = &[
-    OPT_ENGINE_VERSION,
-    OPT_CLUSTER_CONFIG,
-    OPT_EBS_OPTIONS,
-    OPT_ACCESS_POLICIES,
-    OPT_IP_ADDRESS_TYPE,
-    OPT_SNAPSHOT_OPTIONS,
-    OPT_VPC_OPTIONS,
-    OPT_COGNITO_OPTIONS,
-    OPT_ENCRYPTION_AT_REST_OPTIONS,
-    OPT_NODE_TO_NODE_ENCRYPTION_OPTIONS,
-    OPT_ADVANCED_OPTIONS,
-    OPT_LOG_PUBLISHING_OPTIONS,
-    OPT_DOMAIN_ENDPOINT_OPTIONS,
-    OPT_ADVANCED_SECURITY_OPTIONS,
-    OPT_IDENTITY_CENTER_OPTIONS,
-    OPT_AUTO_TUNE_OPTIONS,
-    OPT_OFF_PEAK_WINDOW_OPTIONS,
-    OPT_SOFTWARE_UPDATE_OPTIONS,
-    OPT_AIML_OPTIONS,
-    OPT_DEPLOYMENT_STRATEGY_OPTIONS,
-    OPT_AUTOMATED_SNAPSHOT_PAUSE_OPTIONS,
-    OPT_USE_CASE,
-    OPT_ENGINE_MODE,
-];
-
-/// Whether this create describes the domain the account ALREADY holds under that name.
-///
-/// A create names the WHOLE configuration of the domain it asks for: the members it carries,
-/// plus the value the service itself sets for every block it leaves out
-/// ([`crate::service::domain_configuration::apply_server_defaults`]). So the comparison is
-/// over the whole configuration: the request is projected onto the record it would have
-/// created — through the same projections the create below stores, so a value the create
-/// would normalise or resolve is compared as it would be STORED — the service's own defaults
-/// are applied to it, and the result is compared with the held record option by option,
-/// through the one projection every report of a domain's configuration is computed from
-/// ([`crate::service::domain_configuration::same_options`]).
-///
-/// The domain's TAG SET is compared beside it: a domain is created carrying the tags the
-/// request named, so a create naming tags the domain does not carry describes a different
-/// domain rather than one whose tags are silently dropped. Nothing about the record's
-/// identity, endpoint, history or state takes part: none of those is what a create describes.
-fn describes_held_domain(
-    held: &Domain,
-    input: &CreateDomainInput,
-    engine_version: &str,
-    encryption_at_rest_options: Option<&EncryptionAtRestOptions>,
-    placements: &[crate::state::vpc_network::SubnetPlacement],
-) -> bool {
-    let mut candidate = held.clone();
-    candidate.engine_version = engine_version.to_string();
-    candidate.engine_mode = input
-        .engine_mode
-        .clone()
-        .unwrap_or_else(|| DEFAULT_ENGINE_MODE.to_string());
-    candidate.use_case = input
-        .use_case
-        .clone()
-        .unwrap_or_else(|| DEFAULT_USE_CASE.to_string());
-    candidate.cluster_config = input.cluster_config.clone().unwrap_or_default();
-    candidate.ebs_options = input.ebs_options.clone();
-    candidate.access_policies =
-        crate::service::domain_configuration::stored_access_policies(input.access_policies.clone());
-    candidate.ip_address_type = input.ip_address_type.clone();
-    candidate.snapshot_options = input.snapshot_options.clone();
-    candidate.vpc_options = input
-        .vpc_options
-        .clone()
-        .map(|options| placed_vpc_options(options, placements));
-    candidate.cognito_options = input.cognito_options.clone();
-    candidate.encryption_at_rest_options = encryption_at_rest_options.cloned();
-    candidate.node_to_node_encryption_options = input.node_to_node_encryption_options.clone();
-    candidate.advanced_options = input
-        .advanced_options
-        .clone()
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-    candidate.log_publishing_options = input
-        .log_publishing_options
-        .clone()
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-    candidate.domain_endpoint_options = input.domain_endpoint_options.clone();
-    candidate.advanced_security_options = input
-        .advanced_security_options
-        .clone()
-        .map(stored_advanced_security_options);
-    candidate.identity_center_options = input
-        .identity_center_options
-        .clone()
-        .map(stored_identity_center_options);
-    candidate.auto_tune_options = input.auto_tune_options.clone().map(stored_auto_tune_options);
-    candidate.off_peak_window_options = input.off_peak_window_options.clone();
-    candidate.software_update_options = input.software_update_options.clone();
-    candidate.aiml_options = input.aiml_options.clone().map(stored_aiml_options);
-    candidate.deployment_strategy_options = input.deployment_strategy_options.clone();
-    candidate.automated_snapshot_pause_options = input
-        .automated_snapshot_pause_options
-        .clone()
-        .map(stored_automated_snapshot_pause_options);
-    crate::service::domain_configuration::apply_server_defaults(&mut candidate);
-    crate::service::domain_configuration::same_options(held, &candidate, CONFIGURED_OPTIONS)
-        && held.tags == crate::state::tag_set(input.tag_list.clone().unwrap_or_default())
-}
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -773,28 +663,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Domain names are unique across the domains owned by an account within an
         // Amazon Web Services Region" (`CreateDomainRequest$DomainName`), so a create of a
-        // name the account already holds a domain under creates no second record. What it
-        // does instead is decided by WHAT it asked for: a create describing the domain that
-        // is already there RESOLVES to it — the create of that domain has already happened,
-        // so the call answers that domain's own current status and changes nothing, which is
-        // what lets a retried or re-driven create converge — while one describing a
-        // different configuration asks for a domain the account cannot hold under that name,
-        // and is the modelled already-exists refusal.
-        if let Some(held) = store.domains.get(&name) {
-            if !describes_held_domain(
-                held,
-                &input,
-                &engine_version,
-                encryption_at_rest_options.as_ref(),
-                &placements,
-            ) {
-                return Err(CreateDomainErrorModeled::ResourceAlreadyExistsException(
-                    ResourceAlreadyExistsException {
-                        message: Some(format!("Domain already exists: {name}")),
-                    },
-                )
-                .into());
-            }
+        // name the account already holds a domain under creates no second record: the create
+        // of that domain has already happened, so the call RESOLVES to it — it answers that
+        // domain's own current status and changes nothing, whatever configuration it asked
+        // for. That is what lets a retried or re-driven create converge: the first call's
+        // configuration is the domain's, and every later read keeps reporting it, so a repeat
+        // carrying different options leaves the stored record exactly as it was rather than
+        // moving the domain or minting a second one. Reported through the same clock-owed
+        // settle the read paths make, so what the repeat answers is the domain's state at
+        // THIS instant rather than the one the first create answered with.
+        if store.domains.contains_key(&name) {
+            let held = store
+                .settled_mut(&name, now)
+                .ok_or_else(crate::state::state_unavailable)?;
             return Ok(CreateDomainOutput {
                 domain_status: Some(crate::service::domain_configuration::reported_status(held)),
             });

@@ -352,7 +352,18 @@ async fn every_kind_of_resource_this_account_does_not_hold_is_answered_on_one_st
 async fn a_refusal_carrying_another_modelled_shape_keeps_the_status_the_model_gives_it() {
     let emulator = Emulator::new();
     let held = "status-other-shapes";
-    create_baseline(&emulator, held).await;
+    // The index operations are served by a domain whose engine offers them, so the
+    // already-exists row below reaches the index registry rather than a version gate.
+    create_index_serving_baseline(&emulator, held).await;
+    let held_index = "status-other-index";
+    super::index_registry::created_index(
+        &emulator,
+        held,
+        held_index,
+        &json!({ "mappings": {} }),
+        "the index the already-exists row names",
+    )
+    .await;
     let application = emulator
         .call(
             "POST",
@@ -372,8 +383,13 @@ async fn a_refusal_carrying_another_modelled_shape_keeps_the_status_the_model_gi
     // already-exists, the conflict, the generic envelope and the client-input error.
     let rows: Vec<(&str, Answer, u16, &str)> = vec![
         (
-            "CreateDomain for a name this account already holds",
-            emulator.create(json!({ "DomainName": held })).await,
+            "CreateIndex for a name the domain already holds",
+            super::index_registry::create(
+                &emulator,
+                held,
+                json!({ "IndexName": held_index, "IndexSchema": { "settings": {} } }),
+            )
+            .await,
             409,
             "ResourceAlreadyExistsException",
         ),
