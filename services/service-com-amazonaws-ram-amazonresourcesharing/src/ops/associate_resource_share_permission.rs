@@ -384,6 +384,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.resource_share_arn,
             &input.permission_arn,
             &replaced,
+            now,
         );
         if !attached {
             return Err(

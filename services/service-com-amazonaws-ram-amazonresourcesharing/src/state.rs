@@ -24,6 +24,7 @@
 //! Amazon Web Services maintains are read back through the same lookup.
 
 mod aws_managed_permissions;
+mod permission_associations;
 mod permission_attachments;
 mod permission_deletion;
 mod permission_replacement;
@@ -31,6 +32,7 @@ mod permission_version_deletion;
 mod policy_actions;
 
 pub use aws_managed_permissions::*;
+pub use permission_associations::*;
 pub use permission_attachments::*;
 pub use permission_deletion::*;
 pub use permission_replacement::*;

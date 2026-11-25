@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPermissionAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPermissionAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the resource shares [`crate::state`] holds as associated with a managed
+//! permission, one `@paginated` page at a time.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPermissionAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A managed permission and a resource share are associated exactly while that share is
+//! governed by that permission, so the pairs this reports are the ones a read of each
+//! share's permissions reports from the other side
+//! ([`crate::state::ComAmazonawsRamAmazonresourcesharingState::permission_associations`]):
+//! the permissions a share holds by name, each at the version that attachment carries,
+//! plus the default managed permission of every resource type the share shares that none
+//! of those applies to. Each pair is reported with the version the share is governed by,
+//! whether that is the permission's current default version, and the share's own
+//! `featureSet`.
+//!
+//! Every input member but the pagination pair is a FILTER over those pairs, so a request
+//! naming none of them reports every association this store holds.
+//!
+//! A pure read: it reports what the store holds, and the only writes it makes are the
+//! moves the clock already owed (an association settling, a permission's delete
+//! completing, a `ReplacePermissionAssociations` task running).
 //!
 //! ## Shape of an operation
 //!
@@ -190,18 +200,147 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPermissionAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPermissionAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPermissionAssociations"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListPermissionAssociationsErrorModeled::ServerInternalException(
+                ServerInternalException {
+                    message: "the managed permission store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        // The model constrains neither member, so both rules are applied here, each
+        // rendered as the modelled error RAM words that refusal with.
+        if let Some(why) = input
+            .permission_arn
+            .as_deref()
+            .and_then(|arn| crate::state::permission_arn_rejection("permissionArn", arn))
+        {
+            return Err(
+                ListPermissionAssociationsErrorModeled::MalformedArnException(
+                    MalformedArnException { message: why },
+                )
+                .into(),
+            );
+        }
+        // Versions are numbered upward from the first one, so a number below it names no
+        // version any permission could carry.
+        if input
+            .permission_version
+            .is_some_and(|version| version < crate::state::FIRST_PERMISSION_VERSION)
+        {
+            return Err(
+                ListPermissionAssociationsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: crate::state::permission_version_below_first_message(
+                            "permissionVersion",
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let page_size = crate::state::page_size(input.max_results);
+        let start = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_permission_association_cursor(token).ok_or_else(|| {
+                    ListPermissionAssociationsErrorModeled::InvalidNextTokenException(
+                        InvalidNextTokenException {
+                            message: "nextToken is not a pagination token issued by \
+                                      ListPermissionAssociations"
+                                .to_string(),
+                        },
+                    )
+                })?,
+            ),
+        };
+
+        let mut store = state.lock();
+        // Every move the clock already owed is materialised before the pairs are read,
+        // so an association that has settled, a permission whose delete has completed
+        // and a `ReplacePermissionAssociations` task that has run are reported as they
+        // stand: the only writes this read performs.
+        let now = store.tick();
+        store.settle_due_associations(now);
+        store.settle_due_permissions(now);
+
+        let associations = store.permission_associations();
+        let mut permissions = Vec::with_capacity(page_size.min(associations.len()));
+        let mut next_token = None;
+        // The pairs are in (permission ARN, share ARN) order, so a token naming a pair
+        // starts this page at the first pair at or after it.
+        for association in associations.iter().skip_while(|association| {
+            start.as_ref().is_some_and(|(permission_arn, share_arn)| {
+                association.key() < (permission_arn.as_str(), share_arn.as_str())
+            })
+        }) {
+            if input
+                .permission_arn
+                .as_deref()
+                .is_some_and(|wanted| association.permission_arn != wanted)
+            {
+                continue;
+            }
+            if input
+                .permission_version
+                .is_some_and(|wanted| association.permission_version != wanted)
+            {
+                continue;
+            }
+            // "When true, specifies that you want to list only those associations with
+            // resource shares that use the default version of the specified managed
+            // permission. When false (the default value), lists associations with
+            // resource shares that use any version of the specified managed permission"
+            // (`ListPermissionAssociationsRequest$defaultVersion`), so only the true
+            // value keeps anything out.
+            if input.default_version == Some(true) && !association.default_version {
+                continue;
+            }
+            // The status an association carries is the one it reports
+            // ([`crate::state::SHARE_PERMISSION_STATUS_ASSOCIATED`] for one a share is
+            // currently governed by), so a filter naming any other
+            // `ResourceShareAssociationStatus` asks for associations there are none of.
+            if input
+                .association_status
+                .as_deref()
+                .is_some_and(|wanted| association.status != wanted)
+            {
+                continue;
+            }
+            if input
+                .feature_set
+                .as_deref()
+                .is_some_and(|wanted| association.feature_set != wanted)
+            {
+                continue;
+            }
+            // "Specifies that you want to list only those associations with resource
+            // shares that include at least one resource of this resource type"
+            // (`ListPermissionAssociationsRequest$resourceType`): the filter is about
+            // what the SHARE shares, matched the way this service matches the two
+            // spellings of one resource type.
+            if input.resource_type.as_deref().is_some_and(|wanted| {
+                !store.shares_resource_type(&association.resource_share_arn, wanted)
+            }) {
+                continue;
+            }
+            // The first association that does not fit becomes the next page's start, and
+            // only then is a `nextToken` emitted — the last page carries none.
+            if permissions.len() == page_size {
+                next_token = Some(crate::state::encode_permission_association_cursor(
+                    &association.permission_arn,
+                    &association.resource_share_arn,
+                ));
+                break;
+            }
+            permissions.push(association.view());
+        }
+
+        Ok(ListPermissionAssociationsOutput {
+            permissions: Some(permissions),
+            next_token,
+        })
     }
 }

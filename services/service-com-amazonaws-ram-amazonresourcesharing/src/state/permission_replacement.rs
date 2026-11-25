@@ -229,6 +229,9 @@ impl ComAmazonawsRamAmazonresourcesharingState {
                 share.attach_permission(SharePermissionRecord {
                     permission_arn: to_permission_arn.clone(),
                     version: to_permission_version,
+                    // The task moved the attachment when it fell due, not when
+                    // somebody noticed.
+                    last_updated_time: owed.due_at,
                 });
             }
         }

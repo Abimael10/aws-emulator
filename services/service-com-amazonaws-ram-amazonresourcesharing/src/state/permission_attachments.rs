@@ -53,6 +53,15 @@ pub struct SharePermissionRecord {
     /// `ResourceSharePermissionSummary$defaultVersion` report false for an outdated
     /// attachment.
     pub version: i32,
+    /// When this attachment was last written, in epoch milliseconds: the call that made
+    /// it, or the later one that moved the share onto another version of the same
+    /// permission.
+    ///
+    /// An attachment is a record of its own, so what was last updated about it is not
+    /// what was last updated about the share or about the permission:
+    /// `AssociatedPermission$lastUpdatedTime` is "the date and time when the association
+    /// between the permission and the resource share was last updated".
+    pub last_updated_time: i64,
 }
 
 impl ShareRecord {
@@ -107,6 +116,11 @@ pub struct AttachedPermission<'a> {
     pub permission: &'a PermissionRecord,
     /// The version of it the share attached.
     pub version: &'a PermissionVersionRecord,
+    /// When the share came to be governed by this permission at this version, in epoch
+    /// milliseconds: the attachment's own stamp for a permission the share holds by
+    /// name, and — for one derived from a resource type the share shares — when that
+    /// sharing was last updated, because that is what derives it.
+    pub last_updated_time: i64,
 }
 
 impl AttachedPermission<'_> {
@@ -139,7 +153,7 @@ impl ComAmazonawsRamAmazonresourcesharingState {
     /// An ARN this store holds no permission for still yields a record — the share
     /// carries what the request named, and a read reports only the permissions that
     /// resolve.
-    pub fn permission_attachment(&self, permission_arn: &str) -> SharePermissionRecord {
+    pub fn permission_attachment(&self, permission_arn: &str, now: i64) -> SharePermissionRecord {
         let version = self
             .permission(permission_arn)
             .map_or(FIRST_PERMISSION_VERSION, |permission| {
@@ -148,6 +162,7 @@ impl ComAmazonawsRamAmazonresourcesharingState {
         SharePermissionRecord {
             permission_arn: permission_arn.to_string(),
             version,
+            last_updated_time: now,
         }
     }
 
@@ -241,6 +256,32 @@ impl ComAmazonawsRamAmazonresourcesharingState {
         })
     }
 
+    /// When the share `share_arn`'s sharing of resources of the type `resource_type` was
+    /// last updated: the most recent `lastUpdatedTime` of its resource associations of
+    /// that type that are on the attach path ([`association_is_attaching`]), or `None`
+    /// when it shares no such resource.
+    ///
+    /// Those associations are what derives that type's default managed permission onto
+    /// the share ([`Self::share_permissions`]), so they are also when the derived
+    /// association between the share and that permission last changed.
+    pub fn shared_resource_type_updated_at(
+        &self,
+        share_arn: &str,
+        resource_type: &str,
+    ) -> Option<i64> {
+        self.associations
+            .values()
+            .filter(|record| {
+                record.resource_share_arn == share_arn
+                    && record.association_type == ASSOCIATION_TYPE_RESOURCE
+                    && association_is_attaching(&record.status)
+                    && resource_type_of_arn(&record.associated_entity)
+                        .is_some_and(|shared| resource_type_matches(&shared, resource_type))
+            })
+            .map(|record| record.last_updated_time)
+            .max()
+    }
+
     /// The ARNs of the managed permissions that govern the resources of type
     /// `resource_type` in the share `share_arn`, in permission ARN order.
     ///
@@ -266,8 +307,9 @@ impl ComAmazonawsRamAmazonresourcesharingState {
         share_arn: &str,
         permission_arn: &str,
         replaced: &[String],
+        now: i64,
     ) -> bool {
-        let attachment = self.permission_attachment(permission_arn);
+        let attachment = self.permission_attachment(permission_arn, now);
         let Some(share) = self.live_share_mut(share_arn) else {
             return false;
         };
@@ -311,6 +353,7 @@ impl ComAmazonawsRamAmazonresourcesharingState {
                 Some(AttachedPermission {
                     permission,
                     version,
+                    last_updated_time: attachment.last_updated_time,
                 })
             })
             .collect();
@@ -331,6 +374,12 @@ impl ComAmazonawsRamAmazonresourcesharingState {
                     attached.push(AttachedPermission {
                         permission,
                         version,
+                        // Nothing attached this one by name: it follows from the
+                        // resources of that type the share shares, so what last updated
+                        // it is the sharing of those resources.
+                        last_updated_time: self
+                            .shared_resource_type_updated_at(arn, &resource_type)
+                            .unwrap_or(share.last_updated_time),
                     });
                 }
             }

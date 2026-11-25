@@ -392,7 +392,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|permission_arn| {
                 (
                     permission_arn.clone(),
-                    store.permission_attachment(permission_arn),
+                    store.permission_attachment(permission_arn, now),
                 )
             })
             .collect();
