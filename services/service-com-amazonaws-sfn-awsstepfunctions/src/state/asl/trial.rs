@@ -115,6 +115,7 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
                     "the state input is larger than the {MAX_PAYLOAD_BYTES} bytes a state's \
                      document may carry"
                 )),
+                ..Failure::default()
             },
         );
     }
@@ -652,17 +653,19 @@ impl Interpreter<'_> {
             "Wait" => {
                 self.wait_duration(state, language, effective, context, Duration::ZERO)
                     .map_err(|failure| Failure {
-                        error: failure.error,
                         // A diagnosis this module worded about the state's own
                         // expression already names the field it is written in, so it
                         // is carried exactly as raised — the rule the walk applies
                         // around every such diagnosis ([`diagnosed`]). Every other
                         // reason a `Wait`'s members could not be read names the state
                         // under test, which is the only name this trial has for it.
-                        cause: failure.cause.map(|why| match names_its_state(&why) {
-                            true => why,
-                            false => format!("{SINGLE_STATE_LABEL}: {why}"),
+                        cause: failure.cause.clone().map(|why| {
+                            match names_its_state(&why) {
+                                true => why,
+                                false => format!("{SINGLE_STATE_LABEL}: {why}"),
+                            }
                         }),
+                        ..failure
                     })?;
                 Ok(None)
             }
@@ -674,7 +677,11 @@ impl Interpreter<'_> {
                     self.fail_member(state, language, "Error", "ErrorPath", effective, context)?;
                 let cause =
                     self.fail_member(state, language, "Cause", "CausePath", effective, context)?;
-                Err(Failure { error, cause })
+                Err(Failure {
+                    error,
+                    cause,
+                    ..Failure::default()
+                })
             }
             // A `Task` state's own work is the integration call its `Resource` names,
             // and `TestState` "can test ... an Amazon Web Services service integration
@@ -839,7 +846,6 @@ impl Interpreter<'_> {
         mut inspection: Inspection,
     ) -> Trial {
         let state = test.state;
-        let name = failure.name().to_string();
         // Which `Retry` entry answers for this error, whether or not it still has an
         // attempt left: "the array index of the Retry which handled the exception" is
         // what the trial reports for a failure the state's own error handling took
@@ -848,7 +854,7 @@ impl Interpreter<'_> {
             .iter()
             .enumerate()
             .filter_map(|(index, retrier)| retrier.as_object().map(|retrier| (index, retrier)))
-            .find(|(_, retrier)| errors_match(retrier, &name));
+            .find(|(_, retrier)| failure.matched_by(retrier));
         let retry_index = Some(match retrier {
             Some((index, _)) => i32::try_from(index).unwrap_or(i32::MAX),
             None => NO_RETRIER_INDEX,
@@ -871,7 +877,7 @@ impl Interpreter<'_> {
             let Some(catcher) = catcher.as_object() else {
                 continue;
             };
-            if !errors_match(catcher, &name) {
+            if !failure.matched_by(catcher) {
                 continue;
             }
             let Some(next) = catcher.get("Next").and_then(Value::as_str) else {

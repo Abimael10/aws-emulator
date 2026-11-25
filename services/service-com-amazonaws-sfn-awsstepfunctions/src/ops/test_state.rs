@@ -404,6 +404,7 @@ fn read_mock(mock: &MockInput) -> Result<asl::Mock, TestStateError> {
         (None, Some(error_output)) => Ok(asl::Mock::Error(asl::Failure {
             error: error_output.error.clone(),
             cause: error_output.cause.clone(),
+            ..Default::default()
         })),
         (None, None) => Err(refuse(
             "a mock must name a result or an errorOutput".to_string(),

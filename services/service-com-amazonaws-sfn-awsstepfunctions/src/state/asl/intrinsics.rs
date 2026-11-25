@@ -123,10 +123,16 @@ fn argument_failure(
     context: &Value,
     failure: Failure,
 ) -> Failure {
-    let Some(why) = failure.cause else {
+    let Failure {
+        error,
+        cause,
+        also_answers,
+    } = failure;
+    let Some(why) = cause else {
         return Failure {
-            error: failure.error,
+            error,
             cause: None,
+            also_answers,
         };
     };
     if why.starts_with(INTRINSIC_OPENING)
@@ -134,8 +140,9 @@ fn argument_failure(
         || is_unnamed_producer(&why)
     {
         return Failure {
-            error: failure.error,
+            error,
             cause: Some(why),
+            also_answers,
         };
     }
     let path = argument.trim();
@@ -147,8 +154,9 @@ fn argument_failure(
         false => intrinsic_failure(invocation, &why),
     };
     Failure {
-        error: failure.error,
+        error,
         cause: Some(cause),
+        also_answers,
     }
 }
 

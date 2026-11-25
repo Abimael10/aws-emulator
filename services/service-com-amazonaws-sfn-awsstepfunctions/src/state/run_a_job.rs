@@ -192,6 +192,7 @@ async fn poll<Eng: Send + Sync + 'static>(
                 Some(Err(reason)) => Err(asl::Failure {
                     error: Some(integration::TASK_FAILED_ERROR.to_string()),
                     cause: Some(reason),
+                    ..Default::default()
                 }),
             },
             // The call that reports the job was refused, or could not be made at all:

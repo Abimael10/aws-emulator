@@ -525,8 +525,8 @@ fn choice_path_failure(failure: Failure, path: &str) -> Failure {
         return failure;
     }
     Failure {
-        error: failure.error,
         cause: Some(invalid_choice_condition_path(path)),
+        ..failure
     }
 }
 
@@ -701,8 +701,8 @@ fn diagnosed(name: &str, entered_at: i64, fault: Fault) -> Fault {
         Some(cause) => Fault {
             at: fault.at,
             failure: Failure {
-                error: failure.error,
                 cause: Some(cause),
+                ..failure
             },
         },
         None => Fault {
@@ -724,8 +724,8 @@ fn diagnosed(name: &str, entered_at: i64, fault: Fault) -> Fault {
 fn produced_by_state(name: &str, failure: Failure) -> Failure {
     match failure.cause.as_deref() {
         Some(cause) if is_unnamed_producer(cause) => Failure {
-            error: failure.error,
             cause: Some(result_too_large(name)),
+            ..failure
         },
         _ => failure,
     }
@@ -842,21 +842,29 @@ pub(super) fn intrinsic_path_not_found(path: &str, searched: &Value) -> String {
 /// the wrong type — names the state here, which is the only place a `Wait`'s own
 /// reading of its members knows it from.
 fn wait_failure(name: &str, failure: Failure) -> Failure {
-    let Some(why) = failure.cause else {
+    let Failure {
+        error,
+        cause,
+        also_answers,
+    } = failure;
+    let Some(why) = cause else {
         return Failure {
-            error: failure.error,
+            error,
             cause: None,
+            also_answers,
         };
     };
     if names_its_state(&why) {
         return Failure {
-            error: failure.error,
+            error,
             cause: Some(why),
+            also_answers,
         };
     }
     Failure {
-        error: failure.error,
+        error,
         cause: Some(format!("state '{name}': {why}")),
+        also_answers,
     }
 }
 
@@ -1686,10 +1694,19 @@ impl Context {
 
 /// Why an execution, a `Map` iteration or a `Parallel` branch failed: the `error` and
 /// `cause` the service reports, which `Catch` and `Retry` match against.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Failure {
     pub error: Option<String>,
     pub cause: Option<String>,
+    /// The error names this failure ALSO answers to, beside the one it is reported
+    /// under: empty for everything that answers to its reported name alone.
+    ///
+    /// A failure the language gives more than one name is matched by a retrier or a
+    /// catcher naming ANY of them ([`task_closure_errors`], which states both names of a
+    /// closure a heartbeat window made due), so the names travel with the failure rather
+    /// than with whichever handler happens to look at it: the state's `Retry` and its
+    /// `Catch` are then matched against the same set, wherever that failure was raised.
+    pub also_answers: &'static [&'static str],
 }
 
 impl Failure {
@@ -1701,6 +1718,26 @@ impl Failure {
     /// The error name `Retry`'s and `Catch`'s `ErrorEquals` match against.
     fn name(&self) -> &str {
         self.error.as_deref().unwrap_or("")
+    }
+
+    /// This failure, also answering to `names` beside the name it reports.
+    ///
+    /// What a reply or a call states about the closure it reports ([`CallbackReply`],
+    /// [`reported`]) is attached HERE, so every handler of the state the failure belongs
+    /// to — its retriers and its catchers alike — is matched against the same names.
+    pub(super) fn also_answering(mut self, names: &'static [&'static str]) -> Self {
+        self.also_answers = names;
+        self
+    }
+
+    /// Whether the retrier or catcher `entry` names this failure: its `ErrorEquals` holds
+    /// the name the failure is reported under, or any other name it answers to.
+    ///
+    /// The one question `Retry` and `Catch` ask of an entry, so neither answers for a
+    /// failure the other would not — and the ORDER the definition declares its entries in
+    /// is the order they are asked in, the first that names the failure taking it over.
+    fn matched_by(&self, entry: &Map<String, Value>) -> bool {
+        errors_match(entry, self.name()) || errors_match_any(entry, self.also_answers)
     }
 
     /// The `{Error, Cause}` document a `Catch` hands to the state it transitions to.
@@ -1761,6 +1798,7 @@ fn named(error: &str, cause: String) -> Failure {
     Failure {
         error: Some(error.to_string()),
         cause: Some(cause),
+        ..Failure::default()
     }
 }
 
@@ -1782,6 +1820,7 @@ pub fn timed_out() -> Failure {
     Failure {
         error: Some(TIMEOUT_ERROR.to_string()),
         cause: None,
+        ..Failure::default()
     }
 }
 
@@ -1801,9 +1840,18 @@ pub(super) fn reported(failed: super::integration::Failed) -> Failure {
     if failed.error == TIMEOUT_ERROR {
         return timed_out();
     }
+    // A HEARTBEAT window that lapsed while the call was in flight is the same closure of
+    // the task's own clock, REPORTED under the same one name every bound that ran out is
+    // ("this state fails with a States.Timeout error name") — and it answers to the other
+    // name the language states for it as well ([`task_closure_errors`]), so the state's
+    // retriers and catchers naming either take it over.
+    if failed.error == HEARTBEAT_TIMEOUT_ERROR {
+        return timed_out().also_answering(task_closure_errors(true));
+    }
     Failure {
         error: Some(failed.error),
         cause: Some(failed.cause),
+        ..Failure::default()
     }
 }
 
@@ -3762,7 +3810,6 @@ impl Interpreter<'_> {
                 &raw,
                 &effective,
                 failure,
-                walk::NO_OTHER_ERRORS,
                 context,
                 end,
             ),
@@ -4324,19 +4371,20 @@ pub(super) fn errors_match_any(entry: &Map<String, Value>, errors: &[&str]) -> b
 /// any known error name except States.Timeout" — so a retrier naming it takes over the
 /// failure a task's own work reported, whatever that work named it, which is how a
 /// definition retries a service call or a function that failed without naming the
-/// service's error itself.
+/// service's error itself. The closure of a task's own clock is the one thing it does not
+/// take over, under EITHER of the names the language states for that closure
+/// ([`task_closure_errors`]): a heartbeat window that lapsed is a `States.Timeout` too.
 fn errors_match(entry: &Map<String, Value>, error: &str) -> bool {
     if error == RUNTIME_ERROR {
         return false;
     }
+    let timeout = error == TIMEOUT_ERROR || error == HEARTBEAT_TIMEOUT_ERROR;
     entry
         .get("ErrorEquals")
         .and_then(Value::as_array)
         .is_some_and(|names| {
             names.iter().filter_map(Value::as_str).any(|name| {
-                name == error
-                    || name == ALL_ERRORS
-                    || (name == TASK_FAILED_ERROR && error != TIMEOUT_ERROR)
+                name == error || name == ALL_ERRORS || (name == TASK_FAILED_ERROR && !timeout)
             })
         })
 }
@@ -4682,7 +4730,7 @@ impl Trial {
     /// raised with no producer named ([`UNNAMED_PRODUCER`]) names the state under test
     /// here, exactly as an execution's own state names itself in it ([`diagnosed`]).
     fn failed(inspection: Inspection, failure: Failure) -> Self {
-        let Failure { error, cause } = produced_by_state(SINGLE_STATE_LABEL, failure);
+        let Failure { error, cause, .. } = produced_by_state(SINGLE_STATE_LABEL, failure);
         Self {
             status: TEST_STATUS_FAILED,
             output: None,

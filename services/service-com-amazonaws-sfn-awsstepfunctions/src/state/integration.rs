@@ -3114,9 +3114,16 @@ fn timed_out(call: &Call, waited: Duration) -> Failed {
 /// "If more time than the specified seconds elapses between heartbeats from the task, this
 /// state fails with a States.Timeout error name" — so the window bounds the IDLE span
 /// between two heartbeats, and only a window nothing moved on reaches here.
+///
+/// It is named by the HEARTBEAT name of that closure, which is the name the language
+/// states for this bound alone: the conversion into what the state reports
+/// ([`super::asl::reported`]) is where the closure takes the one name every bound that ran
+/// out is reported under, and where the other name it answers to is attached — so a
+/// catcher or a retrier naming either takes it over, and nothing has to tell a heartbeat
+/// window's lapse from a `TimeoutSeconds`' by its cause.
 fn stopped_heartbeating(call: &Call, window: Duration) -> Failed {
     Failed {
-        error: super::asl::TIMEOUT_ERROR.to_string(),
+        error: super::asl::HEARTBEAT_TIMEOUT_ERROR.to_string(),
         cause: format!(
             "the task token {} carries went {window:?} without a heartbeat",
             call.described()

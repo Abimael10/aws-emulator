@@ -252,6 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let reported = crate::state::asl::Failure {
                 error: input.error.clone(),
                 cause: input.cause.clone(),
+                ..Default::default()
             };
             match store.answer_callback_handover(&input.task_token, Err(reported)) {
                 crate::state::CallbackHandoverReply::Recorded => {
@@ -453,6 +454,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     outcome: Err(crate::state::asl::Failure {
                         error: input.error.clone(),
                         cause: input.cause.clone(),
+                        ..Default::default()
                     }),
                     // A failure a caller NAMED: the task was answered rather than closed
                     // by its own clock, and it answers to that one name — the second name

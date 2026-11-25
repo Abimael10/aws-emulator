@@ -798,7 +798,12 @@ impl Interpreter<'_> {
                 let cause = self
                     .fail_member(state, language, "Cause", "CausePath", &effective, &context)
                     .map_err(|failure| failure.at(at))?;
-                Err(Failure { error, cause }.at(at))
+                Err(Failure {
+                    error,
+                    cause,
+                    ..Failure::default()
+                }
+                .at(at))
             }
             "Map" => self.map_state(name, state, language, raw, effective, &context, at),
             "Task" => self.task_state(name, state, language, raw, effective, &context, at, entered),
@@ -1446,11 +1451,19 @@ impl Interpreter<'_> {
             _ => None,
         };
         let answered = succeeded
-            .map(|reply| (Ok(reply.result), NO_OTHER_ERRORS, false))
+            .map(|reply| (Ok(reply.result), false))
             .or_else(|| {
-                closed.map(|reply| (reply.outcome, reply.also_answers, reply.by_the_clock))
+                closed.map(|reply| {
+                    // The names the closure this reply reports answers to travel with the
+                    // failure itself, so the state's retriers and its catchers are matched
+                    // against the same set ([`Failure::also_answering`]).
+                    let outcome = reply
+                        .outcome
+                        .map_err(|failure| failure.also_answering(reply.also_answers));
+                    (outcome, reply.by_the_clock)
+                })
             });
-        if let Some((outcome, also_answers, by_the_clock)) = answered {
+        if let Some((outcome, by_the_clock)) = answered {
             self.resumed = Some(Resumed {
                 index: self.steps.len(),
                 at,
@@ -1479,7 +1492,6 @@ impl Interpreter<'_> {
                         raw,
                         &effective,
                         failure,
-                        also_answers,
                         context,
                         at,
                     );
@@ -1624,7 +1636,6 @@ impl Interpreter<'_> {
             raw,
             effective,
             failure,
-            NO_OTHER_ERRORS,
             context,
             at,
         )
@@ -2020,7 +2031,6 @@ impl Interpreter<'_> {
                     raw,
                     effective,
                     failure,
-                    NO_OTHER_ERRORS,
                     context,
                     at,
                 )
@@ -2712,7 +2722,16 @@ impl Interpreter<'_> {
                     index: me.steps.len(),
                     at,
                 });
-                return (me.answered_callback(name, &work, at, reply.outcome), at);
+                // The names the closure this reply reports answers to beside the one it
+                // is reported under travel with the failure, so this state's `Retry` and
+                // its `Catch` are matched against the same set — which is what makes a
+                // heartbeat window that lapsed reach a retrier or a catcher naming
+                // `States.HeartbeatTimeout` as well as one naming `States.Timeout`
+                // ([`super::task_closure_errors`]).
+                let outcome = reply
+                    .outcome
+                    .map_err(|failure| failure.also_answering(reply.also_answers));
+                return (me.answered_callback(name, &work, at, outcome), at);
             }
             // A branch of the enclosing `Parallel` state has already failed, so this
             // state's work was stopped in flight: the call is NOT made, nothing is
@@ -2875,6 +2894,7 @@ impl Interpreter<'_> {
                          made of, so nothing was run for it",
                         MAX_CALL_WAIT_DURATION.as_secs()
                     )),
+                    ..Failure::default()
                 };
                 me.push_task_failure(name, &work, &failure, at);
                 return (Err(failure), at);
@@ -2987,6 +3007,7 @@ impl Interpreter<'_> {
                             Some(Err(cause)) => Err(Failure {
                                 error: Some(TASK_FAILED_ERROR.to_string()),
                                 cause: Some(cause),
+                                ..Failure::default()
                             }),
                             // The answer carries no status of the run at all, so
                             // nothing is known about what the child did: the task
@@ -3197,7 +3218,6 @@ impl Interpreter<'_> {
                 &raw,
                 &effective,
                 failure,
-                NO_OTHER_ERRORS,
                 context,
                 end,
             ),
@@ -3392,7 +3412,6 @@ impl Interpreter<'_> {
                     &raw,
                     &effective,
                     failure,
-                    NO_OTHER_ERRORS,
                     context,
                     at,
                 );
@@ -3583,7 +3602,6 @@ impl Interpreter<'_> {
                 &raw,
                 &effective,
                 failure,
-                NO_OTHER_ERRORS,
                 context,
                 end,
             ),
@@ -4112,6 +4130,12 @@ impl Interpreter<'_> {
     /// Run `work`, re-running it while one of the state's `Retry` retriers matches
     /// what it failed with and has attempts left.
     ///
+    /// The retriers are scanned in the order the array declares them and the first one
+    /// that names the failure decides, by the name the failure is reported under or by any
+    /// other name it answers to ([`Failure::also_answers`]) — the one matching every
+    /// `Catch` catcher is asked ([`Interpreter::catch_or_fail`]), so neither half of a
+    /// state's error handling answers for a failure the other would not.
+    ///
     /// The work is really RE-RUN, and the interval each retrier declares really
     /// lengthens the run, so a definition that retries reports an outcome that came
     /// due later than one that does not. The attempt the work is on is what the
@@ -4174,7 +4198,7 @@ impl Interpreter<'_> {
                 let Some(retrier) = retrier.as_object() else {
                     continue;
                 };
-                if !errors_match(retrier, failure.name()) {
+                if !failure.matched_by(retrier) {
                     continue;
                 }
                 let max_attempts = retrier
@@ -4230,11 +4254,11 @@ impl Interpreter<'_> {
     /// `left` is the event the state records when a catcher takes over, so a caught
     /// state's history pairs the event it was entered with.
     ///
-    /// `also_answers` is the error names this failure answers to beside the one it
-    /// carries ([`super::task_closure_errors`]), so a closure the language gives two
-    /// names is taken over by a catcher naming either — and, because the catchers are
-    /// scanned in the order the array declares them, by the FIRST catcher that names one
-    /// of them.
+    /// The catchers are scanned in the order the array declares them and the FIRST one
+    /// that names the failure takes it over — by the name the failure is reported under
+    /// or by any other name it answers to ([`Failure::also_answers`], which is how a
+    /// closure the language gives two names reaches a catcher naming either), never by
+    /// how specifically a catcher names it.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn catch_or_fail(
         &mut self,
@@ -4244,7 +4268,6 @@ impl Interpreter<'_> {
         raw: &Value,
         effective: &Value,
         failure: Failure,
-        also_answers: &[&str],
         context: &Value,
         at: Duration,
     ) -> Result<StateStep, Fault> {
@@ -4263,9 +4286,7 @@ impl Interpreter<'_> {
             let Some(catcher) = catcher.as_object() else {
                 continue;
             };
-            if !errors_match(catcher, failure.name())
-                && !errors_match_any(catcher, also_answers)
-            {
+            if !failure.matched_by(catcher) {
                 continue;
             }
             let Some(next) = catcher.get("Next").and_then(Value::as_str) else {
@@ -4334,11 +4355,17 @@ impl Interpreter<'_> {
             ),
             (None, Some(Value::String(path))) => (
                 path_member.clone(),
-                expression(path, input, context).map_err(|failure| Failure {
-                    error: failure.error,
-                    cause: failure
-                        .cause
-                        .map(|why| member_path_diagnosis(&path_member, path, why)),
+                expression(path, input, context).map_err(|failure| {
+                    let Failure {
+                        error,
+                        cause,
+                        also_answers,
+                    } = failure;
+                    Failure {
+                        error,
+                        cause: cause.map(|why| member_path_diagnosis(&path_member, path, why)),
+                        also_answers,
+                    }
                 })?,
             ),
             (None, Some(other)) => {
@@ -4385,10 +4412,6 @@ fn member_path_value(
 fn is_whole_number(value: &Value) -> bool {
     value.is_i64() || value.is_u64()
 }
-
-/// The error names a reply reports BESIDE the one its failure carries, for an outcome
-/// that answers to that one name alone: everything a caller reported.
-pub(super) const NO_OTHER_ERRORS: &[&str] = &[];
 
 /// What a task fails with when the turn that had already STARTED a call reached another
 /// one instead ([`Interpreter::perform_call`]).
