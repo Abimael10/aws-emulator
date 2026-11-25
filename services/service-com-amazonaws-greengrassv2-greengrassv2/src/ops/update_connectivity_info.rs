@@ -161,16 +161,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The list the request carries is the core device's connectivity information, so
         // storing it REPLACES what that device had published and mints the version token
-        // this response names — the token a client compares to detect a concurrent
+        // this response names — the instant the list was stored, which is the token a client
+        // compares to tell which published list it is looking at and to detect a concurrent
         // overwrite. A body this surface cannot read as connectivity information is refused
         // in the legacy envelope, and nothing is written.
         let endpoints = input.connectivity_info.len();
-        let version = match state
-            .lock()
-            .publish_connectivity_info(&input.thing_name, input.connectivity_info)
-        {
+        let stored_at = ::std::time::SystemTime::now();
+        let version = match state.lock().publish_connectivity_info(
+            &input.thing_name,
+            input.connectivity_info,
+            stored_at,
+        ) {
             Ok(version) => version,
-            Err(st::ConnectivityInfoRefusal::Unparsable) => {
+            Err(st::ConnectivityInfoRefusal::UnparsableList) => {
+                // Nothing this surface could read as the endpoint list arrived under the
+                // `@required` parameter, so the refusal names that parameter.
+                return Err(st::LegacyRefusal::bad_request(
+                    st::unparsable_parameter_message(st::CONNECTIVITY_INFO_PARAMETER),
+                )
+                .into())
+            }
+            Err(st::ConnectivityInfoRefusal::UnreadableEntries) => {
+                // The list WAS read, and what it carries is not connectivity information:
+                // a different class, which this surface words about the body itself.
                 return Err(
                     st::LegacyRefusal::bad_request(st::UNREADABLE_REQUEST_BODY_MESSAGE).into(),
                 )

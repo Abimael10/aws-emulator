@@ -659,11 +659,13 @@ fn connectivity_info_path(thing_name: &str) -> String {
 
 /// The sentences the legacy surface words its own refusals with, written here as the
 /// literals AWS answers rather than read from the implementation's constants, so a wording
-/// that drifts away from AWS fails this suite. Each is entirely fixed text except the
-/// connectivity-information report, whose one variable part is the core device the request
-/// named.
+/// that drifts away from AWS fails this suite. Each is fixed text except for one variable
+/// part: the core device the request named, in the connectivity-information report, and the
+/// parameter nothing readable arrived under, in the unparsable-parameter refusal.
 const NO_SERVICE_ROLE_MESSAGE: &str = "You need to attach an IAM role to this AWS account.";
 const INVALID_ROLE_ARN_MESSAGE: &str = "That role ARN is invalid.";
+const UNPARSABLE_LIST_MESSAGE: &str =
+    "The following required parameter(s) are unparsable: connectivityInfoList.";
 const UNREADABLE_BODY_MESSAGE: &str = "Invalid json format found in the request body.";
 fn no_connectivity_info_message(thing_name: &str) -> String {
     format!("No connectivity info found for thing {thing_name}.")
@@ -750,15 +752,21 @@ fn legacy_refusals() -> Vec<LegacyRefusal> {
             message: no_connectivity_info_message(&thing_name),
         });
     }
-    for (case, entries) in [
-        ("a list naming no endpoint at all", json!([])),
+    for (case, entries, sentence) in [
+        (
+            "a parameter carrying no entry at all",
+            json!([]),
+            UNPARSABLE_LIST_MESSAGE,
+        ),
         (
             "an entry carrying no address",
             json!([{ "Id": "no-address", "PortNumber": 8_883 }]),
+            UNREADABLE_BODY_MESSAGE,
         ),
         (
             "an entry carrying nothing at all",
             json!([{}]),
+            UNREADABLE_BODY_MESSAGE,
         ),
     ] {
         rows.push(LegacyRefusal {
@@ -767,7 +775,7 @@ fn legacy_refusals() -> Vec<LegacyRefusal> {
             path: connectivity_info_path("laser-1"),
             body: document(&json!({ "ConnectivityInfo": entries })),
             status: 400,
-            message: UNREADABLE_BODY_MESSAGE.to_string(),
+            message: sentence.to_string(),
         });
     }
     rows

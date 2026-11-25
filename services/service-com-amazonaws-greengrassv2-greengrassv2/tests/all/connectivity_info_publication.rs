@@ -6,17 +6,24 @@
 //! The rules under test:
 //!
 //! * `UpdateConnectivityInfo` REPLACES the endpoint list the named core device had
-//!   published and answers the version token minted for the stored list — a fresh token
-//!   per write, so a client can tell one write's list from another's;//! * `GetConnectivityInfo` reports exactly the endpoints the last write stored for that
+//!   published and answers the version token minted for the stored list — the INSTANT the
+//!   list was stored, rendered as an ISO-8601 UTC date-time with a three-digit millisecond
+//!   field, drawn from a sequence that never repeats and never runs backwards, so a client
+//!   can read a token as the time its list was published and compare two tokens to tell
+//!   which of the two lists is the newer one;
+//! * `GetConnectivityInfo` reports exactly the endpoints the last write stored for that
 //!   thing name, in the order they were written and with every member each entry carried,
 //!   and reports a thing name nothing has been published for in the legacy surface's
 //!   not-found envelope (HTTP 404 with the sentence in a `Message` body member naming that
 //!   core device) rather than as a success carrying an empty list;
 //! * each core device's record is its own: writing one thing name's endpoints changes no
 //!   other thing name's; and
-//! * a body this surface cannot read as connectivity information — a list with an entry
-//!   that names no endpoint — is refused in the legacy envelope (HTTP 400 with the sentence
-//!   in a `Message` body member) and nothing is stored.
+//! * a request this surface cannot take as connectivity information is refused in the
+//!   legacy envelope (HTTP 400 with the sentence in a `Message` body member) and stores
+//!   nothing, in whichever of the two classes it belongs to: a `@required` endpoint-list
+//!   parameter nothing readable as that list arrived under is refused by NAMING the
+//!   parameter, while a list that was read and carries an entry naming no endpoint is
+//!   refused about the request body.
 //!
 //! Every assertion drives the real `restJson1` front door: the request is built the way an
 //! SDK builds it, dispatched through [`MultiServiceRouter`], and judged on the HTTP status
@@ -30,7 +37,10 @@
 //! about.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use aws_smithy_types::date_time::Format;
+use aws_smithy_types::DateTime;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_greengrassv2_greengrassv2::EmulatedService;
@@ -39,10 +49,21 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The region these requests are signed for.
 pub(crate) const REGION: &str = "us-west-2";
 
-/// The status and sentence this surface refuses a body it cannot read as connectivity
-/// information with — written here as the literals AWS answers rather than read from the
-/// implementation's constants, so a wording that drifts away from AWS fails this suite.
+/// The status this surface refuses a request it cannot take as connectivity information at,
+/// and the sentence each of the two refusal classes carries — written here as the literals
+/// AWS answers rather than read from the implementation's constants, so a wording that
+/// drifts away from AWS fails this suite.
+///
+/// The classes are worded differently because AWS words them differently: a request under
+/// whose `@required` endpoint-list parameter nothing readable as that list arrived is
+/// refused by NAMING the parameter — the service's own name for a list-valued member is the
+/// list shape it targets
+/// (`smithy_query(query="operation",operation="UpdateConnectivityInfo")`: `connectivityInfo`
+/// targets `connectivityInfoList`) — while a list that WAS read and carries an entry naming
+/// no endpoint is refused about the request body, naming nothing of it.
 const UNREADABLE_STATUS: u16 = 400;
+pub(crate) const UNPARSABLE_LIST_MESSAGE: &str =
+    "The following required parameter(s) are unparsable: connectivityInfoList.";
 pub(crate) const UNREADABLE_BODY_MESSAGE: &str = "Invalid json format found in the request body.";
 
 /// The status this surface reports a core device that has published no connectivity
@@ -373,47 +394,66 @@ async fn a_list_that_is_not_connectivity_info_is_refused_and_stores_nothing() {
     let router = emulator();
     let thing_name = "laser-1";
 
-    // (case, the list the write carries)
+    // (case, the list the write carries, the sentence it is refused with)
     //
-    // Connectivity information is a list of ENDPOINTS, so a list that names none — and an
-    // entry that leaves one of the three things an endpoint is named by unnamed — names no
-    // endpoint: the rows span the ways that happens — the empty list, each of the three
-    // absent in turn, each blank or zero where the wire cannot tell that from absent, and
-    // one such entry among readable ones, which refuses the whole list.
-    let rows: Vec<(&str, Value)> = vec![
-        ("a list naming no endpoint at all", json!([])),
+    // Connectivity information is a list of ENDPOINTS, so a parameter that carries no entry
+    // — and an entry that leaves one of the three things an endpoint is named by unnamed —
+    // is not connectivity information: the rows span the ways that happens, and span BOTH
+    // sentences, since nothing arriving under the parameter is the class AWS names the
+    // parameter for while a list it read and cannot take is the class it words about the
+    // body. The entry rows cover each of the three members absent in turn, each blank or
+    // zero where the wire cannot tell that from absent, and one such entry among readable
+    // ones, which refuses the whole list.
+    let rows: Vec<(&str, Value, &str)> = vec![
+        (
+            "a parameter carrying no entry at all",
+            json!([]),
+            UNPARSABLE_LIST_MESSAGE,
+        ),
         (
             "an entry carrying no address",
             json!([{ "Id": "no-address", "PortNumber": 8_883 }]),
+            UNREADABLE_BODY_MESSAGE,
         ),
         (
             "an entry carrying no id",
             json!([{ "HostAddress": "10.0.0.1", "PortNumber": 8_883 }]),
+            UNREADABLE_BODY_MESSAGE,
         ),
         (
             "an entry carrying no port",
             json!([{ "Id": "no-port", "HostAddress": "10.0.0.1" }]),
+            UNREADABLE_BODY_MESSAGE,
         ),
         (
             "an entry carrying only a port",
             json!([{ "PortNumber": 8_883 }]),
+            UNREADABLE_BODY_MESSAGE,
         ),
-        ("an entry carrying nothing at all", json!([{}])),
+        (
+            "an entry carrying nothing at all",
+            json!([{}]),
+            UNREADABLE_BODY_MESSAGE,
+        ),
         (
             "an entry carrying an empty address",
             json!([{ "Id": "empty", "HostAddress": "", "PortNumber": 8_883 }]),
+            UNREADABLE_BODY_MESSAGE,
         ),
         (
             "an entry carrying a blank address",
             json!([{ "Id": "blank", "HostAddress": "   ", "PortNumber": 8_883 }]),
+            UNREADABLE_BODY_MESSAGE,
         ),
         (
             "an entry carrying a blank id",
             json!([{ "Id": " ", "HostAddress": "10.0.0.1", "PortNumber": 8_883 }]),
+            UNREADABLE_BODY_MESSAGE,
         ),
         (
             "an entry naming the port the default makes indistinguishable from none",
             json!([{ "Id": "zero-port", "HostAddress": "10.0.0.1", "PortNumber": PORT_MIN }]),
+            UNREADABLE_BODY_MESSAGE,
         ),
         (
             "one unreadable entry among readable ones",
@@ -421,17 +461,18 @@ async fn a_list_that_is_not_connectivity_info_is_refused_and_stores_nothing() {
                 { "Id": "good", "HostAddress": "10.0.0.1", "PortNumber": 8_883 },
                 { "Id": "bad", "PortNumber": 8_884 },
             ]),
+            UNREADABLE_BODY_MESSAGE,
         ),
     ];
 
     // Nothing is published yet, so a refused write must leave this core device with no
     // endpoints: the refusal is decided on the request, before anything is stored.
-    for (case, entries) in &rows {
+    for (case, entries, sentence) in &rows {
         let (status, refused) = publish(&router, thing_name, entries).await;
         assert_eq!(
             (status, text(&refused, "Message").as_str()),
-            (UNREADABLE_STATUS, UNREADABLE_BODY_MESSAGE),
-            "case {case:?}: expected the unreadable-body refusal, got {status} {refused}"
+            (UNREADABLE_STATUS, *sentence),
+            "case {case:?}: expected the refusal {sentence:?}, got {status} {refused}"
         );
         assert_no_connectivity_info(
             &router,
@@ -445,12 +486,12 @@ async fn a_list_that_is_not_connectivity_info_is_refused_and_stores_nothing() {
     // refusal replaces nothing.
     let held = json!([{ "Id": "held", "HostAddress": "10.0.9.9", "PortNumber": 8_883 }]);
     let version = published_version(&router, "a published list", thing_name, &held).await;
-    for (case, entries) in &rows {
+    for (case, entries, sentence) in &rows {
         let (status, refused) = publish(&router, thing_name, entries).await;
         assert_eq!(
             (status, text(&refused, "Message").as_str()),
-            (UNREADABLE_STATUS, UNREADABLE_BODY_MESSAGE),
-            "case {case:?} over a published list: expected the unreadable-body refusal, \
+            (UNREADABLE_STATUS, *sentence),
+            "case {case:?} over a published list: expected the refusal {sentence:?}, \
              got {status} {refused}"
         );
         let (status, got) = read(&router, thing_name).await;
@@ -468,6 +509,168 @@ async fn a_list_that_is_not_connectivity_info_is_refused_and_stores_nothing() {
         again, version,
         "an accepted write mints a fresh version token, got {again:?} twice"
     );
+}
+
+/// The layout a connectivity-information version token carries, written as a mask: a `0`
+/// stands for one decimal digit and every other character stands for itself. It is the
+/// ISO-8601 UTC date-time with a three-digit millisecond field — the form a client parses a
+/// token with and orders two tokens by, and the one AWS answers a successful write with.
+const VERSION_TOKEN_LAYOUT: &str = "0000-00-00T00:00:00.000Z";
+
+/// The current instant in epoch milliseconds, the resolution a version token carries.
+fn now_millis() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX)
+}
+
+/// Assert that `token` is a version token of the form [`VERSION_TOKEN_LAYOUT`] and answer
+/// the instant it names, in epoch milliseconds.
+///
+/// The form is checked character by character BEFORE the instant is read, so a token that
+/// merely happens to parse — an opaque identifier, a local time, a trimmed subsecond field
+/// — fails here: a client that reads a token as a published-at time needs the layout, not
+/// only something a lenient parser accepts.
+fn version_token_millis(case: &str, token: &str) -> i64 {
+    assert_eq!(
+        token.chars().count(),
+        VERSION_TOKEN_LAYOUT.chars().count(),
+        "case {case:?}: expected a version token of the form {VERSION_TOKEN_LAYOUT:?}, \
+         got {token:?}"
+    );
+    for (index, (mask, got)) in VERSION_TOKEN_LAYOUT.chars().zip(token.chars()).enumerate() {
+        let matches = if mask == '0' {
+            got.is_ascii_digit()
+        } else {
+            got == mask
+        };
+        assert!(
+            matches,
+            "case {case:?}: expected a version token of the form \
+             {VERSION_TOKEN_LAYOUT:?}, which has {mask:?} at index {index}, got {got:?} \
+             there in {token:?}"
+        );
+    }
+    let parsed = DateTime::from_str(token, Format::DateTime).unwrap_or_else(|error| {
+        panic!("case {case:?}: expected an instant, got {token:?} ({error})")
+    });
+    parsed
+        .secs()
+        .saturating_mul(1_000)
+        .saturating_add(i64::from(parsed.subsec_nanos() / 1_000_000))
+}
+
+#[tokio::test]
+async fn a_write_answers_the_instant_it_stored_the_list_at_as_its_version_token() {
+    let router = emulator();
+
+    // (case, thing name, the list published): the rows span what the rule generalises
+    // over — which core device publishes, how many endpoints the list carries and which
+    // members each entry carries — because the token a write answers has the same form and
+    // the same ordering whatever was published and whoever published it.
+    let mut rows: Vec<(String, String, Value)> = Vec::new();
+    for (case, entries) in endpoint_rows() {
+        rows.push((
+            format!("{case}, republished over the last list"),
+            "laser-1".to_string(),
+            entries,
+        ));
+    }
+    for (index, (case, thing_name)) in thing_name_rows().into_iter().enumerate() {
+        rows.push((
+            case.to_string(),
+            thing_name,
+            json!([{
+                "Id": format!("endpoint-{index}"),
+                "HostAddress": format!("10.0.{index}.1"),
+                "PortNumber": 8_883,
+            }]),
+        ));
+    }
+
+    let mut earlier: Option<(String, i64)> = None;
+    for (index, (case, thing_name, entries)) in rows.iter().enumerate() {
+        // The window the call was made in, read from the same clock the store stamps the
+        // record from: a token outside it is not the instant the list was stored.
+        let opened = now_millis();
+        let token = published_version(&router, case, thing_name, entries).await;
+        let closed = now_millis();
+
+        let millis = version_token_millis(case, &token);
+        // The sequence the token is drawn from never repeats, so writes the clock cannot
+        // tell apart are each pushed on by a millisecond: every write already made in this
+        // test can have pushed the sequence that far past the clock reading, and no
+        // further.
+        let pushed_on = i64::try_from(index).unwrap_or(i64::MAX);
+        assert!(
+            (opened..=closed.saturating_add(pushed_on)).contains(&millis),
+            "case {case:?}: expected the instant the list was stored, in \
+             [{opened}, {closed}] (+{pushed_on} for the writes before it), got {token:?} \
+             ({millis})"
+        );
+
+        if let Some((before, before_millis)) = &earlier {
+            assert!(
+                millis > *before_millis,
+                "case {case:?}: expected a token after the previous write's {before:?} \
+                 ({before_millis}), got {token:?} ({millis})"
+            );
+            // And ordered as TEXT too, which is how a client holding two tokens compares
+            // them: the field widths are fixed, so text order is time order.
+            assert!(
+                token.as_str() > before.as_str(),
+                "case {case:?}: expected a token sorting after the previous write's \
+                 {before:?}, got {token:?}"
+            );
+        }
+        earlier = Some((token, millis));
+    }
+}
+
+#[tokio::test]
+async fn a_burst_of_writes_for_one_core_device_answers_strictly_advancing_tokens() {
+    let router = emulator();
+    let thing_name = "laser-1";
+
+    // Written back to back with nothing between them, so several of these writes land
+    // inside one clock millisecond: the rule is still that the token of a later write
+    // names a later instant than the token of an earlier one, so a client comparing two
+    // tokens never sees the newer list as the older one.
+    let mut tokens: Vec<(String, i64)> = Vec::new();
+    for write in 1..=25 {
+        let case = format!("write {write} of a back-to-back burst");
+        let entries = json!([{
+            "Id": format!("endpoint-{write}"),
+            "HostAddress": "10.0.0.1",
+            "PortNumber": 8_883,
+        }]);
+        let token = published_version(&router, &case, thing_name, &entries).await;
+        let millis = version_token_millis(&case, &token);
+        if let Some((before, before_millis)) = tokens.last() {
+            assert!(
+                millis > *before_millis && token.as_str() > before.as_str(),
+                "case {case:?}: expected a token strictly after {before:?} \
+                 ({before_millis}), got {token:?} ({millis})"
+            );
+        }
+        tokens.push((token, millis));
+    }
+
+    // Nothing in the burst repeated a token, which is what makes a token name ONE
+    // published list.
+    for (index, (token, _)) in tokens.iter().enumerate() {
+        assert_eq!(
+            tokens.iter().filter(|(other, _)| other == token).count(),
+            1,
+            "case \"write {} of a back-to-back burst\": expected a token no other write \
+             answered, got {token:?} among {tokens:?}",
+            index + 1
+        );
+    }
 }
 
 #[tokio::test]

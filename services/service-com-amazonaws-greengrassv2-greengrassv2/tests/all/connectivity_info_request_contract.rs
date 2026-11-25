@@ -33,7 +33,8 @@ use smithy_server_runtime::MultiServiceRouter;
 // The harness and the one refusal sentence this surface words itself, from the sibling
 // suite that owns them, so the two suites cannot drift apart in how they address the route.
 use crate::connectivity_info_publication::{
-    call, emulator, published_version, read, reported, text, UNREADABLE_BODY_MESSAGE,
+    call, emulator, published_version, read, reported, text, UNPARSABLE_LIST_MESSAGE,
+    UNREADABLE_BODY_MESSAGE,
 };
 
 /// The status a request this surface cannot read is refused at: a client error the caller
@@ -136,12 +137,14 @@ async fn a_body_that_names_no_connectivity_info_is_refused_and_publishes_nothing
             "case {case:?}: expected the modelled {VALIDATION_CODE} for a member the \
              request never named, got {refused}"
         );
-        assert_ne!(
-            text(&refused, "Message"),
-            UNREADABLE_BODY_MESSAGE,
-            "case {case:?}: expected the missing-member refusal, got the unreadable-body \
-             refusal {refused}"
-        );
+        for worded_itself in [UNPARSABLE_LIST_MESSAGE, UNREADABLE_BODY_MESSAGE] {
+            assert_ne!(
+                text(&refused, "Message"),
+                worded_itself,
+                "case {case:?}: expected the missing-member refusal, got the refusal this \
+                 surface words for a member it read, {refused}"
+            );
+        }
         let (status, got) = read(&router, thing_name).await;
         assert_eq!(
             (status, reported(&got)),

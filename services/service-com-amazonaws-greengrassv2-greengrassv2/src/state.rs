@@ -469,6 +469,11 @@ pub struct ComAmazonawsGreengrassv2Greengrassv2State {
     /// Bounded by [`MAX_CONNECTIVITY_INFO_THINGS`] names, each record by
     /// [`MAX_CONNECTIVITY_INFO_ENTRIES`] endpoints.
     pub connectivity_info: BTreeMap<String, ConnectivityInfoRecord>,
+    /// The epoch milliseconds of the last connectivity-information version token this
+    /// store minted, so the next one never repeats it and never precedes it — see
+    /// [`ComAmazonawsGreengrassv2Greengrassv2State::publish_connectivity_info`]. One
+    /// integer, so it needs no count bound.
+    pub connectivity_info_version_millis: i64,
 }
 
 impl ComAmazonawsGreengrassv2Greengrassv2State {
@@ -1125,11 +1130,7 @@ pub fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 
 /// A `SystemTime` as the `Timestamp` the wire carries.
 pub fn to_datetime(instant: SystemTime) -> ::aws_smithy_types::DateTime {
-    let millis = instant
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    ::aws_smithy_types::DateTime::from_millis(i64::try_from(millis).unwrap_or(i64::MAX))
+    ::aws_smithy_types::DateTime::from_millis(epoch_millis(instant))
 }
 
 /// A `SystemTime` as the instant a STRING timestamp member reports.
@@ -1154,6 +1155,39 @@ pub fn epoch_seconds(instant: SystemTime) -> i64 {
         .unwrap_or_default()
         .as_secs();
     i64::try_from(seconds).unwrap_or(i64::MAX)
+}
+
+/// A `SystemTime` in epoch MILLISECONDS: the resolution of every instant this service
+/// reports, both the `Timestamp` members the wire renders and the instant-valued STRING
+/// members a handler renders itself, so one instant yields one value whichever member
+/// carries it.
+///
+/// It SATURATES at the representable bound rather than failing: the bound is this store's
+/// and not the API's, and an instant that does not fit stays present and in time order.
+pub fn epoch_millis(instant: SystemTime) -> i64 {
+    let millis = instant
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    i64::try_from(millis).unwrap_or(i64::MAX)
+}
+
+/// An epoch-millisecond instant as the instant a STRING member of MILLISECOND resolution
+/// reports: the RFC 3339 instant in UTC an AWS `restJson1` timestamp carries, with a
+/// three-digit millisecond field (`1970-01-01T00:00:00.000Z`).
+///
+/// The width is FIXED rather than trimmed. RFC 3339 permits dropping trailing zeros from
+/// the subsecond field, but a member of this form is modelled as a plain string, so text
+/// order is all a client has to compare two of them by — and `…:21.62Z` does not compare
+/// after `…:21.619Z` as text.
+pub fn to_millisecond_timestamp_text(millis: i64) -> String {
+    let whole = ::aws_smithy_types::DateTime::from_secs(millis.div_euclid(1_000))
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default();
+    match whole.strip_suffix('Z') {
+        Some(prefix) => format!("{prefix}.{:03}Z", millis.rem_euclid(1_000)),
+        None => whole,
+    }
 }
 
 /// An optional tag map for a response: Greengrass reports the tag set of a resource

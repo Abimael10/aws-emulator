@@ -73,12 +73,30 @@ pub const INVALID_ROLE_ARN_MESSAGE: &str = "That role ARN is invalid.";
 /// request (there is none to name — the operation takes no input).
 pub const NO_SERVICE_ROLE_MESSAGE: &str = "You need to attach an IAM role to this AWS account.";
 
-/// What `UpdateConnectivityInfo` answers a request body it cannot read as the connectivity
-/// information the operation takes.
+/// What `UpdateConnectivityInfo` answers a request whose endpoint list it READ and could
+/// not take as connectivity information — an entry of it names no endpoint.
 ///
-/// Fixed text: the refusal is about the BODY as a whole, so it names no member, value or
-/// limit of the request.
+/// Fixed text: the refusal is about the request BODY, so it names no member, value or limit
+/// of the request.
 pub const UNREADABLE_REQUEST_BODY_MESSAGE: &str = "Invalid json format found in the request body.";
+
+/// The name the service publishes `UpdateConnectivityInfo`'s endpoint list under, which is
+/// what [`unparsable_parameter_message`] names when nothing readable as that list arrived:
+/// for a list-valued member it is the name of the LIST SHAPE the member targets
+/// (`smithy_query(query="operation",operation="UpdateConnectivityInfo")`: `connectivityInfo`
+/// targets `connectivityInfoList`), not the member name and not a value of the request.
+pub const CONNECTIVITY_INFO_PARAMETER: &str = "connectivityInfoList";
+
+/// What the legacy surface answers a request under whose parameter nothing it could read as
+/// that parameter's value arrived: the fixed sentence, naming that parameter.
+///
+/// The two refusals are distinct classes, worded as AWS words each: this one names the
+/// parameter nothing readable arrived under, and [`UNREADABLE_REQUEST_BODY_MESSAGE`] answers
+/// a parameter that WAS read and carries something the operation does not take.
+#[must_use]
+pub fn unparsable_parameter_message(parameter: &str) -> String {
+    format!("The following required parameter(s) are unparsable: {parameter}.")
+}
 
 /// What `GetConnectivityInfo` answers for a core device that has published no connectivity
 /// information.
