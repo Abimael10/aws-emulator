@@ -41,6 +41,8 @@ use std::hash::BuildHasher as _;
 use std::ops::Bound;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ::service_common::page_tokens::PageTokenKey;
+
 use crate::ops::types::{
     AppInstanceRetentionSettings, Configuration, EndpointAttributes, EndpointState,
     ExpirationSettings,
@@ -68,8 +70,9 @@ pub const ARN_SERVICE: &str = "chime";
 /// Also the page size used when the caller supplies no `MaxResults`.
 pub const MAX_PAGE_SIZE: i32 = 50;
 
-/// The version marker a `NextToken` this service issues carries, so a token from
-/// anywhere else is recognised as not ours.
+/// The version marker a `NextToken` this service issues carries, so a token whose
+/// cursor this store authenticates but whose layout an earlier version of this code
+/// wrote is recognised as not one the running listing issued.
 const TOKEN_VERSION: &str = "v1";
 
 /// How many `AppInstance`s this emulator holds for one account, and how many
@@ -348,9 +351,21 @@ pub struct ComAmazonawsChimesdkidentityChimeidentityserviceState {
     /// The sequence number the next deletion is recorded under, so the set's eviction
     /// order is the deletion order rather than the ARN order.
     deletions: u64,
+    /// The secret every `NextToken` this store's listings hand out is authenticated
+    /// under — one key per store, drawn from the system's randomness when the store is
+    /// created and never reported (see [`encode_page_token`]).
+    page_token_key: PageTokenKey,
 }
 
 impl ComAmazonawsChimesdkidentityChimeidentityserviceState {
+    /// The key this store's page tokens are minted and verified under.
+    ///
+    /// `Copy`, so a listing takes the key off the store and goes on to borrow the
+    /// records it is about to page in the same call.
+    pub fn page_token_key(&self) -> PageTokenKey {
+        self.page_token_key
+    }
+
     /// The user with this ARN, resolved through the `users_by_arn` index in one hop.
     pub fn user(&self, user_arn: &str) -> Option<&AppInstanceUserRecord> {
         let instance_arn = self.users_by_arn.get(user_arn)?;
@@ -1052,25 +1067,35 @@ pub struct Page<T> {
     pub next_token: Option<String>,
 }
 
-/// Encode a state key as an opaque `NextToken`, scoped to the listing that issued it.
+/// Encode a state key as an opaque `NextToken`, scoped to the listing that issued it
+/// and authenticated under `token_key`.
 ///
-/// The encoded form carries a version marker and the listing's `scope` beside the key,
-/// so a token from one listing (or from another emulator version) is recognisably not
-/// a token the listing being resumed issued, rather than silently resuming at a key
-/// that collection never held. Hex-coded rather than base64: the token travels back in
-/// a query string (`?next-token=...`), and hex needs no escaping there, while base64's
-/// `+` would arrive as a space.
-pub fn encode_page_token(scope: &str, key: &str) -> String {
+/// The cursor travels inside the token (there is no page kept on the side to look up),
+/// so what makes it a token this listing ISSUED is the authenticator
+/// [`::service_common::page_tokens::PageTokenKey::mint`] puts over it: the store's key
+/// is drawn from the system's randomness and never leaves the process, so no caller can
+/// produce the authenticator for a cursor of its own and no listing can be resumed at a
+/// page position it never handed out. Beside the cursor the authenticated bytes carry a
+/// version marker and the listing's `scope`, so a token one listing minted does not
+/// resume another one over the same store's key.
+///
+/// Hex-coded rather than base64: the token travels back in a query string
+/// (`?next-token=...`), and hex needs no escaping there, while base64's `+` would
+/// arrive as a space.
+pub fn encode_page_token(token_key: &PageTokenKey, scope: &str, key: &str) -> String {
     // `\n` separates the fields: a scope is an operation name or an ARN and a key is
     // an ARN, so neither can contain one.
-    ::hex::encode(format!("{TOKEN_VERSION}\n{scope}\n{key}"))
+    ::hex::encode(token_key.mint(&format!("{TOKEN_VERSION}\n{scope}\n{key}")))
 }
 
 /// Decode a `NextToken` issued for `scope` back into the state key it resumes after;
-/// `None` when the token is not one this listing issued.
-pub fn decode_page_token(scope: &str, token: &str) -> Option<String> {
+/// `None` when the token is not one this listing issued — a value that is not hex, one
+/// whose authenticator this store's key does not verify (a value a caller assembled,
+/// one another store minted, one changed on the way back), and one this store minted
+/// for a DIFFERENT listing.
+pub fn decode_page_token(token_key: &PageTokenKey, scope: &str, token: &str) -> Option<String> {
     let raw = ::hex::decode(token).ok()?;
-    let decoded = String::from_utf8(raw).ok()?;
+    let decoded = token_key.cursor_of(&raw)?;
     let mut fields = decoded.splitn(3, '\n');
     let (Some(TOKEN_VERSION), Some(token_scope), Some(key)) =
         (fields.next(), fields.next(), fields.next())
@@ -1087,12 +1112,13 @@ pub fn decode_page_token(scope: &str, token: &str) -> Option<String> {
 /// than re-scanning the consumed prefix — so walking a whole collection costs one
 /// pass in total, not one pass per page. The returned `next_token` is `Some` only
 /// when entries remain, so the final page omits it, which is how a paginating client
-/// knows to stop. `scope` identifies the listing in the token it issues; see
-/// [`encode_page_token`].
+/// knows to stop. `scope` identifies the listing in the token it issues and
+/// `token_key` is the store's key that authenticates it; see [`encode_page_token`].
 pub fn paginate<'a, V, T>(
     entries: &'a BTreeMap<String, V>,
     max_results: Option<i32>,
     after: Option<&str>,
+    token_key: &PageTokenKey,
     scope: &str,
     project: impl Fn(&'a V) -> T,
 ) -> Page<T> {
@@ -1125,7 +1151,7 @@ pub fn paginate<'a, V, T>(
     Page {
         items,
         next_token: truncated
-            .then(|| last_key.map(|key| encode_page_token(scope, key)))
+            .then(|| last_key.map(|key| encode_page_token(token_key, scope, key)))
             .flatten(),
     }
 }

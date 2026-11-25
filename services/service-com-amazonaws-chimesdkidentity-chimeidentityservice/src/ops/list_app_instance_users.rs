@@ -186,12 +186,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         };
 
-        // `NextToken` is opaque and scoped to the listing that issued it, so one this
-        // listing never issued is a bad request rather than an empty page.
+        // `NextToken` is opaque, authenticated under this store's own key and scoped to
+        // the listing that issued it, so one this listing never issued is a bad request
+        // rather than an empty page or a page position nobody was offered.
+        let token_key = state.page_token_key();
         let scope = format!("{}:{}", Self::NAME, instance.arn);
         let after = match input.next_token.as_deref() {
             Some(token) => Some(
-                crate::state::decode_page_token(&scope, token).ok_or_else(|| {
+                crate::state::decode_page_token(&token_key, &scope, token).ok_or_else(|| {
                     ListAppInstanceUsersErrorModeled::BadRequestException(BadRequestException {
                         code: Some("BadRequest".to_string()),
                         message: Some(
@@ -207,6 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &instance.users,
             input.max_results,
             after.as_deref(),
+            &token_key,
             &scope,
             |user| AppInstanceUserSummary {
                 app_instance_user_arn: Some(user.arn.clone()),

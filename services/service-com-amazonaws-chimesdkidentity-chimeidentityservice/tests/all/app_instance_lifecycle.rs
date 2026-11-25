@@ -1301,6 +1301,418 @@ async fn a_minted_app_instance_id_is_a_fresh_v4_uuid() {
     }
 }
 
+/// The `Message` this service words a `NextToken` it did not issue with, on every one
+/// of its listings.
+const UNISSUED_TOKEN_MESSAGE: &str = "NextToken is not a token this listing issued";
+
+/// The width of the authenticator a `NextToken` this service mints carries ahead of its
+/// cursor, from `service_common::page_tokens::AUTHENTICATOR_BYTES`: a value with the
+/// SHAPE of a minted token is that many bytes of authenticator followed by a cursor.
+const AUTHENTICATOR_BYTES: usize = service_common::page_tokens::AUTHENTICATOR_BYTES;
+
+/// One paginated listing of this service, as a caller reaches it.
+struct PagedListing {
+    /// The operation it serves, which is also the first field of its token's scope.
+    operation: &'static str,
+    /// Everything before the query string of the request that drives it.
+    path: String,
+    /// The query parameter the listing REQUIRES (the parent it pages under), already
+    /// percent-encoded, or empty for a listing that pages the account's own collection.
+    required_query: String,
+    /// The scope a token of this listing carries, which a caller knows in full: the
+    /// operation name, plus for a per-parent listing the parent ARN it just supplied.
+    scope: String,
+    /// The response member carrying the page.
+    member: &'static str,
+    /// Where a summary of this listing carries the key the collection is ordered by —
+    /// the cursor a token of it resumes after.
+    key_path: &'static [&'static str],
+}
+
+impl PagedListing {
+    /// This listing with `parameters` appended to the query it requires.
+    async fn call(&self, emulator: &Emulator, parameters: &str) -> (u16, Value) {
+        let mut query = self.required_query.clone();
+        if !parameters.is_empty() {
+            if !query.is_empty() {
+                query.push('&');
+            }
+            query.push_str(parameters);
+        }
+        let path_and_query = if query.is_empty() {
+            self.path.clone()
+        } else {
+            format!("{}?{query}", self.path)
+        };
+        emulator.call("GET", &path_and_query, None).await
+    }
+
+    /// One page of this listing at `max_results`, resuming after `next_token`.
+    async fn page(
+        &self,
+        emulator: &Emulator,
+        max_results: i32,
+        next_token: Option<&str>,
+    ) -> (u16, Value) {
+        let mut parameters = format!("max-results={max_results}");
+        if let Some(token) = next_token {
+            parameters.push_str(&format!("&next-token={}", uri_encode(token)));
+        }
+        self.call(emulator, &parameters).await
+    }
+
+    /// The keys a page carried, in the order the listing reported them.
+    fn keys(&self, body: &Value) -> Vec<String> {
+        body[self.member]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        let mut value = item;
+                        for member in self.key_path {
+                            value = &value[*member];
+                        }
+                        value
+                            .as_str()
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "{}: a summary carrying no {:?}: {item:?}",
+                                    self.operation, self.key_path
+                                )
+                            })
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Register one endpoint under a user, failing the test if it was refused. `ResourceArn`
+/// is the Amazon Pinpoint application ARN
+/// `smithy_query(query="operation",operation="RegisterAppInstanceUserEndpoint")`
+/// documents, whose application id is 32 hexadecimal characters.
+async fn register_endpoint(emulator: &Emulator, user_arn: &str, token: &str, seed: usize) {
+    let (status, body) = emulator
+        .call(
+            "POST",
+            &format!("/app-instance-users/{}/endpoints", uri_encode(user_arn)),
+            Some(json!({
+                "ClientRequestToken": token,
+                "Type": "APNS",
+                "ResourceArn": format!(
+                    "arn:aws:mobiletargeting:us-east-1:123456789012:apps/{:032x}",
+                    seed + 1
+                ),
+                "EndpointAttributes": { "DeviceToken": format!("device-token-{seed}") },
+            })),
+        )
+        .await;
+    assert_eq!(
+        status, 201,
+        "RegisterAppInstanceUserEndpoint({token}) answered {status} {body:?}"
+    );
+}
+
+/// Promote one identity of an app instance to administrator, failing the test if it was
+/// refused.
+async fn promote_admin(emulator: &Emulator, app_instance_arn: &str, admin_arn: &str) {
+    let (status, body) = emulator
+        .call(
+            "POST",
+            &format!("/app-instances/{}/admins", uri_encode(app_instance_arn)),
+            Some(json!({ "AppInstanceAdminArn": admin_arn })),
+        )
+        .await;
+    assert_eq!(
+        status, 201,
+        "CreateAppInstanceAdmin({admin_arn}) answered {status} {body:?}"
+    );
+}
+
+/// Every paginated listing this service serves, over a store whose collections each hold
+/// three entries: more than one page at `MaxResults` 1, so each listing both issues a
+/// token and has a position after it that a forged token could name.
+///
+/// `suffix` distinguishes one store's resources from another's, so two stores built by
+/// this helper never agree on an idempotency token.
+async fn paginated_listings(emulator: &Emulator, suffix: &str) -> Vec<PagedListing> {
+    let instance = emulator
+        .app_instance(&format!("forged-{suffix}"), &format!("tok-forged-{suffix}"))
+        .await;
+    // Two more instances, so the account-wide listing pages as well.
+    for index in 0..2 {
+        emulator
+            .app_instance(
+                &format!("forged-{suffix}-{index}"),
+                &format!("tok-forged-{suffix}-{index}"),
+            )
+            .await;
+    }
+    let mut users = Vec::new();
+    for index in 0..3 {
+        users.push(
+            emulator
+                .user(
+                    &instance,
+                    &format!("u{index}"),
+                    &format!("tok-forged-{suffix}-u{index}"),
+                )
+                .await,
+        );
+    }
+    for index in 0..3 {
+        crate::app_instance_bots::bot(
+            emulator,
+            &instance,
+            &format!("tok-forged-{suffix}-b{index}"),
+            &format!("bot{index}"),
+        )
+        .await;
+    }
+    for index in 0..3 {
+        register_endpoint(
+            emulator,
+            &users[0],
+            &format!("tok-forged-{suffix}-e{index}"),
+            index,
+        )
+        .await;
+    }
+    for user in &users {
+        promote_admin(emulator, &instance, user).await;
+    }
+
+    let encoded_instance = uri_encode(&instance);
+    vec![
+        PagedListing {
+            operation: "ListAppInstances",
+            path: "/app-instances".to_string(),
+            required_query: String::new(),
+            scope: "ListAppInstances".to_string(),
+            member: "AppInstances",
+            key_path: &["AppInstanceArn"],
+        },
+        PagedListing {
+            operation: "ListAppInstanceUsers",
+            path: "/app-instance-users".to_string(),
+            required_query: format!("app-instance-arn={encoded_instance}"),
+            scope: format!("ListAppInstanceUsers:{instance}"),
+            member: "AppInstanceUsers",
+            key_path: &["AppInstanceUserArn"],
+        },
+        PagedListing {
+            operation: "ListAppInstanceBots",
+            path: "/app-instance-bots".to_string(),
+            required_query: format!("app-instance-arn={encoded_instance}"),
+            scope: format!("ListAppInstanceBots:{instance}"),
+            member: "AppInstanceBots",
+            key_path: &["AppInstanceBotArn"],
+        },
+        PagedListing {
+            operation: "ListAppInstanceUserEndpoints",
+            path: format!("/app-instance-users/{}/endpoints", uri_encode(&users[0])),
+            required_query: String::new(),
+            scope: format!("ListAppInstanceUserEndpoints:{}", users[0]),
+            member: "AppInstanceUserEndpoints",
+            key_path: &["EndpointId"],
+        },
+        PagedListing {
+            operation: "ListAppInstanceAdmins",
+            path: format!("/app-instances/{encoded_instance}/admins"),
+            required_query: String::new(),
+            scope: format!("ListAppInstanceAdmins:{instance}"),
+            member: "AppInstanceAdmins",
+            key_path: &["Admin", "Arn"],
+        },
+    ]
+}
+
+/// The token an UNauthenticated codec renders for a position: hex of the three fields a
+/// caller knows — the version marker, the listing's scope and a cursor it reads off the
+/// page it was handed.
+fn plaintext_token(scope: &str, cursor: &str) -> String {
+    hex::encode(format!("v1\n{scope}\n{cursor}"))
+}
+
+/// A value with the SHAPE of a minted token: an authenticator of `filler` bytes ahead of
+/// the plaintext fields a caller knows.
+fn shaped_like_minted(filler: u8, scope: &str, cursor: &str) -> String {
+    let mut bytes = vec![filler; AUTHENTICATOR_BYTES];
+    bytes.extend_from_slice(format!("v1\n{scope}\n{cursor}").as_bytes());
+    hex::encode(bytes)
+}
+
+/// A minted token with one byte of it changed.
+fn with_byte_changed(token: &str, index: usize) -> String {
+    let mut bytes = hex::decode(token).expect("a token this service minted is hex");
+    bytes[index] ^= 0x01;
+    hex::encode(bytes)
+}
+
+/// RULE: a continuation token is one the serving listing ISSUED or it names no position
+/// at all — a value a caller assembled from the fields it knows, one another store
+/// minted, one another listing minted, or one changed on the way back is refused as bad
+/// input rather than served as a page.
+#[tokio::test]
+async fn only_a_token_a_listing_itself_issued_resumes_it() {
+    let emulator = Emulator::new();
+    let listings = paginated_listings(&emulator, "a").await;
+    // A SECOND store, whose listings mint tokens of exactly the same form, under a key
+    // of its own.
+    let other_store = Emulator::new();
+    let other_listings = paginated_listings(&other_store, "b").await;
+
+    // What each listing of this store actually issued: the token off its first page and
+    // the cursor that token resumes after.
+    let mut issued: Vec<(String, String)> = Vec::new();
+    for listing in &listings {
+        let operation = listing.operation;
+        let (status, first) = listing.page(&emulator, 1, None).await;
+        assert_eq!(
+            status, 200,
+            "{operation}: a first page of one entry answered {status} {first:?}"
+        );
+        let first_keys = listing.keys(&first);
+        let token = first["NextToken"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("{operation}: a first page of one entry issued no NextToken: {first:?}")
+            })
+            .to_string();
+
+        // The token the listing issued resumes it, at the position after the page it came
+        // with — the behaviour an authenticated token keeps.
+        let (status, second) = listing.page(&emulator, 1, Some(&token)).await;
+        assert_eq!(
+            status, 200,
+            "{operation}: the token this listing issued answered {status} {second:?}"
+        );
+        let second_keys = listing.keys(&second);
+        assert!(
+            first_keys.len() == 1
+                && second_keys.len() == 1
+                && first_keys[0] < second_keys[0],
+            "{operation}: expected the issued token to resume after {first_keys:?} in key \
+             order, got {second_keys:?}"
+        );
+        issued.push((token, first_keys[0].clone()));
+    }
+
+    for (index, listing) in listings.iter().enumerate() {
+        let operation = listing.operation;
+        let scope = listing.scope.as_str();
+        let (token, cursor) = &issued[index];
+        // The token of the NEXT listing of this same store, and of the SAME listing of
+        // the other store: both minted, neither by this listing.
+        let (another_listings_token, _) = &issued[(index + 1) % issued.len()];
+        let (other_store_token, _) = {
+            let other = &other_listings[index];
+            assert_eq!(
+                other.operation, operation,
+                "the two stores' listings must line up"
+            );
+            let (status, page) = other.page(&other_store, 1, None).await;
+            assert_eq!(
+                status, 200,
+                "{operation}: the other store's first page answered {status} {page:?}"
+            );
+            let minted = page["NextToken"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("{operation}: the other store issued no NextToken: {page:?}")
+                })
+                .to_string();
+            (minted, ())
+        };
+
+        // Rows span the ways a value that is not a token this listing issued can reach
+        // it: the plaintext rendering of the fields a caller knows (the version marker,
+        // the scope it just addressed and a cursor off its own page), that rendering at
+        // positions nobody was offered, a value with a minted token's shape and a
+        // made-up authenticator, a minted token with a byte changed, truncated or
+        // extended, a token minted for another listing or by another store, and values
+        // that are no token at all.
+        let forged: Vec<(String, String)> = vec![
+            (
+                "the plaintext fields with no authenticator".to_string(),
+                plaintext_token(scope, cursor),
+            ),
+            (
+                "plaintext naming a cursor past every key".to_string(),
+                plaintext_token(scope, "~"),
+            ),
+            (
+                "plaintext naming an empty cursor".to_string(),
+                plaintext_token(scope, ""),
+            ),
+            (
+                "an all-zero authenticator ahead of the cursor".to_string(),
+                shaped_like_minted(0x00, scope, cursor),
+            ),
+            (
+                "an all-ones authenticator ahead of the cursor".to_string(),
+                shaped_like_minted(0xff, scope, cursor),
+            ),
+            (
+                "the issued token with a byte of its authenticator changed".to_string(),
+                with_byte_changed(token, 0),
+            ),
+            (
+                "the issued token with a byte of its cursor changed".to_string(),
+                with_byte_changed(token, hex::decode(token).expect("hex").len() - 1),
+            ),
+            ("the issued token truncated by a byte".to_string(), {
+                let mut bytes = hex::decode(token).expect("hex");
+                bytes.pop();
+                hex::encode(bytes)
+            }),
+            ("the issued token with a byte appended".to_string(), {
+                let mut bytes = hex::decode(token).expect("hex");
+                bytes.push(b'x');
+                hex::encode(bytes)
+            }),
+            (
+                "a token another listing of this store minted".to_string(),
+                another_listings_token.clone(),
+            ),
+            (
+                "a token another store minted for this same listing".to_string(),
+                other_store_token.clone(),
+            ),
+            ("not an encoded token at all".to_string(), "not-a-token!!".to_string()),
+            (
+                "hex of bytes that are no token".to_string(),
+                hex::encode("hello"),
+            ),
+        ];
+
+        for (case, value) in forged {
+            let (status, body) = listing.page(&emulator, 1, Some(&value)).await;
+            assert_eq!(
+                (status, body["Code"].as_str(), body["Message"].as_str()),
+                (400, Some("BadRequest"), Some(UNISSUED_TOKEN_MESSAGE)),
+                "{operation}: case {case:?}: expected a NextToken this listing never \
+                 issued to be refused, got {status} {body:?}"
+            );
+        }
+
+        // The refusals changed nothing: the token this listing really issued still
+        // resumes it.
+        let (status, resumed) = listing.page(&emulator, 1, Some(token)).await;
+        assert_eq!(
+            status, 200,
+            "{operation}: after the refusals the issued token answered {status} {resumed:?}"
+        );
+        assert_eq!(
+            listing.keys(&resumed).len(),
+            1,
+            "{operation}: expected the issued token to still resume one entry, got {resumed:?}"
+        );
+    }
+}
+
 /// RULE: a minted ARN carries the region the caller addressed, read from the request's
 /// SigV4 credential scope.
 #[tokio::test]

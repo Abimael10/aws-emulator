@@ -212,12 +212,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|record| (record.admin_arn.clone(), record.clone()))
             .collect();
 
-        // `NextToken` is opaque and scoped to the listing that issued it, so one this
-        // listing never issued is a bad request rather than an empty page.
+        // `NextToken` is opaque, authenticated under this store's own key and scoped to
+        // the listing that issued it, so one this listing never issued is a bad request
+        // rather than an empty page or a page position nobody was offered.
+        let token_key = store.page_token_key();
         let scope = format!("{}:{}", Self::NAME, input.app_instance_arn);
         let after = match input.next_token.as_deref() {
             Some(token) => Some(
-                crate::state::decode_page_token(&scope, token).ok_or_else(|| {
+                crate::state::decode_page_token(&token_key, &scope, token).ok_or_else(|| {
                     ListAppInstanceAdminsErrorModeled::BadRequestException(BadRequestException {
                         code: Some("BadRequest".to_string()),
                         message: Some(
@@ -233,6 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &administrators,
             input.max_results,
             after.as_deref(),
+            &token_key,
             &scope,
             |record| AppInstanceAdminSummary {
                 // The administering identity's NAME is held by the identity's own record,
