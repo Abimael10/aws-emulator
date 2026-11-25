@@ -56,3 +56,59 @@ Causes 3 and 4: `Check timed out after 60.0s` — no assertion reached; the chec
 2. Cause 1: create a rule with `{"detail":{"k":[{"wildcard":"a*b"}]}}`, then PutRule the same name with `{"detail":{"k":[{"wildcard":"a\\b"}]}}` — must be refused with InvalidEventPatternException and leave the stored pattern unchanged.
 3. Cause 2: PutRule with `{"detail":{"ip":[{"cidr":5}]}}` and compare Error.Message's Reason clause.
 4. Causes 3/4: create a custom bus, one rule per operand row with its own SQS queue (queue policy allowing events.amazonaws.com for the rule ARN), PutEvents the row events, and observe which queues receive which events.
+
+## Resolution
+
+All four causes are closed; what is pinned where, and the one residual outside this
+service crate, are recorded here rather than left implied.
+
+Causes 1, 2 and 4 are the shared event-pattern validator and matcher
+(`services/service-com-amazonaws-eventbridge-awsevents/src/state/event_pattern.rs`),
+which `PutRule`, `CreateArchive`/`UpdateArchive` and `TestEventPattern` all read a
+pattern through and which routing matches an event with. They were closed by the fix
+for the wire-corpus issue `20261117T140447Z-events-8-net-new-causes-the-event-pattern.md`,
+which landed after this report was filed: `wildcard_violation` now reads the operand's
+escape grammar (only the wildcard and the escape itself may be escaped, so an escape of
+anything else is refused with `Invalid escape character at pos <position past the escape
+marker>`), `wildcard_segments` reads an escaped metacharacter as one character of
+literal text at match time, and `validate_operator`'s `cidr` arm refuses an operand that
+is not text at all with the plain string-operand requirement every text-comparing match
+type shares, which the service words for the first of them (`prefix match pattern must
+be a string`). Their wording and locators are pinned by
+`tests/all/pattern_numeric_and_wildcard_operands.rs` and
+`tests/all/pattern_refusal_location.rs`; the half those suites did not cover — that a
+refused `PutRule` leaves the live rule's stored pattern and its deliveries untouched —
+is pinned by `tests/all/pattern_empty_operand_delivery.rs`.
+
+Cause 3's rule is that an operand is compared as the TEXT it is, so an empty operand is
+the empty text and not a wildcard: `prefix`/`suffix` compare one END of the leaf and
+hold for every string leaf, the empty string included, while `wildcard`/
+`equals-ignore-case` compare the WHOLE leaf and hold only for the empty string; no
+text-comparing match type holds for a leaf that is not text or for a field the event
+does not carry. The matchers' empty-operand branches implement exactly that, and the
+custom-bus rule → SQS delivery path the report names was repaired by the fan-out fix
+recorded in `20261111T221227Z-events-sqs-a-1-000-event-custom-bus.md`. Both halves are
+now pinned end to end, over a table of six operand forms against ten leaf kinds, by
+`tests/all/pattern_empty_operand_delivery.rs`: one rule per operand row on a custom bus,
+each with its own queue whose policy admits that rule's deliveries, each queue receiving
+exactly the events its operand admits — and the same table read back through
+`TestEventPattern`, so the reporting surface and the live rule answer one verdict.
+
+What is left, and where: replaying
+`events__sqs.events-pattern-empty-string-operands-deliver-strings-only` still ends in
+`Check timed out after 60.0s` inside the check's first `_drain_one`, while its three
+sibling units pass. The report's hypothesis for it — that the per-rule custom-bus → SQS
+deliveries never arrive — does not hold: every delivery that rule set requires arrives,
+synchronously with the `PutEvents` that decided it, and nothing else does. Probed
+against this checkout and all correct: the four operands and their nested and literal
+forms against string, empty-string, blank, upper-case, number, boolean, null, absent,
+object and list leaves; patterns naming only `detail`, naming a nested or dotted path,
+naming the envelope's own string members, and relating branches with `$or`; a rule whose
+bus is named by name or by ARN, with and without `State`; queue policies written
+unconditionally, scoped by `aws:SourceArn` to the rule, scoped by `ArnLike`, with
+list-valued `Principal`/`Action`, with `Resource` `*`, and installed either at
+`CreateQueue` or by `SetQueueAttributes`; and receive-delete-receive until empty. The
+remaining distance for this family of checks is the per-dispatch cost recorded in the
+fan-out issue above — every request the emulator serves pays the claim scan in
+`vendor/smithy-server-runtime/src/multi_service_router.rs` — and no change inside a
+service crate reaches it.
