@@ -14,10 +14,10 @@
 //! openapi" before it sends anything.
 //!
 //! The rows differ along what the rule generalises over: the group version (the core
-//! API and the two groups beside it), the kind inside it, and which document is read
+//! API and the groups beside it), the kind inside it, and which document is read
 //! (the v3 index, a v3 group-version document, the v2 document) — plus the two
-//! negative rows a client can reach: a group version this server publishes no
-//! document for, and a method the documents are not served under.
+//! negative rows a client can reach: a group version this server does not serve, and
+//! a method the documents are not served under.
 //!
 //! The last suite ties the published schema to the server's own admission: the
 //! members the Pod schema declares `required` are exactly the ones a create is
@@ -87,10 +87,11 @@ async fn dial_accepting(config: &Kubeconfig, case: &str, path: &str, accept: &st
 /// `/openapi/v3`, and the `(group, version)` a schema of it is tagged with.
 ///
 /// SOURCE: the discovery documents this server serves — `/api` names the core
-/// version and `/apis` names the two groups beside it — so the table is the surface
+/// version and `/apis` names every group beside it — so the table is the surface
 /// a client can address rather than a list written beside it.
 const GROUP_VERSIONS: &[(&str, &str, &str)] = &[
     ("api/v1", "", "v1"),
+    ("apis/apps/v1", "apps", "v1"),
     (
         "apis/rbac.authorization.k8s.io/v1",
         "rbac.authorization.k8s.io",
@@ -99,6 +100,11 @@ const GROUP_VERSIONS: &[(&str, &str, &str)] = &[
     (
         "apis/authentication.k8s.io/v1",
         "authentication.k8s.io",
+        "v1",
+    ),
+    (
+        "apis/authorization.k8s.io/v1",
+        "authorization.k8s.io",
         "v1",
     ),
 ];
@@ -151,6 +157,17 @@ const KINDS: &[(&str, &str, &str)] = &[
         "SelfSubjectReview",
         "io.k8s.api.authentication.v1.SelfSubjectReview",
     ),
+    (
+        "apis/authorization.k8s.io/v1",
+        "SelfSubjectAccessReview",
+        "io.k8s.api.authorization.v1.SelfSubjectAccessReview",
+    ),
+    (
+        "apis/apps/v1",
+        "Deployment",
+        "io.k8s.api.apps.v1.Deployment",
+    ),
+    ("apis/apps/v1", "DaemonSet", "io.k8s.api.apps.v1.DaemonSet"),
 ];
 
 /// The relative URL the v3 index publishes one group version's document at, read out
@@ -241,19 +258,19 @@ async fn every_group_version_this_server_serves_publishes_an_openapi_document() 
         "case the v2 document: it must reference its definitions, got {rendered}"
     );
 
-    // A group version this server publishes no document for, and a method the
+    // A group version this server does not serve at all, and a method the
     // documents are not served under: both are refused rather than answered empty.
     let missing = dial(
         &config,
-        "a group version no document is published for",
+        "a group version this server does not serve",
         "GET",
-        "/openapi/v3/apis/apps/v1",
+        "/openapi/v3/apis/batch/v1",
         None,
     )
     .await;
     assert_eq!(
         missing.status, 404,
-        "case a group version no document is published for: expected the not-found \
+        "case a group version this server does not serve: expected the not-found \
          Status, got {missing:?}"
     );
     let posted = dial(&config, "a write to the index", "POST", "/openapi/v3", None).await;

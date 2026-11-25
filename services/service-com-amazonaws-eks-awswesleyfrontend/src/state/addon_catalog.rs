@@ -121,8 +121,8 @@ pub(super) struct AddonCatalogSeed {
     /// client that loads the document into a validator honours the keywords of
     /// the dialect that add-on published.
     ///
-    /// It also decides which SHAPE the published document takes, because the two
-    /// go together in the documents Amazon EKS publishes; see
+    /// Which SHAPE that document takes is a published fact of the document too,
+    /// and not one this dialect decides: see [`ADDON_ROOT_DECLARED_SCHEMAS`] and
     /// [`AddonCatalogRecord::configuration_schema_value`].
     pub(super) schema_dialect: &'static str,
     /// The OLDEST Kubernetes version in [`VERSION_CALENDAR`] this add-on has a
@@ -1782,14 +1782,14 @@ impl AddonCatalogRecord {
     /// document declares ([`AddonCatalogSeed::schema_dialect`]), because the two
     /// are properties of the same published document:
     ///
-    /// * the documents written in the draft dialects are a ROOT `$ref` into the
+    /// * most of them are a ROOT `$ref` into the
     ///   document's own `definitions`, whose named definition is the add-on's
     ///   chart values type, with one further definition per object-valued key
     ///   that type carries ([`schema_definition_title`] names them). A key whose
     ///   value is an object therefore reads as
     ///   `{"$ref": "#/definitions/<Type>"}` and the type it names declares that
     ///   object's own keys ([`nested_configuration_properties`]);
-    /// * the ones written in the 2019-09 dialect ([`ADDON_SCHEMA_DIALECT_2019_09`])
+    /// * the ones the add-on publishes ROOT-DECLARED ([`ADDON_ROOT_DECLARED_SCHEMAS`])
     ///   declare the add-on's keys at the document ROOT, under `properties`, with
     ///   each object-valued key's own keys declared inline under it and no
     ///   `definitions` section at all, beside the `description` of what the
@@ -1803,8 +1803,9 @@ impl AddonCatalogRecord {
         version: &AddonCatalogVersionRecord,
     ) -> ::serde_json::Value {
         // Whether this add-on's document carries its types in a `definitions`
-        // section a root `$ref` points into, or declares them at the root.
-        let references_definitions = self.schema_dialect != ADDON_SCHEMA_DIALECT_2019_09;
+        // section a root `$ref` points into, or declares them at the root
+        // ([`ADDON_ROOT_DECLARED_SCHEMAS`]).
+        let references_definitions = !declares_keys_at_root(&self.addon_name);
         // Whether the add-on's published document declares its OWN keys alone
         // ([`ADDON_OWN_KEYS_ONLY_SCHEMAS`]): a document that configures the
         // add-on's components separately carries the placement of each component
@@ -1864,10 +1865,17 @@ impl AddonCatalogRecord {
                     properties.insert(property.clone(), object_definition(&title, &nested));
                 }
             } else {
-                properties.insert(
-                    property.clone(),
-                    ::serde_json::json!({ "type": json_type }),
-                );
+                let mut declared = ::serde_json::json!({ "type": json_type });
+                // A key whose value the add-on's build SHIPS declares that value
+                // as the key's `default`, which is what a client reads the shipped
+                // setting out of the document by, and the most this cluster runs of
+                // that key as its `maximum`, which is what an install asking for
+                // more is refused against ([`Self::shipped_bounds`]).
+                if let Some((shipped, maximum)) = self.shipped_bounds(property) {
+                    declared["default"] = ::serde_json::json!(shipped);
+                    declared["maximum"] = ::serde_json::json!(maximum);
+                }
+                properties.insert(property.clone(), declared);
             }
         }
         for property in &version.required_configuration {
@@ -2014,7 +2022,52 @@ impl AddonCatalogRecord {
             document,
         )
     }
+
+    /// The value this add-on's build SHIPS for the configuration key `property`
+    /// and the largest value an install may set it to, as the published document
+    /// declares them under `default` and `maximum` — and `None` for a key the
+    /// catalog publishes neither for.
+    ///
+    /// A JSON Schema `default` is "the default JSON value associated with a
+    /// particular schema", and a chart's schema carries it for the keys whose
+    /// value the chart itself sets, so a client reads the setting the install runs
+    /// with out of the document instead of guessing it. The one such key this
+    /// catalog publishes a value for is the REPLICA COUNT
+    /// ([`ADDON_REPLICA_COUNT_KEYS`]): the number of replicas the add-on's
+    /// workload runs ([`super::kubernetes_workloads::shipped_replica_count`]),
+    /// which is the same number an install runs when its `configurationValues`
+    /// asks for no other — ONE source for the document and for the cluster.
+    ///
+    /// The `maximum` is the number of replicas this cluster runs of ONE workload
+    /// ([`super::kubernetes_workloads::MAX_REPLICAS_PER_WORKLOAD`], the bound the
+    /// cluster's own `apps/v1` create is held to as well): a document is what an
+    /// install is validated against, so an install asking for more replicas than
+    /// the cluster runs is REFUSED against this document rather than accepted and
+    /// run at another count.
+    fn shipped_bounds(&self, property: &str) -> Option<(u64, u64)> {
+        if !ADDON_REPLICA_COUNT_KEYS.contains(&property) {
+            return None;
+        }
+        let shipped = super::kubernetes_workloads::shipped_replica_count(&self.addon_name)?;
+        Some((
+            shipped,
+            super::kubernetes_workloads::MAX_REPLICAS_PER_WORKLOAD,
+        ))
+    }
 }
+
+/// The configuration keys an add-on's chart carries its REPLICA COUNT in, as the
+/// published documents spell it.
+///
+/// Source: the keys the published documents declare for it
+/// ([`AddonCatalogSeed::configuration_properties`] carries `replicas` for the
+/// upstream charts and `replicaCount` for the ones generated from the Helm
+/// convention). A key of one of these names is the one an install asks for a
+/// number of replicas through, which is why the document declares the shipped
+/// count as its `default` and the most one workload runs as its `maximum`
+/// ([`AddonCatalogRecord::shipped_bounds`]) and why an install that sets it within
+/// that bound runs that many replicas (see `super::kubernetes_workloads`).
+pub(super) const ADDON_REPLICA_COUNT_KEYS: &[&str] = &["replicaCount", "replicas"];
 
 /// The path a JSON Schema validator names the whole document by, which every
 /// violation below is reported relative to.
@@ -2105,11 +2158,12 @@ fn resolved_schema<'document>(
 /// what is wrong with it — or `None` when it satisfies the schema.
 ///
 /// It reads the keywords the add-on configuration schemas above are written with:
-/// `$ref` into the document's own `definitions`, `type`, `properties`, `required`
-/// and `additionalProperties`. The first violation found is the one reported, and
-/// the walk is depth-first through the properties the SCHEMA declares, so its
-/// depth is bounded by the nesting of these schemas rather than by the document a
-/// caller sent; the document itself is parsed by `serde_json`, not here.
+/// `$ref` into the document's own `definitions`, `type`, `maximum`, `properties`,
+/// `required` and `additionalProperties`. The first violation found is the one
+/// reported, and the walk is depth-first through the properties the SCHEMA
+/// declares, so its depth is bounded by the nesting of these schemas rather than by
+/// the document a caller sent; the document itself is parsed by `serde_json`, not
+/// here.
 pub(super) fn json_schema_violation(
     path: &str,
     schema: &::serde_json::Value,
@@ -2133,6 +2187,14 @@ fn json_schema_violation_in(
                 "{path}: {} found, {expected} expected",
                 json_type_name(value)
             ));
+        }
+    }
+    // "maximum: the instance is valid only if it is less than or exactly equal to
+    // the keyword's value" — the declared bound on a number-valued key, which is
+    // how a published document states the most an install may set it to.
+    if let Some(maximum) = schema.get("maximum").and_then(::serde_json::Value::as_f64) {
+        if value.as_f64().is_some_and(|number| number > maximum) {
+            return Some(format!("{path}: {value} found, at most {maximum} expected"));
         }
     }
     let members = value.as_object()?;
@@ -2399,6 +2461,35 @@ pub(super) fn declares_own_keys_alone(addon_name: &str) -> bool {
     // builds publish is the rebuilt add-on's own.
     let published_for = rebuilt_addon(addon_name).unwrap_or(addon_name);
     ADDON_OWN_KEYS_ONLY_SCHEMAS.contains(&published_for)
+}
+
+/// The add-ons whose published configuration document declares the add-on's keys
+/// at the document ROOT, under `properties`, rather than in a `definitions`
+/// section a root `$ref` points into.
+///
+/// WHICH of the two shapes a document takes is a published fact of THAT
+/// document, like the dialect it declares ([`AddonCatalogSeed::schema_dialect`]),
+/// and not something the dialect decides: the catalog publishes documents of both
+/// shapes in the same dialect. A client reads the keys an add-on takes — and the
+/// defaults it ships ([`AddonCatalogRecord::shipped_bounds`]) — off `properties`
+/// where that add-on's own document puts them, so an add-on published here and
+/// one that is not cannot be told apart by their `$schema`.
+///
+/// Source: the document `aws eks describe-addon-configuration --addon-name <name>
+/// --addon-version <build>` reports for the add-on — the same source the keys
+/// themselves are taken from: the drivers whose documents Amazon EKS has reissued
+/// and the upstream charts whose own `values.schema.json` it publishes declare
+/// their keys at the root, while the generated documents of the add-ons it has
+/// published the longest carry them in `definitions`.
+pub(super) const ADDON_ROOT_DECLARED_SCHEMAS: &[&str] = &["aws-efs-csi-driver", "metrics-server"];
+
+/// Whether the document the add-on named `addon_name` publishes declares its keys
+/// at the document root. See [`ADDON_ROOT_DECLARED_SCHEMAS`].
+pub(super) fn declares_keys_at_root(addon_name: &str) -> bool {
+    // A vendor's rebuild of an add-on is the same software, so the document its
+    // builds publish is the rebuilt add-on's own.
+    let published_for = rebuilt_addon(addon_name).unwrap_or(addon_name);
+    ADDON_ROOT_DECLARED_SCHEMAS.contains(&published_for)
 }
 
 /// Declare on a published schema document the properties a build cannot be

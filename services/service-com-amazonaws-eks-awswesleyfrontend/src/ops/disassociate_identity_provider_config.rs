@@ -270,15 +270,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // THE CONFIGURATION the pair names, which only the resolved cluster can carry:
-        // a name this cluster does not hold is the same 404 the cluster itself earns —
-        // "the specified resource could not be found".
+        // a name this cluster does not hold is the same memberless 404 every other
+        // read and delete of a resource INSIDE a cluster answers with — "the
+        // specified resource could not be found" ([`state::resource_not_found`]),
+        // which discloses neither half of the pair.
         if !cluster.identity_provider_configs.contains_key(&config_name) {
-            return Err(DisassociateIdentityProviderConfigErrorModeled::ResourceNotFoundException(
-                state::child_resource_not_found(format!(
-                    "No identity provider config found for name: {config_name}."
-                )),
-            )
-            .into());
+            return Err(not_found());
         }
 
         // One update at a time per cluster: while another is running the cluster is in

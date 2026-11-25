@@ -24,6 +24,21 @@ Issue-Commit: a57dea262f41459244daf18c6d5b4cdf00e6a648
 
 # eks: 2 net-new root causes — the metrics-server add-on configuration schema declares no typed replica property, and asynchronous EKS resources never reach a terminal state (16 checks exhaust their budget)
 
+> _RESOLVED, in part, and the remaining keys re-filed: the metrics-server add-on's
+> published configuration document now declares its keys where that add-on's own
+> document declares them, with the replica count its build ships as that key's
+> `default` and the most one workload runs as its `maximum`; an install's
+> `configurationValues` replica count is what the add-on's Deployment runs; and the
+> one answer still wrong in the lifecycle traces —
+> `DisassociateIdentityProviderConfig`'s own wording for a configuration the cluster
+> does not hold — is the service's generic not-found payload. The lifecycle
+> machinery itself settles: 9 of this report's 16 lifecycle keys are fixed and 2
+> moved. The keys that remain — the three `eks.hpa-*` data-plane checks and the four
+> end-to-end checks that exhaust the suite's 60-second budget in their last wait —
+> are re-filed as
+> `20261124T090000Z-eks-the-kubernetes-data-plane-serves-no-hpa-and-four-checks-still-time-out.md`
+> so they are not recorded as working._
+
 > _Note: this issue was identified against the code base at commit `a57dea262f41459244daf18c6d5b4cdf00e6a648`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

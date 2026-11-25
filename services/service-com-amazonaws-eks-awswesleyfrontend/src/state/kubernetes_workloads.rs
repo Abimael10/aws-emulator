@@ -78,9 +78,17 @@ pub const MAX_WORKLOADS_PER_NAMESPACE: usize = 64;
 /// and well under [`super::kubernetes_objects::MAX_PODS_PER_NAMESPACE`].
 pub const MAX_REPLICAS_PER_WORKLOAD: u64 = 32;
 
+/// The same bound as a COUNT OF OBJECTS, for the convergence that creates one pod
+/// per replica ([`ClusterObjects::run_workload_replicas`]).
+///
+/// Stated as the published bound itself rather than beside it, so the loop that
+/// allocates per replica has a ceiling of its own whatever a stored spec says and
+/// the two cannot drift.
+const MAX_REPLICAS_PER_WORKLOAD_COUNT: usize = MAX_REPLICAS_PER_WORKLOAD as usize;
+
 /// The number of replicas a Deployment that names none runs: "Replicas is the
 /// number of desired pods … Defaults to 1".
-const DEFAULT_REPLICAS: u64 = 1;
+pub(super) const DEFAULT_REPLICAS: u64 = 1;
 
 /// The label Kubernetes puts on the pods of one revision of a Deployment, which is
 /// what tells the pods of one template apart from the pods of the next.
@@ -164,13 +172,13 @@ impl WorkloadResource {
     /// number of replicas the client asked for: "a DaemonSet ensures that all (or
     /// some) nodes run a copy of a pod".
     #[must_use]
-    fn runs_on_every_node(self) -> bool {
+    pub(super) fn runs_on_every_node(self) -> bool {
         matches!(self, Self::DaemonSets)
     }
 
     /// Every resource the group serves, in the order discovery reports them.
     #[must_use]
-    fn all() -> [Self; 2] {
+    pub(super) fn all() -> [Self; 2] {
         [Self::DaemonSets, Self::Deployments]
     }
 }
@@ -222,18 +230,25 @@ impl WorkloadObject {
     /// How many replicas the workload is to run on a cluster holding `nodes`: the
     /// count the spec asked for, and one per node for a DaemonSet — "the number of
     /// nodes that should be running the daemon pod".
+    ///
+    /// BOUNDED by the most one workload runs ([`MAX_REPLICAS_PER_WORKLOAD`])
+    /// whatever the stored spec states, because every replica is a POD this store
+    /// holds: a client's create is refused a greater count
+    /// ([`admitted_workload_spec`]) and an add-on's install is refused one against
+    /// the `maximum` its published document declares, so this is the store's own
+    /// last line and no accepted write ever reaches it.
     #[must_use]
     fn desired_replicas(&self, resource: WorkloadResource, nodes: usize) -> usize {
         if resource.runs_on_every_node() {
             return nodes;
         }
-        usize::try_from(
-            self.spec
-                .get("replicas")
-                .and_then(::serde_json::Value::as_u64)
-                .unwrap_or(DEFAULT_REPLICAS),
-        )
-        .unwrap_or(usize::MAX)
+        let asked = self
+            .spec
+            .get("replicas")
+            .and_then(::serde_json::Value::as_u64)
+            .unwrap_or(DEFAULT_REPLICAS)
+            .min(MAX_REPLICAS_PER_WORKLOAD);
+        usize::try_from(asked).unwrap_or(MAX_REPLICAS_PER_WORKLOAD_COUNT)
     }
 }
 
@@ -625,7 +640,12 @@ impl ClusterObjects {
                 .collect();
             remove.extend(gone);
         } else {
-            let desired = workload.desired_replicas(resource, capacity.shared_node_count());
+            // The count it converges to, with this store's own ceiling on how many
+            // pods ONE workload's convergence may create applied before anything is
+            // allocated per replica.
+            let desired = workload
+                .desired_replicas(resource, capacity.shared_node_count())
+                .min(MAX_REPLICAS_PER_WORKLOAD_COUNT);
             for _ in running.len()..desired {
                 create.push((format!("{name}-{hash}-{}", generated_name_suffix()), None));
             }
@@ -1029,6 +1049,21 @@ const MANAGED_ADDON_WORKLOADS: &[(&str, &[AddonWorkloadRow])] = &[
         &[row(WorkloadResource::Deployments, "coredns", "coredns", 2)],
     ),
     (
+        "metrics-server",
+        // The metrics server is one Deployment, and the chart Amazon EKS builds
+        // the add-on from ships a single replica of it ("replicas: 1" in the
+        // upstream chart's values) — the number its published configuration
+        // document declares as the default of its replica-count key, and the
+        // number an install runs unless its `configurationValues` asks for
+        // another ([`installed_replica_count`]).
+        &[row(
+            WorkloadResource::Deployments,
+            "metrics-server",
+            "metrics-server",
+            1,
+        )],
+    ),
+    (
         "eks-pod-identity-agent",
         &[row(
             WorkloadResource::DaemonSets,
@@ -1148,12 +1183,73 @@ pub fn managed_workloads(
                 namespace: addon.namespace.clone(),
                 name: installed.name.to_string(),
                 image: addon_image(installed.repository, &addon.addon_version, region),
-                replicas: installed.replicas,
+                // How many replicas the install runs: the count its
+                // `configurationValues` document asks for, or the count the build
+                // ships ([`installed_replica_count`]).
+                replicas: installed_replica_count(
+                    installed.replicas,
+                    addon.configuration_values.as_deref(),
+                ),
                 addon: addon_name.clone(),
             });
         }
     }
     workloads
+}
+
+/// How many replicas the Deployment of an add-on named `addon_name` runs when
+/// nothing overrides it: the count the add-on's build SHIPS, as
+/// [`MANAGED_ADDON_WORKLOADS`] states it — and `None` for an add-on that installs
+/// no replicated workload at all, which ships no replica count to publish.
+///
+/// It is the one source for the count the cluster runs and for the `default` the
+/// add-on's published configuration document declares for its replica-count key
+/// ([`super::AddonCatalogRecord::shipped_bounds`]): what a client reads out of
+/// the schema is what the install runs.
+#[must_use]
+pub fn shipped_replica_count(addon_name: &str) -> Option<u64> {
+    let (_, rows) = MANAGED_ADDON_WORKLOADS
+        .iter()
+        .find(|(name, _)| *name == addon_name)?;
+    rows.iter()
+        .find(|installed| !installed.resource.runs_on_every_node())
+        .map(|installed| installed.replicas)
+}
+
+/// How many replicas an install runs: the count its `configurationValues`
+/// document asks for through the replica-count key its schema declares
+/// ([`super::addon_catalog::ADDON_REPLICA_COUNT_KEYS`]), or `shipped` — the count
+/// the build ships — when the document sets none.
+///
+/// "The set of configuration values for the add-on" is what the add-on is
+/// installed WITH, so a value the document sets is the one the cluster runs: the
+/// replicas a client asked for are the replicas it reads back off the workload.
+/// The document is read by the ONE reader the add-on write operations read it with
+/// ([`super::read_addon_configuration`]), so a document written in YAML states the
+/// count exactly as the same document written in JSON does — the form a caller
+/// chose is not what decides what the cluster runs, and nothing here reads a
+/// document that reader would not.
+///
+/// The count is whatever that document states, BOUNDED by the most one workload
+/// runs ([`MAX_REPLICAS_PER_WORKLOAD`]): an install asking for more replicas than
+/// that is REFUSED, because the published document declares that bound as the
+/// key's `maximum` and the install is validated against it
+/// ([`super::AddonCatalogRecord::configuration_violation`]), so no accepted install
+/// reaches this ceiling — it is this STORE's own, because every replica of a
+/// workload is a pod the store holds and a document is not what decides how many
+/// objects it may be asked for.
+#[must_use]
+fn installed_replica_count(shipped: u64, configuration_values: Option<&str>) -> u64 {
+    let super::AddonConfiguration::Read { document, .. } =
+        super::read_addon_configuration(configuration_values)
+    else {
+        return shipped;
+    };
+    super::addon_catalog::ADDON_REPLICA_COUNT_KEYS
+        .iter()
+        .find_map(|key| document.get(*key).and_then(::serde_json::Value::as_u64))
+        .unwrap_or(shipped)
+        .min(MAX_REPLICAS_PER_WORKLOAD)
 }
 
 /// The image an add-on's workload runs: the add-on's repository in the Amazon EKS

@@ -31,11 +31,26 @@
 //! it was sent rather than dropping the ones it does not read. So a manifest this
 //! server would accept validates, and one it would refuse does not — the document
 //! and the admission are one rule.
+//!
+//! That makes the published document THIS SERVER's admission surface rather than a
+//! copy of upstream Kubernetes': where this server requires a member upstream
+//! leaves optional (a workload's `spec` and its pod template) or bounds a value
+//! upstream leaves to the cluster's capacity (a Deployment's replica count, bounded
+//! because every replica is an object this store holds), the document says so, so
+//! that a client validating against it is told what this server will do with the
+//! manifest rather than what another server would.
 
 use super::kubernetes_objects::CORE_API_VERSION;
 use super::kubernetes_rbac::{RBAC_API_GROUP, RBAC_GROUP_VERSION};
 use super::kubernetes_self_subject_review::{
     AUTHENTICATION_API_GROUP, AUTHENTICATION_GROUP_VERSION,
+};
+use super::kubernetes_subject_access_review::{
+    AUTHORIZATION_API_GROUP, AUTHORIZATION_GROUP_VERSION,
+};
+use super::kubernetes_workloads::{
+    WorkloadResource, APPS_API_GROUP, APPS_GROUP_VERSION, DEFAULT_REPLICAS,
+    MAX_REPLICAS_PER_WORKLOAD,
 };
 use super::*;
 
@@ -62,14 +77,23 @@ fn info(kubernetes_version: &str) -> ::serde_json::Value {
 /// one) and the version.
 ///
 /// They are exactly the group versions the routing serves
-/// ([`super::kubernetes_api`]), so a client that reads the index finds a document
-/// for every group version it can address and none for one it cannot.
+/// ([`super::kubernetes_api`]) — the core API and every group the discovery
+/// document beside it names — so a client that reads the index finds a document
+/// for every group version it can address and none for one it cannot. A client
+/// that cannot find the document of the group version its manifest names falls
+/// back to the surface an older server published, and reports that the server
+/// answers nothing it can read rather than sending the object.
 fn published_group_versions() -> Vec<(String, &'static str, &'static str)> {
     vec![
         (
             format!("api/{CORE_API_VERSION}"),
             "",
             CORE_API_VERSION,
+        ),
+        (
+            format!("apis/{APPS_API_GROUP}/{APPS_GROUP_VERSION}"),
+            APPS_API_GROUP,
+            APPS_GROUP_VERSION,
         ),
         (
             format!("apis/{RBAC_API_GROUP}/{RBAC_GROUP_VERSION}"),
@@ -80,6 +104,11 @@ fn published_group_versions() -> Vec<(String, &'static str, &'static str)> {
             format!("apis/{AUTHENTICATION_API_GROUP}/{AUTHENTICATION_GROUP_VERSION}"),
             AUTHENTICATION_API_GROUP,
             AUTHENTICATION_GROUP_VERSION,
+        ),
+        (
+            format!("apis/{AUTHORIZATION_API_GROUP}/{AUTHORIZATION_GROUP_VERSION}"),
+            AUTHORIZATION_API_GROUP,
+            AUTHORIZATION_GROUP_VERSION,
         ),
     ]
 }
@@ -192,6 +221,7 @@ fn schema_name(group: &str, version: &str, kind: &str) -> String {
         "" => format!("io.k8s.api.core.{version}.{kind}"),
         RBAC_API_GROUP => format!("io.k8s.api.rbac.{version}.{kind}"),
         AUTHENTICATION_API_GROUP => format!("io.k8s.api.authentication.{version}.{kind}"),
+        AUTHORIZATION_API_GROUP => format!("io.k8s.api.authorization.{version}.{kind}"),
         other => format!("io.k8s.api.{other}.{version}.{kind}"),
     }
 }
@@ -363,34 +393,7 @@ fn schemas_of(group: &str, version: &str) -> Vec<(String, ::serde_json::Value)> 
     )];
     match (group, version) {
         ("", _) => {
-            let container = schema_name(group, version, "Container");
-            schemas.push((
-                container.clone(),
-                object(
-                    ::serde_json::json!({
-                        "name": { "type": "string" },
-                        "image": { "type": "string" },
-                    }),
-                    // The two members this server requires of a container: a pod
-                    // whose container names neither has no workload to run
-                    // ([`super::kubernetes_pod_spec`]).
-                    &["name", "image"],
-                ),
-            ));
-            let pod_spec = schema_name(group, version, "PodSpec");
-            schemas.push((
-                pod_spec.clone(),
-                object(
-                    ::serde_json::json!({
-                        "containers": list_of(&container),
-                        "serviceAccountName": { "type": "string" },
-                        "serviceAccount": { "type": "string" },
-                        "nodeName": { "type": "string" },
-                    }),
-                    // "There must be at least one container in a Pod".
-                    &["containers"],
-                ),
-            ));
+            let pod_spec = push_pod_spec_schemas(&mut schemas);
             schemas.push(entry(
                 group,
                 version,
@@ -559,7 +562,120 @@ fn schemas_of(group: &str, version: &str) -> Vec<(String, ::serde_json::Value)> 
                 &[],
             ));
         }
+        (AUTHORIZATION_API_GROUP, _) => {
+            // A review states the request it asks about in its `spec`, and this
+            // server refuses one that states none
+            // ([`super::kubernetes_subject_access_review::NO_ATTRIBUTES_MESSAGE`]),
+            // so the schema requires it; the attributes inside it are kept as they
+            // were sent.
+            schemas.push(entry(
+                group,
+                version,
+                "SelfSubjectAccessReview",
+                &[("spec", open_object()), ("status", open_object())],
+                &["spec"],
+            ));
+        }
+        (APPS_API_GROUP, _) => {
+            // The pod template a workload runs is a POD's own spec, validated by
+            // the same admission ([`super::kubernetes_workloads`]), so this
+            // document carries the core group's container and pod-spec schemas
+            // too: a client resolves a `$ref` inside the document it read.
+            let pod_spec = push_pod_spec_schemas(&mut schemas);
+            let template = schema_name("", CORE_API_VERSION, "PodTemplateSpec");
+            schemas.push((
+                template.clone(),
+                object(
+                    ::serde_json::json!({
+                        "metadata": reference(&meta_schema_name("ObjectMeta")),
+                        "spec": reference(&pod_spec),
+                    }),
+                    &[],
+                ),
+            ));
+            let selector = meta_schema_name("LabelSelector");
+            schemas.push((
+                selector.clone(),
+                object(::serde_json::json!({ "matchLabels": string_map() }), &[]),
+            ));
+            for resource in WorkloadResource::all() {
+                let kind = resource.kind();
+                let spec_name = schema_name(group, version, &format!("{kind}Spec"));
+                let mut properties = ::serde_json::json!({
+                    "selector": reference(&selector),
+                    "template": reference(&template),
+                });
+                // Only a workload that runs a NUMBER of replicas declares one, and
+                // it declares the count this server runs for a spec that names none
+                // and the most it serves — the bound a create past it is refused
+                // with.
+                if !resource.runs_on_every_node() {
+                    properties["replicas"] = ::serde_json::json!({
+                        "type": "integer",
+                        "default": DEFAULT_REPLICAS,
+                        "maximum": MAX_REPLICAS_PER_WORKLOAD,
+                    });
+                }
+                schemas.push((
+                    spec_name.clone(),
+                    // The pod template is the one member a workload is refused
+                    // without: "a workload with no pod template is a workload with
+                    // no work".
+                    object(properties, &["template"]),
+                ));
+                schemas.push(entry(
+                    group,
+                    version,
+                    kind,
+                    &[
+                        ("spec", reference(&spec_name)),
+                        ("status", open_object()),
+                    ],
+                    &["spec"],
+                ));
+            }
+        }
         _ => {}
     }
     schemas
+}
+
+/// The schemas of a POD's own spec — the container list and the pod spec that
+/// carries it — pushed onto `schemas`, with the name of the pod-spec schema
+/// returned.
+///
+/// They are the CORE group's types, and the documents of every group version whose
+/// objects carry a pod template declare them too: a client resolves a `$ref`
+/// inside the one document it read, so a reference to a schema that document does
+/// not carry resolves to nothing.
+fn push_pod_spec_schemas(schemas: &mut Vec<(String, ::serde_json::Value)>) -> String {
+    let container = schema_name("", CORE_API_VERSION, "Container");
+    schemas.push((
+        container.clone(),
+        object(
+            ::serde_json::json!({
+                "name": { "type": "string" },
+                "image": { "type": "string" },
+            }),
+            // The two members this server requires of a container: a pod
+            // whose container names neither has no workload to run
+            // ([`super::kubernetes_pod_spec`]).
+            &["name", "image"],
+        ),
+    ));
+    let pod_spec = schema_name("", CORE_API_VERSION, "PodSpec");
+    schemas.push((
+        pod_spec.clone(),
+        object(
+            ::serde_json::json!({
+                "containers": list_of(&container),
+                "serviceAccountName": { "type": "string" },
+                "serviceAccount": { "type": "string" },
+                "nodeName": { "type": "string" },
+            }),
+            // "There must be at least one container in a Pod".
+            &["containers"],
+        ),
+    ));
+    pod_spec
 }
