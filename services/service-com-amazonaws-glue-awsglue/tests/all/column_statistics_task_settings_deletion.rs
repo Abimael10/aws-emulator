@@ -51,11 +51,15 @@ fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 /// read off the request. The same sentence the read answers with, because it is the same
 /// entry, addressed the same way — and the same one for every way the address can miss, the
 /// pair that names no stored table included.
-const SETTINGS_MISS_MESSAGE: &str =
+///
+/// Shared with [`crate::column_statistics_task_settings_delete_admission`], which holds the
+/// absences a REFUSED create leaves behind to the same refusal, so one copy of the sentence
+/// serves both suites.
+pub(crate) const SETTINGS_MISS_MESSAGE: &str =
     "ColumnStatisticsTaskSettings entry for input DatabaseName and TableName does not exist";
 
 /// The delete body addressing one entry, plus whatever `extra` adds (a `CatalogID`).
-fn delete_body(database: &str, table: &str, extra: Value) -> Value {
+pub(crate) fn delete_body(database: &str, table: &str, extra: Value) -> Value {
     let mut body = json!({ "DatabaseName": database, "TableName": table });
     if let Some(members) = extra.as_object() {
         for (member, value) in members {
@@ -67,7 +71,7 @@ fn delete_body(database: &str, table: &str, extra: Value) -> Value {
 
 /// Delete one entry, asserting the operation answers 200 with a body carrying no member of
 /// its own (`DeleteColumnStatisticsTaskSettingsResponse` declares none).
-async fn delete_settings(router: &MultiServiceRouter, body: &Value) {
+pub(crate) async fn delete_settings(router: &MultiServiceRouter, body: &Value) {
     let answered = ok(router, "DeleteColumnStatisticsTaskSettings", body).await;
     let empty = answered
         .as_object()
@@ -80,7 +84,7 @@ async fn delete_settings(router: &MultiServiceRouter, body: &Value) {
 }
 
 /// Assert the read of this address is the modelled miss carrying `message`.
-async fn assert_read_is_miss(
+pub(crate) async fn assert_read_is_miss(
     router: &MultiServiceRouter,
     case: &str,
     body: &Value,
@@ -106,7 +110,7 @@ async fn assert_read_is_miss(
 }
 
 /// Assert the delete of this address is the modelled miss carrying `message`.
-async fn assert_delete_is_miss(
+pub(crate) async fn assert_delete_is_miss(
     router: &MultiServiceRouter,
     case: &str,
     body: &Value,
