@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The WORDING of eleven families of EC2 refusal, driven over the wire the service actually
+//! The WORDING of twelve families of EC2 refusal, driven over the wire the service actually
 //! speaks: `ec2Query` — an `application/x-www-form-urlencoded` POST carrying
 //! `Action=<operation>`, answered with XML (README.md / OPERATIONS.md "Wire protocol").
 //!
@@ -1007,4 +1007,114 @@ async fn a_page_size_outside_the_published_range_is_refused_in_aws_words() {
     ] {
         ok(case, &router, action, &params).await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Family 12: the two sentences that word an unknown local gateway id
+// ---------------------------------------------------------------------------
+
+/// A `LocalGatewayId` the account holds no local gateway for is refused
+/// `InvalidLocalGatewayID.NotFound` by every operation that resolves one, each with ITS OWN of
+/// the two sentences EC2 words that code with: `CreateLocalGatewayRouteTable` names the
+/// resource by the API's own name — `The LocalGateway ID '<id>' does not exist` — where the
+/// other readers of that id name it by the `ResourceType` member it is tagged under, `The
+/// local-gateway ID '<id>' does not exist`. Which sentence a caller gets is a fact of the
+/// OPERATION; the id the REQUEST named is the only variable part of either.
+///
+/// The rows span both planes, more than one operation of the second (the tag plane resolves
+/// the id out of a `Resources` entry rather than out of a `LocalGatewayId` member), and the
+/// ways an id is not the account's: both published EC2 id suffix lengths with digits nothing
+/// was created for, and a long-form id differing from the gateway the account DOES hold in its
+/// last digit only.
+#[tokio::test]
+async fn each_plane_words_an_unknown_local_gateway_its_own_way() {
+    let (router, engine) = super::ec2_query::emulator();
+
+    // A gateway the account really holds, so each refusal below is a verdict about the id the
+    // request carried rather than about an account that holds no Outpost at all. No EC2
+    // operation creates a local gateway, so it is placed through the store's own seam.
+    let held = {
+        let store = engine.state::<Ec2State>();
+        let mut guard = store.lock();
+        guard
+            .insert_local_gateway(ec2::state::LocalGatewaySpec {
+                outpost_arn: format!(
+                    "arn:aws:outposts:{REGION}:{}:outpost/op-00000000000000001",
+                    engine::emulator_account_id()
+                ),
+                state: "available".to_string(),
+                tags: Vec::new(),
+            })
+            .expect("a fresh store must take one seeded local gateway")
+    };
+
+    // (case, the id the request names)
+    let unknown: [(&str, String); 3] = [
+        (
+            "a long-form id nothing was placed for",
+            "lgw-0123456789abcdef0".to_string(),
+        ),
+        ("a short-form id nothing holds", "lgw-0badf00d".to_string()),
+        ("the held gateway's id with its last digit changed", {
+            let (head, last) = held.split_at(held.len() - 1);
+            let changed = if last == "f" { "0" } else { "f" };
+            format!("{head}{changed}")
+        }),
+    ];
+
+    for (case, local_gateway_id) in unknown {
+        assert_refusal(
+            &format!("CreateLocalGatewayRouteTable for {case}"),
+            &router,
+            "CreateLocalGatewayRouteTable",
+            &[param("LocalGatewayId", &local_gateway_id)],
+            "InvalidLocalGatewayID.NotFound",
+            &format!("The LocalGateway ID '{local_gateway_id}' does not exist"),
+        )
+        .await;
+
+        // The other plane: the operations that name the resource by its tagging
+        // `ResourceType`, one resolving the id out of a `LocalGatewayId` member and one out of
+        // a tagging request's `Resources`.
+        let other_plane: [(&str, Vec<Param>); 2] = [
+            (
+                "CreateLocalGatewayVirtualInterfaceGroup",
+                vec![param("LocalGatewayId", &local_gateway_id)],
+            ),
+            (
+                "CreateTags",
+                vec![
+                    param("ResourceId.1", &local_gateway_id),
+                    param("Tag.1.Key", "Name"),
+                    param("Tag.1.Value", "outpost-rack"),
+                ],
+            ),
+        ];
+        for (action, params) in other_plane {
+            assert_refusal(
+                &format!("{action} for {case}"),
+                &router,
+                action,
+                &params,
+                "InvalidLocalGatewayID.NotFound",
+                &format!("The local-gateway ID '{local_gateway_id}' does not exist"),
+            )
+            .await;
+        }
+    }
+
+    // The gateway the account DOES hold is served by the very operation whose sentence the
+    // rows above pinned, so neither sentence is the answer to every id.
+    let created = ok(
+        "the held gateway",
+        &router,
+        "CreateLocalGatewayRouteTable",
+        &[param("LocalGatewayId", &held)],
+    )
+    .await;
+    assert_eq!(
+        element(&created, "localGatewayId").as_deref(),
+        Some(held.as_str()),
+        "the held gateway {held} must serve a create, got {created}"
+    );
 }
