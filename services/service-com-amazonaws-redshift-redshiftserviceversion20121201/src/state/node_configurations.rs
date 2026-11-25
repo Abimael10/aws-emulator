@@ -70,6 +70,7 @@ pub const NODE_CONFIGURATION_MAX_RECORDS_WINDOW: MaxRecordsWindow = MaxRecordsWi
     default: 500,
     min: 100,
     max: 500,
+    above_maximum: AboveWindowMaximum::Served,
 };
 
 /// Why an action whose source the request did not name is refused, naming the

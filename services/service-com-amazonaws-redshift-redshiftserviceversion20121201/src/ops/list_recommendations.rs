@@ -6,8 +6,9 @@
 //! clusters this request scopes the read to — the one cluster a
 //! `ClusterIdentifier` or a `NamespaceArn` names, or every cluster of the
 //! account when it names neither — paged with this service's shared `Marker` /
-//! `MaxRecords` cursor. A report: the only write it makes is the clock-owed
-//! cluster transitions `settle` materialises.
+//! `MaxRecords` cursor, under this operation's OWN page-size window
+//! ([`crate::state::RECOMMENDATION_MAX_RECORDS_WINDOW`]). A report: the only
+//! write it makes is the clock-owed cluster transitions `settle` materialises.
 //!
 //! An Advisor recommendation is an observation ALREADY MADE of a cluster: it
 //! comes from analysing that cluster's workload — its query and table history —
@@ -261,11 +262,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        let (start, end, next_marker) =
-            match st::page_bounds(input.marker.as_deref(), input.max_records, matched.len()) {
-                Ok(page) => page,
-                Err(message) => return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(message)),
-            };
+        // The page size is judged against THIS operation's own `MaxRecords`
+        // window ([`st::RECOMMENDATION_MAX_RECORDS_WINDOW`]), not the one the
+        // `Describe*` family publishes, and the refusal names that window's own
+        // two bounds.
+        let (start, end, next_marker) = match st::page_bounds_within(
+            st::RECOMMENDATION_MAX_RECORDS_WINDOW,
+            input.marker.as_deref(),
+            input.max_records,
+            matched.len(),
+        ) {
+            Ok(page) => page,
+            Err(message) => {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    message,
+                ))
+            }
+        };
 
         Ok(ListRecommendationsOutput {
             recommendations: Some(

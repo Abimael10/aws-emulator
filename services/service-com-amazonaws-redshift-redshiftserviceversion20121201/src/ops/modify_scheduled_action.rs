@@ -12,7 +12,8 @@
 //! ([`crate::state::scheduler_role_is_invalid`]). Only then are the caller's own
 //! values read — a `Schedule` has to be a schedule this service reads
 //! ([`crate::state::parse_scheduled_action_schedule`]) and a `TargetAction` has
-//! to name exactly one supported operation against a cluster this account holds
+//! to name exactly one supported operation (the cluster it names is resolved
+//! when the schedule fires, not here)
 //! — so a modify of an action that is not there reports the missing action
 //! rather than a complaint about a value that would never be stored.
 //!
@@ -202,9 +203,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ///
     /// Nothing is awaited while the store is locked: the one dependency that is
     /// another service's — the IAM role the action would run as — is resolved
-    /// with no lock held, and every dependency resolved under the lock (the
-    /// action itself and the cluster a new target action names) is a record of
-    /// THIS service.
+    /// with no lock held, and the one dependency resolved under the lock (the
+    /// action itself) is a record of THIS service.
     async fn handle(
         &self,
         input: Self::Input,
@@ -282,45 +282,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // A new target action has to name exactly one supported operation, and
-        // the cluster it would run against is resolved below.
-        let target = match input.target_action.as_ref() {
-            None => None,
-            Some(target) => match st::scheduled_action_target(target) {
-                Some((_, cluster)) => Some(cluster.to_string()),
-                None => {
-                    return Err(
-                        ModifyScheduledActionErrorModeled::InvalidScheduledActionFault(
-                            InvalidScheduledActionFault {
-                                message: Some(st::invalid_scheduled_action_message()),
-                            },
-                        )
-                        .into(),
-                    )
-                }
-            },
-        };
+        // A new target action has to name exactly one supported operation. The
+        // cluster it names is NOT resolved: the operation the action triggers
+        // resolves its own `ClusterIdentifier` when the schedule fires, so an
+        // action may target a cluster that is not there yet — the same rule the
+        // create registers one under.
+        if input
+            .target_action
+            .as_ref()
+            .is_some_and(|target| st::scheduled_action_target(target).is_none())
+        {
+            return Err(
+                ModifyScheduledActionErrorModeled::InvalidScheduledActionFault(
+                    InvalidScheduledActionFault {
+                        message: Some(st::invalid_scheduled_action_message()),
+                    },
+                )
+                .into(),
+            );
+        }
 
         let mut store = state.lock();
         store.settle(::service_common::clock::now(&*self.engine));
-
-        if let Some(cluster_identifier) = target.as_deref() {
-            if store.cluster_position(cluster_identifier).is_none() {
-                return Err(ModifyScheduledActionErrorModeled::ClusterNotFoundFault(
-                    ClusterNotFoundFault {
-                        // No recorded refusal gives this operation a sentence of
-                        // its own, so it carries the one every other
-                        // cluster-scoped operation does — see the per-operation
-                        // catalog [`st::ClusterNotFoundWording`].
-                        message: Some(st::cluster_not_found_message(
-                            st::ClusterNotFoundWording::IdentifierThenNotFound,
-                            cluster_identifier,
-                        )),
-                    },
-                )
-                .into());
-            }
-        }
 
         // Resolved again under THIS lock: the lookup above was taken under a
         // lock that has been released, so the position the write uses is one

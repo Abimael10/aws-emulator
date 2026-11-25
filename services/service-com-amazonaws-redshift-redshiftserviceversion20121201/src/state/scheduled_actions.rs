@@ -268,15 +268,15 @@ pub fn invalid_scheduled_action_message() -> String {
 /// Why a create under a name the account already holds a scheduled action under
 /// is refused, naming the action the request asked for.
 ///
-/// The NAME "must be unique within an account"
-/// (`smithy_query(query="doc", shape="CreateScheduledActionMessage",
-/// member="ScheduledActionName")`), so the refusal names it — single-quoted, as
-/// this family words an identifier it reports back inside a sentence (see
-/// [`snapshot_copy_grant_already_exists_message`]).
+/// Amazon Redshift's wording for this fault: the fixed text is
+/// `The scheduled action ` and ` already exists.`, with the name the request
+/// carried as the one variable part — the same shape of sentence the sibling
+/// refusal for an action nobody holds carries
+/// ([`scheduled_action_not_found_message`]), as the NAME "must be unique within
+/// an account" (`smithy_query(query="doc",
+/// shape="CreateScheduledActionMessage", member="ScheduledActionName")`).
 pub fn scheduled_action_already_exists_message(name: &str) -> String {
-    format!(
-        "Cannot create the scheduled action because an action with the name '{name}' already exists."
-    )
+    format!("The scheduled action {name} already exists.")
 }
 
 /// Why a create past [`SCHEDULED_ACTION_QUOTA`] is refused.

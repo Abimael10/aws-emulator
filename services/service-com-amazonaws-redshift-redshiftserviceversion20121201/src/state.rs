@@ -3540,17 +3540,39 @@ fn marker_offset(cursor: &str) -> Option<usize> {
     (tag == short_digest(&format!("marker/{offset}"), 8)).then_some(offset)
 }
 
+/// Whether a `MaxRecords` ABOVE the window's published maximum is served or
+/// refused.
+///
+/// The `Describe*` family's recorded behaviour is to SERVE such a request,
+/// clamped to the window's maximum: the published window is the page size a
+/// paginating client is told to stay inside, not a bound the service turns a
+/// larger request away at. `ListRecommendations` is recorded doing the other
+/// thing — refusing a page size past its own maximum, naming that window's two
+/// bounds — so which of the two a window means is an attribute of the window
+/// rather than of the pager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AboveWindowMaximum {
+    /// A page size above the maximum is served, clamped to it.
+    Served,
+    /// A page size above the maximum is refused
+    /// ([`max_records_out_of_window_message`]).
+    Refused,
+}
+
 /// The `MaxRecords` window one paginated operation accepts: the page size it
 /// uses when the request carries none, the smallest page a request may ask for,
-/// and the largest page the published window names.
+/// the largest page the published window names, and what a request for a bigger
+/// page than that gets.
 ///
-/// A window rather than three bare constants because the operations do NOT all
+/// A window rather than four bare constants because the operations do NOT all
 /// share one: most Redshift `Describe*` operations publish the 20..100 window of
 /// [`MAX_RECORDS_WINDOW`], while `DescribeTags` publishes its own
-/// ([`TAG_MAX_RECORDS_WINDOW`]).
+/// ([`TAG_MAX_RECORDS_WINDOW`]) and `ListRecommendations` its own again
+/// ([`RECOMMENDATION_MAX_RECORDS_WINDOW`]).
 ///
-/// Only [`MaxRecordsWindow::min`] is a refusal; [`MaxRecordsWindow::max`] caps
-/// the page served. See [`page_bounds_within`].
+/// [`MaxRecordsWindow::min`] is always a refusal; what
+/// [`MaxRecordsWindow::max`] means is [`MaxRecordsWindow::above_maximum`]. See
+/// [`page_bounds_within`].
 #[derive(Debug, Clone, Copy)]
 pub struct MaxRecordsWindow {
     /// The page size a request that names no `MaxRecords` gets.
@@ -3558,10 +3580,11 @@ pub struct MaxRecordsWindow {
     /// The smallest `MaxRecords` a request may name.
     pub min: i32,
     /// The largest page the published window names, and the most records one
-    /// page carries: the page a request that names no size is served, and the
-    /// page a request naming MORE is clamped to (see [`page_bounds_within`]) —
-    /// a value past it is not refused.
+    /// page carries.
     pub max: i32,
+    /// What a `MaxRecords` above [`Self::max`] gets (see
+    /// [`page_bounds_within`]).
+    pub above_maximum: AboveWindowMaximum,
 }
 
 /// The window [`page_bounds`] applies: the one every paginated Redshift
@@ -3571,6 +3594,7 @@ pub const MAX_RECORDS_WINDOW: MaxRecordsWindow = MaxRecordsWindow {
     default: MAX_RECORDS_DEFAULT,
     min: MAX_RECORDS_MIN,
     max: MAX_RECORDS_MAX,
+    above_maximum: AboveWindowMaximum::Served,
 };
 
 /// `DescribeTags`'s own `MaxRecords` window.
@@ -3586,6 +3610,29 @@ pub const TAG_MAX_RECORDS_WINDOW: MaxRecordsWindow = MaxRecordsWindow {
     default: 50,
     min: 10,
     max: 50,
+    above_maximum: AboveWindowMaximum::Served,
+};
+
+/// `ListRecommendations`'s own `MaxRecords` window.
+///
+/// The model bounds the member with no range trait
+/// (`smithy_query(query="operation", operation="ListRecommendations")` —
+/// `MaxRecords` is an `IntegerOptional` and the operation's `pageSize`), so the
+/// window is recorded behaviour: this operation accepts a `MaxRecords` of nought
+/// — answering an empty page — and refuses a bigger one, naming its own two
+/// bounds in the sentence. So both bounds are nought and a page size above the
+/// maximum is REFUSED rather than served clamped
+/// ([`AboveWindowMaximum::Refused`]), which is what distinguishes this window
+/// from the `Describe*` family's.
+///
+/// The two bounds judge a `MaxRecords` the REQUEST names; a request that names
+/// none asks for no page size at all and is served this family's default page,
+/// exactly as on every other window.
+pub const RECOMMENDATION_MAX_RECORDS_WINDOW: MaxRecordsWindow = MaxRecordsWindow {
+    default: MAX_RECORDS_DEFAULT,
+    min: 0,
+    max: 0,
+    above_maximum: AboveWindowMaximum::Refused,
 };
 
 /// Why a `MaxRecords` outside the window the operation publishes is refused.
@@ -3604,14 +3651,17 @@ pub fn max_records_out_of_window_message(window: MaxRecordsWindow) -> String {
 /// Resolve one page of `total` records from the request's `Marker` / `MaxRecords`,
 /// under the `MaxRecords` window of the operation serving it.
 ///
-/// Only the window's MINIMUM is a refusal: a `MaxRecords` below it is refused,
-/// while one above the window's published maximum is SERVED — the published
-/// window is the page size a paginating client is told to stay inside, not a
-/// bound the service turns a larger request away at, so refusing a bigger page
-/// would refuse a call the service serves.
+/// The window's MINIMUM is always a refusal. What a `MaxRecords` above its
+/// maximum gets is the window's own
+/// ([`MaxRecordsWindow::above_maximum`]): for the `Describe*` family it is
+/// SERVED — the published window is the page size a paginating client is told to
+/// stay inside, not a bound the service turns a larger request away at, so
+/// refusing a bigger page would refuse a call the service serves — while an
+/// operation recorded refusing it is refused with the same out-of-window
+/// sentence a page size below the minimum earns.
 ///
-/// The page it is served is the window's maximum: that value is the most records
-/// one page carries, so a request for more is answered with a full page and a
+/// A served page is the window's maximum: that value is the most records one
+/// page carries, so a request for more is answered with a full page and a
 /// `Marker` for the rest. Clamping rather than honouring the number keeps the
 /// records one request materialises proportional to the window instead of to the
 /// whole collection, which is what each caller's page is copied and serialised
@@ -3634,6 +3684,11 @@ pub fn page_bounds_within(
 ) -> Result<(usize, usize, Option<String>), String> {
     let page_size = match max_records {
         None => window.default,
+        Some(value)
+            if value > window.max && window.above_maximum == AboveWindowMaximum::Refused =>
+        {
+            return Err(max_records_out_of_window_message(window))
+        }
         Some(value) if value >= window.min => value.min(window.max),
         Some(_) => return Err(max_records_out_of_window_message(window)),
     };

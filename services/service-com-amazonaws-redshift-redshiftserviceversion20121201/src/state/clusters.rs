@@ -261,6 +261,20 @@ pub fn invalid_cluster_state_message(cluster_identifier: &str, status: &str) -> 
     format!("Cluster {cluster_identifier} is in state {status}; it must be {STATUS_AVAILABLE}.")
 }
 
+/// Why a `RebootCluster` cannot be served as the cluster stands.
+///
+/// Recorded Amazon Redshift wording for this operation's
+/// `InvalidClusterStateFault` (awsQuery code `InvalidClusterState`): the fixed
+/// text is `Cluster ` and ` is not in available state to reboot.`, and the
+/// cluster the request named is the one variable part — the sentence does NOT
+/// name the state the cluster is in, unlike the shared
+/// [`invalid_cluster_state_message`] every operation whose precondition is only
+/// "available" answers. One sentence for every state a restart cannot start from,
+/// the way [`PAUSE_REQUIRES_ACTIVE_CLUSTER`] covers every state a pause cannot.
+pub fn reboot_requires_available_cluster_message(cluster_identifier: &str) -> String {
+    format!("Cluster {cluster_identifier} is not in {STATUS_AVAILABLE} state to reboot.")
+}
+
 /// The IAM role associations a cluster reports for `arns`, each at `apply_status`.
 ///
 /// One rule for every path that puts roles on a cluster (`CreateCluster`,
@@ -278,6 +292,64 @@ where
             apply_status: Some(apply_status.to_string()),
         })
         .collect()
+}
+
+/// How many IAM roles ONE cluster may have associated with it.
+///
+/// `smithy_query(query="doc", operation="ModifyClusterIamRoles")` — "The maximum
+/// number of IAM roles that you can associate is subject to a quota. For more
+/// information, go to Quotas and limits in the Amazon Redshift Cluster Management
+/// Guide": the operation publishes the ceiling by reference, and the recorded
+/// refusal shows what it is — associating exactly fifty roles is served and the
+/// next one is refused. Unlike this store's own bounds, this is Amazon
+/// Redshift's quota, so it is stated as a number of roles and reported in the
+/// refusal's own sentence ([`cluster_iam_role_quota_message`]).
+pub const CLUSTER_IAM_ROLE_QUOTA: usize = 50;
+
+/// Why a request that would take a cluster past [`CLUSTER_IAM_ROLE_QUOTA`] is
+/// refused.
+///
+/// Amazon Redshift's own wording for this error class: the fixed text is
+/// `Cluster already has `, ` IAM Roles. Only ` and
+/// ` new IAM Role(s) may be added to this Cluster.`, with the number of roles
+/// the cluster already carries and the headroom left (nil at the ceiling) read
+/// off the cluster's own state. The sentence names neither the cluster nor the
+/// roles the request asked for.
+pub fn cluster_iam_role_quota_message(associated: usize) -> String {
+    let remaining = CLUSTER_IAM_ROLE_QUOTA.saturating_sub(associated);
+    format!(
+        "Cluster already has {associated} IAM Roles. \
+         Only {remaining} new IAM Role(s) may be added to this Cluster."
+    )
+}
+
+/// Whether associating `add` with a cluster that already carries `associated`
+/// stays inside [`CLUSTER_IAM_ROLE_QUOTA`], and the refusal when it does not.
+///
+/// ONE rule for every path that associates a role with a cluster
+/// (`ModifyClusterIamRoles`, and the `IamRoles` a `CreateCluster` or a
+/// `RestoreFromClusterSnapshot` starts the cluster with), so none of them can
+/// leave a cluster holding more roles than Amazon Redshift admits. The list is a
+/// SET keyed by role ARN ([`apply_iam_role_changes`]), so a role the cluster
+/// already carries and a role named twice in one request are not new
+/// associations and do not count against the headroom.
+pub fn check_cluster_iam_role_ceiling(
+    associated: &[ClusterIamRole],
+    add: &[String],
+) -> Result<(), String> {
+    let mut new: Vec<&str> = Vec::new();
+    for arn in add {
+        let held = associated
+            .iter()
+            .any(|role| role.iam_role_arn.as_deref() == Some(arn.as_str()));
+        if !held && !new.contains(&arn.as_str()) {
+            new.push(arn);
+        }
+    }
+    if associated.len().saturating_add(new.len()) > CLUSTER_IAM_ROLE_QUOTA {
+        return Err(cluster_iam_role_quota_message(associated.len()));
+    }
+    Ok(())
 }
 
 /// Associate `add` and disassociate `remove` on a cluster's IAM role list.

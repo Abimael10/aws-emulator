@@ -403,7 +403,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     RestoreTableFromClusterSnapshotErrorModeled::InvalidTableRestoreArgumentFault(
                         InvalidTableRestoreArgumentFault {
-                            message: Some(st::invalid_table_restore_argument_message(&absent)),
+                            message: Some(st::invalid_table_restore_argument_message(
+                                &absent,
+                                &input.source_table_name,
+                            )),
                         },
                     )
                     .into(),

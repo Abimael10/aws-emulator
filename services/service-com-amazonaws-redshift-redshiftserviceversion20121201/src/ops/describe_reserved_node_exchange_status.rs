@@ -201,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     DescribeReservedNodeExchangeStatusErrorModeled::ReservedNodeExchangeNotFoundFault(
                         ReservedNodeExchangeNotFoundFault {
-                            message: Some(st::reserved_node_exchange_not_found_message(request_id)),
+                            message: Some(st::RESERVED_NODE_EXCHANGE_NOT_FOUND.to_string()),
                         },
                     )
                     .into(),
@@ -214,7 +214,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // except that a reservation's state is no bar to READING its exchanges:
         // being exchanged is exactly what a caller polls this operation about.
         if let Some(reserved_node_id) = input.reserved_node_id.as_deref() {
-            if let Err(refusal) = store.held_reserved_node(reserved_node_id) {
+            // This operation words the refusal by the MEMBER the value arrived
+            // on, as its own recorded refusal shows and as the other READ of a
+            // reservation does — the exchange operations word the same fault
+            // about the resource (see [`st::ReservedNodeNotFoundWording`]).
+            if let Err(refusal) = store.held_reserved_node_worded(
+                reserved_node_id,
+                st::ReservedNodeNotFoundWording::MemberThenValue,
+            ) {
                 return Err(refuse(refusal));
             }
         }

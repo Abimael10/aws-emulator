@@ -380,25 +380,57 @@ pub fn reserved_node_of_offering(
 /// Which operations word their refusal this way is an attribute of the
 /// OPERATION, exactly as it is for `ClusterNotFoundFault` (see
 /// [`ClusterNotFoundWording`]): recorded refusals of
-/// `DescribeReservedNodeOfferings`, `PurchaseReservedNodeOffering` and
-/// `DescribeReservedNodes` show this sentence, while the reserved-node EXCHANGE
-/// operations are recorded answering the resource-named sentence of
-/// [`reserved_node_not_found_message`] instead. One helper per sentence, so no
-/// operation can quietly inherit another one's.
+/// `DescribeReservedNodeOfferings`, `PurchaseReservedNodeOffering`,
+/// `DescribeReservedNodes` and `DescribeReservedNodeExchangeStatus` show this
+/// sentence, while the operations that EXCHANGE a reservation are recorded
+/// answering the resource-named sentence
+/// ([`ReservedNodeNotFoundWording::ReservedNodeThenValue`]) instead. One helper
+/// per sentence, so no operation can quietly inherit another one's.
 pub fn member_value_not_found_message(member: &str, value: &str) -> String {
     format!("{member} {value} not found.")
 }
 
-/// What a reserved-node EXCHANGE operation naming a `ReservedNodeId` answers
-/// when the account holds no reservation under it: the resource named in prose,
-/// the identifier the request asked for, then ` not found.`.
+/// Which sentence a `ReservedNodeNotFoundFault` is worded with.
 ///
-/// Shared by every exchange operation that looks a reservation up, so a client
-/// sees one message for one condition across that family. It is NOT the sentence
-/// `DescribeReservedNodes` answers about the same member — see
-/// [`member_value_not_found_message`] for why the two differ.
-pub fn reserved_node_not_found_message(reserved_node_id: &str) -> String {
-    format!("Reserved Node {reserved_node_id} not found.")
+/// The same split as [`ClusterNotFoundWording`]: the fault's status (404) and
+/// awsQuery code (`ReservedNodeNotFound`) are what the model fixes, while the
+/// fixed text around the identifier is an attribute of the OPERATION — recorded
+/// refusals show the exchange operations that look a reservation up answering the
+/// resource-named sentence, and the two operations that REPORT on a reservation
+/// (`DescribeReservedNodes`, `DescribeReservedNodeExchangeStatus`) answering the
+/// member-named one. Naming each wording here keeps the choice at the handler
+/// that makes it, so no operation can quietly inherit another one's sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservedNodeNotFoundWording {
+    /// `Reserved Node <ReservedNodeId> not found.` — the resource named in
+    /// prose, which is what the operations that EXCHANGE a reservation
+    /// (`GetReservedNodeExchangeOfferings`, `AcceptReservedNodeExchange`, the
+    /// reserved-node arm of `ResizeCluster`) answer.
+    ReservedNodeThenValue,
+    /// `ReservedNodeId <ReservedNodeId> not found.` — the input MEMBER the value
+    /// arrived on as the prefix ([`member_value_not_found_message`]), which is
+    /// what `DescribeReservedNodeExchangeStatus` is recorded answering, as
+    /// `DescribeReservedNodes` does about the same member.
+    MemberThenValue,
+}
+
+/// What an operation naming a `ReservedNodeId` answers when the account holds no
+/// reservation under it, in the sentence `wording` words.
+///
+/// One helper per fault, so the two sentences stay side by side and an operation
+/// states which of them it answers.
+pub fn reserved_node_not_found_message(
+    wording: ReservedNodeNotFoundWording,
+    reserved_node_id: &str,
+) -> String {
+    match wording {
+        ReservedNodeNotFoundWording::ReservedNodeThenValue => {
+            format!("Reserved Node {reserved_node_id} not found.")
+        }
+        ReservedNodeNotFoundWording::MemberThenValue => {
+            member_value_not_found_message(MEMBER_RESERVED_NODE_ID, reserved_node_id)
+        }
+    }
 }
 
 /// The input member a reservation is named through.
@@ -538,12 +570,17 @@ pub fn new_reserved_node_exchange_request_id() -> String {
     crate::service::query_error_envelope::new_request_id()
 }
 
-/// What an operation naming a `ReservedNodeExchangeRequestId` answers when this
-/// account asked for no such exchange, worded like the sibling refusal for a
-/// reservation id nobody holds ([`reserved_node_not_found_message`]).
-pub fn reserved_node_exchange_not_found_message(request_id: &str) -> String {
-    format!("Reserved Node Exchange Request {request_id} not found.")
-}
+/// What the exchange-status read answers a `ReservedNodeExchangeRequestId` this
+/// account asked for no exchange under.
+///
+/// Amazon Redshift's wording for this fault, as the recorded refusal shows:
+/// wholly FIXED text naming the resource the read reports on, with no variable
+/// part — the id the request carried is not echoed, so a caller matching the
+/// sentence sees the same one whatever it asked about. That is what distinguishes
+/// it from the sibling refusal for a reservation id nobody holds
+/// ([`reserved_node_not_found_message`]), which interpolates its value.
+pub const RESERVED_NODE_EXCHANGE_NOT_FOUND: &str =
+    "The reserved-node exchange status was not found.";
 
 /// What the exchange-status read answers a request that names NEITHER of the two
 /// optional filters that say which exchanges to report.

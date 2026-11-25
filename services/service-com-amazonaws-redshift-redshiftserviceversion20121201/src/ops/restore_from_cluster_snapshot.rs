@@ -665,6 +665,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreFromCluste
             );
         }
 
+        // A restore starts the cluster with the roles `IamRoles` names
+        // associated, and a cluster carries at most as many associated roles as
+        // Amazon Redshift's quota admits: the same ceiling an association is held
+        // to later ([`st::check_cluster_iam_role_ceiling`]), asked here of a
+        // cluster that carries none yet.
+        if let Err(message) =
+            st::check_cluster_iam_role_ceiling(&[], &input.iam_roles.clone().unwrap_or_default())
+        {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(message));
+        }
+
         let mut store = state.lock();
         store.settle(started);
 

@@ -459,31 +459,22 @@ async fn an_action_this_account_does_not_hold_is_not_found_for_every_operation_n
 }
 
 #[tokio::test]
-async fn a_create_naming_no_cluster_or_no_single_target_action_is_refused() {
+async fn a_create_naming_no_single_target_action_is_refused() {
     let emulator = Emulator::new();
     available_cluster(&emulator, "target-cluster").await;
 
-    // A target action naming a cluster this account does not hold.
-    let missing_cluster =
+    // A target action naming a cluster this account does not hold is SERVED: the
+    // target cluster is resolved when the schedule fires, not when the action is
+    // registered, so an action can be registered before (or independently of)
+    // the cluster it targets. The dedicated table for that rule lives in
+    // [`crate::scheduled_action_target_cluster`].
+    let absent_cluster =
         create_pause_action(&emulator, "no-cluster-action", "no-such-cluster", WEEKLY_CRON).await;
     assert_eq!(
-        (
-            missing_cluster.status,
-            missing_cluster.error_code().as_deref()
-        ),
-        (404, Some("ClusterNotFound")),
-        "case a target action naming no cluster of this account: expected 404 ClusterNotFound, \
-         got {} / {:?} with body {}",
-        missing_cluster.status,
-        missing_cluster.error_code(),
-        missing_cluster.body
-    );
-    assert_eq!(
-        missing_cluster.text("Message").as_deref(),
-        Some("Cluster no-such-cluster not found."),
-        "case a target action naming no cluster of this account: expected the identifier in the \
-         sentence, got {:?}",
-        missing_cluster.text("Message")
+        absent_cluster.status, 200,
+        "case a target action naming no cluster of this account: expected the registration to \
+         be served, got {} with body {}",
+        absent_cluster.status, absent_cluster.body
     );
 
     // A `TargetAction` naming two operations, and one naming three: an action
@@ -602,6 +593,16 @@ async fn a_second_action_under_one_name_is_refused_and_the_first_is_unchanged() 
         second.status,
         second.error_code(),
         second.body
+    );
+    // AWS's own sentence for this fault: `The scheduled action `, the name the
+    // request sent, ` already exists.` — the mirror of the sentence a name
+    // nothing holds an action under earns.
+    let expected = "The scheduled action unique-action already exists.";
+    assert_eq!(
+        second.text("Message").as_deref(),
+        Some(expected),
+        "case a second create under one name: expected the message {expected:?}, got {:?}",
+        second.text("Message")
     );
     let read = describe_one(&emulator, "unique-action").await;
     assert_eq!(

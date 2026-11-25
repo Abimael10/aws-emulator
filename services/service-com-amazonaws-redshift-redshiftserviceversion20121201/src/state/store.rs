@@ -406,15 +406,20 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             .find(|stored| stored.node.reserved_node_id.as_deref() == Some(reserved_node_id))
     }
 
-    /// The reservation an exchange operation's `ReservedNodeId` names.
+    /// The reservation an exchange operation's `ReservedNodeId` names, refused
+    /// in the sentence that operation words.
     ///
     /// The ONE dereference rule the exchange operations share: the identifier's
     /// FORM is ruled out before any lookup — a value this service could never
     /// have minted is a bad parameter value, not a missing resource — and only
-    /// then is it resolved against the reservations this account holds.
-    pub fn held_reserved_node(
+    /// then is it resolved against the reservations this account holds. WHICH
+    /// sentence a missing one is refused with is the caller's
+    /// ([`ReservedNodeNotFoundWording`]), because it is an attribute of the
+    /// operation rather than of the lookup.
+    pub fn held_reserved_node_worded(
         &self,
         reserved_node_id: &str,
+        wording: ReservedNodeNotFoundWording,
     ) -> Result<&StoredReservedNode, ExchangeRefusal> {
         if !is_minted_identifier(reserved_node_id) {
             return Err(ExchangeRefusal::InvalidParameterValue(
@@ -423,9 +428,23 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         }
         self.reserved_node(reserved_node_id).ok_or_else(|| {
             ExchangeRefusal::ReservedNodeNotFound(reserved_node_not_found_message(
+                wording,
                 reserved_node_id,
             ))
         })
+    }
+
+    /// [`Self::held_reserved_node_worded`] in the sentence the operations that
+    /// EXCHANGE a reservation answer
+    /// ([`ReservedNodeNotFoundWording::ReservedNodeThenValue`]).
+    pub fn held_reserved_node(
+        &self,
+        reserved_node_id: &str,
+    ) -> Result<&StoredReservedNode, ExchangeRefusal> {
+        self.held_reserved_node_worded(
+            reserved_node_id,
+            ReservedNodeNotFoundWording::ReservedNodeThenValue,
+        )
     }
 
     /// The reservation an exchange operation's `ReservedNodeId` names, checked
@@ -588,6 +607,7 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             })
             .ok_or_else(|| {
                 ExchangeRefusal::ReservedNodeNotFound(reserved_node_not_found_message(
+                    ReservedNodeNotFoundWording::ReservedNodeThenValue,
                     source_reserved_node_id,
                 ))
             })?;

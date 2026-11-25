@@ -63,9 +63,10 @@ pub struct TableRestoreRequest {
 /// What a table restore did, or which of the names the request carried resolved
 /// to nothing.
 ///
-/// The four negative answers are the four things a restore can fail on that are
-/// about the REQUEST rather than about the engine, so the control plane that asked
-/// for it can answer each with its own modelled fault.
+/// The negative answers are the things a restore can fail on that are about the
+/// REQUEST rather than about the engine — one per NAME it carried, so the control
+/// plane that asked for it can answer each with its own modelled fault and say
+/// which value was wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TableRestored {
     /// The new table is in the target database, holding this many rows.
@@ -75,9 +76,19 @@ pub enum TableRestored {
     },
     /// The capture holds no database of that name, so there is no table to copy.
     SourceDatabaseAbsent,
+    /// The captured database holds no schema of that name, so the name reaches
+    /// no table of it at all.
+    SourceSchemaAbsent,
     /// The captured database holds no such table, under the schema the request
     /// named.
-    SourceTableAbsent,
+    SourceTableAbsent {
+        /// The tables that schema DOES hold, in the catalogue's own order — the
+        /// names a `SourceTableName` could have named. The control plane that
+        /// asked for the restore is what turns them into the suggestion its
+        /// refusal carries, so nothing here decides which of them is the nearest
+        /// to the name the request sent.
+        candidates: Vec<String>,
+    },
     /// The live warehouse holds no database of that name to restore into.
     TargetDatabaseAbsent,
     /// The target database holds no schema of that name, so the new table has
@@ -155,7 +166,7 @@ pub fn restore_table<Eng: Send + Sync + 'static>(
     // table a `SELECT` of the same name would.
     let Some(source_relation) = relation_in(&source, request.source_schema.as_deref(), &request.source_table)
     else {
-        return Ok(TableRestored::SourceTableAbsent);
+        return Ok(TableRestored::SourceSchemaAbsent);
     };
     // "If you omit the TargetSchemaName, the table is restored to the source
     // schema."
@@ -170,7 +181,15 @@ pub fn restore_table<Eng: Send + Sync + 'static>(
 
     let columns = match table_columns(&source, &source_relation) {
         Ok(Some(columns)) => columns,
-        Ok(None) => return Ok(TableRestored::SourceTableAbsent),
+        // The name reaches a schema the captured database holds but no table of
+        // it, so the answer carries that schema's own tables: which of them the
+        // caller is told to consider is the asking control plane's decision.
+        Ok(None) => {
+            return match tables_under(&source, request.source_schema.as_deref()) {
+                Ok(candidates) => Ok(TableRestored::SourceTableAbsent { candidates }),
+                Err(error) => Err(engine_failure(error)),
+            }
+        }
         Err(error) => return Err(engine_failure(error)),
     };
     match table_columns(&destination, &new_relation) {
@@ -214,6 +233,49 @@ fn relation_in(database: &Database, schema: Option<&str>, table: &str) -> Option
         &[schema.to_string(), table.to_string()],
         &database.schemas,
     ))
+}
+
+/// The tables `database` holds under `schema`, by the name a request would have
+/// named one of them, in the catalogue's own order.
+///
+/// A request that names no schema addresses the database's default schema, whose
+/// tables the engine holds under their bare names; any other schema's tables are
+/// held under the qualified name ([`redshift_sql::engine_table_name`]), so the
+/// name a request would use is what follows that prefix.
+fn tables_under(database: &Database, schema: Option<&str>) -> rusqlite::Result<Vec<String>> {
+    let qualifier = schema
+        .filter(|name| !name.eq_ignore_ascii_case(DEFAULT_SCHEMA))
+        .map(|name| format!("{name}."));
+    let mut listing = database.connection.prepare(
+        "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') \
+         AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )?;
+    let mut held: Vec<String> = Vec::new();
+    let mut rows = listing.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(0)?;
+        match &qualifier {
+            // `get` answers None for an index that is not a character boundary,
+            // so a name whose bytes do not split there is simply not this
+            // schema's.
+            Some(prefix) => {
+                if name
+                    .get(..prefix.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+                {
+                    if let Some(table) = name.get(prefix.len()..) {
+                        held.push(table.to_string());
+                    }
+                }
+            }
+            None => {
+                if !name.contains('.') {
+                    held.push(name);
+                }
+            }
+        }
+    }
+    Ok(held)
 }
 
 /// The column names of `relation`, or `None` when the database holds no such

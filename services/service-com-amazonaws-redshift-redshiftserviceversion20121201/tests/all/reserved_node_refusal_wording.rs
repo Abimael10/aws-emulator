@@ -45,8 +45,9 @@ enum Wording {
     /// `Reserved Node <value> not found.` — what the exchange family answers
     /// about a `ReservedNodeId`.
     ReservedNode,
-    /// `Reserved Node Exchange Request <value> not found.` — what the
-    /// exchange-status read answers about a `ReservedNodeExchangeRequestId`.
+    /// `The reserved-node exchange status was not found.` — what the
+    /// exchange-status read answers about a `ReservedNodeExchangeRequestId`:
+    /// wholly fixed text that does NOT echo the id asked about.
     ExchangeRequest,
 }
 
@@ -55,9 +56,7 @@ fn sentence(wording: Wording, value: &str) -> String {
     match wording {
         Wording::MemberThenValue(member) => format!("{member} {value} not found."),
         Wording::ReservedNode => format!("Reserved Node {value} not found."),
-        Wording::ExchangeRequest => {
-            format!("Reserved Node Exchange Request {value} not found.")
-        }
+        Wording::ExchangeRequest => "The reserved-node exchange status was not found.".to_string(),
     }
 }
 
@@ -162,7 +161,10 @@ fn minted_form_operations() -> Vec<OperationCase> {
             "DescribeReservedNodeExchangeStatus on ReservedNodeId",
             "DescribeReservedNodeExchangeStatus",
             reserved_node_only as Request,
-            Wording::ReservedNode,
+            // The exchange-status READ words this fault by the member the value
+            // arrived on, as `DescribeReservedNodes` does — the operations that
+            // perform an exchange word it about the resource.
+            Wording::MemberThenValue("ReservedNodeId"),
             "ReservedNodeNotFound",
         ),
         (

@@ -226,10 +226,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RebootCluster<Eng
         if cluster_status != st::STATUS_AVAILABLE {
             return Err(RebootClusterErrorModeled::InvalidClusterStateFault(
                 InvalidClusterStateFault {
-                    message: Some(format!(
-                        "Cluster {} is in state {cluster_status}; it must be {} to be rebooted.",
-                        input.cluster_identifier,
-                        st::STATUS_AVAILABLE
+                    // This operation's OWN sentence, as its recorded refusal
+                    // words it: it names the cluster and the state a restart is
+                    // legal from, and not the state the cluster is in — see
+                    // [`st::reboot_requires_available_cluster_message`].
+                    message: Some(st::reboot_requires_available_cluster_message(
+                        &input.cluster_identifier,
                     )),
                 },
             )

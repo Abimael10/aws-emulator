@@ -47,6 +47,12 @@ aws-sdk-sns = { version = "1", default-features = false }
 # Availability Zone it lies in are EC2's facts, so `state::ec2_subnets` asks EC2
 # what the account has rather than deriving a network of its own.
 aws-sdk-ec2 = { version = "1", default-features = false }
+# "the nearest table the snapshot does contain" is the suggestion a refused
+# `RestoreTableFromClusterSnapshot` carries, which is a string-similarity
+# question: the maintained implementation of that measure answers it
+# (`state::table_restores`) rather than a comparison written here. A package this
+# repository already locks.
+strsim = "0.11"
 # The Region-label grammar the EC2 endpoint a hop addresses is read under, shared
 # by every service that resolves a caller-supplied Region into an endpoint URL.
 service-common = { path = "../common" }

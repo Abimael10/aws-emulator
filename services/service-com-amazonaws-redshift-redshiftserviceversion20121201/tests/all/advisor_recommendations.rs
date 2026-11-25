@@ -6,7 +6,8 @@
 //! store holds, scoped to the clusters the request names — the one cluster a
 //! `ClusterIdentifier` or a `NamespaceArn` names, or every cluster of the
 //! account when it names neither — in the order they were recorded, and paged
-//! with this service's shared `Marker` / `MaxRecords` cursor. A scope naming no
+//! with the `Marker` cursor and the `MaxRecords` window THIS operation publishes
+//! (which is its own, not the paginated `Describe*` family's). A scope naming no
 //! cluster this account holds is refused with 404 `ClusterNotFound`, and a
 //! cluster no observation names reports an empty page.
 //!
@@ -14,8 +15,8 @@
 //! request carries (neither, each one, both agreeing, both disagreeing), how a
 //! record identifies the cluster it observes (by identifier, by namespace ARN,
 //! by a cluster the account does not hold), how many records a scope selects
-//! (none, one, several, more than one page), and the documented `MaxRecords`
-//! window on each published bound and one past it.
+//! (none, one, several, more than one page), and this operation's `MaxRecords`
+//! window on its published bound, one past it and far past it.
 //!
 //! The observations themselves are written straight into the shared store the
 //! handler reads, because nothing in this control plane mints one: an Advisor
@@ -473,28 +474,42 @@ async fn repeating_the_report_changes_nothing() {
     );
 }
 
-/// The page follows the `MaxRecords` window this service publishes, and the
+/// The sentence a `MaxRecords` outside this operation's own window is refused
+/// with, spelled out here rather than read off the crate under test: the fixed
+/// text names the window's two bounds and echoes nothing of the value sent.
+///
+/// The bounds are THIS operation's: `ListRecommendations` accepts a `MaxRecords`
+/// of nought — the one page size it serves — and refuses any other, so both
+/// bounds it reports are nought. They are not the 20..100 window the paginated
+/// `Describe*` family publishes, which is why the last case below asks one of
+/// those for the same page size and gets a different answer.
+const OUT_OF_WINDOW_MESSAGE: &str = "Invalid value for max records. Must be between 0 and 0";
+
+/// The page follows the `MaxRecords` window THIS operation publishes, and the
 /// `Marker` it hands back resumes the same sequence where the page left it.
 #[tokio::test]
 async fn the_page_follows_the_published_max_records_window() {
     let emulator = Emulator::new();
     let namespace = cluster_with_namespace(&emulator, "advisor-paged").await;
-    // One more than a page of 20, so the first page leaves a cursor with
-    // records behind it.
+    // Several records, so a window that served a page would have records to
+    // leave behind it — the empty page below is the window's answer, not an
+    // empty collection.
     let total = 25usize;
     let ids: Vec<String> = (0..total).map(|index| format!("obs-paged-{index:02}")).collect();
     for id in &ids {
         record_observation(&emulator, id, Some("advisor-paged"), Some(&namespace));
     }
 
+    // The rows differ along where the page size falls against this operation's
+    // window: at its single accepted value, one past it, and far past it —
+    // including the values the `Describe*` family's own window admits.
     for (case, max_records, accepted) in [
-        ("one below the published minimum", "19", false),
-        ("at the published minimum", "20", true),
-        ("inside the window", "50", true),
-        ("at the published maximum", "100", true),
-        ("one past the published maximum", "101", true),
-        ("far past the published maximum", "1000", true),
-        ("zero", "0", false),
+        ("the one page size the window admits", "0", true),
+        ("one past the window's maximum", "1", false),
+        ("the Describe* family's minimum", "20", false),
+        ("inside the Describe* family's window", "50", false),
+        ("the Describe* family's maximum", "100", false),
+        ("far past the window's maximum", "1000", false),
     ] {
         let answer = emulator
             .call("ListRecommendations", &[("MaxRecords", max_records)])
@@ -505,20 +520,40 @@ async fn the_page_follows_the_published_max_records_window() {
                 "case {case}: expected MaxRecords={max_records} served with 200, got {} with body {}",
                 answer.status, answer.body
             );
+            // The page size the request named is the page it is served, so the
+            // report carries no record and no cursor to resume from.
+            assert_eq!(
+                listed(&answer.body),
+                Vec::<String>::new(),
+                "case {case}: expected an empty page for MaxRecords={max_records}, got {:?}",
+                listed(&answer.body)
+            );
         } else {
-            // AWS's own sentence for this error class names the window's two
-            // published bounds and does not echo the value sent.
             assert_refused(
                 case,
                 &answer,
                 400,
                 "InvalidParameterValue",
-                "Invalid value for max records. Must be between 20 and 100",
+                OUT_OF_WINDOW_MESSAGE,
             );
         }
     }
 
-    // The default window takes every record in one page, with no cursor left.
+    // A page size this operation refuses is one a paginated `Describe*` serves,
+    // under ITS own window: the windows are per-operation, not one shared rule.
+    let described = emulator
+        .call("DescribeClusters", &[("MaxRecords", "20")])
+        .await;
+    assert_eq!(
+        described.status, 200,
+        "case the same page size on a Describe*: expected 200 under its own window, got {} with \
+         body {}",
+        described.status, described.body
+    );
+
+    // A request that names no page size at all asks for no window value, and is
+    // served the family's default page: every record in one page, with no cursor
+    // left.
     let unpaged = emulator.call("ListRecommendations", &[]).await;
     assert_eq!(
         listed(&unpaged.body),
@@ -531,40 +566,6 @@ async fn the_page_follows_the_published_max_records_window() {
         None,
         "case the default window: expected no cursor, got {:?}",
         unpaged.text("Marker")
-    );
-
-    // A page of 20 leaves a cursor the next call resumes from, and the two pages
-    // are that one sequence split in order.
-    let first_page = emulator
-        .call("ListRecommendations", &[("MaxRecords", "20")])
-        .await;
-    let first_ids = listed(&first_page.body);
-    assert_eq!(
-        first_ids,
-        ids[..20].to_vec(),
-        "case the first page of 20: expected the first 20 observations, got {first_ids:?}"
-    );
-    let marker = first_page
-        .text("Marker")
-        .expect("case the first page of 20: records remain, so the page carries a cursor");
-    let second_page = emulator
-        .call(
-            "ListRecommendations",
-            &[("MaxRecords", "20"), ("Marker", marker.as_str())],
-        )
-        .await;
-    let second_ids = listed(&second_page.body);
-    assert_eq!(
-        second_ids,
-        ids[20..].to_vec(),
-        "case the second page: expected the remaining {} observations, got {second_ids:?}",
-        total - 20
-    );
-    assert_eq!(
-        second_page.text("Marker"),
-        None,
-        "case the second page: nothing remains, so expected no cursor, got {:?}",
-        second_page.text("Marker")
     );
 
     // A cursor this service never handed out names a position past the end of

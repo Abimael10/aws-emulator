@@ -14,8 +14,11 @@
 //! a `Schedule` written in neither of the two published expression types names
 //! no schedule at all (see
 //! [`crate::state::parse_scheduled_action_schedule`]), then the action it would
-//! trigger — exactly one of the operations the scheduler supports, against a
-//! cluster this account holds — and only then the name it would be stored under.
+//! trigger — exactly one of the operations the scheduler supports — and only
+//! then the name it would be stored under. The cluster that action names is NOT
+//! resolved here: a scheduled action is a registration, and the operation it
+//! triggers resolves its own `ClusterIdentifier` when the schedule fires, so an
+//! action may be registered before, or independently of, the cluster it targets.
 //!
 //! ## Shape of an operation
 //!
@@ -213,9 +216,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ///
     /// Nothing is awaited while the store is locked: the one dependency that is
     /// another service's — the IAM role the action would run as — is resolved
-    /// before the store is reached at all, and every dependency resolved under
-    /// the lock (the cluster its target action names) is a record of THIS
-    /// service, so the whole write is one lock-held step.
+    /// before the store is reached at all, so the whole write is one lock-held
+    /// step.
     async fn handle(
         &self,
         input: Self::Input,
@@ -261,8 +263,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The action it would trigger: exactly one of the operations the
-        // scheduler supports, naming the cluster it would run against.
-        let Some((_, cluster_identifier)) = st::scheduled_action_target(&input.target_action) else {
+        // scheduler supports, naming the cluster it would run against. The
+        // cluster itself is NOT resolved here — a scheduled action is a
+        // REGISTRATION, and the operation it triggers resolves its own
+        // `ClusterIdentifier` when the schedule fires, so an action may be
+        // registered before, or independently of, the cluster it targets.
+        let Some((_, _cluster_identifier)) = st::scheduled_action_target(&input.target_action)
+        else {
             return Err(
                 CreateScheduledActionErrorModeled::InvalidScheduledActionFault(
                     InvalidScheduledActionFault {
@@ -272,7 +279,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        let cluster_identifier = cluster_identifier.to_string();
 
         let Some(state) = st::service_state(&*self.engine) else {
             return Err(
@@ -286,25 +292,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
         store.settle(::service_common::clock::now(&*self.engine));
-
-        // The cluster the target action would run against has to be one this
-        // account holds: an action scheduled against a cluster that is not there
-        // could never run.
-        if store.cluster_position(&cluster_identifier).is_none() {
-            return Err(CreateScheduledActionErrorModeled::ClusterNotFoundFault(
-                ClusterNotFoundFault {
-                    // No recorded refusal gives this operation a sentence of its
-                    // own, so it carries the one every other cluster-scoped
-                    // operation does — see the per-operation catalog
-                    // [`st::ClusterNotFoundWording`].
-                    message: Some(st::cluster_not_found_message(
-                        st::ClusterNotFoundWording::IdentifierThenNotFound,
-                        &cluster_identifier,
-                    )),
-                },
-            )
-            .into());
-        }
 
         // "The name must be unique within an account", and the collection is
         // bounded, so neither a second action under one name nor an unbounded

@@ -23,7 +23,10 @@
 //! the role set as default leaves the cluster with no default.
 //!
 //! An IAM role is a resource of another service, so this service does not resolve
-//! one: the ARN the request carries is stored as it came.
+//! one: the ARN the request carries is stored as it came. How MANY of them a
+//! cluster may carry is Amazon Redshift's own quota
+//! ([`crate::state::CLUSTER_IAM_ROLE_QUOTA`]), so a call that would take the
+//! cluster past it is refused before anything is associated.
 //!
 //! ## Shape of an operation
 //!
@@ -221,6 +224,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let add = input.add_iam_roles.clone().unwrap_or_default();
         let remove = input.remove_iam_roles.clone().unwrap_or_default();
         let roles = stored.cluster.iam_roles.get_or_insert_default();
+        // A cluster carries at most as many associated roles as Amazon Redshift's
+        // quota admits, so a call that would take it past the ceiling is refused
+        // BEFORE anything is associated — the refusal reports what the cluster
+        // already carries and the headroom that is left
+        // ([`st::check_cluster_iam_role_ceiling`]).
+        if let Err(message) = st::check_cluster_iam_role_ceiling(roles, &add) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                message,
+            ));
+        }
         st::apply_iam_role_changes(roles, &add, &remove);
 
         // The default role is one OF the roles the cluster carries, so a call

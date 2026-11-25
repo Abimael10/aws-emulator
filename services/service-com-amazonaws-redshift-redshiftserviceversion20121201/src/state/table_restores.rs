@@ -62,6 +62,53 @@ pub fn table_restore_row_limit_message(limit: i64) -> String {
     )
 }
 
+/// Why a restore naming a table the snapshot does not hold is refused: the
+/// SourceTableName the request sent, and the nearest table the snapshot's own
+/// catalog does hold.
+///
+/// Amazon Redshift's wording for this one cause of
+/// `InvalidTableRestoreArgumentFault`: the fixed text is `Source table "`, `"
+/// doesn't exist in snapshot. Consider using: "` and `"`, with no trailing
+/// period; the variable parts are the name the request carried and a table read
+/// out of the snapshot's catalog. A caller that cannot see the snapshot's tables
+/// is told one it could have named, which is what makes the refusal actionable.
+pub fn absent_source_table_message(source_table_name: &str, candidates: &[String]) -> String {
+    match nearest_table_name(source_table_name, candidates) {
+        Some(candidate) => format!(
+            "Source table \"{source_table_name}\" doesn't exist in snapshot. \
+             Consider using: \"{candidate}\""
+        ),
+        // Nothing to consider: the snapshot's schema holds no table at all, so
+        // the refusal falls back to the fault's own documented sentence rather
+        // than suggesting a name no catalog answered with.
+        None => ABSENT_SOURCE_NAME.to_string(),
+    }
+}
+
+/// The table of `candidates` closest to the name the request sent, by edit
+/// distance, and the first of the catalog's order among equals.
+///
+/// "the nearest table the snapshot does contain" is a string-similarity question,
+/// so it is answered by the maintained implementation of that measure
+/// (`strsim::levenshtein`) rather than by a comparison of this crate's own.
+fn nearest_table_name<'a>(wanted: &str, candidates: &'a [String]) -> Option<&'a str> {
+    candidates
+        .iter()
+        .min_by_key(|candidate| ::strsim::levenshtein(wanted, candidate))
+        .map(String::as_str)
+}
+
+/// The fault's own documented sentence, which names the three source members
+/// together.
+///
+/// `smithy_query(query="shape", shape="InvalidTableRestoreArgumentFault")` — "The
+/// value specified for the sourceDatabaseName, sourceSchemaName, or
+/// sourceTableName parameter, or a combination of these, doesn't exist in the
+/// snapshot". It stands where no more specific sentence can be composed.
+pub const ABSENT_SOURCE_NAME: &str =
+    "The value specified for the sourceDatabaseName, sourceSchemaName, or sourceTableName \
+     parameter, or a combination of these, doesn't exist in the snapshot.";
+
 /// Why a restore whose names resolved to nothing is refused, naming WHICH of
 /// them did.
 ///
@@ -71,15 +118,23 @@ pub fn table_restore_row_limit_message(limit: i64) -> String {
 /// snapshot" — plus the operation's own "you cannot use
 /// RestoreTableFromClusterSnapshot to restore a table with the same name as an
 /// existing table in an Amazon Redshift cluster". Which value was wrong is what
-/// the caller has to fix, so the sentence names it.
-pub fn invalid_table_restore_argument_message(outcome: &TableRestoreOutcome) -> String {
+/// the caller has to fix, so the sentence names it: the SOURCE TABLE has a
+/// sentence of its own ([`absent_source_table_message`], which this routes to
+/// with the `SourceTableName` the request carried), and each other name is named
+/// by the member it arrived on.
+pub fn invalid_table_restore_argument_message(
+    outcome: &TableRestoreOutcome,
+    source_table_name: &str,
+) -> String {
     match outcome {
         TableRestoreOutcome::SourceDatabaseAbsent => {
             "The value specified for SourceDatabaseName doesn't exist in the snapshot."
         }
-        TableRestoreOutcome::SourceTableAbsent => {
-            "The value specified for the sourceDatabaseName, sourceSchemaName, or \
-             sourceTableName parameter, or a combination of these, doesn't exist in the snapshot."
+        TableRestoreOutcome::SourceSchemaAbsent => {
+            "The value specified for SourceSchemaName doesn't exist in the snapshot."
+        }
+        TableRestoreOutcome::SourceTableAbsent { candidates } => {
+            return absent_source_table_message(source_table_name, candidates)
         }
         TableRestoreOutcome::TargetDatabaseAbsent => {
             "The value specified for TargetDatabaseName is not a database of the cluster the \
@@ -97,8 +152,7 @@ pub fn invalid_table_restore_argument_message(outcome: &TableRestoreOutcome) -> 
         // answered by the handler with the refusal that fits it, so neither
         // reaches this sentence.
         TableRestoreOutcome::Restored { .. } | TableRestoreOutcome::SourceTableTooLarge { .. } => {
-            "The value specified for the sourceDatabaseName, sourceSchemaName, or \
-             sourceTableName parameter, or a combination of these, doesn't exist in the snapshot."
+            ABSENT_SOURCE_NAME
         }
     }
     .to_string()

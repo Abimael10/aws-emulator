@@ -423,14 +423,17 @@ async fn a_well_formed_identifier_naming_nothing_is_the_modelled_not_found() {
             "DescribeReservedNodeExchangeStatus",
             vec![("ReservedNodeId", UNHELD_IDENTIFIER)],
             "ReservedNodeNotFound",
-            format!("Reserved Node {UNHELD_IDENTIFIER} not found."),
+            // The exchange-status READ words this fault by the member the value
+            // arrived on, unlike the two operations above it.
+            format!("ReservedNodeId {UNHELD_IDENTIFIER} not found."),
         ),
         (
             "an exchange nobody asked for",
             "DescribeReservedNodeExchangeStatus",
             vec![("ReservedNodeExchangeRequestId", UNHELD_IDENTIFIER)],
             "ReservedNodeExchangeNotFond",
-            format!("Reserved Node Exchange Request {UNHELD_IDENTIFIER} not found."),
+            // Wholly fixed text: this refusal does not echo the id asked about.
+            "The reserved-node exchange status was not found.".to_string(),
         ),
         (
             "an offering the catalog does not publish",
