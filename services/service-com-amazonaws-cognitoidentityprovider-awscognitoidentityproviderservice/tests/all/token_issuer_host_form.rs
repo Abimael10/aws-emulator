@@ -3,20 +3,21 @@
 //! The HOST FORM a user pool's token issuer carries, over the deployments a pool can be
 //! created through.
 //!
-//! The RULE the rows assert, one level above the recorded case (a pool created through a
-//! client configured with this emulator's loopback endpoint, whose tokens announced that
-//! bare `host:port` as their issuer, so no relying party could tell which Cognito pool of
-//! which Region had issued them):
+//! The RULE the rows assert, one level above the recorded case (a pool whose tokens
+//! announced an issuer on a host carrying this service's endpoint prefix under the loopback
+//! zone, a name no client of this emulator resolves to it):
 //!
-//! > A user pool's token issuer is `https://<endpoint-prefix>.<region>.<zone>[:<port>]/<id>`:
-//! > the host carries this service's endpoint prefix (with the `issuer-` label in front of
-//! > it for the `UPDATED` issuer type) and the POOL's own Region, the single path segment is
-//! > the pool's id as the create minted it, and the ZONE and PORT are whichever ones the
-//! > issuer is published in — the ones of the endpoint of THIS emulator the pool was created
-//! > through, and the zone AWS serves its own endpoints in for a pool created by a client
-//! > that resolves those on an emulator served on no port at all. An issuer carrying that
-//! > host form names the pool of that Region whichever zone it is spelled in, which is what
-//! > a verifier configured with one spelling and handed a token carrying the other compares.
+//! > A user pool's token issuer is `https://<authority>/<id>`: the single path segment is
+//! > the pool's id as the create minted it, and the AUTHORITY is an address THIS emulator
+//! > answers on — the `host[:port]` of the endpoint the create reached when that endpoint is
+//! > the emulator's own, and otherwise the address this emulator is served at — carrying no
+//! > label in front of it, because a relying party resolves that authority and dials it.
+//! > Only an emulator served on no port at all has no address of its own to publish, and
+//! > announces the host the model documents instead:
+//! > `https://<endpoint-prefix>.<region>.amazonaws.com/<id>`, with the `issuer-` label in
+//! > front of the endpoint prefix for the `UPDATED` issuer type. Either spelling of a pool's
+//! > issuer names that pool for every verifier of a user-pool token, so a verifier
+//! > configured with one and handed a token carrying the other resolves the same pool.
 //!
 //! The issuer is token content, which this service's model does not describe:
 //! `IssuerConfigurationType.Type` (`smithy_query(query="shape",shape="IssuerConfigurationType")`)
@@ -27,17 +28,18 @@
 //! `https://issuer-cognito-idp.[region].amazonaws.com/[userPoolId]`, where region is the
 //! primary Amazon Web Services Region of your user pool" — and the `iss` claim itself is
 //! recorded behaviour. A zone AWS serves its endpoints in resolves nowhere near this
-//! process, so an emulator with an endpoint of its own publishes the same host form in the
-//! zone that endpoint is reached under, which is a name a resolver answers with the
-//! interface the core binds on.
+//! process, and so does a name this emulator invents under any other zone, so an emulator
+//! with an endpoint of its own publishes that endpoint: the address its client already
+//! dialled is the one address such a client resolves.
 //!
-//! The rows span what the rule generalises over: the ZONE and PORT the issuer is published
-//! in (an emulator reached at a loopback address, at a loopback name, at a bracketed IPv6
+//! The rows span what the rule generalises over: the ADDRESS the issuer is published at (an
+//! emulator reached at a loopback address, at a loopback name, at a bracketed IPv6
 //! literal, at a name an operator serves it under, at such a name on no port at all, and an
 //! emulator served on no port, reached by a client that resolves AWS's own hostnames), the
 //! REGION the pool lives in, and the ISSUER TYPE it is configured with. Each row asserts the
 //! whole round trip the issuer exists for: both signed tokens announce it, it is the reading
-//! every verifier of a user-pool token shares (`state::is_pool_issuer`) for that pool and
+//! every verifier of a user-pool token shares (`UserPool::publishes_issuer`) for that pool
+//! and
 //! for no pool of another Region, and the discovery document and key set a relying party
 //! dereferences are served at it.
 //!
@@ -52,7 +54,6 @@ use serde_json::{json, Value};
 use smithy_server_runtime::{EndpointUrl, MultiServiceRouter};
 
 use service_com_amazonaws_cognitoidentityprovider_awscognitoidentityproviderservice as cognito_idp;
-use service_com_amazonaws_cognitoidentityprovider_awscognitoidentityproviderservice::state;
 
 // The fixture this suite shares with the one that pins the ENDPOINT a pool publishes on: the
 // wire prefix, the credential scope, the anonymous fetch and the JOSE reading are that
@@ -91,7 +92,7 @@ const ROWS: &[Row] = &[
         host: Some("127.0.0.1:39819"),
         region: "us-west-2",
         issuer_type: None,
-        expected_authority: "cognito-idp.us-west-2.localhost:39819",
+        expected_authority: "127.0.0.1:39819",
     },
     Row {
         case: "the same deployment with the UPDATED issuer type, in another Region",
@@ -99,7 +100,7 @@ const ROWS: &[Row] = &[
         host: Some("127.0.0.1:39819"),
         region: "eu-central-1",
         issuer_type: Some("UPDATED"),
-        expected_authority: "issuer-cognito-idp.eu-central-1.localhost:39819",
+        expected_authority: "127.0.0.1:39819",
     },
     Row {
         case: "an emulator reached by the loopback NAME on another port",
@@ -107,7 +108,7 @@ const ROWS: &[Row] = &[
         host: Some("localhost:4566"),
         region: "ap-southeast-2",
         issuer_type: Some("ORIGINAL"),
-        expected_authority: "cognito-idp.ap-southeast-2.localhost:4566",
+        expected_authority: "localhost:4566",
     },
     Row {
         case: "an emulator reached at a bracketed IPv6 loopback literal",
@@ -115,7 +116,7 @@ const ROWS: &[Row] = &[
         host: Some("[::1]:8443"),
         region: "us-east-1",
         issuer_type: None,
-        expected_authority: "cognito-idp.us-east-1.localhost:8443",
+        expected_authority: "[::1]:8443",
     },
     Row {
         case: "an emulator an operator serves under a name of their own, on a port",
@@ -123,7 +124,7 @@ const ROWS: &[Row] = &[
         host: None,
         region: "eu-west-1",
         issuer_type: None,
-        expected_authority: "cognito-idp.eu-west-1.emulator.internal:8443",
+        expected_authority: "emulator.internal:8443",
     },
     Row {
         case: "the same name on no port at all, where the issuer carries none either",
@@ -131,7 +132,7 @@ const ROWS: &[Row] = &[
         host: None,
         region: "eu-west-1",
         issuer_type: Some("UPDATED"),
-        expected_authority: "issuer-cognito-idp.eu-west-1.emulator.internal",
+        expected_authority: "emulator.internal",
     },
     Row {
         case: "an emulator served on no port, reached by a client that resolves AWS's own \
@@ -152,18 +153,18 @@ const ROWS: &[Row] = &[
     },
 ];
 
-/// One emulator with just this service mounted, served as `row` says.
-fn router(row: &Row) -> MultiServiceRouter {
+/// One emulator with just this service mounted, served as `row` says, beside the engine its
+/// state lives in.
+fn router(row: &Row) -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
-    router.register_service(cognito_idp::EmulatedService::new(Arc::new(
-        engine::InMemoryEngine::new(),
-    )));
+    router.register_service(cognito_idp::EmulatedService::new(Arc::clone(&engine)));
     // Signature verification belongs to the emulator, not to this check.
     router.set_request_authentication(false);
     if let Some(base) = row.served_base {
         router.set_url_base(EndpointUrl::parse(base).expect("the row's base URL must parse"));
     }
-    router
+    (router, engine)
 }
 
 /// Call `operation` on the endpoint `row.host` addresses, requiring success, and answer the
@@ -271,14 +272,14 @@ async fn signed_in(router: &MultiServiceRouter, row: &Row, index: usize) -> (Str
     (user_pool_id, authenticated["AuthenticationResult"].clone())
 }
 
-/// Every token a pool mints announces an issuer whose host carries this service's endpoint
-/// prefix and the pool's Region, in the zone and on the port the pool publishes in, with the
-/// pool's id as its whole path — and the documents a verifier dereferences are served there.
+/// Every token a pool mints announces an issuer at an address this emulator answers on —
+/// the endpoint the create reached, or the address the emulator is served at — with the
+/// pool's id as its whole path, and the documents a verifier dereferences are served there.
 #[tokio::test]
-async fn an_issuer_names_this_service_and_the_pools_region_in_the_zone_it_publishes_in() {
+async fn an_issuer_is_published_at_an_address_this_emulator_answers_on() {
     for (index, row) in ROWS.iter().enumerate() {
         let case = row.case;
-        let router = router(row);
+        let (router, _engine) = router(row);
         let (user_pool_id, result) = signed_in(&router, row, index).await;
         let expected = format!("https://{}/{user_pool_id}", row.expected_authority);
 
@@ -300,36 +301,48 @@ async fn an_issuer_names_this_service_and_the_pools_region_in_the_zone_it_publis
             .unwrap_or_else(|| panic!("case {case:?}: a sign-in returns an IdToken"));
         let announced = member(case, &claims(case, id_token), "iss");
 
-        // The host form of the value the pool ANNOUNCED, stated separately so a failure says
-        // which part of it is wrong: the labels in front of the zone are this service's
-        // endpoint prefix — under the `issuer-` label for the UPDATED issuer type — and the
-        // pool's Region.
+        // The form of the value the pool ANNOUNCED, stated separately so a failure says
+        // which part of it is wrong.
         let (authority, path) = announced
             .strip_prefix("https://")
             .and_then(|rest| rest.split_once('/'))
             .unwrap_or_else(|| {
                 panic!("case {case:?}: an issuer carries a path, got {announced:?}")
             });
-        let labels: Vec<&str> = authority.split('.').collect();
-        assert!(
-            labels.len() >= 3 && labels.iter().all(|label| !label.is_empty()),
-            "case {case:?}: an issuer host carries this service, the region and a zone, got \
-             {authority:?}"
-        );
-        let expected_prefix = match row.issuer_type {
-            Some("UPDATED") => format!("issuer-{SIGNING_NAME}"),
-            _ => SIGNING_NAME.to_string(),
-        };
-        assert_eq!(
-            labels[0], expected_prefix,
-            "case {case:?}: the issuer host's first label must name this service, got \
-             {authority:?}"
-        );
-        assert_eq!(
-            labels[1], row.region,
-            "case {case:?}: the issuer host's second label must be the pool's Region, got \
-             {authority:?}"
-        );
+        // The AUTHORITY, derived from the row's deployment rather than from the row's own
+        // expectation: an emulator with an address of its own publishes THAT address — the
+        // endpoint the create reached when the create addressed one, and the address the
+        // emulator is served at for a creating client that resolves AWS's own hostnames —
+        // with nothing in front of it, because a relying party resolves the authority an
+        // issuer names and dials it. Only an emulator served on no port at all publishes the
+        // documented host, whose labels are this service's endpoint prefix (under the
+        // `issuer-` label for the UPDATED issuer type), the pool's Region and AWS's own zone.
+        match row.served_base {
+            Some(base) => {
+                let served = base.trim_start_matches("https://");
+                let reached = row
+                    .host
+                    .filter(|host| !host.ends_with(".amazonaws.com"))
+                    .unwrap_or(served);
+                assert_eq!(
+                    authority, reached,
+                    "case {case:?}: the issuer must be published at an address this emulator \
+                     answers on, got {announced:?}"
+                );
+            }
+            None => {
+                let expected_prefix = match row.issuer_type {
+                    Some("UPDATED") => format!("issuer-{SIGNING_NAME}"),
+                    _ => SIGNING_NAME.to_string(),
+                };
+                assert_eq!(
+                    authority,
+                    format!("{expected_prefix}.{}.amazonaws.com", row.region),
+                    "case {case:?}: an emulator with no address of its own must publish the \
+                     documented host, got {announced:?}"
+                );
+            }
+        }
         assert_eq!(
             path, user_pool_id,
             "case {case:?}: the issuer's whole path must be the pool's id, got {announced:?}"
@@ -377,10 +390,11 @@ async fn an_issuer_names_this_service_and_the_pools_region_in_the_zone_it_publis
 }
 
 /// The issuer a pool announces names THAT pool for every verifier of a user-pool token
-/// (`state::is_pool_issuer`) — and so does the same host form spelled in the other zone, so
-/// a verifier configured with the documented host and handed a token carrying the host this
-/// emulator publishes resolves the same pool. A host naming another Region, another service
-/// or another pool names none of it.
+/// (`UserPool::publishes_issuer`, the reading each one of them resolves a token's `iss`
+/// through) — and so does the documented spelling of the same pool's issuer, so a verifier
+/// configured with AWS's own host and handed a token carrying the address this emulator
+/// publishes resolves the same pool. A host naming another Region, another service or
+/// another pool names none of it.
 #[tokio::test]
 async fn the_announced_issuer_names_its_pool_whichever_zone_it_is_spelled_in() {
     /// A Region no row's pool lives in, to pin that the Region label is read.
@@ -388,7 +402,7 @@ async fn the_announced_issuer_names_its_pool_whichever_zone_it_is_spelled_in() {
 
     for (index, row) in ROWS.iter().enumerate() {
         let case = row.case;
-        let router = router(row);
+        let (router, engine) = router(row);
         let (user_pool_id, result) = signed_in(&router, row, 100 + index).await;
         let token = result["IdToken"]
             .as_str()
@@ -441,10 +455,19 @@ async fn the_announced_issuer_names_its_pool_whichever_zone_it_is_spelled_in() {
             ),
         ];
         for (spelling, issuer, expected) in named {
-            let actual = state::is_pool_issuer(row.region, &user_pool_id, issuer);
+            // The reading a verifier holding the pool applies, read off the STORED pool.
+            let actual = {
+                let store = cognito_idp::state::service_state(&*engine)
+                    .expect("this service's own store");
+                let guard = store.lock();
+                guard
+                    .pool(&user_pool_id)
+                    .unwrap_or_else(|| panic!("case {case:?}: the created pool is stored"))
+                    .publishes_issuer(issuer)
+            };
             assert_eq!(
                 actual, *expected,
-                "case {case:?} / {spelling:?} ({issuer:?}): expected is_pool_issuer == \
+                "case {case:?} / {spelling:?} ({issuer:?}): expected publishes_issuer == \
                  {expected}, got {actual}"
             );
         }

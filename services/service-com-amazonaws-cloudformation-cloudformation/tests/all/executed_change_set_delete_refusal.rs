@@ -16,9 +16,10 @@
 //! succeeds takes only the change set it addressed: the stack whose change the executed plan
 //! carried out is left exactly where that execution left it.**
 //!
-//! A plan the stack no longer HOLDS is addressed by its own ARN: executing a change set carries
-//! its plan out, which frees the name it deployed under for the next plan, so a delete addressed
-//! by that NAME afterwards finds nothing to take away and succeeds without touching the record.
+//! A record whose plan has been carried out is addressed BOTH ways for as long as it is there:
+//! by its own ARN and by the name it was created under, so a delete addressed either way
+//! discards that record and a request to execute it again is answered on the execution it
+//! carried out.
 //!
 //! `change_set_status_refusals.rs` holds the same rule over every `ExecutionStatus` the model
 //! declares, by putting a change set in each; this suite reaches the one the REAL path produces
@@ -234,10 +235,8 @@ async fn an_executed_change_sets_record_is_discarded_once_its_execution_has_conc
             );
 
             // Once the stack has carried the change through, the record of that execution is
-            // discardable like any other — addressed by its own ARN, which is what names a plan
-            // the stack no longer HOLDS: the name it deployed under is free for the next plan,
-            // so a delete addressed by that NAME finds nothing to take away and succeeds
-            // without touching the record.
+            // discardable like any other — by its own ARN and by the name it was created
+            // under, both of which go on addressing the record for as long as it is there.
             awaiting_execution_status(
                 &case,
                 &router,
@@ -252,15 +251,15 @@ async fn an_executed_change_sets_record_is_discarded_once_its_execution_has_conc
                 let (code, body) = delete_change_set(&router, &addressed, stack).await;
                 assert_eq!(
                     code, 200,
-                    "case {case:?}: a delete of a name that addresses no plan succeeds, got \
-                     {code} {body}"
+                    "case {case:?}: the record of a concluded execution is discardable by the \
+                     name it was created under, got {code} {body}"
                 );
                 let (code, body) = describe_change_set(&router, &applied_arn, None).await;
                 assert_eq!(
-                    (code, xml_text(&body, "ExecutionStatus").unwrap_or_default()),
-                    (200, execution_status::EXECUTE_COMPLETE.to_string()),
-                    "case {case:?}: that delete took nothing: the record of the execution is \
-                     still there, got {code} {body}"
+                    (code, refused(&body).0),
+                    (404, "ChangeSetNotFound".to_string()),
+                    "case {case:?}: that delete discarded the record of the execution, got \
+                     {code} {body}"
                 );
             }
             let (code, body) = delete_change_set(&router, &applied_arn, None).await;

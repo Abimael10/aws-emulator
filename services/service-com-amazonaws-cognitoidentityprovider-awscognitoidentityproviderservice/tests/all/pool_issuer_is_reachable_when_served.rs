@@ -9,10 +9,8 @@
 //!
 //! > A pool's token issuer is a URL its relying parties DEREFERENCE — every token it mints
 //! > carries it as `iss`, and a verifier reads `<iss>/.well-known/openid-configuration` and
-//! > `<iss>/.well-known/jwks.json` from it — so its host carries the user-pool issuer FORM
-//! > (`cognito-idp.<region>`, with the `issuer-` label in front of it for the `UPDATED`
-//! > issuer type) in a DNS ZONE that resolves to THIS emulator, on the port it answers on:
-//! > the zone and port of the endpoint the creating request reached when that endpoint is
+//! > `<iss>/.well-known/jwks.json` from it — so its authority is one THIS emulator answers
+//! > on: the `host[:port]` of the endpoint the creating request reached when that endpoint is
 //! > the emulator's own, and otherwise of the address this emulator is served at. Its whole
 //! > path is the pool's id, and both documents are served there.
 //!
@@ -24,7 +22,8 @@
 //! Original issuers have the format of
 //! `https://cognito-idp.[region].amazonaws.com/[userPoolId]`". An emulator that is served on
 //! a port has an address of its OWN to publish instead, and publishes it: a host under a
-//! zone AWS serves its endpoints in answers nowhere near this process.
+//! zone AWS serves its endpoints in answers nowhere near this process, and so does a name
+//! this emulator invents under any other zone.
 //!
 //! The rows span what the rule generalises over: WHICH host the creating request addressed
 //! (an address of this emulator — the served data port, another local port, a bracketed IPv6
@@ -79,9 +78,9 @@ struct Row {
     /// The `IssuerConfiguration.Type` the create asks for, or `None` for a pool that
     /// configures none.
     issuer_type: Option<&'static str>,
-    /// The authority the issuer must name: the user-pool issuer form over the zone and port
-    /// of the endpoint the create reached when that is an endpoint of this emulator, and of
-    /// the served address otherwise.
+    /// The authority the issuer must name: the `host[:port]` of the endpoint the create
+    /// reached when that is an endpoint of this emulator, and of the served address
+    /// otherwise.
     expected_authority: &'static str,
 }
 
@@ -92,21 +91,21 @@ fn rows() -> Vec<Row> {
             host: Some(SERVED_AUTHORITY),
             region: "us-west-2",
             issuer_type: None,
-            expected_authority: "cognito-idp.us-west-2.localhost:9297",
+            expected_authority: SERVED_AUTHORITY,
         },
         Row {
             case: "a client configured with another local address of this emulator",
             host: Some("localhost:7001"),
             region: "eu-west-1",
             issuer_type: Some("ORIGINAL"),
-            expected_authority: "cognito-idp.eu-west-1.localhost:7001",
+            expected_authority: "localhost:7001",
         },
         Row {
             case: "a client configured with a bracketed IPv6 address of this emulator",
             host: Some("[::1]:9443"),
             region: "ap-southeast-2",
             issuer_type: Some("UPDATED"),
-            expected_authority: "issuer-cognito-idp.ap-southeast-2.localhost:9443",
+            expected_authority: "[::1]:9443",
         },
         Row {
             case: "the recorded case: a client that resolves AWS's own hostnames, on this \
@@ -114,14 +113,14 @@ fn rows() -> Vec<Row> {
             host: Some("cognito-idp.us-west-2.amazonaws.com"),
             region: "us-west-2",
             issuer_type: None,
-            expected_authority: "cognito-idp.us-west-2.localhost:9297",
+            expected_authority: SERVED_AUTHORITY,
         },
         Row {
             case: "the same, with the updated issuer type in another Region",
             host: Some("cognito-idp.eu-north-1.amazonaws.com"),
             region: "eu-north-1",
             issuer_type: Some("UPDATED"),
-            expected_authority: "issuer-cognito-idp.eu-north-1.localhost:9297",
+            expected_authority: SERVED_AUTHORITY,
         },
         Row {
             case: "an in-process call of another service, addressed at that service's \
@@ -129,14 +128,14 @@ fn rows() -> Vec<Row> {
             host: Some("cloudformation.us-east-1.amazonaws.com"),
             region: "us-east-1",
             issuer_type: Some("ORIGINAL"),
-            expected_authority: "cognito-idp.us-east-1.localhost:9297",
+            expected_authority: SERVED_AUTHORITY,
         },
         Row {
             case: "a request naming no host at all",
             host: None,
             region: "us-east-2",
             issuer_type: None,
-            expected_authority: "cognito-idp.us-east-2.localhost:9297",
+            expected_authority: SERVED_AUTHORITY,
         },
     ]
 }

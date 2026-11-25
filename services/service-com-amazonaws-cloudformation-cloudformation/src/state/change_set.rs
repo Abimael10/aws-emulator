@@ -277,9 +277,10 @@ impl StoredChangeSet {
     /// is what the model's `EXECUTE_COMPLETE` reports.
     ///
     /// Such a record is no longer a plan the stack HOLDS ([`Self::stack_holds_it`]): the plan
-    /// has been applied, so the name it was created under is free for the next one and
-    /// addresses this record no longer. The record itself stays, addressed by its own ARN,
-    /// which is what keeps the execution it carried out answerable.
+    /// has been applied, so no read of the stack's plans reports it and the name it was created
+    /// under is free for the next one. The record itself stays, addressed by its own ARN and by
+    /// the name it was created under, which is what keeps the execution it carried out
+    /// answerable.
     ///
     /// An execution that did NOT carry its change through left the stack where it was, so the
     /// plan is still one of the stack's own records: `EXECUTE_FAILED` is not this.
@@ -296,8 +297,8 @@ impl StoredChangeSet {
     /// execution did not carry its change through. It no longer holds a record a
     /// `DeleteChangeSet` discarded ([`Self::discarded`]), nor one whose execution was carried
     /// out ([`Self::execution_carried_out`]) — the plan became the stack's current revision, so
-    /// the stack carries it rather than holding it as a change to make. Both stay addressable by
-    /// their own ARN.
+    /// the stack carries it rather than holding it as a change to make. Both stay addressable,
+    /// by their own ARN and by the name they were created under.
     pub fn stack_holds_it(&self) -> bool {
         !self.discarded && !self.execution_carried_out()
     }

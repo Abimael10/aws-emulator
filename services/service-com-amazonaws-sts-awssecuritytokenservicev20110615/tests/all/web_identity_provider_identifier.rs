@@ -16,10 +16,10 @@
 //! `iam:CreateOpenIDConnectProvider` and the role's trust policy is the document
 //! `iam:CreateRole` stored. The rows differ along what the rule generalises over — which
 //! issuer the token names, in each part the identifier is built from: the HOST (a pool
-//! publishes the user-pool issuer host form of its Region, in the DNS zone of the endpoint
-//! it was created through — the documented `amazonaws.com` zone for a pool created at the
-//! service's regional endpoint, and the loopback zone for one created at this emulator's own
-//! address), the PORT that address carries, and the PATH, which is the pool's own id.
+//! publishes its issuer at the endpoint it was created through — the documented regional
+//! host for a pool created at the service's regional endpoint on an emulator served on no
+//! port, and this emulator's own address for one created there), the PORT that address
+//! carries, and the PATH, which is the pool's own id.
 //!
 //! The issuer that carries NO scheme to drop — `cognito-identity.amazonaws.com`, which
 //! every identity pool's own tokens name — is reported unchanged by the same derivation;
@@ -42,20 +42,19 @@ use super::web_identity_verification::{
 const REGIONAL_COGNITO_HOST: &str = "cognito-idp.us-east-1.amazonaws.com";
 
 /// This emulator's own address, which names no service: a pool created through it publishes
-/// its token issuer in the zone that address is reached under, so its issuer carries a
+/// its token issuer AT that address, so its issuer carries a
 /// PORT — the shape an issuer has for every client pointed at a locally served emulator.
 const EMULATOR_AUTHORITY: &str = "127.0.0.1:9297";
 
-/// The authority such a pool announces for [`EMULATOR_AUTHORITY`]: the user-pool issuer host
-/// form of the pool's Region in the loopback zone, which a resolver answers with the
-/// interface this emulator binds on, on that address's own port.
-const EMULATOR_ISSUER_AUTHORITY: &str = "cognito-idp.us-east-1.localhost:9297";
+/// The authority such a pool announces for [`EMULATOR_AUTHORITY`]: that address itself,
+/// which is the one address a relying party on this machine resolves.
+const EMULATOR_ISSUER_AUTHORITY: &str = EMULATOR_AUTHORITY;
 
 /// The same emulator bound on another port, so nothing is keyed to one of them.
 const OTHER_EMULATOR_AUTHORITY: &str = "127.0.0.1:18443";
 
 /// The authority a pool created through [`OTHER_EMULATOR_AUTHORITY`] announces.
-const OTHER_EMULATOR_ISSUER_AUTHORITY: &str = "cognito-idp.us-east-1.localhost:18443";
+const OTHER_EMULATOR_ISSUER_AUTHORITY: &str = OTHER_EMULATOR_AUTHORITY;
 
 /// The scheme an OpenID Connect issuer URL carries, and the one thing the provider
 /// identifier never has: "The URL must begin with https://"
@@ -90,8 +89,8 @@ struct Registered {
     provider_arn: String,
 }
 
-/// Sign in to a pool of its own, created through the endpoint `host` — whose zone and port
-/// its token issuer names — register that issuer as an OpenID Connect provider of the
+/// Sign in to a pool of its own, created through the endpoint `host` — the authority its
+/// token issuer names — register that issuer as an OpenID Connect provider of the
 /// account, and create a role admitting that provider for the token's audience.
 async fn register(router: &MultiServiceRouter, name: &str, host: &str) -> Registered {
     let signed_in = sign_in_at(router, name, host).await;

@@ -66,11 +66,11 @@ pub struct UserPool {
     /// The issuer this pool's tokens carry ([`effective_issuer_configuration`]).
     pub issuer_configuration: IssuerConfigurationType,
     /// The ENDPOINT of this emulator this pool publishes its token issuer on
-    /// ([`UserPool::issuer`]), as the `host[:port]` a client dials — the zone and the
-    /// port of the issuer the pool announces. `None` for a
+    /// ([`UserPool::issuer`]), as the `host[:port]` a client dials — the authority the
+    /// issuer the pool announces carries. `None` for a
     /// pool created through a client that resolves AWS's own hostnames on an
     /// emulator that is served on no port at all, which is the one caller that can
-    /// reach the zone the issuer's documented form names.
+    /// reach the host the issuer's documented form names.
     ///
     /// Settled by the create ([`issuer_endpoint_authority`]) and never rewritten by
     /// a read, because the `iss` claim of a token is what a verifier compares
@@ -407,6 +407,12 @@ const UPDATED_ISSUER_HOST_LABEL_PREFIX: &str = "issuer-";
 /// of `region` configured with the issuer type `issuer_type`: this service's endpoint
 /// prefix and the pool's own Region.
 ///
+/// This is the form AWS's OWN endpoint host carries, which is what a verifier configured
+/// from the documentation holds ([`is_pool_issuer`] reads it in whichever zone it is
+/// spelled). It is NOT a name this emulator announces: a host of this form resolves
+/// nowhere near this process, and an issuer is a URL a relying party dials
+/// ([`UserPool::issuer`]).
+///
 /// An issuer is hosted in the POOL's own Region and names this service: "the
 /// issuer URL is hosted in the user pool's region and provides OIDC endpoints
 /// specific to that region. Original issuers have the format of
@@ -426,28 +432,19 @@ fn issuer_host_labels(region: &str, issuer_type: &str) -> String {
     format!("{label_prefix}{SIGNING_NAME}.{region}")
 }
 
-/// The HOST a user pool of `region` publishes its token issuer on, for a pool
-/// configured with the issuer type `issuer_type`, in the DNS zone `zone`.
-///
-/// The issuer's documented FORM ([`issuer_host_labels`]) over the zone the name is
-/// published in: `amazonaws.com` is the zone AWS serves its own endpoints in
-/// ([`ENDPOINT_DNS_SUFFIX`]), and the zone THIS emulator answers in is the one it is
-/// reached under ([`UserPool::issuer`]) — a name a verifier resolves has to lead back
-/// to whoever publishes the key set it then reads.
-fn issuer_host_in(region: &str, issuer_type: &str, zone: &str) -> String {
-    format!("{}.{zone}", issuer_host_labels(region, issuer_type))
-}
-
 /// The host a user pool of `region` publishes its token issuer on for a client that
-/// resolves AWS's OWN hostnames: the documented form, in the zone AWS serves its
-/// endpoints in.
+/// resolves AWS's OWN hostnames: the documented form ([`issuer_host_labels`]) in the zone
+/// AWS serves its endpoints in ([`ENDPOINT_DNS_SUFFIX`]).
 fn issuer_host(region: &str, issuer_type: &str) -> String {
-    issuer_host_in(region, issuer_type, ENDPOINT_DNS_SUFFIX)
+    format!(
+        "{}.{ENDPOINT_DNS_SUFFIX}",
+        issuer_host_labels(region, issuer_type)
+    )
 }
 
 /// The endpoint a pool created by the request being served publishes its token
-/// ISSUER on: the `host[:port]` of THIS emulator, whose zone and port the issuer
-/// is announced in ([`UserPool::issuer`]), since the issuer is a URL a
+/// ISSUER on: the `host[:port]` of THIS emulator, which is the authority the issuer
+/// is announced at ([`UserPool::issuer`]), since the issuer is a URL a
 /// relying party fetches later — a verifier reads the key set from
 /// `<iss>/.well-known/jwks.json` — and a name this emulator announces has to
 /// lead back to this emulator.
@@ -460,7 +457,7 @@ fn issuer_host(region: &str, issuer_type: &str) -> String {
 /// pool minted by an in-process call of another service publishes an address that
 /// service's caller can reach too. `None` only for an emulator served on no port
 /// at all, where there is no endpoint to publish and the pool falls back to the
-/// zone its documented form names ([`issuer_host`]).
+/// host its documented form names ([`issuer_host`]).
 ///
 /// Both readings are the workspace's shared ones
 /// ([`::service_common::data_plane_addressing::reached_emulator_endpoint_of_parts`] and
@@ -482,10 +479,10 @@ pub fn issuer_endpoint_authority(
 /// web-identity federation).
 ///
 /// `issuer` names the pool when its whole path is that pool's id and its
-/// authority is one a pool of that Region publishes an issuer on
-/// ([`names_a_pool_issuer_host`]) or an address this emulator is reached at
-/// ([`serves_pool`]),
-/// which is what a verifier configured from this emulator's own endpoint holds.
+/// authority is one a pool of that Region answers at ([`serves_pool`]): a host carrying the
+/// issuer FORM such a pool publishes ([`names_a_pool_issuer_host`]), which is what a verifier
+/// configured from AWS's own documentation holds, or an address this emulator is reached at,
+/// which is what one configured from this emulator's endpoint holds.
 /// Everything else is a FOREIGN issuer, which names this pool no more than it
 /// names any other — and what proves a token is the pool's own remains its
 /// signature against the key set the pool publishes.
@@ -502,22 +499,41 @@ pub fn is_pool_issuer(region: &str, pool_id: &str, issuer: &str) -> bool {
     else {
         return false;
     };
-    serves_pool(region, authority)
+    serves_pool(region, pool_id, authority)
 }
 
-/// Whether `authority` is an address a pool of `region` answers at: a host carrying the
-/// issuer FORM a pool of that Region publishes ([`names_a_pool_issuer_host`], in whichever
-/// DNS zone it is published), or a host-shaped address naming NO service, which is how the
-/// emulator's own endpoint is addressed — an operator binds it wherever they
+/// Whether `authority` is an address the pool `pool_id` of `region` answers at: a host
+/// carrying the issuer FORM a pool of that Region publishes ([`names_a_pool_issuer_host`], in
+/// whichever DNS zone it is published), or a host-shaped address naming NO service, which is
+/// how the emulator's own endpoint is addressed — an operator binds it wherever they
 /// like and a client on this machine resolves nothing else.
+///
+/// An ADDRESS carries no Region label, so what names the Region there is the POOL's own id
+/// ([`id_names_region`]): `<region>_<suffix>` is the form every `UserPoolId` is minted in, so
+/// an id naming another Region than the one asked about names no pool of this one, exactly as
+/// an issuer host carrying another Region does.
 ///
 /// An authority naming a DIFFERENT service's endpoint — including this service's
 /// endpoint in another region, where the pool does not live — is served by that
 /// service and not by this pool.
-fn serves_pool(region: &str, authority: &str) -> bool {
+fn serves_pool(region: &str, pool_id: &str, authority: &str) -> bool {
     names_a_pool_issuer_host(region, authority)
-        || (::service_common::data_plane_addressing::is_host_shaped(authority)
+        || (id_names_region(pool_id, region)
+            && ::service_common::data_plane_addressing::is_host_shaped(authority)
             && !::service_common::data_plane_addressing::names_a_service(authority))
+}
+
+/// Whether `pool_id` is the id of a pool of `region`.
+///
+/// A `UserPoolId` is `<region>_<suffix>` — the form this service mints one in, and the form
+/// the modelled pattern `^[\w-]+_[0-9a-zA-Z]+$` admits, whose first half is the Region — so
+/// the id itself states which Region its pool lives in. The separator is the LAST underscore,
+/// because a Region may be spelled with one. Compared without regard to letter case, since a
+/// Region names the same Region however it is spelled.
+fn id_names_region(pool_id: &str, region: &str) -> bool {
+    pool_id
+        .rsplit_once('_')
+        .is_some_and(|(named, _)| named.eq_ignore_ascii_case(region))
 }
 
 /// Whether `authority`'s host is an ISSUER HOST of a pool of `region`: the labels such a
@@ -561,26 +577,26 @@ impl UserPool {
     /// This pool's TOKEN ISSUER: the user-pool issuer URL it publishes, with this
     /// pool's id as the whole path.
     ///
-    /// The HOST is the form every user-pool issuer carries — this service's endpoint
-    /// prefix and the pool's own Region ([`issuer_host_labels`]) — in the DNS ZONE the
-    /// issuer is published in, and that is the one thing the deployment decides:
+    /// The HOST is the one thing the deployment decides, and the issuer is a URL the
+    /// holder of a token DIALS — it is the discovery root a verifier reads
+    /// `<iss>/.well-known/jwks.json` from (Amazon Cognito Developer Guide, "Verifying a
+    /// JSON web token") — so the host has to be one this emulator answers on:
     ///
     /// * a pool created through an endpoint of THIS emulator
-    ///   ([`UserPool::issuer_endpoint`]) publishes the issuer in the zone that endpoint
-    ///   is reached under
-    ///   ([`::service_common::data_plane_addressing::announced_zone_of_authority`], the
-    ///   loopback zone for an endpoint addressed as an address), on that endpoint's own
-    ///   port. The issuer is a URL the holder of a token FETCHES — it is the discovery
-    ///   root a verifier reads `<iss>/.well-known/jwks.json` from (Amazon Cognito
-    ///   Developer Guide, "Verifying a JSON web token") — and this emulator answers
-    ///   those routes (`crate::service`) on the interface that zone resolves to, so the
-    ///   locator a token leads a verifier to leads back here instead of to a host
-    ///   nothing on this machine serves;
+    ///   ([`UserPool::issuer_endpoint`]) publishes the issuer AT that endpoint's own
+    ///   `host[:port]`, which is the address its creator dialled and the one address a
+    ///   relying party on this machine resolves. This emulator answers the issuer's
+    ///   routes there (`crate::service`), so the locator a token leads a verifier to
+    ///   leads back here;
     /// * a pool created by a client that resolves AWS's own hostnames, on an emulator
     ///   served on no port at all, has no endpoint of this emulator to publish and
-    ///   announces the documented zone instead ([`issuer_host`]):
+    ///   announces the documented host instead ([`issuer_host`]):
     ///   `https://cognito-idp.<region>.amazonaws.com/<UserPoolId>` for a pool issuing
-    ///   the original way.
+    ///   the original way, which is the only deployment whose client resolves that host.
+    ///
+    /// Only the HOST is the emulator's; the PATH is the one AWS gives the issuer, the
+    /// pool's own id, so a client that reads the pool out of an issuer reads the same
+    /// segment it would against AWS.
     ///
     /// Either way it is rendered from what the pool STORES, so one pool announces
     /// ONE issuer however its later callers address this emulator: the `iss` claim
@@ -590,27 +606,19 @@ impl UserPool {
         format!("https://{}/{}", self.issuer_authority(), self.id)
     }
 
-    /// The AUTHORITY this pool publishes its issuer on: its issuer host in the zone the
-    /// pool publishes in, carrying the port that zone is served on (see
-    /// [`UserPool::issuer`]).
+    /// The AUTHORITY this pool publishes its issuer on: the endpoint of this emulator the
+    /// pool was created through, as the `host[:port]` its creator dialled, and the
+    /// documented regional host for a pool with no endpoint of this emulator to publish
+    /// (see [`UserPool::issuer`]).
     ///
-    /// A stored endpoint names a port only when it was reached on one, and a value outside
-    /// the port range is no port at all, so such an endpoint publishes the issuer on the
-    /// scheme's own port exactly as an endpoint that named none does.
+    /// The stored endpoint is published as it was reached, with no label inserted in front
+    /// of it: a client resolves the authority an issuer names and dials it, and the only
+    /// authority it can resolve to this process is the one it already reached this service
+    /// at.
     fn issuer_authority(&self) -> String {
-        use ::service_common::data_plane_addressing as addressing;
-
-        let Some(endpoint) = self.issuer_endpoint.as_deref() else {
-            return issuer_host(&self.region, self.issuer_type());
-        };
-        let host = issuer_host_in(
-            &self.region,
-            self.issuer_type(),
-            &addressing::announced_zone_of_authority(endpoint),
-        );
-        match addressing::addressed_port(Some(endpoint)).and_then(|port| u16::try_from(port).ok()) {
-            Some(port) => addressing::host_port_authority(&host, port),
-            None => host,
+        match self.issuer_endpoint.as_deref() {
+            Some(endpoint) => endpoint.to_string(),
+            None => issuer_host(&self.region, self.issuer_type()),
         }
     }
 
@@ -626,11 +634,18 @@ impl UserPool {
     /// Whether `issuer` is a token issuer OF THIS POOL — the question a verifier
     /// holding a token asks to find the pool whose key set verifies it.
     ///
-    /// [`is_pool_issuer`] is that reading: the pool's own issuer names it, and so
-    /// does the same pool addressed at an endpoint of this emulator, which is
-    /// what a verifier configured from this emulator's endpoint holds.
+    /// The pool's OWN announced issuer ([`UserPool::issuer`]) names it, compared as a
+    /// base URI so a trailing `/` names the same provider: whatever address this
+    /// deployment publishes — including a host an operator serves this emulator under,
+    /// which no reading without the pool in hand can tell from another service's — the
+    /// value the pool itself announces is its issuer. Beside it, [`is_pool_issuer`] is
+    /// the reading a verifier with no pool record shares: the documented host form of a
+    /// pool of this Region, in whichever zone it is spelled, which is what a verifier
+    /// configured from AWS's documentation holds.
     pub fn publishes_issuer(&self, issuer: &str) -> bool {
-        is_pool_issuer(&self.region, &self.id, issuer)
+        let presented = issuer.trim().trim_end_matches('/');
+        presented == self.issuer().trim_end_matches('/')
+            || is_pool_issuer(&self.region, &self.id, issuer)
     }
 
     /// This pool's token-signing keys, minted when the pool was created.

@@ -5,12 +5,12 @@
 //!
 //! RULE: a change set is a PLAN its stack holds until that plan is carried out. An execution
 //! that completes carries it out — the plan became the revision the stack now carries — so the
-//! stack holds that record no longer: no read of the stack's change sets reports it
-//! (`ListChangeSets` does not list it) and the NAME it deployed under addresses no change set,
-//! so `DescribeChangeSet` for that name answers the modelled `ChangeSetNotFound` and the next
-//! deployment may plan under it. The RECORD itself stays, addressed by its own ARN: it reports
-//! the execution it carried out, which is what keeps `ExecuteChangeSet` for it answered on that
-//! execution rather than as a change set that never existed. Every plan the stack has still to
+//! stack holds that record no longer: no read of the stack's plans reports it
+//! (`ListChangeSets` does not list it) and the next deployment may plan under the name it
+//! deployed under. The RECORD itself stays, addressed by its own ARN and by the name it was
+//! created under: it reports the execution it carried out, which is what keeps
+//! `ExecuteChangeSet` and `DescribeChangeSet` for it answered on that execution rather than as
+//! a change set that never existed. Every plan the stack has still to
 //! carry out is held, whatever state it is in — one being computed, one ready to execute, one
 //! being applied right now, one another execution superseded, one whose creation left no plan
 //! and one whose execution did not carry its change through.
@@ -134,31 +134,16 @@ async fn a_stack_holds_every_plan_but_the_one_an_execution_carried_out() {
             execution,
         );
 
-        // The NAME addresses the record only while the stack holds it as a plan.
+        // The NAME addresses the record for as long as the record is there, whatever became
+        // of the plan it describes.
         let (code, body) = describe_change_set(&router, &change_set, Some(&stack)).await;
-        if held {
-            assert_eq!(
-                (code, xml_text(&body, "ExecutionStatus").unwrap_or_default()),
-                (200, execution.to_string()),
-                "case {case:?}: the name must address the plan the stack holds, got {code} \
-                 {body}"
-            );
-        } else {
-            assert_eq!(
-                (code, refusal(&body)),
-                (
-                    404,
-                    (
-                        "ChangeSetNotFound".to_string(),
-                        format!("ChangeSet [{change_set}] does not exist"),
-                    ),
-                ),
-                "case {case:?}: the name must address no plan the stack holds, got {code} \
-                 {body}"
-            );
-        }
+        assert_eq!(
+            (code, xml_text(&body, "ExecutionStatus").unwrap_or_default()),
+            (200, execution.to_string()),
+            "case {case:?}: the name must address the record, got {code} {body}"
+        );
 
-        // ...and so does a read of the stack's change sets.
+        // A read of the stack's PLANS reports only the ones it still holds.
         let names = listed(&router, &stack).await;
         let expected: Vec<String> = if held {
             vec![change_set.clone()]
@@ -186,8 +171,10 @@ async fn a_stack_holds_every_plan_but_the_one_an_execution_carried_out() {
 }
 
 /// The same rule over the REAL path, for each change-set type whose execution changes a stack:
-/// the execution carries the plan out, the name it deployed under is free for the next plan —
-/// with no delete in between — and the record of that execution answers under its own ARN.
+/// the execution carries the plan out, the stack lists it no longer and the name it deployed
+/// under is free for the next plan — with no delete in between — while the record of that
+/// execution answers under its own ARN and under the name it was created under, refusing
+/// another execution on the execution it carried out.
 #[tokio::test]
 async fn an_execution_frees_the_name_it_deployed_under_for_the_next_plan() {
     // (case, the change-set type, the template the executed plan deploys, the template the
@@ -228,14 +215,39 @@ async fn an_execution_frees_the_name_it_deployed_under_for_the_next_plan() {
             "case {case:?}: the execution must have been carried out, got {code} {body}"
         );
 
-        // The stack holds that plan no longer: its name addresses nothing and the stack lists
-        // no change set at all.
+        // The stack holds that plan no longer: it lists no change set at all, while the
+        // record of the execution still answers under the name it was created under.
         let (code, body) = describe_change_set(&router, change_set, Some(&stack)).await;
         assert_eq!(
-            (code, refusal(&body).0),
-            (404, "ChangeSetNotFound".to_string()),
-            "case {case:?}: the name of the plan that was carried out addresses nothing, got \
-             {code} {body}"
+            (
+                code,
+                xml_text(&body, "ChangeSetId").unwrap_or_default(),
+                xml_text(&body, "ExecutionStatus").unwrap_or_default(),
+            ),
+            (
+                200,
+                arn.clone(),
+                execution_status::EXECUTE_COMPLETE.to_string()
+            ),
+            "case {case:?}: the name of the plan that was carried out addresses that record, \
+             got {code} {body}"
+        );
+        let (code, body) = execute_change_set(&router, change_set, Some(&stack)).await;
+        assert_eq!(
+            (code, refusal(&body)),
+            (
+                400,
+                (
+                    "InvalidChangeSetStatus".to_string(),
+                    format!(
+                        "ChangeSet [{arn}] cannot be executed in its current execution status \
+                         of [{}]",
+                        execution_status::EXECUTE_COMPLETE
+                    ),
+                ),
+            ),
+            "case {case:?}: expected the execution that happened to refuse a call naming it by \
+             name, got {code} {body}"
         );
         let names = listed(&router, &stack).await;
         assert!(

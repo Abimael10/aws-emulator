@@ -177,9 +177,9 @@ struct Addressing {
     /// the form of the address the minted api announces.
     reaches_only_the_emulator: bool,
     /// The AUTHORITY of the issuer a pool created at [`Addressing::cognito_host`] announces:
-    /// the user-pool issuer host form (`cognito-idp.<region>`) in the DNS zone that endpoint
-    /// is reached under, on its port — the documented `amazonaws.com` zone for a client that
-    /// resolves AWS's own hostnames, and the loopback zone for an endpoint of this emulator.
+    /// the endpoint of this emulator that create reached, for a client that resolves nothing
+    /// else, and the documented regional host for a client that resolves AWS's own hostnames
+    /// on an emulator served on no port.
     issuer_authority: &'static str,
 }
 
@@ -188,14 +188,14 @@ const LOOPBACK_ENDPOINT: Addressing = Addressing {
     cognito_host: "127.0.0.1:45923",
     control_host: "127.0.0.1:45923",
     reaches_only_the_emulator: true,
-    issuer_authority: "cognito-idp.us-east-1.localhost:45923",
+    issuer_authority: "127.0.0.1:45923",
 };
 const NAMED_LOCAL_ENDPOINT: Addressing = Addressing {
     case: "the same endpoint named by its loopback NAME, on another port",
     cognito_host: "localhost:9297",
     control_host: "localhost:9297",
     reaches_only_the_emulator: true,
-    issuer_authority: "cognito-idp.us-east-1.localhost:9297",
+    issuer_authority: "localhost:9297",
 };
 const PUBLISHED_REGIONAL_HOSTS: Addressing = Addressing {
     case: "a client that resolves AWS's own hosts: each service's own regional host",
@@ -848,8 +848,8 @@ async fn the_jwt_surface_at(addressing: &Addressing) {
     // The issuer the pool announces, which is what a relying party composes from the endpoint
     // it dialled and the pool's id — the documented
     // `https://cognito-idp.{region}.amazonaws.com/{userPoolId}` (`JWTConfiguration$Issuer`) for
-    // a caller that resolves AWS's own hostnames, and the same host form in the zone of the
-    // endpoint a client of this emulator reached.
+    // a caller that resolves AWS's own hostnames, and the endpoint itself for a client of this
+    // emulator, which resolves nothing else.
     let issuer = format!("https://{}/{pool_id}", addressing.issuer_authority);
     let (header, claims) = parts_of(&admitted_token);
     assert_eq!(

@@ -46,13 +46,12 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 
 /// The endpoint of THIS emulator the suite's calls are addressed at, which is the address
 /// a client configured with the emulator's own endpoint reaches it on — and therefore the
-/// endpoint whose zone and port the pools it creates publish their token issuer in.
+/// authority the pools it creates publish their token issuer on.
 const EMULATOR_ENDPOINT: &str = "127.0.0.1:9297";
 
-/// The ISSUER AUTHORITY a pool created through [`EMULATOR_ENDPOINT`] announces: the
-/// user-pool issuer form over the zone that endpoint is reached under — an address is
-/// announced in the loopback zone — on that endpoint's own port.
-const ISSUER_AUTHORITY: &str = "cognito-idp.us-west-2.localhost:9297";
+/// The ISSUER AUTHORITY a pool created through [`EMULATOR_ENDPOINT`] announces: that
+/// endpoint itself, which is the one address a relying party on this machine resolves.
+const ISSUER_AUTHORITY: &str = EMULATOR_ENDPOINT;
 
 /// A password satisfying a default pool's password policy.
 const GOOD_PASSWORD: &str = "Passw0rd!2024";

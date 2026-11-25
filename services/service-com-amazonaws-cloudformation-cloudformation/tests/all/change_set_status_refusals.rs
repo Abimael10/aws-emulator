@@ -449,10 +449,10 @@ async fn an_executed_change_set_keeps_the_record_of_its_execution_until_it_is_di
             "case {case:?}: the execution completes with the stack, got {body}"
         );
         // ...and what is left is the RECORD of the change the stack took, addressed by its own
-        // ARN: a call asking for it to be executed again is answered on the execution that
-        // happened. The plan is no longer one the stack HOLDS — it became the stack's own
-        // revision — so the name it deployed under addresses nothing and no read of the
-        // stack's change sets reports it.
+        // ARN and by the name it was created under: a call asking for it to be executed again
+        // is answered on the execution that happened, whichever way it names the record. The
+        // plan is no longer one the stack HOLDS — it became the stack's own revision — so no
+        // read of the stack's plans reports it.
         let (code, body) = describe_change_set(&router, &change_set_id, None).await;
         assert_eq!(
             (code, xml_text(&body, "ExecutionStatus").unwrap_or_default()),
@@ -461,10 +461,37 @@ async fn an_executed_change_set_keeps_the_record_of_its_execution_until_it_is_di
         );
         let (code, body) = describe_change_set(&router, &change_set_name, Some(&stack_name)).await;
         assert_eq!(
-            (code, xml_text(&body, "Code").unwrap_or_default()),
-            (404, "ChangeSetNotFound".to_string()),
-            "case {case:?}: the name of a plan that was carried out addresses nothing, got \
-             {code} {body}"
+            (
+                code,
+                xml_text(&body, "ChangeSetId").unwrap_or_default(),
+                xml_text(&body, "ExecutionStatus").unwrap_or_default(),
+            ),
+            (
+                200,
+                change_set_id.clone(),
+                execution_status::EXECUTE_COMPLETE.to_string(),
+            ),
+            "case {case:?}: the name it was created under addresses that record, got {code} \
+             {body}"
+        );
+        let (code, body) = execute_change_set(&router, &change_set_name, Some(&stack_name)).await;
+        assert_eq!(
+            (
+                code,
+                xml_text(&body, "Code").unwrap_or_default(),
+                xml_text(&body, "Message").unwrap_or_default(),
+            ),
+            (
+                400,
+                "InvalidChangeSetStatus".to_string(),
+                format!(
+                    "ChangeSet [{change_set_id}] cannot be executed in its current execution \
+                     status of [{}]",
+                    execution_status::EXECUTE_COMPLETE
+                ),
+            ),
+            "case {case:?}: executing it again by name is answered on the execution that \
+             happened, got {body}"
         );
         let (code, body) = call(
             &router,

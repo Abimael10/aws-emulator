@@ -10,9 +10,10 @@
 //! delete in between; `DeleteChangeSet` is what frees the name of a plan nothing executed. Every
 //! round therefore reads back as a change set of its own (its own ARN, its own plan), the stack
 //! keeps every change its executions carried out, and the record of each round's execution stays
-//! addressable by its OWN ARN while the shared NAME addresses only the plan the stack still
-//! holds. What the store KEEPS of the records a stack no longer holds is bounded, oldest
-//! reclaimed first, so deploying in a loop cannot grow it without limit.
+//! addressable by its OWN ARN — and by the shared NAME until the next round plans under it, which
+//! is then the plan that name addresses. What the store KEEPS of the records a stack no longer
+//! holds is bounded, oldest reclaimed first, so deploying in a loop cannot grow it without
+//! limit.
 //!
 //! The table below is the rounds: the first brings the stack into existence from a `CREATE`
 //! change set and each later one updates it from an `UPDATE` change set, so the rule is held
@@ -172,15 +173,23 @@ async fn a_redeployment_plans_under_the_name_the_last_one_deployed_under() {
             expected_ids,
             "case {case:?}: expected the stack to carry every round's resources"
         );
-        // ...and the record of that execution is no longer a plan the stack holds: the shared
-        // NAME addresses nothing, while the record itself is still there under its own ARN,
-        // reporting the execution it carried out.
+        // ...and the record of that execution is no longer a plan the stack holds, while the
+        // record itself is still there — under its own ARN, and under the shared NAME until the
+        // next round plans under it — reporting the execution it carried out.
         let (code, described) = describe_change_set(&router, DEPLOY_SET, Some(stack)).await;
         assert_eq!(
-            (code, refusal(&described).0),
-            (404, "ChangeSetNotFound".to_string()),
-            "case {case:?}: the name must address no plan once this round carried its own \
-             out, got {code} {described}"
+            (
+                code,
+                xml_text(&described, "ChangeSetId").unwrap_or_default(),
+                xml_text(&described, "ExecutionStatus").unwrap_or_default(),
+            ),
+            (
+                200,
+                arn.clone(),
+                execution_status::EXECUTE_COMPLETE.to_string()
+            ),
+            "case {case:?}: the shared name must address the record this round carried out, \
+             got {code} {described}"
         );
         let (code, described) = describe_change_set(&router, &arn, None).await;
         assert_eq!(

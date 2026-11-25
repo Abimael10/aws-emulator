@@ -3362,17 +3362,18 @@ impl ComAmazonawsCloudformationCloudformationState {
             return stack_matches.then_some(index);
         }
         // A bare name is resolved within one stack ("If you specify the name of a change
-        // set, you must also specify the stack name") — among the change sets that stack
-        // still HOLDS ([`StoredChangeSet::stack_holds_it`]). A change set whose execution
-        // has been carried out is not one of them: its plan has been applied, so the name it
-        // deployed under is free for the next plan and names this record no longer. Its own
-        // ARN still names it, which is what keeps the execution it carried out answerable.
+        // set, you must also specify the stack name"), among the records of that stack —
+        // whatever became of the plan each describes. A record whose execution was carried
+        // out is one of them: the name it was created under goes on addressing it for as
+        // long as the record is there, which is what keeps every call that would act on it
+        // again refused on its own status rather than answered as a change set that never
+        // existed. The LAST matching record answers, so a plan created under the same name
+        // afterwards is the one a bare name addresses.
         let stack_name_or_id = stack_name_or_id?;
         let stack_id = self.resolve(region, stack_name_or_id)?.stack_id.clone();
         self.change_sets.iter().rposition(|change_set| {
             change_set.stack_id == stack_id
                 && change_set.change_set_name == name_or_id
-                && !change_set.execution_carried_out()
                 && considered(change_set)
         })
     }

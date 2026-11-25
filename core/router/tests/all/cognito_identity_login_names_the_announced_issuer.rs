@@ -8,15 +8,14 @@
 //! Amazon Cognito Identity's (`cognito-identity`), and the session it vends is assumed
 //! through IAM and STS.
 //!
-//! The RULE the rows assert, one level above the recorded case (a token whose `iss` was the
-//! emulator's bare `host:port`, which named no Cognito pool of any Region, so no
-//! user-pool-backed identity-pool flow could be exercised at all):
+//! The RULE the rows assert, one level above the recorded case:
 //!
-//! > A user pool's token issuer is `https://cognito-idp.<region>.<zone>[:<port>]/<id>` — the
-//! > user-pool issuer host form over the zone the pool publishes in — and that issuer is the
-//! > value an identity pool matches a `Logins` provider name against: a provider name
-//! > carrying that host form and the pool's id names the pool, whichever of the zones the
-//! > issuer is published in each of the two is spelled with, and a name carrying another
+//! > A user pool publishes its token issuer at an address this emulator answers on — the
+//! > `host[:port]` the create reached, with the pool's id as the whole path — and that issuer
+//! > is the value an identity pool matches a `Logins` provider name against: the announced
+//! > issuer without its scheme names the pool, and so does the documented
+//! > `cognito-idp.<region>.<domain>/<UserPoolId>` form of the same pool, which is what a
+//! > client configured from AWS's own documentation is holding; a name carrying another
 //! > Region names no pool of this one.
 //!
 //! The `Logins` key is "`cognito-idp.<region>.<domain>/<YOUR_USER_POOL_ID>`" (`GetId.Logins`
@@ -227,11 +226,10 @@ fn an_identity_pool_admits_the_login_its_user_pools_issuer_names() {
                 .expect("an id token carries a string iss claim")
                 .to_string();
 
-            // The issuer the pool announced carries the user-pool issuer host form over the
-            // zone of the endpoint this emulator is served at, with the pool's id as its
-            // whole path — and it is a locator this emulator answers, which is what makes it
-            // a value a relying party can use.
-            let expected = format!("https://cognito-idp.{REGION}.localhost:9297/{user_pool_id}");
+            // The issuer the pool announced is the address this emulator is served at, with
+            // the pool's id as its whole path — a locator this emulator answers, which is what
+            // makes it a value a relying party can use.
+            let expected = format!("https://127.0.0.1:9297/{user_pool_id}");
             assert_eq!(
                 announced, expected,
                 "the pool must announce iss {expected:?}, got {announced:?}"

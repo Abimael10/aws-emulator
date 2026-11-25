@@ -14,10 +14,10 @@
 //! > A user pool announces its token issuer at the endpoint it was CREATED through, so the
 //! > issuer a relying party composes from the endpoint it dialled and the pool's id — the
 //! > documented `https://cognito-idp.{region}.amazonaws.com/{userPoolId}` for a caller that
-//! > resolves AWS's own hostnames, and that same host form in the DNS zone of this
-//! > emulator's own endpoint for a caller that resolves only it — is the `iss` claim that
-//! > pool's tokens carry, and the verification material (the OpenID Connect discovery
-//! > document and the key set) is published under
+//! > resolves AWS's own hostnames, and `https://<that endpoint>/{userPoolId}` for a caller
+//! > that resolves only this emulator — is the `iss` claim that pool's tokens carry, and the
+//! > verification material (the OpenID Connect discovery document and the key set) is
+//! > published under
 //! > it. A route whose `AuthorizationType` is `JWT` therefore admits a request to its
 //! > integration exactly when the token at the authorizer's identity source is a signed JWT
 //! > whose `iss` is that authorizer's `Issuer` (compared as a base URI, so a trailing `/`
@@ -103,10 +103,9 @@ struct Addressing {
     /// The authority the API Gateway V2 control plane is dialled at.
     control_host: &'static str,
     /// The AUTHORITY of the issuer a pool created at [`Addressing::cognito_host`] announces:
-    /// the user-pool issuer host form (`cognito-idp.<region>`) in the DNS zone that endpoint
-    /// is reached under, on its port — the documented `amazonaws.com` zone for a client that
-    /// resolves AWS's own hostnames, and the loopback zone for an endpoint of this emulator,
-    /// which is a name a resolver answers with the interface the core binds on.
+    /// the endpoint of this emulator that create reached — the one address a client of this
+    /// emulator resolves — and the documented regional host for a client that resolves AWS's
+    /// own hostnames on an emulator served on no port.
     issuer_authority: &'static str,
 }
 
@@ -117,13 +116,13 @@ const LOOPBACK_ENDPOINT: Addressing = Addressing {
     case: "a loopback address with a port, which is how this emulator is reached",
     cognito_host: "127.0.0.1:9297",
     control_host: "127.0.0.1:9297",
-    issuer_authority: "cognito-idp.us-west-2.localhost:9297",
+    issuer_authority: "127.0.0.1:9297",
 };
 const NAMED_LOCAL_ENDPOINT: Addressing = Addressing {
     case: "a named local endpoint with a port",
     cognito_host: "localhost:4566",
     control_host: "localhost:4566",
-    issuer_authority: "cognito-idp.us-west-2.localhost:4566",
+    issuer_authority: "localhost:4566",
 };
 const PUBLISHED_REGIONAL_HOSTS: Addressing = Addressing {
     case: "each service's own published regional host",
@@ -578,7 +577,7 @@ async fn the_gate_at(addressing: &Addressing) {
         // endpoint it dialled and the pool's id: the documented
         // `https://cognito-idp.{region}.amazonaws.com/{userPoolId}`
         // (`JWTConfiguration$Issuer`) for a caller that resolves AWS's own hostnames, and
-        // the same host form in the zone of the endpoint a client of this emulator reached.
+        // the endpoint itself for a client of this emulator, which resolves nothing else.
         let issuer = format!("https://{}/{pool_id}", addressing.issuer_authority);
         let (header, claims) = parts_of(&admitted_token);
         assert_eq!(
