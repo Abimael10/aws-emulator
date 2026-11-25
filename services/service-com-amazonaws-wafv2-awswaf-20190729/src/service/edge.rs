@@ -748,7 +748,7 @@ pub fn decide<Eng: Send + Sync + 'static>(
     // own documentation describes.
     let web_acl_arn = {
         let store = state.lock();
-        store.web_acl_associations.get(resource_arn)?.clone()
+        store.web_acl_associations.get(resource_arn)?.web_acl_arn.clone()
     };
     decided(engine, &web_acl_arn, Some(resource_arn), request)
 }

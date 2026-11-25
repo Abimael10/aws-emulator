@@ -4614,7 +4614,10 @@ pub fn associated_web_acl_arn<Eng: Send + Sync + 'static>(
     let arn = stage_arn(region, rest_api_id, stage_name);
     let waf = ::service_com_amazonaws_wafv2_awswaf_20190729::state::service_state(engine)?;
     let store = waf.lock();
-    store.web_acl_associations.get(&arn).cloned()
+    store
+        .web_acl_associations
+        .get(&arn)
+        .map(|association| association.web_acl_arn.clone())
 }
 
 /// The ARN of the stored custom domain name addressed by `key` (a [`domain_name_key`]).

@@ -21,9 +21,11 @@
 //! observes.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_wafv2_awswaf_20190729::state::MAX_WEB_ACL_CAPACITY;
 
 use crate::managed_rule_sets::provision_managed_rule_set;
-use crate::web_acl_lifecycle::{create_ip_set, create_web_acl, rule, visibility, Waf};
+use crate::rule_group_lifecycle::create_rule_group;
+use crate::web_acl_lifecycle::{create_ip_set, rule, visibility, Waf};
 
 /// The `ErrorReason` WAF carries for an ARN it will not accept, as recorded.
 /// Spelled out here independently of the service's own constant, so this suite
@@ -120,11 +122,17 @@ async fn every_invalid_parameter_refusal_carries_field_parameter_and_reason() {
     let put_set_name = "vendor-managed-set";
     let (put_set_id, _put_set_arn, _put_set_lock) =
         provision_managed_rule_set(&engine, "REGIONAL", put_set_name, None);
-    // A CLOUDFRONT-scoped web ACL, for the WEB_ACL row: such a web ACL is put in front
-    // of a distribution through the distribution's own configuration, so associating it
-    // through this API is the refusal that names WEB_ACL.
-    let (_global_id, global_acl_arn, _global_lock) =
-        create_web_acl(&waf, "CLOUDFRONT", "probe-global-acl", json!([])).await;
+    // A rule group declaring one capacity unit more than one web ACL's rules may cost,
+    // for the WEB_ACL row: a save whose rules price past that ceiling is the refusal
+    // that names WEB_ACL, with the price those rules cost as its `Parameter`.
+    let (_group_id, over_ceiling_group, _group_lock) = create_rule_group(
+        &waf,
+        "REGIONAL",
+        "probe-over-ceiling-group",
+        MAX_WEB_ACL_CAPACITY + 1,
+        json!([]),
+    )
+    .await;
 
     // A rule tree one level past the published nesting maximum, for the STATEMENT
     // row: ten `NotStatement`s wrapping a leaf is eleven levels.
@@ -192,15 +200,25 @@ async fn every_invalid_parameter_refusal_carries_field_parameter_and_reason() {
         // reports the omission against the request itself, under its own code and
         // sentence, which `crate::web_acl_identifier_refusals` asserts.
         Case {
-            case: "AssociateWebACL, a CLOUDFRONT-scoped web ACL",
-            operation: "AssociateWebACL",
+            case: "CreateWebACL, rules priced past the web ACL capacity ceiling",
+            operation: "CreateWebACL",
             request: json!({
-                "WebACLArn": &global_acl_arn,
-                "ResourceArn": "arn:aws:elasticloadbalancing:us-west-2:000000000000:\
-                                loadbalancer/app/probe-lb/1234567890abcdef",
+                "Name": "probe-acl-over-ceiling",
+                "Scope": "REGIONAL",
+                "DefaultAction": { "Allow": {} },
+                "VisibilityConfig": visibility("probe-acl-over-ceiling"),
+                "Rules": [{
+                    "Name": "rg",
+                    "Priority": 0,
+                    "Statement": {
+                        "RuleGroupReferenceStatement": { "ARN": &over_ceiling_group }
+                    },
+                    "OverrideAction": { "None": {} },
+                    "VisibilityConfig": visibility("rg"),
+                }],
             }),
             field: "WEB_ACL",
-            parameter: global_acl_arn.clone(),
+            parameter: (MAX_WEB_ACL_CAPACITY + 1).to_string(),
         },
         Case {
             case: "CreateIPSet, an address that is not in CIDR notation",

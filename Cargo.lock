@@ -10156,6 +10156,7 @@ dependencies = [
  "serde",
  "serde_json",
  "service-com-amazonaws-s3-amazons3",
+ "service-com-amazonaws-wafv2-awswaf-20190729",
  "service-common",
  "sha2 0.10.9",
  "tokio",

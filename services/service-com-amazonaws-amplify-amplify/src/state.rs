@@ -39,6 +39,9 @@ pub mod hosting_address;
 /// The execution steps a settled job reports, and the output each of them publishes a URL
 /// for.
 pub mod job_steps;
+/// The WAF firewall in front of a hosted app: the web ACL WAFv2 has in front of it, as
+/// `App$wafConfiguration` reports it.
+pub mod web_acl;
 
 pub use basic_auth::{
     ingest_auto_branch_basic_auth, ingest_basic_auth, presented_credentials, BasicAuthCredentials,
@@ -57,6 +60,11 @@ pub use hosting_address::{
     addressed_hosted_site, announced_default_domain, default_domain_prefix, hosted_branch_host,
     hosted_site_host, hosted_site_path, hosting_plane_prefix, HostedSiteAddress,
     HOSTING_PLANE_LABEL,
+};
+
+pub use web_acl::{
+    reported_waf_configuration, waf_configuration, ASSOCIATION_SETTLES_AFTER_MILLIS,
+    WAF_STATUS_ASSOCIATING, WAF_STATUS_ASSOCIATION_SUCCESS,
 };
 
 /// One Amplify app as this service persists it: the modelled record it hands back,

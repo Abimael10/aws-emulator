@@ -19,9 +19,10 @@
 //!   it belongs to another service and possibly another account, so this
 //!   deployment cannot show it absent.
 //! * `WebACLArn` must name a web ACL this service holds, which it can show, so an
-//!   ARN naming none is `WAFNonexistentItemException`; and it must be a REGIONAL
-//!   one, because a CLOUDFRONT-scoped web ACL is bound through the distribution's
-//!   own configuration rather than through this API.
+//!   ARN naming none is `WAFNonexistentItemException`; and its `Scope` must be the
+//!   one the protected resource's KIND takes — the global namespace for a resource
+//!   served from the edge, a REGIONAL web ACL for one that serves its traffic in a
+//!   single Region ([`crate::state::ProtectedResourceForm::scope`]).
 //!
 //! ## Shape of an operation
 //!
@@ -215,12 +216,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        let Some(resource_type) = crate::state::protected_resource_type(&input.resource_arn) else {
+        let Some(form) = crate::state::protected_resource_form(&input.resource_arn) else {
             return Err(AssociateWebACLErrorModeled::WAFInvalidParameterException(
                 crate::state::invalid_arn_exception(&input.resource_arn),
             )
             .into());
         };
+        let resource_type = form.resource_type;
 
         // "WAF couldn't retrieve a resource that you specified for this operation"
         // (`WAFUnavailableEntityException`): a protected resource belongs to another
@@ -276,12 +278,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name = entry.web_acl.name.clone();
         let id = entry.web_acl.id.clone();
 
-        // "Use this for all resource types except for Amazon CloudFront
-        // distributions. For Amazon CloudFront, call UpdateDistribution" (the
-        // operation's own doc): a CLOUDFRONT-scoped web ACL protects distributions,
-        // which carry their web ACL in their own configuration, so it is not what
-        // this call binds.
-        if scope == crate::state::SCOPE_CLOUDFRONT {
+        // A web ACL protects the resource kinds its own `Scope` serves: the global
+        // namespace is "for a global resource type, such as a Amazon CloudFront
+        // distribution. For an Amplify application, use CLOUDFRONT" (`Scope`'s own
+        // doc), while a resource that serves its traffic in one Region takes a
+        // REGIONAL web ACL. So the decision is about the KIND of resource
+        // `ResourceArn` names ([`crate::state::ProtectedResourceForm::scope`]) and
+        // not about the scope alone: a CloudFront DISTRIBUTION is the one resource
+        // this operation does not bind at all ("use this for all resource types
+        // except for Amazon CloudFront distributions"), and it is absent from the
+        // catalogue above, so it is already refused as a resource kind.
+        if scope != form.scope {
             crate::state::audit(
                 "AssociateWebACL",
                 &scope,
@@ -290,13 +297,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "WAFInvalidParameterException",
             );
             return Err(AssociateWebACLErrorModeled::WAFInvalidParameterException(
-                crate::state::invalid_parameter_exception(
-                    crate::state::FIELD_WEB_ACL,
-                    &input.web_acl_arn,
-                    "a CLOUDFRONT-scoped web ACL is put in front of a CloudFront \
-                     distribution through the distribution's own configuration, not \
-                     through this operation",
-                ),
+                crate::state::resource_not_supported_in_region_exception(),
             )
             .into());
         }

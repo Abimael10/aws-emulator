@@ -141,20 +141,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // A pure read: the app record is returned exactly as `CreateApp` persisted it,
-        // projected the way a read reports it.
-        let store = state.lock();
-        let app = store
-            .apps
-            .get(&input.app_id)
-            .map(|stored| stored.app.clone())
-            .ok_or_else(|| {
-                GetAppErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(crate::state::not_found_message(
-                        crate::state::APP_ENTITY,
-                        &input.app_id,
-                    )),
-                })
-            })?;
+        // projected the way a read reports it. The firewall member is the exception:
+        // the web ACL in front of this app is WAF's own record, read with this
+        // service's store released (`crate::state::web_acl`).
+        let app = {
+            let store = state.lock();
+            store
+                .apps
+                .get(&input.app_id)
+                .map(|stored| stored.app.clone())
+                .ok_or_else(|| {
+                    GetAppErrorModeled::NotFoundException(NotFoundException {
+                        message: Some(crate::state::not_found_message(
+                            crate::state::APP_ENTITY,
+                            &input.app_id,
+                        )),
+                    })
+                })?
+        };
+        let app = crate::state::reported_waf_configuration(&*self.engine, app);
 
         Ok(GetAppOutput {
             app: AppProjection::reported(app),

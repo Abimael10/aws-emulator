@@ -19,8 +19,9 @@
 //!
 //! The rows differ along what the rule generalises over: which kind of protected resource the
 //! binding names (an Amazon Cognito user pool the same stack declares, an API Gateway stage,
-//! an Application Load Balancer, an Amplify app, an Amazon Web Services Verified Access
-//! instance — each in the ARN format `AssociateWebACLRequest$ResourceArn` documents for it),
+//! an Application Load Balancer, an AppSync GraphQL API, an Amazon Web Services Verified
+//! Access instance — each in the ARN format `AssociateWebACLRequest$ResourceArn` documents
+//! for it),
 //! whether the ARN is written literally or comes from an `Fn::GetAtt` to another resource of
 //! the same stack, how many bindings one stack declares, which spelling the template is in
 //! (JSON and YAML), and — for the other type the rule covers — which pair identifies the
@@ -323,9 +324,14 @@ fn load_balancer_arn(name: &str, id: &str) -> String {
     )
 }
 
-fn amplify_app_arn(app_id: &str) -> String {
+/// An AppSync GraphQL API's ARN. A REGIONAL kind, like every other protected resource this
+/// suite's stacks declare: the web ACLs they create are REGIONAL, and a web ACL protects the
+/// resource kinds its own `Scope` serves (a resource served from CloudFront's edge, such as
+/// an Amplify application, takes a CLOUDFRONT-scoped web ACL —
+/// `smithy_query(query="doc",shape="CreateWebACLRequest",member="Scope")`).
+fn graphql_api_arn(api_id: &str) -> String {
     format!(
-        "arn:aws:amplify:{REGION}:{}:apps/{app_id}",
+        "arn:aws:appsync:{REGION}:{}:apis/{api_id}",
         engine::emulator_account_id()
     )
 }
@@ -499,18 +505,18 @@ const ROWS: &[Row] = &[
         }],
     },
     Row {
-        case: "two bindings in one stack: an Amplify app and a Verified Access instance \
-               behind two web ACLs",
+        case: "two bindings in one stack: an AppSync GraphQL API and a Verified Access \
+               instance behind two web ACLs",
         stack_name: "wafv2-assoc-pair",
         template: || {
             json!({
                 "Resources": {
                     "FrontAcl": web_acl("assoc-front-acl"),
                     "EdgeAcl": web_acl("assoc-edge-acl"),
-                    "AmplifyAssoc": {
+                    "GraphqlAssoc": {
                         "Type": "AWS::WAFv2::WebACLAssociation",
                         "Properties": {
-                            "ResourceArn": amplify_app_arn("d1a2b3c4d5e6f7"),
+                            "ResourceArn": graphql_api_arn("abcdefghijklmnopqrstuvwxyz"),
                             "WebACLArn": { "Fn::GetAtt": ["FrontAcl", "Arn"] }
                         }
                     },
@@ -525,7 +531,7 @@ const ROWS: &[Row] = &[
                 "Outputs": {
                     "FrontAclArn": { "Value": { "Fn::GetAtt": ["FrontAcl", "Arn"] } },
                     "EdgeAclArn": { "Value": { "Fn::GetAtt": ["EdgeAcl", "Arn"] } },
-                    "AmplifyRef": { "Value": { "Ref": "AmplifyAssoc" } },
+                    "GraphqlRef": { "Value": { "Ref": "GraphqlAssoc" } },
                     "AccessRef": { "Value": { "Ref": "AccessAssoc" } }
                 }
             })
@@ -533,11 +539,11 @@ const ROWS: &[Row] = &[
         },
         bindings: &[
             Binding {
-                ref_output: "AmplifyRef",
+                ref_output: "GraphqlRef",
                 web_acl_arn_output: "FrontAclArn",
-                resource_arn: Some(|| amplify_app_arn("d1a2b3c4d5e6f7")),
+                resource_arn: Some(|| graphql_api_arn("abcdefghijklmnopqrstuvwxyz")),
                 resource_arn_output: "",
-                resource_type: "AMPLIFY",
+                resource_type: "APPSYNC",
             },
             Binding {
                 ref_output: "AccessRef",

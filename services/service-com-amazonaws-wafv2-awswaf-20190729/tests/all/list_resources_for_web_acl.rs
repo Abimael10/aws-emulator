@@ -19,7 +19,9 @@
 
 use serde_json::{json, Value};
 
-use crate::web_acl_associations::{listed_resources, web_acl_for_resource, PROTECTED_RESOURCES};
+use crate::web_acl_associations::{
+    listed_resources, web_acl_for_resource, web_acl_scope, PROTECTED_RESOURCES,
+};
 use crate::web_acl_lifecycle::{create_web_acl, rule, sqli_statement, Waf};
 
 /// Every `ResourceType` a listing can name, and the row for a request that names
@@ -40,15 +42,25 @@ fn resource_type_rows() -> Vec<Option<&'static str>> {
 async fn an_unassociated_web_acl_reports_an_empty_list_for_every_resource_type() {
     let waf = Waf::new();
 
-    // One other web ACL holds a binding of every documented kind, so an empty
-    // answer below is about the web ACL that was NAMED and not about an empty
-    // store.
+    // Two other web ACLs — one per scope, because a resource kind is protected by a
+    // web ACL of the scope it takes ([`web_acl_scope`]) — hold a binding of every
+    // documented kind, so an empty answer below is about the web ACL that was NAMED
+    // and not about an empty store.
     let (_busy_id, busy_arn, _busy_token) =
         create_web_acl(&waf, "REGIONAL", "bound-acl", json!([])).await;
-    for (case, resource_arn, _) in PROTECTED_RESOURCES {
+    let (_busy_global_id, busy_global_arn, _busy_global_token) =
+        create_web_acl(&waf, "CLOUDFRONT", "bound-global-acl", json!([])).await;
+    let busy_of = |resource_type: &str| -> &str {
+        if web_acl_scope(resource_type) == "CLOUDFRONT" {
+            busy_global_arn.as_str()
+        } else {
+            busy_arn.as_str()
+        }
+    };
+    for (case, resource_arn, resource_type) in PROTECTED_RESOURCES {
         waf.ok(
             "AssociateWebACL",
-            json!({ "ResourceArn": resource_arn, "WebACLArn": busy_arn }),
+            json!({ "ResourceArn": resource_arn, "WebACLArn": busy_of(resource_type) }),
         )
         .await;
         let bound = web_acl_for_resource(&waf, resource_arn).await;
@@ -74,8 +86,8 @@ async fn an_unassociated_web_acl_reports_an_empty_list_for_every_resource_type()
             json!([rule("block-sqli", sqli_statement())]),
         ),
         (
-            // A distribution is bound through its own configuration, so this
-            // service holds no binding that could name a CLOUDFRONT web ACL.
+            // A CLOUDFRONT web ACL protects the resource kinds served from the edge,
+            // and this one was put in front of none of them.
             "a CLOUDFRONT web ACL",
             "CLOUDFRONT",
             "quiet-global-acl",
@@ -98,9 +110,9 @@ async fn an_unassociated_web_acl_reports_an_empty_list_for_every_resource_type()
         }
     }
 
-    // Nothing the listings above did took the other web ACL's bindings away.
+    // Nothing the listings above did took the other web ACLs' bindings away.
     for (case, resource_arn, resource_type) in PROTECTED_RESOURCES {
-        let listed = listed_resources(&waf, &busy_arn, Some(resource_type)).await;
+        let listed = listed_resources(&waf, busy_of(resource_type), Some(resource_type)).await;
         assert_eq!(
             listed,
             vec![(*resource_arn).to_string()],

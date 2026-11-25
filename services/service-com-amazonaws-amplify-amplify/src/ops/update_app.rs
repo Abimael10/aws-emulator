@@ -346,8 +346,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `tags` member — so the tag map in the answer is the APP's, reported the way
         // every read of the app reports it (the empty map when it carries none). The
         // projection fills it on the outgoing copy only; stored state is untouched.
+        //
+        // The firewall member is read the same way every report of an app reads it,
+        // out of WAF's own association record and with this service's store released
+        // (`crate::state::web_acl`): an update that names none of WAF's business
+        // cannot answer an app whose firewall differs from the one `GetApp` reports.
+        let updated = app.clone();
+        drop(store);
         Ok(UpdateAppOutput {
-            app: AppProjection::reported(app.clone()),
+            app: AppProjection::reported(crate::state::reported_waf_configuration(
+                &*self.engine,
+                updated,
+            )),
         })
     }
 }

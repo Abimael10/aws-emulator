@@ -165,8 +165,8 @@ async fn a_refused_association_leaves_the_binding_the_resource_already_carries()
     .await;
 
     // One row per way `WebACLArn` fails: a well-formed wafv2 web ACL ARN naming
-    // nothing stored, a web ACL of the scope this operation does not bind, and an
-    // ARN that is not a wafv2 resource at all.
+    // nothing stored, a web ACL whose scope does not serve the named resource's
+    // kind, and an ARN that is not a wafv2 resource at all.
     let cases: &[(&str, &str, &str)] = &[
         (
             "a web ACL ARN naming nothing this account holds",
@@ -174,7 +174,7 @@ async fn a_refused_association_leaves_the_binding_the_resource_already_carries()
             "WAFNonexistentItemException",
         ),
         (
-            "a CLOUDFRONT-scoped web ACL",
+            "a CLOUDFRONT-scoped web ACL, against a resource served in one Region",
             cloudfront_arn.as_str(),
             "WAFInvalidParameterException",
         ),

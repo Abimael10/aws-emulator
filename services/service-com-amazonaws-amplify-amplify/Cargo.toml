@@ -35,6 +35,10 @@ sha2 = { workspace = true }
 # subset); `yaml-rust2` is the pure-Rust YAML reader the cloudformation, configservice and
 # greengrassv2 crates already read caller-supplied YAML with.
 yaml-rust2 = { version = "0.10", default-features = false }
+# The WAFv2 web ACL in front of a hosted app: the association is made by `AssociateWebACL`
+# against the app's ARN, so the record is that service's and `App$wafConfiguration` is read
+# from it on every report rather than copied here (`state::web_acl`).
+service-com-amazonaws-wafv2-awswaf-20190729 = { workspace = true }
 tracing = { workspace = true }
 # Amazon S3 client a manual deployment's source is read through: `StartDeployment` reads
 # the source bucket's policy and its objects over the in-process callback into this same

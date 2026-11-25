@@ -1283,7 +1283,7 @@ pub struct ComAmazonawsWafv2Awswaf20190729State {
     /// alone. See [`SettlementRecordEntry`].
     pub settlement_records: HashMap<String, Vec<SettlementRecordEntry>>,
     /// The live web ACL association of every protected resource: the resource's
-    /// own ARN → the ARN of the web ACL that is in front of it.
+    /// own ARN → the web ACL that is in front of it ([`WebAclAssociation`]).
     ///
     /// Keyed by the RESOURCE, because a protected resource has at most one web
     /// ACL in front of it — `GetWebACLForResource` answers "the web ACL that is
@@ -1292,7 +1292,7 @@ pub struct ComAmazonawsWafv2Awswaf20190729State {
     /// `ListResourcesForWebACL` reports. A protected resource is NOT a wafv2
     /// resource: it belongs to another service (see [`PROTECTED_RESOURCE_FORMS`]),
     /// so it is held by ARN and is not in [`Self::arn_index`].
-    pub web_acl_associations: HashMap<String, String>,
+    pub web_acl_associations: HashMap<String, WebAclAssociation>,
     /// The requests each web ACL has EVALUATED at the edge, by `(Scope, Id)`: the
     /// population `GetSampledRequests` draws its sample from.
     ///
@@ -1985,15 +1985,29 @@ impl ComAmazonawsWafv2Awswaf20190729State {
     /// [`MAX_PROTECTED_RESOURCES_PER_WEB_ACL`] resources, which is the refusal a
     /// binding operation reports as its modelled `WAFLimitsExceededException`.
     pub fn associate_web_acl(&mut self, resource_arn: &str, web_acl_arn: &str) -> bool {
-        let already_bound =
-            self.web_acl_associations.get(resource_arn).map(String::as_str) == Some(web_acl_arn);
+        let already_bound = self
+            .web_acl_associations
+            .get(resource_arn)
+            .is_some_and(|association| association.web_acl_arn == web_acl_arn);
         if !already_bound
             && self.protected_resources(web_acl_arn).len() >= MAX_PROTECTED_RESOURCES_PER_WEB_ACL
         {
             return false;
         }
-        self.web_acl_associations
-            .insert(resource_arn.to_string(), web_acl_arn.to_string());
+        // Re-binding the web ACL the resource already carries changes nothing, the
+        // instant the association was made included: the association that is already
+        // in effect is not put back into propagation by a call that asked for what is
+        // already there.
+        if already_bound {
+            return true;
+        }
+        self.web_acl_associations.insert(
+            resource_arn.to_string(),
+            WebAclAssociation {
+                web_acl_arn: web_acl_arn.to_string(),
+                associated_at_millis: now_millis(),
+            },
+        );
         true
     }
 
@@ -2003,7 +2017,7 @@ impl ComAmazonawsWafv2Awswaf20190729State {
         let mut arns: Vec<&str> = self
             .web_acl_associations
             .iter()
-            .filter(|(_, bound)| bound.as_str() == web_acl_arn)
+            .filter(|(_, bound)| bound.web_acl_arn == web_acl_arn)
             .map(|(resource, _)| resource.as_str())
             .collect();
         arns.sort_unstable();
@@ -2013,8 +2027,19 @@ impl ComAmazonawsWafv2Awswaf20190729State {
     /// The web ACL in front of `resource_arn`, or `None` when the resource carries
     /// no association.
     pub fn web_acl_for_resource(&self, resource_arn: &str) -> Option<&WebAclEntry> {
-        let web_acl_arn = self.web_acl_associations.get(resource_arn)?;
-        self.web_acl_by_arn(web_acl_arn)
+        let association = self.web_acl_associations.get(resource_arn)?;
+        self.web_acl_by_arn(&association.web_acl_arn)
+    }
+
+    /// The association record `resource_arn` carries, or `None` when no web ACL is in
+    /// front of it.
+    ///
+    /// The same record [`Self::web_acl_for_resource`] resolves the web ACL out of, for
+    /// a reader that needs the binding itself — the protected resource's own service,
+    /// which reports the web ACL in front of it and how far that association has got
+    /// ([`WebAclAssociation`]).
+    pub fn web_acl_association(&self, resource_arn: &str) -> Option<&WebAclAssociation> {
+        self.web_acl_associations.get(resource_arn)
     }
 
     /// Take the web ACL away from `resource_arn`, and answer whether one was there
@@ -3054,8 +3079,8 @@ pub fn is_wafv2_resource_arn(value: &str) -> bool {
         && resource_parts[1..].iter().all(|part| !part.is_empty())
 }
 
-/// One form of protected-resource ARN a web ACL can be put in front of, and the
-/// `ResourceType` value that form names.
+/// One form of protected-resource ARN a web ACL can be put in front of, the
+/// `ResourceType` value that form names, and the `Scope` of the web ACL it takes.
 #[derive(Debug)]
 pub struct ProtectedResourceForm {
     /// The ARN's service-namespace segment (`elasticloadbalancing`, `appsync`, …).
@@ -3066,6 +3091,18 @@ pub struct ProtectedResourceForm {
     pub segments: &'static [Option<&'static str>],
     /// The `ResourceType` value this form names.
     pub resource_type: &'static str,
+    /// The `Scope` a web ACL must have been created in to be put in front of this
+    /// form.
+    ///
+    /// A resource whose traffic is served from the edge is protected by a web ACL of
+    /// the GLOBAL namespace — "specifies whether this is for a global resource type,
+    /// such as a Amazon CloudFront distribution. For an Amplify application, use
+    /// CLOUDFRONT" (`Scope`'s own doc,
+    /// `smithy_query(query="doc",shape="CreateWebACLRequest",member="Scope")`) —
+    /// while a resource that serves its traffic in ONE Region is protected by a
+    /// REGIONAL one, the scope that lives in that Region's namespace
+    /// ([`namespace_region`]).
+    pub scope: &'static str,
 }
 
 impl ProtectedResourceForm {
@@ -3105,6 +3142,7 @@ pub const PROTECTED_RESOURCE_FORMS: &[ProtectedResourceForm] = &[
         // balancer the list names.
         segments: &[Some("loadbalancer"), Some("app"), None, None],
         resource_type: "APPLICATION_LOAD_BALANCER",
+        scope: SCOPE_REGIONAL,
     },
     ProtectedResourceForm {
         service: "apigateway",
@@ -3112,42 +3150,52 @@ pub const PROTECTED_RESOURCE_FORMS: &[ProtectedResourceForm] = &[
         // before the parts are compared.
         segments: &[Some("restapis"), None, Some("stages"), None],
         resource_type: "API_GATEWAY",
+        scope: SCOPE_REGIONAL,
     },
     ProtectedResourceForm {
         service: "appsync",
         // `apis/<GraphQLApiId>`
         segments: &[Some("apis"), None],
         resource_type: "APPSYNC",
+        scope: SCOPE_REGIONAL,
     },
     ProtectedResourceForm {
         service: "cognito-idp",
         // `userpool/<user-pool-id>`
         segments: &[Some("userpool"), None],
         resource_type: "COGNITO_USER_POOL",
+        scope: SCOPE_REGIONAL,
     },
     ProtectedResourceForm {
         service: "apprunner",
         // `service/<apprunner-service-name>/<apprunner-service-id>`
         segments: &[Some("service"), None, None],
         resource_type: "APP_RUNNER_SERVICE",
+        scope: SCOPE_REGIONAL,
     },
     ProtectedResourceForm {
         service: "ec2",
         // `verified-access-instance/<instance-id>`
         segments: &[Some("verified-access-instance"), None],
         resource_type: "VERIFIED_ACCESS_INSTANCE",
+        scope: SCOPE_REGIONAL,
     },
     ProtectedResourceForm {
         service: "amplify",
         // `apps/<app-id>`
         segments: &[Some("apps"), None],
         resource_type: "AMPLIFY",
+        // An Amplify application is served from CloudFront's edge, so its firewall is
+        // a web ACL of the global namespace: "for an Amplify application, use
+        // CLOUDFRONT" (`Scope`'s own doc).
+        scope: SCOPE_CLOUDFRONT,
     },
     ProtectedResourceForm {
         service: "bedrock-agentcore",
         // `gateway/<gateway-id>`
         segments: &[Some("gateway"), None],
         resource_type: "AGENTCORE_GATEWAY",
+        scope: SCOPE_REGIONAL,
     },
 ];
 
@@ -3166,6 +3214,16 @@ pub const DEFAULT_RESOURCE_TYPE: &str = "APPLICATION_LOAD_BALANCER";
 /// well-formed ARN of a resource kind [`PROTECTED_RESOURCE_FORMS`] does not
 /// catalogue.
 pub fn protected_resource_type(arn: &str) -> Option<&'static str> {
+    protected_resource_form(arn).map(|form| form.resource_type)
+}
+
+/// The catalogued form of the resource `arn` names, or `None` when a web ACL cannot
+/// be put in front of it.
+///
+/// What [`protected_resource_type`] answers the kind out of, for a caller that needs
+/// the rest of the form as well — the `Scope` of the web ACL that kind takes
+/// ([`ProtectedResourceForm::scope`]).
+pub fn protected_resource_form(arn: &str) -> Option<&'static ProtectedResourceForm> {
     let mut segments = arn.split(':');
     let (
         Some("arn"),
@@ -3196,7 +3254,50 @@ pub fn protected_resource_type(arn: &str) -> Option<&'static str> {
     PROTECTED_RESOURCE_FORMS
         .iter()
         .find(|form| form.matches(service, &parts))
-        .map(|form| form.resource_type)
+}
+
+/// One live web ACL association: the web ACL in front of a protected resource, and
+/// when it was put there.
+///
+/// The instant is part of the record because WAF's own documentation makes the
+/// association take effect over a span rather than at once — "the changes take a
+/// small amount of time to propagate to all areas where the resources are stored"
+/// (`AssociateWebACL`'s own doc) — and the protected resource's service reports that
+/// span as the status of the association it carries. WAF's own reads
+/// (`GetWebACLForResource`, `ListResourcesForWebACL`) report the binding from the
+/// moment it is written, which is what that same doc describes.
+#[derive(Debug, Clone)]
+pub struct WebAclAssociation {
+    /// The ARN of the web ACL that is in front of the resource.
+    pub web_acl_arn: String,
+    /// When the web ACL was put in front of the resource, as [`now_millis`].
+    pub associated_at_millis: i64,
+}
+
+/// The `ErrorReason`-less message WAF answers when the protected resource the
+/// request names is not a resource kind the web ACL's `Scope` serves, as recorded.
+///
+/// The whole message is this one sentence — it carries nothing from the request,
+/// unlike the `Field`/`Parameter`/`Reason` envelope
+/// ([`invalid_parameter_exception`]) — so it is spelled out once here.
+pub const RESOURCE_NOT_SUPPORTED_IN_REGION_MESSAGE: &str =
+    "The resource is not supported in current region";
+
+/// `WAFInvalidParameterException` for a protected resource whose kind the named web
+/// ACL's `Scope` does not serve: an Amplify application, which is protected from the
+/// edge, against a REGIONAL web ACL, or a resource that serves its traffic in one
+/// Region against a CLOUDFRONT one.
+///
+/// Carries [`RESOURCE_NOT_SUPPORTED_IN_REGION_MESSAGE`] and none of the three
+/// structured members, because the recorded refusal's message is that sentence
+/// alone.
+pub fn resource_not_supported_in_region_exception() -> WAFInvalidParameterException {
+    WAFInvalidParameterException {
+        message: Some(RESOURCE_NOT_SUPPORTED_IN_REGION_MESSAGE.to_string()),
+        field: None,
+        parameter: None,
+        reason: None,
+    }
 }
 
 /// The region whose namespace holds a resource of `scope` created at, or addressed

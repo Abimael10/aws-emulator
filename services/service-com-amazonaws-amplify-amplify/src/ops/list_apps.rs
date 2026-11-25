@@ -158,16 +158,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A pure read over every app in state, in `appId` order, so the page this
         // call serves and the page the next `nextToken` serves never overlap. Each
         // element is projected the way a read reports an app, so a listed app and a
-        // `GetApp` of the same app agree member for member.
-        let store = state.lock();
-        let (apps, next_token) = crate::state::page(
-            store
-                .apps
-                .iter()
-                .map(|(app_id, stored)| (app_id.clone(), AppProjection::reported(stored.app.clone()))),
-            input.next_token.as_deref(),
-            crate::state::page_size(input.max_results, MAX_RESULTS),
-        );
+        // `GetApp` of the same app agree member for member — the firewall WAF has in
+        // front of each one included, read with this service's store released
+        // (`crate::state::web_acl`).
+        let (page, next_token) = {
+            let store = state.lock();
+            crate::state::page(
+                store
+                    .apps
+                    .iter()
+                    .map(|(app_id, stored)| (app_id.clone(), stored.app.clone())),
+                input.next_token.as_deref(),
+                crate::state::page_size(input.max_results, MAX_RESULTS),
+            )
+        };
+        let apps = page
+            .into_iter()
+            .map(|app| {
+                AppProjection::reported(crate::state::reported_waf_configuration(
+                    &*self.engine,
+                    app,
+                ))
+            })
+            .collect();
 
         Ok(ListAppsOutput { apps, next_token })
     }

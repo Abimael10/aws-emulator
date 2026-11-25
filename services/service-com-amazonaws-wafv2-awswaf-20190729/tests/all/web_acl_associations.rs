@@ -7,8 +7,10 @@
 //! (`GetWebACLForResource`, `ListResourcesForWebACL`) report that binding until
 //! `DisassociateWebACL` takes it away, and a resource carries at most ONE web ACL.
 //! A request naming an ARN of a resource kind a web ACL cannot be put in front of
-//! is refused with `WAFInvalidParameterException`, and one naming a web ACL this
-//! account does not hold with `WAFNonexistentItemException` — both HTTP 400.
+//! is refused with `WAFInvalidParameterException`, one naming a web ACL this
+//! account does not hold with `WAFNonexistentItemException`, and one naming a web
+//! ACL whose `Scope` does not serve that resource kind with
+//! `WAFInvalidParameterException` — all HTTP 400.
 //!
 //! The tables below span the class rather than one recorded case: one row per
 //! resource FORM the API documents (eight kinds, each addressed by its own ARN
@@ -100,6 +102,23 @@ pub(crate) async fn listed_resources(
                 .to_string()
         })
         .collect()
+}
+
+/// The `Scope` of the web ACL that can be put in front of each documented resource
+/// form, by the `ResourceType` that form names.
+///
+/// `Scope` is what says which: "specifies whether this is for a global resource type,
+/// such as a Amazon CloudFront distribution. For an Amplify application, use
+/// CLOUDFRONT"
+/// (`smithy_query(query="doc",shape="CreateWebACLRequest",member="Scope")`). So an
+/// Amplify application, whose traffic is served from the edge, is protected by a
+/// CLOUDFRONT-scoped web ACL, and every other documented form — each serving its
+/// traffic in one Region — by a REGIONAL one.
+pub(crate) fn web_acl_scope(resource_type: &str) -> &'static str {
+    match resource_type {
+        "AMPLIFY" => "CLOUDFRONT",
+        _ => "REGIONAL",
+    }
 }
 
 /// The web ACL `GetWebACLForResource` reports for `resource_arn`, or `None` when it
@@ -292,15 +311,42 @@ async fn user_pool(waf: &Waf, name: &str) -> String {
 #[tokio::test]
 async fn associate_binds_each_documented_resource_form_and_the_reads_report_it() {
     let waf = Waf::new();
-    let (web_acl_id, web_acl_arn, _lock_token) = create_web_acl(
-        &waf,
-        "REGIONAL",
-        "association-acl",
-        json!([rule("block-sqli", sqli_statement())]),
-    )
-    .await;
+    // One web ACL per scope, each carrying the same rule tree: a form is protected by
+    // a web ACL of the scope its own kind takes ([`web_acl_scope`]), so covering the
+    // catalogue takes both.
+    let per_scope: Vec<(&str, (String, String, String))> = vec![
+        (
+            "REGIONAL",
+            create_web_acl(
+                &waf,
+                "REGIONAL",
+                "association-acl",
+                json!([rule("block-sqli", sqli_statement())]),
+            )
+            .await,
+        ),
+        (
+            "CLOUDFRONT",
+            create_web_acl(
+                &waf,
+                "CLOUDFRONT",
+                "association-global-acl",
+                json!([rule("block-sqli", sqli_statement())]),
+            )
+            .await,
+        ),
+    ];
+    let web_acl_of = |resource_type: &str| -> (&str, &str) {
+        let scope = web_acl_scope(resource_type);
+        let (_, (id, arn, _)) = per_scope
+            .iter()
+            .find(|(candidate, _)| *candidate == scope)
+            .expect("a web ACL of every scope the catalogue names");
+        (id.as_str(), arn.as_str())
+    };
 
     for (case, resource_arn, resource_type) in PROTECTED_RESOURCES {
+        let (web_acl_id, web_acl_arn) = web_acl_of(resource_type);
         let unbound = web_acl_for_resource(&waf, resource_arn).await;
         assert!(
             unbound.is_none(),
@@ -330,12 +376,12 @@ async fn associate_binds_each_documented_resource_form_and_the_reads_report_it()
             .unwrap_or_else(|| panic!("case {case:?}: the resource must report its web ACL"));
         assert_eq!(
             bound["ARN"].as_str(),
-            Some(web_acl_arn.as_str()),
+            Some(web_acl_arn),
             "case {case:?}: expected the web ACL {web_acl_arn}, got {bound}"
         );
         assert_eq!(
             bound["Id"].as_str(),
-            Some(web_acl_id.as_str()),
+            Some(web_acl_id),
             "case {case:?}: expected the web ACL id {web_acl_id}, got {bound}"
         );
         assert_eq!(
@@ -346,7 +392,7 @@ async fn associate_binds_each_documented_resource_form_and_the_reads_report_it()
 
         // The listing selects by resource TYPE, so this resource shows up under its
         // own kind and under no other.
-        let own_kind = listed_resources(&waf, &web_acl_arn, Some(resource_type)).await;
+        let own_kind = listed_resources(&waf, web_acl_arn, Some(resource_type)).await;
         assert!(
             own_kind.contains(&(*resource_arn).to_string()),
             "case {case:?}: {resource_type} must list {resource_arn}, got {own_kind:?}"
@@ -356,7 +402,7 @@ async fn associate_binds_each_documented_resource_form_and_the_reads_report_it()
             .map(|(_, _, candidate)| *candidate)
             .find(|candidate| candidate != resource_type)
             .expect("the table holds more than one resource type");
-        let other_kind = listed_resources(&waf, &web_acl_arn, Some(other_type)).await;
+        let other_kind = listed_resources(&waf, web_acl_arn, Some(other_type)).await;
         assert!(
             !other_kind.contains(&(*resource_arn).to_string()),
             "case {case:?}: {other_type} must not list {resource_arn}, got {other_kind:?}"
@@ -365,7 +411,8 @@ async fn associate_binds_each_documented_resource_form_and_the_reads_report_it()
 
     // Every form is bound at once, and each kind reports exactly its own resource.
     for (case, resource_arn, resource_type) in PROTECTED_RESOURCES {
-        let listed = listed_resources(&waf, &web_acl_arn, Some(resource_type)).await;
+        let (_web_acl_id, web_acl_arn) = web_acl_of(resource_type);
+        let listed = listed_resources(&waf, web_acl_arn, Some(resource_type)).await;
         assert_eq!(
             listed,
             vec![(*resource_arn).to_string()],
@@ -374,6 +421,7 @@ async fn associate_binds_each_documented_resource_form_and_the_reads_report_it()
     }
 
     for (case, resource_arn, resource_type) in PROTECTED_RESOURCES {
+        let (_web_acl_id, web_acl_arn) = web_acl_of(resource_type);
         let disassociated = waf
             .ok(
                 "DisassociateWebACL",
@@ -394,7 +442,7 @@ async fn associate_binds_each_documented_resource_form_and_the_reads_report_it()
             "case {case:?}: a disassociated resource must report a null web ACL, \
              got {after:?}"
         );
-        let listed = listed_resources(&waf, &web_acl_arn, Some(resource_type)).await;
+        let listed = listed_resources(&waf, web_acl_arn, Some(resource_type)).await;
         assert!(
             listed.is_empty(),
             "case {case:?}: {resource_type} must list nothing once {resource_arn} is \
@@ -558,8 +606,8 @@ async fn a_resource_carries_one_web_acl_and_rebinding_moves_it() {
     );
 }
 
-/// A `WebACLArn` that names no web ACL of this account, or a CLOUDFRONT-scoped one,
-/// binds nothing.
+/// A `WebACLArn` that names no web ACL of this account, or one whose `Scope` does
+/// not serve the kind of resource the request names, binds nothing.
 #[tokio::test]
 async fn a_web_acl_arn_that_cannot_be_bound_is_refused() {
     let waf = Waf::new();
@@ -590,7 +638,7 @@ async fn a_web_acl_arn_that_cannot_be_bound_is_refused() {
             "WAFInvalidParameterException",
         ),
         (
-            "a CLOUDFRONT-scoped web ACL",
+            "a CLOUDFRONT-scoped web ACL, against a resource served in one Region",
             cloudfront_arn.as_str(),
             "WAFInvalidParameterException",
         ),
@@ -626,12 +674,12 @@ async fn a_web_acl_arn_that_cannot_be_bound_is_refused() {
         "listing by a resource type the model does not declare",
     )
     .await;
-    // A CLOUDFRONT-scoped web ACL is bound through the distribution's own
-    // configuration, so this service holds no binding naming one.
+    // The CLOUDFRONT-scoped web ACL above was refused against every resource it was
+    // named for, so nothing is bound to it.
     let global = listed_resources(&waf, &cloudfront_arn, None).await;
     assert!(
         global.is_empty(),
-        "a CLOUDFRONT-scoped web ACL must list no protected resource, got {global:?}"
+        "a web ACL every association refused must list no protected resource, got {global:?}"
     );
 }
 
