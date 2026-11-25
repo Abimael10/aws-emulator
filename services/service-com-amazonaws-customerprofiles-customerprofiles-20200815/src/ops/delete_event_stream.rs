@@ -158,6 +158,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 not_found(crate::state::event_stream_not_found(
                     &input.event_stream_name,
+                    &input.domain_name,
                 ))
             })?;
 

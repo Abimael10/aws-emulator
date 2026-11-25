@@ -114,13 +114,14 @@ pub fn event_stream_arn(region: &str, domain_name: &str, event_stream_name: &str
 }
 
 /// The `ResourceNotFoundException` message for an event stream a domain does not hold, as
-/// the service words that refusal: the resource kind as the API spells it and "is not
-/// found", whose only variable part is the name the request's `{EventStreamName}` label
-/// carried. The domain is the one the request addressed, so it is not restated. Shared by
-/// every operation addressing one stream, so the same absent name reads the same whichever
-/// of them was called.
-pub fn event_stream_not_found(event_stream_name: &str) -> String {
-    format!("EventStream {event_stream_name} is not found")
+/// the service words that refusal: the resource kind as the API spells it, the name the
+/// request's `{EventStreamName}` label carried, and the domain its `{DomainName}` label
+/// named — both labels verbatim, so a caller can tell WHICH domain the stream was looked
+/// for in (the form [`super::upload_job_not_found`] takes for the other resource addressed
+/// under a domain by a second label). Shared by every operation addressing one stream, so
+/// the same absent name reads the same whichever of them was called.
+pub fn event_stream_not_found(event_stream_name: &str, domain_name: &str) -> String {
+    format!("The EventStream with name {event_stream_name} not found for domain {domain_name}")
 }
 
 /// The `BadRequestException` message for an event stream name the domain already holds:

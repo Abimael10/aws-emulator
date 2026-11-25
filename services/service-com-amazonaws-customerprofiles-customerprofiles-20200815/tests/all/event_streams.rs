@@ -518,7 +518,7 @@ async fn a_deleted_event_stream_is_gone_and_its_siblings_remain() {
             status, 404,
             "case {name:?}: expected a second delete to find nothing, got {status} {refused:?}"
         );
-        let expected = format!("EventStream {name} is not found");
+        let expected = format!("The EventStream with name {name} not found for domain deldom");
         assert_eq!(
             error_message(&refused),
             expected,
@@ -616,7 +616,7 @@ async fn an_absent_domain_or_event_stream_is_not_found() {
                 "case {case:?}: expected ResourceNotFoundException from {operation}, got \
                  {refused:?}"
             );
-            let expected = format!("EventStream {name} is not found");
+            let expected = format!("The EventStream with name {name} not found for domain here");
             assert_eq!(
                 error_message(&refused),
                 expected,
