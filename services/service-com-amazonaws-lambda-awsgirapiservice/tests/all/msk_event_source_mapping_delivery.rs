@@ -116,17 +116,25 @@ const DEFAULT_GROUP_PREFIX: &str = "/aws/lambda/";
 /// its own lines are delivered to its log group, so all four are reached in process — the shape
 /// `core/router/src/lib.rs` mounts them in.
 fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = router_on(&engine);
+    emulator_on(&Arc::new(engine::InMemoryEngine::new()))
+}
+
+/// The same four services mounted on `engine`, for a suite that needs the engine handle
+/// itself — the sibling suite over the consumer GROUP such a mapping reads as
+/// ([`crate::kafka_event_source_delivery`]) reads that group out of the store the service
+/// which owns it holds, so it brings its own engine and mounts the services on it here rather
+/// than carrying a second copy of this bring-up.
+pub(crate) fn emulator_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+    let mut router = router_on(engine);
     router.register_service(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new(
-        Arc::clone(&engine),
+        Arc::clone(engine),
     ));
     router.register_service(
-        service_com_amazonaws_kafka_kafka::EmulatedService::new(Arc::clone(&engine)),
+        service_com_amazonaws_kafka_kafka::EmulatedService::new(Arc::clone(engine)),
     );
     router.register_service(
         service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(Arc::clone(
-            &engine,
+            engine,
         )),
     );
     router
@@ -180,7 +188,10 @@ async fn kafka_call(
 
 /// Create the cluster `name` through Amazon MSK's own `CreateCluster`, answering the ARN that
 /// service minted for it.
-async fn given_cluster(router: &MultiServiceRouter, case: &str, name: &str) -> String {
+///
+/// `pub(crate)` so the sibling suite over the consumer group a mapping reads as brings a
+/// cluster up the one way ([`emulator_on`]).
+pub(crate) async fn given_cluster(router: &MultiServiceRouter, case: &str, name: &str) -> String {
     let (status, created) = kafka_call(
         router,
         "POST",
@@ -209,7 +220,9 @@ async fn given_cluster(router: &MultiServiceRouter, case: &str, name: &str) -> S
 
 /// Create the topic `name` with `partitions` partitions on `cluster`, and wait until that
 /// service reports it `ACTIVE` — the state in which a client's produce reaches its log.
-async fn given_topic(
+///
+/// `pub(crate)` for the reason [`given_cluster`] is.
+pub(crate) async fn given_topic(
     router: &MultiServiceRouter,
     case: &str,
     cluster: &str,

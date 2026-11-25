@@ -48,6 +48,7 @@ pub mod acls;
 pub mod addressing;
 pub mod broker_config;
 pub mod codecs;
+pub mod consumer_protocol;
 pub mod groups;
 pub mod iam_access;
 pub mod legacy_frames;

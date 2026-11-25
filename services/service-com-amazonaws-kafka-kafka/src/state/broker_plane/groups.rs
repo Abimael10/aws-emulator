@@ -892,8 +892,8 @@ impl ConsumerGroup {
             .find(|member| member.client_id == client_id)
         {
             member.session_deadline = now + session_window;
-            member.metadata = subscription_of(topics);
-            member.assignment = Some(assignment_of(assigned));
+            member.metadata = super::consumer_protocol::subscription_bytes(topics);
+            member.assignment = Some(super::consumer_protocol::assignment_bytes(assigned));
             return Some(member.id.clone());
         }
         if !self.members.is_empty() {
@@ -905,7 +905,7 @@ impl ConsumerGroup {
         self.members.push(GroupMember {
             id: member_id.clone(),
             client_id: client_id.to_string(),
-            metadata: subscription_of(topics),
+            metadata: super::consumer_protocol::subscription_bytes(topics),
             rejoined: Some(self.rejoins),
             assignment: None,
             session_deadline: now + session_window,
@@ -920,10 +920,10 @@ impl ConsumerGroup {
             .iter_mut()
             .find(|member| member.id == member_id)
         {
-            member.assignment = Some(assignment_of(assigned));
+            member.assignment = Some(super::consumer_protocol::assignment_bytes(assigned));
         }
-        self.protocol_type = Some(CONSUMER_PROTOCOL_TYPE.to_string());
-        self.protocol_name = Some(CONSUMER_ASSIGNOR_NAME.to_string());
+        self.protocol_type = Some(super::consumer_protocol::CONSUMER_PROTOCOL_TYPE.to_string());
+        self.protocol_name = Some(super::consumer_protocol::RANGE_ASSIGNOR.to_string());
         self.state = GroupState::Stable;
         self.rebalance_deadline = None;
         Some(member_id)
@@ -948,75 +948,6 @@ impl ConsumerGroup {
             false => self.begin_rebalance(now, MAX_REBALANCE_BARRIER),
         }
     }
-}
-
-/// The `protocol_type` a CONSUMING client's group runs under, which is what tells a group of
-/// consumers from a group of any other kind of client (Apache Kafka's own
-/// `ConsumerProtocol.PROTOCOL_TYPE`).
-const CONSUMER_PROTOCOL_TYPE: &str = "consumer";
-
-/// The assignor an in-process consumer's group names: Apache Kafka's RangeAssignor, whose
-/// protocol name is `range` — the name a group reports as the protocol its members agreed on.
-const CONSUMER_ASSIGNOR_NAME: &str = "range";
-
-/// The version the subscription and the assignment of a consuming member are written at: the
-/// first version of Apache Kafka's consumer embedded protocol, whose two documents every
-/// consumer client reads.
-const CONSUMER_PROTOCOL_VERSION: i16 = 0;
-
-/// The SUBSCRIPTION a member joined with, as the consumer embedded protocol carries one: the
-/// version, then the topics the consumer subscribed to.
-///
-/// A reader of the group hands these bytes to its own reader of that protocol, so they are
-/// written by the one implementation of it in this process rather than by hand.
-fn subscription_of(topics: &[String]) -> Bytes {
-    use ::kafka_protocol::messages::consumer_protocol_subscription::ConsumerProtocolSubscription;
-
-    let subscribed = ConsumerProtocolSubscription::default().with_topics(
-        topics
-            .iter()
-            .map(|topic| StrBytes::from_string(topic.clone()))
-            .collect(),
-    );
-    embedded_protocol(&subscribed)
-}
-
-/// The ASSIGNMENT a member holds, as that same protocol carries one: the version, then the
-/// partitions of each topic the member was given.
-fn assignment_of(assigned: &[(String, Vec<i32>)]) -> Bytes {
-    use ::kafka_protocol::messages::consumer_protocol_assignment::{
-        ConsumerProtocolAssignment, TopicPartition,
-    };
-
-    let held = ConsumerProtocolAssignment::default().with_assigned_partitions(
-        assigned
-            .iter()
-            .map(|(topic, partitions)| {
-                TopicPartition::default()
-                    .with_topic(TopicName(StrBytes::from_string(topic.clone())))
-                    .with_partitions(partitions.clone())
-            })
-            .collect(),
-    );
-    embedded_protocol(&held)
-}
-
-/// One document of the consumer embedded protocol, written as a client reads it: the two-byte
-/// version first, then the document itself at that version.
-fn embedded_protocol<Document: ::kafka_protocol::protocol::Encodable>(
-    document: &Document,
-) -> Bytes {
-    use ::bytes::BufMut as _;
-
-    let mut written = ::bytes::BytesMut::new();
-    written.put_i16(CONSUMER_PROTOCOL_VERSION);
-    if document
-        .encode(&mut written, CONSUMER_PROTOCOL_VERSION)
-        .is_err()
-    {
-        return Bytes::new();
-    }
-    written.freeze()
 }
 
 /// The window a member's session lives for, from the timeout it named: read within
