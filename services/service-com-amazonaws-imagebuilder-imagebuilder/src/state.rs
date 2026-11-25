@@ -152,6 +152,11 @@ pub use workflow::*;
 mod image_pipeline_listing;
 pub use image_pipeline_listing::*;
 
+/// What a distribution-configuration listing asks for, which member one of its filters
+/// selects on, and what one of its entries reports.
+mod distribution_configuration_listing;
+pub use distribution_configuration_listing::*;
+
 /// What ONE PIPELINE's image listing asks for, and which stored build versions it reaches.
 mod pipeline_image_listing;
 pub use pipeline_image_listing::*;
