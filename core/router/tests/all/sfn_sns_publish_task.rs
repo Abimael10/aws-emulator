@@ -42,28 +42,35 @@ use crate::sfn_task_target_authorization::{
 
 /// The history events a task's two outcomes write
 /// (`smithy_query(query="shape",shape="HistoryEventType")`).
-const TASK_SUCCEEDED: &str = "TaskSucceeded";
-const TASK_FAILED: &str = "TaskFailed";
+///
+/// `pub(crate)` for the reason the rest of this suite's handles are: `tests/all/main.rs` is
+/// one crate root, and `all/sfn_sns_publish_denied_catch_routing.rs` asks what that very
+/// refusal is ROUTABLE by, so it reads a task's outcome the same way rather than restating
+/// it.
+pub(crate) const TASK_SUCCEEDED: &str = "TaskSucceeded";
+/// See [`TASK_SUCCEEDED`].
+pub(crate) const TASK_FAILED: &str = "TaskFailed";
 
 /// The error name a `Task` state reports for an unauthorized publish: Amazon SNS models
 /// that refusal as `AuthorizationErrorException`, and Step Functions names a failed
 /// integration call `<service>.<exception class>`.
-const AUTHORIZATION_ERROR: &str = "SNS.AuthorizationErrorException";
+pub(crate) const AUTHORIZATION_ERROR: &str = "SNS.AuthorizationErrorException";
 
 /// The IAM action Amazon SNS publishes for `Publish`, spelled the way that service
 /// publishes its own actions — `SNS:<ApiName>` ("Actions defined by Amazon Simple
 /// Notification Service", IAM Service Authorization Reference) — which is therefore the
 /// action its refusal of an unauthorized publish names.
-const PUBLISH_ACTION: &str = "SNS:Publish";
+pub(crate) const PUBLISH_ACTION: &str = "SNS:Publish";
 
 /// The metadata Amazon SNS's own SDK client appends to the refusal, with the id of the
 /// refused request normalized away ([`normalized`]): the client the call was made with,
 /// the status `AuthorizationErrorException` carries and the query code it is named by.
-const REFUSAL_METADATA: &str = " (Service: AmazonSNS; Status Code: 403; Error Code: \
-                                 AuthorizationError; Request ID: <id>; Proxy: null)";
+pub(crate) const REFUSAL_METADATA: &str = " (Service: AmazonSNS; Status Code: 403; Error \
+                                            Code: AuthorizationError; Request ID: <id>; \
+                                            Proxy: null)";
 
 /// The four services this question spans, over ONE shared engine.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -122,7 +129,10 @@ async fn sns(router: &MultiServiceRouter, action: &str, members: &[(&str, &str)]
 
 /// A queue that admits `sns.amazonaws.com`, and a topic it is subscribed to; answers the
 /// queue's url and the topic's ARN.
-async fn topic_with_subscriber(router: &MultiServiceRouter, name: &str) -> (String, String) {
+pub(crate) async fn topic_with_subscriber(
+    router: &MultiServiceRouter,
+    name: &str,
+) -> (String, String) {
     let created = sqs(router, "CreateQueue", &json!({ "QueueName": name })).await;
     let (queue_url, queue_arn) = queue_handles(router, &created).await;
     let topic_arn = element(&sns(router, "CreateTopic", &[("Name", name)]).await, "TopicArn");
@@ -199,7 +209,7 @@ async fn ran(
 }
 
 /// The history events of one execution.
-async fn history(router: &MultiServiceRouter, execution_arn: &str) -> Vec<Value> {
+pub(crate) async fn history(router: &MultiServiceRouter, execution_arn: &str) -> Vec<Value> {
     let answered = sfn(
         router,
         "GetExecutionHistory",
@@ -214,7 +224,7 @@ async fn history(router: &MultiServiceRouter, execution_arn: &str) -> Vec<Value>
 }
 
 /// Every event of `events` whose `type` is `named`.
-fn of_type<'a>(events: &'a [Value], named: &str) -> Vec<&'a Value> {
+pub(crate) fn of_type<'a>(events: &'a [Value], named: &str) -> Vec<&'a Value> {
     events
         .iter()
         .filter(|event| event.get("type").and_then(Value::as_str) == Some(named))
@@ -222,7 +232,7 @@ fn of_type<'a>(events: &'a [Value], named: &str) -> Vec<&'a Value> {
 }
 
 /// The notification bodies waiting on the queue at `url`, drained.
-async fn delivered(router: &MultiServiceRouter, url: &str) -> Vec<String> {
+pub(crate) async fn delivered(router: &MultiServiceRouter, url: &str) -> Vec<String> {
     let received = sqs(
         router,
         "ReceiveMessage",
@@ -243,7 +253,7 @@ async fn delivered(router: &MultiServiceRouter, url: &str) -> Vec<String> {
 /// `message` with every request id it reports replaced by `<id>`, asserting on the way
 /// that each one carries the 8-4-4-4-12 form an AWS request id has: the id identifies the
 /// refused call, so it differs per refusal and is no part of the sentence.
-fn normalized(case: &str, message: &str) -> String {
+pub(crate) fn normalized(case: &str, message: &str) -> String {
     const MARKER: &str = "Request ID: ";
 
     let mut rest = message;
