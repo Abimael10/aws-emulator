@@ -16,9 +16,9 @@
 //!    whose sentence names that pair.
 //! 3. An ARN member WAF cannot READ as the kind of ARN the member takes — malformed,
 //!    or of the wrong kind — is the invalid-parameter refusal with `Field`
-//!    RESOURCE_ARN, answered before the request's other members are judged; an ARN
-//!    that is well formed and only fails to RESOLVE is judged against the store, so
-//!    it comes after the target the request acts on.
+//!    RESOURCE_ARN, answered before the request's other members are judged; the
+//!    resource the request ADDRESSES is resolved ahead of everything its body carries,
+//!    so a request about a resource that is not there reports that instead.
 //! 4. A regular expression a save would store has to be one WAF can inspect with:
 //!    it must parse AND its match must be able to consume something, so a pattern
 //!    that matches the empty string is refused as badly formatted.
@@ -363,23 +363,30 @@ async fn a_managed_rule_group_that_resolves_to_nothing_is_named_in_the_refusal()
 }
 
 /// Rule 3: an `AssociatedRuleGroupArn` WAF cannot READ as a rule-group ARN is the
-/// invalid-parameter refusal naming the ARN, and it is answered before the lock token
-/// and before the managed rule set the put targets are judged.
+/// invalid-parameter refusal naming the ARN, and it is answered before the lock token, once
+/// the managed rule set the put targets has resolved.
 ///
 /// The rows differ in HOW the ARN fails to be one — not an ARN at all, another
-/// service's ARN, a wafv2 ARN of another resource kind — and each is sent with a lock
-/// token that is not even `LockToken`-shaped and against a set no account holds, so
-/// what the refusal reports is the ARN rather than either of those. Each of those
-/// faults is in the REQUEST, which is why it is reported ahead of both. An ARN that
-/// is well formed and only fails to RESOLVE is judged against the store, so it comes
-/// after the target the put acts on
+/// service's ARN, a wafv2 ARN of another resource kind — and each is sent against a set the
+/// account DOES hold with a lock token that is not even `LockToken`-shaped, so what the
+/// refusal reports is the ARN rather than the token. The resource the put ADDRESSES is
+/// resolved ahead of everything the body carries, so the same bodies against a set no account
+/// holds report the missing set instead
 /// (`crate::refusal_precedence`).
 #[tokio::test]
-async fn an_arn_the_put_cannot_use_is_refused_before_anything_else() {
-    let waf = Waf::new();
+async fn an_arn_the_put_cannot_use_is_refused_before_the_lock_token() {
+    let (waf, engine) = Waf::sharing_engine();
     let (_group_id, group_arn, _group_lock) =
         create_rule_group(&waf, SCOPE_REGIONAL, "vendor-group", 100, json!([])).await;
     let ip_set_kind = group_arn.replace("/rulegroup/", "/ipset/");
+    let set_name = "vendor-set";
+    let (set_id, _set_arn, _set_lock) =
+        crate::managed_rule_sets::provision_managed_rule_set(
+            &engine,
+            SCOPE_REGIONAL,
+            set_name,
+            None,
+        );
 
     for (case, arn) in [
         (
@@ -399,9 +406,9 @@ async fn an_arn_the_put_cannot_use_is_refused_before_anything_else() {
                 TEST_REGION,
                 "PutManagedRuleSetVersions",
                 json!({
-                    "Name": "no-such-set",
+                    "Name": set_name,
                     "Scope": SCOPE_REGIONAL,
-                    "Id": "00000000-0000-0000-0000-000000000000",
+                    "Id": &set_id,
                     "LockToken": "stale-token",
                     "VersionsToPublish": {
                         "Version_1.0": { "AssociatedRuleGroupArn": &arn },
@@ -415,19 +422,44 @@ async fn an_arn_the_put_cannot_use_is_refused_before_anything_else() {
             body.0, body.1
         );
         assert_invalid_parameter(&body.1, FIELD_RESOURCE_ARN, &arn, ARN_NOT_VALID, case);
+
+        // The same body against a set no account holds reports the missing set: the
+        // resource the put addresses is resolved before the body is judged at all.
+        let (status, missing) = waf
+            .call_from(
+                TEST_REGION,
+                "PutManagedRuleSetVersions",
+                json!({
+                    "Name": "no-such-set",
+                    "Scope": SCOPE_REGIONAL,
+                    "Id": "00000000-0000-0000-0000-000000000000",
+                    "LockToken": "stale-token",
+                    "VersionsToPublish": {
+                        "Version_1.0": { "AssociatedRuleGroupArn": &arn },
+                    },
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a put against a set no account holds is refused, got {missing}"
+        );
+        assert!(
+            error_code(&missing).ends_with("WAFNonexistentItemException"),
+            "case {case:?}: expected the missing set to be reported, got {missing}"
+        );
     }
 
-    // With an ARN WAF CAN use, the next thing judged is the target the put acts on —
-    // which is how the rows above are shown to have reported the ARN first rather than
-    // only ever reporting the missing set.
+    // With an ARN WAF CAN use, the next thing judged is the lock token the put carries —
+    // which is how the rows above are shown to have reported the ARN first.
     let (status, body) = waf
         .call_from(
             TEST_REGION,
             "PutManagedRuleSetVersions",
             json!({
-                "Name": "no-such-set",
+                "Name": set_name,
                 "Scope": SCOPE_REGIONAL,
-                "Id": "00000000-0000-0000-0000-000000000000",
+                "Id": &set_id,
                 "LockToken": "stale-token",
                 "VersionsToPublish": {
                     "Version_1.0": { "AssociatedRuleGroupArn": &group_arn },
@@ -437,11 +469,18 @@ async fn an_arn_the_put_cannot_use_is_refused_before_anything_else() {
         .await;
     assert_eq!(
         status, 400,
-        "a put against a set no account holds is refused, got {body}"
+        "a put carrying a token outside LockToken's form is refused, got {body}"
+    );
+    // Once the ARN is one WAF can use, the next thing judged is the token's own modelled
+    // constraint, which the request validator reports naming that member.
+    assert_eq!(
+        error_code(&body),
+        "ValidationException",
+        "expected the token's own constraint to be what is reported, got {body}"
     );
     assert!(
-        error_code(&body).ends_with("WAFNonexistentItemException"),
-        "once the ARN is one WAF can read, the missing set is what is reported, got {body}"
+        error_message(&body).contains("at 'lockToken' failed to satisfy constraint:"),
+        "expected the clause to name lockToken, got {body}"
     );
 }
 

@@ -445,7 +445,7 @@ async fn a_base_path_is_admitted_only_inside_the_character_class_api_gateway_sta
                 .await;
             assert_eq!(
                 listed.body,
-                crate::emptied_collection_page_member::empty_page_body("GetBasePathMappings"),
+                crate::emptied_collection_page_member::empty_page_body(),
                 "case {}: a refused create must store nothing, so the collection answers \
                  the page of nothing its listing carries, got {:?}",
                 row.case,

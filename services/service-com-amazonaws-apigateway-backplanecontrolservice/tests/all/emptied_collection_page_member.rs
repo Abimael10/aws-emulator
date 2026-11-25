@@ -178,19 +178,18 @@ async fn emptied(gateway: &Gateway, collection: &str) -> String {
     }
 }
 
-/// The whole body the listing named `collection` answers once its page holds no element: the
-/// page member PRESENT and empty — "the current page of elements from this collection" is a
-/// list a client counts, and a page of nothing is a list of nothing — and nothing beside it,
-/// no cursor and no page-size echo, because a page of nothing carries on nowhere.
+/// The whole body the listing of ANY `position`/`limit` collection of this service answers once
+/// its page holds no element: the page member PRESENT and empty — "the current page of elements
+/// from this collection" is a list a client counts, and a page of nothing is a list of nothing
+/// — and nothing beside it, no cursor and no page-size echo, because a page of nothing carries
+/// on nowhere.
 ///
 /// EVERY `position`/`limit` listing of this service answers that way, the base path mappings
 /// of one domain name included: the body does not change shape with which collection, or with
 /// how the page came to hold nothing.
 ///
 /// `pub(crate)` so every suite of this crate that reads an empty page reads the same spelling.
-/// The collection is still named by each caller — it is what a failing case is read against —
-/// and no longer decides the answer.
-pub(crate) fn empty_page_body(_collection: &str) -> Value {
+pub(crate) fn empty_page_body() -> Value {
     json!({ "item": [] })
 }
 
@@ -209,7 +208,7 @@ async fn an_emptied_collection_reports_the_page_member_its_listing_answers() {
         );
         // The envelope this collection answers an emptied page with, and nothing beside it:
         // the page holds no element, so it carries on at no cursor and echoes no page size.
-        let expected = empty_page_body(collection);
+        let expected = empty_page_body();
         assert_eq!(
             answer.body, expected,
             "case {case}: expected {expected:?}, got {:?}",
@@ -239,7 +238,7 @@ async fn an_emptied_collection_asked_for_a_page_size_reports_the_same_answer() {
                 "case {case}: expected 200, got {} with {:?}",
                 answer.status, answer.body
             );
-            let expected = empty_page_body(collection);
+            let expected = empty_page_body();
             assert_eq!(
                 answer.body, expected,
                 "case {case}: expected the same {expected:?}, got {:?}",

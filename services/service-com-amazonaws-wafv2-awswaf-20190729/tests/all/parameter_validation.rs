@@ -112,9 +112,14 @@ struct Case {
 /// the composition rule that is asserted, not a sentence.
 #[tokio::test]
 async fn every_invalid_parameter_refusal_carries_field_parameter_and_reason() {
-    let waf = Waf::new();
+    let (waf, engine) = Waf::sharing_engine();
     let (_ip_set_id, ip_set_arn, _ip_set_lock) =
         create_ip_set(&waf, "REGIONAL", "probe-reference-ips").await;
+    // The managed rule set the put rows address: the resource a write addresses is
+    // resolved before its body, so a reference row needs a set that is there.
+    let put_set_name = "vendor-managed-set";
+    let (put_set_id, _put_set_arn, _put_set_lock) =
+        provision_managed_rule_set(&engine, "REGIONAL", put_set_name, None);
     // A CLOUDFRONT-scoped web ACL, for the WEB_ACL row: such a web ACL is put in front
     // of a distribution through the distribution's own configuration, so associating it
     // through this API is the refusal that names WEB_ACL.
@@ -143,21 +148,36 @@ async fn every_invalid_parameter_refusal_carries_field_parameter_and_reason() {
         Case {
             case: "PutManagedRuleSetVersions, a reference with an unknown scope segment",
             operation: "PutManagedRuleSetVersions",
-            request: put_versions(Some(unknown_scope_arn), WELL_FORMED_LOCK),
+            request: put_versions_for(
+                put_set_name,
+                &put_set_id,
+                Some(unknown_scope_arn),
+                WELL_FORMED_LOCK,
+            ),
             field: "RESOURCE_ARN",
             parameter: unknown_scope_arn.to_string(),
         },
         Case {
             case: "PutManagedRuleSetVersions, another service's ARN as the reference",
             operation: "PutManagedRuleSetVersions",
-            request: put_versions(Some(malformed_arn), WELL_FORMED_LOCK),
+            request: put_versions_for(
+                put_set_name,
+                &put_set_id,
+                Some(malformed_arn),
+                WELL_FORMED_LOCK,
+            ),
             field: "RESOURCE_ARN",
             parameter: malformed_arn.to_string(),
         },
         Case {
             case: "PutManagedRuleSetVersions, a live IP set's ARN as the reference",
             operation: "PutManagedRuleSetVersions",
-            request: put_versions(Some(ip_set_arn.as_str()), WELL_FORMED_LOCK),
+            request: put_versions_for(
+                put_set_name,
+                &put_set_id,
+                Some(ip_set_arn.as_str()),
+                WELL_FORMED_LOCK,
+            ),
             field: "RESOURCE_ARN",
             parameter: ip_set_arn.clone(),
         },
@@ -291,9 +311,14 @@ async fn every_invalid_parameter_refusal_carries_field_parameter_and_reason() {
 /// rows here are the ones that need no store at all.
 #[tokio::test]
 async fn an_unacceptable_resource_reference_carries_the_arn_reason() {
-    let waf = Waf::new();
+    let (waf, engine) = Waf::sharing_engine();
     let (_ip_set_id, ip_set_arn, _ip_set_lock) =
         create_ip_set(&waf, "REGIONAL", "probe-wrong-kind-ips").await;
+    // The set the put addresses, so what each row is refused for is the reference it
+    // carries: the resource a write addresses is resolved ahead of its body.
+    let set_name = "vendor-managed-set";
+    let (set_id, _set_arn, _set_lock) =
+        provision_managed_rule_set(&engine, "REGIONAL", set_name, None);
 
     let arns: Vec<(&str, String)> = vec![
         ("not an ARN at all", "rulegroup/absent/1111111111".to_string()),
@@ -316,7 +341,7 @@ async fn an_unacceptable_resource_reference_carries_the_arn_reason() {
         let (status, body) = waf
             .call(
                 "PutManagedRuleSetVersions",
-                put_versions(Some(arn.as_str()), WELL_FORMED_LOCK),
+                put_versions_for(set_name, &set_id, Some(arn.as_str()), WELL_FORMED_LOCK),
             )
             .await;
         assert_eq!(
@@ -368,12 +393,25 @@ async fn a_resource_reference_is_resolved_before_the_lock_token() {
     let bad_tokens = ["stale-token", "1111111", ""];
 
     for token in bad_tokens {
-        for (target, name, id) in [
-            ("a set the account holds", set_name, set_id.as_str()),
-            ("an identity it does not", "never-provisioned", ENTITY_ID),
+        for (target, name, id, expected_code) in [
+            (
+                "a set the account holds",
+                set_name,
+                set_id.as_str(),
+                "WAFInvalidParameterException",
+            ),
+            // The resource the put ADDRESSES is resolved before its body is judged, so a
+            // request about a set that is not there reports the set rather than the
+            // reference it carries.
+            (
+                "an identity it does not",
+                "never-provisioned",
+                ENTITY_ID,
+                "WAFNonexistentItemException",
+            ),
         ] {
-            // Reference unreadable AND token bad: the reference wins, whichever
-            // target the request addresses.
+            // Reference unreadable AND token bad: against the set that exists the
+            // reference wins, and against an identity nothing holds the target does.
             let (status, body) = waf
                 .call(
                     "PutManagedRuleSetVersions",
@@ -387,9 +425,12 @@ async fn a_resource_reference_is_resolved_before_the_lock_token() {
             );
             assert_eq!(
                 error_code(&body),
-                "WAFInvalidParameterException",
-                "case {case:?}: the unacceptable reference must be what is reported, got {body}"
+                expected_code,
+                "case {case:?}: expected {expected_code}, got {body}"
             );
+            if expected_code != "WAFInvalidParameterException" {
+                continue;
+            }
             assert_eq!(
                 body["Field"].as_str().unwrap_or_default(),
                 "RESOURCE_ARN",

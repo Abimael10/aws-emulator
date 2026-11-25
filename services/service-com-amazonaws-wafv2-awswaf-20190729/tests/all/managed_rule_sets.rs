@@ -644,8 +644,8 @@ async fn a_put_whose_rule_group_does_not_exist_is_refused() {
 }
 
 /// A `VersionsToPublish` KEY that breaks `VersionKeyString`'s own constraints is
-/// refused as a bad request — before the set itself is resolved, because the service
-/// cannot read a version key out of it at all.
+/// refused as a bad request — once the set itself has been resolved, because the resource the
+/// put addresses is what a request about a set that is not there is told about.
 ///
 /// The rows differ in WHICH constraint the key breaks (the pattern, the length
 /// ceiling) and are each tried against a set that exists and one that does not, so
@@ -669,9 +669,21 @@ async fn a_version_key_outside_the_modelled_form_is_refused() {
     ];
 
     for (case, version) in illegal {
-        for (target, name, id) in [
-            ("a set that exists", set_name, set_id.as_str()),
-            ("a set that does not", "never-provisioned", FOREIGN_ID),
+        for (target, name, id, expected) in [
+            (
+                "a set that exists",
+                set_name,
+                set_id.as_str(),
+                "ValidationException",
+            ),
+            // The resource the put addresses is resolved first, so a request about a set that
+            // is not there is told about the set rather than about its version keys.
+            (
+                "a set that does not",
+                "never-provisioned",
+                FOREIGN_ID,
+                "WAFNonexistentItemException",
+            ),
         ] {
             let case = format!("{case}, against {target}");
             let body = waf
@@ -686,10 +698,13 @@ async fn a_version_key_outside_the_modelled_form_is_refused() {
                             *version: version_to_publish(&rule_groups[0], 90),
                         },
                     }),
-                    "ValidationException",
+                    expected,
                     &case,
                 )
                 .await;
+            if expected != "ValidationException" {
+                continue;
+            }
             let message = body["message"]
                 .as_str()
                 .or_else(|| body["Message"].as_str())

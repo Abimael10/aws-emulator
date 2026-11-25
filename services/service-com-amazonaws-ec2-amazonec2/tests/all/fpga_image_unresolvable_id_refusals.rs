@@ -10,17 +10,20 @@
 //!    operations the same way — 400 `InvalidFpgaImageID.Malformed` with the FPGA-image id
 //!    kind's `Image ID '<id>' is invalid.`, naming the value the REQUEST sent — before
 //!    anything is looked up, and nothing is written by the refusal.
-//! 2. A value in the PRINTED id form that this service never ISSUED is answered by the
+//! 2. A value in the PRINTED id form that this service holds no AFI under is answered by the
 //!    OPERATION's own refusal, because EC2 words a refusal per operation rather than per id
 //!    kind:
 //!    * `DescribeFpgaImages` makes the SAME answer as for a value that is no AFI id at all:
 //!      it reports on "the AFIs available to you", so it judges the id it was given rather
 //!      than resolving one resource of the account's own Region;
-//!    * `CopyFpgaImage`, `DeleteFpgaImage` and `ResetFpgaImageAttribute` answer the
-//!      unreadable-id refusal: EC2's long id form is an obfuscated identifier the service
-//!      decodes before the lookup, so a value no issue of this kind ever produced is one they
-//!      cannot read — their `InvalidFpgaImageID.NotFound` with `Image ID '<id>' not found.` is
-//!      reserved for an identifier this service DID issue, which rule 3 drives;
+//!    * `CopyFpgaImage` resolves the id it READ, so an id of the printed form it holds no AFI
+//!      under names a resource that is missing: `InvalidFpgaImageID.NotFound` with `Image ID
+//!      '<id>' not found.`;
+//!    * `DeleteFpgaImage` and `ResetFpgaImageAttribute` answer the unreadable-id refusal:
+//!      EC2's long id form is an obfuscated identifier they decode before the lookup, so a
+//!      value no issue of this kind ever produced is one they cannot read — their
+//!      `InvalidFpgaImageID.NotFound` is reserved for an identifier this service DID issue,
+//!      which rule 3 drives;
 //!    * `DescribeFpgaImageAttribute` answers the not-found code with EC2's common missing-id
 //!      sentence instead, naming the `fpga-image` resource type.
 //! 3. The two readings are about the ID and not about the operation's subject: the id of a
@@ -93,9 +96,9 @@ fn unreadable_message(fpga_image_id: &str) -> String {
 }
 
 /// Every operation that resolves an AFI id, with the answer it makes for a value in the
-/// printed id form that this service never ISSUED.
+/// printed id form that the account holds no AFI under.
 const RESOLVERS: [(&str, Unresolved); 5] = [
-    ("CopyFpgaImage", Unresolved::Unreadable),
+    ("CopyFpgaImage", Unresolved::NotFoundImageId),
     ("DescribeFpgaImages", Unresolved::Unreadable),
     ("DeleteFpgaImage", Unresolved::Unreadable),
     ("ResetFpgaImageAttribute", Unresolved::Unreadable),
@@ -170,16 +173,16 @@ fn unreadable_rows() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// `(case, the value)`: every row is in the PRINTED form EC2 issues an AFI id in, and this
-/// service never issued an AFI id as any of them.
+/// `(case, the value)`: every row is in the PRINTED form EC2 issues an AFI id in, and the
+/// account holds no AFI under any of them.
 fn unresolved_rows() -> Vec<(&'static str, String)> {
     vec![
         (
-            "the long id form, which nothing was ever issued under",
+            "the long id form, which nothing is stored under",
             "afi-0123456789abcdef0".to_string(),
         ),
         (
-            "the short id form, which nothing was ever issued under",
+            "the short id form, which nothing is stored under",
             "afi-01234567".to_string(),
         ),
         (
@@ -244,10 +247,10 @@ async fn a_value_outside_the_issued_afi_id_form_is_refused_the_same_way_everywhe
     );
 }
 
-/// RULE 2: a value in the printed id form that this service never ISSUED is answered by the
-/// OPERATION's own refusal — the unreadable-id refusal from the ones that judge or decode the
-/// id they were given, the not-found code with its own sentence from the copy, which resolves
-/// the value it read, and from the attribute describe.
+/// RULE 2: a value in the printed id form that the account holds no AFI under is answered by
+/// the OPERATION's own refusal — the unreadable-id refusal from the ones that judge or decode
+/// the id they were given, the not-found code with its own sentence from the copy, which
+/// resolves the value it read, and from the attribute describe.
 #[tokio::test]
 async fn an_unresolved_afi_id_is_answered_by_each_operations_own_refusal() {
     let (router, engine) = emulator();

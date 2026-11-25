@@ -7,11 +7,10 @@
 //! 1. An error about a service level objective that cannot be RESOLVED identifies it by its
 //!    ARN, and reports the resource's capitalised type name — never the bare name the
 //!    request happened to send and never the lower-case segment an ARN spells.
-//! 2. A create refused because the name it sent is already stored identifies the STORED
-//!    record: the sentence of that error class states that record's own ARN, read off the
-//!    record rather than minted from the refused request, so it is the same sentence
-//!    whatever the refused request looks like and wherever it was signed. The record it
-//!    conflicts with stays addressable by that ARN, which the create that won returned.
+//! 2. A create refused because the name it sent is already stored reads the FIXED sentence
+//!    of that error class, naming neither the resource nor the identifier: it is the same
+//!    sentence whatever the refused request looks like and wherever it was signed. The
+//!    record it conflicts with stays addressable by the ARN the create that won returned.
 //! 3. A constraint-violation message states the member path and the requirement it
 //!    violated, in AWS's `N validation error(s) detected: ` envelope, with no echo of the
 //!    rejected value and with a `@pattern` requirement rendered without the `^`/`$` anchors
@@ -322,12 +321,12 @@ async fn a_conflict_sentence_does_not_depend_on_the_refused_request() {
             );
             let message = error["Message"].as_str().unwrap_or_default();
             assert_name_already_taken(&label, name, message);
-            // The sentence names the STORED objective's ARN, so no region this request
-            // happened to be signed in reaches it.
+            // The sentence is fixed text, so no region this request happened to be signed
+            // in reaches it.
             if region != REGION {
                 assert!(
                     !message.contains(region),
-                    "case {label}: expected the stored objective's ARN, \
+                    "case {label}: expected the fixed taken-identifier sentence, \
                      which carries no {region:?}, got {message:?}"
                 );
             }

@@ -366,7 +366,7 @@ async fn a_collection_that_holds_nothing_reports_the_empty_page_member() {
         let empty = stand_up(&gateway, collection, 0).await;
         let case = format!("{collection}(the empty collection)");
         let answer = page(&gateway, &empty, "", &case).await;
-        let expected = crate::emptied_collection_page_member::empty_page_body(collection);
+        let expected = crate::emptied_collection_page_member::empty_page_body();
         assert_eq!(
             answer.body, expected,
             "case {case}: expected {expected:?} from a collection with no element, got {:?}",

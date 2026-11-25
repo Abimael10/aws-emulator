@@ -121,7 +121,7 @@ async fn a_collection_that_holds_no_element_reports_the_empty_page_member() {
         let answer = listed(&gateway, uri, case).await;
         // The envelope this listing answers an empty page with
         // (`crate::emptied_collection_page_member::empty_page_body`).
-        let expected = crate::emptied_collection_page_member::empty_page_body(case);
+        let expected = crate::emptied_collection_page_member::empty_page_body();
         assert_eq!(
             answer.body, expected,
             "case {case}: expected {expected:?} for a collection that holds no \
@@ -149,7 +149,7 @@ async fn a_collection_that_holds_no_element_reports_the_empty_page_member() {
         ("GetDomainNames", "/domainnames"),
     ] {
         let answer = listed(&empty, uri, case).await;
-        let expected = crate::emptied_collection_page_member::empty_page_body(case);
+        let expected = crate::emptied_collection_page_member::empty_page_body();
         assert_eq!(
             answer.body, expected,
             "case {case}: expected {expected:?} for a collection that holds no \

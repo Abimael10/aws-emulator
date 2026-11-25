@@ -5,15 +5,14 @@
 //!
 //! The rules under test are:
 //!
-//! 1. A SOURCE AFI THE COPY CANNOT RESOLVE IS TOLD APART BY WHAT IS WRONG WITH IT: EC2's id
-//!    form is an obfuscated identifier the service DECODES before it looks anything up, so a
-//!    value outside the printed form EC2 issues an AFI id in and a value inside that form
-//!    which no issue of this kind ever produced are both 400 `InvalidFpgaImageID.Malformed`
-//!    with the id kind's `Image ID '<id>' is invalid.`; 400 `InvalidFpgaImageID.NotFound`
-//!    with `Image ID '<id>' not found.` is reserved for an identifier this service DID issue
-//!    and holds no AFI under any longer — the id of a copy the delete has removed, which
-//!    rule 3 drives. The operations that act on an AFI OF THEIR OWN REGION answer the same id
-//!    table the same way, because which half a request earns is a fact of the id it carried.
+//! 1. A SOURCE AFI THE COPY CANNOT RESOLVE IS TOLD APART BY WHAT IS WRONG WITH IT: a value
+//!    outside the printed form EC2 issues an AFI id in is 400
+//!    `InvalidFpgaImageID.Malformed` with the id kind's `Image ID '<id>' is invalid.`,
+//!    answered before anything is looked up, and an id INSIDE that form the account holds no
+//!    AFI under — a fabricated one, and the id of a copy the delete has removed, which rule 3
+//!    drives — is 400 `InvalidFpgaImageID.NotFound` with `Image ID '<id>' not found.`. The
+//!    operations that act on an AFI OF THEIR OWN REGION decode the id instead, so they answer
+//!    the unreadable half for a form nothing was issued under.
 //! 2. `SourceRegion` HAS TO NAME A REGION of the account's partition — "the Region that
 //!    contains the source AFI" — so a value that names none is refused with
 //!    `InvalidParameterValue` naming the value that is no Region's name.
@@ -56,8 +55,8 @@ const DRY_RUN_STATUS: u16 = 412;
 /// all — the first half of the malformed-before-not-found pair.
 const UNREADABLE_SOURCE_CODE: &str = "InvalidFpgaImageID.Malformed";
 
-/// The answer the COPY and the decoding operations alike have for an identifier this service
-/// DID issue that names no stored AFI — the id of a copy a delete has removed.
+/// The answer the COPY has for an identifier of the form EC2 issues an AFI id in that names
+/// no stored AFI — a fabricated id of that form, and the id of a copy a delete has removed.
 const UNKNOWN_SOURCE_CODE: &str = "InvalidFpgaImageID.NotFound";
 
 /// A well-formed AFI id, in the long (17 hex digit) form EC2 mints today, that the account
@@ -110,20 +109,21 @@ fn stored_afi_count(engine: &engine::InMemoryEngine) -> usize {
 
 /// `(case, the id, the code the COPY answers it with, the code the operations that DECODE an
 /// AFI id of their own Region answer it with)`. The ids differ along prefix, suffix length and
-/// alphabet, and include both accepted id FORMS (8 and 17 hex digits); every row is a value
-/// the mint never issued, so every operation — the copy included — answers it as unreadable.
+/// alphabet, and include both accepted id FORMS (8 and 17 hex digits): a value INSIDE one of
+/// those forms is one the copy can read, so it is not found, while every value outside them is
+/// unreadable for every operation.
 fn unresolvable_source_rows() -> [(&'static str, &'static str, &'static str, &'static str); 9] {
     [
         (
-            "the long id form, which nothing was ever issued under",
+            "the long id form, which nothing is stored under",
             UNKNOWN_FPGA_IMAGE_ID,
-            UNREADABLE_SOURCE_CODE,
+            UNKNOWN_SOURCE_CODE,
             UNREADABLE_SOURCE_CODE,
         ),
         (
-            "the short id form, which nothing was ever issued under",
+            "the short id form, which nothing is stored under",
             "afi-01234567",
-            UNREADABLE_SOURCE_CODE,
+            UNKNOWN_SOURCE_CODE,
             UNREADABLE_SOURCE_CODE,
         ),
         (
@@ -248,15 +248,15 @@ async fn an_unresolved_source_is_refused_the_same_way_in_every_region() {
             status, 400,
             "case {case:?}: expected HTTP 400, got {status} with body {body}"
         );
-        // The id is one no issue of this kind ever produced, so it is the one the service
-        // cannot read — whichever Region the request named it in.
+        // The id is one of the form EC2 issues, so the copy can read it and reports the AFI
+        // as missing — whichever Region the request named it in.
         assert_eq!(
             error_code(&body),
-            UNREADABLE_SOURCE_CODE,
-            "case {case:?}: expected {UNREADABLE_SOURCE_CODE}, got {body}"
+            UNKNOWN_SOURCE_CODE,
+            "case {case:?}: expected {UNKNOWN_SOURCE_CODE}, got {body}"
         );
         let message = unescaped(&element(&body, "Message").unwrap_or_default());
-        let expected_message = format!("Image ID '{UNKNOWN_FPGA_IMAGE_ID}' is invalid.");
+        let expected_message = format!("Image ID '{UNKNOWN_FPGA_IMAGE_ID}' not found.");
         assert_eq!(
             message, expected_message,
             "case {case:?}: expected the message {expected_message:?}, got {message:?}"

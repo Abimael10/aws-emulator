@@ -47,10 +47,6 @@ use crate::domain_name_collection::created_domain;
 use crate::emptied_collection_page_member::{deleted, empty_page_body};
 use crate::rest_api_lifecycle::{page_items, string_member, Gateway};
 
-/// The listing this suite reads, as [`empty_page_body`] names the collections of this
-/// service.
-const LISTING: &str = "GetDomainNames";
-
 /// The page sizes a read asks this collection for: none at all, the smallest a page may be,
 /// the documented default and the published maximum — "The maximum number of returned
 /// results per page. The default value is 25 and the maximum value is 500"
@@ -202,7 +198,7 @@ fn assert_empty_page(body: &Value, case: &str) {
         member.is_some_and(|item| item.as_array().is_some_and(Vec::is_empty)),
         "case {case}: expected the page member present and empty, got {body:?}"
     );
-    let expected = empty_page_body(LISTING);
+    let expected = empty_page_body();
     assert_eq!(
         body, &expected,
         "case {case}: expected {expected:?}, got {body:?}"

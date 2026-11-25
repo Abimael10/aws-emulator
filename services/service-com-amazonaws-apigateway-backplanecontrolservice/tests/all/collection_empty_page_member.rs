@@ -429,12 +429,11 @@ async fn every_paginated_listing_of_this_service_reports_its_page_as_the_listing
     for (case, uri, held) in &rows {
         let body = listed(&gateway, uri, case).await;
         // Every listing of this service reports its page member whatever the page holds —
-        // the empty list for a page of nothing — except the one collection the shared
-        // reading of an empty page names as answered otherwise
+        // the empty list for a page of nothing
         // (`crate::emptied_collection_page_member::empty_page_body`).
         match held {
             Some(0) => {
-                let expected = crate::emptied_collection_page_member::empty_page_body(case);
+                let expected = crate::emptied_collection_page_member::empty_page_body();
                 assert_eq!(
                     body.get("item"),
                     expected.get("item"),
@@ -537,7 +536,7 @@ async fn an_empty_page_is_the_same_answer_whatever_the_request_asked_for() {
     ];
 
     for (collection, uri, narrowing) in &rows {
-        let expected = crate::emptied_collection_page_member::empty_page_body(collection);
+        let expected = crate::emptied_collection_page_member::empty_page_body();
         let mut queries: Vec<String> = PAGE_SIZES.iter().map(|size| (*size).to_string()).collect();
         if let Some(narrowing) = narrowing {
             for size in PAGE_SIZES {

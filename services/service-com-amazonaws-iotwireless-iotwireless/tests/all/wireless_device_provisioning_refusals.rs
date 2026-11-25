@@ -31,13 +31,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::destination_and_wireless_device_lifecycle::{call, error_code, router};
 
-/// The sentence a duplicate `DevEui` conflict carries, about the identifier the request
-/// submitted: fixed text with the `DevEui` the caller has to change inside it, spelled out
-/// here so the suite pins the wording rather than whatever the service happens to emit. The
-/// template leaves a second identifier unfilled after that `DevEui`, hence the double space.
-fn duplicate_dev_eui_message(dev_eui: &str) -> String {
-    format!("DevEui {dev_eui}  with same key has been claimed")
-}
+/// The sentence a duplicate `DevEui` conflict carries: FIXED text, with no variable part —
+/// neither the identifier the request submitted nor the device that holds it — spelled out here
+/// so the suite pins the wording rather than whatever the service happens to emit.
+const DUPLICATE_DEV_EUI_MESSAGE: &str = "Device with given DevEui already exists";
 
 /// AWS's sentence for key material the referenced device profile's `MacVersion` cannot
 /// provision. The only variable part is that stored `MacVersion`.
@@ -440,15 +437,19 @@ async fn a_duplicate_dev_eui_conflict_carries_one_sentence_for_every_input() {
             "ConflictException",
             "case {case:?}: expected ConflictException, got {response}"
         );
-        let expected_conflict = duplicate_dev_eui_message(dev_eui);
+        let expected_conflict = DUPLICATE_DEV_EUI_MESSAGE;
         assert_eq!(
             response["Message"],
             json!(expected_conflict),
             "case {case:?}: expected Message {expected_conflict:?}, got {response}"
         );
         let message = response["Message"].as_str().unwrap_or_default().to_string();
-        // The one variable part is the identifier the request submitted, as it submitted
-        // it: nothing about the device that holds it is disclosed.
+        // The sentence is fixed text: neither the identifier the request submitted nor
+        // anything about the device that holds it is disclosed.
+        assert!(
+            !message.contains(dev_eui),
+            "case {case:?}: the refusal must not name the submitted identifier, got {message:?}"
+        );
         assert!(
             !message.contains(&owner),
             "case {case:?}: the refusal must not name the identifier's owner, got {message:?}"
@@ -519,7 +520,7 @@ async fn the_two_conflict_classes_of_a_device_create_carry_their_own_sentences()
         StatusCode::CONFLICT,
         "the duplicate DevEui must be 409, got {status} {duplicate}"
     );
-    let expected_conflict = duplicate_dev_eui_message(dev_eui);
+    let expected_conflict = DUPLICATE_DEV_EUI_MESSAGE;
     assert_eq!(
         duplicate["Message"],
         json!(expected_conflict),

@@ -103,7 +103,7 @@ async fn get_base_path_mappings_pages_through_creation_order_on_position_and_lim
     let empty = page_of(&gateway, domain_name, "", "the empty collection").await;
     assert_eq!(
         empty,
-        crate::emptied_collection_page_member::empty_page_body("GetBasePathMappings"),
+        crate::emptied_collection_page_member::empty_page_body(),
         "case the empty collection: expected the page member present and empty, got {empty:?}"
     );
 
@@ -552,7 +552,7 @@ async fn an_empty_page_of_this_collection_is_answered_with_the_empty_page_member
             let body = page_of(&gateway, &domain_name, query, &case).await;
             assert_eq!(
                 body,
-                crate::emptied_collection_page_member::empty_page_body("GetBasePathMappings"),
+                crate::emptied_collection_page_member::empty_page_body(),
                 "case {case}: expected the page member present and empty with nothing beside \
                  it, got {body:?}"
             );

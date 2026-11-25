@@ -354,7 +354,7 @@ async fn a_refused_write_leaves_the_listing_reporting_its_empty_page() {
         // The refusal stored nothing, so the listing answers the whole body it answers for
         // a page holding no element — and nothing beside the page member, because a page of
         // nothing carries on at no cursor and echoes no page size.
-        let expected = empty_page_body(collection);
+        let expected = empty_page_body();
         for listing in &row.listings {
             let case = format!("{collection}({listing}) after {}", row.refused);
             let body = listed(&gateway, listing, &case).await;

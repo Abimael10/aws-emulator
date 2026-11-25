@@ -861,9 +861,6 @@ pub fn slo_not_found(region: &str, id: &str) -> ResourceNotFoundException {
 /// The predicate [`slo_arn_sentence`] states about an SLO this service does not hold.
 const SLO_DOES_NOT_EXIST: &str = "does not exist";
 
-/// The predicate [`slo_arn_sentence`] states about an SLO this service ALREADY holds.
-const SLO_ALREADY_EXISTS: &str = "already exists";
-
 /// The ONE sentence this service words a refusal ABOUT ONE PARTICULAR SLO IT CANNOT RESOLVE
 /// with: the resource's capitalised type name ([`SLO_RESOURCE_TYPE`]), the ARN that addresses
 /// it in single quotes, and the predicate saying what is wrong with it, closed by a period.
@@ -983,18 +980,21 @@ pub fn tagged_resource_type(resource_arn: &str) -> &'static str {
     }
 }
 
-/// The modelled `ConflictException` a create is refused with when the identifier it sent is
-/// already stored.
+/// What a create whose identifier is already stored is refused with: FIXED text stating that
+/// the identifier the request named is taken, and naming neither the resource type nor the
+/// identifier itself.
 ///
-/// The refusal is about ONE PARTICULAR SLO — the stored one whose identifier the create asked
-/// for — so it is worded in the one sentence this service states about one SLO it names
-/// ([`slo_arn_sentence`]): the resource's capitalised type name, that SLO's ARN in single
-/// quotes, and the predicate saying what is wrong with it. `arn` is the STORED record's own,
-/// which is the full resource identifier a client parses to resolve the resource it collided
-/// with.
-pub fn slo_already_exists(arn: &str) -> ConflictException {
+/// The refusal is about the IDENTIFIER the caller sent, which the caller already holds — it is
+/// what it has to change to get a create through — so the sentence carries no variable part,
+/// unlike this service's refusals about one particular SLO it cannot resolve
+/// ([`slo_arn_sentence`]), which address that SLO by ARN.
+pub const SAME_IDENTIFIER_ALREADY_EXISTS: &str = "A resource with the same identifier already exists";
+
+/// The modelled `ConflictException` a create is refused with when the identifier it sent is
+/// already stored ([`SAME_IDENTIFIER_ALREADY_EXISTS`]).
+pub fn slo_already_exists() -> ConflictException {
     ConflictException {
-        message: slo_arn_sentence(arn, SLO_ALREADY_EXISTS),
+        message: SAME_IDENTIFIER_ALREADY_EXISTS.to_string(),
     }
 }
 

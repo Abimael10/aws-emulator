@@ -9,17 +9,17 @@
 //! Three rules this handler keeps:
 //!
 //! 1. a source AFI this copy cannot resolve is told apart by the AFI id kind's
-//!    malformed-before-not-found pair, the same pair every operation of this service that
-//!    resolves an AFI by id answers: a value outside the form EC2 could have ISSUED an AFI id
-//!    in, and a value inside that form no issue of this kind ever produced, are each 400
-//!    `InvalidFpgaImageID.Malformed` ([`crate::state::invalid_fpga_image_id_malformed`]),
-//!    because EC2's id form is an obfuscated identifier the service decodes before it looks
-//!    anything up; only an identifier this service DID issue and holds no AFI under any
-//!    longer is 400 `InvalidFpgaImageID.NotFound`
-//!    ([`crate::state::invalid_fpga_image_id_not_found`]) — the same two answers
-//!    `DeleteFpgaImage` and `ResetFpgaImageAttribute` give the same two causes, because which
-//!    of them a request earns is a fact of the ID it carried and not of the member or the
-//!    Region member beside it;
+//!    malformed-before-not-found pair: a value outside the form EC2 ISSUES an AFI id in is
+//!    400 `InvalidFpgaImageID.Malformed`
+//!    ([`crate::state::invalid_fpga_image_id_malformed`]), answered before anything is
+//!    looked up, and an id INSIDE that form the account holds no AFI under is 400
+//!    `InvalidFpgaImageID.NotFound` ([`crate::state::invalid_fpga_image_id_not_found`]) —
+//!    the same reading the attribute operations give an AFI id
+//!    ([`crate::state::require_fpga_image_by_id_shape`]), because an id of the issued form
+//!    is one the service can read and so names a resource that is missing rather than an id
+//!    it cannot read, and because whether THIS process minted the id is a fact of its
+//!    history and not of the request. Which half a request earns is a fact of the ID it
+//!    carried, so the `SourceRegion` member beside it changes neither answer;
 //! 2. "The Region that contains the source AFI" (`CopyFpgaImageRequest$SourceRegion`) has
 //!    to name a Region of the account's partition, so a value that names no Region is
 //!    refused with `InvalidParameterValue` rather than copied from. It is VALIDATED ONLY:
@@ -137,15 +137,14 @@ fn unreadable_source_fpga_image_id(fpga_image_id: &str) -> CopyFpgaImageError {
     crate::state::invalid_fpga_image_id_malformed(fpga_image_id)
 }
 
-/// Refuse a copy whose `SourceFpgaImageId` is an AFI id this service ISSUED and holds no AFI
-/// for any longer: HTTP 400 `InvalidFpgaImageID.NotFound`, naming the id the request sent —
-/// the SECOND half of that pair.
+/// Refuse a copy whose `SourceFpgaImageId` is an AFI id of the form EC2 issues that the
+/// account holds no AFI under: HTTP 400 `InvalidFpgaImageID.NotFound`, naming the id the
+/// request sent — the SECOND half of that pair.
 ///
-/// An identifier this service issued is one it can READ, so a source it no longer holds is a
-/// resource that is MISSING rather than an id it cannot read: that is the one cause this half
-/// states, exactly as it is on the operations that act on an AFI of their own Region. Which
-/// half a request earns is a fact of the id it carried, so the `SourceRegion` member beside it
-/// changes neither answer.
+/// An identifier of the issued form is one the service can READ, so a source it holds no AFI
+/// under is a resource that is MISSING rather than an id it cannot read: that is the one cause
+/// this half states. Which half a request earns is a fact of the id it carried, so the
+/// `SourceRegion` member beside it changes neither answer.
 fn unknown_source_fpga_image_id(fpga_image_id: &str) -> CopyFpgaImageError {
     crate::state::invalid_fpga_image_id_not_found(fpga_image_id)
 }
@@ -289,17 +288,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Region: the store holds the AFIs of the Region this call was signed for, and the
         // `SourceRegion` checked above is validated rather than resolved against.
         //
-        // The source id is DECODED before it is resolved — EC2's long id form is an
-        // obfuscated identifier the service reads ahead of the lookup — so a value no issue
-        // of this kind ever produced is one this service cannot read, and it earns the
-        // malformed half of the pair exactly as it does on the operations that act on an AFI
-        // of their own Region ([`crate::state::ComAmazonawsEc2Amazonec2State::id_was_issued`]
-        // is the one reader of what was issued). Which half a request earns is a fact of the
-        // ID it carried, so the NOT-FOUND half ([`unknown_source_fpga_image_id`]) is reserved
-        // for an identifier this service DID issue and holds no AFI under any longer.
-        if !store.id_was_issued(FPGA_IMAGE_ID_PREFIX, &input.source_fpga_image_id) {
-            return Err(unreadable_source_fpga_image_id(&input.source_fpga_image_id));
-        }
+        // The source is resolved by the FORM an AFI id is issued in and nothing else: an id
+        // of that form is one the service can read, so a form it holds no AFI under names a
+        // resource that is MISSING and earns the NOT-FOUND half of the pair
+        // ([`unknown_source_fpga_image_id`]) — whether this store ever minted the id or not,
+        // which is a fact of this process's history rather than of the request. The MALFORMED
+        // half is reserved for a value outside that form, which the check at the top of this
+        // handler already answered before anything was looked up. It is the same reading
+        // [`crate::state::require_fpga_image_by_id_shape`] gives an AFI id on the attribute
+        // operations, so a well-formed id nothing is stored under is reported one way here.
         let source = store
             .fpga_images
             .get(&input.source_fpga_image_id)
