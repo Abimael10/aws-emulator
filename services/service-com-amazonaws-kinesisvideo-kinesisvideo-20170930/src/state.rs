@@ -9,12 +9,16 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// Where a signaling channel's `HTTPS`/`WEBRTC` endpoint is announced, which is an address
+/// this process answers on — see the module's own header.
+pub mod announced_channel_endpoint;
 /// What a stream's media APIs are addressed at, which is not this service's own
 /// endpoint — see the module's own header.
 pub mod data_endpoint;
 /// What answers at an announced data endpoint, and over which transport.
 pub mod data_plane_serving;
 
+pub use announced_channel_endpoint::announced_channel_endpoint_authority;
 pub use data_endpoint::{
     data_plane_of, endpoint_serves_stream, ensure_data_endpoint, published_endpoint,
     published_endpoint_stream, published_plane, serve_on_data_plane, service_host, DataPlane,
@@ -871,23 +875,7 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
-/// The authority this request arrived on, falling back to the service's own regional
-/// host form when the request carries none.
-///
-/// It is NOT where a stream's media planes live: those are resolved per access mode by
-/// [`ensure_data_endpoint`], which is the whole point of `GetDataEndpoint`. The
-/// signaling-channel endpoints report this authority under the scheme each
-/// `ChannelProtocol` names.
-pub fn request_authority(parts: &::http::request::Parts, region: &str) -> String {
-    let authority = parts
-        .headers
-        .get(::http::header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .filter(|host| !host.is_empty())
-        .map(ToString::to_string)
-        .or_else(|| parts.uri.authority().map(ToString::to_string));
-    match authority {
-        Some(authority) => authority,
-        None => service_host(region),
-    }
-}
+// Where an address this service ANNOUNCES comes from is read in two child modules, and
+// nowhere else: a stream's media planes are resolved per access mode by
+// [`ensure_data_endpoint`] (the whole point of `GetDataEndpoint`), and a signaling channel's
+// `HTTPS`/`WEBRTC` endpoint by [`announced_channel_endpoint_authority`].

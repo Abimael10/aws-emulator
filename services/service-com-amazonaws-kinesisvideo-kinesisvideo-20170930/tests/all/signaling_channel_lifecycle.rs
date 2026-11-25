@@ -31,22 +31,38 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use service_com_amazonaws_kinesisvideo_kinesisvideo_20170930 as kvs;
-use smithy_server_runtime::MultiServiceRouter;
+use smithy_server_runtime::{EndpointUrl, MultiServiceRouter};
 
 /// A router carrying only this service, over its own engine, with request
 /// authentication off so a case can send an unsigned-but-scoped request.
+///
+/// It is SERVED at [`SERVED_BASE`] (`MultiServiceRouter::set_url_base`, which is what
+/// `OperationContext::endpoint` reports), because an address this service announces for a
+/// client to dial is the address this process answers on — so a case that reads an
+/// announced endpoint has a served address to compare it with.
 fn harness() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
+    router.set_url_base(
+        EndpointUrl::parse(SERVED_BASE).unwrap_or_else(|| panic!("{SERVED_BASE} must parse")),
+    );
     router.register_service(kvs::EmulatedService::new(engine));
     router
 }
 
-/// The emulator endpoint every case addresses. Also the authority
-/// `GetSignalingChannelEndpoint` has to hand back, so a signaling client lands on this
-/// emulator again.
+/// The emulator endpoint every case addresses: one of AWS's own regional hosts, which is
+/// what a client that resolves them sends — and which this process does not answer on, so
+/// it is NOT an address this service may announce back.
 const ENDPOINT_HOST: &str = "kinesisvideo.us-east-1.amazonaws.com";
+
+/// The base URL this process is SERVED at: the address every endpoint this service
+/// announces for a client to dial has to name.
+const SERVED_BASE: &str = "https://127.0.0.1:9297";
+
+/// That base's `host:port`, which is the authority an announced endpoint carries under the
+/// scheme its `ChannelProtocol` names.
+const SERVED_AUTHORITY: &str = "127.0.0.1:9297";
 
 /// One answer from the router: HTTP status, the parsed JSON body, and the two response
 /// headers the `restJson1` error envelope is made of.
@@ -899,9 +915,12 @@ async fn an_endpoint_is_reported_for_every_protocol_the_request_names() {
                      on, got {reported:?}"
                 );
             } else {
+                // The request addressed one of AWS's own regional hosts, which this
+                // process does not answer on, so the announced endpoint names the address
+                // it IS served at.
                 assert_eq!(
                     reported,
-                    format!("{scheme}://{ENDPOINT_HOST}"),
+                    format!("{scheme}://{SERVED_AUTHORITY}"),
                     "case {case:?}: endpoint {index} must address this emulator over \
                      {scheme}, got {:?}",
                     listed[index]

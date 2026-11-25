@@ -153,8 +153,16 @@ pub fn data_plane_of(api_name: &str) -> Option<DataPlane> {
 }
 
 /// This service's regional host: its endpoint prefix, the request's region and the AWS
-/// DNS suffix — the name AWS publishes this service at, used where a request carries no
-/// address of its own to report back ([`super::request_authority`]).
+/// DNS suffix — the name AWS publishes this service at.
+///
+/// The ENDPOINT IDENTITY of this service in a region, which is what tells one region's
+/// published endpoint from another's. It is NOT an address this emulator answers on, so
+/// nothing this service ANNOUNCES for a client to dial is built from it: a stream's media
+/// planes are announced at the listener each one is served on
+/// ([`ensure_data_endpoint`]), and a signaling channel's endpoint at the address this
+/// process answers on ([`super::announced_channel_endpoint_authority`]). What reads this
+/// is the inverse question — whether an address a request carries is one of this service's
+/// announced planes ([`published_plane`]), which such a host is not.
 pub fn service_host(region: &str) -> String {
     format!("kinesisvideo.{region}.amazonaws.com")
 }

@@ -3,9 +3,12 @@
 //! @op GetSignalingChannelEndpoint
 //! Reports one endpoint per `ChannelProtocol` the request asks for, for the stored
 //! signaling channel the `ChannelARN` names, listed by `ChannelProtocol` value rather
-//! than in the order the request names them. Every endpoint is THIS emulator's own
-//! authority under the scheme that protocol names, because the endpoint has to be
-//! reachable: a client takes it and connects back here. `WEBRTC` is refused with the
+//! than in the order the request names them. Every endpoint is an address THIS emulator
+//! ANSWERS on under the scheme that protocol names, because the endpoint has to be
+//! reachable: a client takes it and connects back here — the address this process answers
+//! on for the `HTTPS` and `WEBRTC` protocols
+//! ([`crate::state::announced_channel_endpoint_authority`]), and the socket the channels'
+//! WebSocket data plane is served on for `WSS`. `WEBRTC` is refused with the
 //! modeled `InvalidArgumentException` on a channel that is not configured for ingestion,
 //! as the operation's docs state.
 //!
@@ -179,8 +182,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        let region = crate::state::request_region(ctx.parts());
-        let authority = crate::state::request_authority(ctx.parts(), &region);
+        // WHERE the announced endpoints are addressed: an address this process ANSWERS on,
+        // never one the request merely carried that nothing here answers on and never the
+        // host AWS publishes this service at (see
+        // [`crate::state::announced_channel_endpoint`]).
+        let authority = crate::state::announced_channel_endpoint_authority(ctx);
 
         // The store is read under one guard in this block and the guard is dropped with it:
         // an address below is resolved by opening a listener, which is awaited, and a
