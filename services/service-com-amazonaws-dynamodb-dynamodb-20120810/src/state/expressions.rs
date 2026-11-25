@@ -3928,27 +3928,40 @@ impl<'a> ExprParser<'a> {
     /// kind each position takes ([`check_operand_kind`]) are facts of the expression's own
     /// text, so a malformed call is refused naming the rule it broke rather than reported
     /// as the grammar position the parse stopped at.
+    ///
+    /// Those rules speak about the call the expression WROTE, so each of them is asked only
+    /// of a call the expression CLOSED ([`Self::operands_in_call`]) — the one reading of
+    /// that property this call is read under; text that ends inside a call is the syntax
+    /// error the parse stops at.
     fn condition_function(&mut self, name: &str) -> Result<ConditionNode, RequestError> {
         let Some(signature) = condition_function_signature(name) else {
             return Err(unknown_function(self.member, name));
         };
         self.at += 2;
-        self.check_operand_count(name, signature.len())?;
+        let stated = self.operands_in_call();
+        self.check_operand_count(name, signature.len(), stated)?;
+        let closed = stated.is_some();
         let node = match name {
-            "attribute_exists" => ConditionNode::Exists(self.function_path(name)?, true),
-            "attribute_not_exists" => ConditionNode::Exists(self.function_path(name)?, false),
+            "attribute_exists" => ConditionNode::Exists(self.function_path(name, closed)?, true),
+            "attribute_not_exists" => {
+                ConditionNode::Exists(self.function_path(name, closed)?, false)
+            }
             "attribute_type" => {
-                let path = self.function_path(name)?;
+                let path = self.function_path(name, closed)?;
                 self.expect(&ExprToken::Comma)?;
-                let wanted = self.function_operand(name, signature, 1)?;
-                check_attribute_type_name(self.member, &wanted)?;
+                let wanted = self.function_operand(name, signature, 1, closed)?;
+                if closed {
+                    check_attribute_type_name(self.member, &wanted)?;
+                }
                 ConditionNode::AttributeType(path, wanted)
             }
             "begins_with" => {
-                let value = self.function_operand(name, signature, 0)?;
+                let value = self.function_operand(name, signature, 0, closed)?;
                 self.expect(&ExprToken::Comma)?;
-                let prefix = self.function_operand(name, signature, 1)?;
-                check_begins_with_prefix(self.member, &prefix)?;
+                let prefix = self.function_operand(name, signature, 1, closed)?;
+                if closed {
+                    check_begins_with_prefix(self.member, &prefix)?;
+                }
                 // A prefix read from the very location it is tested against is no prefix
                 // test ([`Self::check_distinct_first_operands`]).
                 self.note_non_distinct(name, &value, &[&prefix]);
@@ -3958,9 +3971,9 @@ impl<'a> ExprParser<'a> {
             // is read at the kind its signature declares like every other position — a
             // location the item holds, or a collection the REQUEST carried.
             _ => {
-                let searched = self.function_operand(name, signature, 0)?;
+                let searched = self.function_operand(name, signature, 0, closed)?;
                 self.expect(&ExprToken::Comma)?;
-                let needle = self.function_operand(name, signature, 1)?;
+                let needle = self.function_operand(name, signature, 1, closed)?;
                 // The one rule beyond the operand kinds: the two operands address
                 // different locations ([`Self::check_distinct_first_operands`]).
                 self.note_non_distinct(name, &searched, &[&needle]);
@@ -3975,14 +3988,22 @@ impl<'a> ExprParser<'a> {
     /// takes.
     ///
     /// A call that carries NO operand at all is not held to this: there is nothing there
-    /// to be the wrong number OF. An expression that ends inside a call
-    /// (`attribute_exists(`), or that closes one straight away (`attribute_exists()`), is
-    /// text the grammar cannot complete — so it is the syntax error the parse stops at,
-    /// naming the position the expression ran out, which is what the parse below reports
-    /// once the operand position is read. The arity sentence is for a call whose operands
-    /// are THERE and are too many or too few.
-    fn check_operand_count(&self, function: &str, takes: usize) -> Result<(), RequestError> {
-        let supplied = self.operands_in_call();
+    /// to be the wrong number OF. Neither is a call the expression never CLOSES, which
+    /// states no operand list at all (`stated` is then `None`, see
+    /// [`Self::operands_in_call`]): text that ends inside a call is text the grammar cannot
+    /// complete, so it is the syntax error the parse stops at, naming the position the
+    /// expression ran out, which is what the parse below reports once the next operand
+    /// position is read. The arity sentence is for a call whose operand list the
+    /// expression finished and that carries too many or too few operands.
+    fn check_operand_count(
+        &self,
+        function: &str,
+        takes: usize,
+        stated: Option<usize>,
+    ) -> Result<(), RequestError> {
+        let Some(supplied) = stated else {
+            return Ok(());
+        };
         if supplied == takes || supplied == 0 {
             return Ok(());
         }
@@ -3991,33 +4012,49 @@ impl<'a> ExprParser<'a> {
 
     /// How many operands the call the parse has just entered carries: one per `,` at this
     /// call's own bracket depth plus one for the last, and none at all for a call that
-    /// closes straight away.
+    /// closes straight away — or `None` for a call the expression never closes, which
+    /// states no operand list at all because the text ran out inside it.
+    ///
+    /// Read ONCE where a call is entered, and the reading is what every rule about that
+    /// call's operands is then asked under — how many it carries
+    /// ([`Self::check_operand_count`]) and what kind each position takes
+    /// ([`check_operand_kind`], [`requires_document_path`]) are all facts of the call the
+    /// expression finished writing. Text that ends inside a call never states that call at
+    /// all: it is the syntax error the parse stops at ([`Self::syntax`]), which names the
+    /// position the expression ran out instead of pointing a caller at a signature.
     ///
     /// Counted off the TOKENS rather than by parsing them, because the count belongs in
     /// the refusal and a call this parser has already rejected is not read any further.
     /// The walk is bounded by [`MAX_EXPRESSION_TOKENS`], like every other pass over an
     /// expression's tokens, so what one request can ask this for is a constant of this
     /// service rather than a function of its text.
-    fn operands_in_call(&self) -> usize {
+    fn operands_in_call(&self) -> Option<usize> {
         let mut depth = 0usize;
         let mut separators = 0usize;
         let mut written = false;
+        let mut closed = false;
         for token in self.tokens.iter().skip(self.at) {
             match token {
                 ExprToken::Open => {
                     depth += 1;
                     written = true;
                 }
-                ExprToken::Close if depth == 0 => break,
+                ExprToken::Close if depth == 0 => {
+                    closed = true;
+                    break;
+                }
                 ExprToken::Close => depth -= 1,
                 ExprToken::Comma if depth == 0 => separators += 1,
                 _ => written = true,
             }
         }
-        if !written && separators == 0 {
-            return 0;
+        if !closed {
+            return None;
         }
-        separators + 1
+        if !written && separators == 0 {
+            return Some(0);
+        }
+        Some(separators + 1)
     }
 
     /// One ARGUMENT of a call, read through the parentheses that group it.
@@ -4048,10 +4085,15 @@ impl<'a> ExprParser<'a> {
     }
 
     /// One operand position the signature declares as a document PATH: a `:placeholder`
-    /// written there names no location at all.
-    fn function_path(&mut self, function: &str) -> Result<DocumentPath, RequestError> {
+    /// written there names no location at all — a rule about the operands of a call the
+    /// expression `closed`, like the two below it.
+    fn function_path(
+        &mut self,
+        function: &str,
+        closed: bool,
+    ) -> Result<DocumentPath, RequestError> {
         self.argument(|parser| {
-            if matches!(parser.peek(), Some(ExprToken::Placeholder(_))) {
+            if closed && matches!(parser.peek(), Some(ExprToken::Placeholder(_))) {
                 return Err(requires_document_path(parser.member, function));
             }
             parser.path()
@@ -4064,8 +4106,12 @@ impl<'a> ExprParser<'a> {
         function: &str,
         signature: &[OperandKind],
         at: usize,
+        closed: bool,
     ) -> Result<Operand, RequestError> {
         let operand = self.argument(|parser| parser.operand())?;
+        if !closed {
+            return Ok(operand);
+        }
         if let Some(kind) = signature.get(at) {
             check_operand_kind(self.member, function, *kind, &operand)?;
         }
@@ -4132,8 +4178,9 @@ impl<'a> ExprParser<'a> {
         }
         if self.peek_call().as_deref() == Some(SIZE_FUNCTION) {
             self.at += 2;
-            self.check_operand_count(SIZE_FUNCTION, 1)?;
-            let path = self.function_path(SIZE_FUNCTION)?;
+            let stated = self.operands_in_call();
+            self.check_operand_count(SIZE_FUNCTION, 1, stated)?;
+            let path = self.function_path(SIZE_FUNCTION, stated.is_some())?;
             self.expect(&ExprToken::Close)?;
             return Ok(Operand::Size(path));
         }
@@ -4231,10 +4278,11 @@ impl<'a> ExprParser<'a> {
             }
             self.at += 2;
             self.descend()?;
-            self.check_operand_count(&name, 2)?;
+            let stated = self.operands_in_call();
+            self.check_operand_count(&name, 2, stated)?;
             let operand = match name.as_str() {
                 "if_not_exists" => {
-                    let path = self.function_path(&name)?;
+                    let path = self.function_path(&name, stated.is_some())?;
                     self.expect(&ExprToken::Comma)?;
                     SetOperand::IfNotExists(path, Box::new(self.set_operand()?))
                 }
