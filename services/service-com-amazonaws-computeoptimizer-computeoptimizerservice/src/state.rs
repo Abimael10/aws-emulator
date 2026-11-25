@@ -75,6 +75,10 @@ mod lambda_inventory;
 // set of recommendation candidates, and the instance-type catalog they resolve against.
 mod preferred_resources;
 pub use preferred_resources::*;
+// How a utilization preference's threshold and headroom resolve into the capacity a
+// rightsizing-recommendation option has to carry.
+mod utilization_preferences;
+pub use utilization_preferences::*;
 pub use auto_scaling_groups::*;
 pub use rds_inventory::*;
 pub use ebs_inventory::*;

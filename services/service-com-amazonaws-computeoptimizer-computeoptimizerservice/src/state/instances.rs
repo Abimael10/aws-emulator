@@ -288,9 +288,10 @@ impl ObservedInstance {
     /// The options a reader of this instance's recommendation REPORTS, best first: the stored
     /// candidates the preferences in force admit
     /// ([`InstanceConfiguration::option_admitted`]) — the request's `cpuVendorArchitectures`
-    /// and the account's preferred-resource lists — kept in the order the analysis found them,
-    /// so an option's `rank` is its position among them ("the top recommendation option is
-    /// ranked as 1").
+    /// and the account's preferred-resource lists — and that CARRY the analysed workload under
+    /// the utilization preference in force ([`Self::carries_analysed_utilization`]), kept in
+    /// the order the analysis found them, so an option's `rank` is its position among them
+    /// ("the top recommendation option is ranked as 1").
     ///
     /// Selected here once for the same reason the admission rule itself is stated once
     /// ([`architecture_admitted`]): the reader of these recommendations, their export and the
@@ -304,7 +305,91 @@ impl ObservedInstance {
         self.candidates
             .iter()
             .filter(|candidate| candidate.option_admitted(preferences, requested_architectures))
+            .filter(|candidate| self.carries_analysed_utilization(candidate, preferences))
             .collect()
+    }
+
+    /// The analysed utilization a sizing decision reads for the `MetricName` `metric_name`, as
+    /// a percentage of what the instance runs today, or `None` for a metric the analysis
+    /// observed nothing of.
+    ///
+    /// The utilization preference in force names the percentile of the metric's distribution
+    /// the decision reads ([`EffectivePreferences::metric_threshold_percentile`]), which the
+    /// analysis holds as the peak the metric reached and its average over the look-back period
+    /// ([`utilization_at_percentile`]). An analysis that observed the metric under one
+    /// statistic only reads that observation at every percentile, since it recorded no spread
+    /// to read one from.
+    fn analysed_utilization(
+        &self,
+        metric_name: &str,
+        preferences: &EffectivePreferences,
+    ) -> Option<f64> {
+        let observed = |statistic: &str| {
+            self.utilization
+                .iter()
+                .find(|metric| metric.name == metric_name && metric.statistic == statistic)
+                .map(|metric| metric.value)
+        };
+        let peak = observed(METRIC_STATISTIC_MAXIMUM)?;
+        Some(utilization_at_percentile(
+            observed(METRIC_STATISTIC_AVERAGE).unwrap_or(peak),
+            peak,
+            preferences.metric_threshold_percentile(metric_name),
+        ))
+    }
+
+    /// The capacity a candidate instance type has to provide of the resource the `MetricName`
+    /// `metric_name` measures, or `None` for a metric the instance type does not size or the
+    /// analysis observed nothing of.
+    ///
+    /// The analysed utilization the preference in force reads ([`Self::analysed_utilization`])
+    /// is a percentage of the capacity the instance runs today, so what the workload used is
+    /// that share of it; the option has to carry that with the headroom the preference states
+    /// on top ([`EffectivePreferences::metric_headroom`]) — "the headroom value in percentage
+    /// used for the specified metric parameter".
+    pub fn required_capacity(
+        &self,
+        metric_name: &str,
+        preferences: &EffectivePreferences,
+    ) -> Option<f64> {
+        let utilization = self.analysed_utilization(metric_name, preferences)?;
+        let capacity = self.current.metric_capacity(metric_name)?;
+        let used = capacity * utilization / UTILIZATION_PERCENTAGE_CEILING;
+        Some(used * (1.0 + preferences.metric_headroom(metric_name)))
+    }
+
+    /// Whether `option` carries the workload the analysis observed on this instance, under the
+    /// utilization preference in force.
+    ///
+    /// `UtilizationPreference` is "the preference to control the resource's CPU utilization
+    /// threshold, CPU utilization headroom, and memory utilization headroom", so what the
+    /// preference controls is the capacity a rightsizing candidate has to provide: a candidate
+    /// has to provide the capacity the workload needs of EVERY resource the instance type
+    /// sizes ([`Self::required_capacity`]), because one dimension it could not carry would
+    /// make it an option the workload does not fit on. A candidate that provides less is
+    /// considered by no reader of the recommendation, which is how a preference asking for
+    /// more headroom leaves fewer — and smaller candidates leave first, since those are the
+    /// ones a headroom pushes out of reach.
+    pub fn carries_analysed_utilization(
+        &self,
+        option: &InstanceConfiguration,
+        preferences: &EffectivePreferences,
+    ) -> bool {
+        [METRIC_CPU, METRIC_MEMORY].into_iter().all(|metric_name| {
+            let required = self.required_capacity(metric_name, preferences);
+            let provided = option.metric_capacity(metric_name);
+            match (required, provided) {
+                // The capacity a candidate provides is compared with a figure a share and a
+                // headroom were multiplied into, so a candidate sized exactly at it is
+                // admitted whichever way the last bit of that arithmetic fell.
+                (Some(required), Some(provided)) => {
+                    required <= provided * (1.0 + SIZING_TOLERANCE)
+                }
+                // A metric the instance type does not size, or the analysis observed nothing
+                // of, states no capacity a candidate has to provide.
+                _ => true,
+            }
+        })
     }
 
     /// The metrics `InstanceRecommendation$utilizationMetrics` reports: every observation the

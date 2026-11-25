@@ -18,7 +18,9 @@
 //!   percentage of a resource the instance type sizes (its vCPUs, its memory) scales by the
 //!   ratio of the two types' capacities for THAT resource and cannot pass 100, and those two
 //!   are the only metrics this action reports a series for — an observation of the workload's
-//!   own traffic is projected by no option;
+//!   own traffic is projected by no option (a projection that would pass 100 is one of an
+//!   option the analysed peak overshoots, which only a utilization-threshold preference leaves
+//!   reachable, so the ceiling is asserted in `utilization_preference_option_sizing`);
 //! * `stat` selects which observed statistic is projected, and the CPU vendor architecture
 //!   preference selects which candidates are projected at all;
 //! * an instance the analysis would not move has no option, so there is nothing to project;
@@ -36,7 +38,9 @@ use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, call_in_region, emulator_with_engine, error_code, opt_in, ACCOUNT};
+use crate::harness::{
+    call, call_in_region, emulator_with_engine, error_code, make_analysis_due, opt_in, ACCOUNT,
+};
 
 /// The region the harness signs for, and so the regional endpoint every call below addresses
 /// unless it names another.
@@ -158,8 +162,12 @@ fn corpus() -> Vec<ObservedInstance> {
                 metric("Memory", "Maximum", 96.0),
             ],
         ),
-        // Far smaller: both projections would pass 100, which no utilization percentage can,
-        // while the workload's own packet rate is of neither resource the instance type sizes.
+        // Far smaller — a twenty-fourth of the capacity — so each percentage of a resource the
+        // instance type sizes is multiplied by that ratio, while the workload's own packet rate
+        // is of neither resource the instance type sizes. The idle workload still FITS on the
+        // candidate with the headroom the service's default utilization preference keeps, which
+        // is what makes the candidate an option at all
+        // (`ObservedInstance::carries_analysed_utilization`).
         instance(
             FAR_SMALLER,
             configuration("r5.12xlarge", 48.0, 384.0, 3.024, CPU_ARCHITECTURE_CURRENT),
@@ -171,8 +179,8 @@ fn corpus() -> Vec<ObservedInstance> {
                 CPU_ARCHITECTURE_CURRENT,
             )],
             vec![
-                metric("Cpu", "Maximum", 10.0),
-                metric("Memory", "Maximum", 5.0),
+                metric("Cpu", "Maximum", 3.0),
+                metric("Memory", "Maximum", 3.0),
                 metric("NETWORK_PACKETS_IN_PER_SECOND", "Maximum", 2_048.0),
             ],
         ),
@@ -254,19 +262,20 @@ fn analysed_instances(engine: &Arc<engine::InMemoryEngine>) -> usize {
         .len()
 }
 
-/// Opt the account in and let the analysis its enrollment starts come due — the gate every
-/// recommendation reader of this service applies. The span is the service's own
-/// ([`ANALYSIS_DELAY`]); the extra margin covers scheduler jitter.
-async fn analysed(router: &MultiServiceRouter) {
+/// Opt the account in and make the analysis its enrollment starts DUE — the gate every
+/// recommendation reader of this service applies. The stored enrollment instant is moved back
+/// a span ([`make_analysis_due`]) rather than waited out, so the condition holds however fast
+/// or loaded the host is.
+async fn analysed(router: &MultiServiceRouter, engine: &Arc<engine::InMemoryEngine>) {
     opt_in(router).await;
-    tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
+    make_analysis_due(engine);
 }
 
 /// An emulator whose account is opted in, whose analysis is due and which holds [`corpus`].
 async fn emulator_with_corpus() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let (router, engine) = emulator_with_engine();
     record(&engine, corpus());
-    analysed(&router).await;
+    analysed(&router, &engine).await;
     (router, engine)
 }
 
@@ -441,10 +450,10 @@ async fn the_series_spans_the_requested_window_at_the_requested_granularity() {
 type ProjectionRow<'a> = (&'a str, &'a str, &'a str, &'a str, Vec<(&'a str, f64)>);
 
 /// The projection rule: a metric measured as a percentage of a resource the instance type
-/// sizes scales by the ratio of the two types' capacities for THAT resource and cannot pass
-/// the percentage ceiling, and a metric measuring the workload's own traffic is projected
-/// unchanged. Each row differs along the direction and the size of the capacity change, and
-/// along which of the two resources changes at all.
+/// sizes scales by the ratio of the two types' capacities for THAT resource, and a metric
+/// measuring the workload's own traffic is projected unchanged. Each row differs along the
+/// direction and the size of the capacity change, and along which of the two resources changes
+/// at all.
 #[tokio::test]
 async fn each_metric_is_projected_onto_the_recommended_instance_type() {
     let (router, _engine) = emulator_with_corpus().await;
@@ -473,12 +482,12 @@ async fn each_metric_is_projected_onto_the_recommended_instance_type() {
             vec![("Cpu", 46.0), ("Memory", 24.0)],
         ),
         (
-            "a projection that would pass the ceiling stops at it",
+            "a far smaller type multiplies each percentage by the capacity ratio",
             FAR_SMALLER,
             "Maximum",
             "r5.large",
-            // 10% of 48 vCPUs is 240% of 2 of them, and 5% of 384 GiB is 120% of 16.
-            vec![("Cpu", 100.0), ("Memory", 100.0)],
+            // 3% of 48 vCPUs is 72% of 2 of them, and 3% of 384 GiB is 72% of 16.
+            vec![("Cpu", 72.0), ("Memory", 72.0)],
         ),
         (
             "the same capacity projects every percentage unchanged",
@@ -1015,7 +1024,7 @@ async fn the_read_waits_for_the_enrollment_and_the_analysis() {
 #[tokio::test]
 async fn the_analysed_instance_projects_every_candidate_it_records() {
     let (router, engine) = emulator_with_engine();
-    analysed(&router).await;
+    analysed(&router, &engine).await;
     let before = analysed_instances(&engine);
 
     // The instance the analysis would move to half its capacity, with a Graviton candidate

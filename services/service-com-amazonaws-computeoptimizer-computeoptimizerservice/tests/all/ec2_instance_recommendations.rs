@@ -20,6 +20,11 @@
 //! have and of which CPU architecture, and in whether they carry tags — never one recorded
 //! call. Every money figure and every projected percentage is recomputed here from the stored
 //! prices and capacities, so a response that is not derived from the store fails.
+//!
+//! The last suites here are about what the account's STORED preferences do to that answer: a
+//! `utilizationPreferences` preference states the percentile of the analysed utilization the
+//! sizing reads and the headroom it keeps above it, so it decides which candidate instance
+//! types carry the workload and are reported as options at all.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,7 +38,10 @@ use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, call_in_region, emulator_with_engine, error_code, opt_in, ACCOUNT};
+use crate::harness::{
+    call, call_in_region, emulator_with_engine, error_code, make_analysis_due, opt_in,
+    put_preference, ACCOUNT,
+};
 
 /// The region the harness signs for, and so the regional endpoint every call below addresses
 /// unless it names another.
@@ -1195,5 +1203,467 @@ async fn the_reported_preferences_are_the_account_s_stored_preferences() {
                 "case {case:?}: expected the same saving before and after discounts, got {option}"
             );
         }
+    }
+}
+
+// What the account's UTILIZATION preference does to the options this operation reports.
+//
+// The rule under test: `UtilizationPreference` is "the preference to control the resource's CPU
+// utilization threshold, CPU utilization headroom, and memory utilization headroom", and its
+// `metricParameters` are "the parameters to set when customizing the resource utilization
+// thresholds" — a `threshold` naming the percentile of the analysed utilization the sizing
+// reads ("you can only specify the threshold value for CPU utilization") and a `headroom`
+// giving "the headroom value in percentage used for the specified metric parameter". So the
+// capacity a rightsizing candidate has to provide is the analysed utilization at that
+// percentile plus that headroom, of EVERY resource the instance type sizes: a candidate that
+// provides less is an option of no answer, and a preference asking for more headroom — or
+// reading a higher percentile — therefore leaves fewer options. With nothing stored the
+// service's documented defaults are in force ("CPU utilization: `P99_5` for threshold,
+// `PERCENT_20` for headroom. Memory utilization: `PERCENT_20` for headroom").
+//
+// The rows below span both metrics' headroom values (`PERCENT_0` | `PERCENT_10` |
+// `PERCENT_20` | `PERCENT_30`), all three thresholds (`P90` | `P95` | `P99_5`), a preference
+// that writes the defaults out and no preference at all, over instances whose candidates sit
+// on either side of the capacity each case asks for; every expected option set is the
+// capacity arithmetic of the stored analysis, stated in the comment beside it.
+
+/// The ids of the analysed instances [`sizing_corpus`] records.
+const CPU_HEADROOM_BOUND: &str = "i-0c1b2c3d4e5f80010";
+const MEMORY_HEADROOM_BOUND: &str = "i-0c1b2c3d4e5f80011";
+const THRESHOLD_BOUND: &str = "i-0c1b2c3d4e5f80012";
+const OVERSHOT_PEAK: &str = "i-0c1b2c3d4e5f80013";
+
+/// The first data point the projections below ask for, in epoch seconds.
+const SIZING_WINDOW_START: i64 = 1_761_000_000;
+
+/// The analysis output the utilization-preference fixtures read. Every instance runs an
+/// `m5.2xlarge` (8 vCPUs, 32 GiB), so what each case varies is the utilization observed on it
+/// and the capacity the candidates offer:
+///
+/// * [`CPU_HEADROOM_BOUND`] peaks at 40% of its vCPUs (3.2 of them) and 30% of its memory
+///   (9.6 GiB), with no spread between the statistics, so every threshold reads the same
+///   figure and only the CPU headroom decides: `m5.xlarge` has the 4 vCPUs that carries 3.2 of
+///   them up to a headroom of 25%, while `m5.large`'s 2 vCPUs carry the workload at no
+///   headroom at all.
+/// * [`MEMORY_HEADROOM_BOUND`] peaks at 40% of its memory (12.8 GiB) and 20% of its vCPUs, so
+///   only the MEMORY headroom decides: `m5.xlarge`'s 16 GiB carry 12.8 up to a headroom of
+///   25%.
+/// * [`THRESHOLD_BOUND`] averages 20% of its vCPUs and peaks at 45%, so the percentile the
+///   threshold names decides what the sizing reads at all.
+/// * [`OVERSHOT_PEAK`] averages 4% of its vCPUs and peaks at 60%, so the only preference that
+///   leaves `m5.xlarge` an option is the lowest threshold with no headroom — and the PEAK
+///   projected onto that option passes the percentage ceiling.
+fn sizing_corpus() -> Vec<ObservedInstance> {
+    vec![
+        instance(
+            CPU_HEADROOM_BOUND,
+            m5_2xlarge(),
+            vec![m5_xlarge(), m5_large()],
+            vec![
+                metric("Cpu", MAXIMUM, 40.0),
+                metric("Cpu", AVERAGE, 40.0),
+                metric("Memory", MAXIMUM, 30.0),
+                metric("Memory", AVERAGE, 30.0),
+            ],
+            &[],
+            &[],
+            &[],
+        ),
+        instance(
+            MEMORY_HEADROOM_BOUND,
+            m5_2xlarge(),
+            vec![m5_xlarge()],
+            vec![
+                metric("Cpu", MAXIMUM, 20.0),
+                metric("Cpu", AVERAGE, 20.0),
+                metric("Memory", MAXIMUM, 40.0),
+                metric("Memory", AVERAGE, 40.0),
+            ],
+            &[],
+            &[],
+            &[],
+        ),
+        instance(
+            THRESHOLD_BOUND,
+            m5_2xlarge(),
+            vec![m5_xlarge()],
+            vec![
+                metric("Cpu", MAXIMUM, 45.0),
+                metric("Cpu", AVERAGE, 20.0),
+                metric("Memory", MAXIMUM, 20.0),
+                metric("Memory", AVERAGE, 20.0),
+            ],
+            &[],
+            &[],
+            &[],
+        ),
+        instance(
+            OVERSHOT_PEAK,
+            m5_2xlarge(),
+            vec![m5_xlarge()],
+            vec![
+                metric("Cpu", MAXIMUM, 60.0),
+                metric("Cpu", AVERAGE, 4.0),
+                metric("Memory", MAXIMUM, 20.0),
+                metric("Memory", AVERAGE, 20.0),
+            ],
+            &[],
+            &[],
+            &[],
+        ),
+    ]
+}
+
+/// An emulator whose account is opted in, whose analysis is DUE and which holds
+/// [`sizing_corpus`]. The stored enrollment instant is moved back a span rather than waited
+/// out, so nothing here depends on how fast the host runs.
+async fn emulator_with_sizing_corpus() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let (router, engine) = emulator_with_engine();
+    record(&engine, sizing_corpus());
+    opt_in(&router).await;
+    make_analysis_due(&engine);
+    (router, engine)
+}
+
+/// A `PutRecommendationPreferences` request storing `utilization_preferences` for the
+/// account's Amazon EC2 instances — the one resource type this preference may be set for
+/// ("you can only set CPU and memory utilization preferences for the Amazon EC2 instance
+/// resource type").
+fn utilization_preference(utilization_preferences: Value) -> Value {
+    json!({
+        "resourceType": "Ec2Instance",
+        "scope": {"name": "AccountId", "value": ACCOUNT},
+        "utilizationPreferences": utilization_preferences,
+    })
+}
+
+/// One stored utilization preference entry: the `CustomizableMetricName` and the
+/// `metricParameters` set for it.
+fn utilization_entry(metric_name: &str, threshold: Option<&str>, headroom: &str) -> Value {
+    let mut parameters = json!({"headroom": headroom});
+    if let Some(threshold) = threshold {
+        parameters["threshold"] = json!(threshold);
+    }
+    json!({"metricName": metric_name, "metricParameters": parameters})
+}
+
+/// The instance types the read reports as options of one instance's recommendation, in the
+/// order reported.
+fn reported_option_types(case: &str, body: &Value, instance_id: &str) -> Vec<String> {
+    let recommendation = recommendation_for(body, instance_id);
+    assert!(
+        !recommendation["recommendationOptions"].is_null(),
+        "case {case:?}: {instance_id} must carry an options list, got {recommendation}"
+    );
+    options(&recommendation)
+        .iter()
+        .map(|option| {
+            option["instanceType"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+/// The instance types `GetEC2RecommendationProjectedMetrics` projects for one instance, in the
+/// order reported, with the series each option carries.
+async fn projected_options(
+    router: &MultiServiceRouter,
+    case: &str,
+    instance_id: &str,
+) -> Vec<Value> {
+    let request = json!({
+        "instanceArn": instance_arn(instance_id),
+        "stat": MAXIMUM,
+        "period": 3_600,
+        "startTime": SIZING_WINDOW_START,
+        "endTime": SIZING_WINDOW_START + 3_600,
+    });
+    let (status, body) = call(router, "GetEC2RecommendationProjectedMetrics", request.clone()).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200 from {request}, got {status}: {body}"
+    );
+    body["recommendedOptionProjectedMetrics"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// One row of the sizing table: the case, the `utilizationPreferences` the account stores
+/// (`None` where it stores none, so the service's documented defaults are in force), and the
+/// option types expected per analysed instance.
+type SizingRow<'a> = (&'a str, Option<Value>, Vec<(&'a str, Vec<&'a str>)>);
+
+/// The utilization preference in force decides which candidates are options: a candidate is
+/// one only where it provides the analysed utilization the preference's threshold reads, plus
+/// the headroom it states, of every resource the instance type sizes.
+#[tokio::test]
+async fn the_utilization_preference_in_force_decides_which_candidates_are_options() {
+    // The three instance types the candidates are drawn from: 8 vCPUs and 32 GiB for the type
+    // every analysed instance runs, 4 and 16 for `m5.xlarge`, 2 and 8 for `m5.large`.
+    let rows: Vec<SizingRow> = vec![
+        (
+            "nothing stored, so the documented defaults are in force",
+            None,
+            vec![
+                // 3.2 vCPUs with 20% headroom asks for 3.84 of them, which only m5.xlarge has.
+                (CPU_HEADROOM_BOUND, vec!["m5.xlarge"]),
+                // 12.8 GiB with 20% headroom asks for 15.36, which m5.xlarge's 16 carry.
+                (MEMORY_HEADROOM_BOUND, vec!["m5.xlarge"]),
+                // P99_5 reads 44.75% of 8 vCPUs; 3.58 of them with 20% headroom asks for
+                // 4.296, which m5.xlarge's 4 do not carry.
+                (THRESHOLD_BOUND, Vec::new()),
+                // P99_5 reads 59.44%: 4.76 vCPUs with headroom asks for 5.71.
+                (OVERSHOT_PEAK, Vec::new()),
+            ],
+        ),
+        (
+            "the documented defaults written out",
+            Some(json!([
+                utilization_entry("CpuUtilization", Some("P99_5"), "PERCENT_20"),
+                utilization_entry("MemoryUtilization", None, "PERCENT_20"),
+            ])),
+            vec![
+                (CPU_HEADROOM_BOUND, vec!["m5.xlarge"]),
+                (MEMORY_HEADROOM_BOUND, vec!["m5.xlarge"]),
+                (THRESHOLD_BOUND, Vec::new()),
+                (OVERSHOT_PEAK, Vec::new()),
+            ],
+        ),
+        (
+            "no cpu headroom at all",
+            Some(json!([
+                utilization_entry("CpuUtilization", Some("P99_5"), "PERCENT_0"),
+                utilization_entry("MemoryUtilization", None, "PERCENT_20"),
+            ])),
+            vec![
+                (CPU_HEADROOM_BOUND, vec!["m5.xlarge"]),
+                (MEMORY_HEADROOM_BOUND, vec!["m5.xlarge"]),
+                // 3.58 vCPUs with no headroom is inside m5.xlarge's 4.
+                (THRESHOLD_BOUND, vec!["m5.xlarge"]),
+                // 4.76 vCPUs is not, whatever the headroom.
+                (OVERSHOT_PEAK, Vec::new()),
+            ],
+        ),
+        (
+            "the widest cpu headroom",
+            Some(json!([
+                utilization_entry("CpuUtilization", Some("P99_5"), "PERCENT_30"),
+                utilization_entry("MemoryUtilization", None, "PERCENT_20"),
+            ])),
+            vec![
+                // 3.2 vCPUs with 30% headroom asks for 4.16, which m5.xlarge's 4 do not carry.
+                (CPU_HEADROOM_BOUND, Vec::new()),
+                // 1.6 vCPUs with 30% headroom is 2.08, and the memory headroom is unchanged.
+                (MEMORY_HEADROOM_BOUND, vec!["m5.xlarge"]),
+                (THRESHOLD_BOUND, Vec::new()),
+                (OVERSHOT_PEAK, Vec::new()),
+            ],
+        ),
+        (
+            "the widest memory headroom, leaving the cpu parameters at their defaults",
+            Some(json!([utilization_entry(
+                "MemoryUtilization",
+                None,
+                "PERCENT_30"
+            )])),
+            vec![
+                // 9.6 GiB with 30% headroom is 12.48, inside m5.xlarge's 16.
+                (CPU_HEADROOM_BOUND, vec!["m5.xlarge"]),
+                // 12.8 GiB with 30% headroom asks for 16.64, which those 16 do not carry.
+                (MEMORY_HEADROOM_BOUND, Vec::new()),
+                (THRESHOLD_BOUND, Vec::new()),
+                (OVERSHOT_PEAK, Vec::new()),
+            ],
+        ),
+        (
+            "the lowest cpu threshold",
+            Some(json!([
+                utilization_entry("CpuUtilization", Some("P90"), "PERCENT_20"),
+                utilization_entry("MemoryUtilization", None, "PERCENT_20"),
+            ])),
+            vec![
+                (CPU_HEADROOM_BOUND, vec!["m5.xlarge"]),
+                (MEMORY_HEADROOM_BOUND, vec!["m5.xlarge"]),
+                // P90 reads 40% of 8 vCPUs: 3.2 of them with 20% headroom is 3.84.
+                (THRESHOLD_BOUND, vec!["m5.xlarge"]),
+                // P90 reads 48.8%: 3.9 vCPUs with 20% headroom asks for 4.68.
+                (OVERSHOT_PEAK, Vec::new()),
+            ],
+        ),
+        (
+            "the middle cpu threshold",
+            Some(json!([
+                utilization_entry("CpuUtilization", Some("P95"), "PERCENT_20"),
+                utilization_entry("MemoryUtilization", None, "PERCENT_20"),
+            ])),
+            vec![
+                (CPU_HEADROOM_BOUND, vec!["m5.xlarge"]),
+                (MEMORY_HEADROOM_BOUND, vec!["m5.xlarge"]),
+                // P95 reads 42.5% of 8 vCPUs: 3.4 of them with headroom asks for 4.08.
+                (THRESHOLD_BOUND, Vec::new()),
+                (OVERSHOT_PEAK, Vec::new()),
+            ],
+        ),
+        (
+            "the lowest cpu threshold with no headroom and the narrowest memory headroom",
+            Some(json!([
+                utilization_entry("CpuUtilization", Some("P90"), "PERCENT_0"),
+                utilization_entry("MemoryUtilization", None, "PERCENT_10"),
+            ])),
+            vec![
+                (CPU_HEADROOM_BOUND, vec!["m5.xlarge"]),
+                // 12.8 GiB with 10% headroom is 14.08, inside m5.xlarge's 16.
+                (MEMORY_HEADROOM_BOUND, vec!["m5.xlarge"]),
+                (THRESHOLD_BOUND, vec!["m5.xlarge"]),
+                // P90 reads 48.8% of 8 vCPUs: 3.9 of them with no headroom is inside 4.
+                (OVERSHOT_PEAK, vec!["m5.xlarge"]),
+            ],
+        ),
+    ];
+
+    for (case, preference, expected) in rows {
+        // A fresh emulator per row, so each row is read under exactly the preference it
+        // states.
+        let (router, _engine) = emulator_with_sizing_corpus().await;
+        if let Some(stored) = &preference {
+            put_preference(&router, &utilization_preference(stored.clone())).await;
+        }
+        let body = recommendations(&router, case, json!({})).await;
+        for (instance_id, wanted) in expected {
+            let reported = reported_option_types(case, &body, instance_id);
+            assert_eq!(
+                reported, wanted,
+                "case {case:?}: expected {instance_id} to report the options {wanted:?}, got \
+                 {reported:?}"
+            );
+            // The preference a recommendation says it was generated under is the one the
+            // options above were selected with, so a read cannot report a parameter it did not
+            // apply.
+            if let Some(stored) = &preference {
+                assert_eq!(
+                    recommendation_for(&body, instance_id)["effectiveRecommendationPreferences"]
+                        ["utilizationPreferences"],
+                    *stored,
+                    "case {case:?}: {instance_id} must report the stored utilization preference"
+                );
+            }
+        }
+    }
+}
+
+/// Every surface of ONE analysis reports the options the utilization preference leaves: the
+/// reader of the recommendation and the projection of an option's metrics apply the same
+/// sizing, so neither can report an option the other leaves out.
+#[tokio::test]
+async fn every_surface_reports_the_options_the_utilization_preference_leaves() {
+    // (case, the preference stored, the options expected per instance)
+    let rows: Vec<SizingRow> = vec![
+        (
+            "the lowest threshold with no headroom leaves every candidate the workload fits",
+            Some(json!([
+                utilization_entry("CpuUtilization", Some("P90"), "PERCENT_0"),
+                utilization_entry("MemoryUtilization", None, "PERCENT_10"),
+            ])),
+            vec![
+                (CPU_HEADROOM_BOUND, vec!["m5.xlarge"]),
+                (THRESHOLD_BOUND, vec!["m5.xlarge"]),
+                (OVERSHOT_PEAK, vec!["m5.xlarge"]),
+            ],
+        ),
+        (
+            "the widest headrooms leave some of them out",
+            Some(json!([
+                utilization_entry("CpuUtilization", Some("P99_5"), "PERCENT_30"),
+                utilization_entry("MemoryUtilization", None, "PERCENT_30"),
+            ])),
+            vec![
+                (CPU_HEADROOM_BOUND, Vec::new()),
+                (MEMORY_HEADROOM_BOUND, Vec::new()),
+                (THRESHOLD_BOUND, Vec::new()),
+            ],
+        ),
+    ];
+
+    for (case, preference, expected) in rows {
+        let (router, _engine) = emulator_with_sizing_corpus().await;
+        if let Some(stored) = &preference {
+            put_preference(&router, &utilization_preference(stored.clone())).await;
+        }
+        let body = recommendations(&router, case, json!({})).await;
+        for (instance_id, wanted) in expected {
+            let reported = reported_option_types(case, &body, instance_id);
+            assert_eq!(
+                reported, wanted,
+                "case {case:?}: expected the read of {instance_id} to report {wanted:?}, got \
+                 {reported:?}"
+            );
+            let projected: Vec<String> = projected_options(&router, case, instance_id)
+                .await
+                .iter()
+                .map(|option| {
+                    option["recommendedInstanceType"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect();
+            assert_eq!(
+                projected, wanted,
+                "case {case:?}: expected the projection of {instance_id} to report {wanted:?}, \
+                 got {projected:?}"
+            );
+        }
+    }
+}
+
+/// A projection onto an option the analysed PEAK overshoots stops at the percentage ceiling:
+/// the sizing reads the percentile the threshold names, so a lower threshold can leave an
+/// option the peak itself would not fit on — and a utilization percentage cannot pass 100.
+#[tokio::test]
+async fn a_projection_the_analysed_peak_overshoots_stops_at_the_ceiling() {
+    let (router, _engine) = emulator_with_sizing_corpus().await;
+    let case = "the peak overshoots the option the threshold admitted";
+    put_preference(
+        &router,
+        &utilization_preference(json!([
+            utilization_entry("CpuUtilization", Some("P90"), "PERCENT_0"),
+            utilization_entry("MemoryUtilization", None, "PERCENT_10"),
+        ])),
+    )
+    .await;
+
+    let options = projected_options(&router, case, OVERSHOT_PEAK).await;
+    let option = options
+        .first()
+        .unwrap_or_else(|| panic!("case {case:?}: expected one projected option, got {options:?}"));
+    // (the metric, the percentage projected onto 4 of the 8 vCPUs and 16 of the 32 GiB)
+    for (metric_name, wanted) in [
+        // A 60% peak of 8 vCPUs is 120% of 4 of them, which stops at the ceiling.
+        ("Cpu", 100.0),
+        // A 20% peak of 32 GiB is 40% of 16.
+        ("Memory", 40.0),
+    ] {
+        let series = option["projectedMetrics"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .find(|metric| metric["name"] == json!(metric_name))
+            .unwrap_or_else(|| panic!("case {case:?}: a {metric_name} series, got {option}"));
+        let values: Vec<f64> = series["values"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|value| value.as_f64().unwrap_or_default())
+            .collect();
+        assert!(
+            !values.is_empty() && values.iter().all(|value| (value - wanted).abs() < 1e-6),
+            "case {case:?}: expected {metric_name} projected at {wanted} everywhere, got \
+             {values:?}"
+        );
     }
 }
