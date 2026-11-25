@@ -331,16 +331,20 @@ async fn answer(
     if let Some(refused) = refused_before_dispatch(&parts, &context.remote_origins) {
         return refused;
     }
-    // One permit per request IN FLIGHT, taken before a byte of the body is read: a request
-    // that finds none is shed, which is what the core's own HTTP listener answers such a
-    // request with.
-    let Ok(permit) = Arc::clone(&in_flight).try_acquire_owned() else {
-        return error_response(503, "ServiceUnavailableException", SERVER_BUSY);
-    };
     let limited = Limited::new(body, body_ceiling());
     let served = ::tokio::time::timeout(request_deadline(), async move {
-        // Held for the whole read and the execution, and released with them.
-        let _permit: OwnedSemaphorePermit = permit;
+        // One permit per request IN FLIGHT, which is what bounds the memory the bodies on this
+        // endpoint hold. The permit is WAITED for rather than demanded: an AppSync API serves
+        // the requests a client makes at the same time rather than refusing one because
+        // another is still in flight, so a request that finds every permit taken takes its
+        // turn — under this request's own deadline, so the wait is bounded and a client that
+        // never gets one is answered rather than held. Held for the whole read and the
+        // execution, and released with them.
+        let Ok(_permit): Result<OwnedSemaphorePermit, _> =
+            Arc::clone(&in_flight).acquire_owned().await
+        else {
+            return error_response(503, "ServiceUnavailableException", SERVER_BUSY);
+        };
         let Ok(collected) = limited.collect().await else {
             return error_response(413, BAD_REQUEST_ERROR_TYPE, BODY_TOO_LARGE);
         };

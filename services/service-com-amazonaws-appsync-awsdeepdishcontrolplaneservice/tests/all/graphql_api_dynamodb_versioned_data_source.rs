@@ -680,14 +680,79 @@ async fn a_delta_sync_answers_the_rows_changed_after_the_moment_it_is_given() {
     );
 }
 
+/// Each refusal is read from the row as it stands WHEN that refusal is made, so a caller that
+/// retries a stale write after the row has moved on again is told what it has moved on to.
+///
+/// The rule the cases above assert over one refusal, asserted here over a SEQUENCE of them: the
+/// row the conflict carries is not the row of the first refusal, nor a value the endpoint kept
+/// from it, but the one the table holds at that moment.
+#[tokio::test]
+async fn every_refusal_carries_the_row_as_it_stands_when_it_is_made() {
+    let suite = setup("live-refusals").await;
+    let case = "a stale write refused twice, with an accepted write in between";
+    let id = "post-live-refusal";
+    seeded(&suite, case, id).await;
+
+    let stale = format!(
+        "mutation M($id: ID!, $title: String!, $v: Int!) \
+         {{ updatePost(id: $id, title: $title, expectedVersion: $v) {SELECTION} }}"
+    );
+    // The row stands at version 2 under `v2`, and every one of these writes states version 1 —
+    // a version the row has moved past — while the accepted writes between them move it on. So
+    // each refusal has its own answer to carry, and a refusal carrying the row of an earlier
+    // one is visible.
+    let mut expected: Vec<(i64, String)> = Vec::new();
+    for (title, version) in [("v3", 2), ("v4", 3)] {
+        let refused = posted(
+            &suite.api,
+            case,
+            &stale,
+            json!({"id": id, "title": "stale", "v": 1}),
+        )
+        .await;
+        let reported = errors(&refused);
+        assert_eq!(
+            reported.len(),
+            1,
+            "case {case:?}: expected exactly one field error, got {refused}"
+        );
+        let carried = &reported[0]["data"];
+        expected.push((
+            carried["_version"].as_i64().unwrap_or_default(),
+            carried["title"].as_str().unwrap_or_default().to_string(),
+        ));
+
+        // The accepted write that moves the row on, stating the version it stands at.
+        let moved = posted(
+            &suite.api,
+            case,
+            &stale,
+            json!({"id": id, "title": title, "v": version}),
+        )
+        .await;
+        assert_eq!(
+            (
+                errors(&moved),
+                moved["data"]["updatePost"]["_version"].as_i64()
+            ),
+            (Vec::<Value>::new(), Some(version + 1)),
+            "case {case:?}: the write between the refusals is applied, got {moved}"
+        );
+    }
+    assert_eq!(
+        expected,
+        vec![(2, "v2".to_string()), (3, "v3".to_string())],
+        "case {case:?}: expected each refusal to carry the row as it stood when it was made"
+    );
+}
+
 /// The ids the page `answered` carries, in NAME order.
 ///
 /// A delta sync reads the table, and a table read reports no order of its own, so what a case
 /// asserts is WHICH rows a page carries: the ids are ordered here so the expectation does not
 /// rest on an order no rule gives.
 fn ids(answered: &Value) -> Vec<String> {
-    let mut carried: Vec<String> = answered["items"]
-        .as_array()
+    let mut carried: Vec<String> = answered["items"]        .as_array()
         .map(|items| {
             items
                 .iter()
