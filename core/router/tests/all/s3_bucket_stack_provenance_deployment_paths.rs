@@ -52,7 +52,7 @@ use service_com_amazonaws_cloudformation_cloudformation::state::{execution_statu
 use super::cloudformation_stamps_s3vectors_stack_provenance::{
     expected_resource_tags, tag_members, LOGICAL_ID_TAG, STACK_ID_TAG, STACK_NAME_TAG,
 };
-use super::query_wire::{elements, form_encode, opt_element, physical_ids_of, xml_escape};
+use super::query_wire::{form_encode, opt_element, physical_ids_of, tag_set_of, xml_escape};
 
 /// The change set name every row that deploys through one uses.
 const CHANGE_SET: &str = "s3-bucket-provenance-plan";
@@ -243,31 +243,6 @@ async fn delete_bucket_tagging(
     bucket: &str,
 ) -> (u16, String) {
     s3(router, region, "DELETE", &format!("/{bucket}?tagging"), "").await
-}
-
-/// The tag set a `GetBucketTagging` body reports, as the key-to-value map a client reads it
-/// as.
-///
-/// Each pair is read from the `<Tag>` that carries BOTH halves, rather than by zipping two
-/// document-ordered lists, so a member that ever omitted one half misaligns nothing.
-fn tag_set_of(xml: &str) -> BTreeMap<String, String> {
-    let mut held: BTreeMap<String, String> = BTreeMap::new();
-    let mut rest = xml;
-    while let Some(start) = rest.find("<Tag>") {
-        let after = &rest[start + "<Tag>".len()..];
-        let Some(end) = after.find("</Tag>") else {
-            break;
-        };
-        let tag = &after[..end];
-        if let (Some(key), Some(value)) = (
-            elements(tag, "Key").into_iter().next(),
-            elements(tag, "Value").into_iter().next(),
-        ) {
-            held.insert(key, value);
-        }
-        rest = &after[end + "</Tag>".len()..];
-    }
-    held
 }
 
 /// The `Code` and `Message` of an Amazon S3 error body, as a client reads them.

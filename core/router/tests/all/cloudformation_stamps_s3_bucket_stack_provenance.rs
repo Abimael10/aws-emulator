@@ -36,7 +36,7 @@ use bytes::Bytes;
 use serde_json::json;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::query_wire::{elements, form_encode, opt_element, physical_ids_of};
+use super::query_wire::{form_encode, opt_element, physical_ids_of, tag_set_of};
 
 /// The Region every request here is signed for, and so the Region the stack's buckets
 /// belong to.
@@ -124,16 +124,6 @@ async fn get_bucket_tagging(router: &MultiServiceRouter, bucket: &str) -> (u16, 
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
     (status, String::from_utf8_lossy(response.body()).into_owned())
-}
-
-/// The tag set a `GetBucketTagging` body reports, as the key-to-value map a client reads it
-/// as. Each `<Tag>` carries exactly one `<Key>` and one `<Value>`, so the two document-ordered
-/// lists pair up.
-fn tag_set_of(xml: &str) -> BTreeMap<String, String> {
-    elements(xml, "Key")
-        .into_iter()
-        .zip(elements(xml, "Value"))
-        .collect()
 }
 
 /// One bucket a row declares: its logical id in the template and the `Tags` that declaration

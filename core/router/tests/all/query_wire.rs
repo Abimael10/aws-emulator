@@ -297,6 +297,26 @@ pub(crate) fn physical_ids_of(xml: &str) -> BTreeMap<String, String> {
     pairs_of(xml, "LogicalResourceId", "PhysicalResourceId")
 }
 
+/// An Amazon S3 answer's `TagSet`, as the key-to-value map a client reads it as: every `<Tag>`
+/// the document carries, each paired from the halves that ONE tag states.
+///
+/// Here, once, for the reason this module exists: several suites read a bucket's tag set out of
+/// a `GetBucketTagging` answer, and one that writes its own scan drifts from the others. Each
+/// pair is read from the `<Tag>` carrying BOTH halves rather than by zipping two
+/// document-ordered lists, for the reason [`pairs_of`] records: a tag that ever omitted one half
+/// would silently misalign every pair after it, so a suite would compare the wrong pair instead
+/// of failing. A tag carrying only one half contributes nothing.
+pub(crate) fn tag_set_of(xml: &str) -> BTreeMap<String, String> {
+    blocks_of(xml, "Tag")
+        .into_iter()
+        .filter_map(|tag| {
+            let key = elements(tag, "Key").into_iter().next()?;
+            let value = elements(tag, "Value").into_iter().next()?;
+            Some((key, value))
+        })
+        .collect()
+}
+
 /// Whether the IPv4 block `block` (`a.b.c.d/len`) holds the IPv4 address `address`.
 ///
 /// Here, ONCE, for the reason this module exists: several suites judge an address a service
