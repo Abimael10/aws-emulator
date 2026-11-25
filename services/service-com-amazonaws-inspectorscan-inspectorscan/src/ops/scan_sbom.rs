@@ -208,34 +208,48 @@ const CYCLONEDX_COMPONENT_TYPES: &[&str] = &[
     "data",
 ];
 
+/// How a CVSS vector states the specification version it is written in: the
+/// version follows this literal and is terminated by [`CVSS_VECTOR_SEPARATOR`],
+/// per the CVSS specification's own vector-string grammar.
+const CVSS_VECTOR_PREFIX: &str = "CVSS:";
+
+/// The character separating a CVSS vector string's fields, and so the one
+/// terminating the version its prefix states.
+const CVSS_VECTOR_SEPARATOR: char = '/';
+
+/// The CVSS notations a vector's version prefix can state: each specification
+/// version as the vector spells it, paired with the method value the CycloneDX
+/// 1.5 schema enumerates for that version.
+///
+/// ONE table, read by both report forms through [`cvss_notation`], so a notation
+/// added here reaches the CycloneDX `ratings[].method` and the Inspector-native
+/// `version` together instead of one form rating a vector the other drops.
+const CVSS_NOTATIONS: &[(&str, &str)] = &[("4.0", "CVSSv4"), ("3.1", "CVSSv31"), ("3.0", "CVSSv3")];
+
+/// The notation a CVSS vector is written in — its specification version and the
+/// CycloneDX method spelling of that version — or `None` when the vector states
+/// no version this recognises.
+fn cvss_notation(vector: &str) -> Option<(&'static str, &'static str)> {
+    let stated = vector.strip_prefix(CVSS_VECTOR_PREFIX)?;
+    CVSS_NOTATIONS.iter().copied().find(|(version, _)| {
+        stated
+            .strip_prefix(version)
+            .is_some_and(|rest| rest.starts_with(CVSS_VECTOR_SEPARATOR))
+    })
+}
+
 /// The CycloneDX `vulnerability.ratings[].method` for a CVSS vector, read from
 /// the vector's own version prefix. The returned values are the method values
 /// the CycloneDX 1.5 schema enumerates; a vector in a notation this does not
 /// recognise is reported as `other` rather than mislabelled.
 fn cvss_method(vector: &str) -> &'static str {
-    if vector.starts_with("CVSS:4.0/") {
-        "CVSSv4"
-    } else if vector.starts_with("CVSS:3.1/") {
-        "CVSSv31"
-    } else if vector.starts_with("CVSS:3.0/") {
-        "CVSSv3"
-    } else {
-        "other"
-    }
+    cvss_notation(vector).map_or("other", |(_, method)| method)
 }
 
 /// The CVSS specification version a vector is written in, or `None` when the
 /// vector names none.
 fn cvss_version(vector: &str) -> Option<&'static str> {
-    if vector.starts_with("CVSS:4.0/") {
-        Some("4.0")
-    } else if vector.starts_with("CVSS:3.1/") {
-        Some("3.1")
-    } else if vector.starts_with("CVSS:3.0/") {
-        Some("3.0")
-    } else {
-        None
-    }
+    cvss_notation(vector).map(|(version, _)| version)
 }
 
 /// The namespace Amazon Inspector uses for the CycloneDX `properties` it adds to
