@@ -14,13 +14,27 @@ use std::time::{Duration, Instant};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    ApprovalConfiguration, AutoDetection, CustomMetadataSchemaConfiguration,
-    Descriptors, DiscoveryConfiguration, EncryptionConfiguration, Provenance,
+    ApprovalConfiguration, AutoDetection, AutoDetectionConfiguration,
+    CustomMetadataSchemaConfiguration, Descriptors, DiscoveryConfiguration,
+    EncryptionConfiguration, Provenance,
 };
 
 mod custom_metadata;
 mod descriptor_payload;
 mod mcp_server_schema;
+mod patch;
+mod schema_evolution;
+
+/// Applying the PATCH wrappers an update operation of this service takes: a leaf wrapper
+/// over an optional field, and a wrapper over a structure whose members are each
+/// independently patchable. See [`patch`].
+pub use patch::{patch_optional, patch_structure};
+
+/// The refusal message for a custom-metadata schema configuration that would WITHDRAW
+/// something the registry's current one declares — a field, an allowed value of a field, or
+/// a field's declared type — or `None` where the replacement keeps all three. See
+/// [`schema_evolution`].
+pub use schema_evolution::refusal as custom_metadata_schema_evolution_refusal;
 
 /// The refusal message for a descriptor payload that is not the content a descriptor carries
 /// — one that is not the JSON the content is serialized as, or one that is JSON no supported
@@ -183,6 +197,8 @@ pub const DEFAULT_PAGE_SIZE: usize = 100;
 pub const REGISTRY_CREATING: &str = "CREATING";
 /// `RegistryStatus` of a usable registry.
 pub const REGISTRY_READY: &str = "READY";
+/// `RegistryStatus` while `UpdateRegistry`'s asynchronous update is in flight.
+pub const REGISTRY_UPDATING: &str = "UPDATING";
 /// `RegistryStatus` while `DeleteRegistry`'s asynchronous deletion is in flight.
 pub const REGISTRY_DELETING: &str = "DELETING";
 
@@ -409,6 +425,34 @@ pub fn effective_approval_configuration(
         configuration.auto_approval_rules = Some(Vec::new());
     }
     configuration
+}
+
+/// The `AutoDetectionStatus` of a registry whose auto-detection is running, from the
+/// catalogue `crate::ops::types::AUTO_DETECTION_STATUS_VALUES`.
+pub const AUTO_DETECTION_ACTIVE: &str = "ACTIVE";
+
+/// The `AutoDetectionStatus` of a registry whose auto-detection is not running, from the
+/// same catalogue as [`AUTO_DETECTION_ACTIVE`].
+pub const AUTO_DETECTION_INACTIVE: &str = "INACTIVE";
+
+/// The `AutoDetection` a registry carries once a request configures auto-detection on it:
+/// "the requested configuration and the current detection status".
+///
+/// `enabled` is "whether auto-detection is requested for the registry", and the status is
+/// `ACTIVE` when "the registry is actively being populated with detected resources" — so a
+/// configuration that asks for detection is reported ACTIVE and one that does not is
+/// INACTIVE. The ONE place this is derived, so a registry's create and its update report the
+/// same status for the same configuration.
+pub fn auto_detection_for(configuration: AutoDetectionConfiguration) -> AutoDetection {
+    AutoDetection {
+        status: if configuration.enabled {
+            AUTO_DETECTION_ACTIVE.to_string()
+        } else {
+            AUTO_DETECTION_INACTIVE.to_string()
+        },
+        configuration,
+        status_reason: None,
+    }
 }
 
 /// The one `AutoApprovalRule` the model declares — the catalogue it comes from is

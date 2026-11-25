@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRegistry
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRegistry`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRegistry::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: patches the stored registry — every member the operation declares follows
+//! PATCH semantics — and answers the registry as the accepted update leaves it. The update
+//! is asynchronous, so the registry is stored `UPDATING` with the clock owing it `READY`.
 //!
 //! ## Shape of an operation
 //!
@@ -124,6 +118,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+// The PATCH wrappers' two kinds, applied the one way every update operation of this service
+// applies them.
+use crate::state::patch_optional;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -199,18 +196,198 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRegistry` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRegistryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRegistry"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateRegistryErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the agent registry store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // The label accepts the registry's ARN or its bare id.
+        let registry_id = crate::state::identifier_to_id(&input.registry_id).to_string();
+
+        let mut state = state.lock();
+        state.materialise_due_transitions();
+
+        let Some(registry) = state.registries.get(&registry_id) else {
+            // The identifier is stated back exactly as the request supplied it — the
+            // model's `RegistryIdentifier` accepts either the ARN or the bare id, and the
+            // one that resolved to nothing is the one the caller sent.
+            return Err(UpdateRegistryErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::registry_not_found_message(
+                        &input.registry_id,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The custom metadata schema configuration "replaces the current one. You can add
+        // fields and allowed values, but you can't remove a field or an allowed value, or
+        // change a field's type" — so a replacement that withdraws any of the three is
+        // refused before the registry is written, rather than stored and then applied to
+        // records it would no longer admit. The comparison is the state module's, and it is
+        // bounded by the schemas' own modelled length and the registry's ten overrides, so
+        // unlike the schema EVALUATION (which compiles a schema and applies it to a
+        // document) it costs no more than reading the two configurations.
+        if let Some(wanted) = input.custom_metadata_schema_configuration.as_ref() {
+            if let Some(message) = crate::state::custom_metadata_schema_evolution_refusal(
+                registry.custom_metadata_schema_configuration.as_ref(),
+                wanted.optional_value.as_ref(),
+            ) {
+                return Err(UpdateRegistryErrorModeled::ValidationException(
+                    ValidationException {
+                        message,
+                        reason: crate::state::FIELD_VALIDATION_FAILED.to_string(),
+                        field_list: None,
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A registry is usable once it reaches READY, so one that is still being created or
+        // is being deleted has no settled configuration for a patch to apply to, and one
+        // whose previous update is still being processed is already carrying out a change —
+        // the same rule every other write of this service holds itself to.
+        if registry.status != crate::state::REGISTRY_READY {
+            return Err(UpdateRegistryErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "registry {registry_id} is in status {}; it can be updated once it is {}",
+                    registry.status,
+                    crate::state::REGISTRY_READY
+                )),
+            })
+            .into());
+        }
+
+        // A registry's name identifies it within the account, so a rename onto a name
+        // another live registry already holds is refused with the same sentence a create of
+        // a duplicate name is. Renaming a registry to the name it already has is not a
+        // duplicate: it is the same registry.
+        let renamed_to = input.name.clone().filter(|name| name != &registry.name);
+        if let Some(name) = renamed_to.as_deref() {
+            if state.registry_name_index.contains_key(name) {
+                return Err(UpdateRegistryErrorModeled::ConflictException(ConflictException {
+                    message: Some(crate::state::duplicate_registry_name_message(name)),
+                })
+                .into());
+            }
+        }
+
+        // Read off the registry before the store is written to, since the write below takes
+        // it again: the name index is keyed by name, so a rename has to drop the entry the
+        // registry is listed under now.
+        let previous_name = registry.name.clone();
+
+        let updated_at = crate::state::now();
+        // "Updates are applied asynchronously and the registry transitions to the UPDATING
+        // status while they are processed": the registry carries UPDATING until the clock
+        // owes it READY again. Nothing sleeps for it.
+        let pending = crate::state::DueTransition::after_async_span(
+            crate::state::RegistryTransition::Ready,
+        );
+        state.arm_transition(pending.due_at);
+
+        if let Some(name) = renamed_to {
+            state.registry_name_index.remove(&previous_name);
+            state
+                .registry_name_index
+                .insert(name, registry_id.clone());
+        }
+
+        let Some(registry) = state.registries.get_mut(&registry_id) else {
+            return Err(UpdateRegistryErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(format!(
+                        "registry {registry_id} disappeared while it was being updated"
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // PATCH semantics, for every member the operation declares: an omitted member
+        // leaves the stored value alone, a member carrying a value replaces it, and a patch
+        // wrapper supplied empty unsets the optional field it wraps.
+        if let Some(name) = input.name {
+            registry.name = name;
+        }
+        patch_optional(
+            &mut registry.description,
+            input.description.map(|wrapper| wrapper.optional_value),
+        );
+        // A registry HAS a discovery and an approval configuration whether or not a request
+        // named one, so what a patch of either leaves behind is the EFFECTIVE configuration
+        // — the patched values with the service's own defaults filled in for what is not
+        // set — exactly as a create stores it.
+        if let Some(patch) = input.discovery_configuration {
+            let mut configuration = registry.discovery_configuration.take().unwrap_or_default();
+            // `UpdatedDiscoveryConfiguration` patches the authorizer configuration alone:
+            // the authorizer TYPE is not one of its members, so an update cannot change it.
+            patch_optional(
+                &mut configuration.authorizer_configuration,
+                patch
+                    .authorizer_configuration
+                    .map(|wrapper| wrapper.optional_value),
+            );
+            registry.discovery_configuration = Some(
+                crate::state::effective_discovery_configuration(Some(configuration)),
+            );
+        }
+        if let Some(wrapper) = input.approval_configuration {
+            // The approval configuration a wrapper carries REPLACES the stored one, and a
+            // wrapper supplied empty leaves the registry with the workflow that has no rule
+            // in it — the one that sends every submission to manual review. The change
+            // "applies only to records that move to PENDING_APPROVAL after the update":
+            // nothing of a record is touched here, and it is each submission that reads the
+            // configuration as it stands when the record is submitted.
+            registry.approval_configuration = Some(
+                crate::state::effective_approval_configuration(wrapper.optional_value),
+            );
+        }
+        patch_optional(
+            &mut registry.custom_metadata_schema_configuration,
+            input
+                .custom_metadata_schema_configuration
+                .map(|wrapper| wrapper.optional_value),
+        );
+        if let Some(wrapper) = input.auto_detection_configuration {
+            // `AutoDetection` reports the configuration the caller asked for together with
+            // whether it is running, derived the one way a create derives it; a wrapper
+            // supplied empty leaves the registry with no auto-detection at all, which is
+            // how a registry whose records are managed through this API alone reads.
+            registry.auto_detection = wrapper
+                .optional_value
+                .map(crate::state::auto_detection_for);
+        }
+
+        registry.status = crate::state::REGISTRY_UPDATING.to_string();
+        // The reason described the status the registry has just left, and nothing is
+        // claimed about this one that the update did not decide.
+        registry.status_reason = None;
+        registry.updated_at = updated_at;
+        registry.pending = Some(pending);
+
+        Ok(UpdateRegistryOutput {
+            name: registry.name.clone(),
+            description: registry.description.clone(),
+            registry_id: registry.registry_id.clone(),
+            registry_arn: registry.registry_arn.clone(),
+            discovery_configuration: registry.discovery_configuration.clone(),
+            encryption_configuration: registry.encryption_configuration.clone(),
+            approval_configuration: registry.approval_configuration.clone(),
+            custom_metadata_schema_configuration: registry
+                .custom_metadata_schema_configuration
+                .clone(),
+            status: registry.status.clone(),
+            status_reason: registry.status_reason.clone(),
+            auto_detection: registry.auto_detection.clone(),
+            created_at: registry.created_at,
+            updated_at: registry.updated_at,
+        })
     }
 }

@@ -139,6 +139,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+// The PATCH wrappers' two kinds, applied the one way every update operation of this service
+// applies them.
+use crate::state::{patch_optional, patch_structure};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -570,36 +573,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &verdict,
             ),
         })
-    }
-}
-
-/// Apply a LEAF patch wrapper to the optional field it patches, which is what the model's
-/// "Omit to leave the field unchanged; provide an empty wrapper to unset it" means: no
-/// wrapper at all (`None`) leaves the stored value, a wrapper carrying a value replaces
-/// it, and a wrapper carrying none unsets it.
-fn patch_optional<T>(field: &mut Option<T>, wrapper: Option<Option<T>>) {
-    if let Some(value) = wrapper {
-        *field = value;
-    }
-}
-
-/// Apply a STRUCTURE patch wrapper: a wrapper carrying no value clears the structure
-/// ("supply an empty object to clear them"), and one carrying a per-field patch applies
-/// `apply` to the stored structure — materialising it first when the record holds none,
-/// so a patch can fill a structure that was never set.
-fn patch_structure<T: Default, P>(
-    field: &mut Option<T>,
-    wrapper: Option<Option<P>>,
-    apply: impl FnOnce(&mut T, P),
-) {
-    match wrapper {
-        None => {}
-        Some(None) => *field = None,
-        Some(Some(patch)) => {
-            let mut current = field.take().unwrap_or_default();
-            apply(&mut current, patch);
-            *field = Some(current);
-        }
     }
 }
 

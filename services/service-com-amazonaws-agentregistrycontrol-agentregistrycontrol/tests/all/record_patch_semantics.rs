@@ -1,22 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end tests for `UpdateRegistryRecord`, driven over HTTP through the real router
-//! so every assertion goes through routing, deserialization, the handler and
-//! serialization.
+//! End-to-end tests for this service's two update operations — `UpdateRegistryRecord` and
+//! `UpdateRegistry` — driven over HTTP through the real router so every assertion goes
+//! through routing, deserialization, the handler and serialization.
 //!
-//! The rule under test: an update is a PATCH of the STORED record — "Fields that use
-//! update wrappers follow PATCH semantics: omit the field to leave it unchanged", a
-//! wrapper carrying a value replaces the stored value and a wrapper supplied empty unsets
-//! the field it wraps — and the update is asynchronous, so the record carries `UPDATING`
+//! The rule under test: an update is a PATCH of the STORED resource — "specify only the
+//! fields you want to change, and omit the rest to leave them unchanged", a wrapper
+//! carrying a value replaces the stored value and a wrapper supplied empty unsets the
+//! field it wraps — and the update is asynchronous, so the resource carries `UPDATING`
 //! while it is processed and then settles. What was written is what every later read
-//! reports, through `GetRegistryRecord` and through the `ListRegistryRecords` summary
-//! alike, since both project the one stored record.
+//! reports, since every read path projects the one stored resource.
 //!
 //! Every test asserts over a TABLE of inputs, so it holds for a class of requests rather
 //! than for one recorded shape: the rows span which member is patched, whether it is set
-//! or unset, how deep in the descriptor tree it sits, the type of the value (string,
-//! document, nested structure), the number of members patched at once, and the status the
-//! record is in when the edit arrives.
+//! or unset, how deep in the wrapper tree it sits, the type of the value (string,
+//! document, nested structure, list), the number of members patched at once, and the status
+//! the resource is in when the edit arrives.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -1361,5 +1360,862 @@ async fn an_edit_of_a_record_is_held_to_its_registry_being_ready() {
                 read_back.body
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// `UpdateRegistry`: the same PATCH rule, applied to the registry itself.
+// ---------------------------------------------------------------------------------------
+
+/// Read a registry: `GET /registries/{registryId}`.
+async fn get_registry(router: &MultiServiceRouter, registry: &str) -> Reply {
+    call(
+        router,
+        "GET",
+        &format!("/registries/{}", encode_label(registry)),
+        None,
+    )
+    .await
+}
+
+/// Patch a registry: `PATCH /registries/{registryId}`.
+async fn update_registry(router: &MultiServiceRouter, registry: &str, body: Value) -> Reply {
+    call(
+        router,
+        "PATCH",
+        &format!("/registries/{}", encode_label(registry)),
+        Some(body),
+    )
+    .await
+}
+
+/// Look at a registry until it reports `wanted`, or give up at the deadline. The wait is on
+/// the CONDITION — a transition the clock owes — never on a fixed span.
+async fn registry_reaching(
+    router: &MultiServiceRouter,
+    case: &str,
+    registry: &str,
+    wanted: &str,
+) -> Reply {
+    let started = std::time::Instant::now();
+    loop {
+        let reply = get_registry(router, registry).await;
+        if reply.str_field("status") == wanted {
+            return reply;
+        }
+        assert!(
+            started.elapsed() < TRANSITION_DEADLINE,
+            "case {case:?}: the registry never reached {wanted}, last answer {} {:?}",
+            reply.status,
+            reply.body
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// A custom JWT authorizer configuration, the one member `AuthorizerConfiguration` declares
+/// (`smithy_query(query="shape", shape="AuthorizerConfiguration")`). `audience` is what
+/// makes one configuration distinguishable from another across a patch.
+fn jwt_authorizer(audience: &str) -> Value {
+    json!({
+        "customJWTAuthorizer": {
+            "discoveryUrl": "https://idp.example.test/.well-known/openid-configuration",
+            "allowedAudience": [audience]
+        }
+    })
+}
+
+/// A `CustomMetadataSchemaDefinition`: the JSON Schema a registry declares its custom
+/// metadata fields in, over the `properties` given.
+fn schema_definition(properties: Value) -> String {
+    json!({ "type": "object", "properties": properties }).to_string()
+}
+
+/// The fields the registries in these tests declare for every record type: a typed field, a
+/// field with an enumerated set of allowed values, and an object field with a field of its
+/// own, so a NESTED declaration is covered as well as a top-level one.
+fn declared_properties() -> Value {
+    json!({
+        "owner": { "type": "string" },
+        "tier": { "enum": ["gold", "silver"] },
+        "contact": { "type": "object", "properties": { "email": { "type": "string" } } }
+    })
+}
+
+/// A `CustomMetadataSchemaConfiguration` over the fields every record type is held to and
+/// the per-record-type schemas.
+fn schema_configuration(properties: Value, overrides: Value) -> Value {
+    json!({
+        "defaultSchema": schema_definition(properties),
+        "recordTypeSchemaOverrides": overrides
+    })
+}
+
+/// The per-record-type schemas of the registries in these tests: one for `CUSTOM`, a record
+/// type of the model's own catalogue (`smithy_query(query="shape", shape="RecordType")`).
+fn declared_overrides(custom_properties: Value) -> Value {
+    json!([{ "recordType": "CUSTOM", "schema": schema_definition(custom_properties) }])
+}
+
+/// The custom-metadata schema configuration a registry in these tests is created with.
+fn created_schema_configuration() -> Value {
+    schema_configuration(
+        declared_properties(),
+        declared_overrides(json!({ "environment": { "enum": ["dev", "prod"] } })),
+    )
+}
+
+/// The members a registry in these tests is created with, so every row starts from one
+/// known configuration and what an omitted member leaves alone is visible. `name` is the
+/// row's, since a registry name "already exists in this account" is a conflict.
+fn registry_created_with(name: &str) -> Value {
+    json!({
+        "name": name,
+        "description": "the description it was created with",
+        "discoveryConfiguration": {
+            "authorizerType": "CUSTOM_JWT",
+            "authorizerConfiguration": jwt_authorizer("audience-at-create")
+        },
+        "approvalConfiguration": { "autoApprovalRules": [] },
+        "customMetadataSchemaConfiguration": created_schema_configuration(),
+        "autoDetectionConfiguration": { "scope": "ORGANIZATION", "enabled": true }
+    })
+}
+
+/// What a read reports for a registry created with [`registry_created_with`] before any
+/// patch: the create's own members, with `autoDetectionConfiguration` reported as the
+/// `autoDetection` the service derives from it.
+fn registry_reports(name: &str) -> Map<String, Value> {
+    json!({
+        "name": name,
+        "description": "the description it was created with",
+        "discoveryConfiguration": {
+            "authorizerType": "CUSTOM_JWT",
+            "authorizerConfiguration": jwt_authorizer("audience-at-create")
+        },
+        "approvalConfiguration": { "autoApprovalRules": [] },
+        "customMetadataSchemaConfiguration": created_schema_configuration(),
+        "autoDetection": {
+            "configuration": { "scope": "ORGANIZATION", "enabled": true },
+            "status": "ACTIVE"
+        }
+    })
+    .as_object()
+    .expect("an object")
+    .clone()
+}
+
+/// A registry created with [`registry_created_with`] and waited for, so it is `READY`.
+async fn ready_configured_registry(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+) -> (String, String) {
+    ready_registry(router, case, registry_created_with(name)).await
+}
+
+#[tokio::test]
+async fn a_registry_patch_is_applied_to_the_stored_registry_and_read_back_by_get_registry() {
+    let (router, _engine) = router();
+
+    // (case, the PATCH body, what the registry carries afterwards). Only the members a row
+    // names change: every other member must still report what the registry was created
+    // with, which is what "specify only the fields you want to change, and omit the rest to
+    // leave them unchanged" means. A `null` expectation means the member is absent from the
+    // answer.
+    //
+    // The wrapper shapes come from the model: a leaf wrapper is `{"optionalValue": <value>}`
+    // and an empty `{}` unsets the field it wraps, while `UpdatedDiscoveryConfiguration`
+    // patches its members one by one (`smithy_query(query="shape",
+    // shape="UpdatedDescription,UpdatedApprovalConfiguration,UpdatedDiscoveryConfiguration")`).
+    let rows: Vec<(&str, Value, Value)> = vec![
+        (
+            "set description",
+            json!({ "description": { "optionalValue": "a description set by the update" } }),
+            json!({ "description": "a description set by the update" }),
+        ),
+        (
+            "unset description with an empty wrapper",
+            json!({ "description": {} }),
+            json!({ "description": null }),
+        ),
+        (
+            "rename the registry",
+            json!({ "name": "registry-patch-renamed" }),
+            json!({ "name": "registry-patch-renamed" }),
+        ),
+        (
+            "replace the discovery authorizer configuration",
+            json!({
+                "discoveryConfiguration": {
+                    "authorizerConfiguration": {
+                        "optionalValue": jwt_authorizer("audience-after-update")
+                    }
+                }
+            }),
+            json!({
+                "discoveryConfiguration": {
+                    "authorizerType": "CUSTOM_JWT",
+                    "authorizerConfiguration": jwt_authorizer("audience-after-update")
+                }
+            }),
+        ),
+        (
+            "unset the discovery authorizer configuration with an empty wrapper",
+            json!({ "discoveryConfiguration": { "authorizerConfiguration": {} } }),
+            json!({ "discoveryConfiguration": { "authorizerType": "CUSTOM_JWT" } }),
+        ),
+        (
+            "a discovery patch that names no member of its own leaves it alone",
+            json!({ "discoveryConfiguration": {} }),
+            json!({}),
+        ),
+        (
+            "replace the approval configuration with an auto-approval rule",
+            json!({
+                "approvalConfiguration": {
+                    "optionalValue": { "autoApprovalRules": ["APPROVE_ALL"] }
+                }
+            }),
+            json!({ "approvalConfiguration": { "autoApprovalRules": ["APPROVE_ALL"] } }),
+        ),
+        (
+            "unset the approval configuration with an empty wrapper",
+            json!({ "approvalConfiguration": {} }),
+            json!({ "approvalConfiguration": { "autoApprovalRules": [] } }),
+        ),
+        (
+            "widen the custom metadata schema",
+            json!({
+                "customMetadataSchemaConfiguration": {
+                    "optionalValue": schema_configuration(
+                        json!({
+                            "owner": { "type": "string" },
+                            "tier": { "enum": ["gold", "silver"] },
+                            "contact": {
+                                "type": "object",
+                                "properties": { "email": { "type": "string" } }
+                            },
+                            "costCentre": { "type": "string" }
+                        }),
+                        declared_overrides(json!({ "environment": { "enum": ["dev", "prod"] } })),
+                    )
+                }
+            }),
+            json!({
+                "customMetadataSchemaConfiguration": schema_configuration(
+                    json!({
+                        "owner": { "type": "string" },
+                        "tier": { "enum": ["gold", "silver"] },
+                        "contact": {
+                            "type": "object",
+                            "properties": { "email": { "type": "string" } }
+                        },
+                        "costCentre": { "type": "string" }
+                    }),
+                    declared_overrides(json!({ "environment": { "enum": ["dev", "prod"] } })),
+                )
+            }),
+        ),
+        (
+            "replace the auto-detection configuration",
+            json!({
+                "autoDetectionConfiguration": {
+                    "optionalValue": { "scope": "ORGANIZATION", "enabled": false }
+                }
+            }),
+            json!({
+                "autoDetection": {
+                    "configuration": { "scope": "ORGANIZATION", "enabled": false },
+                    "status": "INACTIVE"
+                }
+            }),
+        ),
+        (
+            "unset auto-detection with an empty wrapper",
+            json!({ "autoDetectionConfiguration": {} }),
+            json!({ "autoDetection": null }),
+        ),
+        (
+            "patch two members in one request",
+            json!({
+                "name": "registry-patch-both-at-once",
+                "description": {}
+            }),
+            json!({ "name": "registry-patch-both-at-once", "description": null }),
+        ),
+    ];
+
+    for (index, (case, patch, changes)) in rows.into_iter().enumerate() {
+        let name = format!("registry-patch-probe-{index}");
+        let (registry_id, registry_arn) = ready_configured_registry(&router, case, &name).await;
+
+        // What the registry must report afterwards: what it was created with, overwritten
+        // by the row's expectations.
+        let mut expected = registry_reports(&name);
+        for (member, value) in changes.as_object().expect("an object") {
+            expected.insert(member.clone(), value.clone());
+        }
+
+        let updated = update_registry(&router, &registry_id, patch).await;
+        assert_eq!(
+            updated.status, 202,
+            "case {case:?}: UpdateRegistry must answer 202, got {} {:?}",
+            updated.status, updated.body
+        );
+        assert_eq!(
+            (
+                updated.str_field("registryId"),
+                updated.str_field("registryArn"),
+                updated.str_field("status"),
+            ),
+            (registry_id.as_str(), registry_arn.as_str(), "UPDATING"),
+            "case {case:?}: the answer addresses the registry it patched and reports the \
+             asynchronous status, got {:?}",
+            updated.body
+        );
+        // The answer already carries the patched configuration, since it reports the
+        // registry that was just written.
+        assert_members(case, &updated.body, &expected, "the update's own answer");
+
+        // The update is asynchronous, so the registry settles back at READY, and the read
+        // path reports the patch.
+        let settled = registry_reaching(&router, case, &registry_id, "READY").await;
+        assert_members(case, &settled.body, &expected, "GetRegistry");
+    }
+}
+
+/// One row of the schema-evolution table: the configuration an update asks for, and whether
+/// the registry's current one admits it.
+struct SchemaEvolutionRow {
+    case: &'static str,
+    /// The `optionalValue` of the patch wrapper, or `Value::Null` for an empty wrapper —
+    /// which asks for the configuration to be cleared.
+    wanted: Value,
+    /// The parts of the refusal that name what cannot be withdrawn, or `None` when the
+    /// update is accepted.
+    refusal: Option<Vec<&'static str>>,
+}
+
+#[tokio::test]
+async fn the_custom_metadata_schema_may_only_be_widened() {
+    let (router, _engine) = router();
+
+    // A registry's custom metadata schema configuration "replaces the current one. You can
+    // add fields and allowed values, but you can't remove a field or an allowed value, or
+    // change a field's type". The rows span each of those three withdrawals and each way of
+    // widening, at the top level of the schema every record type is held to, inside a
+    // nested object field, and in the schema of one record type.
+    let rows: Vec<SchemaEvolutionRow> = vec![
+        SchemaEvolutionRow {
+            case: "a field is added",
+            wanted: schema_configuration(
+                json!({
+                    "owner": { "type": "string" },
+                    "tier": { "enum": ["gold", "silver"] },
+                    "contact": {
+                        "type": "object",
+                        "properties": { "email": { "type": "string" } }
+                    },
+                    "costCentre": { "type": "string" }
+                }),
+                declared_overrides(json!({ "environment": { "enum": ["dev", "prod"] } })),
+            ),
+            refusal: None,
+        },
+        SchemaEvolutionRow {
+            case: "an allowed value is added",
+            wanted: schema_configuration(
+                json!({
+                    "owner": { "type": "string" },
+                    "tier": { "enum": ["gold", "silver", "bronze"] },
+                    "contact": {
+                        "type": "object",
+                        "properties": { "email": { "type": "string" } }
+                    }
+                }),
+                declared_overrides(json!({ "environment": { "enum": ["dev", "prod"] } })),
+            ),
+            refusal: None,
+        },
+        SchemaEvolutionRow {
+            case: "a field is added inside a nested object field",
+            wanted: schema_configuration(
+                json!({
+                    "owner": { "type": "string" },
+                    "tier": { "enum": ["gold", "silver"] },
+                    "contact": {
+                        "type": "object",
+                        "properties": {
+                            "email": { "type": "string" },
+                            "pager": { "type": "string" }
+                        }
+                    }
+                }),
+                declared_overrides(json!({ "environment": { "enum": ["dev", "prod"] } })),
+            ),
+            refusal: None,
+        },
+        SchemaEvolutionRow {
+            case: "a schema for another record type is added",
+            wanted: schema_configuration(
+                declared_properties(),
+                json!([
+                    {
+                        "recordType": "CUSTOM",
+                        "schema": schema_definition(
+                            json!({ "environment": { "enum": ["dev", "prod"] } })
+                        )
+                    },
+                    {
+                        "recordType": "MCP",
+                        "schema": schema_definition(json!({ "transport": { "type": "string" } }))
+                    }
+                ]),
+            ),
+            refusal: None,
+        },
+        SchemaEvolutionRow {
+            case: "a field is removed",
+            wanted: schema_configuration(
+                json!({
+                    "tier": { "enum": ["gold", "silver"] },
+                    "contact": {
+                        "type": "object",
+                        "properties": { "email": { "type": "string" } }
+                    }
+                }),
+                declared_overrides(json!({ "environment": { "enum": ["dev", "prod"] } })),
+            ),
+            refusal: Some(vec!["owner", "defaultSchema"]),
+        },
+        SchemaEvolutionRow {
+            case: "a field nested inside an object field is removed",
+            wanted: schema_configuration(
+                json!({
+                    "owner": { "type": "string" },
+                    "tier": { "enum": ["gold", "silver"] },
+                    "contact": { "type": "object", "properties": {} }
+                }),
+                declared_overrides(json!({ "environment": { "enum": ["dev", "prod"] } })),
+            ),
+            refusal: Some(vec!["contact.email", "defaultSchema"]),
+        },
+        SchemaEvolutionRow {
+            case: "a field's type is changed",
+            wanted: schema_configuration(
+                json!({
+                    "owner": { "type": "integer" },
+                    "tier": { "enum": ["gold", "silver"] },
+                    "contact": {
+                        "type": "object",
+                        "properties": { "email": { "type": "string" } }
+                    }
+                }),
+                declared_overrides(json!({ "environment": { "enum": ["dev", "prod"] } })),
+            ),
+            refusal: Some(vec!["owner", "string", "integer"]),
+        },
+        SchemaEvolutionRow {
+            case: "an allowed value is removed",
+            wanted: schema_configuration(
+                json!({
+                    "owner": { "type": "string" },
+                    "tier": { "enum": ["gold"] },
+                    "contact": {
+                        "type": "object",
+                        "properties": { "email": { "type": "string" } }
+                    }
+                }),
+                declared_overrides(json!({ "environment": { "enum": ["dev", "prod"] } })),
+            ),
+            refusal: Some(vec!["silver", "tier"]),
+        },
+        SchemaEvolutionRow {
+            case: "the schema of a record type is dropped",
+            wanted: schema_configuration(declared_properties(), json!([])),
+            refusal: Some(vec!["environment", "record type CUSTOM"]),
+        },
+        SchemaEvolutionRow {
+            case: "the whole configuration is cleared with an empty wrapper",
+            wanted: Value::Null,
+            refusal: Some(vec!["contact", "defaultSchema"]),
+        },
+    ];
+
+    for (index, row) in rows.into_iter().enumerate() {
+        let SchemaEvolutionRow {
+            case,
+            wanted,
+            refusal,
+        } = row;
+        let name = format!("registry-schema-probe-{index}");
+        let (registry_id, _registry_arn) = ready_configured_registry(&router, case, &name).await;
+
+        // A wrapper carrying no value asks for the configuration to be cleared; one
+        // carrying a value asks for it to be replaced by that value.
+        let patch = match &wanted {
+            Value::Null => json!({ "customMetadataSchemaConfiguration": {} }),
+            value => json!({ "customMetadataSchemaConfiguration": { "optionalValue": value } }),
+        };
+        let answered = update_registry(&router, &registry_id, patch).await;
+
+        match refusal {
+            None => {
+                assert_eq!(
+                    answered.status, 202,
+                    "case {case:?}: a widening of the schema must be accepted, got {} {:?}",
+                    answered.status, answered.body
+                );
+                let settled = registry_reaching(&router, case, &registry_id, "READY").await;
+                assert_eq!(
+                    &settled.body["customMetadataSchemaConfiguration"], &wanted,
+                    "case {case:?}: the registry reports the schema the update installed, \
+                     got {:?}",
+                    settled.body["customMetadataSchemaConfiguration"]
+                );
+            }
+            Some(fragments) => {
+                assert_eq!(
+                    (answered.status, answered.error_code.as_deref()),
+                    (400, Some("ValidationException")),
+                    "case {case:?}: expected the modelled 400 ValidationException, got {} {:?}",
+                    answered.status,
+                    answered.body
+                );
+                for fragment in fragments {
+                    assert!(
+                        answered.message().contains(fragment),
+                        "case {case:?}: the refusal names {fragment:?}, got {:?}",
+                        answered.message()
+                    );
+                }
+                // The refused update wrote nothing: the registry is still READY and still
+                // declares the schema it was created with.
+                let read_back = get_registry(&router, &registry_id).await;
+                assert_eq!(
+                    (
+                        read_back.str_field("status"),
+                        &read_back.body["customMetadataSchemaConfiguration"],
+                    ),
+                    ("READY", &created_schema_configuration()),
+                    "case {case:?}: a refused update leaves the stored registry alone, got \
+                     {:?}",
+                    read_back.body
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_approval_configuration_update_decides_only_the_submissions_made_after_it() {
+    let (router, _engine) = router();
+    let (registry_id, _registry_arn) = ready_registry(
+        &router,
+        "approval configuration",
+        json!({ "name": "approval-configuration-registry" }),
+    )
+    .await;
+
+    // The updated approval configuration "applies only to records that move to
+    // PENDING_APPROVAL after the update; records already in PENDING_APPROVAL are
+    // unaffected". The rows span both directions of the change and both ways of asking for
+    // manual review (an empty rule list, and no configuration at all), applied one after
+    // another to the one registry, so each row also re-checks every record submitted under
+    // an earlier configuration. The rule installed is the model's one `AutoApprovalRule`
+    // (`smithy_query(query="shape", shape="AutoApprovalRule")`: APPROVE_ALL).
+    let rows: Vec<(&str, Value, &str)> = vec![
+        (
+            "an auto-approval rule is installed",
+            json!({ "optionalValue": { "autoApprovalRules": ["APPROVE_ALL"] } }),
+            "APPROVED",
+        ),
+        (
+            "the rule list is emptied",
+            json!({ "optionalValue": { "autoApprovalRules": [] } }),
+            "PENDING_APPROVAL",
+        ),
+        (
+            "the rule is installed again",
+            json!({ "optionalValue": { "autoApprovalRules": ["APPROVE_ALL"] } }),
+            "APPROVED",
+        ),
+        (
+            "the configuration is unset with an empty wrapper",
+            json!({}),
+            "PENDING_APPROVAL",
+        ),
+    ];
+
+    // Every record submitted so far, with the status its own submission settled at.
+    let mut submitted: Vec<(String, String)> = Vec::new();
+
+    for (index, (case, wanted, settles_at)) in rows.into_iter().enumerate() {
+        // A record submitted BEFORE the update, which the update must not move.
+        let (before_id, _before_arn) =
+            draft_record(&router, case, &registry_id, &format!("before-{index}")).await;
+        let answered = submit_for_approval(&router, case, &registry_id, &before_id).await;
+        submitted.push((before_id, answered.str_field("status").to_string()));
+
+        let updated = update_registry(
+            &router,
+            &registry_id,
+            json!({ "approvalConfiguration": wanted }),
+        )
+        .await;
+        assert_eq!(
+            (updated.status, updated.str_field("status")),
+            (202, "UPDATING"),
+            "case {case:?}: UpdateRegistry must accept the change and report the \
+             asynchronous status, got {} {:?}",
+            updated.status,
+            updated.body
+        );
+        registry_reaching(&router, case, &registry_id, "READY").await;
+
+        // Nothing already in the workflow moved: each record still reports the status its
+        // own submission settled at, whichever configuration has been installed since.
+        for (record_id, status) in &submitted {
+            let read_back = get_record(&router, &registry_id, record_id).await;
+            assert_eq!(
+                read_back.str_field("status"),
+                status,
+                "case {case:?}: record {record_id} was submitted under an earlier \
+                 configuration and must still report {status}, got {:?}",
+                read_back.body
+            );
+        }
+
+        // A submission made AFTER the update follows the configuration as it stands now.
+        let (after_id, _after_arn) =
+            draft_record(&router, case, &registry_id, &format!("after-{index}")).await;
+        let answered = submit_for_approval(&router, case, &registry_id, &after_id).await;
+        assert_eq!(
+            answered.str_field("status"),
+            settles_at,
+            "case {case:?}: a submission made after the update settles at {settles_at}, got \
+             {:?}",
+            answered.body
+        );
+        let read_back = get_record(&router, &registry_id, &after_id).await;
+        assert_eq!(
+            read_back.str_field("status"),
+            settles_at,
+            "case {case:?}: the read path reports the submitted record as {settles_at}, got \
+             {:?}",
+            read_back.body
+        );
+        submitted.push((after_id, settles_at.to_string()));
+    }
+}
+
+#[tokio::test]
+async fn an_update_of_a_registry_is_held_to_it_being_ready() {
+    let (router, engine) = router();
+    let (registry_id, _registry_arn) = ready_registry(
+        &router,
+        "registry status",
+        json!({ "name": "registry-update-status" }),
+    )
+    .await;
+
+    // Rows span the statuses a registry can be in when an update arrives: the three
+    // transient ones of `RegistryStatus` and the usable one
+    // (`smithy_query(query="shape", shape="RegistryStatus")`).
+    let rows: Vec<(&str, &str, bool)> = vec![
+        (
+            "a registry still being created",
+            control::REGISTRY_CREATING,
+            false,
+        ),
+        (
+            "a registry whose previous update is still being processed",
+            control::REGISTRY_UPDATING,
+            false,
+        ),
+        ("a registry being deleted", control::REGISTRY_DELETING, false),
+        ("a ready registry", control::REGISTRY_READY, true),
+    ];
+
+    for (case, registry_status, accepted) in rows {
+        set_registry_status(&engine, &registry_id, registry_status);
+        let wanted = format!("updated with the registry in {registry_status}");
+        let answered = update_registry(
+            &router,
+            &registry_id,
+            json!({ "description": { "optionalValue": wanted.clone() } }),
+        )
+        .await;
+        if accepted {
+            assert_eq!(
+                (answered.status, answered.str_field("status")),
+                (202, "UPDATING"),
+                "case {case:?}: an accepted update reports the asynchronous status, got {} \
+                 {:?}",
+                answered.status,
+                answered.body
+            );
+            let settled = registry_reaching(&router, case, &registry_id, "READY").await;
+            assert_eq!(
+                settled.str_field("description"),
+                wanted,
+                "case {case:?}: the settled registry carries the update, got {:?}",
+                settled.body
+            );
+        } else {
+            assert_eq!(
+                (answered.status, answered.error_code.as_deref()),
+                (409, Some("ConflictException")),
+                "case {case:?}: expected the modelled 409 ConflictException, got {} {:?}",
+                answered.status,
+                answered.body
+            );
+            assert!(
+                answered.message().contains(registry_status),
+                "case {case:?}: the refusal names the status the registry is in, got {:?}",
+                answered.message()
+            );
+            // The refused update wrote nothing: with the registry usable again it still
+            // carries no description at all, the way it was created.
+            set_registry_status(&engine, &registry_id, control::REGISTRY_READY);
+            let read_back = get_registry(&router, &registry_id).await;
+            assert!(
+                read_back.body["description"].is_null(),
+                "case {case:?}: a refused update leaves the stored registry alone, got {:?}",
+                read_back.body
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_registry_rename_keeps_registry_names_unique_in_the_account() {
+    let (router, _engine) = router();
+    let (held_id, _held_arn) =
+        ready_registry(&router, "held", json!({ "name": "rename-held" })).await;
+    let (mover_id, _mover_arn) =
+        ready_registry(&router, "mover", json!({ "name": "rename-mover" })).await;
+
+    // (case, the name the rename asks for, whether it is accepted). A name another live
+    // registry holds is a conflict; the registry's OWN name is not a duplicate of itself,
+    // and a name nothing holds is free — including the one this registry has just left.
+    let rows: Vec<(&str, &str, bool)> = vec![
+        ("onto the name another registry holds", "rename-held", false),
+        ("onto its own name", "rename-mover", true),
+        ("onto a free name", "rename-moved", true),
+        ("onto the name it has just left", "rename-mover", true),
+    ];
+
+    for (case, wanted, accepted) in rows {
+        let answered = update_registry(&router, &mover_id, json!({ "name": wanted })).await;
+        if accepted {
+            assert_eq!(
+                answered.status, 202,
+                "case {case:?}: the rename must be accepted, got {} {:?}",
+                answered.status, answered.body
+            );
+            let settled = registry_reaching(&router, case, &mover_id, "READY").await;
+            assert_eq!(
+                settled.str_field("name"),
+                wanted,
+                "case {case:?}: the renamed registry reports its new name, got {:?}",
+                settled.body
+            );
+        } else {
+            assert_eq!(
+                (answered.status, answered.error_code.as_deref()),
+                (409, Some("ConflictException")),
+                "case {case:?}: expected the modelled 409 ConflictException, got {} {:?}",
+                answered.status,
+                answered.body
+            );
+            let read_back = get_registry(&router, &mover_id).await;
+            assert_eq!(
+                read_back.str_field("name"),
+                "rename-mover",
+                "case {case:?}: a refused rename leaves the stored name alone, got {:?}",
+                read_back.body
+            );
+        }
+    }
+
+    // The registry that held the contested name is untouched by the refused rename, the
+    // name the mover ended up on is the one a create cannot take now, and the name it left
+    // behind is free for a create.
+    let held = get_registry(&router, &held_id).await;
+    assert_eq!(
+        held.str_field("name"),
+        "rename-held",
+        "the registry holding the name is untouched, got {:?}",
+        held.body
+    );
+    let taken = call(
+        &router,
+        "POST",
+        "/registries",
+        Some(json!({ "name": "rename-mover" })),
+    )
+    .await;
+    assert_eq!(
+        (taken.status, taken.error_code.as_deref()),
+        (409, Some("ConflictException")),
+        "a create cannot take the name the rename moved onto, got {} {:?}",
+        taken.status,
+        taken.body
+    );
+    let freed = call(
+        &router,
+        "POST",
+        "/registries",
+        Some(json!({ "name": "rename-moved" })),
+    )
+    .await;
+    assert_eq!(
+        freed.status, 202,
+        "the name the rename left is free for a create, got {} {:?}",
+        freed.status, freed.body
+    );
+}
+
+#[tokio::test]
+async fn an_update_of_a_registry_nothing_holds_is_a_resource_not_found() {
+    let (router, _engine) = router();
+
+    // `RegistryIdentifier` admits the bare id or the registry's ARN, at the lengths the
+    // model's own pattern allows, and the value that resolved to nothing is the one the
+    // refusal quotes (`smithy_query(query="shape", shape="RegistryIdentifier")`).
+    let rows: Vec<(&str, String)> = vec![
+        ("a bare id nothing holds", "a1b2c3d4e5f6".to_string()),
+        (
+            "an ARN nothing holds",
+            format!("arn:aws:agent-registry:{REGION}:000000000000:registry/a1b2c3d4e5f6"),
+        ),
+        (
+            "a bare id of the longest form the model admits",
+            "a1b2c3d4e5f6a1b2".to_string(),
+        ),
+    ];
+
+    for (case, identifier) in rows {
+        let answered = update_registry(
+            &router,
+            &identifier,
+            json!({ "description": { "optionalValue": "nothing to update" } }),
+        )
+        .await;
+        assert_eq!(
+            (answered.status, answered.error_code.as_deref()),
+            (404, Some("ResourceNotFoundException")),
+            "case {case:?}: expected the modelled 404 ResourceNotFoundException, got {} {:?}",
+            answered.status,
+            answered.body
+        );
+        assert!(
+            answered.message().contains(&identifier),
+            "case {case:?}: the refusal quotes the identifier as the request supplied it, \
+             got {:?}",
+            answered.message()
+        );
     }
 }

@@ -258,18 +258,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         state.arm_transition(pending.due_at);
         // `AutoDetection` reports the configuration the caller asked for together with
-        // whether it is running; `AutoDetectionStatus` is ACTIVE | INACTIVE.
+        // whether it is running; the status it is derived from is the state module's, so
+        // this create and a later update report the same one.
         let auto_detection = input
             .auto_detection_configuration
-            .map(|configuration| AutoDetection {
-                status: if configuration.enabled {
-                    "ACTIVE".to_string()
-                } else {
-                    "INACTIVE".to_string()
-                },
-                configuration,
-                status_reason: None,
-            });
+            .map(crate::state::auto_detection_for);
         let registry = crate::state::Registry {
             registry_id: registry_id.clone(),
             registry_arn: registry_arn.clone(),
