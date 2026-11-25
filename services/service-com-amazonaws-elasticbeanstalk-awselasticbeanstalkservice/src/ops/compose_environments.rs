@@ -176,11 +176,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx);
-        // The socket every environment's published address is served on, opened
-        // on the first call that needs one: an environment this composition
-        // launches publishes an address a client can dial, and binding it
-        // reaches the core — which cannot happen while the store is held.
-        let plane_authority = crate::state::environment_plane_authority(&*self.engine, ctx).await;
+        // WHERE an environment this composition launches publishes its addresses:
+        // the zone this emulator announces its own names in, and the address the
+        // environment plane answers on — whose socket is opened on the first call
+        // that needs one, which reaches the core and so cannot happen while the
+        // store is held.
+        let addressing = crate::state::published_addressing(&*self.engine, ctx).await;
 
         // "Takes a list of version labels that specify application source
         // bundles for each of the environments to create or update." Without one
@@ -437,7 +438,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             let environment = store.compose_environment(crate::state::ComposedEnvironment {
                 region: &region,
-                plane_authority: &plane_authority,
+                addressing: &addressing,
                 application_name: &application_name,
                 version_label: &composed.version_label,
                 environment_name: &composed.environment_name,

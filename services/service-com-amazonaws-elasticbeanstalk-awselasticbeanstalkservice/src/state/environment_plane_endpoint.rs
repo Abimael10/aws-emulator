@@ -15,10 +15,13 @@
 //! the core (`engine.listeners().tcp_plaintext(..)`, which owns the socket, the
 //! bind interface and the port range), and every environment's published address
 //! is a NAME in the zone this emulator may announce in, with the environment's
-//! CNAME prefix and Region as its leading labels, on that socket's PORT
-//! ([`super::environment_cname`]). A client dials exactly what it was told: the
-//! name resolves to the interface the core bound (RFC 6761 reserves the loopback
-//! zone for it) and the port is the socket's own.
+//! CNAME prefix and Region as its leading labels
+//! ([`super::fully_qualified_cname`]) — a name carrying neither a port nor a
+//! path, because a name carries neither. The PORT is this socket's own and the
+//! PATH is the request's: a client that resolves the name reaches the interface
+//! the core bound (RFC 6761 reserves the loopback zone for it), and one that
+//! resolves nothing but the emulator's own endpoint reaches the same plane by the
+//! path ([`super::environment_plane_path`]).
 //!
 //! ONE socket serves every environment of an engine: WHICH environment a request
 //! is for is in the leading labels of the host it named — or in the PATH, for a
@@ -380,25 +383,37 @@ fn forwarded(
     RtRequest::try_from(built).ok()
 }
 
-/// Whether a LIVE environment of `store` answers at the name `host` — the same
+/// Whether a LIVE environment of `store` answers at the host `host` — the same
 /// question the front door's claim asks of the store
 /// (`crate::service::environment_plane`), asked here because the authority a
 /// relayed request carries must name an environment this service HOLDS and not
 /// merely a host shaped like one.
 ///
-/// A termination the clock has already completed is what makes a name stop being
+/// Either published host answers it ([`published_host`]): the NAME an environment
+/// carries, or the host of the load balancer in front of one.
+///
+/// A termination the clock has already completed is what makes a host stop being
 /// answered, and it was due whether or not anybody dialled, so the owed
 /// transitions are settled first — the one write this reading performs.
 fn serves_the_name(
     store: &::engine::ServiceState<ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState>,
     host: &str,
 ) -> bool {
-    let Some((region, cname_prefix)) = environment_address_labels(host) else {
+    let Some(addressed) = published_host(host) else {
         return false;
     };
     let mut held = store.lock();
     held.materialize_due_transitions();
-    environment_serving_cname_prefix(&held, region, cname_prefix).is_some()
+    match addressed {
+        PublishedHost::Name {
+            region,
+            cname_prefix,
+        } => environment_serving_cname_prefix(&held, region, cname_prefix).is_some(),
+        PublishedHost::LoadBalancer {
+            region,
+            load_balancer,
+        } => environment_behind_load_balancer(&held, region, load_balancer).is_some(),
+    }
 }
 
 /// One answer this socket renders itself, for a request it could not hand over at

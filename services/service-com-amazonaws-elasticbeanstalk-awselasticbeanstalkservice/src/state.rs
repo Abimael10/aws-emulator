@@ -74,6 +74,9 @@ pub mod object_storage;
 pub mod platform_build;
 pub mod platform_catalog;
 pub mod procfile;
+/// The addresses an environment publishes — its `CNAME` and its `EndpointURL` —
+/// and the reading of a host built from one of them.
+pub mod published_addresses;
 pub mod python_application;
 pub mod python_program;
 /// Declared but not glob-re-exported: this module adds only methods to the
@@ -105,6 +108,7 @@ pub use object_storage::*;
 pub use platform_build::*;
 pub use platform_catalog::*;
 pub use procfile::*;
+pub use published_addresses::*;
 pub use served_requests::*;
 pub use python_application::*;
 pub use python_program::*;
@@ -827,10 +831,11 @@ pub const DATA_PLANE_SEGMENT: &str = "elasticbeanstalk";
 /// path then follows.
 ///
 /// The name an environment PUBLISHES carries the Region and the prefix in its
-/// leading labels ([`environment_cname`]); this is the same addressing in a PATH,
-/// for a client that resolves nothing but the emulator's own endpoint — the
+/// leading labels ([`fully_qualified_cname`]); this is the same addressing in a
+/// PATH, for a client that resolves nothing but the emulator's own endpoint — the
 /// shared data-plane reading of this tree, where what a host cannot carry the
-/// path carries.
+/// path carries, and where the port and the path the published name does not
+/// carry are resolved.
 ///
 /// The REGION is part of it because it is part of the name a prefix forms: an
 /// environment's CNAME sits in its own Region's zone, so the same prefix in two
@@ -844,36 +849,6 @@ pub fn environment_plane_path(region: &str, cname_prefix: &str) -> String {
         "/{}/{DATA_PLANE_SEGMENT}/{region}/{cname_prefix}",
         ::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE
     )
-}
-
-/// The address an environment is reached at — `EnvironmentDescription$CNAME`,
-/// "the URL to the CNAME for this environment".
-///
-/// A client READS this address and DIALS it, so the value has to be an address a
-/// client of THIS emulator can reach: the `host:port` of one of the emulator's
-/// own listeners ([`environment_plane_endpoint::environment_plane_authority`],
-/// the socket the environment plane answers on), followed by the path that names
-/// WHICH environment the request is for ([`environment_plane_path`]). A name
-/// under Elastic Beanstalk's public zone
-/// (`<prefix>.<region>.elasticbeanstalk.com`) resolves to nothing on the machine
-/// this emulator runs on, and a name this emulator minted under the loopback
-/// zone is not an address either: nothing resolves it, and it is not one of the
-/// hosts this emulator serves on — so either would make the one address the API
-/// publishes the one address nobody can reach. The DNS NAME a prefix forms is a
-/// different question, asked and answered where the service reports on a name
-/// rather than on an address ([`fully_qualified_cname`],
-/// `CheckDNSAvailability$FullyQualifiedCNAME`).
-///
-/// The CNAME PREFIX and the Region are what the address CARRIES, in the two
-/// segments [`environment_plane_path`] writes, and what
-/// [`environment_address_parts`] reads back out of it: the prefix inside its
-/// Region is what identifies the name, so it is what `CheckDNSAvailability`
-/// reports on, what at most one live environment may hold, and what a
-/// `SwapEnvironmentCNAMEs` moves between two environments — which is why a
-/// request addressed this way is served by the environment carrying that prefix
-/// NOW ([`crate::service::environment_plane`]).
-pub fn environment_cname(authority: &str, region: &str, cname_prefix: &str) -> String {
-    format!("{authority}{}", environment_plane_path(region, cname_prefix))
 }
 
 /// The segment that names an environment's OWN address, ahead of its
@@ -965,11 +940,12 @@ pub fn addressed_environment_path(path: &str) -> Option<(AddressedEnvironment<'_
 /// The Region and the CNAME PREFIX the published address `address` names, or
 /// `None` for a value that names no published environment name of this service.
 ///
-/// The reading of [`environment_cname`]: an address is `host:port` followed by the
-/// path naming the Region and the prefix, so the PATH is what carries them. A
-/// value with no path at all is read as a HOST instead
-/// ([`environment_address_labels`]), which is how a request that named the
-/// environment in its `Host` is served.
+/// A published address is a HOST ([`fully_qualified_cname`]), whose leading labels
+/// are what name the environment ([`environment_address_labels`]); a value
+/// carrying a PATH is read as the plane addressing instead
+/// ([`environment_plane_path`]), which is the same prefix and Region in the
+/// segments a client that resolves nothing but the emulator's own endpoint
+/// addresses them in.
 pub fn environment_address_parts(address: &str) -> Option<(&str, &str)> {
     match address.find('/') {
         Some(start) => match addressed_environment_path(&address[start..])? {
@@ -987,73 +963,22 @@ pub fn environment_address_parts(address: &str) -> Option<(&str, &str)> {
 }
 
 /// The Region and the CNAME PREFIX the published host `host` names, or `None` for
-/// a host that names no environment address of this service.
+/// a host that names no CNAME of this service.
 ///
-/// A client on another machine may still RESOLVE the DNS name a prefix forms
-/// ([`fully_qualified_cname`]) to this emulator and send it as the request's
-/// `Host`, in which case the leading labels are what name the environment: the
-/// prefix label, the Region label, this service's own label, and then the domain
-/// the name sits in — which carries at least one label of its own, since a name is
-/// a name only with a domain under it. Any userinfo, the port and a trailing root
-/// dot are not part of the name and are dropped first, and the comparison of this
-/// service's label ignores case, the way DNS compares names.
+/// The name half of [`published_host`], which is the one reading of the hosts this
+/// service publishes: a client RESOLVES the DNS name a prefix forms
+/// ([`fully_qualified_cname`]) to this emulator and sends it as the request's
+/// `Host`, and its leading labels are what name the environment. A load
+/// balancer's host is the OTHER published address and is not a CNAME, so it is no
+/// answer here ([`environment_behind_load_balancer`] is the question it answers).
 pub fn environment_address_labels(host: &str) -> Option<(&str, &str)> {
-    let named = ::service_common::data_plane_addressing::host_only(host).trim_end_matches('.');
-    let mut labels = named.split('.');
-    let cname_prefix = labels.next()?;
-    let region = labels.next()?;
-    let service = labels.next()?;
-    let domain_has_labels = labels.next().is_some_and(|label| !label.is_empty());
-    (!cname_prefix.is_empty()
-        && !region.is_empty()
-        && service.eq_ignore_ascii_case(DATA_PLANE_SEGMENT)
-        && domain_has_labels)
-        .then_some((region, cname_prefix))
-}
-
-/// The address the environment's traffic is SERVED at —
-/// `EnvironmentDescription$EndpointURL`, "for load-balanced, autoscaling
-/// environments, the URL to the LoadBalancer. For single-instance environments,
-/// the IP address of the instance".
-///
-/// A DIFFERENT value from the CNAME: what this member carries is the ADDRESS of
-/// the thing answering behind the name — on AWS a load balancer's own host, or,
-/// for a single-instance environment, the instance's IP ADDRESS. Here that thing
-/// is this emulator's own socket, so the member is that socket's `host:port` with
-/// the environment's OWN plane path on it ([`environment_own_plane_path`]): the
-/// address a client reaches THIS environment at, whatever name points at it.
-///
-/// It stays with its environment when a `SwapEnvironmentCNAMEs` moves the NAMES,
-/// exactly as a load balancer does: the swap exchanges which name points at which
-/// environment, not which address each environment is served at. That is why it
-/// names the environment by its `EnvironmentId` and the CNAME names it by the
-/// prefix it carries.
-pub fn environment_endpoint_url(authority: &str, region: &str, environment_id: &str) -> String {
-    format!(
-        "{authority}{}",
-        environment_own_plane_path(region, environment_id)
-    )
-}
-
-/// The DNS zone an environment CNAME sits in, under its own Region:
-/// `<prefix>.<region>.elasticbeanstalk.com`.
-pub const CNAME_ZONE: &str = "elasticbeanstalk.com";
-
-/// The fully qualified DNS NAME a CNAME prefix forms in `region` — what
-/// `CheckDNSAvailability$FullyQualifiedCNAME` reports, "the fully qualified CNAME
-/// to reserve when CreateEnvironment is called with the provided prefix".
-///
-/// This is a NAME the report answers a question ABOUT, not an address the caller
-/// dials: what the caller does with it is read `Available` beside it and then
-/// create an environment under that prefix. The address an environment is
-/// actually REACHED at is a different member of a different operation, minted in
-/// the zone this emulator answers in ([`environment_cname`]) — a name in Elastic
-/// Beanstalk's own zone resolves to nothing on the machine this emulator runs on.
-///
-/// The REGION is part of the name because the same prefix in two Regions is two
-/// names, which is why the published address carries the Region label too.
-pub fn fully_qualified_cname(region: &str, cname_prefix: &str) -> String {
-    format!("{cname_prefix}.{region}.{CNAME_ZONE}")
+    match published_host(host)? {
+        PublishedHost::Name {
+            region,
+            cname_prefix,
+        } => Some((region, cname_prefix)),
+        PublishedHost::LoadBalancer { .. } => None,
+    }
 }
 
 /// The resource portion of `arn` when it is an ARN of THIS service, i.e.
@@ -2361,7 +2286,16 @@ pub struct Environment {
     /// environment leaves it carrying a name it never reserved, and the name it
     /// gave away is reserved by nobody. See [`environment_reserving_cname`].
     pub reserved_cname: String,
-    pub endpoint_url: Option<String>,
+    /// The DNS zone the names this environment publishes sit in: the zone this
+    /// emulator announced its own names in when the launch minted them
+    /// ([`published_addresses::announced_zone`]). Stored, so every later read of
+    /// this environment reports the names its launch published rather than ones
+    /// re-derived from the reading caller's own request.
+    pub published_zone: String,
+    /// The address this environment's Amazon EC2 instances answer at, which is
+    /// what it publishes as its `EndpointURL` while nothing is in front of them
+    /// ([`Environment::endpoint_url`]).
+    pub instance_address: String,
     pub tier: Option<EnvironmentTier>,
     /// "A list of links to other environments in the same group", which an
     /// environment composed from a manifest declaring links carries and every
@@ -3002,7 +2936,7 @@ macro_rules! environment_description {
             platform_arn: env.platform_arn.clone(),
             template_name: env.template_name.clone(),
             description: env.description.clone(),
-            endpoint_url: env.endpoint_url.clone(),
+            endpoint_url: env.endpoint_url(),
             cname: Some(env.cname.clone()),
             date_created: Some(env.date_created),
             date_updated: Some(env.date_updated),
@@ -3010,12 +2944,13 @@ macro_rules! environment_description {
             abortable_operation_in_progress: Some(env.abortable_operation_in_progress),
             health: Some(health),
             health_status,
-            // `EnvironmentDescription$Resources` carries the environment's load
-            // balancer by its DNS `Domain` and its `Listeners`, which this
-            // emulator serves no traffic on and so reports no `EndpointURL` for
-            // either; the resources the environment is MADE of are what
-            // `DescribeEnvironmentResources` reports, from the inventory on this
-            // same record.
+            // `EnvironmentDescription$Resources` describes the environment's load
+            // balancer by its `Domain` and the `Listeners` it accepts traffic on
+            // — per-port listeners this emulator serves no traffic on, so it
+            // describes none of them; the address the environment is reached at is
+            // the `EndpointURL` above, and the resources the environment is MADE
+            // of are what `DescribeEnvironmentResources` reports, from the
+            // inventory on this same record.
             resources: None,
             tier: env.tier.clone(),
             // "A list of links to other environments in the same group" — the
@@ -4701,7 +4636,7 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 // ---------------------------------------------------------------------------
 // The CNAME reservation rule
 //
-// A CNAME ([`environment_cname`]) is RESERVED by at most ONE live environment —
+// A CNAME ([`fully_qualified_cname`]) is RESERVED by at most ONE live environment —
 // the one that took it when it was created and still carries it
 // ([`environment_reserving_cname_prefix`]) — and is SERVED by at most one live
 // environment, which is whichever one carries it now
@@ -4767,7 +4702,7 @@ pub fn environment_serving_cname<'store>(
 /// `cname_prefix` in `region` — the one a request to that address is served by.
 ///
 /// The PREFIX inside its Region is what identifies the address
-/// ([`environment_cname`]): it is the first label of the name the environment
+/// ([`fully_qualified_cname`]): it is the first label of the name the environment
 /// publishes and the Region is the second, so this is the same question
 /// [`environment_serving_cname`] answers, asked by a request rather than by a
 /// whole name.
@@ -4782,7 +4717,7 @@ pub fn environment_serving_cname_prefix<'store>(
 }
 
 /// The live environment in `store` whose OWN ADDRESS names it —
-/// ([`environment_endpoint_url`], "the URL to the LoadBalancer", "the IP address
+/// ([`Environment::endpoint_url`], "the URL to the LoadBalancer", "the IP address
 /// of the instance"), which names the environment by its `EnvironmentId`.
 ///
 /// DELIBERATELY not the question [`environment_serving_cname_prefix`] answers: a
@@ -4821,5 +4756,38 @@ fn addresses(cname: &str, region: &str, cname_prefix: &str) -> bool {
     let region = ::service_common::arn::region_label(region).unwrap_or(DEFAULT_REGION);
     environment_address_parts(cname).is_some_and(|(named_region, named_prefix)| {
         named_region.eq_ignore_ascii_case(region) && named_prefix.eq_ignore_ascii_case(cname_prefix)
+    })
+}
+
+/// The live environment in `store` the load balancer `load_balancer` in `region`
+/// fronts — the one a request to that load balancer's published host
+/// ([`load_balancer_host`], the `EndpointURL` of a load-balanced environment) is
+/// served by.
+///
+/// An environment's own address, not a name: a `SwapEnvironmentCNAMEs` moves the
+/// NAMES and moves neither environment, so a load balancer goes on reaching the
+/// environment it fronts — the same question [`environment_at_own_address`]
+/// answers for the plane path, asked by the host the member publishes. The
+/// comparison is against the published LABEL of the load balancer in the
+/// environment's own stored inventory, so nothing but a load balancer this service
+/// provisioned answers here.
+pub fn environment_behind_load_balancer<'store>(
+    store: &'store ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState,
+    region: &str,
+    load_balancer: &str,
+) -> Option<&'store Environment> {
+    let region = ::service_common::arn::region_label(region).unwrap_or(DEFAULT_REGION);
+    store.environments.values().find(|environment| {
+        !environment.is_terminated()
+            && ::service_common::arn::region_label(&environment.region).unwrap_or(DEFAULT_REGION)
+                .eq_ignore_ascii_case(region)
+            && environment
+                .resources
+                .as_ref()
+                .and_then(|resources| resources.load_balancer.as_deref())
+                .is_some_and(|provisioned| {
+                    ::service_common::data_plane_addressing::dns_label(provisioned)
+                        .eq_ignore_ascii_case(load_balancer)
+                })
     })
 }

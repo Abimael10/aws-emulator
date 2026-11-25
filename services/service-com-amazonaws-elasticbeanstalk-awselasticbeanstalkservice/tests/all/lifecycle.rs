@@ -49,6 +49,21 @@ const API_VERSION: &str = "2010-12-01";
 /// is asserted against something that is not the default.
 pub(crate) const TEST_REGION: &str = "us-west-2";
 
+/// The DNS zone the emulator a test drives announces a name of its OWN in: a
+/// test's emulator is served at no endpoint of its own, so such a name sits in the
+/// zone RFC 6761 reserves for the loopback interface the core binds its listeners
+/// on — which is what a resolver answers it with.
+pub(crate) const ANNOUNCED_ZONE: &str = "localhost";
+
+/// The zone a CNAME prefix forms its fully qualified DNS NAME in, which
+/// `CheckDNSAvailability` REPORTS ON — Elastic Beanstalk's own.
+pub(crate) const CNAME_ZONE: &str = "elasticbeanstalk.com";
+
+/// The domain every ADDRESS this service hands a client sits under: this service's
+/// own label in the zone above, so an address it publishes leads back to this
+/// process rather than to anything of Amazon Web Services' own.
+pub(crate) const PUBLISHED_DOMAIN: &str = "elasticbeanstalk.localhost";
+
 /// The access key id every suite signs with unless it is asserting WHO the caller
 /// is: a key neither the IAM store nor any session holds a record for, which is
 /// the position the account's own published credential is in.
@@ -232,13 +247,14 @@ impl Emulator {
         Self { router, engine }
     }
 
-    /// The `host:port` every environment address this emulator publishes starts
-    /// with: the socket the environment plane is served on, which the first call
-    /// that needed an address opened.
+    /// The `host:port` of the socket the environment plane is served on, which
+    /// the first call that needed an address opened.
     ///
-    /// For a suite that asserts the address a prefix forms: the port is the
-    /// core's to choose, so the expectation is read off the socket rather than
-    /// written here. Empty before any call has needed an address.
+    /// NOT a value any operation publishes: the published addresses are NAMES,
+    /// carrying neither a port nor a path ([`Emulator::published_cname`]). This is
+    /// what resolves them — the socket a client that resolved one of those names
+    /// reaches, and the authority a suite that dials the plane by PATH addresses.
+    /// Empty before any call has needed an address.
     pub(crate) fn plane_authority(&self) -> String {
         self.store()
             .lock()
@@ -248,9 +264,10 @@ impl Emulator {
             .unwrap_or_default()
     }
 
-    /// The address the CNAME prefix `prefix` forms in `region`, as
-    /// `state::environment_cname` builds it: the socket above, then the plane
-    /// path that prefix's environment is served at.
+    /// The `host:port` and PATH a client of this emulator reaches the environment
+    /// carrying the CNAME prefix `prefix` in `region` at: the socket above, then
+    /// the plane path naming the Region and that prefix — the port and the path the
+    /// published name does not carry, resolved at the listener.
     pub(crate) fn environment_address(&self, region: &str, prefix: &str) -> String {
         format!(
             "{}{}",
@@ -259,30 +276,54 @@ impl Emulator {
         )
     }
 
-    /// The address an environment with the CNAME prefix `prefix` in `region`
-    /// PUBLISHES as its `CNAME`.
+    /// The NAME the CNAME prefix `prefix` forms in `region` in Elastic Beanstalk's
+    /// own zone — what `CheckDNSAvailability` REPORTS for it.
     ///
     /// The FORM is spelled out here rather than read off the crate, so a suite
-    /// that asserts the published value holds the service to it: an address a
-    /// client of this emulator can DIAL — the `host:port` of the socket the
-    /// environment plane answers on, then the emulator's data-plane namespace,
-    /// this service's own segment, the Region and the CNAME prefix. Only the
-    /// authority is read off that socket, because the port is the core's to
-    /// choose.
-    pub(crate) fn published_cname(&self, region: &str, prefix: &str) -> String {
-        format!(
-            "{}/_aws/elasticbeanstalk/{region}/{prefix}",
-            self.plane_authority()
-        )
+    /// that asserts the reported value holds the service to it: the prefix exactly
+    /// as the caller wrote it, the Region, then that zone ([`CNAME_ZONE`]).
+    ///
+    /// Not an address: the address an environment under that prefix is REACHED at
+    /// is published in the zone this emulator answers in
+    /// ([`Emulator::dialable_name`], [`assert_published_cname`]).
+    pub(crate) fn reserved_cname(&self, region: &str, prefix: &str) -> String {
+        format!("{prefix}.{region}.{CNAME_ZONE}")
     }
 
-    /// The address an environment PUBLISHES as its `EndpointURL`: the same socket,
-    /// then the path naming the environment's own id — the address that reaches
-    /// THIS environment whatever name points at it.
-    pub(crate) fn published_endpoint_url(&self, region: &str, environment_id: &str) -> String {
+    /// A name under the zone this emulator announces in that reaches the
+    /// environment carrying the CNAME prefix `prefix` in `region`: the plane serves
+    /// a request naming a prefix for whichever environment carries that prefix
+    /// now, so a suite dials this without having to know the sub-domain the
+    /// environment's own `CNAME` carries ([`assert_published_cname`] is where that
+    /// value's form is asserted).
+    pub(crate) fn dialable_name(&self, region: &str, prefix: &str) -> String {
+        format!("{prefix}.{region}.{PUBLISHED_DOMAIN}")
+    }
+
+    /// The address an environment with NO load balancer in front of it publishes
+    /// as its `EndpointURL`: "the IP address of the instance", which is the host
+    /// the environment plane's socket is bound on — that socket's authority without
+    /// the port, since the member carries a host and nothing else.
+    pub(crate) fn published_instance_address(&self) -> String {
+        let authority = self.plane_authority();
+        match authority.rsplit_once(':') {
+            Some((host, _port)) => host.to_string(),
+            None => authority,
+        }
+    }
+
+    /// The host an environment whose load balancer is named `load_balancer`
+    /// publishes as its `EndpointURL`: "the URL to the LoadBalancer" — that load
+    /// balancer's own name as one DNS label, the Region, the load-balancing
+    /// service's label and this emulator's zone.
+    pub(crate) fn published_load_balancer_host(
+        &self,
+        region: &str,
+        load_balancer: &str,
+    ) -> String {
         format!(
-            "{}/_aws/elasticbeanstalk/{region}/_environment/{environment_id}",
-            self.plane_authority()
+            "{}.{region}.elb.{ANNOUNCED_ZONE}",
+            load_balancer.to_ascii_lowercase()
         )
     }
 
@@ -640,6 +681,62 @@ pub(crate) fn is_environment_id(id: &str) -> bool {
 
 pub(crate) fn account() -> &'static str {
     engine::emulator_account_id()
+}
+
+/// Hold `cname` to the FORM an environment's published `CNAME` carries, for the
+/// environment holding the CNAME prefix `prefix` in `region`, and answer the
+/// environment's own sub-domain label out of it.
+///
+/// The form is spelled out here rather than read off the crate, so every suite
+/// holds the service to the same one: a dot-separated DNS name carrying no port
+/// and no path, whose FIRST label is the prefix as ONE DNS label — the published
+/// value is the authority of an address a client dials, so the prefix reaches it
+/// folded through the workspace's own reading of that question
+/// (`service_common::data_plane_addressing::dns_label`), which is the documented
+/// route back to it since DNS compares labels case-insensitively — then one label
+/// the service minted for this environment alone, then the Region, then this
+/// service's own label in the zone this emulator announces its addresses in
+/// ([`PUBLISHED_DOMAIN`]).
+pub(crate) fn assert_published_cname<'c>(
+    case: &str,
+    cname: &'c str,
+    region: &str,
+    prefix: &str,
+) -> &'c str {
+    assert!(
+        !cname.contains(':') && !cname.contains('/'),
+        "case {case:?}: a published CNAME carries neither ':' nor '/', got {cname:?}"
+    );
+    let labels: Vec<&str> = cname.split('.').collect();
+    assert!(
+        labels.iter().all(|label| !label.is_empty()),
+        "case {case:?}: a published CNAME carries no empty label, got {cname:?}"
+    );
+    assert_eq!(
+        labels.first().copied(),
+        Some(service_common::data_plane_addressing::dns_label(prefix).as_str()),
+        "case {case:?}: the first label must be the environment's CNAME prefix as one DNS \
+         label, got {cname:?}"
+    );
+    assert_eq!(
+        labels.get(2).copied(),
+        Some(region),
+        "case {case:?}: the Region must be the label behind the sub-domain, got {cname:?}"
+    );
+    assert!(
+        cname.ends_with(&format!(".{PUBLISHED_DOMAIN}")),
+        "case {case:?}: expected an address under {PUBLISHED_DOMAIN}, got {cname:?}"
+    );
+    assert_eq!(
+        labels.len(),
+        3 + PUBLISHED_DOMAIN.split('.').count(),
+        "case {case:?}: expected the prefix, one sub-domain, the Region and this service's \
+         own domain, got {cname:?}"
+    );
+    labels
+        .get(1)
+        .copied()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a sub-domain label in {cname:?}"))
 }
 
 /// A timestamp this service rendered, as the INSTANT it names.
@@ -1193,11 +1290,7 @@ async fn created_environments_are_derived_from_the_request_and_persisted() {
             // With no prefix the environment name carries one appended
             // alphanumeric string — its own unique id body.
             .unwrap_or_else(|| format!("{name}-{}", environment_id.trim_start_matches("e-")));
-        assert_eq!(
-            cname,
-            emulator.published_cname(case.region, &expected_prefix),
-            "case {name:?}: unexpected CNAME, got {cname:?}"
-        );
+        assert_published_cname(name, &cname, case.region, &expected_prefix);
         assert_eq!(
             created.expect("EnvironmentArn", name),
             format!(

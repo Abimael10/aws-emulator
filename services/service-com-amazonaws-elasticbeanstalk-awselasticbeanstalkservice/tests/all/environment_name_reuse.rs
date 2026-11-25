@@ -19,7 +19,9 @@
 //! The HTTP harness is the one `lifecycle.rs` already owns in this same test
 //! binary.
 
-use crate::lifecycle::{Answer, Emulator, PAST_DUE, SOLUTION_STACK, TEST_REGION};
+use crate::lifecycle::{
+    assert_published_cname, Answer, Emulator, PAST_DUE, SOLUTION_STACK, TEST_REGION,
+};
 
 /// The application every environment below belongs to.
 const APPLICATION: &str = "reuse-app";
@@ -190,13 +192,7 @@ async fn a_name_is_held_until_its_environment_is_terminated_and_can_then_be_take
             second_id, first_id,
             "case {case:?}: the re-created environment must carry a new EnvironmentId"
         );
-        assert_eq!(
-            again.expect("CNAME", case),
-            emulator.published_cname(TEST_REGION, prefix),
-            "case {case:?}: the re-created environment publishes the address its prefix \
-             forms, got {}",
-            again.body
-        );
+        assert_published_cname(case, again.expect("CNAME", case), TEST_REGION, prefix);
 
         // And a client polling that NAME reads the record it has just created,
         // not the terminated one it replaced: the newest record is the first.

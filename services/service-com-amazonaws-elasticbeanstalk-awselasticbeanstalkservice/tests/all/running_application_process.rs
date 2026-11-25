@@ -398,14 +398,20 @@ pub(crate) async fn launched(
     .await;
 }
 
-/// GET `path` of the published address of the environment with the CNAME prefix
-/// `prefix`, looking again until the deployed application has ANSWERED — a request
-/// this emulator had no run slot for is answered as an address with nothing behind
-/// it, which is not an answer of the application's.
+/// GET `path` at a name under the zone this emulator announces its addresses in
+/// that reaches the environment carrying the CNAME prefix `prefix`, looking again
+/// until the deployed application has ANSWERED — a request this emulator had no run
+/// slot for is answered as an address with nothing behind it, which is not an
+/// answer of the application's.
+///
+/// That name is served for whichever environment carries the prefix now, so this
+/// suite dials it without having to know the sub-domain the launched environment's
+/// own `CNAME` carries. `pub(crate)` for the sibling suites in this same binary
+/// that ask the same question of the same addresses.
 pub(crate) async fn answered(emulator: &Emulator, case: &str, prefix: &str, path: &str) -> Answer {
     let url = format!(
         "http://{}{path}",
-        emulator.published_cname(TEST_REGION, prefix)
+        emulator.dialable_name(TEST_REGION, prefix)
     );
     let deadline = Instant::now() + SERVED_DEADLINE;
     loop {

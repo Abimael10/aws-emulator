@@ -40,9 +40,10 @@ pub struct EnvironmentLaunch<'a> {
     pub sequence: u64,
     /// The region the launching request was addressed to.
     pub region: &'a str,
-    /// The `host:port` every environment's published address is served on
-    /// ([`super::environment_plane_authority`]).
-    pub plane_authority: &'a str,
+    /// WHERE this emulator publishes an environment's addresses: the zone its
+    /// names are announced in and the address its instances answer at
+    /// ([`super::published_addressing`]).
+    pub addressing: &'a PublishedAddressing,
     /// The CNAME prefix the launch was asked for, if any: "if not specified,
     /// the CNAME is generated automatically by appending a random alphanumeric
     /// string to the environment name", which is this environment's own unique
@@ -79,7 +80,7 @@ impl Environment {
             environment_name,
             sequence,
             region,
-            plane_authority,
+            addressing,
             cname_prefix,
             application_name,
             version_label,
@@ -101,6 +102,16 @@ impl Environment {
             )
         });
         let created = now();
+        // The NAME this environment publishes: the prefix it carries, under a
+        // sub-domain of this environment's own, which is what makes the name an
+        // environment answers at one label longer than the name its prefix
+        // reserves ([`environment_cname`]).
+        let cname = environment_cname(
+            &addressing.zone,
+            region,
+            &new_environment_sub_domain(),
+            &cname_prefix,
+        );
         let mut environment = Self {
             arn: environment_arn(region, application_name, &environment_name),
             region: region.to_string(),
@@ -110,21 +121,16 @@ impl Environment {
             platform_arn,
             template_name,
             description,
-            cname: environment_cname(plane_authority, region, &cname_prefix),
-            // The launch RESERVES the name the prefix forms, which is what
-            // `CheckDNSAvailability` reports a prefix as taken for until this
-            // environment stops carrying it.
-            reserved_cname: environment_cname(plane_authority, region, &cname_prefix),
-            // `EndpointURL` is "the URL to the LoadBalancer" or "the IP address
-            // of the instance" — the ADDRESS the environment's traffic is served
-            // at, which is this emulator's own socket
-            // ([`environment_endpoint_url`]), rather than the NAME the CNAME
-            // carries.
-            endpoint_url: Some(environment_endpoint_url(
-                plane_authority,
-                region,
-                &environment_id,
-            )),
+            // The launch RESERVES the name it publishes, which is what
+            // `CheckDNSAvailability` reports the prefix as taken for until this
+            // environment stops carrying that name.
+            reserved_cname: cname.clone(),
+            cname,
+            // Where the OTHER address it publishes is announced, and the address
+            // its instances answer at: what its `EndpointURL` is derived from once
+            // the resources below are provisioned ([`Environment::endpoint_url`]).
+            published_zone: addressing.zone.clone(),
+            instance_address: addressing.instance_address.clone(),
             tier,
             option_settings,
             // A launch deploys the configuration it was given, so there is no

@@ -7,15 +7,16 @@
 //! An environment publishes the address its traffic goes to —
 //! `EnvironmentDescription$CNAME`, "the URL to the CNAME for this environment",
 //! and the `EndpointURL` beside it — and a client READS that address and dials
-//! it. Both are addresses of the EMULATOR's own socket
-//! ([`crate::state::environment_plane_endpoint`]): the CNAME carries the
-//! environment's CNAME prefix and Region in its path
-//! ([`crate::state::environment_plane_path`]) and the `EndpointURL` the
-//! environment's own id ([`crate::state::environment_own_plane_path`]), so a
-//! client reaches either without resolving a name. A client that DOES resolve the
-//! DNS name a prefix forms ([`crate::state::fully_qualified_cname`]) to this
-//! emulator is served the same request by the leading labels of the host it named
-//! ([`crate::state::environment_address_labels`]).
+//! it. Both are HOSTS this emulator announces in a zone of its own
+//! ([`crate::state::published_addresses`]): the CNAME is the name the
+//! environment's prefix forms in its Region, and the `EndpointURL` the host of
+//! the load balancer in front of it or the address its instances answer at. A
+//! client that resolves such a name to this emulator is served by the leading
+//! labels of the host it named ([`crate::state::published_host`]), and a client
+//! that resolves nothing but the emulator's own endpoint carries in the PATH what
+//! it cannot carry in the host: the plane path naming the Region and the prefix
+//! ([`crate::state::environment_plane_path`]) or the environment's own id
+//! ([`crate::state::environment_own_plane_path`]).
 //!
 //! Neither addressing names a modelled operation of this service: the front door
 //! could resolve no operation for such a request and answered a routing failure,
@@ -50,8 +51,9 @@ use aws_smithy_types::body::SdkBody;
 use smithy_server_runtime::{http, BoxFuture, ErasedOperation, OperationContext, Service};
 
 use crate::state::{
-    environment_at_own_address, environment_serving_cname_prefix, service_state,
-    stream_instance_logs, Environment, GuestRequest, GuestResponse, InstanceLogStreaming,
+    environment_at_own_address, environment_behind_load_balancer,
+    environment_serving_cname_prefix, service_state, stream_instance_logs, Environment,
+    GuestRequest, GuestResponse, InstanceLogStreaming, PublishedHost,
 };
 /// What this plane answers for an address no environment serves — the prefix of
 /// an environment the store does not hold, or one the clock has terminated
@@ -82,8 +84,8 @@ const HEADERS_DESCRIBING_A_BODY: &[&str] = &["content-length", "transfer-encodin
 /// is served at ("the URL to the LoadBalancer", "the IP address of the
 /// instance"), which no swap moves: it goes on reaching its own environment.
 /// Which one a request used is in the path it addressed
-/// ([`crate::state::addressed_environment_path`]), or in the host it named, which
-/// can only be a name.
+/// ([`crate::state::addressed_environment_path`]), or in the labels of the host it
+/// named ([`crate::state::published_host`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Addressing<'r> {
     /// The NAME the environment publishes: the prefix it carries, in its Region.
@@ -96,6 +98,13 @@ enum Addressing<'r> {
     OwnAddress {
         region: &'r str,
         environment_id: &'r str,
+    },
+    /// The host of the LOAD BALANCER in front of one environment, which is the
+    /// `EndpointURL` of a load-balanced environment: its own address too, since no
+    /// swap moves the load balancer an environment sits behind.
+    LoadBalancer {
+        region: &'r str,
+        load_balancer: &'r str,
     },
 }
 
@@ -114,7 +123,9 @@ impl Addressed<'_> {
     /// client of it presents no credential to read a Region from.
     fn region(&self) -> &str {
         match self.addressing {
-            Addressing::Name { region, .. } | Addressing::OwnAddress { region, .. } => region,
+            Addressing::Name { region, .. }
+            | Addressing::OwnAddress { region, .. }
+            | Addressing::LoadBalancer { region, .. } => region,
         }
     }
 }
@@ -138,9 +149,9 @@ pub fn addresses_environment_plane(path: &str, host: Option<&str>) -> bool {
 /// NAME, `/_aws/elasticbeanstalk/<region>/_environment/<environment id>` for the
 /// environment's own address, each followed by the application's own request
 /// path), and otherwise the leading labels of the HOST the request named
-/// ([`crate::state::environment_address_labels`]) — the DNS name a prefix forms,
-/// for a client that resolves it to this emulator — whose whole path is then the
-/// application's own.
+/// ([`crate::state::published_host`]) — the name a prefix forms or the host of an
+/// environment's load balancer, for a client that resolves one of them to this
+/// emulator — whose whole path is then the application's own.
 fn addressed_by<'r>(path: &'r str, host: Option<&'r str>) -> Option<Addressed<'r>> {
     if let Some((addressed, path)) = crate::state::addressed_environment_path(path) {
         return Some(Addressed {
@@ -163,14 +174,23 @@ fn addressed_by<'r>(path: &'r str, host: Option<&'r str>) -> Option<Addressed<'r
             },
         });
     }
-    let (region, cname_prefix) = crate::state::environment_address_labels(host?)?;
-    Some(Addressed {
-        path,
-        addressing: Addressing::Name {
+    let addressing = match crate::state::published_host(host?)? {
+        PublishedHost::Name {
+            region,
+            cname_prefix,
+        } => Addressing::Name {
             region,
             cname_prefix,
         },
-    })
+        PublishedHost::LoadBalancer {
+            region,
+            load_balancer,
+        } => Addressing::LoadBalancer {
+            region,
+            load_balancer,
+        },
+    };
+    Some(Addressed { path, addressing })
 }
 
 /// The live environment that answers what `addressed` addresses: the one CARRYING
@@ -191,6 +211,10 @@ fn environment_answering<'store>(
             region,
             environment_id,
         } => environment_at_own_address(store, region, environment_id),
+        Addressing::LoadBalancer {
+            region,
+            load_balancer,
+        } => environment_behind_load_balancer(store, region, load_balancer),
     }
 }
 

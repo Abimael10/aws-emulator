@@ -34,8 +34,8 @@
 use crate::application_version_processing::Bundle;
 use crate::environment_info::entries;
 use crate::lifecycle::{
-    wait_for_status, Answer, Emulator, ACCOUNT_KEY_ID, PAST_DUE, POLL_INTERVAL, SOLUTION_STACK,
-    STATUS_DEADLINE, TEST_REGION,
+    assert_published_cname, wait_for_status, Answer, Emulator, ACCOUNT_KEY_ID, PAST_DUE,
+    POLL_INTERVAL, SOLUTION_STACK, STATUS_DEADLINE, TEST_REGION,
 };
 
 use service_com_amazonaws_elasticbeanstalk_awselasticbeanstalkservice as eb;
@@ -169,16 +169,18 @@ fn rows() -> Vec<Row> {
     ]
 }
 
-/// The address an environment with the CNAME prefix `prefix` publishes, which is
-/// the address a client dials: the `host:port` of the socket this emulator serves
-/// the environment plane on, then the path naming the environment's Region and
-/// that prefix.
+/// The NAME a client dials to reach the environment carrying the CNAME prefix
+/// `prefix`: a name under the zone this emulator announces its addresses in, which
+/// the plane serves for whichever environment carries that prefix now. The
+/// environment publishes the same prefix under a sub-domain of its own, which only
+/// the service can mint (`published_environment_name.rs` is where that value's
+/// form is asserted).
 fn published_address(emulator: &Emulator, prefix: &str) -> String {
-    emulator.published_cname(TEST_REGION, prefix)
+    emulator.dialable_name(TEST_REGION, prefix)
 }
 
-/// The URL this suite DIALS for `prefix` and `path` — the published address,
-/// which is the address a client dials as it was given it.
+/// The URL this suite DIALS for `prefix` and `path` — the published name, with the
+/// request path under it, which is the address a client dials as it was given it.
 fn dialled(emulator: &Emulator, prefix: &str, path: &str) -> String {
     format!("http://{}{path}", published_address(emulator, prefix))
 }
@@ -240,16 +242,19 @@ async fn deployed(emulator: &Emulator, case: &str, prefix: &str, bundle: Bundle)
     )
     .await;
     let address = published_address(emulator, prefix);
-    assert_eq!(
-        launched.expect("CNAME", case),
-        address,
-        "case {case:?}: the environment must publish the address its prefix names, got body {}",
-        launched.body
-    );
-    assert_eq!(
-        launched.expect("EndpointURL", case),
-        emulator.published_endpoint_url(TEST_REGION, launched.expect("EnvironmentId", case)),
-        "case {case:?}: the EndpointURL must be the address it is served at, got body {}",
+    // The environment publishes the name its prefix forms, under a sub-domain of
+    // its own: the prefix is the first label either way, which is what the address
+    // above dials.
+    assert_published_cname(case, launched.expect("CNAME", case), TEST_REGION, prefix);
+    // The `EndpointURL` beside the name is the address of what answers BEHIND it,
+    // which is a host too — never the name, and never a host carrying a port or a
+    // path. WHICH address it is (the environment's load balancer, or its single
+    // instance) is `published_environment_name.rs`'s table.
+    let endpoint = launched.expect("EndpointURL", case);
+    assert!(
+        !endpoint.contains(':') && !endpoint.contains('/') && endpoint != address,
+        "case {case:?}: the EndpointURL must be the host of what answers behind the name, got \
+         {endpoint:?} and body {}",
         launched.body
     );
     std::thread::sleep(PAST_DUE);
@@ -855,16 +860,17 @@ async fn retrieved_once_compiled(emulator: &Emulator, case: &str, environment: &
     }
 }
 
-/// RULE: the address an environment publishes is one a client really DIALS, as it
+/// RULE: the name an environment publishes is one a client really DIALS, as it
 /// stands: the socket this emulator serves the environment plane on speaks
-/// HTTP/1.1 on the port that address is published with, and a plain HTTP request
-/// for the path it carries — the address `EnvironmentDescription$CNAME` publishes,
-/// with the environment named in that path and no credential of any kind — is
+/// HTTP/1.1, and a plain HTTP request stating that name — the host
+/// `EnvironmentDescription$CNAME` publishes, with no credential of any kind — is
 /// answered by the deployed application.
 ///
-/// The connection is opened to the authority the published address names, which is
-/// the one a client was handed: what is under test is that the plane resolves the
-/// environment out of the published address the request STATES.
+/// The name is sent as the request's `Host`, which is what a client that resolved
+/// it does, and the connection is opened to the loopback interface the core binds
+/// its listeners on — the interface a resolver answers a name under the loopback
+/// zone with (RFC 6761). What is under test is that the plane resolves the
+/// environment out of the published name the request STATES.
 #[tokio::test]
 async fn the_published_address_answers_a_plain_http_request() {
     let row = PythonRow {
@@ -877,21 +883,20 @@ async fn the_published_address_answers_a_plain_http_request() {
     let emulator = Emulator::with_object_storage();
     deployed_python(&emulator, &row, "deployed-env-1").await;
 
-    let address = published_address(&emulator, "deployed-env-1");
-    let (authority, path) = address.split_once('/').unwrap_or_else(|| {
-        panic!("case {case:?}: expected an address with a path, got {address:?}")
-    });
+    let name = published_address(&emulator, "deployed-env-1");
+    let authority = emulator.plane_authority();
     let port: u16 = authority
         .rsplit_once(':')
         .and_then(|(_host, port)| port.parse().ok())
-        .unwrap_or_else(|| panic!("case {case:?}: expected a port in {address:?}"));
-    let request = format!(
-        "GET /{path} HTTP/1.1\r\nHost: {authority}\r\nAccept: */*\r\nConnection: close\r\n\r\n"
-    );
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: expected the plane to answer on a port, got {authority:?}")
+        });
+    let request =
+        format!("GET / HTTP/1.1\r\nHost: {name}\r\nAccept: */*\r\nConnection: close\r\n\r\n");
     let mut connection = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
         .await
         .unwrap_or_else(|error| {
-            panic!("case {case:?}: expected {address} to be dialable, got {error}")
+            panic!("case {case:?}: expected {name} to be dialable, got {error}")
         });
     tokio::io::AsyncWriteExt::write_all(&mut connection, request.as_bytes())
         .await

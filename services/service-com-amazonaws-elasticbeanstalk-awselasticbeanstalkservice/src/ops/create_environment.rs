@@ -247,17 +247,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx);
-        // The socket every environment's published address is served on, opened
-        // on the first call that needs one: the address this launch publishes has
-        // to be one a client can dial, and binding it reaches the core — which
-        // cannot happen while the store is held.
-        let plane_authority =
-            crate::state::environment_plane_authority(&*self.engine, ctx).await;
+        // WHERE this launch publishes the environment's addresses: the zone this
+        // emulator announces its own names in, and the address the environment
+        // plane answers on — whose socket is opened on the first call that needs
+        // one, which reaches the core and so cannot happen while the store is
+        // held.
+        let addressing = crate::state::published_addressing(&*self.engine, ctx).await;
         // The launch takes this service's store and gives it back before this call
         // awaits anything again: what the launch owes CloudWatch Logs is delivered
         // afterwards, and that delivery calls another service and RUNS the
         // deployed application, so the guard cannot be held across it.
-        let launched = self.launch(&input, &region, &plane_authority, ctx)?;
+        let launched = self.launch(&input, &region, &addressing, ctx)?;
         // "Launches an environment for the specified application using the
         // specified configuration": the launch DEPLOYS that version to the
         // environment's instances, which starts the application's web process on
@@ -310,11 +310,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateEnvironment
         &self,
         input: &CreateEnvironmentInput,
         region: &str,
-        plane_authority: &str,
+        addressing: &crate::state::PublishedAddressing,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Launched, CreateEnvironmentError> {
         let region = region.to_string();
-        let plane_authority = plane_authority.to_string();
 
         // A parameter this request needs but did not supply is answered BEFORE any
         // resource the request names is resolved: an absent input is a statement about
@@ -611,7 +610,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateEnvironment
             environment_name,
             sequence,
             region: &region,
-            plane_authority: &plane_authority,
+            addressing,
             // "If not specified, the CNAME is generated automatically by
             // appending a random alphanumeric string to the environment name",
             // which the launch derives from the environment's own id.

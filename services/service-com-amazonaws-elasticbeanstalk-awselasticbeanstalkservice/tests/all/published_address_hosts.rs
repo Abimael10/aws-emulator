@@ -5,23 +5,29 @@
 //! RULE: every value this service publishes as an address for a client to DIAL —
 //! `EnvironmentDescription$CNAME` ("the URL to the CNAME for this environment")
 //! and the `EndpointURL` beside it ("the URL to the LoadBalancer", "the IP address
-//! of the instance") — sits on a host THIS emulator answers on. It is never a name
-//! in Elastic Beanstalk's public DNS zone or any other AWS production domain,
-//! which resolve to nothing on the machine this emulator runs on: the name that
-//! zone forms is a different value, reported where the service reports on a NAME
-//! rather than on an address (`CheckDNSAvailability$FullyQualifiedCNAME`), so the
-//! address a client dials and that name are never the same string.
+//! of the instance") — is a HOST this emulator answers at: a name in the zone it
+//! may announce a name of its own in (the loopback zone RFC 6761 reserves for the
+//! interface the core binds its listeners on), or a loopback address literal. It
+//! is never a name in Elastic Beanstalk's public DNS zone or any other AWS
+//! production domain, which resolve to nothing on the machine this emulator runs
+//! on: the name that zone forms is a different value, reported where the service
+//! reports on a NAME rather than on an address
+//! (`CheckDNSAvailability$FullyQualifiedCNAME`), so the address a client dials and
+//! that name are never the same string. Neither value carries a port or a path —
+//! a host carries neither, and the port and the path a request needs are resolved
+//! at the listener the plane is served on.
 //!
-//! `published_environment_name.rs` holds the published address to its FORM — the
-//! plane path, the Region segment and the prefix segment, over the prefix lengths
-//! and cases `DNSCnamePrefix` admits — so this suite does not repeat that table.
-//! What it spans is what THIS rule adds: which operation minted the address
-//! (`CreateEnvironment` here, `ComposeEnvironments` in the second suite), whether
-//! the launch supplied the CNAME prefix or left it to be generated, the Region,
-//! whether an application is deployed behind the address, and whether the value is
-//! read from the launch's own answer or from a later `DescribeEnvironments`. Every
-//! published address is then dialled and has to be ANSWERED by this emulator,
-//! which an address in a public AWS zone could not be.
+//! `published_environment_name.rs` holds the published CNAME to its FORM — the
+//! prefix label, the environment's own sub-domain, the Region and this service's
+//! own domain, over the prefix lengths and cases `DNSCnamePrefix` admits — so this
+//! suite does not repeat that table. What it spans is what THIS rule adds: which
+//! operation minted the address (`CreateEnvironment` here, `ComposeEnvironments`
+//! in the second suite), whether the launch supplied the CNAME prefix or left it
+//! to be generated, the Region, whether an application is deployed behind the
+//! address, and whether the value is read from the launch's own answer or from a
+//! later `DescribeEnvironments`. Every published address is then dialled and has to
+//! be ANSWERED by this emulator, which an address in a public AWS zone could not
+//! be.
 //!
 //! The HTTP harness (the router, the form encoder, the XML element reader, the
 //! object-storage upload and the poll for a settled status) is the one
@@ -128,52 +134,54 @@ fn rows() -> Vec<AddressRow> {
     ]
 }
 
-/// Hold one published address to this rule, and hand back the `host:port` it
-/// starts with and the path under it.
+/// Hold one published address to this rule: a HOST this emulator answers at, and
+/// nothing of an AWS production address.
 ///
 /// What is asserted is the address itself: no part of it in Elastic Beanstalk's
-/// public DNS zone or an AWS production domain, and a `host:port` a client of
-/// this emulator can open a connection to — the loopback the core binds its
-/// listeners on, carrying the port that listener answers at. The FORM of the path
-/// under it is `published_environment_name.rs`'s subject, not this one's.
-fn emulator_address(case: &str, member: &str, address: &str) -> (String, String) {
+/// public DNS zone or an AWS production domain, no port separator and no path
+/// separator — a host carries neither — and a host a client of this emulator
+/// reaches, which is a loopback address literal or a name under the zone RFC 6761
+/// reserves for the loopback interface the core binds its listeners on. The FORM of
+/// the labels in front of that zone is `published_environment_name.rs`'s subject,
+/// not this one's.
+fn emulator_address(case: &str, member: &str, address: &str) {
     assert!(
         !address.contains(PUBLISHED_CNAME_ZONE) && !address.contains(PRODUCTION_DOMAIN),
         "case {case:?}: the published {member} must not be an AWS production address, got \
          {address:?}"
     );
-    let (authority, path) = address.split_once('/').unwrap_or_else(|| {
-        panic!("case {case:?}: expected the published {member} to carry a path, got {address:?}")
-    });
-    let (host, port) = authority.rsplit_once(':').unwrap_or_else(|| {
-        panic!("case {case:?}: expected the published {member} to carry a port, got {address:?}")
-    });
-    let on_this_machine = host
+    assert!(
+        !address.contains(':') && !address.contains('/'),
+        "case {case:?}: the published {member} is a host, carrying neither ':' nor '/', got \
+         {address:?}"
+    );
+    assert!(
+        address.split('.').all(|label| !label.is_empty()),
+        "case {case:?}: the published {member} must carry no empty label, got {address:?}"
+    );
+    let on_this_machine = address
         .parse::<std::net::IpAddr>()
-        .map_or(host == LOOPBACK_NAME, |ip| ip.is_loopback());
+        .map_or(address == LOOPBACK_NAME || address.ends_with(&format!(".{LOOPBACK_NAME}")), |ip| {
+            ip.is_loopback()
+        });
     assert!(
         on_this_machine,
-        "case {case:?}: the published {member} must sit on a host this emulator answers on, got \
-         {host:?} in {address:?}"
+        "case {case:?}: the published {member} must be a host this emulator answers at, got \
+         {address:?}"
     );
-    assert!(
-        port.parse::<u16>().unwrap_or_default() > 0,
-        "case {case:?}: the published {member} must carry the port its listener answers at, got \
-         {port:?} in {address:?}"
-    );
-    (authority.to_string(), path.to_string())
 }
 
 /// The whole HTTP/1.1 answer a client gets for `GET /` of the published address
 /// `address`, named for the `member` that published it.
 ///
 /// One dial for the whole target: `published_environment_name::dialled` opens the
-/// connection to the loopback literal with the port the address published and
-/// states the published authority in the request's `Host`, so what is under test
-/// is the addressing rather than the host's own resolver — [`emulator_address`] is
-/// what holds the published host itself to the loopback the core binds.
-async fn answer_at(case: &str, member: &str, address: &str) -> String {
-    dialled(&format!("{case}, the published {member}"), address).await
+/// connection to the loopback literal on the port the environment plane answers at
+/// — the published host carries none — and states that host in the request's
+/// `Host`, so what is under test is the addressing rather than the host's own
+/// resolver; [`emulator_address`] is what holds the published host itself to the
+/// loopback the core binds.
+async fn answer_at(emulator: &Emulator, case: &str, member: &str, address: &str) -> String {
+    dialled(emulator, &format!("{case}, the published {member}"), address).await
 }
 
 /// Upload a bundle carrying [`LAUNCH_DOCUMENT`] as its root document and create
@@ -240,19 +248,20 @@ async fn no_published_environment_address_is_an_aws_production_name() {
         let endpoint_url = launched.expect("EndpointURL", case).to_string();
 
         // Both published addresses obey the rule …
-        let (cname_authority, cname_path) = emulator_address(case, "CNAME", &cname);
-        let (endpoint_authority, _) = emulator_address(case, "EndpointURL", &endpoint_url);
-        // … and both are addresses of the same listener, the one socket this
-        // service's environment traffic is served on.
-        assert_eq!(
-            cname_authority, endpoint_authority,
-            "case {case:?}: both published addresses must name the socket this service serves on"
+        emulator_address(case, "CNAME", &cname);
+        emulator_address(case, "EndpointURL", &endpoint_url);
+        // … and they are different values: the NAME the environment answers at,
+        // and the address of what answers behind it.
+        assert_ne!(
+            cname, endpoint_url,
+            "case {case:?}: the EndpointURL is the address behind the name, not the name"
         );
 
-        // The prefix the address carries is what the PUBLIC DNS name is formed
-        // from, and the two values are never the same string: one is an address a
-        // client dials, the other the name the service reports ON.
-        let prefix = cname_path.rsplit('/').next().unwrap_or_default().to_string();
+        // The prefix the NAME carries — its first dot-label, the documented route
+        // back to it — is what the PUBLIC DNS name is formed from, and the two
+        // values are never the same string: one is an address a client dials, the
+        // other the name the service reports ON.
+        let prefix = cname.split('.').next().unwrap_or_default().to_string();
         let checked = ok_in(
             &emulator,
             case,
@@ -293,8 +302,8 @@ async fn no_published_environment_address_is_an_aws_production_name() {
             emulator_address(case, member, &read_back);
         }
 
-        // And the client the address exists for: a request for the path it
-        // carries, on the port it published.
+        // And the client the address exists for: a request stating the published
+        // host, on the port the plane answers at.
         let expected = match row.version_label {
             // "Ready: Environment is available to have an action performed on
             // it" — waited for as a CONDITION, never as a fixed time, because the
@@ -307,7 +316,7 @@ async fn no_published_environment_address_is_an_aws_production_name() {
             None => None,
         };
         for (member, address) in [("CNAME", &cname), ("EndpointURL", &endpoint_url)] {
-            let answered = answer_at(case, member, address).await;
+            let answered = answer_at(&emulator, case, member, address).await;
             match expected.as_deref() {
                 Some(document) => assert!(
                     answered.starts_with("HTTP/1.1 200") && answered.contains(document),
@@ -391,7 +400,7 @@ async fn a_composed_environment_publishes_an_address_this_emulator_serves() {
         wait_for_status(&emulator, case, environment_name, eb::state::STATUS_READY).await;
         let document = String::from_utf8_lossy(document).to_string();
         for (member, address) in [("CNAME", &cname), ("EndpointURL", &endpoint_url)] {
-            let answered = answer_at(case, member, address).await;
+            let answered = answer_at(&emulator, case, member, address).await;
             assert!(
                 answered.starts_with("HTTP/1.1 200") && answered.contains(&document),
                 "case {case:?}: a client dialling the published {member} must be served this \

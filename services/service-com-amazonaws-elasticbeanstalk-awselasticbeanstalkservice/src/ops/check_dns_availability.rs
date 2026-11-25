@@ -144,12 +144,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialize_due_transitions();
 
         // "The fully qualified CNAME to reserve when CreateEnvironment is called
-        // with the provided prefix" — the DNS NAME the prefix forms in this
-        // Region ([`crate::state::fully_qualified_cname`]), which is what this
-        // report is about: the caller reads it beside `Available` and then
-        // creates an environment under that prefix. It is reported for an
-        // unusable prefix too: the member says which name the prefix WOULD form,
-        // and `Available` is what says it cannot be had.
+        // with the provided prefix" — the DNS NAME the prefix forms in this Region
+        // ([`crate::state::fully_qualified_cname`]), in the zone Elastic Beanstalk
+        // publishes its environments' names in. A name this report is ABOUT, not
+        // an address the caller dials: the address the environment created under
+        // that prefix is REACHED at is its `CNAME`, announced in the zone this
+        // emulator answers in. It is reported for an unusable prefix too: the
+        // member says which name the prefix WOULD form, and `Available` is what
+        // says it cannot be had.
         let fully_qualified_cname =
             crate::state::fully_qualified_cname(&region, &input.cname_prefix);
         // Available unless the name cannot exist at all, or a live environment

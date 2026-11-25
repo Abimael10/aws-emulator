@@ -3,11 +3,10 @@
 //! `CheckDNSAvailability`, over the service's awsQuery HTTP surface.
 //!
 //! The rules under test: the DNS name a prefix forms is
-//! `<prefix>.<region>.elasticbeanstalk.com`, which is what
-//! `FullyQualifiedCNAME` reports — the name the check is ABOUT — while the
-//! address the environment holding it is SERVED at is the emulator's own endpoint
-//! with the environment's Region and that prefix in the path, because a client
-//! reads THAT address and dials it. The name can be RESERVED by at most ONE live
+//! `<prefix>.<region>.elasticbeanstalk.<zone>`, which is what
+//! `FullyQualifiedCNAME` reports — the name the check is ABOUT — and which is also
+//! the name the environment created under that prefix PUBLISHES as its `CNAME`.
+//! The name can be RESERVED by at most ONE live
 //! environment in its Region — the one that took it when it was created and still
 //! carries it — and it is available exactly when the prefix can be a host name
 //! label at all and no live environment holds that reservation. Checking a prefix
@@ -18,7 +17,7 @@
 //! the one `lifecycle.rs` already owns in this same test binary, so this suite
 //! adds no second copy of it.
 
-use crate::lifecycle::{Emulator, SOLUTION_STACK, TEST_REGION};
+use crate::lifecycle::{assert_published_cname, Emulator, CNAME_ZONE, SOLUTION_STACK, TEST_REGION};
 
 /// How long a poll below waits for a transition the CLOCK owes to be completed before it
 /// gives up: generous, so a loaded host is not what decides the outcome. The transition
@@ -28,19 +27,14 @@ const RELEASE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60)
 /// How long a poll below waits between two looks.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// The address `prefix` forms in `region`, as `state::environment_cname` builds
-/// it: the DNS name whose first labels are that prefix and that Region, on the
-/// port the socket this emulator serves the environment plane on answers. Read
-/// off the emulator, because that port is the core's to choose.
-fn served_at(emulator: &Emulator, prefix: &str, region: &str) -> String {
-    emulator.published_cname(region, prefix)
-}
-
 /// The DNS name `prefix` forms in `region`, as `CheckDNSAvailability` reports it:
-/// `<prefix>.<region>.elasticbeanstalk.com`, spelled out here rather than read off
-/// the crate so the FORM is what this suite holds the report to.
+/// the prefix, the Region and this service's own label in the zone this emulator
+/// announces its names in, spelled out here rather than read off the crate so the
+/// FORM is what this suite holds the report to. The environment that takes that
+/// prefix publishes the same name under a sub-domain of its own, which
+/// `assert_published_cname` holds it to.
 fn dns_name(prefix: &str, region: &str) -> String {
-    format!("{prefix}.{region}.elasticbeanstalk.com")
+    format!("{prefix}.{region}.{CNAME_ZONE}")
 }
 
 /// One `CheckDNSAvailability` call: its prefix, the region it is signed for, and
@@ -86,11 +80,11 @@ async fn availability_is_derived_from_the_prefix_and_the_live_environments() {
         "case \"setup\": expected 200 from CreateEnvironment, got {} and body {}",
         held.status, held.body
     );
-    assert_eq!(
+    assert_published_cname(
+        "setup",
         held.expect("CNAME", "setup"),
-        served_at(&emulator, "held-prefix", TEST_REGION),
-        "case \"setup\": the environment must hold the CNAME its prefix forms, got {}",
-        held.body
+        TEST_REGION,
+        "held-prefix",
     );
 
     // Rows differ along what the rule generalises over: whether the name is
@@ -282,6 +276,7 @@ async fn checking_a_prefix_neither_reserves_nor_releases_it() {
         created.status, created.body
     );
     let environment_id = created.expect("EnvironmentId", case).to_string();
+    let held_cname = created.expect("CNAME", case).to_string();
 
     // Now it is held, and repeated checks do not release it.
     for round in 0..3 {
@@ -306,7 +301,7 @@ async fn checking_a_prefix_neither_reserves_nor_releases_it() {
         .await;
     assert_eq!(
         described.values_at("Environments/member/CNAME"),
-        vec![served_at(&emulator, prefix, TEST_REGION).as_str()],
+        vec![held_cname.as_str()],
         "case {case:?}: the checked name must still belong to its environment, got {}",
         described.body
     );
@@ -444,10 +439,10 @@ async fn create_environment_holds_the_same_cname_rule() {
         "case \"another region\": the same prefix names another CNAME there, got {} and body {}",
         elsewhere.status, elsewhere.body
     );
-    assert_eq!(
+    assert_published_cname(
+        "another region",
         elsewhere.expect("CNAME", "another region"),
-        served_at(&emulator, "taken-prefix", "eu-central-1"),
-        "case \"another region\": unexpected CNAME in {}",
-        elsewhere.body
+        "eu-central-1",
+        "taken-prefix",
     );
 }

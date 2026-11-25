@@ -166,8 +166,9 @@ pub fn composed_environment_name(manifest_name: &str, group_name: Option<&str>) 
 #[derive(Debug)]
 pub struct ComposedEnvironment<'a> {
     pub region: &'a str,
-    /// The `host:port` every environment's published address is served on.
-    pub plane_authority: &'a str,
+    /// WHERE this emulator publishes an environment's addresses
+    /// ([`super::published_addressing`]).
+    pub addressing: &'a PublishedAddressing,
     pub application_name: &'a str,
     /// The version label this environment runs — "a list of version labels,
     /// specifying one or more application source bundles that belong to the
@@ -201,7 +202,7 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
     pub fn compose_environment(&mut self, composed: ComposedEnvironment<'_>) -> Environment {
         let ComposedEnvironment {
             region,
-            plane_authority,
+            addressing,
             application_name,
             version_label,
             environment_name,
@@ -234,7 +235,7 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
             environment_name: environment_name.to_string(),
             sequence,
             region,
-            plane_authority,
+            addressing,
             // A manifest declares no CNAME prefix, so a composed environment
             // gets the generated one every launch that names none gets.
             cname_prefix: None,

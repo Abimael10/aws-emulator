@@ -17,7 +17,9 @@
 //! each side by (id or name), which of the two prefixes is asked about, and a
 //! prefix no swap touched.
 
-use crate::lifecycle::{Emulator, PAST_DUE, SOLUTION_STACK, TEST_REGION};
+use crate::lifecycle::{assert_published_cname, wait_for_status, Emulator, SOLUTION_STACK, TEST_REGION};
+
+use service_com_amazonaws_elasticbeanstalk_awselasticbeanstalkservice as eb;
 
 /// The application every case is created under.
 const APPLICATION: &str = "cname-app";
@@ -54,17 +56,15 @@ fn rows() -> Vec<Row> {
     ]
 }
 
-/// The CNAME a prefix forms, as `state::environment_cname` builds it: the DNS
-/// name whose first labels are that prefix and the Region, on the port the socket
-/// this emulator serves the environment plane on answers. Read off the emulator,
-/// because that port is the core's to choose.
-fn fully_qualified(emulator: &Emulator, prefix: &str) -> String {
-    emulator.published_cname(TEST_REGION, prefix)
-}
-
 /// Create the environment `name` holding the CNAME `prefix` forms, and answer its
-/// `EnvironmentId`.
-async fn create(emulator: &Emulator, case: &str, name: &str, prefix: &str) -> String {
+/// `EnvironmentId` and the `CNAME` it published — held to its form, since only the
+/// service can mint the sub-domain that name carries.
+async fn create(
+    emulator: &Emulator,
+    case: &str,
+    name: &str,
+    prefix: &str,
+) -> (String, String) {
     let created = emulator
         .call(
             "CreateEnvironment",
@@ -81,7 +81,9 @@ async fn create(emulator: &Emulator, case: &str, name: &str, prefix: &str) -> St
         "case {case:?}: expected 200 from CreateEnvironment, got {} and body {}",
         created.status, created.body
     );
-    created.expect("EnvironmentId", case).to_string()
+    let cname = created.expect("CNAME", case).to_string();
+    assert_published_cname(case, &cname, TEST_REGION, prefix);
+    (created.expect("EnvironmentId", case).to_string(), cname)
 }
 
 /// Whether `CheckDNSAvailability` reports `prefix` available.
@@ -146,12 +148,13 @@ async fn a_swap_releases_the_prefixes_it_exchanges_and_a_second_swap_takes_them_
         let case = row.case;
         let source_prefix = format!("{}-prefix", row.source);
         let destination_prefix = format!("{}-prefix", row.destination);
-        let source_id = create(&emulator, case, row.source, &source_prefix).await;
-        let destination_id = create(&emulator, case, row.destination, &destination_prefix).await;
+        let (source_id, source_cname) = create(&emulator, case, row.source, &source_prefix).await;
+        let (destination_id, destination_cname) =
+            create(&emulator, case, row.destination, &destination_prefix).await;
         // An untouched prefix, so what the swap changes is asserted against a
         // reservation no swap moved.
         let untouched_prefix = format!("{}-untouched", row.source);
-        let untouched_id = create(
+        let (untouched_id, untouched_cname) = create(
             &emulator,
             case,
             &format!("{}-untouched", row.source),
@@ -168,19 +171,23 @@ async fn a_swap_releases_the_prefixes_it_exchanges_and_a_second_swap_takes_them_
             );
         }
 
-        // The swap needs both environments Ready, which is what the clock owes.
-        std::thread::sleep(PAST_DUE);
+        // The swap needs both environments Ready, which is what the clock owes:
+        // waited for by LOOKING AGAIN until each one reports it, never by waiting a
+        // fixed time.
+        for environment in [row.source, row.destination] {
+            wait_for_status(&emulator, case, environment, eb::state::STATUS_READY).await;
+        }
         swap(&emulator, &row, &source_id, &destination_id).await;
 
         // Each environment now answers at the OTHER's name...
         assert_eq!(
             reported_cname(&emulator, case, &source_id).await,
-            fully_qualified(&emulator, &destination_prefix),
+            destination_cname,
             "case {case:?}: the swap must hand the source the destination's CNAME"
         );
         assert_eq!(
             reported_cname(&emulator, case, &destination_id).await,
-            fully_qualified(&emulator, &source_prefix),
+            source_cname,
             "case {case:?}: the swap must hand the destination the source's CNAME"
         );
         // ... and neither carries the name it reserved, so both exchanged
@@ -199,7 +206,7 @@ async fn a_swap_releases_the_prefixes_it_exchanges_and_a_second_swap_takes_them_
         );
         assert_eq!(
             reported_cname(&emulator, case, &untouched_id).await,
-            fully_qualified(&emulator, &untouched_prefix),
+            untouched_cname,
             "case {case:?}: the untouched environment keeps its own CNAME"
         );
 
@@ -222,10 +229,9 @@ async fn a_swap_releases_the_prefixes_it_exchanges_and_a_second_swap_takes_them_
             "case {case:?}: expected the create to refuse a served name, got {} and body {}",
             taken.status, taken.body
         );
-        let expected = format!(
-            "DNS name ({}) is not available.",
-            fully_qualified(&emulator, &source_prefix)
-        );
+        // The name the refusal quotes is the one the environment SERVING that
+        // prefix carries, which the swap handed it.
+        let expected = format!("DNS name ({source_cname}) is not available.");
         assert_eq!(
             taken.error_message(),
             expected,
@@ -238,7 +244,7 @@ async fn a_swap_releases_the_prefixes_it_exchanges_and_a_second_swap_takes_them_
         swap(&emulator, &row, &source_id, &destination_id).await;
         assert_eq!(
             reported_cname(&emulator, case, &source_id).await,
-            fully_qualified(&emulator, &source_prefix),
+            source_cname,
             "case {case:?}: swapping twice must restore the source's CNAME"
         );
         for prefix in [&source_prefix, &destination_prefix] {
@@ -264,9 +270,13 @@ async fn checking_a_released_prefix_changes_nothing() {
         "case {case:?}: expected 200 from CreateApplication, got {} and body {}",
         created.status, created.body
     );
-    let source_id = create(&emulator, case, "blue", "blue-prefix").await;
-    let destination_id = create(&emulator, case, "green", "green-prefix").await;
-    std::thread::sleep(PAST_DUE);
+    let (source_id, blue_cname) = create(&emulator, case, "blue", "blue-prefix").await;
+    let (destination_id, green_cname) = create(&emulator, case, "green", "green-prefix").await;
+    // The swap needs both environments Ready, which is what the clock owes:
+    // waited for as a CONDITION, never as a fixed time.
+    for environment in ["blue", "green"] {
+        wait_for_status(&emulator, case, environment, eb::state::STATUS_READY).await;
+    }
     let swapped = emulator
         .call(
             "SwapEnvironmentCNAMEs",
@@ -291,12 +301,12 @@ async fn checking_a_released_prefix_changes_nothing() {
     // And the environments are exactly as the swap left them.
     assert_eq!(
         reported_cname(&emulator, case, &source_id).await,
-        fully_qualified(&emulator, "green-prefix"),
+        green_cname,
         "case {case:?}: the reads must not move either CNAME"
     );
     assert_eq!(
         reported_cname(&emulator, case, &destination_id).await,
-        fully_qualified(&emulator, "blue-prefix"),
+        blue_cname,
         "case {case:?}: the reads must not move either CNAME"
     );
 }

@@ -15,12 +15,12 @@
 
 use crate::harness::{Answer, Emulator, PAST_DUE, SOLUTION_STACK};
 
-/// The segment every environment address this service derives carries ahead of
-/// the Region and the CNAME prefix — an environment's address is the `host:port`
-/// this emulator answers on followed by the path naming this service's plane, the
-/// Region and the prefix, so the marker below is the segment that names this
-/// service in it and the prefix is read off the value rather than repeated here.
-const CNAME_SERVICE_SEGMENT: &str = "/elasticbeanstalk/";
+/// The label every CNAME this service derives carries behind the Region — an
+/// environment's CNAME is the DNS name its prefix forms, whose first label is the
+/// prefix, whose second is the Region and whose third names this service, so the
+/// marker below is that label and the prefix is read off the value rather than
+/// repeated here.
+const CNAME_SERVICE_LABEL: &str = ".elasticbeanstalk.";
 
 /// The awsQuery error envelope's `<Message>`, or `""` on an answer that carries
 /// none. Read through the shared harness's element reader, so this suite adds no
@@ -201,13 +201,13 @@ async fn the_two_selected_environments_exchange_their_cnames() {
             ("destination", &destination_before, row.destination_prefix),
         ] {
             assert!(
-                cname.contains(CNAME_SERVICE_SEGMENT),
-                "case {case:?}: the {label} CNAME must be an address this emulator serves for \
+                cname.contains(CNAME_SERVICE_LABEL),
+                "case {case:?}: the {label} CNAME must be a name this emulator announces for \
                  this service, got {cname:?}"
             );
             if let Some(prefix) = prefix {
                 assert!(
-                    cname.ends_with(&format!("/{prefix}")),
+                    cname.starts_with(&format!("{prefix}.")),
                     "case {case:?}: the {label} CNAME must name its prefix {prefix:?}, got {cname:?}"
                 );
             }

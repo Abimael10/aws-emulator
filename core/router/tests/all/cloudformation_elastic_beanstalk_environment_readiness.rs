@@ -288,13 +288,19 @@ async fn a_stack_is_complete_only_once_its_environment_is_ready() {
              {environments}"
         );
 
-        // And it really holds its address: the prefix the published address names is
-        // taken for as long as the environment carries it.
+        // And it really holds its address: the prefix the published NAME names is
+        // taken for as long as the environment carries it. The prefix is the
+        // FIRST dot-label of that name, which is the documented route back to it.
         let cname = element(&environments, "CNAME");
         let prefix = cname
-            .rsplit('/')
+            .split('.')
             .next()
             .unwrap_or_else(|| panic!("case {case:?}: no CNAME prefix in {environments}"));
+        assert!(
+            !cname.contains(':') && !cname.contains('/'),
+            "case {case:?}: a published CNAME is a DNS name, carrying neither ':' nor '/', got \
+             {cname:?}"
+        );
         let checked = elasticbeanstalk(
             &router,
             case,
@@ -312,8 +318,8 @@ async fn a_stack_is_complete_only_once_its_environment_is_ready() {
         if let Some(declared) = row.cname_prefix {
             assert_eq!(
                 prefix, declared,
-                "case {case:?}: the published address must name the declared prefix, got \
-                 {cname:?}"
+                "case {case:?}: the published name's first label must be the declared prefix, \
+                 got {cname:?}"
             );
         }
     }
