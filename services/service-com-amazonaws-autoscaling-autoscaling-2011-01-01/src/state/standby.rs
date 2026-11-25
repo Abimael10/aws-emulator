@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use super::{
-    ActivityMilestone, AutoScalingState, StoredActivity, StoredInstance, GROUP_STATE_IN_SERVICE,
+    ActivityMilestone, AutoScalingState, StoredActivity, StoredInstance,
     LIFECYCLE_ENTERING_STANDBY, LIFECYCLE_IN_SERVICE, LIFECYCLE_PENDING, LIFECYCLE_STANDBY,
     LIFECYCLE_TRANSITION,
 };
@@ -308,7 +308,6 @@ impl AutoScalingState {
                             desired_capacity,
                             new_desired_capacity,
                         ),
-                        group_state: GROUP_STATE_IN_SERVICE,
                         start_time: now,
                         completes_at: Some(due),
                         milestone: move_kind.milestone(),

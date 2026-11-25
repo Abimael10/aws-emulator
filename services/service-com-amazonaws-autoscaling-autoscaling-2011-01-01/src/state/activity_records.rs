@@ -153,8 +153,6 @@ pub struct ActivityRecord<'a> {
     pub description: String,
     /// `Activity$Cause`: the reason the activity began.
     pub cause: String,
-    /// `Activity$AutoScalingGroupState`.
-    pub group_state: &'a str,
     /// `Activity$StartTime`.
     pub start_time: SystemTime,
     /// When the activity completes, or `None` for one that is already finished.
@@ -167,6 +165,23 @@ pub struct ActivityRecord<'a> {
 }
 
 impl AutoScalingState {
+    /// The `Activity$AutoScalingGroupState` of the group one activity belongs to: "The
+    /// state of the Auto Scaling group, which is either InService or Deleted"
+    /// (`smithy_query(query="doc",shape="Activity",member="AutoScalingGroupState")`).
+    ///
+    /// Read off whether the account still holds the group, so the two values are both
+    /// reachable: an activity of a group that has since been deleted reports it deleted
+    /// however the group stood when the activity was written. THE ONE reading of that
+    /// state, for the one read that reports it ([`StoredActivity::to_activity`]).
+    #[must_use]
+    pub fn activity_group_state(&self, group_name: &str) -> &'static str {
+        if self.groups.contains_key(group_name) {
+            GROUP_STATE_IN_SERVICE
+        } else {
+            GROUP_STATE_DELETED
+        }
+    }
+
     /// The cause a capacity change records: when it was asked for, what asked for it, and
     /// the capacities it moved between.
     ///
@@ -272,7 +287,6 @@ impl AutoScalingState {
                 record.milestone.progress()
             },
             details,
-            auto_scaling_group_state: Some(record.group_state.to_string()),
             completes_at: record.completes_at,
             // A step that is under way is going to complete: a step that turns out not to
             // have is settled with the terminal code it ends in instead
@@ -318,7 +332,6 @@ impl AutoScalingState {
             status_message: Some(status_message),
             progress: 100,
             details: None,
-            auto_scaling_group_state: Some(GROUP_STATE_IN_SERVICE.to_string()),
             completes_at: None,
             // Nothing is owed on it, so there is no later completion to state a code for.
             completes_as: None,

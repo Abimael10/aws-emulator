@@ -387,7 +387,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 group_arn: &arn,
                 description: format!("Deleting the Auto Scaling group: {name}"),
                 cause: cause.clone(),
-                group_state: crate::state::GROUP_STATE_DELETED,
                 start_time: now,
                 completes_at: None,
                 milestone: crate::state::ActivityMilestone::InProgress,

@@ -1215,7 +1215,6 @@ async fn the_activity_a_termination_answers_with_describes_that_termination() {
     for (member, expected) in [
         ("AutoScalingGroupName", "asg-activity"),
         ("StatusCode", "InProgress"),
-        ("AutoScalingGroupState", "InService"),
         ("Description", &format!("Terminating EC2 instance: {}", held[0])[..]),
     ] {
         let actual = tag_value(&answer.body, member);
@@ -1225,6 +1224,13 @@ async fn the_activity_a_termination_answers_with_describes_that_termination() {
             answer.body
         );
     }
+    // This answer reports the activity it just recorded, not the state of the account's
+    // groups, so it leaves the optional `AutoScalingGroupState` out.
+    assert!(
+        tag_value(&answer.body, "AutoScalingGroupState").is_empty(),
+        "expected the activity to report no AutoScalingGroupState, got {:?}",
+        answer.body
+    );
     for member in ["ActivityId", "StartTime", "Progress", "AutoScalingGroupARN"] {
         assert!(
             !tag_value(&answer.body, member).is_empty(),

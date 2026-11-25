@@ -1509,7 +1509,6 @@ pub struct StoredActivity {
     pub status_message: Option<String>,
     pub progress: i32,
     pub details: Option<String>,
-    pub auto_scaling_group_state: Option<String>,
     /// When this activity finishes, if it has not finished yet.
     pub completes_at: Option<SystemTime>,
     /// The terminal `ScalingActivityStatusCode` the clock finishes this activity in, for one
@@ -1529,10 +1528,13 @@ impl StoredActivity {
     /// operation answers with and a later read of the same activity report it
     /// identically.
     ///
-    /// `group_held` is whether the account still holds the group the activity belongs to,
-    /// which is what `AutoScalingGroupState` reports: a group deleted since the activity
-    /// was recorded is reported deleted on every activity of its own.
-    pub fn to_activity(&self, group_held: bool) -> Activity {
+    /// `group_state` is the `AutoScalingGroupState` to report, or `None` to leave that
+    /// optional member out. The state of the group is reported only by a read that
+    /// reports the state of groups at all — the one a caller asked to be told about
+    /// deleted groups on — and there it is read off whether the account still holds the
+    /// group ([`AutoScalingState::activity_group_state`]), so a group deleted since the
+    /// activity was recorded is reported deleted on every activity of its own.
+    pub fn to_activity(&self, group_state: Option<&str>) -> Activity {
         Activity {
             activity_id: self.activity_id.clone(),
             auto_scaling_group_name: self.auto_scaling_group_name.clone(),
@@ -1550,13 +1552,7 @@ impl StoredActivity {
             status_message: self.status_message.clone(),
             progress: Some(self.progress),
             details: self.details.clone(),
-            auto_scaling_group_state: Some(if group_held {
-                self.auto_scaling_group_state
-                    .clone()
-                    .unwrap_or_else(|| GROUP_STATE_IN_SERVICE.to_string())
-            } else {
-                GROUP_STATE_DELETED.to_string()
-            }),
+            auto_scaling_group_state: group_state.map(str::to_string),
             auto_scaling_group_arn: self.auto_scaling_group_arn.clone(),
         }
     }
@@ -2576,7 +2572,6 @@ impl AutoScalingState {
                     group_arn: &arn,
                     description: warm_pools::warm_pool_return_description(instance_id),
                     cause,
-                    group_state: GROUP_STATE_IN_SERVICE,
                     start_time: now,
                     completes_at: Some(due),
                     milestone: ActivityMilestone::InProgress,

@@ -288,9 +288,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 now,
             )
             .iter()
-            // The group these activities belong to is the one this call just terminated
-            // instances of, so the account holds it.
-            .map(|activity| activity.to_activity(true))
+            // This answer reports the activity it just recorded, not the state of the
+            // groups of the account: there is no deleted-group reading for it to
+            // distinguish, so it reports no `AutoScalingGroupState`.
+            .map(|activity| activity.to_activity(None))
             .collect();
 
         crate::state::audit(

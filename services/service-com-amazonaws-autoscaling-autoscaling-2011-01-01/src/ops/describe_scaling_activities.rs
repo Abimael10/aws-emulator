@@ -289,7 +289,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|activity| criteria.admits(activity))
             .filter_map(|activity| {
                 let group_held = state.groups.contains_key(&activity.auto_scaling_group_name);
-                (group_held || include_deleted_groups).then(|| activity.to_activity(group_held))
+                if !group_held && !include_deleted_groups {
+                    return None;
+                }
+                // The state of the group is reported only by the read that reports the
+                // state of groups at all: the one the caller asked to be told about
+                // deleted groups on, which is where `InService` and `Deleted` tell a
+                // group the account still holds from one it has torn down. A read that
+                // did not ask reports activities of held groups only, so there is no
+                // state for it to distinguish and the optional member is left out.
+                let group_state = include_deleted_groups
+                    .then(|| state.activity_group_state(&activity.auto_scaling_group_name));
+                Some(activity.to_activity(group_state))
             })
             .collect();
         // "Activities are sorted by start time. Activities still in progress are

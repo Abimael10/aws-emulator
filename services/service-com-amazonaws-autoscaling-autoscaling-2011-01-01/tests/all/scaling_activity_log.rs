@@ -207,13 +207,12 @@ async fn every_capacity_change_records_an_activity_per_instance() {
                 row.case
             );
         }
-        for state in tag_values(&body, "AutoScalingGroupState") {
-            assert_eq!(
-                state, "InService",
-                "case {:?}: the group is still held, got {body}",
-                row.case
-            );
-        }
+        assert!(
+            tag_values(&body, "AutoScalingGroupState").is_empty(),
+            "case {:?}: a read that did not ask about deleted groups reports no group \
+             state, got {body}",
+            row.case
+        );
         let expected_cause = format!("changing the desired capacity from 0 to {}", row.created);
         for cause in tag_values(&body, "Cause") {
             assert!(
@@ -805,9 +804,6 @@ fn seed_activity(
             status_message: None,
             progress: 100,
             details: None,
-            auto_scaling_group_state: Some(
-                autoscaling::state::GROUP_STATE_IN_SERVICE.to_string(),
-            ),
             completes_at: None,
             completes_as: None,
         });

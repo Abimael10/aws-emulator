@@ -38,8 +38,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use super::{
-    ec2_instances, AutoScalingState, StoredActivity, StoredInstance, GROUP_STATE_IN_SERVICE,
-    HEALTH_STATUS_HEALTHY, LIFECYCLE_PENDING, LIFECYCLE_TRANSITION,
+    ec2_instances, AutoScalingState, StoredActivity, StoredInstance, HEALTH_STATUS_HEALTHY,
+    LIFECYCLE_PENDING, LIFECYCLE_TRANSITION,
 };
 
 /// The `Activity$Description` the scaling activity for one attach carries, naming the
@@ -354,7 +354,6 @@ impl AutoScalingState {
                         group_arn: &arn,
                         description: attach_description(instance_id),
                         cause: cause.clone(),
-                        group_state: GROUP_STATE_IN_SERVICE,
                         start_time: now,
                         completes_at: Some(due),
                         milestone: super::ActivityMilestone::InProgress,

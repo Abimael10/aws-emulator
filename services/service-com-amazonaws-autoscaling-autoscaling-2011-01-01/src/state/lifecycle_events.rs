@@ -76,9 +76,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use super::{
-    AutoScalingState, StoredGroup, ACTIVITY_CANCELLED, ACTIVITY_SUCCESSFUL, GROUP_STATE_IN_SERVICE,
-};
+use super::{AutoScalingState, StoredGroup, ACTIVITY_CANCELLED, ACTIVITY_SUCCESSFUL};
 
 /// The `source` of every event Amazon EC2 Auto Scaling publishes.
 ///
@@ -494,7 +492,6 @@ impl AutoScalingState {
                 group_arn: change.group_arn,
                 description: description.clone(),
                 cause: change.cause.to_string(),
-                group_state: GROUP_STATE_IN_SERVICE,
                 start_time: change.start_time,
                 completes_at: Some(due),
                 // A step a hook is holding the instance at is paused at that hold, which

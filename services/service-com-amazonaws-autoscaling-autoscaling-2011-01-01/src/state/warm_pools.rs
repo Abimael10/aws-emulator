@@ -69,7 +69,7 @@ use crate::ops::types::{InstanceReusePolicy, WarmPoolConfiguration};
 
 use super::{
     AutoScalingState, GroupLaunch, HeldTransition, LaunchDestination, StoredGroup, StoredInstance,
-    GROUP_STATE_IN_SERVICE, LIFECYCLE_IN_SERVICE, LIFECYCLE_PENDING, LIFECYCLE_TRANSITION,
+    LIFECYCLE_IN_SERVICE, LIFECYCLE_PENDING, LIFECYCLE_TRANSITION,
 };
 
 /// `MinSize` when a request that CREATES a warm pool omits it.
@@ -1009,7 +1009,6 @@ impl AutoScalingState {
                     group_arn: &arn,
                     description: warm_pool_launch_description(instance_id),
                     cause: cause.clone(),
-                    group_state: GROUP_STATE_IN_SERVICE,
                     start_time: now,
                     completes_at: Some(due),
                     milestone: super::ActivityMilestone::InProgress,
@@ -1025,7 +1024,6 @@ impl AutoScalingState {
                     group_arn: &arn,
                     description: warm_pool_termination_description(instance_id),
                     cause: cause.clone(),
-                    group_state: GROUP_STATE_IN_SERVICE,
                     start_time: now,
                     completes_at: Some(due),
                     milestone: super::ActivityMilestone::InProgress,

@@ -667,7 +667,6 @@ impl super::AutoScalingState {
                 group_arn: &group_arn,
                 description: scheduled_action_description(&action.action_name),
                 cause: cause.clone(),
-                group_state: super::GROUP_STATE_IN_SERVICE,
                 start_time: action.occurrence.at,
                 completes_at: None,
                 milestone: super::ActivityMilestone::InProgress,
