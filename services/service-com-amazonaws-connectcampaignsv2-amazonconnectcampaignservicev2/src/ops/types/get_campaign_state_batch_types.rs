@@ -31,10 +31,7 @@ pub struct SuccessfulCampaignStateResponse {
     pub state: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.connectcampaignsv2#FailedCampaignStateResponse")]
-#[derive(Debug, Clone, Default)]
-pub struct FailedCampaignStateResponse {
-    pub campaign_id: Option<String>,
-    pub failure_code: Option<String>,
-}
+// `FailedCampaignStateResponse` is declared in `super::failed_campaign_state_wire` instead
+// of here: its wire carries a member the on-disk model does not declare, which the derive
+// above cannot express, so its schema and codec are written out there.
 

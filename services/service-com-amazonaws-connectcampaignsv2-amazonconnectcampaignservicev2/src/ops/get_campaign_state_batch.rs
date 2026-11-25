@@ -5,8 +5,11 @@
 //! leaves that campaign at — the same projection `GetCampaignState` serves for one id
 //! ([`crate::state::StoredCampaign::state_at`]), answered per id rather than as a
 //! whole-batch refusal: an id the region holds no campaign under is reported in
-//! `failedRequests` with the `ResourceNotFound` failure code, never as an error on the
-//! call. A pure read — every id is resolved against the store and nothing is written.
+//! `failedRequests` with the `ResourceNotFound` failure code and the explanation of that
+//! failure in words ([`crate::state::campaign_absent_message`], the member the on-disk
+//! model does not declare — see [`super::types::failed_campaign_state_wire`]), never as an
+//! error on the call. A pure read — every id is resolved against the store and nothing is
+//! written.
 //!
 //! ## Shape of an operation
 //!
@@ -195,10 +198,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }),
                 // An id this region holds no campaign under is a per-id failure of the
                 // batch rather than a failure of the call, carrying the failure code
-                // the model's own catalog names for it.
+                // the model's own catalog names for it and, beside it, the explanation
+                // of that failure in words: the one sentence this service words for a
+                // campaign id that names no campaign ([`crate::state::campaign_absent_message`]),
+                // naming the id the request asked about, so a client reads the same text
+                // here as the single-id operations answer with.
                 None => failed_requests.push(FailedCampaignStateResponse {
                     campaign_id: Some(id.clone()),
                     failure_code: Some(RESOURCE_NOT_FOUND_FAILURE_CODE.to_string()),
+                    failure_reason: Some(crate::state::campaign_absent_message(id)),
                 }),
             }
         }

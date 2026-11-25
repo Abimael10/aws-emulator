@@ -10,8 +10,9 @@
 //!   them: an id the request's region holds a campaign under is reported in
 //!   `successfulRequests` with the state that campaign is at — the same state the
 //!   single-id reader `GetCampaignState` reports for it — and an id it holds none
-//!   under is reported in `failedRequests` with the `ResourceNotFound` failure code,
-//!   never as an error on the call;
+//!   under is reported in `failedRequests` with the `ResourceNotFound` failure code AND
+//!   the reason for that failure in words, naming that entry's own id, never as an error
+//!   on the call;
 //! * the read WRITES NOTHING: repeating it answers the same, and the single-id reader
 //!   agrees afterwards;
 //! * every id is resolved in the region the request was signed for, so a campaign of
@@ -34,6 +35,16 @@ use super::common::{
 /// (`smithy_query query="shape" shape="GetCampaignStateBatchFailureCode"`), whose two
 /// values are this one and `UnknownError`.
 const RESOURCE_NOT_FOUND: &str = "ResourceNotFound";
+
+/// The `failureReason` a requested id that names no campaign is reported with: the fixed
+/// text `"Campaign: "` and `" doesn't exist"` around the id the request carried, which is
+/// the only variable part of it. Written out here rather than read from the crate's own
+/// helper, so a drift in that helper cannot keep these cases green — it is the same
+/// sentence this service's single-id campaign operations answer with, whose text
+/// `tests/all/campaign_not_found_message.rs` pins.
+fn not_found_reason(id: &str) -> String {
+    format!("Campaign: {id} doesn't exist")
+}
 
 /// `CampaignId`'s modelled `@length` maximum, and `CampaignIdList`'s own: source
 /// `smithy_query query="closure" operation="GetCampaignStateBatch"`, which gives
@@ -159,37 +170,45 @@ async fn get_state_batch(
 /// The `(campaignId, state)` pairs a response's `successfulRequests` carries, in the
 /// order it carries them.
 fn successful(response: &Value) -> Vec<(String, String)> {
-    entries(response, "successfulRequests", "state")
+    rows(response, "successfulRequests")
+        .iter()
+        .map(|row| (member(row, "campaignId"), member(row, "state")))
+        .collect()
 }
 
-/// The `(campaignId, failureCode)` pairs a response's `failedRequests` carries, in the
-/// order it carries them.
-fn failed(response: &Value) -> Vec<(String, String)> {
-    entries(response, "failedRequests", "failureCode")
+/// The `(campaignId, failureCode, failureReason)` triples a response's `failedRequests`
+/// carries, in the order it carries them: a per-id failure states which id failed, the
+/// modelled code for why, and the reason in words.
+fn failed(response: &Value) -> Vec<(String, String, String)> {
+    rows(response, "failedRequests")
+        .iter()
+        .map(|row| {
+            (
+                member(row, "campaignId"),
+                member(row, "failureCode"),
+                member(row, "failureReason"),
+            )
+        })
+        .collect()
 }
 
-/// The `(campaignId, <member>)` pairs of one response list, in order.
-fn entries(response: &Value, list: &str, member: &str) -> Vec<(String, String)> {
+/// The elements of one response list, in order, or none when the response carries no such
+/// list at all.
+fn rows(response: &Value, list: &str) -> Vec<Value> {
     response
         .get(list)
         .and_then(Value::as_array)
-        .map(|rows| {
-            rows.iter()
-                .map(|row| {
-                    (
-                        row.get("campaignId")
-                            .and_then(Value::as_str)
-                            .unwrap_or("<no campaignId>")
-                            .to_string(),
-                        row.get(member)
-                            .and_then(Value::as_str)
-                            .unwrap_or("<missing>")
-                            .to_string(),
-                    )
-                })
-                .collect()
-        })
+        .cloned()
         .unwrap_or_default()
+}
+
+/// One string member of a response row, or a marker naming it absent — so an assertion
+/// that fails reports WHICH member the entry is missing rather than panicking.
+fn member(row: &Value, name: &str) -> String {
+    row.get(name)
+        .and_then(Value::as_str)
+        .unwrap_or("<missing>")
+        .to_string()
 }
 
 /// A batch reports the state of every id the request's region holds a campaign under
@@ -287,13 +306,15 @@ async fn a_batch_reports_the_state_of_every_id_it_holds_and_fails_the_rest() {
                 Requested::Unknown(_) => None,
             })
             .collect();
-        let expected_failed: Vec<(String, String)> = requested
+        let expected_failed: Vec<(String, String, String)> = requested
             .iter()
             .filter_map(|one| match one {
                 Requested::Known(_) => None,
-                Requested::Unknown(id) => {
-                    Some(((*id).to_string(), RESOURCE_NOT_FOUND.to_string()))
-                }
+                Requested::Unknown(id) => Some((
+                    (*id).to_string(),
+                    RESOURCE_NOT_FOUND.to_string(),
+                    not_found_reason(id),
+                )),
             })
             .collect();
 
@@ -381,7 +402,11 @@ async fn a_batch_resolves_every_id_in_the_region_the_request_was_signed_for() {
         if theirs != mine {
             assert_eq!(
                 failed(&body),
-                vec![(theirs.clone(), RESOURCE_NOT_FOUND.to_string())],
+                vec![(
+                    theirs.clone(),
+                    RESOURCE_NOT_FOUND.to_string(),
+                    not_found_reason(theirs),
+                )],
                 "case {region:?}: expected the other region's id to fail, got {:?}",
                 failed(&body)
             );
@@ -491,9 +516,15 @@ async fn the_batch_holds_every_id_to_the_id_shape_and_the_list_to_its_length() {
             );
             // Nothing was created in this region, so every admitted id is reported as
             // a per-id failure rather than as an error on the call.
-            let expected: Vec<(String, String)> = sent
+            let expected: Vec<(String, String, String)> = sent
                 .iter()
-                .map(|id| (id.clone(), RESOURCE_NOT_FOUND.to_string()))
+                .map(|id| {
+                    (
+                        id.clone(),
+                        RESOURCE_NOT_FOUND.to_string(),
+                        not_found_reason(id),
+                    )
+                })
                 .collect();
             assert_eq!(
                 failed(&body),
@@ -521,6 +552,97 @@ async fn the_batch_holds_every_id_to_the_id_shape_and_the_list_to_its_length() {
                 "case {case:?}: expected a refusal to report no ids, got {:?} / {:?}",
                 successful(&body),
                 failed(&body)
+            );
+        }
+    }
+}
+
+/// The members a `failedRequests` entry carries, in the order a JSON object's keys sort.
+const FAILED_ENTRY_MEMBERS: [&str; 3] = ["campaignId", "failureCode", "failureReason"];
+
+/// A per-id failure EXPLAINS itself: every `failedRequests` entry carries the reason in
+/// words beside the code, composed from that entry's OWN id — so a batch of several
+/// unknown ids carries as many distinct reasons and no entry borrows another's text, and
+/// an entry carries those members and nothing else.
+///
+/// A TABLE whose rows differ along what the rule generalises over: the form of the id
+/// (digits, the id shape's punctuation, mixed case, one character, the published length
+/// maximum), how many unknown ids one call carries, and whether one of them repeats.
+#[tokio::test]
+async fn every_failed_entry_explains_itself_with_the_id_it_was_asked_about() {
+    let region = "ca-central-1";
+    let router = router();
+
+    // Ids spanning `CampaignId` — len 1..256 with pattern `^[-:/a-zA-Z0-9]+$`, source
+    // `smithy_query query="shape" shape="CampaignId"` — none of which this region holds a
+    // campaign under, so each one is reported as a per-id failure.
+    let at_max_length = "z".repeat(CAMPAIGN_ID_MAX_LENGTH);
+    let cases: Vec<(&str, Vec<String>)> = vec![
+        ("one id of digits", vec!["000000000001".to_string()]),
+        (
+            "one id in the hyphenated form a minted id takes",
+            vec!["1b9c3f52-0ad1-4d7e-8c41-5e2f6a7b8c90".to_string()],
+        ),
+        (
+            "one character, the length minimum",
+            vec!["q".to_string()],
+        ),
+        ("at the length maximum", vec![at_max_length.clone()]),
+        (
+            "several ids of different forms, so no two reasons can read alike",
+            vec![
+                "AAA-111".to_string(),
+                "b/c:d".to_string(),
+                "MixedCase9".to_string(),
+                at_max_length.clone(),
+            ],
+        ),
+        (
+            "one id repeated beside another",
+            vec![
+                "222222222222".to_string(),
+                "222222222222".to_string(),
+                "333333333333".to_string(),
+            ],
+        ),
+    ];
+
+    for (case, sent) in cases {
+        let (status, body) = get_state_batch(&router, region, &sent).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} {body}"
+        );
+
+        let expected: Vec<(String, String, String)> = sent
+            .iter()
+            .map(|id| {
+                (
+                    id.clone(),
+                    RESOURCE_NOT_FOUND.to_string(),
+                    not_found_reason(id),
+                )
+            })
+            .collect();
+        assert_eq!(
+            failed(&body),
+            expected,
+            "case {case:?}: expected each entry to carry its own id, the not-found code \
+             and the reason about that id, got {:?}",
+            failed(&body)
+        );
+
+        // An entry carries those three members and nothing else: the reason is a member
+        // of the entry, not a second list beside it.
+        for (index, row) in rows(&body, "failedRequests").iter().enumerate() {
+            let mut carried: Vec<String> = row
+                .as_object()
+                .map(|object| object.keys().cloned().collect())
+                .unwrap_or_default();
+            carried.sort();
+            assert_eq!(
+                carried, FAILED_ENTRY_MEMBERS,
+                "case {case:?}: entry {index} carried {carried:?}"
             );
         }
     }
