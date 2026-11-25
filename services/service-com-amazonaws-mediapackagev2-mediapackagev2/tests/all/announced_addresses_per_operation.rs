@@ -9,10 +9,13 @@
 //! those names, this emulator serves nothing on them, and a client that dials one leaves the
 //! emulated environment (or fails to resolve it at all).
 //!
-//! A channel group's `EgressDomain` is a DOMAIN rather than a URL, so the same rule reaches
-//! it as a NAME: it is announced in the zone that endpoint resolves in, carrying dotted DNS
-//! labels and nothing else — no scheme, no path and no `:port`. The tests at the end of this
-//! file own that half, over the same address table.
+//! A channel group's `EgressDomain` is a DOMAIN rather than a URL, and the rule for it is a
+//! different one: the member is the DNS name AWS publishes a group's egress under, so it is
+//! minted in this service's OWN regional zone (`<labels>.egress.<labels>.mediapackagev2.
+//! <region>.amazonaws.com`) for every create, whatever address the creating request arrived
+//! on — dotted DNS labels and nothing else, no scheme, no path and no `:port`. The tests at
+//! the end of this file own that half, over the same address table, and the sweep above
+//! excepts that one member from the zone rule it applies to everything a client DIALS.
 //!
 //! The zones are the tree's one catalog of them, called rather than copied
 //! (`service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES`: `.amazonaws.com`,
@@ -39,6 +42,12 @@ use serde_json::{json, Value};
 
 use crate::channel_lifecycle::Emulator as RegionalEmulator;
 use crate::rejection_rule_and_negative_paths::{grant_policy, split_url, Answer, Emulator};
+
+/// The Region every request in this suite is signed for: it travels in the SigV4 credential
+/// scope, which is where the service reads it from, and is the Region the name a group
+/// announces carries. Both shared clients this suite drives sign for it, so it is read off
+/// the one place the crate states it rather than written again here.
+const REGION: &str = crate::channel_lifecycle::REGION;
 
 /// The names every row's fixtures are created under. One emulator per row, so the names are
 /// reused across rows.
@@ -281,11 +290,25 @@ async fn every_operation_announces_the_address_the_create_reached() {
                 answer.status, answer.body
             );
 
+            let mut addresses = Vec::new();
+            announced_addresses(&answer.json, None, &mut addresses);
+
             // No string of any response may name a host in a zone AWS publishes its own
-            // endpoints in: such a host is AWS's, not this emulator's.
+            // endpoints in: such a host is AWS's, not this emulator's. The DOMAIN member is
+            // the one exception, because it is the name AWS publishes a group's egress under
+            // rather than an address a client dials this emulator at — the tests below own
+            // it.
+            let announced_domains: Vec<&String> = addresses
+                .iter()
+                .filter(|(member, _)| member == "EgressDomain")
+                .map(|(_, value)| value)
+                .collect();
             let mut every_string = Vec::new();
             strings(&answer.json, &mut every_string);
             for text in &every_string {
+                if announced_domains.contains(&text) {
+                    continue;
+                }
                 assert!(
                     !::service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES
                         .iter()
@@ -295,8 +318,6 @@ async fn every_operation_announces_the_address_the_create_reached() {
                 );
             }
 
-            let mut addresses = Vec::new();
-            announced_addresses(&answer.json, None, &mut addresses);
             assert_eq!(
                 !addresses.is_empty(),
                 call.announces,
@@ -308,7 +329,7 @@ async fn every_operation_announces_the_address_the_create_reached() {
                 // form and its zone, since a name may not carry the port a URL does. The
                 // tests below own that half of the rule.
                 if member == "EgressDomain" {
-                    assert_announced_domain(&case, row.authority, value);
+                    assert_announced_domain(&case, REGION, value);
                     continue;
                 }
                 let host = announced_host(value);
@@ -324,15 +345,20 @@ async fn every_operation_announces_the_address_the_create_reached() {
 }
 
 // ---------------------------------------------------------------------------
-// The DOMAIN half of the rule: a channel group's `EgressDomain` is a DNS name, never a URL
-// authority.
+// The DOMAIN half of the rule: a channel group's `EgressDomain` is the DNS name AWS publishes
+// that group's egress under, never a URL authority and never a name in a zone of this
+// emulator's own.
 //
 // The model documents the member as the domain to integrate "with a downstream CDN (such as
 // Amazon CloudFront) or playback device"
 // (`smithy_query(query="shape",shape="CreateChannelGroupResponse")`), so the value is a host
-// NAME and nothing else: dotted DNS labels, no scheme, no path and no `:port`, for an address
-// this emulator answers on. The port this emulator may be reached on belongs to the full URLs
-// the group's data plane publishes, which are the members allowed to carry one.
+// NAME and nothing else: dotted DNS labels, no scheme, no path and no `:port`. AWS mints it in
+// this service's own regional zone — two opaque labels, the `egress` plane label, the signing
+// name, the Region and `amazonaws.com` — and the name is a function of the resource rather than
+// of the request that created it, so the same group is announced under the same name whichever
+// address the create arrived on. The port this emulator may be reached on belongs to the full
+// URLs the group's data plane publishes, which are the members allowed to carry one and the
+// ones the sweep above holds to the reached address.
 //
 // Every path that reports the member (`CreateChannelGroup`, `GetChannelGroup`,
 // `UpdateChannelGroup`) reports the one name the create resolved; `ListChannelGroups` is not
@@ -353,8 +379,8 @@ struct DomainRow {
 
 /// The rows. The ADDRESS is the axis the rule generalises over; the Region and the shape of the
 /// group's own name vary with it, so no case can pass by accident of one Region or one name
-/// being special. The last row is the caller that resolves AWS's own hosts, which is announced
-/// the hostname this service publishes there.
+/// being special. The last row is the caller that addressed one of AWS's own hosts, which is
+/// announced the same name as every other row.
 const DOMAIN_ROWS: &[DomainRow] = &[
     DomainRow {
         label: "an IPv4 loopback address with a port",
@@ -439,25 +465,51 @@ pub(crate) fn assert_is_a_dns_domain(case: &str, value: &str) {
     }
 }
 
-/// That `value` is a DNS domain name in the zone the address `authority` resolves in — read
-/// through the tree's one reading of that question rather than spelled out per case, with the
-/// one exception the addressing makes: a caller that addressed one of AWS's own hosts resolves
-/// them, so it is announced the hostname this service publishes there, in AWS's own zone.
+/// That `value` is the DNS name AWS publishes a channel group's egress under in `region`: this
+/// service's own regional zone, with the `egress` plane label in front of it and the two opaque
+/// per-account/per-group labels in front of that.
+///
+/// The zone is the tree's one catalog of the zones AWS publishes its endpoints in, called
+/// rather than copied (`AWS_ENDPOINT_DNS_SUFFIXES`' first entry is the commercial partition's
+/// DNS suffix, the partition every ARN this emulator mints names).
 ///
 /// `pub(crate)` for the same reason [`assert_is_a_dns_domain`] is.
-pub(crate) fn assert_announced_domain(case: &str, authority: &str, value: &str) {
+pub(crate) fn assert_announced_domain(case: &str, region: &str, value: &str) {
     assert_is_a_dns_domain(case, value);
-    let zone = if ::service_common::data_plane_addressing::addresses_an_aws_endpoint(authority) {
-        "amazonaws.com".to_string()
-    } else {
-        ::service_common::data_plane_addressing::announced_zone_of_authority(authority)
+    let aws_zone = ::service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES
+        .first()
+        .copied()
+        .expect("the catalog of AWS endpoint DNS zones is not empty");
+    let zone = format!(".{SIGNING_NAME}.{region}{aws_zone}");
+    let Some(labels) = value.strip_suffix(&zone) else {
+        panic!(
+            "case {case:?}: EgressDomain must sit in this service's own regional zone \
+             ({zone:?}), got {value:?}"
+        )
     };
-    assert!(
-        value.ends_with(&format!(".{zone}")),
-        "case {case:?}: EgressDomain must sit in the zone the reached address resolves in \
-         ({zone:?}), got {value:?}"
+    // In front of the zone: an opaque group label, the label that names the EGRESS half of
+    // the plane, and an opaque account label.
+    let labels: Vec<&str> = labels.split('.').collect();
+    assert_eq!(
+        labels.len(),
+        3,
+        "case {case:?}: EgressDomain must carry a group label, the plane label and an account \
+         label in front of the zone, got {value:?}"
+    );
+    assert_eq!(
+        labels.get(1).copied(),
+        Some(PLANE_LABEL),
+        "case {case:?}: EgressDomain must name the EGRESS half of the plane, got {value:?}"
     );
 }
+
+/// This service's signing name, which is the first label of the regional zone every hostname
+/// it publishes sits under.
+const SIGNING_NAME: &str = "mediapackagev2";
+
+/// The label that names the EGRESS half of this service's data plane in a hostname it
+/// publishes.
+const PLANE_LABEL: &str = "egress";
 
 /// Create the group for one row and report the `EgressDomain` the create, the read and the
 /// update each report.
@@ -514,7 +566,7 @@ async fn every_path_reports_the_egress_domain_as_a_port_less_dns_name() {
         let (_, announced) = &reported[0];
         for (operation, domain) in &reported {
             let case = format!("{} / {operation}", row.label);
-            assert_announced_domain(&case, row.authority, domain);
+            assert_announced_domain(&case, row.region, domain);
             // The name carries the Region whose resources it serves, exactly as this
             // service's own regional hostnames do.
             assert!(
@@ -560,13 +612,93 @@ async fn two_groups_of_one_account_are_announced_under_different_names() {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        assert_announced_domain(group, row.authority, &domain);
+        assert_announced_domain(group, row.region, &domain);
         assert!(
             !announced.contains(&domain),
             "case {group:?}: a second group must be announced under a name of its own, got \
              {domain:?} again among {announced:?}"
         );
         announced.push(domain);
+    }
+}
+
+/// The addresses a creating request can arrive on, which is the axis the announcement must NOT
+/// depend on: every shape of this emulator's own endpoint (an IPv4 loopback address and a
+/// bracketed IPv6 literal, each with a port, a loopback name with a port and one with none),
+/// plus one of AWS's own hostnames for the Region the group is served in.
+fn create_addresses(region: &str) -> Vec<String> {
+    vec![
+        "127.0.0.1:9297".to_string(),
+        "localhost:41235".to_string(),
+        "[::1]:9297".to_string(),
+        "localhost".to_string(),
+        format!("{SIGNING_NAME}.{region}.amazonaws.com"),
+    ]
+}
+
+#[tokio::test]
+async fn the_announced_domain_does_not_depend_on_the_address_the_create_reached() {
+    // The member names the group's egress in AWS's DNS, so it is a function of the resource:
+    // the Region and the group, never the address the create happened to arrive on. The rows
+    // cross that address axis with the Region the group is served in and the shape of its own
+    // name, so no case can pass by accident of one Region or one name being special.
+    for (region, group) in [
+        ("us-west-2", "grp"),
+        ("eu-west-1", "Group_1"),
+        ("ap-southeast-2", "a"),
+        (
+            "us-east-1",
+            "a-very-long-channel-group-name-that-still-has-to-fit-in-one-dns-label",
+        ),
+    ] {
+        let mut announced: Vec<(String, String)> = Vec::new();
+        for authority in create_addresses(region) {
+            // One emulator per address: the same group name is created in each, so what is
+            // compared is the name announced for one resource, not two.
+            let emulator = RegionalEmulator::new();
+            let case = format!("{region} / {group} / reached at {authority}");
+            let (status, created) = emulator
+                .send_in_region(
+                    "POST",
+                    "/channelGroup",
+                    Some(json!({"ChannelGroupName": group})),
+                    &authority,
+                    region,
+                    &[],
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: CreateChannelGroup expected HTTP 200, got {status} with body \
+                 {created}"
+            );
+            let domain = created
+                .get("EgressDomain")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            assert_announced_domain(&case, region, &domain);
+            // A name in a zone this emulator announces addresses of its own in is exactly
+            // what the member may not carry: it is neither AWS's egress name nor an address a
+            // client reaches this emulator at.
+            assert!(
+                !::service_common::data_plane_addressing::names_the_loopback_interface(&domain),
+                "case {case:?}: EgressDomain must not be announced in a loopback zone, got \
+                 {domain:?}"
+            );
+            announced.push((case, domain));
+        }
+        let (first_case, first) = announced
+            .first()
+            .expect("every row sweeps at least one address")
+            .clone();
+        for (case, domain) in &announced {
+            assert_eq!(
+                domain, &first,
+                "case {case:?}: one group is announced under one name, the same as \
+                 {first_case:?} reported ({first:?}), got {domain:?}"
+            );
+        }
     }
 }
 
@@ -593,7 +725,7 @@ async fn the_announced_domain_is_a_host_this_service_answers_on() {
         created.status, created.body
     );
     let domain = created.string("EgressDomain").to_string();
-    assert_announced_domain("the announced domain", authority, &domain);
+    assert_announced_domain("the announced domain", REGION, &domain);
 
     let channel = emulator
         .send(

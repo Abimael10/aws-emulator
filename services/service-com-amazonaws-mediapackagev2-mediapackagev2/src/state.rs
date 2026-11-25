@@ -946,16 +946,17 @@ pub struct ChannelGroup {
     pub arn: String,
     /// The DNS domain this group's egress is announced under — the value its `EgressDomain`
     /// member carries, which is a domain NAME and nothing else: no scheme, no port, no path.
-    /// Resolved once by the create ([`announced_egress_domain`]) and stored, so every later
-    /// read of this group reports the same name.
+    /// Minted once by the create, in the zone AWS publishes this service's per-group egress
+    /// in ([`egress_domain`]), and stored, so every later read of this group reports the same
+    /// name.
     pub egress_domain: String,
     /// The `host[:port]` every URL beneath this group is rooted on — its channels' ingest
     /// endpoints and its endpoints' manifests ([`announced_data_plane_domain`]).
     ///
     /// SEPARATE from [`ChannelGroup::egress_domain`] because a URL's authority may carry the
-    /// port this emulator is reached on, which a domain name may not: the two differ exactly
-    /// when the group's plane is announced on one of the emulator's own addresses, and are
-    /// the same published hostname when it is announced in AWS's own DNS.
+    /// port this emulator is reached on, which a domain name may not: the two differ whenever
+    /// the group's plane is announced on one of the emulator's own addresses, and are the same
+    /// published hostname when it is announced in AWS's own DNS.
     pub data_plane_authority: String,
     pub description: Option<String>,
     pub created_at: ::aws_smithy_types::DateTime,
@@ -2438,35 +2439,29 @@ fn statement_names_anonymous_principal(statement: &::serde_json::Value) -> bool 
     }
 }
 
-/// The egress domain a channel group is given IN AWS'S OWN DNS ZONE: the host every
-/// manifest URL beneath it is served from there, so all of the group's channels and
-/// endpoints share one DNS name.
+/// The egress domain a channel group is given: a DOMAIN NAME and nothing else — dotted
+/// labels, no scheme, no port and no path — so it can be resolved, or handed to a CDN as an
+/// origin domain name, as it stands.
 ///
-/// The zone-parameterised derivation is [`egress_domain_in_zone`]; this is it in the zone AWS
-/// publishes this service's own data plane in, which is the domain announced to a caller that
-/// resolves AWS's own hosts.
-pub fn egress_domain(region: &str, group: &str) -> String {
-    egress_domain_in_zone(region, group, AWS_DNS_ZONE)
-}
-
-/// The egress domain a channel group is given in one DNS `zone`: a DOMAIN NAME and nothing
-/// else — dotted labels, no scheme, no port and no path — so it can be resolved, or handed to
-/// a CDN as an origin domain name, as it stands.
+/// It is the host every manifest URL beneath the group is served from in AWS, so all of the
+/// group's channels and endpoints share one DNS name, and it is the value the group's
+/// `EgressDomain` member carries for EVERY create: the name AWS publishes this service's
+/// per-group egress under, in the service's own regional zone ([`AWS_DNS_ZONE`]), whatever
+/// address the creating request arrived on. The address a caller reaches this emulator at is
+/// a different value, carried by the full URLs rooted on the group's data-plane authority
+/// ([`announced_data_plane_domain`]), which is where a port may travel.
 ///
 /// The two opaque labels are derived from the account and from the group's identity, so
 /// the domain is a function of the resource (stable across reads, distinct per group)
-/// rather than of the moment it was created.
-///
-/// Only the ZONE differs between a caller that resolves AWS's own hosts ([`egress_domain`])
-/// and one that resolves nothing but this emulator's own addresses
-/// ([`announced_egress_domain`]); the labels in front of it, which are what name the plane,
-/// the Region and the group, are the same either way — so the one reading of a published host
-/// ([`data_plane_of_host`], [`data_plane_region`]) covers both.
-pub fn egress_domain_in_zone(region: &str, group: &str, zone: &str) -> String {
+/// rather than of the moment it was created. The labels in front of the zone name the plane,
+/// the Region and the group, which is what lets the one reading of a published host
+/// ([`data_plane_of_host`], [`data_plane_region`]) recognise the name as this service's and
+/// serve the plane it announces.
+pub fn egress_domain(region: &str, group: &str) -> String {
     let account = ::engine::emulator_account_id();
     let group_label = short_digest(&[account, region, group], 8);
     let account_label = short_digest(&[account], 12);
-    format!("{group_label}.egress.{account_label}.{SIGNING_NAME}.{region}.{zone}")
+    format!("{group_label}.egress.{account_label}.{SIGNING_NAME}.{region}.{AWS_DNS_ZONE}")
 }
 
 /// The DNS zone AWS itself publishes this service's endpoints and its per-group data-plane

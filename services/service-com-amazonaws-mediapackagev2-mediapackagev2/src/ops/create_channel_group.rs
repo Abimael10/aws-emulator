@@ -319,16 +319,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let arn = crate::state::channel_group_arn(&region, &name);
         // WHERE this group's data plane is announced, decided once here and stored, in the
         // two forms a client is handed it in: the `host[:port]` every URL beneath the group
-        // is rooted on, and the DNS domain the group's `EgressDomain` member carries, which
-        // is a domain name and nothing else.
+        // is rooted on, which is an address this emulator answers at, and the DNS domain the
+        // group's `EgressDomain` member carries — the name AWS publishes a group's egress
+        // under, minted in this service's own regional zone whatever address this request
+        // arrived on, because the member is a domain name and nothing else.
         let data_plane_authority = crate::state::announced_data_plane_domain(
             ctx.parts(),
             ctx.endpoint().as_str(),
             &region,
             &name,
         );
-        let egress_domain =
-            crate::state::announced_egress_domain(&data_plane_authority, &region, &name);
+        let egress_domain = crate::state::egress_domain(&region, &name);
 
         let mut group = crate::state::ChannelGroup {
             name: name.clone(),
