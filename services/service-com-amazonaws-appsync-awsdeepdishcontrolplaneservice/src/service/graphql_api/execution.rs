@@ -468,8 +468,10 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
     // The type the operation's fields belong to: the type the API's schema binds as that
     // operation's root, which is what says WHICH resolvers the selection addresses — beside
     // the QUERY root, which is the type the introspection system's own two root fields are
-    // fields of ([`Execution::introspected`]).
-    let Some((root_type, query_root)) = context
+    // fields of, and WHETHER this API serves those two at all
+    // ([`Execution::introspected`]). All three read off ONE guard of the store, so one
+    // request is answered against one configuration of the API.
+    let Some((root_type, query_root, introspects)) = context
         .state
         .lock()
         .graphql_apis
@@ -480,7 +482,11 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
                 OperationKind::Mutation => api.mutation_root_type(),
                 OperationKind::Subscription => api.subscription_root_type(),
             };
-            (root_type, api.query_root_type())
+            (
+                root_type,
+                api.query_root_type(),
+                super::introspection::serves_introspection(api),
+            )
         })
     else {
         return Answer::refused(crate::state::API_NOT_FOUND_MESSAGE.to_string());
@@ -491,11 +497,15 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
     // The document is validated against the API's ACTIVE schema BEFORE any field of it is
     // dispatched, the way AppSync validates one: a selection the schema does not declare
     // is a validation failure of the request rather than a field that resolves to nothing,
-    // so the request is answered with those errors and no `data` at all.
+    // so the request is answered with those errors and nothing resolved.
     let invalid = schema_validation_errors(context, &root_type, &fields);
     if !invalid.is_empty() {
         return Answer {
-            data: None,
+            // Validation runs BEFORE execution, so a document it refuses resolved NOTHING:
+            // the result carries its `data` member as the null it resolved to, which is what
+            // tells a client the request failed as a whole rather than that one field of it
+            // did.
+            data: Some(Json::Null),
             errors: invalid,
             traces: Vec::new(),
             extensions: None,
@@ -551,6 +561,7 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
         context,
         request,
         query_root,
+        introspects,
         introspected: None,
         introspected_bytes: MAX_INTROSPECTED_BYTES,
         answer_bytes: MAX_ANSWER_BYTES,
@@ -743,6 +754,12 @@ struct Execution<'a> {
     /// The type the API's schema binds as its QUERY root, which is the type the introspection
     /// system's own `__schema` and `__type` are fields of.
     query_root: String,
+    /// Whether the API serves GraphQL's INTROSPECTION SYSTEM at all
+    /// ([`super::introspection::serves_introspection`]): an API that disables it serves a
+    /// schema the introspection meta-types are no part of, so neither root meta-field reports
+    /// one ([`Execution::introspected`]). Read ONCE, before the first field is dispatched, so
+    /// one request cannot be answered half from a type system and half from none.
+    introspects: bool,
     /// The API's type system as introspection reports it, rendered at most ONCE per request
     /// ([`Execution::introspection_document`]) — `None` until a selected field needs it.
     introspected: Option<Json>,
@@ -1339,9 +1356,11 @@ impl Execution<'_> {
     ///
     /// `__typename` is available on every object and names the type the selection is on;
     /// `__schema` and `__type(name:)` are fields of the QUERY ROOT and report the type system
-    /// itself, so they are answered only where the selection is on that root. All three are
-    /// read off the one type-system snapshot this request renders
-    /// ([`Self::introspection_document`]).
+    /// itself, so they are answered only where the selection is on that root AND the API
+    /// serves introspection at all ([`Self::introspects`]) — an API that disables it reports
+    /// no type system through either, while `__typename` is the TYPE system's own field and
+    /// is answered either way. All three are read off the one type-system snapshot this
+    /// request renders ([`Self::introspection_document`]).
     fn introspected(
         &mut self,
         type_name: &str,
@@ -1353,11 +1372,13 @@ impl Execution<'_> {
                 let named = introspection::type_name(self.introspection_document(), type_name);
                 Some(("", named))
             }
-            introspection::SCHEMA_FIELD if type_name == self.query_root => Some((
-                introspection::SCHEMA_TYPE,
-                self.introspection_document().clone(),
-            )),
-            introspection::TYPE_FIELD if type_name == self.query_root => {
+            introspection::SCHEMA_FIELD if self.introspects && type_name == self.query_root => {
+                Some((
+                    introspection::SCHEMA_TYPE,
+                    self.introspection_document().clone(),
+                ))
+            }
+            introspection::TYPE_FIELD if self.introspects && type_name == self.query_root => {
                 let name = field
                     .arguments
                     .get(introspection::TYPE_NAME_ARGUMENT)

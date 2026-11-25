@@ -21,6 +21,11 @@
 //! the API's schema. [`field_type`] is that half of the introspection schema: the type each
 //! field of `__Schema`, `__Type`, `__Field`, `__InputValue`, `__Directive` and `__EnumValue`
 //! resolves to, as GraphQL's own introspection schema declares it.
+//!
+//! Whether the API serves the two ROOT meta-fields at all is its own configuration
+//! ([`serves_introspection`]): an API that disables introspection serves a schema those
+//! meta-types are no part of, so a document selecting a field of one selects a field nothing
+//! declares, and the request's own DOCUMENT VALIDATION is what reports it.
 
 use ::serde_json::Value as Json;
 
@@ -66,6 +71,42 @@ pub fn is_introspection_field(field_name: &str) -> bool {
 
 /// The prefix GraphQL reserves for the names its type and introspection systems define.
 const RESERVED_PREFIX: &str = "__";
+
+/// The introspection type one of the QUERY ROOT's own two meta-fields resolves to, or `None`
+/// for a field that is neither of them.
+///
+/// `__schema` reports the type system as a [`SCHEMA_TYPE`] and `__type(name:)` reports one
+/// type of it as a [`TYPE_TYPE`]; both belong to the query root alone. Read where the fields
+/// those two carry have to be named without the API's own schema — the walk that projects a
+/// selection onto one of them ([`field_type`]), and the one that reports them undefined on an
+/// API serving no introspection at all.
+pub fn root_field_type(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        SCHEMA_FIELD => Some(SCHEMA_TYPE),
+        TYPE_FIELD => Some(TYPE_TYPE),
+        _ => None,
+    }
+}
+
+/// Whether `api` serves GraphQL's INTROSPECTION SYSTEM on its data plane at all.
+///
+/// `GraphqlApi$introspectionConfig` "sets the value of the GraphQL API to enable (`ENABLED`)
+/// or disable (`DISABLED`) introspection", and "will produce an error if the operation
+/// attempts to use the introspection feature while this field is disabled" — so an API
+/// configured with [`INTROSPECTION_DISABLED`] carries no introspection meta-type in the
+/// schema its data plane serves, and a document selecting a field of one is selecting a field
+/// nothing declares. Only the two meta-fields of the query root are taken away with them:
+/// `__typename` is the TYPE system's own field rather than the introspection system's, and
+/// what the API's schema declares is untouched either way.
+pub fn serves_introspection(api: &GraphqlApiRecord) -> bool {
+    api.introspection_config != INTROSPECTION_DISABLED
+}
+
+/// The `GraphQLApiIntrospectionConfig` value that takes introspection off an API. Source: the
+/// enum's own values (`smithy_query(query="shape",shape="GraphQLApiIntrospectionConfig")` —
+/// `ENABLED | DISABLED`), the other of which is the default
+/// (`crate::state::DEFAULT_INTROSPECTION_CONFIG`).
+const INTROSPECTION_DISABLED: &str = "DISABLED";
 
 /// The type one field of an introspection type resolves to, as GraphQL's introspection
 /// schema declares it, or `None` for a field that resolves to a scalar (or for a type this

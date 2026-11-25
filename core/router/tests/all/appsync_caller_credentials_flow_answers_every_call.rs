@@ -1186,10 +1186,13 @@ async fn every_call_on_the_caller_credentials_path_is_answered_a_document() {
                     .unwrap_or_default()
                     .to_string();
                 assert_eq!(
-                    (answered.status, answered.document.get("data")),
-                    (200, None),
-                    "case {:?}: a document the schema rejects is answered its errors and no \
-                     data, got {} and {}",
+                    (
+                        answered.status,
+                        answered.document.get("data").map(Value::is_null),
+                    ),
+                    (200, Some(true)),
+                    "case {:?}: a document the schema rejects is answered its errors and a \
+                     null data member, got {} and {}",
                     row.case,
                     answered.status,
                     answered.document

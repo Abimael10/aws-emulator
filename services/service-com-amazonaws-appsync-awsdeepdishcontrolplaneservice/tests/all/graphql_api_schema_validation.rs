@@ -11,7 +11,7 @@
 //! > declare is a failure of the REQUEST, not a field that resolves to nothing: the answer
 //! > carries one `errors` entry per such selection — GraphQL's own validation error, naming
 //! > the class of the failure (`FieldUndefined`), the field, the type that does not declare
-//! > it and the query path it sits at — and no `data` member at all, so none of the
+//! > it and the query path it sits at — and its `data` member null, so none of the
 //! > document's other fields is resolved either. A document every selection of which the
 //! > schema declares is executed as before, and the fields GraphQL's introspection system
 //! > adds to every schema are not selections of the API's own type system.
@@ -232,12 +232,12 @@ async fn a_selection_the_active_schema_does_not_declare_is_refused_before_execut
             "case {case:?}: expected {:?}, got {answered}",
             row.errors
         );
-        // Nothing of the document was executed, so the answer carries no `data` member at
-        // all — not even for the selections the schema does declare.
-        assert_eq!(
-            answered.get("data"),
-            None,
-            "case {case:?}: expected no data member, got {answered}"
+        // Validation ran before execution, so nothing of the document was executed: the
+        // answer carries its `data` member as the null it resolved to — not the values of the
+        // selections the schema does declare.
+        assert!(
+            answered.get("data").is_some_and(Value::is_null),
+            "case {case:?}: expected the data member present and null, got {answered}"
         );
     }
 }

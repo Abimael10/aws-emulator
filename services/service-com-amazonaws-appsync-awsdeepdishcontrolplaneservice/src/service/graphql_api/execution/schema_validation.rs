@@ -34,45 +34,99 @@ use super::*;
 /// declares those fields is no longer the one this walk holds and they are left for the
 /// execution rather than reported against the wrong type. The fields GraphQL's INTROSPECTION
 /// SYSTEM adds to every schema belong to no type the schema declares, so they are not
-/// validated here either.
+/// validated here either — except on an API that serves NO introspection, whose schema the
+/// introspection meta-types are no part of, so the fields selected through the query root's
+/// two meta-fields are undefined like any others (`gated_introspection_errors`).
 pub(super) fn schema_validation_errors(
     context: &PlaneContext,
     root_type: &str,
     fields: &[SelectedField],
 ) -> Vec<Json> {
+    use crate::service::graphql_api::introspection;
+
     let store = context.state.lock();
-    let Some(types) = store
-        .graphql_apis
-        .get(&context.api_id)
-        .map(|api| &api.types)
-    else {
+    let Some(api) = store.graphql_apis.get(&context.api_id) else {
         return Vec::new();
     };
+    // The type whose two INTROSPECTION meta-fields this API serves nothing through: an API
+    // that disables introspection serves a schema the introspection meta-types are no part
+    // of, so every field selected THROUGH `__schema` or `__type(name:)` — both of which
+    // belong to the query root — is a field of a type that declares none, and `None` for an
+    // API that serves introspection, where those selections are answered by the executor
+    // rather than reported here ([`introspection::serves_introspection`]).
+    let gated_root = match introspection::serves_introspection(api) {
+        true => None,
+        false => Some(api.query_root_type()),
+    };
+    let types = &api.types;
     // A root operation type the API's schema does not declare holds no field at all, so
     // EVERY selection of the operation is undefined: that is the schema a Merged API serves
     // once the associations whose merges carried its types are gone, and what an API that
     // holds no type system at all serves — a document validated against nothing is not a
     // document whose every field resolves to nothing.
     if !types.contains_key(root_type) {
-        return fields
-            .iter()
-            .filter(|field| {
-                !crate::service::graphql_api::introspection::is_introspection_field(&field.name)
-            })
-            .map(|field| {
-                json!({
-                    "message": undefined_field_message(
-                        &field.name,
-                        root_type,
-                        ::std::slice::from_ref(&field.name),
-                    ),
-                })
-            })
-            .collect();
+        let mut errors = Vec::new();
+        for field in fields {
+            if gated_root.as_deref() == Some(root_type) {
+                gated_introspection_errors(field, &mut Vec::new(), &mut errors);
+            }
+            if introspection::is_introspection_field(&field.name) {
+                continue;
+            }
+            errors.push(json!({
+                "message": undefined_field_message(
+                    &field.name,
+                    root_type,
+                    ::std::slice::from_ref(&field.name),
+                ),
+            }));
+        }
+        return errors;
     }
     let mut errors = Vec::new();
-    undefined_fields(types, root_type, fields, &mut Vec::new(), &mut errors);
+    undefined_fields(
+        types,
+        root_type,
+        fields,
+        gated_root.as_deref(),
+        &mut Vec::new(),
+        &mut errors,
+    );
     errors
+}
+
+/// Report every selection an API serving NO introspection leaves undefined under one field of
+/// its query root, and nothing for a field that is not one of the introspection system's two
+/// root meta-fields.
+///
+/// `__schema` and `__type(name:)` stay fields of the query root — the schema the API serves
+/// is what the meta-types are taken out of — so what is undefined is each field selected
+/// THROUGH one of them: the type it resolves to declares none. The selection is not
+/// descended into, for the reason a field no type declares is not:
+/// there is no type to validate its own sub-selection against. `__typename` is the TYPE
+/// system's field rather than the introspection system's, so it is left where it is selected.
+fn gated_introspection_errors(
+    field: &SelectedField,
+    at: &mut Vec<String>,
+    errors: &mut Vec<Json>,
+) {
+    use crate::service::graphql_api::introspection;
+
+    let Some(meta_type) = introspection::root_field_type(&field.name) else {
+        return;
+    };
+    at.push(field.name.clone());
+    for selected in &field.selections {
+        if selected.name == introspection::TYPENAME_FIELD {
+            continue;
+        }
+        at.push(selected.name.clone());
+        errors.push(json!({
+            "message": undefined_field_message(&selected.name, meta_type, at),
+        }));
+        at.pop();
+    }
+    at.pop();
 }
 
 /// Report every field of `fields` that `type_name` does not declare, and walk the
@@ -82,10 +136,14 @@ pub(super) fn schema_validation_errors(
 /// descent is bounded by the reading that produced `fields`: a selection set deeper than
 /// [`MAX_SELECTION_DEPTH`] is refused before it is expanded, so this recursion is bounded
 /// by the same depth, and the number of errors by the nodes one document may expand to.
+///
+/// `gated_root` names the query root of an API serving NO introspection, whose two root
+/// meta-fields then declare nothing either ([`gated_introspection_errors`]).
 pub(super) fn undefined_fields(
     types: &BTreeMap<String, crate::state::TypeRecord>,
     type_name: &str,
     fields: &[SelectedField],
+    gated_root: Option<&str>,
     at: &mut Vec<String>,
     errors: &mut Vec<Json>,
 ) {
@@ -96,6 +154,9 @@ pub(super) fn undefined_fields(
         return;
     }
     for field in fields {
+        if gated_root == Some(type_name) {
+            gated_introspection_errors(field, at, errors);
+        }
         if crate::service::graphql_api::introspection::is_introspection_field(&field.name) {
             continue;
         }
@@ -115,7 +176,7 @@ pub(super) fn undefined_fields(
                     .as_ref()
                     .map(named_type)
                     .unwrap_or_default();
-                undefined_fields(types, &child, &field.selections, at, errors);
+                undefined_fields(types, &child, &field.selections, gated_root, at, errors);
             }
             Some(_) => {}
         }

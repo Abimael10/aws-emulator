@@ -333,8 +333,8 @@ async fn a_merged_field_is_answered_by_the_definition_the_merge_carried() {
     let case = "a field no source API's schema declares";
     let answered = query(case, &merged, &json!({"query": "query { absent }"})).await;
     assert!(
-        answered.get("data").is_none(),
-        "case {case:?}: a document that does not validate carries no data, got {answered}"
+        answered.get("data").is_some_and(Value::is_null),
+        "case {case:?}: a document that does not validate resolves nothing, got {answered}"
     );
     let reported = answered["errors"][0]["message"].as_str().unwrap_or_default();
     for named in ["FieldUndefined", "absent", "Query"] {
@@ -741,7 +741,9 @@ async fn a_disassociation_withdraws_the_source_apis_fields_from_the_merged_endpo
     loop {
         let answered = query(case, &merged, &json!({"query": "query { lambdaCoded }"})).await;
         let reported = answered["errors"][0]["message"].as_str().unwrap_or_default();
-        if answered.get("data").is_none() && reported.contains("FieldUndefined") {
+        if answered.get("data").is_some_and(Value::is_null)
+            && reported.contains("FieldUndefined")
+        {
             assert!(
                 reported.contains("lambdaCoded"),
                 "case {case:?}: expected the validation failure to name the withdrawn field, \
@@ -786,7 +788,7 @@ async fn a_disassociation_withdraws_the_source_apis_fields_from_the_merged_endpo
     loop {
         let answered = query(case, &merged, &json!({"query": "query { muCoded }"})).await;
         let reported = answered["errors"][0]["message"].as_str().unwrap_or_default();
-        if answered.get("data").is_none() && reported.contains("muCoded") {
+        if answered.get("data").is_some_and(Value::is_null) && reported.contains("muCoded") {
             break;
         }
         assert!(
