@@ -33,6 +33,12 @@
 //! WHICH interfaces each EC2 filter selects, and `elbv2_host_counts_and_interfaces.rs` asserts
 //! WHAT one of them carries; this suite asserts what the teardown makes DELETABLE. Nothing
 //! reaches into either service's state struct: every assertion is a wire answer.
+//!
+//! The harness below — the two-service [`emulator`], the [`Reply`] its callers read, the
+//! [`seed_network`] every row's VPC comes out of, [`service_interface_ids`] and the
+//! [`interfaces_until`] poll over it — is `pub(crate)` because it is the ONE way this test
+//! crate drives these two services together: `subnet_dependency_clears_with_its_last_holder.rs`
+//! imports it rather than keeping a second copy that would drift from this one.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -54,10 +60,10 @@ const ELB_VERSION: &str = "2015-12-01";
 /// `NetworkInterface$RequesterId` of an interface Elastic Load Balancing created and manages,
 /// which is what a client filters its VPC's interfaces by to find the network presence of its
 /// load balancers.
-const SERVICE_REQUESTER: &str = "amazon-elb";
+pub(crate) const SERVICE_REQUESTER: &str = "amazon-elb";
 
 /// The error code EC2 refuses the delete of a subnet something still sits in with.
-const SUBNET_IN_USE_CODE: &str = "DependencyViolation";
+pub(crate) const SUBNET_IN_USE_CODE: &str = "DependencyViolation";
 
 /// The error code Elastic Load Balancing answers for an ARN naming no load balancer, which is
 /// what the deleted one's ARN names afterwards.
@@ -66,13 +72,13 @@ const LOAD_BALANCER_GONE_CODE: &str = "LoadBalancerNotFound";
 /// How long this suite keeps looking for a condition it waits on, and how often it looks
 /// again. Generous on purpose: it waits for the CONDITION rather than for a fixed time, so
 /// what it asserts does not depend on how fast or how loaded the host is.
-const DRAIN_DEADLINE: Duration = Duration::from_secs(60);
+pub(crate) const DRAIN_DEADLINE: Duration = Duration::from_secs(60);
 /// See [`DRAIN_DEADLINE`].
-const LOOK_AGAIN_AFTER: Duration = Duration::from_millis(25);
+pub(crate) const LOOK_AGAIN_AFTER: Duration = Duration::from_millis(25);
 
 /// One emulator carrying Amazon EC2 and Elastic Load Balancing v2 over ONE shared engine,
 /// exactly as `core/router/src/lib.rs` mounts them.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -88,14 +94,14 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// One query-protocol answer, reduced to what a client branches on.
-struct Reply {
-    status: u16,
-    body: String,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) body: String,
 }
 
 impl Reply {
     /// The query error envelope's `Code`, or `""` when the answer carries no envelope.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         crate::query_wire::blocks_of(&self.body, "Error")
             .first()
             .and_then(|envelope| opt_element(envelope, "Code"))
@@ -133,12 +139,20 @@ async fn query(
 }
 
 /// Call one Amazon EC2 action.
-async fn ec2_call(router: &MultiServiceRouter, action: &str, members: &[(&str, &str)]) -> Reply {
+pub(crate) async fn ec2_call(
+    router: &MultiServiceRouter,
+    action: &str,
+    members: &[(&str, &str)],
+) -> Reply {
     query(router, "ec2", EC2_API_VERSION, action, members).await
 }
 
 /// One ec2Query action that must succeed, answered with its XML body.
-async fn ec2(router: &MultiServiceRouter, action: &str, members: &[(&str, &str)]) -> String {
+pub(crate) async fn ec2(
+    router: &MultiServiceRouter,
+    action: &str,
+    members: &[(&str, &str)],
+) -> String {
     let reply = ec2_call(router, action, members).await;
     assert_eq!(
         reply.status, 200,
@@ -149,7 +163,11 @@ async fn ec2(router: &MultiServiceRouter, action: &str, members: &[(&str, &str)]
 }
 
 /// Call one Elastic Load Balancing v2 operation over its awsQuery wire.
-async fn elbv2_call(router: &MultiServiceRouter, action: &str, members: &[(&str, &str)]) -> Reply {
+pub(crate) async fn elbv2_call(
+    router: &MultiServiceRouter,
+    action: &str,
+    members: &[(&str, &str)],
+) -> Reply {
     query(
         router,
         "elasticloadbalancingv2",
@@ -161,7 +179,11 @@ async fn elbv2_call(router: &MultiServiceRouter, action: &str, members: &[(&str,
 }
 
 /// One ELBv2 operation that must succeed, answered with its XML body.
-async fn elbv2(router: &MultiServiceRouter, action: &str, members: &[(&str, &str)]) -> String {
+pub(crate) async fn elbv2(
+    router: &MultiServiceRouter,
+    action: &str,
+    members: &[(&str, &str)],
+) -> String {
     let reply = elbv2_call(router, action, members).await;
     assert_eq!(
         reply.status, 200,
@@ -174,16 +196,16 @@ async fn elbv2(router: &MultiServiceRouter, action: &str, members: &[(&str, &str
 /// The network a row places its load balancer in: the VPC, one subnet per zone in the order
 /// created, a security group of it, and the internet gateway attached to it when the row's
 /// placement needs one.
-struct Network {
-    vpc: String,
-    subnets: Vec<String>,
-    security_group: String,
-    gateway: Option<String>,
+pub(crate) struct Network {
+    pub(crate) vpc: String,
+    pub(crate) subnets: Vec<String>,
+    pub(crate) security_group: String,
+    pub(crate) gateway: Option<String>,
 }
 
 /// Create that network through EC2's OWN operations, so every identifier handed to Elastic
 /// Load Balancing is one the owner of subnets handed out.
-async fn seed_network(
+pub(crate) async fn seed_network(
     router: &MultiServiceRouter,
     second_octet: u8,
     zones: &[&str],
@@ -255,7 +277,10 @@ async fn seed_network(
 
 /// Every interface EC2 reports in `vpc` that Elastic Load Balancing created and manages — the
 /// read a client does to find the network presence of its load balancers.
-async fn service_interface_ids(router: &MultiServiceRouter, vpc: &str) -> Vec<String> {
+pub(crate) async fn service_interface_ids(
+    router: &MultiServiceRouter,
+    vpc: &str,
+) -> Vec<String> {
     let body = ec2(
         router,
         "DescribeNetworkInterfaces",
@@ -275,7 +300,7 @@ async fn service_interface_ids(router: &MultiServiceRouter, vpc: &str) -> Vec<St
 ///
 /// Bounded by [`DRAIN_DEADLINE`]; a deadline that passes fails naming the ids last seen — the
 /// poll a client tearing its network down runs, and the one the emulator has to let converge.
-async fn interfaces_until(
+pub(crate) async fn interfaces_until(
     router: &MultiServiceRouter,
     case: &str,
     description: &str,
@@ -700,7 +725,7 @@ async fn a_refused_create_places_no_interface_and_holds_no_subnet() {
 }
 
 /// The owned form members as the borrowed pairs [`query`] takes.
-fn borrowed(members: &[(String, String)]) -> Vec<(&str, &str)> {
+pub(crate) fn borrowed(members: &[(String, String)]) -> Vec<(&str, &str)> {
     members
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
