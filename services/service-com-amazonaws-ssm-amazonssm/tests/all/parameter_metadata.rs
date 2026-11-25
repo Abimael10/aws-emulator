@@ -268,8 +268,9 @@ fn seed_puts(image: &str) -> Vec<Value> {
 
 /// Every seeded name AS A READ REPORTS IT, in the ascending name order the store keeps
 /// them in (the store is keyed by the canonical name, which drops the leading separator,
-/// so `/RootLevel` sorts beside `TopLevel` after the `Describe` hierarchy while each is
-/// reported under the name its put wrote).
+/// so `/RootLevel` sorts beside `TopLevel` after the `Describe` hierarchy — and, being a
+/// one-level name, is held and reported under that same canonical spelling, because the
+/// separator leads a name that names a hierarchy and a one-level name names none).
 const SEEDED_NAMES: &[&str] = &[
     "/Describe/Dev/db-port",
     "/Describe/Dev/db-url",
@@ -279,7 +280,7 @@ const SEEDED_NAMES: &[&str] = &[
     "/Describe/Prod/image",
     "/Describe/advanced",
     "/Describe/tagged",
-    "/RootLevel",
+    "RootLevel",
     "TopLevel",
 ];
 
@@ -412,7 +413,7 @@ fn expected_metadata() -> Vec<Metadata<'static>> {
             0,
         ),
         (
-            "/RootLevel",
+            "RootLevel",
             "String",
             None,
             1,
@@ -648,7 +649,7 @@ async fn filters_narrow_the_listing_to_the_parameters_they_match() {
                     "Values": ["/RootLevel", "/Describe/tagged"],
                 }],
             }),
-            vec!["/Describe/tagged", "/RootLevel"],
+            vec!["/Describe/tagged", "RootLevel"],
         ),
         (
             "Name BeginsWith a hierarchy",
@@ -757,7 +758,7 @@ async fn filters_narrow_the_listing_to_the_parameters_they_match() {
             json!({
                 "ParameterFilters": [{ "Key": "Path", "Option": "OneLevel", "Values": ["/"] }],
             }),
-            vec!["/RootLevel", "TopLevel"],
+            vec!["RootLevel", "TopLevel"],
         ),
         (
             "Tier Equals Advanced",
@@ -780,7 +781,7 @@ async fn filters_narrow_the_listing_to_the_parameters_they_match() {
                 "/Describe/Prod/db-url",
                 "/Describe/advanced",
                 "/Describe/tagged",
-                "/RootLevel",
+                "RootLevel",
                 "TopLevel",
             ],
         ),

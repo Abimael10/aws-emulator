@@ -27,7 +27,9 @@
 //! A `Filters` entry narrows the patches by one of the keys this read publishes
 //! ([`INSTANCE_PATCH_FILTER_KEYS`]); a key outside them names no property of a patch and is
 //! refused in the voice this service refuses an unknown patch filter key in
-//! ([`super::instance_patch_states::unknown_filter_key`]), before any node is resolved.
+//! ([`super::instance_patch_states::unknown_filter_key`]), before any node is resolved. Each
+//! entry narrows by ONE value of the property its key names, so a `Values` list holding any
+//! other number of values is refused as well ([`INSTANCE_PATCH_FILTER_VALUE_SIZE_MESSAGE`]).
 
 /// The filter key that narrows the patches by "the classification of the patch, such as
 /// `SecurityUpdates`" (`PatchComplianceData$Classification`): "Supported keys for
@@ -73,13 +75,32 @@ pub fn is_instance_patch_filter_key(key: &str) -> bool {
 pub const INSTANCE_PATCH_FILTER_KEY_MISSING: &str =
     super::patch_baselines::PATCH_BASELINE_FILTER_KEY_MISSING;
 
+/// What a `Filters` entry whose `Values` list does not hold exactly ONE value is refused
+/// with.
+///
+/// A patch of a node either has the classification, the id, the severity or the state the
+/// filter names or it does not, so this read narrows by a single value per entry: a list
+/// carrying none of them narrows nothing and a list carrying several asks for a comparison
+/// this read does not make. The sentence states that rule and NOTHING of the request —
+/// neither the key nor the values the entry carried — so every such refusal of this read is
+/// worded identically.
+///
+/// The sibling patch reads keep their own wording, which names the key
+/// ([`super::patch_baselines::patch_baseline_filter_value_missing`]): their filter keys do
+/// take several values at once, so a missing value is the only value-size mistake they have.
+pub const INSTANCE_PATCH_FILTER_VALUE_SIZE_MESSAGE: &str =
+    "Invalid filter value size. A filter can only contain one value.";
+
+/// How many values one `Filters` entry of this read narrows by: "a key-value pair" is one
+/// value per key ([`INSTANCE_PATCH_FILTER_VALUE_SIZE_MESSAGE`]).
+pub const INSTANCE_PATCH_FILTER_VALUES: usize = 1;
+
 /// Why one `Filters` entry of a request cannot be served, or `None` for a filter this read
 /// can narrow by.
 ///
-/// The key has to name a property of a patch, and the filter has to carry a value to search
-/// for: "the value for the filter key" is what narrows anything, so an entry naming a key and
-/// no value narrows nothing. Both are refusals of the REQUEST, taken before a node is
-/// resolved.
+/// The key has to name a property of a patch, and the entry has to carry exactly
+/// [`INSTANCE_PATCH_FILTER_VALUES`] value to compare that property against. Both are
+/// refusals of the REQUEST, taken before a node is resolved.
 pub fn instance_patch_filter_rejection(key: &str, values: &[String]) -> Option<String> {
     if key.is_empty() {
         return Some(INSTANCE_PATCH_FILTER_KEY_MISSING.to_string());
@@ -87,9 +108,8 @@ pub fn instance_patch_filter_rejection(key: &str, values: &[String]) -> Option<S
     if !is_instance_patch_filter_key(key) {
         return Some(super::instance_patch_states::unknown_filter_key(key));
     }
-    values
-        .is_empty()
-        .then(|| super::patch_baselines::patch_baseline_filter_value_missing(key))
+    (values.len() != INSTANCE_PATCH_FILTER_VALUES)
+        .then(|| INSTANCE_PATCH_FILTER_VALUE_SIZE_MESSAGE.to_string())
 }
 
 /// The lower bound the modelled page size of this read carries

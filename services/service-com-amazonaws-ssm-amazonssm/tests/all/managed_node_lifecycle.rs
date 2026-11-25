@@ -581,9 +581,13 @@ async fn a_patch_read_refuses_a_filter_key_that_names_no_property_of_a_patch() {
             "A Filters entry carries no filter key to search on".to_string(),
         ),
         (
+            // A patch filter narrows by ONE value of the property its key names, so an
+            // entry carrying none of them is refused with the value-size sentence, which
+            // states that rule and nothing of the request. What that rule generalises over
+            // is the sibling suite `all/instance_patch_filter_values.rs`'s subject.
             "a published key carrying no value",
             json!([{ "Key": "State" }]),
-            "Filter key 'State' carries no value to search for".to_string(),
+            "Invalid filter value size. A filter can only contain one value.".to_string(),
         ),
         (
             "a bad key beside a good one",

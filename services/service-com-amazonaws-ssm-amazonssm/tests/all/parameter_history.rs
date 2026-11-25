@@ -170,13 +170,21 @@ async fn seed_versions(
     seed_versions_in_region(router, REGION, name, type_, values).await
 }
 
-/// The `Name` a read reports for the parameter whose put named `name`: the name as the
-/// put wrote it, leading separator and all ("The fully qualified name includes the
-/// complete hierarchy of the parameter path and name", `PutParameterRequest$Name`). The
-/// parameter's ARN carries that name without the leading separator, which is also its
-/// store key, so either spelling addresses the one parameter.
+/// The `Name` a history entry reports for the parameter whose put named `name`: the name
+/// the store holds it under. The hierarchy separator LEADS a name that names a hierarchy
+/// ("The fully qualified name includes the complete hierarchy of the parameter path and
+/// name. For parameters in a hierarchy, you must include a leading forward slash character
+/// (/) when you create or reference a parameter", `PutParameterRequest$Name`), so a
+/// one-level name is held without one, whichever spelling the put used. That name is also
+/// the resource the parameter's ARN carries and its store key, so either spelling addresses
+/// the one parameter.
 fn reported_name(name: &str) -> &str {
-    name
+    let path = name.strip_prefix('/').unwrap_or(name);
+    if path.contains('/') {
+        name
+    } else {
+        path
+    }
 }
 
 /// `GetParameterHistory` signed for `region`.

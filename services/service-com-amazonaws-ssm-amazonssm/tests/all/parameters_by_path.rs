@@ -269,10 +269,10 @@ async fn a_path_read_reports_the_parameters_under_that_level() {
             "the root's own level, however a top-level name is spelled",
             "/",
             false,
-            // Both top-level parameters are reported under the name their put wrote,
-            // separator and all: the separator is part of the name, and not part of the
-            // parameter's identity, so either spelling addresses it.
-            vec!["/RootLevel", "TopLevel"],
+            // Both top-level parameters are reported under the name the store holds: the
+            // separator leads a name that names a hierarchy, and a one-level name names
+            // none, so either spelling of it addresses the one parameter reported here.
+            vec!["RootLevel", "TopLevel"],
         ),
         (
             "every parameter under the root",
@@ -286,7 +286,7 @@ async fn a_path_read_reports_the_parameters_under_that_level() {
                 "/Dev/secret",
                 "/DevOps/tool",
                 "/Prod/DBServer/db-url",
-                "/RootLevel",
+                "RootLevel",
                 "TopLevel",
             ],
         ),

@@ -1150,20 +1150,31 @@ pub fn allowed_pattern_mismatch_message(pattern: &str) -> String {
 /// The one rendering of a parameter name: what the store keeps for a name a request
 /// supplied, and therefore what every read and every refusal reports it by.
 ///
-/// A name is reported AS IT WAS WRITTEN, leading separator and all: "The fully qualified
-/// name includes the complete hierarchy of the parameter path and name. For parameters in
-/// a hierarchy, you must include a leading forward slash character (/) when you create or
-/// reference a parameter" (`PutParameter`'s `Name` doc), and that separator is part of the
-/// name a caller addresses and reads back at every depth — a parameter created as
-/// `/MyParameter` is reported as `/MyParameter`.
+/// The hierarchy separator LEADS a name that names a hierarchy: "The fully qualified name
+/// includes the complete hierarchy of the parameter path and name. For parameters in a
+/// hierarchy, you must include a leading forward slash character (/) when you create or
+/// reference a parameter" (`PutParameter`'s `Name` doc). A name of a SINGLE level names no
+/// hierarchy to lead, so it carries no leading separator at all: `MyParameter` and
+/// `/MyParameter` are the one parameter ([`canonical_name`]) and that parameter is held and
+/// reported as `MyParameter`, while `/Dev/DBServer` keeps its whole path, separator and all.
 ///
-/// What the separator is not part of is the parameter's IDENTITY: `MyParameter` and
-/// `/MyParameter` name the one parameter, which is the store key ([`canonical_name`]) and
+/// That rendering is the parameter's IDENTITY: it is the store key ([`canonical_name`]) and
 /// the resource the parameter's ARN carries after its `parameter/` prefix
-/// ([`parameter_arn`]). So either spelling addresses the parameter, and a client that
-/// round-trips a reported `Name` into another call reaches the one it read.
+/// ([`parameter_arn`]). So either spelling addresses the parameter, a client that round-trips
+/// a reported `Name` into another call reaches the one it read, and the `Name` a read reports
+/// never disagrees with the ARN beside it.
+///
+/// A read of a SINGLE named parameter reports it under the spelling its own request asked
+/// with instead ([`echoed_name`]), which is what a client keying its results by the string it
+/// sent needs; a listing and a history, which report the parameter rather than echo a name,
+/// report this one.
 pub fn reported_name(name: &str) -> &str {
-    name
+    let path = canonical_name(name);
+    if path.contains('/') {
+        name
+    } else {
+        path
+    }
 }
 
 /// The separator a `Name` carries between a parameter's name and the version or label a
@@ -1210,22 +1221,13 @@ pub fn echoed_name<'a>(asked: &'a str, query: &ParameterQuery<'_>, stored: &'a s
     }
 }
 
-/// How a refusal that names a version or a label QUOTES the parameter back: by the
-/// hierarchy path the name carries, which is the bare name for a parameter at the top
-/// level — a top-level parameter is in no hierarchy, so it has no separator in front of it
-/// to carry, while a hierarchical name is its whole path, separator and all.
-///
-/// That is not [`reported_name`], the name a READ reports: the two renderings are worded
-/// by different parts of the service and a one-level name written `/MyParameter` is read
-/// back under that spelling but quoted as `MyParameter`
-/// ([`version_not_found_message`], [`version_label_not_found_message`]).
+/// How a refusal that names a version or a label QUOTES the parameter back: by the one
+/// rendering of a parameter name this service holds and reports it under
+/// ([`reported_name`]), so a caller reads the same name in a refusal as in a read — the
+/// hierarchy path for a hierarchical name, separator and all, and the bare name for a
+/// top-level one, which is in no hierarchy to lead.
 pub fn quoted_name(name: &str) -> &str {
-    let path = canonical_name(name);
-    if path.contains('/') {
-        name
-    } else {
-        path
-    }
+    reported_name(name)
 }
 
 /// What a read whose `name:version` selector names a version the parameter does not

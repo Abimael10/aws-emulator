@@ -131,25 +131,37 @@ fn policy_document(count: usize) -> Value {
         .collect::<Vec<Value>>())
 }
 
-/// A name is kept as the create wrote it: every read reports that spelling, and the
-/// reported name addresses the same parameter when it is fed back into another call — as
-/// does the same name spelled without its leading separator, which is the parameter's
-/// store key and the resource its ARN carries.
+/// A read of ONE named parameter answers under the spelling its request asked with, and a
+/// listing or a history reports the parameter under the name the store holds: the hierarchy
+/// separator leads a name that names a hierarchy, so a one-level name is held without one.
+/// Either name addresses the same parameter when it is fed back into another call — as does
+/// the store key the parameter's ARN carries.
 #[tokio::test]
-async fn every_read_reports_the_name_the_parameter_was_created_with() {
+async fn every_read_reports_the_name_the_parameter_is_held_under() {
     let router = router();
 
-    // (case, the name the put used, the name every read must report)
-    let cases: &[(&str, &str, &str)] = &[
-        ("a top-level name", "PayloadTop", "PayloadTop"),
+    // (case, the name the put used, the name a read ASKED with it echoes, the name the
+    // store holds and every projection of the parameter reports)
+    let cases: &[(&str, &str, &str, &str)] = &[
+        ("a top-level name", "PayloadTop", "PayloadTop", "PayloadTop"),
         (
+            // The separator leads a hierarchy, and a one-level name names none: the put's
+            // spelling is echoed to the read that asked with it, while the parameter is
+            // held — and projected — under the bare name.
             "a top-level name spelled with the separator",
             "/PayloadRooted",
             "/PayloadRooted",
+            "PayloadRooted",
         ),
-        ("a two-level name", "/Payload/two", "/Payload/two"),
+        (
+            "a two-level name",
+            "/Payload/two",
+            "/Payload/two",
+            "/Payload/two",
+        ),
         (
             "a five-level name",
+            "/Payload/a/b/c/five",
             "/Payload/a/b/c/five",
             "/Payload/a/b/c/five",
         ),
@@ -157,10 +169,11 @@ async fn every_read_reports_the_name_the_parameter_was_created_with() {
             "a top-level name of only symbols the name rule admits",
             "/Payload_top-level.0",
             "/Payload_top-level.0",
+            "Payload_top-level.0",
         ),
     ];
 
-    for (case, written, expected) in cases {
+    for (case, written, echoed, expected) in cases {
         put_ok(
             &router,
             case,
@@ -187,23 +200,31 @@ async fn every_read_reports_the_name_the_parameter_was_created_with() {
         )
         .await;
 
-        let reported: Vec<(&str, Value)> = vec![
-            ("GetParameter", single["Parameter"].clone()),
-            ("GetParameters", list(case, &batch, "Parameters")[0].clone()),
+        // A read that ASKED by name echoes that name; a history and a listing report the
+        // parameter, so they report the name the store holds.
+        let reported: Vec<(&str, Value, &str)> = vec![
+            ("GetParameter", single["Parameter"].clone(), *echoed),
+            (
+                "GetParameters",
+                list(case, &batch, "Parameters")[0].clone(),
+                *echoed,
+            ),
             (
                 "GetParameterHistory",
                 list(case, &history, "Parameters")[0].clone(),
+                *expected,
             ),
             (
                 "DescribeParameters",
                 list(case, &described, "Parameters")[0].clone(),
+                *expected,
             ),
         ];
-        for (operation, record) in &reported {
+        for (operation, record, want) in &reported {
             assert_eq!(
                 record["Name"].as_str(),
-                Some(*expected),
-                "case {case:?}: {operation} must report the name as {expected:?}, got {record}"
+                Some(*want),
+                "case {case:?}: {operation} must report the name as {want:?}, got {record}"
             );
         }
         // The ARN carries that name with its leading separator dropped, which is the

@@ -7,10 +7,14 @@
 //! The decisions, in order:
 //!
 //! 1. every `Filters` entry has to name a property of a patch this read knows
-//!    ([`crate::state::instance_patches::INSTANCE_PATCH_FILTER_KEYS`]) and carry a value to
-//!    search for. A filter that names neither is a refusal of the REQUEST, taken before any
-//!    node is resolved and worded as this service words an unknown patch filter key
-//!    ([`crate::state::instance_patch_states::unknown_filter_key`]);
+//!    ([`crate::state::instance_patches::INSTANCE_PATCH_FILTER_KEYS`]) and carry exactly one
+//!    value to compare that property against. A filter that names no such property is a
+//!    refusal of the REQUEST, taken before any node is resolved and worded as this service
+//!    words an unknown patch filter key
+//!    ([`crate::state::instance_patch_states::unknown_filter_key`]); one whose `Values` list
+//!    holds any other number of values is refused with the value-size sentence
+//!    ([`crate::state::instance_patches::INSTANCE_PATCH_FILTER_VALUE_SIZE_MESSAGE`]), which
+//!    states the rule and nothing of the request;
 //! 2. the patches themselves, which are the ones that have been REPORTED for that node id.
 //!    Patch compliance is gathered inside the node by the patching operation Patch Manager
 //!    runs there, and no call of this service's model reports one, so an id nothing has

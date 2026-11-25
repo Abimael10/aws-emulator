@@ -20,6 +20,13 @@
 //! ([`crate::state::public_parameters::reserved_read_denial_message`]) rather than reported
 //! as a name nothing is stored under.
 //!
+//! ## The `Name` each entry reports
+//!
+//! Every entry reports the parameter under the name the STORE holds, which is the one
+//! rendering of a parameter name ([`crate::state::reported_name`]): the hierarchy separator
+//! leads a name that names a hierarchy, so a one-level name is reported without one whichever
+//! spelling the request addressed it by.
+//!
 //! ## Paging
 //!
 //! A page carries at most `MaxResults` entries, up to the modelled maximum
