@@ -348,6 +348,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         record.status = docdb::STATUS_DELETING.to_string();
         record.available_at = None;
+        // The cluster's DOCUMENTS are its storage, so nothing of them outlives it — and the
+        // credential its endpoints checked a login against goes with them. The socket of any
+        // member still held is closed too: a port onto a cluster that is gone would answer
+        // out of nothing.
+        for member in &record.members {
+            store
+                .instance_data_planes
+                .close(&member.db_instance_identifier);
+        }
+        if let Some(documents) = crate::state::ClusterDocuments::of(&*self.engine) {
+            documents.lock().forget(&record.resource_id);
+        }
         // The cluster is gone from the store, so this service stops claiming the
         // `DbClusterResourceId` it minted for it.
         if let Some(directory) = crate::state::data_source_directory(&*self.engine) {

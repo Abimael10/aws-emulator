@@ -241,26 +241,44 @@ async fn a_cluster_publishes_the_address_its_data_plane_is_served_at() {
     }
 }
 
-/// One row of the member table: the case, the engine, and the host and engine port the
-/// member must publish (`None` for an engine whose plane this emulator does not serve, which
-/// keeps its AWS DNS name).
-type MemberRow = (&'static str, &'static str, Option<(&'static str, &'static str)>);
+/// What a member instance must publish.
+enum MemberAddress {
+    /// The host this emulator answers an API data plane on, with the port it answers it at:
+    /// the address of this process itself, which is where that plane is served.
+    ApiPlane(&'static str, &'static str),
+    /// A listener of the member's OWN, for an engine whose native wire this emulator serves:
+    /// the address and port of the socket the core opened for it.
+    OwnListener,
+}
+
+/// One row of the member table: the case, the engine, and what the member must publish.
+type MemberRow = (&'static str, &'static str, MemberAddress);
 
 #[tokio::test]
 async fn a_cluster_member_publishes_the_same_address_as_its_cluster() {
     let router = emulator();
-    // A member instance is a second address onto the same data plane, so the rule holds
-    // for it too: the rows are the Neptune cluster whose API this emulator serves at its
-    // own endpoint and the DocumentDB cluster whose plane it serves neither way.
+    // A member instance is a second address onto the same data plane, so the rule holds for
+    // it too: the rows are the Neptune cluster whose API this emulator serves at its own
+    // endpoint, and the DocumentDB cluster whose wire it serves on a listener of its own —
+    // where each member is reached at an endpoint of ITS own, because such a cluster is
+    // reachable only from inside the virtual private cloud it was placed in
+    // (`crate::state::document_plane`).
     let rows: [MemberRow; 2] = [
         (
             "a Neptune cluster member",
             "neptune",
             // The address this emulator answers the graph API on — never the engine port
             // the create asks for below, which nothing of this process listens on.
-            Some(("127.0.0.1", "9297")),
+            MemberAddress::ApiPlane("127.0.0.1", "9297"),
         ),
-        ("a DocumentDB cluster member", "docdb", None),
+        (
+            "a DocumentDB cluster member",
+            "docdb",
+            // The address and port of the socket the core opened for this member — never the
+            // instance `Port` the create asks for below, which the core's own port range
+            // takes no account of.
+            MemberAddress::OwnListener,
+        ),
     ];
     let endpoint = "https://127.0.0.1:9297/";
 
@@ -295,7 +313,7 @@ async fn a_cluster_member_publishes_the_same_address_as_its_cluster() {
         );
         let (address, port) = endpoint_of(&created);
         match expected {
-            Some((host, expected_port)) => {
+            MemberAddress::ApiPlane(host, expected_port) => {
                 assert_eq!(
                     address, *host,
                     "case {case:?}: expected the instance <Address> {host:?}, got {address:?}"
@@ -306,11 +324,21 @@ async fn a_cluster_member_publishes_the_same_address_as_its_cluster() {
                     "case {case:?}: expected the instance <Port> {expected_port:?}, got {port}"
                 );
             }
-            None => {
-                let suffix = format!(".{REGION}.docdb.amazonaws.com");
+            MemberAddress::OwnListener => {
                 assert!(
-                    address.ends_with(&suffix),
-                    "case {case:?}: expected an <Address> ending {suffix}, got {address:?}"
+                    address.parse::<std::net::IpAddr>().is_ok(),
+                    "case {case:?}: expected the <Address> its own socket is bound on, got \
+                     {address:?}"
+                );
+                assert!(
+                    !address.ends_with("amazonaws.com"),
+                    "case {case:?}: a served member must publish no name in the engine's AWS \
+                     DNS zone, got {address:?}"
+                );
+                assert!(
+                    port > 0 && port.to_string() != "7777",
+                    "case {case:?}: expected the port the core assigned its socket rather \
+                     than the one the create asked for, got {port}"
                 );
             }
         }

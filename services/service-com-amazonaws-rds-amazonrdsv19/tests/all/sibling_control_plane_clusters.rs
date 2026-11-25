@@ -262,12 +262,14 @@ async fn a_cluster_members_endpoint_sits_in_the_same_domain_as_its_cluster() {
     let router = emulator();
 
     // The rule holds for the member INSTANCES of a cluster too: an instance of an engine
-    // another control plane owns is reached under that control plane's domain. An Aurora
-    // member is the exception, and for the same reason its cluster's endpoints are: this
-    // emulator SERVES that engine's wire, so the member's endpoint is the address of the
-    // listener it opened onto the cluster's volume rather than a name nothing resolves.
+    // another control plane owns is reached under that control plane's domain — unless this
+    // emulator SERVES that engine's wire, and then the member's endpoint is the address of
+    // the listener it opened onto the cluster's own storage rather than a name nothing
+    // resolves. An Aurora member and an Amazon DocumentDB member are both of that second
+    // kind; an Amazon Neptune member is not, because its plane is an API rather than a wire
+    // of its own.
     let rows: [(&str, &str, Option<&str>); 3] = [
-        ("a DocumentDB cluster member", "docdb", Some(DOCDB_DOMAIN)),
+        ("a DocumentDB cluster member", "docdb", None),
         ("a Neptune cluster member", "neptune", Some(NEPTUNE_DOMAIN)),
         ("an Aurora MySQL cluster member", "aurora-mysql", None),
     ];
@@ -300,10 +302,12 @@ async fn a_cluster_members_endpoint_sits_in_the_same_domain_as_its_cluster() {
                      {suffix}, got {address:?}"
                 );
             }
-            None => assert_eq!(
-                address, "127.0.0.1",
-                "case {case:?}: expected the host the member's own engine listener is bound \
-                 to, got {address:?}"
+            None => assert!(
+                address
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback()),
+                "case {case:?}: expected an address of the interface the member's own engine \
+                 listener is bound on, got {address:?}"
             ),
         }
     }

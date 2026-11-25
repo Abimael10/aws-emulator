@@ -492,6 +492,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(period) = input.backup_retention_period {
                 record.backup_retention_period = period;
             }
+            // `MasterUserPassword`: "The password for the master database user." The
+            // credential a client of this cluster's endpoints authenticates with is derived
+            // from it again below, so a login after this modify is checked against the new
+            // password and no longer against the old one.
             if let Some(window) = input.preferred_backup_window {
                 record.preferred_backup_window = window;
             }
@@ -564,6 +568,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clusters
             .get(&new_key)
             .expect("the renamed cluster was just re-inserted");
+        // A new `MasterUserPassword` replaces the credential a client of this cluster's
+        // ENDPOINTS authenticates with, which is held with the cluster's documents under its
+        // immutable resource id (`docdb::cluster_data_plane::volumes`) — so a login after this
+        // modify is checked against the new password and no longer against the old one. The
+        // password itself is not stored. The DocumentDB store is held and the shared storage
+        // taken second, the order its doc fixes.
+        if let (Some(username), Some(password)) = (
+            stored.master_username.as_deref(),
+            input.master_user_password.as_deref(),
+        ) {
+            if let Some(documents) = docdb::ClusterDocuments::of(&*self.engine) {
+                documents.lock().set_credentials(
+                    &stored.resource_id,
+                    Some(docdb::cluster_data_plane::auth::ScramCredentials::derive(
+                        username, password,
+                    )),
+                );
+            }
+        }
         Ok(ModifyDBClusterOutput {
             db_cluster: Some(docdb::cluster_to_shape(stored, &store.instances)),
         })

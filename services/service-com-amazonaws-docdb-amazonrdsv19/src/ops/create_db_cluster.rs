@@ -548,6 +548,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .expect("the cluster was inserted on the line above");
         let resource_id = stored.resource_id.clone();
         let engine = stored.engine.clone();
+        // The credential a client of this cluster's ENDPOINTS authenticates with, derived from
+        // the password the create carried: what is kept is the SCRAM credential a login is
+        // checked against, never the password or any form it can be recovered from. It is held
+        // with the cluster's documents, under the cluster's immutable resource id, because
+        // both belong to the CLUSTER rather than to the view of this front door that created
+        // it (`docdb::cluster_data_plane::volumes`). A create that named no master user
+        // records none, and its endpoints then have nothing to check a client against. The
+        // DocumentDB store is held and the shared storage taken second, the order its doc
+        // fixes.
+        let credentials = match (
+            stored.master_username.as_deref(),
+            input.master_user_password.as_deref(),
+        ) {
+            (Some(username), Some(password)) => Some(
+                docdb::cluster_data_plane::auth::ScramCredentials::derive(username, password),
+            ),
+            _ => None,
+        };
+        if credentials.is_some() {
+            if let Some(documents) = docdb::ClusterDocuments::of(&*self.engine) {
+                documents
+                    .lock()
+                    .set_credentials(&resource_id, credentials);
+            }
+        }
         let db_cluster = docdb::cluster_to_shape(stored, &store.instances);
         // The `DbClusterResourceId` just minted is recorded in the SHARED
         // data-source directory, so a service that monitors this cluster

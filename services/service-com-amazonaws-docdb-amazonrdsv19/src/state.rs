@@ -25,7 +25,16 @@ pub mod ec2_subnets;
 /// The connection address an instance announces for a client to dial.
 pub mod announced_address;
 
+/// The data plane behind that address: the socket a client of an instance connects to and
+/// the documents its cluster holds.
+pub mod cluster_data_plane;
+
 pub use announced_address::announced_instance_host;
+
+pub use cluster_data_plane::{
+    endpoints_are_encrypted, engine_speaks_the_document_wire, serve_instance, ClusterDocuments,
+    InstanceDataPlanes, ServedEndpoint, SharedVolume,
+};
 
 pub use ec2_subnets::{
     az_coverage_message, group_network_types, invalid_subnets_message, resolve_subnets,
@@ -596,6 +605,11 @@ pub struct DbInstanceRecord {
     /// `Endpoint$Address`, resolved when the instance was created; see
     /// [`announced_address`].
     pub endpoint_address: String,
+    /// The address this instance's own socket answers on, published as `Endpoint$Address` and
+    /// `Endpoint$Port` where this emulator serves the instance's data plane
+    /// ([`cluster_data_plane`]). `None` for an instance it serves none for, which publishes
+    /// [`Self::endpoint_address`] and its cluster's port instead.
+    pub served_endpoint: Option<ServedEndpoint>,
     /// `InstanceCreateTime`.
     pub instance_create_time: ::aws_smithy_types::DateTime,
     /// `PreferredMaintenanceWindow`.
@@ -622,6 +636,31 @@ impl DbInstanceRecord {
             &self.region,
             &format!("db:{}", self.identifier),
         )
+    }
+
+    /// `Endpoint$Address`: the host a client connects to.
+    ///
+    /// The address the instance's own socket answers on where this emulator serves its data
+    /// plane, and the name its control plane publishes where it serves none — an endpoint is
+    /// an address the service answers on, so a served instance publishes the address a client
+    /// of this emulator reaches it at.
+    pub fn endpoint_address(&self) -> String {
+        match &self.served_endpoint {
+            Some(served) => served.host.clone(),
+            None => self.endpoint_address.clone(),
+        }
+    }
+
+    /// `Endpoint$Port`: the port the database engine is listening on.
+    ///
+    /// The port the core assigned this instance's own socket where this emulator serves its
+    /// data plane — the pair is ONE address a client dials, so the port is the socket's as the
+    /// host is — and the port its cluster publishes for the engine where it serves none.
+    pub fn endpoint_port(&self, cluster_port: i32) -> i32 {
+        match &self.served_endpoint {
+            Some(served) => served.port,
+            None => cluster_port,
+        }
     }
 
     /// Materialise the `creating` -> `available` transition if the clock already owes it.
@@ -853,6 +892,10 @@ pub struct ComAmazonawsDocdbAmazonrdsv19State {
     pub cluster_parameter_groups: BTreeMap<String, DbClusterParameterGroupRecord>,
     /// Subnet groups, keyed by lowercased `DBSubnetGroupName`.
     pub subnet_groups: BTreeMap<String, DbSubnetGroupRecord>,
+    /// The sockets this emulator has open for its instances, keyed by the instance they
+    /// serve. Kept beside the records because a live socket is not a cloneable value; see
+    /// [`cluster_data_plane`].
+    pub instance_data_planes: InstanceDataPlanes,
     /// Monotonic counter behind every minted resource id, so ids are deterministic.
     pub next_resource_id: u64,
 }
@@ -1445,7 +1488,9 @@ pub fn validate_master_username(value: &str) -> Result<(), String> {
 
 /// Refuse a `MasterUserPassword` outside its documented rule; see
 /// [`MIN_MASTER_USER_PASSWORD_LEN`] and [`MASTER_USER_PASSWORD_FORBIDDEN`]. The value
-/// itself is never quoted back, and this service never stores it.
+/// itself is never quoted back, and this service stores no form of it from which it could be
+/// recovered: what a create keeps is the SCRAM credential a client's login is checked against
+/// ([`cluster_data_plane::auth::ScramCredentials`]).
 pub fn validate_master_user_password(value: &str) -> Result<(), String> {
     let length = value.chars().count();
     let printable_ascii = value.chars().all(|c| c.is_ascii() && !c.is_ascii_control());
@@ -1772,8 +1817,8 @@ pub fn instance_to_shape(
         ),
         http_endpoint_enabled: Some(INSTANCE_HTTP_ENDPOINT_ENABLED),
         endpoint: Some(Endpoint {
-            address: Some(record.endpoint_address.clone()),
-            port: Some(cluster.map_or(DEFAULT_PORT, |owner| owner.port)),
+            address: Some(record.endpoint_address()),
+            port: Some(record.endpoint_port(cluster.map_or(DEFAULT_PORT, |owner| owner.port))),
             hosted_zone_id: cluster.map(|owner| owner.hosted_zone_id.clone()),
         }),
         instance_create_time: Some(record.instance_create_time),

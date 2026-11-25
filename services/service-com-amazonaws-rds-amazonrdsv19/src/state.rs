@@ -314,6 +314,15 @@ pub use tenant_databases::{
 // (two wire protocols and a SQL engine), and only the record the store holds and the
 // opener a create calls are reached from here.
 pub mod data_plane;
+// The DOCUMENT data plane of a DB instance whose engine is Amazon DocumentDB's: an AWS SDK
+// DocumentDB client signs `rds`, so such an instance is created here, and what its endpoint
+// publishes is the socket this emulator answers that engine's own wire on — served by the one
+// implementation of that wire this tree has, which the DocumentDB control plane's crate owns.
+pub mod document_plane;
+pub use document_plane::{
+    engine_serves_the_document_wire, forget_cluster_documents, open_document_plane,
+    published_address, record_master_credential, DocumentPlane,
+};
 // The subnets a request NAMES, resolved against the service that owns them: a subnet's
 // Availability Zone is Amazon EC2's fact, and this is the one place this crate asks for it.
 pub mod ec2_subnets;
@@ -710,6 +719,12 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     /// every engine whose wire this emulator speaks, and
     /// [`Self::settle_due_transitions`] drops it with the instance.
     pub db_engine_endpoints: BTreeMap<RegionalKey, DbEngineEndpoint>,
+    /// The DOCUMENT-wire socket of each DB instance that has one, by `(region,
+    /// DBInstanceIdentifier)` — the Amazon DocumentDB instances this door created
+    /// ([`document_plane`]). Kept beside the instance records for the reason the engine
+    /// endpoints above are: a record is a cloneable value and a live socket is not, and the
+    /// handle held here is what keeps the port open for exactly as long as the instance.
+    pub document_planes: BTreeMap<RegionalKey, DocumentPlane>,
     /// The live engine endpoint of each DB CLUSTER that has one, by the same
     /// `(region, DBClusterIdentifier)` key as [`Self::db_clusters`].
     ///
@@ -853,6 +868,9 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             // The instance is gone from the service, so its engine endpoint goes with
             // it: dropping the record closes the port and severs every session on it.
             self.db_engine_endpoints.remove(&key);
+            // And its DOCUMENT-wire socket, where it had one, for the same reason
+            // ([`document_plane`]).
+            self.document_planes.remove(&key);
             // And so do its tenant databases: a tenant database is a pluggable database
             // INSIDE a DB instance, so none of them outlives the instance that held it.
             self.drop_tenant_databases_of(&key);
@@ -873,6 +891,11 @@ impl ComAmazonawsRdsAmazonrdsv19State {
                 // connected to stays the endpoint this instance publishes, whatever it is
                 // now called.
                 self.move_engine_endpoint(&from, &to);
+                // The same for its document-wire socket: a rename moves the key the handle is
+                // held under, so the port stays the endpoint this instance publishes.
+                if let Some(plane) = self.document_planes.remove(&from) {
+                    self.document_planes.insert(to.clone(), plane);
+                }
                 // Its tenant databases move with it too: each of them is addressed by the
                 // instance that holds it, which is now called something else.
                 self.move_tenant_databases_of(&from, &to);

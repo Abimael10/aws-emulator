@@ -535,10 +535,10 @@ async fn a_multi_instance_page_carries_the_attribute_set_on_every_instance_it_li
 }
 
 // ---------------------------------------------------------------------------
-// The host an instance announces
+// The address an instance publishes
 // ---------------------------------------------------------------------------
 
-/// One row of the announced-host table.
+/// One row of the published-address table.
 struct AddressCase {
     label: &'static str,
     /// The `Host` header the request carries — the address the client is talking to — or
@@ -547,81 +547,67 @@ struct AddressCase {
     /// The URL this emulator's data port is published at, or `None` for a router served on
     /// no port.
     served_base: Option<&'static str>,
-    /// The host this emulator is REACHED at in this row, which the announced address must
-    /// not be: this emulator serves no Amazon DocumentDB data plane, so an instance keeps
-    /// the name its own control plane publishes rather than this process's address.
-    reached_host: &'static str,
-    /// The `Port` the cluster is created with, when the row names one.
+    /// The `Port` the cluster is created with, when the row names one: the engine port the
+    /// CLUSTER publishes, which an instance served on a socket of its own does not report,
+    /// because what it publishes is the address and port that socket answers at.
     cluster_port: Option<&'static str>,
-    /// The port its `Endpoint$Port` must report: the port its CLUSTER publishes for the
-    /// engine, whatever address the request arrived at.
-    expected_port: &'static str,
 }
 
 #[tokio::test]
-async fn an_instance_announces_the_dns_name_under_its_clusters_endpoint_suffix() {
+async fn an_instance_publishes_the_address_its_own_socket_answers_on() {
+    // RULE: an endpoint a service advertises is an address the service ANSWERS on, so an
+    // instance whose data plane this emulator serves publishes the host and port of the
+    // socket the core opened for it — never a name in Amazon DocumentDB's own DNS zone,
+    // which resolves to nothing on the machine this emulator runs on.
+    //
     // The rows span how the emulator is addressed and how it is served: the default data
     // port, an ephemeral one, loopback by name, an IPv6 literal whose own colons live
-    // inside its brackets, an authority naming no port, and the two ways a request can name
-    // no address of this process while the process itself is served at one. None of them
-    // changes what the instance announces — that is the rule — and the announced PORT is
-    // its cluster's, which the rows vary independently.
+    // inside its brackets, an authority naming no port, the two ways a request can name no
+    // address of this process, and a cluster that chose its engine port. None of them
+    // changes the rule — what an instance publishes is its OWN socket, not the address the
+    // control-plane request happened to arrive at.
     let cases = [
         AddressCase {
             label: "the front door on the emulator's default data port",
             host: Some("127.0.0.1:9297"),
             served_base: None,
-            reached_host: "127.0.0.1",
             cluster_port: None,
-            expected_port: "27017",
         },
         AddressCase {
             label: "an ephemeral data port, on a cluster that chose its engine port",
             host: Some("127.0.0.1:44903"),
             served_base: None,
-            reached_host: "127.0.0.1",
             cluster_port: Some("27018"),
-            expected_port: "27018",
         },
         AddressCase {
             label: "loopback by name",
             host: Some("localhost:41509"),
             served_base: None,
-            reached_host: "localhost",
             cluster_port: None,
-            expected_port: "27017",
         },
         AddressCase {
             label: "an IPv6 loopback literal",
             host: Some("[::1]:38001"),
             served_base: None,
-            reached_host: "[::1]",
             cluster_port: None,
-            expected_port: "27017",
         },
         AddressCase {
             label: "an authority that names no port of its own",
             host: Some("127.0.0.1"),
             served_base: None,
-            reached_host: "127.0.0.1",
             cluster_port: None,
-            expected_port: "27017",
         },
         AddressCase {
             label: "a request that named no host, on an emulator served on a port",
             host: None,
             served_base: Some("https://127.0.0.1:9297"),
-            reached_host: "127.0.0.1",
             cluster_port: None,
-            expected_port: "27017",
         },
         AddressCase {
             label: "a request that addressed an AWS host, on an emulator served on a port",
             host: Some("docdb.us-east-1.amazonaws.com"),
             served_base: Some("https://127.0.0.1:35117"),
-            reached_host: "127.0.0.1",
             cluster_port: None,
-            expected_port: "27017",
         },
     ];
 
@@ -630,8 +616,8 @@ async fn an_instance_announces_the_dns_name_under_its_clusters_endpoint_suffix()
             Some(base) => Docdb::served_at(base),
             None => Docdb::new(),
         };
-        let cluster = format!("announced-cluster-{index}");
-        let instance = format!("announced-instance-{index}");
+        let cluster = format!("published-cluster-{index}");
+        let instance = format!("published-instance-{index}");
         let mut cluster_params: Vec<(&str, &str)> = vec![
             ("DBClusterIdentifier", cluster.as_str()),
             ("Engine", "docdb"),
@@ -670,41 +656,43 @@ async fn an_instance_announces_the_dns_name_under_its_clusters_endpoint_suffix()
             &[("DBInstanceIdentifier", instance.as_str())],
         )
         .await;
-        // ROUND TRIP: the describe reports the host the create announced, because the
-        // create resolved it once and stored it on the record.
+        // ROUND TRIP: the describe reports the address the create published, because the
+        // create resolved it once — from the socket it opened — and stored it on the record.
+        let mut published: Vec<(String, String)> = Vec::new();
         for (path, xml) in [("create", &created.xml), ("describe", &described.xml)] {
             let address = text(xml, "Address");
             let port = text(xml, "Port");
-            // The name this engine's control plane publishes for a member: the instance's
-            // own label under the DNS suffix its cluster minted.
             assert!(
-                address.starts_with(&format!("{instance}."))
-                    && address.ends_with(&format!(".{REGION}.docdb.amazonaws.com")),
-                "case {:?} / {path}: expected an Endpoint.Address of the form \
-                 {instance}.<cluster label>.{REGION}.docdb.amazonaws.com, got {address:?} in \
-                 {xml}",
+                !address.ends_with(&format!(".{REGION}.docdb.amazonaws.com")),
+                "case {:?} / {path}: the published address must be one this emulator answers \
+                 on, not a name in Amazon DocumentDB's own DNS zone, got {address:?} in {xml}",
                 case.label
-            );
-            assert!(
-                !address.contains(case.reached_host),
-                "case {:?} / {path}: the announced address must not name the address this \
-                 emulator was reached at ({:?}), which serves no data plane for this \
-                 engine, got {address:?}",
-                case.label,
-                case.reached_host
             );
             assert!(
                 !address.contains("://"),
                 "case {:?} / {path}: Endpoint.Address is a host, not a URL, got {address:?}",
                 case.label
             );
-            assert_eq!(
-                port, case.expected_port,
-                "case {:?} / {path}: expected Endpoint.Port {:?}, got {port:?} in {xml}",
-                case.label, case.expected_port
+            // A host of this emulator's: the core binds its listeners on the operator-chosen
+            // interface, loopback by default, so the published host is an address literal of
+            // this machine rather than a name that has to be resolved.
+            assert!(
+                address
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok(),
+                "case {:?} / {path}: expected the address of the interface the core bound, \
+                 got {address:?} in {xml}",
+                case.label
             );
-            // The point of the pair: `<Address>:<Port>` is ONE address a client dials, so
-            // it parses as a URL naming exactly the announced port.
+            assert!(
+                port.parse::<u16>().is_ok_and(|port| port > 0),
+                "case {:?} / {path}: expected the port the core assigned the instance's \
+                 socket, got {port:?} in {xml}",
+                case.label
+            );
+            // The point of the pair: `<Address>:<Port>` is ONE address a client dials, so it
+            // parses as a URL naming exactly the published port.
             let dialled = format!("https://{address}:{port}/")
                 .parse::<http::Uri>()
                 .unwrap_or_else(|error| {
@@ -716,28 +704,48 @@ async fn an_instance_announces_the_dns_name_under_its_clusters_endpoint_suffix()
                 });
             assert_eq!(
                 dialled.port_u16().map(|found| found.to_string()).as_deref(),
-                Some(case.expected_port),
-                "case {:?} / {path}: expected the dialed URL to name port {:?}, got {:?}",
+                Some(port.as_str()),
+                "case {:?} / {path}: expected the dialed URL to name port {port:?}, got {:?}",
                 case.label,
-                case.expected_port,
                 dialled.port_u16()
+            );
+            published.push((address, port));
+        }
+        assert_eq!(
+            published.first(),
+            published.last(),
+            "case {:?}: the describe must report the address the create published, got \
+             {published:?}",
+            case.label
+        );
+        // The cluster's own `Port` member is the engine port its endpoints publish, and is
+        // untouched by what the instance's socket answers on.
+        if let Some(requested) = case.cluster_port {
+            let cluster_port = text(&created_cluster.xml, "Port");
+            assert_eq!(
+                cluster_port, requested,
+                "case {:?}: the cluster must still report the engine port it was created \
+                 with, got {cluster_port:?} in {}",
+                case.label, created_cluster.xml
             );
         }
     }
 }
 
 #[tokio::test]
-async fn an_instance_endpoint_reports_the_port_its_cluster_publishes() {
-    // The port the pair names is the cluster's, as its own `Port` member sets it
-    // (`CreateDBClusterMessage$Port`: "Default: 27017"), because an instance of this engine
-    // has no port of its own to publish.
-    for (label, requested_port, expected_port) in [
+async fn each_member_of_a_cluster_publishes_the_address_of_its_own_socket() {
+    // The pair an instance publishes is ONE address a client dials: the host and port of the
+    // socket this emulator answers that instance on. The cluster goes on reporting the engine
+    // port it was created with (`CreateDBClusterMessage$Port`: "Default: 27017"), which the
+    // rows vary — the member's own endpoint is its socket's either way, because the core owns
+    // the port range and takes no port from this service.
+    for (label, requested_port, expected_cluster_port) in [
         ("no Port member, so the engine default", None, "27017"),
         ("a Port member the cluster chose", Some("27018"), "27018"),
     ] {
         let docdb = Docdb::new();
-        let cluster = format!("unserved-cluster-{expected_port}");
-        let instance = format!("unserved-instance-{expected_port}");
+        let cluster = format!("member-address-cluster-{expected_cluster_port}");
+        let instance = format!("member-address-instance-{expected_cluster_port}");
         let mut cluster_params: Vec<(&str, &str)> = vec![
             ("DBClusterIdentifier", cluster.as_str()),
             ("Engine", "docdb"),
@@ -745,7 +753,13 @@ async fn an_instance_endpoint_reports_the_port_its_cluster_publishes() {
         if let Some(port) = requested_port {
             cluster_params.push(("Port", port));
         }
-        docdb.ok(label, "CreateDBCluster", &cluster_params).await;
+        let created_cluster = docdb.ok(label, "CreateDBCluster", &cluster_params).await;
+        assert_eq!(
+            text(&created_cluster, "Port"),
+            expected_cluster_port,
+            "case {label:?}: the cluster reports the engine port it was created with, got \
+             {created_cluster}"
+        );
         let created = docdb
             .ok(
                 label,
@@ -759,16 +773,40 @@ async fn an_instance_endpoint_reports_the_port_its_cluster_publishes() {
             )
             .await;
         let address = text(&created, "Address");
-        assert!(
-            address.starts_with(&format!("{instance}."))
-                && address.ends_with(&format!(".{REGION}.docdb.amazonaws.com")),
-            "case {label:?}: unexpected Endpoint.Address {address:?} in {created}"
-        );
         let port = text(&created, "Port");
-        assert_eq!(
-            port, expected_port,
-            "case {label:?}: expected Endpoint.Port {expected_port:?}, got {port:?} in \
+        assert!(
+            address
+                .trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_ok(),
+            "case {label:?}: expected the address its socket is bound on, got {address:?} in \
              {created}"
+        );
+        assert!(
+            port.parse::<u16>().is_ok_and(|port| port > 0),
+            "case {label:?}: expected the port the core assigned its socket, got {port:?} in \
+             {created}"
+        );
+        // Two instances of one cluster are two addresses onto its storage, each served on a
+        // socket of its own — so each publishes its own pair, which is what tells them apart.
+        let second_identifier = format!("{instance}-2");
+        let second = docdb
+            .ok(
+                label,
+                "CreateDBInstance",
+                &[
+                    ("DBInstanceIdentifier", second_identifier.as_str()),
+                    ("DBInstanceClass", "db.r5.large"),
+                    ("Engine", "docdb"),
+                    ("DBClusterIdentifier", cluster.as_str()),
+                ],
+            )
+            .await;
+        assert_ne!(
+            (text(&second, "Address"), text(&second, "Port")),
+            (address, port),
+            "case {label:?}: a second member must publish its own socket's address, got \
+             {second}"
         );
     }
 }

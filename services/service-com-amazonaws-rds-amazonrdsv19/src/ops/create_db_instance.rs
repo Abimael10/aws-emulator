@@ -1137,6 +1137,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if record.served_endpoint.is_none() {
             record.served_endpoint = crate::state::api_plane_endpoint(&record.engine, ctx);
         }
+        // An Amazon DocumentDB instance — created HERE because an AWS SDK DocumentDB client
+        // signs `rds` — is served the DOCUMENT wire on a socket of its own, over the documents
+        // its cluster holds, and publishes the address that socket answers on
+        // ([`crate::state::document_plane`]).
+        let document_plane = match record.served_endpoint.is_none() {
+            true => crate::state::open_document_plane(&*self.engine, &state, &record).await,
+            false => None,
+        };
+        if let Some(plane) = &document_plane {
+            record.served_endpoint = Some(crate::state::published_address(plane));
+        }
         // The instance's CONTINUOUS BACKUP starts from the data it comes up with, so an
         // instant before its first commit has the state it started from to be restored to
         // rather than a later commit's
@@ -1222,7 +1233,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The listener is the instance's: the store holds it, so it stays open for as
         // long as the instance does and closes with it.
         if let Some(endpoint) = endpoint {
-            store.db_engine_endpoints.insert(key, endpoint);
+            store.db_engine_endpoints.insert(key.clone(), endpoint);
+        }
+        // The same for the DOCUMENT-wire socket of an Amazon DocumentDB instance: the handle
+        // lives on the store under the instance's own key, so dropping it with the instance
+        // closes the port.
+        if let Some(plane) = document_plane {
+            store.document_planes.insert(key, plane);
         }
         // The create happened, so the region's event log records it: that entry is what
         // `DescribeEvents` reports for this instance from now on.

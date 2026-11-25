@@ -195,6 +195,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .instances
             .remove(&key)
             .expect("the instance key was resolved from this same map above");
+        // The instance's socket goes with the instance: dropping the handle closes the port
+        // and severs every session on it, which is what a delete does. The cluster's
+        // DOCUMENTS stay, because they are the cluster's storage, not this member's.
+        store.instance_data_planes.close(&key);
         let cluster_key = record.cluster_identifier.clone();
         if let Some(cluster) = store.clusters.get_mut(&cluster_key) {
             cluster

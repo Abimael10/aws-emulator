@@ -16,15 +16,32 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "net", "time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 # `state::new_request_id`'s digest: a maintained hash, so the per-response request id in an
 # awsQuery `<ErrorResponse>` envelope is shaped by library code rather than by hand.
+# SHA-256 is also one of the two SCRAM mechanisms a client of a cluster's endpoint
+# authenticates with (`src/state/cluster_data_plane/auth.rs`).
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The BSON codec of the wire a client of an Amazon DocumentDB cluster speaks: every command a
+# client sends and every reply its endpoint answers with is a BSON document, encoded and
+# decoded by the format's own implementation rather than by a reading of it written here
+# (`src/state/cluster_data_plane/wire.rs`).
+bson = "2"
+# The SCRAM exchange that authenticates a client of a cluster's endpoint as its master user
+# (`src/state/cluster_data_plane/auth.rs`): HMAC and PBKDF2 over SHA-1 and SHA-256 are what
+# RFC 5802 computes a credential and a proof with, MD5 is how the engine's SCRAM-SHA-1
+# credential prepares a password, and the salts and nonces come from the operating system's
+# random source.
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+sha1 = "0.10"
+md-5 = "0.10"
+rand = "0.9"
 # `rds_cluster_parameters`: the cluster parameter catalog and the parameter rules the
 # Amazon RDS, DocumentDB and Neptune models of the one `rds` front door share
 # (`src/state.rs`).
@@ -55,6 +72,12 @@ percent-encoding = "2"
 # driven end to end with the owner of subnets on the same engine. DEV-ONLY: this crate
 # depends on no other service's crate outside its tests.
 service-com-amazonaws-ec2-amazonec2 = { workspace = true }
+# The data-plane suite drives a real client against an instance's own socket in ONE process:
+# `rustls` / `tokio-rustls` run the client side of the TLS a cluster with its `tls` parameter
+# on is served over, which the core terminates. Both are the versions this workspace already
+# builds.
+rustls = { workspace = true }
+tokio-rustls = "0.26"
 
 [lints]
 workspace = true

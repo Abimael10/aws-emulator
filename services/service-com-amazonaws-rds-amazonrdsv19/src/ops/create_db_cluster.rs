@@ -1051,6 +1051,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let master_username = input.master_username.clone().or_else(|| {
             crate::state::assigned_master_username(&input.engine).map(str::to_string)
         });
+        // The master user and password a DOCUMENT-wire cluster's endpoints authenticate a
+        // client against, kept in hand until the record is admitted and then derived into the
+        // credential the endpoints check a login against ([`crate::state::document_plane`]).
+        // The password a managed secret generated is the master user's too, so the branch
+        // below records that one instead.
+        let document_master_username = master_username.clone();
+        let mut document_master_password = input.master_user_password.clone();
         // The secret RDS manages for this cluster's master user password, for a request
         // that asked it to: generated, stored in Secrets Manager and reported as
         // `MasterUserSecret` ([`crate::state::mint_master_user_secret`]). The store's
@@ -1082,6 +1089,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &minted.password,
                 )
             });
+            // ... and, for a cluster whose endpoints authenticate with SCRAM, the credential
+            // derived below from the same value.
+            document_master_password = Some(minted.password.clone());
             (Some(minted.secret), digested)
         } else {
             // The password the request carried, kept only as the digests a login can be
@@ -1525,6 +1535,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     if let Some(directory) = crate::state::graph_db_clusters(&*self.engine) {
                         directory.provision(&identifier, configuration);
                     }
+                }
+                // An Amazon DocumentDB cluster's endpoints authenticate a client as its
+                // master user, and the credential that login is checked against belongs to
+                // the CLUSTER rather than to this view of the front door: it is derived from
+                // the password now, while it is in hand, and held with the cluster's own
+                // documents under its immutable resource id
+                // ([`crate::state::document_plane`]). The password itself goes nowhere. The
+                // RDS store is held and the shared storage taken second, the same lock order
+                // as the directory above.
+                if crate::state::engine_serves_the_document_wire(&engine) {
+                    crate::state::record_master_credential(
+                        &*self.engine,
+                        &resource_id,
+                        document_master_username.as_deref(),
+                        document_master_password.as_deref(),
+                    );
                 }
                 Some(db_cluster)
             }

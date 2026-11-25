@@ -43,6 +43,11 @@ pub(crate) const API_VERSION: &str = "2014-10-31";
 /// `core/router/tests/all/rds_shared_query_front_door_routing.rs` instead.
 pub(crate) struct Docdb {
     router: MultiServiceRouter,
+    /// The ONE shared engine the service was built on, so a suite can reach the stores that
+    /// live in it beside this service's own — the register of the data planes this emulator
+    /// serves, which is where an in-process client of a published endpoint opens its
+    /// connection (`tests/all/instance_data_plane.rs`).
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 /// The route key a request that addresses Amazon DocumentDB by its own name resolves to —
@@ -82,8 +87,13 @@ impl Docdb {
         if let Some(base) = base {
             router.set_url_base(base);
         }
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// The shared engine this harness built the service on; see the field's own note.
+    pub(crate) fn engine(&self) -> &Arc<engine::InMemoryEngine> {
+        &self.engine
     }
 
     /// This service AND Amazon EC2 on ONE engine, with an EC2 client over the router's own
@@ -120,7 +130,7 @@ impl Docdb {
             )
             .build();
         (
-            Self { router },
+            Self { router, engine },
             ::aws_sdk_ec2::Client::from_conf(config),
         )
     }
@@ -470,21 +480,26 @@ async fn the_cluster_lifecycle_is_computed_from_persisted_state() {
         "my-cluster",
         "case \"create instance\": the instance must carry its cluster, got {instance}"
     );
-    assert_eq!(
-        text(&instance, "Address"),
-        format!(
-            "my-instance-1.{}.{REGION}.docdb.amazonaws.com",
-            resource_id
-                .trim_start_matches("cluster-")
-                .to_ascii_lowercase()
-        ),
-        "case \"create instance\": an instance endpoint shares its cluster's DNS segment, \
-         got {instance}"
+    // The instance's endpoint is an address its own socket answers at, which the create
+    // opened through the core: an address of this emulator's, on the engine port its cluster
+    // publishes. The data-plane suite (`tests/all/instance_data_plane.rs`) is what drives a
+    // session on it; here the pair is only read back as the create published it.
+    let address = text(&instance, "Address");
+    let port = text(&instance, "Port");
+    assert!(
+        !address.ends_with("docdb.amazonaws.com"),
+        "case \"create instance\": the endpoint must be an address this emulator answers on, \
+         not a name in Amazon DocumentDB's own DNS zone, got {address:?} in {instance}"
     );
-    assert_eq!(
-        text(&instance, "Port"),
-        "27017",
-        "case \"create instance\": the endpoint port comes from the cluster, got {instance}"
+    assert!(
+        address.parse::<std::net::IpAddr>().is_ok(),
+        "case \"create instance\": the endpoint must name the address its socket is bound \
+         on, got {address:?} in {instance}"
+    );
+    assert!(
+        port.parse::<u16>().is_ok_and(|port| port > 0),
+        "case \"create instance\": the endpoint port is the one the core assigned its \
+         socket, got {port:?} in {instance}"
     );
 
     let duplicate_instance = docdb

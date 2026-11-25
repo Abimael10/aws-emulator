@@ -615,6 +615,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(directory) = crate::state::graph_db_clusters(&*self.engine) {
             directory.forget(&identifier);
         }
+        // And the documents an Amazon DocumentDB cluster held — its storage, and the
+        // credential its endpoints checked a login against — go with it, for the same reason:
+        // nothing of a cluster's storage outlives the cluster
+        // ([`crate::state::document_plane`]).
+        crate::state::forget_cluster_documents(&*self.engine, &resource_id);
 
         (db_cluster, managed_secret, member_secrets)
         };

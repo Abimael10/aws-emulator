@@ -141,6 +141,13 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 # READ out of such a copy is the TABLES, when an export of a cluster or of a snapshot of one
 # writes a Parquet file per table of the data it holds (`src/state/data_api_rows.rs`).
 service-com-amazonaws-rdsdata-rdsdataservice = { workspace = true }
+# The Amazon DocumentDB control plane's own crate, which owns the ONE implementation of the
+# document wire this tree has, and the documents each DocumentDB cluster holds. An AWS SDK
+# DocumentDB client signs `rds`, so a `CreateDBInstance` with `Engine: docdb` is served HERE —
+# and the endpoint such an instance publishes is the socket that wire answers on, opened
+# through that crate rather than through a second copy of the protocol
+# (`src/state/document_plane.rs`). One store per AWS resource, on the same shared engine.
+service-com-amazonaws-docdb-amazonrdsv19 = { workspace = true }
 # Every lifecycle change this service records is also published onto the account's DEFAULT
 # EventBridge bus as an `aws.rds` event, the way Amazon RDS publishes one with no opt-in:
 # this is the EventBridge client that publication goes out over the in-process callback with
@@ -202,6 +209,13 @@ service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 sha1 = "0.10"
 rustls = { workspace = true }
 tokio-rustls = "0.26"
+# The document-plane suite drives a real client against the endpoint an Amazon DocumentDB
+# instance publishes, in ONE process: `bson` encodes the commands that wire carries, and
+# `hmac`/`pbkdf2` compute the SCRAM proof a client presents (the same versions the DocumentDB
+# crate's own server half is built on).
+bson = "2"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 # The RDS/S3 integration suite mounts Amazon S3 and IAM beside this service on one engine,
 # exactly as the assembled router mounts them, and reads the objects an export wrote back
 # through Amazon S3's OWN operations: `aws-sdk-s3` and `aws-sdk-iam` are those clients, over

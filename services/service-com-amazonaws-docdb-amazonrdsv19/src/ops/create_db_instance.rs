@@ -270,139 +270,163 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the docdb emulator could not reach its state store",
             ));
         };
-        let mut store = state.lock();
-        store.settle_clock();
+        // The record is written under the store's lock, which is released at the end of this
+        // block: the socket the instance is served on is opened afterwards, because opening
+        // one is asynchronous and this service holds no lock across an await.
+        {
+            let mut store = state.lock();
+            store.settle_clock();
 
-        if store.instances.contains_key(&identifier) {
-            return Err(CreateDBInstanceErrorModeled::DBInstanceAlreadyExistsFault(
-                DBInstanceAlreadyExistsFault {
-                    message: Some(format!("DB instance already exists: {identifier}")),
-                },
-            )
-            .into());
-        }
+            if store.instances.contains_key(&identifier) {
+                return Err(CreateDBInstanceErrorModeled::DBInstanceAlreadyExistsFault(
+                    DBInstanceAlreadyExistsFault {
+                        message: Some(format!("DB instance already exists: {identifier}")),
+                    },
+                )
+                .into());
+            }
 
-        let Some(cluster) = store.clusters.get(&cluster_key) else {
-            return Err(CreateDBInstanceErrorModeled::DBClusterNotFoundFault(
-                DBClusterNotFoundFault {
-                    message: Some(format!("DBCluster not found: {cluster_key}")),
-                },
-            )
-            .into());
-        };
+            let Some(cluster) = store.clusters.get(&cluster_key) else {
+                return Err(CreateDBInstanceErrorModeled::DBClusterNotFoundFault(
+                    DBClusterNotFoundFault {
+                        message: Some(format!("DBCluster not found: {cluster_key}")),
+                    },
+                )
+                .into());
+            };
 
-        // The store's own caps: an over-quota create is refused, never stored.
-        if cluster.members.len() >= docdb::MAX_DB_INSTANCES_PER_CLUSTER {
-            return Err(CreateDBInstanceErrorModeled::InstanceQuotaExceededFault(
-                InstanceQuotaExceededFault {
-                    message: Some(format!(
-                        "Cannot create more than {} instances in cluster {cluster_key}",
-                        docdb::MAX_DB_INSTANCES_PER_CLUSTER
-                    )),
-                },
-            )
-            .into());
-        }
-        if store.instances.len() >= docdb::MAX_DB_INSTANCES {
-            return Err(CreateDBInstanceErrorModeled::InstanceQuotaExceededFault(
-                InstanceQuotaExceededFault {
-                    message: Some(format!(
-                        "Cannot create more than {} instances in this Region",
-                        docdb::MAX_DB_INSTANCES
-                    )),
-                },
-            )
-            .into());
-        }
+            // The store's own caps: an over-quota create is refused, never stored.
+            if cluster.members.len() >= docdb::MAX_DB_INSTANCES_PER_CLUSTER {
+                return Err(CreateDBInstanceErrorModeled::InstanceQuotaExceededFault(
+                    InstanceQuotaExceededFault {
+                        message: Some(format!(
+                            "Cannot create more than {} instances in cluster {cluster_key}",
+                            docdb::MAX_DB_INSTANCES_PER_CLUSTER
+                        )),
+                    },
+                )
+                .into());
+            }
+            if store.instances.len() >= docdb::MAX_DB_INSTANCES {
+                return Err(CreateDBInstanceErrorModeled::InstanceQuotaExceededFault(
+                    InstanceQuotaExceededFault {
+                        message: Some(format!(
+                            "Cannot create more than {} instances in this Region",
+                            docdb::MAX_DB_INSTANCES
+                        )),
+                    },
+                )
+                .into());
+            }
 
-        // A cluster's first member is its writer; every later member is a replica.
-        let is_cluster_writer = cluster.members.is_empty();
-        // `AvailabilityZone` is optional, and DocumentDB then places the instance itself:
-        // members are spread over the cluster's own zones in the order they join.
-        let availability_zone = input.availability_zone.unwrap_or_else(|| {
-            let zones = &cluster.availability_zones;
-            zones
-                .get(cluster.members.len() % zones.len().max(1))
-                .cloned()
-                .unwrap_or_else(|| format!("{region}a"))
-        });
-        // An instance's endpoint shares its cluster's DNS suffix; see
-        // [`docdb::announced_address`].
-        let endpoint_address =
-            docdb::announced_instance_host(&identifier, &cluster.endpoint_suffix);
-        let preferred_maintenance_window = input
-            .preferred_maintenance_window
-            .unwrap_or_else(|| cluster.preferred_maintenance_window.clone());
-        let promotion_tier = input
-            .promotion_tier
-            .unwrap_or(docdb::DEFAULT_PROMOTION_TIER);
-
-        let ordinal = store.next_resource_ordinal();
-        let token = docdb::resource_token(ordinal);
-
-        let record = docdb::DbInstanceRecord {
-            identifier: identifier.clone(),
-            dbi_resource_id: format!("db-{token}"),
-            region,
-            instance_class: input.db_instance_class,
-            engine: input.engine.to_ascii_lowercase(),
-            status: docdb::STATUS_CREATING.to_string(),
-            available_at: Some(::std::time::Instant::now() + docdb::PROVISIONING_DELAY),
-            cluster_identifier: cluster_key.clone(),
-            availability_zone,
-            promotion_tier,
-            endpoint_address,
-            instance_create_time: docdb::now(),
-            preferred_maintenance_window,
-            // `AutoMinorVersionUpgrade`: "Default: false".
-            auto_minor_version_upgrade: input.auto_minor_version_upgrade.unwrap_or(false),
-            copy_tags_to_snapshot: input.copy_tags_to_snapshot.unwrap_or(false),
-            performance_insights_enabled: input.enable_performance_insights.unwrap_or(false),
-            performance_insights_kms_key_id: input.performance_insights_kms_key_id,
-            ca_certificate_identifier: input.ca_certificate_identifier,
-            tags: docdb::tag_pairs(input.tags),
-        };
-
-        store.instances.insert(identifier.clone(), record);
-        if let Some(cluster) = store.clusters.get_mut(&cluster_key) {
-            cluster.members.push(docdb::ClusterMember {
-                db_instance_identifier: identifier.clone(),
-                is_cluster_writer,
-                promotion_tier,
+            // A cluster's first member is its writer; every later member is a replica.
+            let is_cluster_writer = cluster.members.is_empty();
+            // `AvailabilityZone` is optional, and DocumentDB then places the instance itself:
+            // members are spread over the cluster's own zones in the order they join.
+            let availability_zone = input.availability_zone.unwrap_or_else(|| {
+                let zones = &cluster.availability_zones;
+                zones
+                    .get(cluster.members.len() % zones.len().max(1))
+                    .cloned()
+                    .unwrap_or_else(|| format!("{region}a"))
             });
-        }
+            // An instance's endpoint shares its cluster's DNS suffix where this emulator
+            // serves no data plane for it; see [`docdb::announced_address`].
+            let endpoint_address =
+                docdb::announced_instance_host(&identifier, &cluster.endpoint_suffix);
+            let preferred_maintenance_window = input
+                .preferred_maintenance_window
+                .unwrap_or_else(|| cluster.preferred_maintenance_window.clone());
+            let promotion_tier = input
+                .promotion_tier
+                .unwrap_or(docdb::DEFAULT_PROMOTION_TIER);
 
-        let stored = store
-            .instances
-            .get(&identifier)
-            .expect("the instance was inserted on the line above");
-        let dbi_resource_id = stored.dbi_resource_id.clone();
-        let engine = stored.engine.clone();
-        let monitoring = ::service_common::db_data_sources::MonitoringConfiguration {
-            performance_insights_enabled: stored.performance_insights_enabled,
-            // Amazon DocumentDB's model has no `DatabaseInsightsMode` member at all, so
-            // this service records none: the mode is not a setting that exists here,
-            // which is different from one that is off.
-            database_insights_mode: None,
+            let ordinal = store.next_resource_ordinal();
+            let token = docdb::resource_token(ordinal);
+
+            let record = docdb::DbInstanceRecord {
+                identifier: identifier.clone(),
+                dbi_resource_id: format!("db-{token}"),
+                region,
+                instance_class: input.db_instance_class,
+                engine: input.engine.to_ascii_lowercase(),
+                status: docdb::STATUS_CREATING.to_string(),
+                available_at: Some(::std::time::Instant::now() + docdb::PROVISIONING_DELAY),
+                cluster_identifier: cluster_key.clone(),
+                availability_zone,
+                promotion_tier,
+                endpoint_address,
+                // The address this instance's own socket answers on, published once the
+                // socket is opened below.
+                served_endpoint: None,
+                instance_create_time: docdb::now(),
+                preferred_maintenance_window,
+                // `AutoMinorVersionUpgrade`: "Default: false".
+                auto_minor_version_upgrade: input.auto_minor_version_upgrade.unwrap_or(false),
+                copy_tags_to_snapshot: input.copy_tags_to_snapshot.unwrap_or(false),
+                performance_insights_enabled: input.enable_performance_insights.unwrap_or(false),
+                performance_insights_kms_key_id: input.performance_insights_kms_key_id,
+                ca_certificate_identifier: input.ca_certificate_identifier,
+                tags: docdb::tag_pairs(input.tags),
+            };
+
+            store.instances.insert(identifier.clone(), record);
+            if let Some(cluster) = store.clusters.get_mut(&cluster_key) {
+                cluster.members.push(docdb::ClusterMember {
+                    db_instance_identifier: identifier.clone(),
+                    is_cluster_writer,
+                    promotion_tier,
+                });
+            }
+
+            let stored = store
+                .instances
+                .get(&identifier)
+                .expect("the instance was inserted on the line above");
+            let dbi_resource_id = stored.dbi_resource_id.clone();
+            let engine = stored.engine.clone();
+            let monitoring = ::service_common::db_data_sources::MonitoringConfiguration {
+                performance_insights_enabled: stored.performance_insights_enabled,
+                // Amazon DocumentDB's model has no `DatabaseInsightsMode` member at all, so
+                // this service records none: the mode is not a setting that exists here,
+                // which is different from one that is off.
+                database_insights_mode: None,
+            };
+            // The `DbiResourceId` just minted is recorded in the SHARED data-source
+            // directory, so a service that monitors this instance can tell that THIS
+            // service owns the id — Amazon RDS mints `db-<TOKEN>` ids too, so the form
+            // cannot say it. The monitoring settings this create persisted go in beside it,
+            // because a monitoring service cannot measure whether a feature is turned on
+            // for an instance — this service is what the setting was given to. The
+            // DocumentDB store is already locked and the directory is taken second, the
+            // order its doc fixes.
+            if let Some(directory) = crate::state::data_source_directory(&*self.engine) {
+                let mut directory = directory.lock();
+                directory.register(
+                    &dbi_resource_id,
+                    ::service_common::db_data_sources::SERVICE_TYPE_DOCDB,
+                    &engine,
+                );
+                directory.record_monitoring(&dbi_resource_id, monitoring);
+            }
+        }
+        // The instance's DATA PLANE: the socket a client connects to and speaks the engine's
+        // own wire on, opened through the core, over the documents its CLUSTER holds. What it
+        // answers on is published as this instance's `Endpoint`, because an endpoint is an
+        // address the service answers on (`docdb::cluster_data_plane`). An engine this
+        // emulator serves no wire for, and a process whose engine vends no listeners, leave
+        // the instance with the name its control plane publishes instead.
+        docdb::serve_instance(&*self.engine, &state, &identifier).await;
+        let store = state.lock();
+        // The lock was released while the socket was opened, so the record is read back
+        // fallibly: another request may have deleted the instance in between, and this
+        // emulator's own failure to find it is a 500 rather than a panic.
+        let Some(stored) = store.instances.get(&identifier) else {
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                "the docdb instance this create stored is no longer in the store",
+            ));
         };
         let db_instance = docdb::instance_to_shape(stored, store.clusters.get(&cluster_key));
-        // The `DbiResourceId` just minted is recorded in the SHARED data-source
-        // directory, so a service that monitors this instance can tell that THIS
-        // service owns the id — Amazon RDS mints `db-<TOKEN>` ids too, so the form
-        // cannot say it. The monitoring settings this create persisted go in beside it,
-        // because a monitoring service cannot measure whether a feature is turned on
-        // for an instance — this service is what the setting was given to. The
-        // DocumentDB store is already locked and the directory is taken second, the
-        // order its doc fixes.
-        if let Some(directory) = crate::state::data_source_directory(&*self.engine) {
-            let mut directory = directory.lock();
-            directory.register(
-                &dbi_resource_id,
-                ::service_common::db_data_sources::SERVICE_TYPE_DOCDB,
-                &engine,
-            );
-            directory.record_monitoring(&dbi_resource_id, monitoring);
-        }
         Ok(CreateDBInstanceOutput {
             db_instance: Some(db_instance),
         })
