@@ -13,10 +13,16 @@
 //! > on the create's own answer and on every later read of the same record.
 //!
 //! The rows span what the rule generalises over: the access point with no `PosixUser` at all
-//! (a different absence), one whose identity names no secondary group, and ones whose list
-//! holds a single group and the modelled maximum of sixteen (`SecondaryGids` is
-//! `@length 0..16`), at both published ends of `Uid`/`Gid` ("values from 0 to 2^32
-//! (4294967295)").
+//! (a different absence), one whose identity names no secondary group, one whose identity
+//! names an EMPTY secondary-group list (present-and-empty, which `@length min 0` admits and
+//! which is a different answer from the absent member), and ones whose list holds a single
+//! group and the modelled maximum of sixteen (`SecondaryGids` is `@length 0..16`), at both
+//! published ends of `Uid`/`Gid` ("values from 0 to 2^32 (4294967295)").
+//!
+//! Every read path of the stored record is checked the same way: the create's own answer, the
+//! read that SELECTS one access point by id, and the reads that LIST a set of them (by file
+//! system and with no selector at all), because all three project the one stored
+//! `AccessPointDescription`.
 
 use serde_json::{json, Value};
 
@@ -40,6 +46,12 @@ fn rows() -> Vec<Row> {
             posix_user: Some(json!({ "Uid": 1000, "Gid": 1000 })),
         },
         Row {
+            // Present-and-empty: `SecondaryGids` is `@length min 0`, so a request MAY name the
+            // empty list, and that is not the same answer as naming no list at all.
+            case: "an identity with an empty secondary-group list",
+            posix_user: Some(json!({ "Uid": 1, "Gid": 1, "SecondaryGids": [] })),
+        },
+        Row {
             case: "an identity with one secondary group",
             posix_user: Some(json!({ "Uid": 0, "Gid": 0, "SecondaryGids": [4] })),
         },
@@ -59,6 +71,19 @@ fn rows() -> Vec<Row> {
 fn reported(description: &Value) -> Value {
     description
         .get("PosixUser")
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// The description of `access_point_id` in one `DescribeAccessPoints` answer, whichever
+/// position of the `AccessPoints` list it occupies.
+fn entry_of(listed: &Value, access_point_id: &str) -> Value {
+    listed["AccessPoints"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .find(|entry| entry["AccessPointId"].as_str() == Some(access_point_id))
         .cloned()
         .unwrap_or(Value::Null)
 }
@@ -108,10 +133,46 @@ async fn an_access_point_reports_the_posix_identity_its_request_named() {
             reply.status, reply.body
         );
         let described = reply.get("AccessPoints")[0].clone();
+        // Same guard as the listing reads below: the selected record has to be there
+        // before what it reports about its identity means anything.
+        assert_eq!(
+            described["AccessPointId"].as_str(),
+            Some(access_point_id.as_str()),
+            "case {case:?}: expected the read to select {access_point_id}, got {:?}",
+            reply.body
+        );
         assert_eq!(
             reported(&described),
             *expected,
             "case {case:?}: expected the read to report {expected:?}, got {described:?}"
         );
+    }
+
+    // And the same again off the LISTING read paths — the set of a file system's access
+    // points, and the account-wide set — which project the same stored description.
+    for selector in [format!("FileSystemId={file_system_id}"), String::new()] {
+        let reply = efs.describe_access_points(&selector).await;
+        assert_eq!(
+            reply.status, 200,
+            "selector {selector:?}: expected 200 from DescribeAccessPoints, got {} {:?}",
+            reply.status, reply.body
+        );
+        for (case, access_point_id, expected) in &created {
+            let entry = entry_of(&reply.body, access_point_id);
+            // The record has to BE in the listing before its identity says anything: an
+            // absent `PosixUser` and an absent entry both read as `Null`, so the entry is
+            // asserted found first.
+            assert!(
+                !entry.is_null(),
+                "case {case:?} listed by {selector:?}: expected an entry for \
+                 {access_point_id}, got {:?}",
+                reply.body
+            );
+            assert_eq!(
+                reported(&entry),
+                *expected,
+                "case {case:?} listed by {selector:?}: expected {expected:?}, got {entry:?}"
+            );
+        }
     }
 }
