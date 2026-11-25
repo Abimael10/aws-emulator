@@ -112,6 +112,10 @@ pub const HSM_ACTIVE: &str = "ACTIVE";
 /// An HSM `DeleteHsm` has accepted.
 pub const HSM_DELETE_IN_PROGRESS: &str = "DELETE_IN_PROGRESS";
 
+/// The prefix a backup's identifier carries, from the modelled `ResourceId` pattern
+/// `^(?:cluster|backup)-[2-7a-zA-Z]{11,16}$` that names a tagged resource.
+pub const BACKUP_ID_PREFIX: &str = "backup-";
+
 /// The alphabet the modelled cloudhsm id patterns accept — `[2-7a-zA-Z]` for
 /// `^cluster-[2-7a-zA-Z]{11,16}$`, `^hsm-[2-7a-zA-Z]{11,16}$` and
 /// `^backup-[2-7a-zA-Z]{11,16}$`.
@@ -389,6 +393,20 @@ impl ComAmazonawsCloudhsmv2BaldrapiserviceState {
         self.clusters.get(cluster_id)
     }
 
+    /// The tags held for the resource `resource_id` names, or `None` when this emulator
+    /// holds no such resource.
+    ///
+    /// A tagged resource is identified by the modelled `ResourceId` pattern
+    /// `^(?:cluster|backup)-[2-7a-zA-Z]{11,16}$`, so an identifier can name a cluster or
+    /// a backup. This emulator holds no backups — every backup operation
+    /// (`DescribeBackups` through `RestoreBackup`) is still scaffolded, and nothing mints
+    /// one — so only a cluster identifier resolves, and a cluster's tags are listable for
+    /// as long as the store holds its record.
+    pub fn resource_tags(&self, resource_id: &str) -> Option<&[Tag]> {
+        self.cluster(resource_id)
+            .map(|cluster| cluster.tags.as_slice())
+    }
+
     /// 32 bytes derived from `domain`, a per-state counter and the wall clock, so
     /// every minted id is distinct from every other.
     fn digest(&mut self, domain: &str) -> [u8; 32] {
@@ -528,20 +546,22 @@ pub fn synthesized_eni_ip_v6(az_index: u8, eni_ip: &str) -> String {
     format!("2001:db8:0:{az_index:x}::{host:x}")
 }
 
-/// A `NextToken` that resumes a paged describe at `cluster_id`.
+/// A `NextToken` that resumes a paged listing at `resume_at` — the id of the cluster
+/// a `DescribeClusters` page continues at, or the key of the tag a `ListTags` page
+/// does.
 ///
-/// Hex-encoded rather than returned raw so a client cannot read a resource id
-/// out of a pagination token, and so a token this emulator did not mint is
-/// refused rather than silently treated as a cluster id. `NextToken` is modelled
-/// `len 0..256`, which a hex-encoded cluster id stays well inside.
-pub fn encode_next_token(cluster_id: &str) -> String {
-    hex::encode(cluster_id)
+/// Hex-encoded rather than returned raw so a client cannot read a resource id or a
+/// tag key out of a pagination token, and so a token this emulator did not mint is
+/// refused rather than silently treated as one. `NextToken` is modelled
+/// `len 0..256`, which a hex-encoded cluster id or tag key stays well inside.
+pub fn encode_next_token(resume_at: &str) -> String {
+    hex::encode(resume_at)
 }
 
-/// The cluster id a `NextToken` resumes at, or `None` when the token was not
+/// The value a `NextToken` resumes at, or `None` when the token was not
 /// minted by [`encode_next_token`].
 pub fn decode_next_token(token: &str) -> Option<String> {
     let bytes = hex::decode(token).ok()?;
-    let id = String::from_utf8(bytes).ok()?;
-    (!id.is_empty()).then_some(id)
+    let resume_at = String::from_utf8(bytes).ok()?;
+    (!resume_at.is_empty()).then_some(resume_at)
 }

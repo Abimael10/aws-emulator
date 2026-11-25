@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the tags [`crate::state`] holds for the resource the request
+//! names, ordered by tag key and paged by `MaxResults`/`NextToken`. The notes below are
+//! the scaffold's, kept for the next reader.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Nothing else about `ListTags` is asserted here — this file is the ONLY one to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +164,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTags"))
+        // Reporting only: `ctx` carries nothing this operation needs, since every answer
+        // comes from the store.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsErrorModeled::CloudHsmInternalFailureException(
+                CloudHsmInternalFailureException {
+                    message: Some(
+                        "the cloudhsmv2 emulator is mounted on an engine that holds no state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let page_size = usize::try_from(match input.max_results {
+            Some(requested) => requested.clamp(1, MAX_PAGE_SIZE),
+            None => MAX_PAGE_SIZE,
+        })
+        .unwrap_or(1);
+
+        // A token this emulator did not mint names no tag to resume at, so it is refused
+        // rather than read as a tag key.
+        let resume_at = match &input.next_token {
+            Some(token) => Some(crate::state::decode_next_token(token).ok_or_else(|| {
+                invalid_request("NextToken was not produced by a ListTags response".to_string())
+            })?),
+            None => None,
+        };
+
+        let mut store = state.lock();
+        // A read reports what the clock has already made due: once the store has
+        // reclaimed a resource's record there are no tags of it left to list, whether or
+        // not anybody called in between.
+        store.settle(::std::time::SystemTime::now());
+
+        let Some(tags) = store.resource_tags(&input.resource_id) else {
+            return Err(resource_not_found(&input.resource_id));
+        };
+
+        // `TagList` declares no order and a resumable token needs a total one, so the
+        // listing is ordered by the key a tag is identified by, ties broken by value.
+        let mut ordered: Vec<Tag> = tags.to_vec();
+        ordered.sort_by(|left, right| {
+            left.key
+                .cmp(&right.key)
+                .then_with(|| left.value.cmp(&right.value))
+        });
+
+        let start = match &resume_at {
+            Some(key) => ordered
+                .iter()
+                .position(|tag| &tag.key == key)
+                .ok_or_else(|| {
+                    invalid_request(
+                        "NextToken resumes at a tag the resource no longer carries".to_string(),
+                    )
+                })?,
+            None => 0,
+        };
+
+        let remaining = &ordered[start..];
+        let (page, next_token) = if remaining.len() > page_size {
+            (
+                &remaining[..page_size],
+                Some(crate::state::encode_next_token(&remaining[page_size].key)),
+            )
+        } else {
+            (remaining, None)
+        };
+
+        Ok(ListTagsOutput {
+            // A resource carrying no tags at all reports the empty list: that is what
+            // "there are no more tags to get" looks like on the first call.
+            tag_list: page.to_vec(),
+            next_token,
+        })
     }
+}
+
+/// The most tags one page carries: `MaxSize` models `range 1..100`, and a request that
+/// names no `MaxResults` gets that maximum.
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// Refuse the request with the error this operation models for one that is not valid.
+fn invalid_request(message: String) -> ListTagsError {
+    ListTagsErrorModeled::CloudHsmInvalidRequestException(CloudHsmInvalidRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse the request because it names a resource this emulator does not hold, with the
+/// error the operation models for "a resource that cannot be found".
+///
+/// `ResourceId` is modelled `^(?:cluster|backup)-[2-7a-zA-Z]{11,16}$`, so the sentence
+/// names the kind of resource the identifier itself names.
+fn resource_not_found(resource_id: &str) -> ListTagsError {
+    let kind = if resource_id.starts_with(crate::state::BACKUP_ID_PREFIX) {
+        "backup"
+    } else {
+        "cluster"
+    };
+    ListTagsErrorModeled::CloudHsmResourceNotFoundException(CloudHsmResourceNotFoundException {
+        message: Some(format!("{kind} {resource_id} does not exist")),
+    })
+    .into()
 }

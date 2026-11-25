@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end cover for the cluster/HSM lifecycle this crate implements:
-//! `CreateCluster`, `DescribeClusters`, `CreateHsm`, `DeleteHsm`, `DeleteCluster`.
+//! `CreateCluster`, `DescribeClusters`, `CreateHsm`, `DeleteHsm`, `DeleteCluster`,
+//! `ListTags`.
 //!
 //! Every case drives the real wire path — `POST /` with
 //! `X-Amz-Target: BaldrApiService.<Operation>` through the multi-service router — so
@@ -19,7 +20,9 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_cloudhsmv2_baldrapiservice::state::{MAX_CLUSTERS, MAX_HSMS_PER_CLUSTER};
+use service_com_amazonaws_cloudhsmv2_baldrapiservice::state::{
+    encode_next_token, MAX_CLUSTERS, MAX_HSMS_PER_CLUSTER,
+};
 use service_com_amazonaws_cloudhsmv2_baldrapiservice::EmulatedService;
 use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 
@@ -1214,7 +1217,6 @@ async fn operations_outside_this_slice_still_answer_501() {
             }),
         ),
         ("DescribeBackups", json!({})),
-        ("ListTags", json!({ "ResourceId": "cluster-aaaaaaaaaaa2" })),
     ] {
         let (status, response) = emulator.call(operation, &body).await;
         assert_eq!(
@@ -1222,5 +1224,323 @@ async fn operations_outside_this_slice_still_answer_501() {
             "case {operation:?}: expected a scaffolded operation to answer 501, got \
              {status} {response}"
         );
+    }
+}
+
+// --- `ListTags` -------------------------------------------------------------------
+//
+// The rule: `ListTags` reports exactly the tags the store holds for the resource the
+// request names, in one total order, paged by `MaxResults` with a `NextToken` that
+// resumes that order, and refuses an identifier no resource of this emulator carries.
+
+/// The maxima the `Tag` shape models for a tag's members
+/// (`smithy_query(query="shape",shape="Tag")`): `Key` is `len 1..128` and `Value` is
+/// `len 0..256`, both matching `^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`.
+const TAG_KEY_MAX: usize = 128;
+/// See [`TAG_KEY_MAX`].
+const TAG_VALUE_MAX: usize = 256;
+
+/// The most tags one resource carries: `TagList` models `len 1..50`.
+const TAG_LIST_MAX: usize = 50;
+
+/// The page-size bounds `ListTags` publishes for `MaxResults`: `MaxSize` models
+/// `range 1..100`.
+const LIST_TAGS_PAGE_MIN: usize = 1;
+/// See [`LIST_TAGS_PAGE_MIN`].
+const LIST_TAGS_PAGE_MAX: usize = 100;
+
+/// The modelled error this service answers a request naming a resource it cannot find
+/// with.
+const NOT_FOUND: &str = "CloudHsmResourceNotFoundException";
+
+/// The modelled error it answers a request that is not valid with.
+const INVALID_REQUEST: &str = "CloudHsmInvalidRequestException";
+
+/// A cluster id inside the modelled `ResourceId` pattern that no account holds.
+const UNHELD_CLUSTER: &str = "cluster-aaaaaaaaaaa2";
+
+/// A backup id inside the same pattern. This emulator mints no backups at all.
+const UNHELD_BACKUP: &str = "backup-aaaaaaaaaaa2";
+
+/// The tag sets the `ListTags` table creates its cluster with.
+///
+/// Rows differ in the tag COUNT (none, one, several, the modelled maximum), in the order
+/// the keys arrive in, and in the form of the keys and values: every character class the
+/// modelled `Tag` pattern allows, the empty value `TagValue`'s `len 0..256` permits, and
+/// a key and a value at their modelled length maxima.
+fn tag_cases() -> Vec<(&'static str, Vec<(String, String)>)> {
+    let tag = |key: &str, value: &str| (key.to_string(), value.to_string());
+    vec![
+        ("no tags at all", Vec::new()),
+        ("one tag", vec![tag("Team", "crypto")]),
+        (
+            "keys that arrive out of order, one with the empty value the model allows",
+            vec![tag("zeta", "last"), tag("Alpha", ""), tag("mu", "middle")],
+        ),
+        (
+            "every character class the modelled tag pattern allows",
+            vec![
+                tag("cost.center:ops/unit=1+2-3@aws", "a value with spaces"),
+                tag("Ünicode Λetters", "wert"),
+                tag("1_2", "3"),
+            ],
+        ),
+        (
+            "a key and a value at the modelled length maxima",
+            vec![tag(&"k".repeat(TAG_KEY_MAX), &"v".repeat(TAG_VALUE_MAX))],
+        ),
+        (
+            "the modelled maximum of 50 tags",
+            (0..TAG_LIST_MAX)
+                .map(|index| (format!("key-{index:02}"), format!("value-{index}")))
+                .collect(),
+        ),
+    ]
+}
+
+/// `tags` as the `TagList` a request carries.
+fn tag_list(tags: &[(String, String)]) -> Vec<Value> {
+    tags.iter()
+        .map(|(key, value)| json!({ "Key": key, "Value": value }))
+        .collect()
+}
+
+/// `tags` in the order a listing must report them: tag keys are unique within a
+/// resource, so ordering by key is the total order a resumable page token needs.
+fn tags_by_key(tags: &[(String, String)]) -> Vec<Value> {
+    let mut ordered = tags.to_vec();
+    ordered.sort();
+    tag_list(&ordered)
+}
+
+/// The `Key` of each tag of `listed`, so a difference names the tag rather than the
+/// whole page.
+fn tag_keys(listed: &[Value]) -> Vec<String> {
+    listed
+        .iter()
+        .map(|tag| tag["Key"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// Page `ListTags` over `resource_id` to exhaustion, answering the tags it reported in
+/// order and how many pages that took.
+///
+/// Asserts along the way what paging itself promises: the required `TagList` member is
+/// always there, no page is longer than the requested size, and the walk terminates.
+async fn list_every_tag(
+    emulator: &Emulator,
+    case: &str,
+    resource_id: &str,
+    page_size: Option<usize>,
+) -> (Vec<Value>, usize) {
+    let mut listed: Vec<Value> = Vec::new();
+    let mut next_token: Option<String> = None;
+    let mut pages = 0;
+
+    loop {
+        let mut request = json!({ "ResourceId": resource_id });
+        if let Some(size) = page_size {
+            request["MaxResults"] = json!(size);
+        }
+        if let Some(token) = &next_token {
+            request["NextToken"] = json!(token);
+        }
+        let response = emulator.ok(case, "ListTags", &request).await;
+        let page = response["TagList"].as_array().cloned().unwrap_or_else(|| {
+            panic!("case {case:?}: expected the required TagList member, got {response}")
+        });
+        if let Some(size) = page_size {
+            assert!(
+                page.len() <= size,
+                "case {case:?}: expected at most {size} tags in a page, got {}",
+                page.len()
+            );
+        }
+        listed.extend(page);
+        next_token = response["NextToken"].as_str().map(str::to_string);
+        pages += 1;
+        assert!(
+            pages <= TAG_LIST_MAX + 1,
+            "case {case:?}: expected paging to terminate, got {pages} pages"
+        );
+        if next_token.is_none() {
+            break;
+        }
+    }
+
+    (listed, pages)
+}
+
+#[tokio::test]
+async fn list_tags_reports_the_tags_the_resource_carries_and_pages_them() {
+    let emulator = Emulator::new();
+    let subnets = emulator.subnet_ids_in(REGION).await;
+
+    for (name, tags) in tag_cases() {
+        let mut request = json!({ "HsmType": "hsm2m.medium", "SubnetIds": [subnets[0]] });
+        if !tags.is_empty() {
+            request["TagList"] = Value::Array(tag_list(&tags));
+        }
+        let created = emulator.ok(name, "CreateCluster", &request).await;
+        let cluster_id = created["Cluster"]["ClusterId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {name:?}: no cluster id in {created}"))
+            .to_string();
+        let expected = tags_by_key(&tags);
+
+        // Page sizes: none at all, both bounds the model publishes, and two sizes that do
+        // not divide the tag count.
+        for page_size in [
+            None,
+            Some(LIST_TAGS_PAGE_MIN),
+            Some(2),
+            Some(7),
+            Some(LIST_TAGS_PAGE_MAX),
+        ] {
+            let case = format!("{name}, MaxResults {page_size:?}");
+            let (listed, pages) = list_every_tag(&emulator, &case, &cluster_id, page_size).await;
+            assert_eq!(
+                listed,
+                expected,
+                "case {case:?}: expected every tag the cluster carries exactly once, \
+                 ordered by key, got {:?}",
+                tag_keys(&listed)
+            );
+            let expected_pages = match page_size {
+                Some(size) => expected.len().div_ceil(size).max(1),
+                None => 1,
+            };
+            assert_eq!(
+                pages, expected_pages,
+                "case {case:?}: expected {expected_pages} pages for {} tags, got {pages}",
+                expected.len()
+            );
+        }
+
+        // Listing is a READ: the tags are still exactly the ones the cluster carries, both
+        // to a second listing and to the cluster the describe projects.
+        let (again, _) = list_every_tag(&emulator, name, &cluster_id, None).await;
+        assert_eq!(
+            again,
+            expected,
+            "case {name:?}: expected a second listing to report the same tags, got {:?}",
+            tag_keys(&again)
+        );
+        let described = emulator
+            .ok(
+                name,
+                "DescribeClusters",
+                &json!({ "Filters": { "clusterIds": [cluster_id] } }),
+            )
+            .await;
+        let mut projected = described["Clusters"][0]["TagList"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        projected.sort_by_key(|tag| tag["Key"].as_str().unwrap_or_default().to_string());
+        assert_eq!(
+            projected,
+            expected,
+            "case {name:?}: expected the listed tags to be the ones the cluster carries, \
+             got {:?}",
+            tag_keys(&projected)
+        );
+    }
+}
+
+#[tokio::test]
+async fn list_tags_refuses_an_identifier_and_a_token_it_cannot_resolve() {
+    let emulator = Emulator::new();
+    let subnets = emulator.subnet_ids_in(REGION).await;
+    let created = emulator
+        .ok(
+            "fixture",
+            "CreateCluster",
+            &json!({
+                "HsmType": "hsm2m.medium",
+                "SubnetIds": [subnets[0]],
+                "TagList": [{ "Key": "Team", "Value": "crypto" }],
+            }),
+        )
+        .await;
+    let cluster_id = created["Cluster"]["ClusterId"]
+        .as_str()
+        .expect("a cluster id")
+        .to_string();
+
+    // A token this emulator really mints, resuming at a key the resource does not carry:
+    // well formed, and still not a page of this listing.
+    let stale_token = encode_next_token("a key no tag of this cluster carries");
+
+    // Each row: the rule, the request that breaks it, the modelled error it must answer
+    // with, and the sentence that error carries when the rule fixes one. Every row is a
+    // 400.
+    let cases: Vec<(&str, Value, &str, Option<String>)> = vec![
+        (
+            "a cluster this emulator does not hold",
+            json!({ "ResourceId": UNHELD_CLUSTER }),
+            NOT_FOUND,
+            Some(format!("cluster {UNHELD_CLUSTER} does not exist")),
+        ),
+        (
+            "a backup, of which this emulator holds none",
+            json!({ "ResourceId": UNHELD_BACKUP }),
+            NOT_FOUND,
+            Some(format!("backup {UNHELD_BACKUP} does not exist")),
+        ),
+        (
+            "an identifier outside the modelled ResourceId pattern",
+            json!({ "ResourceId": "cluster-not+an+id" }),
+            INVALID_REQUEST,
+            None,
+        ),
+        (
+            "no ResourceId at all",
+            json!({}),
+            INVALID_REQUEST,
+            None,
+        ),
+        (
+            "a NextToken this emulator never minted",
+            json!({ "ResourceId": cluster_id, "NextToken": "not-a-token" }),
+            INVALID_REQUEST,
+            None,
+        ),
+        (
+            "a NextToken resuming at a tag the resource does not carry",
+            json!({ "ResourceId": cluster_id, "NextToken": stale_token }),
+            INVALID_REQUEST,
+            None,
+        ),
+        (
+            "MaxResults one below the modelled range",
+            json!({ "ResourceId": cluster_id, "MaxResults": LIST_TAGS_PAGE_MIN - 1 }),
+            INVALID_REQUEST,
+            None,
+        ),
+        (
+            "MaxResults one above the modelled range",
+            json!({ "ResourceId": cluster_id, "MaxResults": LIST_TAGS_PAGE_MAX + 1 }),
+            INVALID_REQUEST,
+            None,
+        ),
+    ];
+
+    for (name, body, expected, expected_message) in cases {
+        let (status, response) = emulator.call("ListTags", &body).await;
+        let code = error_code(&response);
+        assert_eq!(
+            (status, code.contains(expected)),
+            (400, true),
+            "case {name:?}: expected ListTags to answer 400 {expected}, got {status} \
+             {response}"
+        );
+        if let Some(sentence) = expected_message {
+            let message = response["Message"].as_str().unwrap_or_default();
+            assert_eq!(
+                message, sentence,
+                "case {name:?}: expected the refusal to say {sentence:?}, got {message:?}"
+            );
+        }
     }
 }
