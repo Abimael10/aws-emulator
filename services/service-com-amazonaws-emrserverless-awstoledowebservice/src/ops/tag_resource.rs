@@ -154,6 +154,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
+        // An ARN that resolves to no resource is the tagging front door's refusal: the
+        // modelled shape raised here is restated under that stack's own identity on the way
+        // out (`crate::service::error_type_locator`).
         let tags = store
             .resource_tags_mut(&input.resource_arn)
             .map_err(TagResourceErrorModeled::ResourceNotFoundException)?;

@@ -62,6 +62,12 @@ const NO_CONTENT_LENGTH: Option<&str> = Some("0");
 /// The status every other operation of this service answers a success with.
 const WITH_CONTENT_STATUS: u16 = 200;
 
+/// The error shape a tag mutation's not-found refusal names: the generic one of the stack
+/// that fronts `/tags/{resourceArn}`, which no operation of this model declares.
+/// `resource_tagging.rs` owns that rule; this suite needs it only to tell a refusal from a
+/// served mutation.
+const TAGGING_NOT_FOUND_SHAPE: &str = "NotFoundException";
+
 /// The longest key and value the modelled `TagKey` / `TagValue` admit
 /// (`smithy_query(query="shape",shape="TagKey,TagValue")`: `@length(min: 1, max: 128)` and
 /// `@length(min: 0, max: 256)`).
@@ -446,7 +452,7 @@ async fn only_the_tag_mutations_answer_no_content() {
         );
         assert_eq!(
             answer.error_code(),
-            "ResourceNotFoundException",
+            TAGGING_NOT_FOUND_SHAPE,
             "case {case:?}: a refusal carries its error shape, got {:?}",
             answer.body
         );

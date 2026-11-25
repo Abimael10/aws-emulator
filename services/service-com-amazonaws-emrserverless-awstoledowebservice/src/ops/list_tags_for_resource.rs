@@ -151,6 +151,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A report, and the one `@readonly` operation of the three that share
         // `/tags/{resourceArn}`: it reads the tag map the create, the submit or a tag
         // write stored, and writes nothing.
+        //
+        // An ARN that resolves to no resource is the tagging front door's refusal: the
+        // modelled shape raised here is restated under that stack's own identity on the
+        // way out (`crate::service::error_type_locator`), and the sentence it carries is
+        // that stack's generic one.
         let store = state.lock();
         let tags = store
             .resource_tags(&input.resource_arn)

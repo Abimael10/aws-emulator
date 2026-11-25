@@ -9,8 +9,9 @@
 //! the rest; `UntagResource` removes exactly the keys it names and keeps the rest;
 //! `ListTagsForResource` reports the stored set — the same set the resource's own
 //! `Get` reports — and changes nothing. An ARN that names no stored resource of this
-//! service is refused with the modelled `ResourceNotFoundException` (HTTP 404) by all
-//! three.
+//! service is refused HTTP 404 by all three, under the identity the stack that fronts
+//! `/tags/{resourceArn}` answers with (`resource_tagging.rs` owns that identity and the
+//! sentence it carries).
 //!
 //! Every assertion spans a SET of inputs: all three resource classes this emulator
 //! stores (an application, a job run and an interactive session), tag sets differing in
@@ -38,6 +39,12 @@ use super::session_lifecycle::{get_session, minimal_session, session_application
 /// (`smithy_query(query="shape",shape="TagMap")`), so 200 is the published bound and
 /// 201 is one past it.
 const MAX_TAGS_PER_RESOURCE: usize = 200;
+
+/// The error shape a tag operation's not-found refusal names: the generic one of the stack
+/// that fronts `/tags/{resourceArn}`, which no operation of this model declares.
+/// `resource_tagging.rs` is where that rule and its wording are asserted; this suite only
+/// needs the identity so a refused call is told apart from a served one.
+const TAGGING_NOT_FOUND_SHAPE: &str = "NotFoundException";
 
 /// The status a successful TAG MUTATION answers with: 204 No Content, because
 /// `TagResourceResponse` and `UntagResourceResponse` declare no members
@@ -371,8 +378,8 @@ async fn a_tag_write_touches_exactly_the_keys_it_names() {
     }
 }
 
-/// An ARN that names no stored resource is refused by all three tag operations with the
-/// modelled `ResourceNotFoundException`, and the refusal stores nothing.
+/// An ARN that names no stored resource is refused by all three tag operations with HTTP
+/// 404, and the refusal stores nothing.
 #[tokio::test]
 async fn an_arn_that_names_no_stored_resource_is_refused() {
     let router = emulator();
@@ -414,8 +421,8 @@ async fn an_arn_that_names_no_stored_resource_is_refused() {
             );
             assert_eq!(
                 answer.error_code(),
-                "ResourceNotFoundException",
-                "case {case:?}/{operation}: expected ResourceNotFoundException, got {:?}",
+                TAGGING_NOT_FOUND_SHAPE,
+                "case {case:?}/{operation}: expected {TAGGING_NOT_FOUND_SHAPE}, got {:?}",
                 answer.body
             );
         }

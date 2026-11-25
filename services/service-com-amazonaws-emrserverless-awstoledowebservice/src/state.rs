@@ -1451,6 +1451,11 @@ impl ComAmazonawsEmrserverlessAwstoledowebserviceState {
     /// (`Application$tags`, `JobRun$tags`, `Session$tags`), so this reports exactly
     /// what the resource's own `Get` reports. A resource that carries no tag map
     /// carries no tags, which is an EMPTY set rather than an absent one.
+    ///
+    /// An ARN that resolves to no record is [`tagged_resource_not_found`] whichever
+    /// resource kind it addressed: the tagging surface names its subject generically, so
+    /// its not-found refusal states the generic resource class rather than the class the
+    /// ARN happened to spell.
     pub fn resource_tags(
         &self,
         resource_arn: &str,
@@ -1459,7 +1464,7 @@ impl ComAmazonawsEmrserverlessAwstoledowebserviceState {
             TaggedResource::Application { application_arn } => {
                 let record = self
                     .application_by_arn(application_arn)
-                    .ok_or_else(application_not_found)?;
+                    .ok_or_else(tagged_resource_not_found)?;
                 Ok(record.application.tags.clone().unwrap_or_default())
             }
             TaggedResource::JobRun {
@@ -1468,11 +1473,11 @@ impl ComAmazonawsEmrserverlessAwstoledowebserviceState {
             } => {
                 let record = self
                     .application_by_arn(application_arn)
-                    .ok_or_else(application_not_found)?;
+                    .ok_or_else(tagged_resource_not_found)?;
                 let run = record
                     .job_runs
                     .get(job_run_id)
-                    .ok_or_else(job_run_not_found)?;
+                    .ok_or_else(tagged_resource_not_found)?;
                 Ok(run.job_run.tags.clone().unwrap_or_default())
             }
             TaggedResource::Session {
@@ -1481,11 +1486,11 @@ impl ComAmazonawsEmrserverlessAwstoledowebserviceState {
             } => {
                 let record = self
                     .application_by_arn(application_arn)
-                    .ok_or_else(application_not_found)?;
+                    .ok_or_else(tagged_resource_not_found)?;
                 let session = record
                     .sessions
                     .get(session_id)
-                    .ok_or_else(session_not_found)?;
+                    .ok_or_else(tagged_resource_not_found)?;
                 Ok(session.session.tags.clone().unwrap_or_default())
             }
         }
@@ -1501,7 +1506,7 @@ impl ComAmazonawsEmrserverlessAwstoledowebserviceState {
             TaggedResource::Application { application_arn } => {
                 let record = self
                     .application_by_arn_mut(application_arn)
-                    .ok_or_else(application_not_found)?;
+                    .ok_or_else(tagged_resource_not_found)?;
                 Ok(record.application.tags.get_or_insert_default())
             }
             TaggedResource::JobRun {
@@ -1510,11 +1515,11 @@ impl ComAmazonawsEmrserverlessAwstoledowebserviceState {
             } => {
                 let record = self
                     .application_by_arn_mut(application_arn)
-                    .ok_or_else(application_not_found)?;
+                    .ok_or_else(tagged_resource_not_found)?;
                 let run = record
                     .job_runs
                     .get_mut(job_run_id)
-                    .ok_or_else(job_run_not_found)?;
+                    .ok_or_else(tagged_resource_not_found)?;
                 Ok(run.job_run.tags.get_or_insert_default())
             }
             TaggedResource::Session {
@@ -1523,11 +1528,11 @@ impl ComAmazonawsEmrserverlessAwstoledowebserviceState {
             } => {
                 let record = self
                     .application_by_arn_mut(application_arn)
-                    .ok_or_else(application_not_found)?;
+                    .ok_or_else(tagged_resource_not_found)?;
                 let session = record
                     .sessions
                     .get_mut(session_id)
-                    .ok_or_else(session_not_found)?;
+                    .ok_or_else(tagged_resource_not_found)?;
                 Ok(session.session.tags.get_or_insert_default())
             }
         }
@@ -2187,7 +2192,10 @@ pub fn decode_page_token(token: &str) -> Option<String> {
 /// that was not found, naming no identifier: the same sentence comes back whichever
 /// operation refused and whatever id was asked for. Recorded responses show it on both
 /// an application report and a job submission, so the phrase belongs to the resource,
-/// not to the operation — hence one constant every handler shares.
+/// not to the operation — hence one constant every handler that addresses an application
+/// BY ITS ID shares. The tagging operations address their subject by ARN rather than by
+/// id and are answered by their own front door, whose generic phrase is
+/// [`TAGGED_RESOURCE_NOT_FOUND_MESSAGE`].
 pub const APPLICATION_NOT_FOUND_MESSAGE: &str = "Application does not exist";
 
 /// The same, for the job run a request names.
@@ -2253,6 +2261,35 @@ pub fn job_run_attempt_not_found() -> ResourceNotFoundException {
 pub fn session_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: SESSION_NOT_FOUND_MESSAGE.to_string(),
+    }
+}
+
+/// What a `ResourceNotFoundException` says when the ARN a TAG operation carries names no
+/// resource of this service.
+///
+/// The tagging surface addresses its subject GENERICALLY: `TagResource`, `UntagResource`
+/// and `ListTagsForResource` each take one `resourceArn` whose `ResourceArn` pattern
+/// admits an application, a job run or a session alike, so what such a lookup fails to
+/// find is "the specified resource" — the class `ResourceNotFoundException` documents
+/// itself for — and not one resource class the caller named. The sentence states that
+/// class as fixed text: no ARN, no resource kind, no identifier, so one phrase comes back
+/// whichever of the three operations refused and whichever kind of resource the ARN
+/// addressed.
+///
+/// The operations that address ONE resource class by its own id keep that class's own
+/// phrase ([`APPLICATION_NOT_FOUND_MESSAGE`], [`JOB_RUN_NOT_FOUND_MESSAGE`],
+/// [`SESSION_NOT_FOUND_MESSAGE`]): there the request named the class, so the refusal can
+/// too.
+pub const TAGGED_RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// The `ResourceNotFoundException` payload a tag operation refuses an ARN that names no
+/// resource with.
+///
+/// Takes no argument on purpose: the message states the resource class generically, so
+/// there is no way for the caller's ARN to reach the error body through here.
+pub fn tagged_resource_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: TAGGED_RESOURCE_NOT_FOUND_MESSAGE.to_string(),
     }
 }
 

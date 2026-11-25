@@ -13,7 +13,9 @@
 //! 1. A refusal states the condition it refuses on; it never echoes the value the
 //!    request carried. A not-found refusal names the RESOURCE CLASS that does not
 //!    exist, the same sentence whichever operation refused and whatever id was asked
-//!    for.
+//!    for — the class the REQUEST addressed, which for the tagging operations, whose one
+//!    `resourceArn` admits an application, a job run or a session alike, is the generic
+//!    resource.
 //! 2. A `@range` violation names the member and the bound it broke, and does not quote
 //!    the submitted value.
 //! 3. A resource ARN is checked for its VENDOR: an ARN of another service is refused by
@@ -45,8 +47,17 @@ const SIGNED_FOR_EU_WEST_1: &str = "AWS4-HMAC-SHA256 \
      SignedHeaders=host, Signature=abc";
 
 /// The fixed phrase a `ResourceNotFoundException` carries for an application that does
-/// not exist, whichever operation refused.
+/// not exist, whichever operation that addresses an application BY ITS ID refused.
 const APPLICATION_NOT_FOUND: &str = "Application does not exist";
+
+/// The same, for the TAGGING surface, which addresses an application, a job run or a
+/// session through one `resourceArn` and so states the generic resource class instead.
+const TAGGED_RESOURCE_NOT_FOUND: &str = "Resource was not found";
+
+/// The error shape that refusal names: the generic not-found shape of the stack that fronts
+/// `/tags/{resourceArn}`, the same stack [`WRONG_VENDOR_CODE`] belongs to. No operation of
+/// this model declares it; `resource_tagging.rs` owns that rule.
+const TAGGING_NOT_FOUND_SHAPE: &str = "NotFoundException";
 
 /// The same, for a job run.
 const JOB_RUN_NOT_FOUND: &str = "Job Run with given ID doesn't exist";
@@ -775,7 +786,7 @@ async fn a_resource_arn_of_another_vendor_is_refused_by_the_vendor_check() {
 
     // An ARN of THIS vendor is not the vendor check's business. One that satisfies
     // `ResourceArn` reaches the handler, which answers on the resource it names (no
-    // application was created here, so the modelled `ResourceNotFoundException`); one
+    // application was created here, so the tagging surface's own not-found refusal); one
     // that does not keeps the framework's constraint wording, which names the member.
     let application_arn =
         "arn:aws:emr-serverless:eu-west-1:000000000000:/applications/0000000000000001";
@@ -799,15 +810,15 @@ async fn a_resource_arn_of_another_vendor_is_refused_by_the_vendor_check() {
     );
     assert_eq!(
         listed.error_code(),
-        "ResourceNotFoundException",
-        "case ListTagsForResource(own vendor): expected ResourceNotFoundException, got {:?}",
+        TAGGING_NOT_FOUND_SHAPE,
+        "case ListTagsForResource(own vendor): expected {TAGGING_NOT_FOUND_SHAPE}, got {:?}",
         listed.body
     );
     assert_eq!(
         listed.message(),
-        APPLICATION_NOT_FOUND,
-        "case ListTagsForResource(own vendor): expected the class phrase {APPLICATION_NOT_FOUND:?}, \
-         got {:?}",
+        TAGGED_RESOURCE_NOT_FOUND,
+        "case ListTagsForResource(own vendor): expected the tagging surface's generic phrase \
+         {TAGGED_RESOURCE_NOT_FOUND:?}, got {:?}",
         listed.message()
     );
 

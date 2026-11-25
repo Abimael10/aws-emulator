@@ -21,8 +21,11 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   correctly. EDITED here, and NOT to re-route: every modelled operation is served
+//!   through the layer that puts the served operation in scope, so the error SHAPE a
+//!   refusal of the tagging surface names can be restated where the operation that
+//!   answered is known ([`front_door_identity`]). The operation itself is still the one
+//!   the generated routing table names.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. EDITED here: this service words two refusal classes
 //!   itself — a resource ARN of another vendor, and a `@range` violation — and
@@ -65,7 +68,19 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! That generated entry is handed back as the generator emitted it; what this file adds
+//! around it is the ONE restatement the tagging surface's refusals need
+//! ([`front_door_identity`]): the error SHAPE a `/tags/{resourceArn}` refusal names is the
+//! front door's own, which is a fact about the OPERATION that answered and so cannot be
+//! decided by the refusal seam.
 
+/// Which error SHAPE a refusal of the tagging surface names: the two names, and the one
+/// step that restates it in both places a failure names a shape.
+mod error_type_locator;
+/// WHICH operation answered — the fact the restatement above needs, in scope only at the
+/// per-operation layer `override_operation` hands back.
+mod front_door_identity;
 mod read_projection;
 
 use aws_smithy_runtime_api::http::{Request as WireRequest, Response as WireResponse};
@@ -73,9 +88,7 @@ use aws_smithy_schema::Schema;
 use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
 use aws_smithy_schema_server::{ProtocolError, ServerProtocol};
 use service_common::no_content_responses::without_content;
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
 
 use read_projection::ReadProjection;
@@ -106,6 +119,10 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// refusal of this service's own surface (`maxResults` outside its `@range`) is the
 /// modelled `ValidationException` that [`VALIDATION_EXCEPTION`] names. The two layers
 /// keep their own identities here for that reason.
+///
+/// It is this front door's BAD-REQUEST shape; its not-found counterpart, for an ARN that
+/// names no resource, is [`error_type_locator::TAGGING_NOT_FOUND`] — one identity per
+/// refusal class of the one stack.
 const WRONG_VENDOR_ERROR_TYPE: &str = "BadRequestException";
 
 /// The modelled member that names the resource a tag operation targets.
@@ -257,12 +274,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Serve every modelled operation through the one layer that can restate the error
+        // SHAPE a refusal of the tagging surface names ([`front_door_identity`]): the
+        // refusal seam is handed the violations alone, and a handler cannot reach the
+        // rendering of its own error, so the operation that answered is known only here.
+        // The layer makes no routing decision of its own — it delegates to the operation
+        // the generated routing table names for the request, and it is claimed only for a
+        // request that table can serve, so a request naming no modelled operation stays
+        // the framework's own routing failure.
+        service_common::restated_refusal::routes(self.definition(), req)
+            .then_some(&front_door_identity::SERVED_OPERATION_LAYER as &dyn ErasedOperation)
     }
 
     fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
@@ -385,7 +406,9 @@ impl<Eng: Send + Sync + 'static> ServerProtocol for EmulatedService<Eng> {
         // No error shape of this model carries a configuration block, so a failure is
         // rendered exactly as the framework renders it. Nor is any of them a no-content
         // status — every modelled failure of this service carries a JSON error envelope at
-        // a 4xx or 5xx — so there is nothing here to reframe either.
+        // a 4xx or 5xx — so there is nothing here to reframe either. WHICH shape a refusal
+        // of the tagging surface names is restated on the way out of the operation, where
+        // the operation that answered is known ([`front_door_identity`]).
         self.entry
             .protocol()
             .serialize_error(error, error_schema, error_code, http_status)
