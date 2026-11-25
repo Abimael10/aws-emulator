@@ -52,7 +52,11 @@
 //! you set BatchSize to a value greater than 10, you must set
 //! MaximumBatchingWindowInSeconds to at least 1" — is decided against the values in force
 //! after this update, so a mapping on a queue is never left with a batch it has no window to
-//! gather (see [`crate::state::queue_batch_window_refusal`]).
+//! gather (see [`crate::state::queue_batch_window_refusal`]). And the `KMSKeyArn` in force
+//! after the update is the customer managed key the criteria in force after it are sealed
+//! under, which Lambda opens again as its own service principal: a key whose policy withholds
+//! that use is refused with that same modelled 400 and the mapping keeps the key and criteria
+//! it had (see [`crate::state::filter_criteria_key_denial`]).
 //!
 //! A setting whose own documentation gives an EMPTY value a meaning is read that way rather
 //! than stored as it arrived: "To delete the filter criteria, specify an empty FilterCriteria
@@ -572,6 +576,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // [`crate::state::filter_criteria_refusal`]) — which is also what keeps a later,
         // valid update of the same mapping possible.
         if let Some(message) = crate::state::filter_criteria_refusal(input.filter_criteria.as_ref())
+        {
+            return Err(invalid_parameter(message.to_string()));
+        }
+
+        // And the KEY those criteria are sealed under is held to exactly what the create's is:
+        // Lambda opens an encrypted mapping's criteria under its own service principal, which
+        // holds no identity-based policies, so a key whose own policy withholds that use is
+        // refused rather than stored over the key the mapping had (see
+        // [`crate::state::filter_criteria_key_denial`]). Both halves are the values in force
+        // AFTER this update — what this request states for each, and the stored value for the
+        // half it leaves alone — because that pair is what the criteria would be sealed under.
+        if let Some(message) = store
+            .event_source_mappings
+            .get(&input.uuid)
+            .and_then(|record| {
+                crate::state::filter_criteria_key_denial(
+                    &*self.engine,
+                    &region,
+                    input
+                        .kms_key_arn
+                        .as_deref()
+                        .or(record.kms_key_arn.as_deref()),
+                    input
+                        .filter_criteria
+                        .as_ref()
+                        .or(record.filter_criteria.as_ref()),
+                    &record.arn,
+                )
+            })
         {
             return Err(invalid_parameter(message.to_string()));
         }

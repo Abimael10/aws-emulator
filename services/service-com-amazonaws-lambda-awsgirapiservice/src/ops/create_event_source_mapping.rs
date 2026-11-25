@@ -55,6 +55,14 @@
 //! 400 rather than stored as criteria no record could be matched against (see
 //! [`crate::state::filter_criteria_refusal`]).
 //!
+//! Criteria a request asks to have ENCRYPTED have to be criteria Lambda could read back: the
+//! `KMSKeyArn` such a request names is the customer managed key they are sealed under, and
+//! Lambda opens them again under it as its OWN service principal, which holds no
+//! identity-based policies — so a key whose own policy withholds that use from this service is
+//! refused with that same modelled 400 and no mapping is created, rather than stored as
+//! criteria no record could ever be matched against (see
+//! [`crate::state::filter_criteria_key_denial`]).
+//!
 //! The two settings the model leaves optional because only SOME of those sources need them
 //! — the position a stream is read from, and the instant a position stated as a timestamp
 //! starts at — are required for the sources and the position that need them, and a request
@@ -863,6 +871,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The mapping's own identifier and ARN are minted HERE rather than at the write
+        // below, because the authorization of the key its filter criteria would be sealed
+        // under is taken FOR this mapping: `aws:SourceArn` names the resource another
+        // service's use of a key is made for, and that resource is the mapping this call
+        // creates. A refused create discards both.
+        let uuid = crate::state::mint_event_source_mapping_uuid();
+        let mapping_arn = crate::state::event_source_mapping_arn(&region, &uuid);
+
+        // `KMSKeyArn` is "the ... customer managed key that Lambda uses to encrypt your
+        // function's filter criteria", so a mapping that names one has its criteria sealed
+        // under that key and opened again under it — by LAMBDA itself, as its own service
+        // principal, which holds no identity-based policies and so draws the whole of its
+        // authority from the key's own policy. A key that withholds that use is one the
+        // criteria could never be read back out of, so it is refused here, before anything is
+        // persisted, rather than stood up as a mapping whose filter nothing could ever apply
+        // (see [`crate::state::filter_criteria_key_denial`], including the cases that show
+        // nothing about the key and refuse nothing).
+        if let Some(message) = crate::state::filter_criteria_key_denial(
+            &*self.engine,
+            &region,
+            input.kms_key_arn.as_deref(),
+            input.filter_criteria.as_ref(),
+            &mapping_arn,
+        ) {
+            return Err(invalid_parameter(message.to_string()));
+        }
+
         // "The resource already exists, or another operation is in progress": the records
         // a mapping reads are polled for one function by at most one mapping, so a second
         // create that would read the SAME records for the same function conflicts rather
@@ -936,13 +971,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let uuid = crate::state::mint_event_source_mapping_uuid();
         // "When true, the event source mapping is active. When false, Lambda pauses
         // polling and invocation. Default: True" — read once, so the setting the mapping
         // is stored with and the state it is created in cannot disagree.
         let enabled = input.enabled.unwrap_or(true);
         let record = crate::state::EventSourceMappingRecord {
-            arn: crate::state::event_source_mapping_arn(&region, &uuid),
+            arn: mapping_arn,
             uuid: uuid.clone(),
             function_arn,
             function_name,

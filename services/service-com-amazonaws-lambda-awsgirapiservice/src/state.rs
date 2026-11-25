@@ -2909,6 +2909,16 @@ pub use event_source_request::{
 pub mod event_source_queue_probe;
 pub use event_source_queue_probe::absent_queue_event_source_refusal;
 
+/// Whether the customer managed key such a mapping's FILTER CRITERIA would be sealed under
+/// lets this service open them again lives in [`filter_criteria_key`], apart from the readings
+/// above for the same reason the queue probe is: it asks the service that owns keys. The create
+/// and the update share it, so neither accepts a key the other would refuse — see the module's
+/// own header.
+pub mod filter_criteria_key;
+pub use filter_criteria_key::{
+    filter_criteria_key_denial, regional_service_principal, FILTER_CRITERIA_KEY_DENIED_MESSAGE,
+};
+
 /// WHICH destinations such a mapping may hand a record of a failed batch to lives in
 /// [`event_source_mapping_destination`], beside the slice above, and is re-exported here for
 /// the same reason: the two calls that state a mapping's destinations name it as

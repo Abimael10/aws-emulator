@@ -263,6 +263,11 @@ aws-sdk-ec2 = { version = "1", default-features = false }
 # service: it is asked over the same in-process callback
 # (`state::execution::environment_key`).
 aws-sdk-kms = { version = "1", default-features = false }
+# Whether the customer managed key an event source mapping's FILTER CRITERIA are sealed
+# under lets this service open them again is KMS's OWN decision over the key policy its
+# handlers wrote (`state::filter_criteria_key`): the key record and that decision are
+# reached through the shared engine, which needs the owning service's state TYPE.
+service-com-amazonaws-kms-trentservice = { workspace = true }
 # The CloudWatch store Lambda publishes its own metrics to (the `AWS/Lambda` namespace,# `state::metrics`). CloudWatch refuses a `PutMetricData` into a reserved `AWS/`
 # namespace, so a service's own metrics never travel over that API; this writes the very
 # store `ListMetrics`/`GetMetricStatistics` read.
@@ -431,8 +436,8 @@ automod = { workspace = true }
 # builds, signs and parses those `ec2Query` calls over the in-process callback is the one the
 # guest SDK seam holds, declared under `[dependencies]` above.
 # The key service a durable function's `DurableConfig` names a key in, mounted beside
-# lambda so a key really is disabled when the test says it is.
-service-com-amazonaws-kms-trentservice = { workspace = true }
+# lambda so a key really is disabled when the test says it is, is declared under
+# `[dependencies]` above.
 # The two services that own what a VPC's own resolver answers a handler inside that VPC:
 # Route 53 holds the PRIVATE hosted zones and their VPC associations, and Route 53 Resolver owns
 # the in-VPC DNS data plane that reads them. Both are mounted beside lambda on ONE engine in the
