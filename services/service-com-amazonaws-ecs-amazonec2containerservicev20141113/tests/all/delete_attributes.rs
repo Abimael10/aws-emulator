@@ -79,13 +79,13 @@ const INSTANCE_ID: &str = "i-0aaa0000000000001";
 /// The sentence a `TargetNotFoundException` carries for an entry whose target this cluster
 /// holds NO record of: the fixed text and the container instance the entry referred to,
 /// which is the one variable part.
-fn target_not_found(reference: &str) -> String {
+pub(crate) fn target_not_found(reference: &str) -> String {
     format!("Container instance {} not found.", short_id(reference))
 }
 
 /// The same for an entry whose target the cluster DID hold and has since deregistered: a
 /// target that is out of service is reported as that rather than as absent.
-fn target_inactive(reference: &str) -> String {
+pub(crate) fn target_inactive(reference: &str) -> String {
     format!("Container instance {} is inactive.", short_id(reference))
 }
 
