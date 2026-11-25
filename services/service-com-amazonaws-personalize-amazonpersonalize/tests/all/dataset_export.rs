@@ -343,11 +343,44 @@ impl Exporter {
         }
     }
 
+    /// Give `group` the Item interactions dataset an event tracker appends its event data
+    /// to, unless it already holds one.
+    ///
+    /// "Amazon Personalize then appends the event data to the Item interactions dataset of
+    /// the dataset group you specify in your event tracker"
+    /// (`smithy_query(query="doc", shape="CreateEventTracker")`), so a group holding no such
+    /// dataset takes no tracker — including a group whose own dataset is the separate Action
+    /// interactions type.
+    async fn ensure_interactions_dataset(&self, case: &str, suffix: &str, group: &str) {
+        let listed = self
+            .control_ok("ListDatasets", &json!({"datasetGroupArn": group}), case)
+            .await;
+        let holds = listed["datasets"].as_array().is_some_and(|datasets| {
+            datasets.iter().any(|dataset| {
+                dataset["datasetType"]
+                    .as_str()
+                    .is_some_and(|value| value.eq_ignore_ascii_case("Interactions"))
+            })
+        });
+        if holds {
+            return;
+        }
+        self.dataset(
+            case,
+            &format!("tracker-{suffix}"),
+            group,
+            "Interactions",
+            &["USER_ID", "ITEM_ID", "TIMESTAMP"],
+        )
+        .await;
+    }
+
     /// Create an event tracker for `group` through the control plane and wait for it to
     /// become `ACTIVE`, then return its `trackingId`: a tracking id is minted by
     /// `CreateEventTracker`, never by the ingestion plane, so a suite that ingests events
     /// gets one the same way a client does.
     async fn active_tracker(&self, case: &str, suffix: &str, group: &str) -> String {
+        self.ensure_interactions_dataset(case, suffix, group).await;
         let created = self
             .control_ok(
                 "CreateEventTracker",

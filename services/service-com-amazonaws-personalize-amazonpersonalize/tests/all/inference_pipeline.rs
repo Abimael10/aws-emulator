@@ -1924,6 +1924,39 @@ async fn every_stage_is_terminal_for_the_first_describe_after_its_create() {
             assert_first_read(case, "DescribeDatasetImportJob", &described, "ACTIVE");
         }
 
+        // An event tracker appends its event data to the Item interactions dataset of its
+        // dataset group, so the group holds that dataset before it holds a tracker. The
+        // actions row's own dataset is the separate Action interactions type, so it creates
+        // the Item interactions dataset here; it stays empty, which the precondition is
+        // indifferent to.
+        if row.actions {
+            let interactions = interactions_fixture(CATALOG_ITEMS);
+            let schema = created(
+                &emulator,
+                "CreateSchema",
+                &json!({
+                    "name": format!("{}-{suffix}", interactions.dataset_type),
+                    "schema": avro_schema(interactions.dataset_type, interactions.columns),
+                }),
+                "schemaArn",
+                case,
+            )
+            .await;
+            created(
+                &emulator,
+                "CreateDataset",
+                &json!({
+                    "name": format!("{}-{suffix}", interactions.dataset_type),
+                    "datasetGroupArn": group,
+                    "datasetType": interactions.dataset_type,
+                    "schemaArn": schema,
+                }),
+                "datasetArn",
+                case,
+            )
+            .await;
+        }
+
         // An event tracker and a filter belong to the same group and follow the same rule.
         let tracker = created(
             &emulator,

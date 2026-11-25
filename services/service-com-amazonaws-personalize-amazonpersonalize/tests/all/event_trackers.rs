@@ -28,7 +28,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::dataset_group_lifecycle::{
-    create_active_group, error_code, error_message, list_all, Emulator, ACCOUNT, REGION,
+    avro_schema, create_active_group, create_dataset, create_schema, error_code, error_message,
+    list_all, Emulator, ACCOUNT, REGION,
 };
 
 /// The statuses a tracker reports on the way to being created. Source: the model's own
@@ -64,6 +65,30 @@ fn tracker_names() -> Vec<(&'static str, String)> {
 /// listing orders by.
 fn expected_tracker_arn(name: &str) -> String {
     format!("arn:aws:personalize:{REGION}:{ACCOUNT}:event-tracker/{name}")
+}
+
+/// The dataset type an event tracker's events are appended to: "Amazon Personalize then
+/// appends the event data to the Item interactions dataset of the dataset group you specify
+/// in your event tracker" (`smithy_query(query="doc", shape="CreateEventTracker")`).
+const INTERACTIONS: &str = "Interactions";
+
+/// Create a dataset group that already holds the Item interactions dataset an event tracker
+/// appends its events to, and return the group's ARN.
+///
+/// A group that holds no such dataset takes no tracker at all, which is the rule
+/// `a_create_is_refused_until_its_group_holds_an_interactions_dataset` states, so every
+/// group that is to carry a tracker is built this way.
+async fn create_trackable_group(emulator: &Emulator, name: &str, case: &str) -> String {
+    let group = create_active_group(emulator, name, case).await;
+    let schema = create_schema(
+        emulator,
+        &format!("{name}-interactions"),
+        &avro_schema(INTERACTIONS),
+        case,
+    )
+    .await;
+    create_dataset(emulator, &group, &schema, INTERACTIONS, case).await;
+    group
 }
 
 /// Create an event tracker in `group_arn` and return its ARN and tracking id.
@@ -171,7 +196,7 @@ async fn list_event_trackers_reports_every_tracker_at_every_page_size() {
     let names = tracker_names();
     let mut groups: Vec<(String, String)> = Vec::new();
     for (index, (case, name)) in names.iter().enumerate() {
-        let group = create_active_group(&emulator, &format!("et-dsg-{index}"), case).await;
+        let group = create_trackable_group(&emulator, &format!("et-dsg-{index}"), case).await;
         let (arn, _) = create_tracker(&emulator, &group, name, case).await;
         groups.push((group, arn));
     }
@@ -277,7 +302,8 @@ async fn list_event_trackers_resumes_only_from_a_token_it_issued() {
 
     let names = tracker_names();
     for (index, (case, name)) in names.iter().enumerate() {
-        let group = create_active_group(&emulator, &format!("et-token-dsg-{index}"), case).await;
+        let group =
+            create_trackable_group(&emulator, &format!("et-token-dsg-{index}"), case).await;
         create_tracker(&emulator, &group, name, case).await;
     }
     let mut expected: Vec<String> = names
@@ -358,8 +384,8 @@ async fn list_event_trackers_resumes_only_from_a_token_it_issued() {
 async fn a_create_is_refused_when_its_group_is_unknown_or_already_tracked() {
     let emulator = Emulator::new();
 
-    let first = create_active_group(&emulator, "et-refusal-1", "refusals").await;
-    let second = create_active_group(&emulator, "et-refusal-2", "refusals").await;
+    let first = create_trackable_group(&emulator, "et-refusal-1", "refusals").await;
+    let second = create_trackable_group(&emulator, "et-refusal-2", "refusals").await;
     let (tracked_arn, _) = create_tracker(&emulator, &first, "refusalTracker", "refusals").await;
 
     // A group this account holds nothing for: the not-found class, worded for the KIND of
@@ -425,6 +451,194 @@ async fn a_create_is_refused_when_its_group_is_unknown_or_already_tracked() {
         vec![tracked_arn],
         "case \"after the refusals\": expected the stored tracker and nothing else"
     );
+}
+
+/// One row of the interactions-precondition table: what the dataset group holds when the
+/// create is attempted, and whether a tracker may be created in it.
+struct PreconditionRow {
+    case: &'static str,
+    /// The `datasetType` of each dataset the group holds, spelled as the request sends it.
+    /// The values come from the documented set for `CreateDatasetRequest$datasetType` —
+    /// "Interactions, Items, Users, Actions, Action_Interactions", case insensitive
+    /// (`smithy_query(query="doc", shape="CreateDatasetRequest", member="datasetType")`).
+    holds: &'static [&'static str],
+    /// Whether a group holding exactly that takes an event tracker.
+    takes_a_tracker: bool,
+}
+
+/// What a group may hold, and whether an event tracker may be created in it. The rows vary
+/// what the rule generalises over: how many datasets the group holds (none through several),
+/// which types they are (every documented type that is NOT Item interactions, including the
+/// separate Action interactions type), the position of the Item interactions dataset among
+/// them, and the casing its `datasetType` was created with.
+const PRECONDITION_CATALOG: &[PreconditionRow] = &[
+    // The recorded case: a group that exists and holds nothing at all.
+    PreconditionRow {
+        case: "a group holding no dataset at all",
+        holds: &[],
+        takes_a_tracker: false,
+    },
+    PreconditionRow {
+        case: "a group holding an Items dataset only",
+        holds: &["Items"],
+        takes_a_tracker: false,
+    },
+    PreconditionRow {
+        case: "a group holding Users and Actions datasets",
+        holds: &["Users", "Actions"],
+        takes_a_tracker: false,
+    },
+    // Action interactions is its own dataset type: it is not the Item interactions dataset
+    // an event tracker's event data is appended to.
+    PreconditionRow {
+        case: "a group holding an Action_Interactions dataset only",
+        holds: &["Action_Interactions"],
+        takes_a_tracker: false,
+    },
+    PreconditionRow {
+        case: "a group holding the Item interactions dataset",
+        holds: &["Interactions"],
+        takes_a_tracker: true,
+    },
+    PreconditionRow {
+        case: "a group holding the Item interactions dataset among others",
+        holds: &["Items", "Interactions", "Users"],
+        takes_a_tracker: true,
+    },
+    // The type is matched the way `CreateDataset` accepts it — case insensitively — so the
+    // casing the dataset was created with is not part of the precondition.
+    PreconditionRow {
+        case: "a group whose interactions dataset was created in lower case",
+        holds: &["interactions"],
+        takes_a_tracker: true,
+    },
+];
+
+#[tokio::test]
+async fn a_create_is_refused_until_its_group_holds_an_interactions_dataset() {
+    let emulator = Emulator::new();
+
+    for (index, row) in PRECONDITION_CATALOG.iter().enumerate() {
+        let case = row.case;
+        let group = create_active_group(&emulator, &format!("precondition-{index}"), case).await;
+        for dataset_type in row.holds {
+            let schema = create_schema(
+                &emulator,
+                &format!("precondition-{index}-{dataset_type}"),
+                &avro_schema(dataset_type),
+                case,
+            )
+            .await;
+            create_dataset(&emulator, &group, &schema, dataset_type, case).await;
+        }
+
+        let name = format!("preconditionTracker{index}");
+        let (status, answered) = emulator
+            .call(
+                "CreateEventTracker",
+                json!({"name": name, "datasetGroupArn": group}),
+            )
+            .await;
+
+        if row.takes_a_tracker {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected CreateEventTracker to answer 200, got {status} \
+                 {answered:?}"
+            );
+            assert_eq!(
+                answered["eventTrackerArn"].as_str(),
+                Some(expected_tracker_arn(&name).as_str()),
+                "case {case:?}: expected the minted tracker ARN, got {answered:?}"
+            );
+            let tracking_id = answered["trackingId"].as_str().unwrap_or_default();
+            assert!(
+                !tracking_id.is_empty() && tracking_id.len() <= 256,
+                "case {case:?}: expected a tracking id inside the modelled length, got \
+                 {answered:?}"
+            );
+            continue;
+        }
+
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected CreateEventTracker to answer HTTP 400, got {status} \
+             {answered:?}"
+        );
+        assert!(
+            error_code(&answered).contains("ResourceNotFoundException"),
+            "case {case:?}: expected ResourceNotFoundException, got {answered:?}"
+        );
+        assert_eq!(
+            error_message(&answered),
+            format!("Missing INTERACTIONS dataset with datasetgroup: [{group}]"),
+            "case {case:?}: expected the missing-dataset wording naming the group asked for"
+        );
+        assert!(
+            answered["eventTrackerArn"].is_null() && answered["trackingId"].is_null(),
+            "case {case:?}: expected a refusal to carry no tracker, got {answered:?}"
+        );
+
+        // The refused create stored nothing: the group holds no tracker, and the ARN it
+        // would have minted resolves to nothing.
+        let listed = list_all(
+            &emulator,
+            "ListEventTrackers",
+            "eventTrackers",
+            Some(("datasetGroupArn", &group)),
+            None,
+        )
+        .await;
+        assert!(
+            listed.is_empty(),
+            "case {case:?}: expected the refused create to store no tracker, got {listed:?}"
+        );
+        let (status, read) = emulator
+            .call_with_arn(
+                "DescribeEventTracker",
+                "eventTrackerArn",
+                &expected_tracker_arn(&name),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected DescribeEventTracker to refuse the ARN the refused \
+             create would have minted, got {status} {read:?}"
+        );
+
+        // And the precondition is the only thing in the way: once the group holds the Item
+        // interactions dataset, the SAME create is served.
+        let schema = create_schema(
+            &emulator,
+            &format!("precondition-{index}-late"),
+            &avro_schema(INTERACTIONS),
+            case,
+        )
+        .await;
+        create_dataset(&emulator, &group, &schema, INTERACTIONS, case).await;
+        let (status, answered) = emulator
+            .call(
+                "CreateEventTracker",
+                json!({"name": name, "datasetGroupArn": group}),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the create to be served once the group holds the \
+             interactions dataset, got {status} {answered:?}"
+        );
+        assert_eq!(
+            answered["eventTrackerArn"].as_str(),
+            Some(expected_tracker_arn(&name).as_str()),
+            "case {case:?}: expected the minted tracker ARN, got {answered:?}"
+        );
+        assert!(
+            answered["trackingId"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+            "case {case:?}: expected a tracking id, got {answered:?}"
+        );
+    }
 }
 
 /// One emulator mounting the Personalize control plane and the Personalize Events
@@ -563,6 +777,38 @@ async fn a_created_tracker_describes_back_and_its_tracking_id_ingests_until_it_i
         .as_str()
         .unwrap_or_else(|| panic!("case \"setup\": expected a datasetGroupArn, got {body:?}"))
         .to_string();
+
+    // The Item interactions dataset the tracker's events are appended to: the group holds it
+    // before it holds a tracker, which is what makes the create below a legitimate one.
+    let (status, body) = emulator
+        .control(
+            "CreateSchema",
+            json!({"name": "et-ingest-interactions", "schema": avro_schema(INTERACTIONS)}),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case \"setup\": expected CreateSchema to answer 200, got {status} {body:?}"
+    );
+    let schema = body["schemaArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case \"setup\": expected a schemaArn, got {body:?}"))
+        .to_string();
+    let (status, body) = emulator
+        .control(
+            "CreateDataset",
+            json!({
+                "name": "et-ingest-interactions",
+                "datasetGroupArn": group,
+                "datasetType": INTERACTIONS,
+                "schemaArn": schema,
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case \"setup\": expected CreateDataset to answer 200, got {status} {body:?}"
+    );
 
     let (status, body) = emulator
         .control(

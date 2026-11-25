@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEventTracker
-//! Implemented: creates an event tracker in a dataset group, mints the tracking id its
-//! `PutEvents` ingestion is addressed by, and records that id in the registry Amazon
-//! Personalize Events resolves. This is the ONLY file to touch for this operation.
+//! Implemented: creates an event tracker in a dataset group that already holds the Item
+//! interactions dataset its events are appended to, mints the tracking id its `PutEvents`
+//! ingestion is addressed by, and records that id in the registry Amazon Personalize
+//! Events resolves. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -193,6 +194,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.dataset_group_arn,
             ));
         };
+
+        // "Amazon Personalize then appends the event data to the Item interactions dataset
+        // of the dataset group you specify in your event tracker": the dataset the tracker's
+        // events land in has to be there before the tracker is, or the group has nowhere to
+        // append them. A group holding none of that type is answered as the resource that is
+        // missing — the dataset, not the group — naming the type and the group the request
+        // asked for ([`crate::state::missing_dataset_message`]).
+        if !crate::state::holds_dataset_of_type(
+            &state,
+            &input.dataset_group_arn,
+            crate::state::INTERACTIONS_DATASET_TYPE,
+        ) {
+            return Err(
+                CreateEventTrackerErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::missing_dataset_message(
+                            crate::state::INTERACTIONS_DATASET_TYPE,
+                            &input.dataset_group_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let arn = event_tracker_arn(&region, &input.name);
 
         // "Only one event tracker can be associated with a dataset group. You will get an

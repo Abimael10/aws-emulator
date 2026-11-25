@@ -570,10 +570,15 @@ async fn a_filter_is_refused_until_its_dataset_group_holds_interaction_records()
     }
 
     // The OTHER source the precondition names: the event-interactions stream an event
-    // tracker gives the group. This group holds no dataset at all, so the tracker is the
-    // only reason the filter is taken.
-    let streamed = "a group with an event tracker and no datasets";
+    // tracker gives the group. This group's INTERACTIONS dataset has no import job — the row
+    // above shows that alone is refused — so the tracker is the only reason the filter is
+    // taken. (An event tracker appends its events to that dataset, so a group holding none
+    // takes no tracker: `CreateEventTracker`'s own precondition.)
+    let streamed = "a group whose INTERACTIONS dataset has no import, with an event tracker";
     let tracked = emulator.group("tracked", streamed).await;
+    emulator
+        .dataset("tracked", &tracked, "Interactions", streamed)
+        .await;
     for (index, (expression_case, expression)) in EXPRESSIONS.iter().enumerate() {
         assert_filter_refused(
             &emulator,

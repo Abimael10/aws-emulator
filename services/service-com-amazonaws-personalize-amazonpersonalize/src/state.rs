@@ -354,6 +354,17 @@ pub const FILTER_INTERACTIONS_REQUIRED_MESSAGE: &str = "Dataset group must conta
 pub const DATASET_GROUP_IN_USE_MESSAGE: &str =
     "The provided dataset-group is being referenced by one or more datasets";
 
+/// What an operation whose dataset group must ALREADY hold a dataset of one type answers
+/// when the group holds none of it: the sentence names the type, in the upper-case spelling
+/// the service identifies a dataset type by, and the group ARN the request asked for —
+/// those two are its only variable parts.
+pub fn missing_dataset_message(dataset_type: &str, dataset_group_arn: &str) -> String {
+    format!(
+        "Missing {} dataset with datasetgroup: [{dataset_group_arn}]",
+        dataset_type.to_ascii_uppercase()
+    )
+}
+
 // ---------------------------------------------------------------------------
 // The create-status clock
 // ---------------------------------------------------------------------------
@@ -636,6 +647,24 @@ pub fn is_dataset_type(record: &DatasetRecord, value: &str) -> bool {
 /// The dataset type whose records are a user's interactions with the items of a group:
 /// "Interactions", one of [`DATASET_TYPE_VALUES`].
 pub const INTERACTIONS_DATASET_TYPE: &str = "Interactions";
+
+/// Whether the dataset group `dataset_group_arn` holds a dataset of the type `dataset_type`
+/// names, whatever that dataset holds.
+///
+/// A group holds at most one dataset of each type, and the type is matched exactly as
+/// `CreateDataset` accepts the member ([`is_dataset_type`]), so the answer does not depend
+/// on the casing either side was written in.
+///
+/// A pure read of the store: it answers a question about the group, it changes nothing.
+pub fn holds_dataset_of_type(
+    store: &ComAmazonawsPersonalizeAmazonpersonalizeState,
+    dataset_group_arn: &str,
+    dataset_type: &str,
+) -> bool {
+    store.datasets.values().any(|dataset| {
+        dataset.dataset_group_arn == dataset_group_arn && is_dataset_type(dataset, dataset_type)
+    })
+}
 
 /// Whether the dataset group `dataset_group_arn` holds INTERACTION records at all.
 ///
