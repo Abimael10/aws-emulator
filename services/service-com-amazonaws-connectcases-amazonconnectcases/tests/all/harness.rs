@@ -18,6 +18,22 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The access key id the harness signs with unless a suite names another one.
 pub const DEFAULT_ACCESS_KEY_ID: &str = "AKIDEXAMPLE";
 
+/// The one sentence the layer ahead of this service's handlers states for a
+/// request BODY that breaks a modelled constraint, re-exported from the shared
+/// front door the service is served behind rather than written out again, so a
+/// suite cannot pin wording the service does not state.
+pub use service_common::front_door::INVALID_REQUEST_BODY;
+
+/// The header a restJson1 client resolves a failure's error shape from, named
+/// where the shared layer that writes it names it.
+pub use service_common::error_type_locator::ERROR_TYPE_HEADER;
+
+/// The error code the layer ahead of this service's handlers refuses a request BODY
+/// under, re-exported from the shared front door the service is served behind: a shape
+/// this service's model does not declare, because that layer sits ahead of the code which
+/// owns the modelled errors.
+pub const BODY_REJECTION_CODE: &str = service_common::front_door::BAD_REQUEST_EXCEPTION;
+
 /// A SigV4 `Authorization` header scoped to this service's signing name
 /// (`cases`, per the crate's `OPERATIONS.md`), which is what the router routes
 /// on and what the handlers read the ARN region from, signed by
@@ -155,6 +171,59 @@ impl Emulator {
             .unwrap_or("<no message>")
             .to_string();
         (status, code, message)
+    }
+
+    /// Send a call that must fail, and hand back its status, the error shape its
+    /// `x-amzn-errortype` header names (the whole header value, locator and all)
+    /// and its message.
+    pub async fn failure_error_type(
+        &self,
+        case: &str,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> (u16, String, String) {
+        let payload = body
+            .map(|body| serde_json::to_vec(&body).expect("serialize the request body"))
+            .unwrap_or_default();
+        let request = http::Request::builder()
+            .method(method)
+            .uri(format!(
+                "https://cases.{}.amazonaws.com{path}",
+                self.region
+            ))
+            .header(
+                "authorization",
+                authorization_as(DEFAULT_ACCESS_KEY_ID, &self.region),
+            )
+            .header("content-type", "application/json")
+            .body(bytes::Bytes::from(payload))
+            .expect("build the request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let error_type = response
+            .headers()
+            .get(ERROR_TYPE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("<no x-amzn-errortype>")
+            .to_string();
+        let body = response.into_body();
+        let json: Value = if body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&body).unwrap_or(Value::Null)
+        };
+        assert_ne!(
+            status, 200,
+            "case {case:?}: expected a failure, got HTTP 200 with body {json:?}"
+        );
+        let message = json
+            .get("message")
+            .or_else(|| json.get("Message"))
+            .and_then(Value::as_str)
+            .unwrap_or("<no message>")
+            .to_string();
+        (status, error_type, message)
     }
 }
 

@@ -29,7 +29,7 @@ use service_com_amazonaws_connectcases_amazonconnectcases::state::{
 // shared with this crate's other suites.
 use crate::harness::{
     domain, field_of_type, fields_of_every_type, instant_at, is_minted_id, string_at, template,
-    title_value, Emulator, DEFAULT_ACCESS_KEY_ID,
+    title_value, Emulator, BODY_REJECTION_CODE, DEFAULT_ACCESS_KEY_ID,
 };
 
 /// A second caller, so an edge attributed to the caller's own credentials is
@@ -548,7 +548,8 @@ async fn the_audit_history_is_paged_newest_first_within_the_modelled_page_size()
         );
     }
 
-    // One past each published bound is refused rather than clamped.
+    // One past each published bound is refused rather than clamped. `maxResults` travels
+    // in the request BODY, so the layer ahead of the handlers is what refuses it.
     for requested in [0, MAX_AUDIT_EVENTS_PER_PAGE + 1] {
         let case = format!("GetCaseAuditEvents maxResults={requested}");
         let (status, code, message) = emulator
@@ -561,7 +562,7 @@ async fn the_audit_history_is_paged_newest_first_within_the_modelled_page_size()
             .await;
         assert_eq!(
             (status, code.as_str()),
-            (400, "ValidationException"),
+            (400, BODY_REJECTION_CODE),
             "case {case:?}: a page size outside 1..{MAX_AUDIT_EVENTS_PER_PAGE} must be \
              refused, got {status} {code}: {message}"
         );

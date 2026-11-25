@@ -16,7 +16,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcases_amazonconnectcases::state::MAX_EVENT_INCLUDED_FIELD_IDS;
 
-use crate::harness::{domain, Emulator};
+use crate::harness::{domain, Emulator, BODY_REJECTION_CODE};
 
 /// The URI both operations bind to for `domain_id`
 /// (`smithy_query(query="operation", operation="PutCaseEventConfiguration")`:
@@ -235,8 +235,8 @@ async fn the_included_field_list_is_bounded_by_the_models_cap() {
         .await;
     assert_eq!(
         (status, code.as_str()),
-        (400, "ValidationException"),
-        "case {case:?}: a list past the cap must be refused with 400 ValidationException, \
+        (400, BODY_REJECTION_CODE),
+        "case {case:?}: a list past the cap must be refused with 400 {BODY_REJECTION_CODE}, \
          got {status} {code:?}"
     );
 

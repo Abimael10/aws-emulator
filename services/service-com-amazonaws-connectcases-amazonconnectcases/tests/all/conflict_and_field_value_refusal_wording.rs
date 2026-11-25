@@ -31,7 +31,7 @@ use service_com_amazonaws_connectcases_amazonconnectcases::ops::types::FIELD_TYP
 
 use crate::harness::{
     domain, field_of_type, fields_of_every_type, get_case_fields, string_at, template, title_value,
-    Emulator,
+    Emulator, BODY_REJECTION_CODE,
 };
 
 /// The one account a generated emulator serves, which every ARN it mints
@@ -272,7 +272,8 @@ async fn a_duplicate_domain_name_is_refused_with_the_account_the_name_is_taken_i
     }
 
     // A name outside the modelled length is not this refusal at all: the
-    // request is rejected for its own shape before any name is resolved.
+    // request's BODY is rejected for its own shape, ahead of the handler and
+    // before any name is resolved.
     let outside: Vec<(&'static str, String)> = vec![
         (
             "a name one character past the longest the model allows",
@@ -293,7 +294,7 @@ async fn a_duplicate_domain_name_is_refused_with_the_account_the_name_is_taken_i
             .await;
         assert_eq!(
             (status, code.as_str()),
-            (400, "ValidationException"),
+            (400, BODY_REJECTION_CODE),
             "case {case:?}: a name outside the modelled shape must be refused as invalid, \
              got {status} {code}"
         );

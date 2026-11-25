@@ -1036,7 +1036,10 @@ async fn a_malformed_create_case_member_is_refused_at_the_path_the_input_shape_g
     // member of the input names its own member path, one absent from a shape
     // NESTED under a member names the trail from the input inwards (the member,
     // the element's 1-based position, the collection step, the member), and a
-    // value of the wrong type is refused rather than stored.
+    // value of the wrong type is refused rather than stored. `CreateCase` is the
+    // one operation whose body the layer ahead of the handlers does not validate
+    // (see `tests/all/request_body_rejection.rs`), so these sentences are the
+    // per-member ones its wire shows rather than that layer's fixed sentence.
     let emulator = Emulator::new();
     let domain_id = domain(&emulator, "malformed-member-domain").await;
     let fields = fields_of_every_type(&emulator, &domain_id).await;

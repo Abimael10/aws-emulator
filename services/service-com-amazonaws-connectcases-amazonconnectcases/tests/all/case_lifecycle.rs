@@ -24,6 +24,7 @@ use service_com_amazonaws_connectcases_amazonconnectcases::state::{
 use crate::harness::{
     domain, field_of_type, field_value_variants, fields_of_every_type, get_case_fields,
     is_minted_id, string_at, template, template_required_field_refusal, title_value, Emulator,
+    BODY_REJECTION_CODE, INVALID_REQUEST_BODY,
 };
 
 #[tokio::test]
@@ -895,23 +896,41 @@ async fn a_field_id_list_is_bounded_and_a_repeat_is_refused_only_on_a_write() {
     ];
 
     for (operation, method, path, cap, body_for, refuses_repeat) in rows {
-        // One past the cap is refused, and the refusal says so rather than
-        // tripping over the ids themselves.
+        // One past the cap is refused. For an operation the body-validating layer fronts
+        // that is the body rejection it states for every modelled constraint a body breaks
+        // — one fixed sentence, naming neither the member nor the cap — while `CreateCase`,
+        // the one operation it does not front, is refused behind the door, naming the
+        // member (see `tests/all/request_body_rejection.rs`).
+        let fronted = operation != "CreateCase";
         let over: Vec<String> = (0..=cap).map(|index| format!("id-{index}")).collect();
         let case = format!("{operation} with {} field ids", over.len());
         let (status, code, message) = emulator
             .failure_detail(&case, method, &path, Some(body_for(&over)))
             .await;
+        let expected_code = if fronted {
+            BODY_REJECTION_CODE
+        } else {
+            "ValidationException"
+        };
         assert_eq!(
             (status, code.as_str()),
-            (400, "ValidationException"),
-            "case {case:?}: expected 400 ValidationException past the cap of {cap}, \
+            (400, expected_code),
+            "case {case:?}: expected 400 {expected_code} past the cap of {cap}, \
              got {status} {code}: {message}"
         );
-        assert!(
-            message.contains(&cap.to_string()),
-            "case {case:?}: the refusal must name the cap of {cap}, got {message:?}"
-        );
+        if fronted {
+            assert_eq!(
+                message, INVALID_REQUEST_BODY,
+                "case {case:?}: past the cap of {cap} the body rejection is the fixed \
+                 sentence, got {message:?}"
+            );
+        } else {
+            assert!(
+                message.contains("fields") && message.contains(&cap.to_string()),
+                "case {case:?}: past the cap of {cap} the refusal names the member and the \
+                 cap, got {message:?}"
+            );
+        }
 
         // Exactly the cap is within bounds, so the refusal above is the cap and
         // not an off-by-one: this one may still fail on the ids themselves, but
@@ -1904,7 +1923,10 @@ async fn a_case_rule_a_write_cannot_resolve_is_refused_with_the_modeled_error() 
     // `CaseRuleName` is `@length(1..100)` with `@pattern("^.*[\\S]$")` and
     // `CaseRuleDescription` is `@length(max: 255)`
     // (`smithy_query(query="operation", operation="CreateCaseRule")`), so each
-    // bound is tested at its published value and one past it.
+    // bound is tested at its published value and one past it. A value outside one of
+    // those is a BODY rejection, refused ahead of the handler under the code that layer
+    // owns; the rows that name a reference the store cannot resolve are the handler's own
+    // modelled refusals.
     let rows: Vec<CaseRuleCreateRow> = vec![
         (
             "a domain this store does not hold".to_string(),
@@ -1971,19 +1993,19 @@ async fn a_case_rule_a_write_cannot_resolve_is_refused_with_the_modeled_error() 
             "a name one past the published maximum 100 characters".to_string(),
             domain_id.clone(),
             json!({ "name": "n".repeat(101), "rule": required(json!([])) }),
-            Some((400, "ValidationException")),
+            Some((400, BODY_REJECTION_CODE)),
         ),
         (
             "a name one short of the published minimum 1 character".to_string(),
             domain_id.clone(),
             json!({ "name": "", "rule": required(json!([])) }),
-            Some((400, "ValidationException")),
+            Some((400, BODY_REJECTION_CODE)),
         ),
         (
             "a name that does not end in a non-whitespace character".to_string(),
             domain_id.clone(),
             json!({ "name": "trailing space ", "rule": required(json!([])) }),
-            Some((400, "ValidationException")),
+            Some((400, BODY_REJECTION_CODE)),
         ),
         (
             "a description of the published maximum 255 characters".to_string(),
@@ -2003,7 +2025,7 @@ async fn a_case_rule_a_write_cannot_resolve_is_refused_with_the_modeled_error() 
                 "description": "d".repeat(256),
                 "rule": required(json!([])),
             }),
-            Some((400, "ValidationException")),
+            Some((400, BODY_REJECTION_CODE)),
         ),
     ];
 

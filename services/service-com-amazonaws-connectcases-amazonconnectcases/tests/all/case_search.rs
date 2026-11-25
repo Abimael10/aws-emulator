@@ -27,7 +27,7 @@ use service_com_amazonaws_connectcases_amazonconnectcases::state::{
 // shared with this crate's other suites.
 use crate::harness::{
     domain, field_of_type, fields_of_every_type, get_case_fields, string_at, template, title_value,
-    Emulator,
+    Emulator, BODY_REJECTION_CODE,
 };
 
 /// A user ARN written into the `User` field of the `with-a-user-arn` case; it is
@@ -878,7 +878,9 @@ async fn a_search_refuses_a_request_it_cannot_answer() {
     // Every reference a search carries is resolved against the domain's schema,
     // and every paging and ordering argument against the model's own range, so
     // a request that names something the store does not hold is refused rather
-    // than answered with an empty page.
+    // than answered with an empty page. A reference the schema cannot resolve is the
+    // handler's own modelled refusal; a value outside what the MODEL admits is a body
+    // rejection, refused ahead of the handler under the code that layer owns.
     let rows: Vec<(&str, Value, u16, &str)> = vec![
         (
             "fields names a field the domain does not define",
@@ -911,19 +913,19 @@ async fn a_search_refuses_a_request_it_cannot_answer() {
             "sortOrder is not an Order",
             json!({ "sorts": [{ "fieldId": known, "sortOrder": "Ascending" }] }),
             400,
-            "ValidationException",
+            BODY_REJECTION_CODE,
         ),
         (
             "maxResults below the modelled range",
             json!({ "maxResults": 0 }),
             400,
-            "ValidationException",
+            BODY_REJECTION_CODE,
         ),
         (
             "maxResults above the modelled range",
             json!({ "maxResults": MAX_PAGE_SIZE + 1 }),
             400,
-            "ValidationException",
+            BODY_REJECTION_CODE,
         ),
         (
             "a nextToken this service never issued",

@@ -27,7 +27,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcases_amazonconnectcases::ops::types::TEMPLATE_STATUS_VALUES;
 
-use crate::harness::{domain, instant_at, string_at, Emulator};
+use crate::harness::{domain, instant_at, string_at, Emulator, BODY_REJECTION_CODE};
 
 /// The published bounds of the members `UpdateTemplate` writes, from the model:
 /// `TemplateName` is `@length(1..100)`, `TemplateDescription` `@length(..255)`,
@@ -624,14 +624,14 @@ async fn an_update_the_store_cannot_satisfy_is_refused_with_the_modeled_error() 
             path.clone(),
             json!({ "name": "n".repeat(MAX_TEMPLATE_NAME + 1) }),
             400,
-            "ValidationException",
+            BODY_REJECTION_CODE,
         ),
         (
             "a name one short of the published minimum 1 character".to_string(),
             path.clone(),
             json!({ "name": "" }),
             400,
-            "ValidationException",
+            BODY_REJECTION_CODE,
         ),
         (
             // `TemplateName` is `@pattern("^.*[\\S]$")`: a name ending in
@@ -640,7 +640,7 @@ async fn an_update_the_store_cannot_satisfy_is_refused_with_the_modeled_error() 
             path.clone(),
             json!({ "name": "trailing space " }),
             400,
-            "ValidationException",
+            BODY_REJECTION_CODE,
         ),
         (
             format!(
@@ -650,7 +650,7 @@ async fn an_update_the_store_cannot_satisfy_is_refused_with_the_modeled_error() 
             path.clone(),
             json!({ "description": "d".repeat(MAX_TEMPLATE_DESCRIPTION + 1) }),
             400,
-            "ValidationException",
+            BODY_REJECTION_CODE,
         ),
         (
             format!("requiredFields one past the published maximum {MAX_REQUIRED_FIELDS} entries"),
@@ -659,7 +659,7 @@ async fn an_update_the_store_cannot_satisfy_is_refused_with_the_modeled_error() 
                 .map(|index| json!({ "fieldId": format!("field-{index}") }))
                 .collect::<Vec<Value>>() }),
             400,
-            "ValidationException",
+            BODY_REJECTION_CODE,
         ),
         (
             format!(
@@ -672,18 +672,19 @@ async fn an_update_the_store_cannot_satisfy_is_refused_with_the_modeled_error() 
                 { "resourceType": "Cases", "tagMap": { "team": "billing" } },
             ] }),
             400,
-            "ValidationException",
+            BODY_REJECTION_CODE,
         ),
     ];
     // A value that is not a `TemplateStatus` cannot be a template's status, so it
-    // is refused rather than stored.
+    // is refused rather than stored — by the layer ahead of the handler, since the
+    // model is what declares the status vocabulary.
     for unknown in ["Draft", "active", "ACTIVE", "Deleted", ""] {
         rows.push((
             format!("a status that is not a TemplateStatus: {unknown:?}"),
             path.clone(),
             json!({ "status": unknown }),
             400,
-            "ValidationException",
+            BODY_REJECTION_CODE,
         ));
     }
 

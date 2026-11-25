@@ -23,7 +23,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{domain, is_minted_id, string_at, Emulator};
+use crate::harness::{domain, is_minted_id, string_at, Emulator, BODY_REJECTION_CODE};
 
 /// Create a `Text` field in `domain_id` and return its id. One field is enough
 /// for a layout: a layout references a field, it does not carry its type.
@@ -569,7 +569,7 @@ async fn a_layout_s_lists_are_bounded_by_the_published_caps() {
         "case {case:?}: every field of the group must be reported, in order, got {fetched:?}"
     );
 
-    // ONE PAST each bound is refused as invalid, and nothing is stored.
+    // ONE PAST each bound is refused as a body rejection, and nothing is stored.
     let mut past_field_bound = fields.clone();
     past_field_bound.push(fields[0].clone());
     let one_section = json!({ "fieldGroup": { "fields": [{ "id": fields[0] }] } });
@@ -594,8 +594,8 @@ async fn a_layout_s_lists_are_bounded_by_the_published_caps() {
             .await;
         assert_eq!(
             (status, code.as_str()),
-            (400, "ValidationException"),
-            "case {case:?}: expected HTTP 400 ValidationException, got {status} {code}"
+            (400, BODY_REJECTION_CODE),
+            "case {case:?}: expected HTTP 400 {BODY_REJECTION_CODE}, got {status} {code}"
         );
     }
 }

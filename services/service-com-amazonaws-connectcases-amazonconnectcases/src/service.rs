@@ -43,9 +43,40 @@
 //! A sixth seam, `override_protocol`, is the one this service DOES take: every timestamp
 //! member of this model declares `@timestampFormat("date-time")`, so each instant it
 //! reports is an RFC 3339 string rather than the protocol's default epoch-seconds number.
+//!
+//! ## How a refusal of a request BODY is stated
+//!
+//! Most of this service's operations have their request BODY validated against the
+//! operation's modelled input by a layer AHEAD of the code that owns the modelled errors,
+//! and that layer states ONE fixed sentence for every member and every constraint class it
+//! refuses — it names neither the member, nor the value, nor the clause it broke, nor how
+//! many clauses failed — under the error code that layer owns, which this service's model
+//! does not declare. So each of those operations is served behind this service's front
+//! door ([`::service_common::front_door::FrontDoorTable`], wired in [`body_door`]), which
+//! reads each violated member's HTTP binding off that
+//! operation's own input schema: a value the request carries OUTSIDE its body (a
+//! `@httpLabel` path segment) is NOT a body rejection and is left to the layers behind the
+//! door, which state it naming the member that failed. Nothing is re-implemented and no
+//! check is repeated in other words: the violations are the framework's own, the status and
+//! the envelope stay the framework's, and the code and the sentence are the shared ones
+//! every service reached through such a layer answers.
+//!
+//! `CreateCase` is NOT behind that door, and the recordings are what say so: a create
+//! whose body omits a required member is refused there with the modelled
+//! `ValidationException` and the per-member clause that names the member and the constraint
+//! it broke — the wording the framework's own walk states — rather than with the fixed
+//! sentence the operations above answer. So its body keeps the framework's refusal, and the
+//! two wordings stay with the operations whose wire shows each.
+//!
+//! A rule the model states only in prose is neither of those: it is refused by the
+//! operation that owns it, as its own modelled `ValidationException` naming what failed (a
+//! field value whose type the field does not declare, a create that supplies no value for
+//! a field the service or the chosen template requires).
+
+pub mod body_door;
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, OperationRoutingTable, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
@@ -56,6 +87,12 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The modelled operations the body-validating layer fronts, each served behind this
+    /// service's front door so a request BODY that breaks a modelled rule is refused the
+    /// way this service refuses one ([`body_door::table`]). Keyed by the routing key the
+    /// protocol resolves — the key the generated table uses — and built from the SAME shared
+    /// engine, so a wrapped operation reads and writes the one store.
+    front_door: OperationRoutingTable,
     /// This service's wire protocol, built ONCE here because
     /// [`Service::override_protocol`] hands back a borrow of it.
     protocol: ::service_common::date_time_json::DateTimeRestJson,
@@ -67,7 +104,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            front_door: body_door::table(&engine),
             protocol: ::service_common::date_time_json::DateTimeRestJson::new(),
         }
     }
@@ -95,24 +133,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // NOT a re-route: the key is the one the generated table's own protocol resolves,
+        // and the operation it names is the one served — wrapped in the front door so a
+        // request BODY that breaks a modelled rule is refused the way this service refuses
+        // one. A key the model does not name resolves to `None` here exactly as it does in
+        // the generated table, so the router's routing-error path is unchanged, and so does
+        // an operation the door does not front (`CreateCase`), which the generated table
+        // then serves.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.front_door.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
+        // The front door above answers every refusal of a request BODY it fronts, so what
+        // reaches this seam is a refusal of a value the request carries OUTSIDE its body
+        // (the `@httpLabel` `domainId`, `caseId`, `fieldId`, `templateId` and `layoutId`
+        // path segments, the `@httpQuery` members of the listings), a body the codec itself
+        // could not read at all and so reported no constraint violation for, or the body of
+        // the one operation the door does not front. Each of those names the member that
+        // failed and the constraint it broke — which is what the framework's own wording
+        // already does — so this service rewords none of them.
         let _ = refusal;
         None
     }

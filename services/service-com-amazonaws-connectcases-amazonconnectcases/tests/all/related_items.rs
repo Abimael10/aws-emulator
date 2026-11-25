@@ -30,7 +30,7 @@ use service_com_amazonaws_connectcases_amazonconnectcases::ops::types::RELATED_I
 // shared with this crate's other suites.
 use crate::harness::{
     domain, field_of_type, fields_of_every_type, is_minted_id, string_at, template, title_value,
-    Emulator, DEFAULT_ACCESS_KEY_ID,
+    Emulator, BODY_REJECTION_CODE, DEFAULT_ACCESS_KEY_ID,
 };
 
 /// An Amazon Connect contact ARN: the external identifier a `Contact` item
@@ -396,7 +396,7 @@ async fn an_association_resolves_every_reference_it_makes_before_storing_anythin
             path.clone(),
             json!({ "type": "Booking", "content": { "contact": { "contactArn": CONTACT_ARN } } }),
             400,
-            "ValidationException",
+            BODY_REJECTION_CODE,
         ),
         (
             "Custom item naming a field the domain does not hold",
@@ -564,8 +564,8 @@ async fn an_association_is_accepted_at_each_modelled_bound_and_refused_past_it()
                 .await;
             assert_eq!(
                 (status, code.as_str()),
-                (400, "ValidationException"),
-                "case {case:?}: a value past a modelled bound is a bad request, got {status} \
+                (400, BODY_REJECTION_CODE),
+                "case {case:?}: a value past a modelled bound is a body rejection, got {status} \
                  {code} with message {message:?}"
             );
         }

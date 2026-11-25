@@ -29,7 +29,9 @@ use service_com_amazonaws_connectcases_amazonconnectcases::state::{
     MAX_BATCH_FIELD_OPTIONS, MAX_FIELD_OPTIONS_PER_FIELD, MAX_FIELD_OPTION_TEXT_LEN,
 };
 
-use crate::harness::{domain, field_of_type, fields_of_every_type, string_at, Emulator};
+use crate::harness::{
+    domain, field_of_type, fields_of_every_type, string_at, Emulator, BODY_REJECTION_CODE,
+};
 
 /// `FieldOptionValue` forms the service accepts: "max length 100 and must be
 /// alphanumeric with hyphens and underscores"
@@ -681,7 +683,8 @@ async fn an_option_set_is_bounded_and_a_repeated_value_is_refused() {
         "case {case:?}: two entries for one value must be refused, got {status}/{code} ({message})"
     );
 
-    // One past the model's own per-request cap (`options` is `length ..50`).
+    // One past the model's own per-request cap (`options` is `length ..50`), which the
+    // layer ahead of the handler refuses as a body rejection.
     let case = "one option past the request cap";
     let too_many: Vec<Value> = (0..=MAX_BATCH_FIELD_OPTIONS)
         .map(|i| option(&format!("name {i}"), &format!("over-{i:04}"), true))
@@ -696,7 +699,7 @@ async fn an_option_set_is_bounded_and_a_repeated_value_is_refused() {
         .await;
     assert_eq!(
         (status, code.as_str()),
-        (400, "ValidationException"),
+        (400, BODY_REJECTION_CODE),
         "case {case:?}: at most {MAX_BATCH_FIELD_OPTIONS} options may be put at once, got \
          {status}/{code} ({message})"
     );

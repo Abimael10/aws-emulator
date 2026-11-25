@@ -30,7 +30,7 @@ use service_com_amazonaws_connectcases_amazonconnectcases::ops::types::{
 
 use crate::harness::{
     domain, field_of_type, fields_of_every_type, is_minted_id, string_at, template, title_value,
-    Emulator,
+    Emulator, BODY_REJECTION_CODE,
 };
 
 /// An Amazon Connect contact ARN: the external identifier a `Contact` item
@@ -1016,7 +1016,9 @@ async fn a_search_refuses_what_it_cannot_honour() {
     let issued = token.expect("a search cut at one entry hands out a cursor");
 
     // One row per request a search cannot answer, with the status and code it
-    // must be refused with.
+    // must be refused with: a value the MODEL does not admit is a body rejection,
+    // refused ahead of the handler, while a reference or a cursor the store cannot
+    // resolve is the handler's own modelled refusal.
     let rows: Vec<(&str, String, Value, u16, &str)> = vec![
         (
             "a domain this store does not hold",
@@ -1030,28 +1032,28 @@ async fn a_search_refuses_what_it_cannot_honour() {
             search_path(&fixture.domain_id),
             json!({ "maxResults": PAGE_SIZE_BOUNDS.0 - 1 }),
             400,
-            "ValidationException",
+            BODY_REJECTION_CODE,
         ),
         (
             "a page size above the published maximum",
             search_path(&fixture.domain_id),
             json!({ "maxResults": PAGE_SIZE_BOUNDS.1 + 1 }),
             400,
-            "ValidationException",
+            BODY_REJECTION_CODE,
         ),
         (
             "a sort property the model does not declare",
             search_path(&fixture.domain_id),
             json!({ "sorts": [{ "sortProperty": "AssociationDate", "sortOrder": "Asc" }] }),
             400,
-            "ValidationException",
+            BODY_REJECTION_CODE,
         ),
         (
             "a sort order the model does not declare",
             search_path(&fixture.domain_id),
             json!({ "sorts": [{ "sortProperty": "CaseId", "sortOrder": "Ascending" }] }),
             400,
-            "ValidationException",
+            BODY_REJECTION_CODE,
         ),
         (
             "a custom filter on a field the domain holds no record of",
