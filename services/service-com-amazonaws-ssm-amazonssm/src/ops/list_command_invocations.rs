@@ -9,12 +9,13 @@
 //! one store in [`crate::state::commands`]: every invocation of every command of the Region
 //! the request was signed for, narrowed by the criteria the request names — the invocations of
 //! the one command a `CommandId` names, the invocation one `InstanceId` holds, and the filters,
-//! which narrow together. A criterion no stored invocation meets selects none rather than
-//! refusing the read; a `CommandId` no command of the Region carries is the one refusal
-//! (`InvalidCommandId`), because "the invocations for a specific command ID" names a command
-//! rather than describing one, and `ExecutionStage` is the one filter key this operation does
-//! not take ("The `ExecutionStage` filter can't be used with the `ListCommandInvocations`
-//! operation, only with `ListCommands`", `CommandFilter$key`).
+//! which narrow together. EVERY member of the input is such a criterion, so one no stored
+//! invocation meets — including a `CommandId` this Region holds no command under — selects no
+//! invocation and is reported as the empty page it is rather than refusing the read. What is
+//! left to refuse is a request this operation cannot read at all: a filter key it does not
+//! take (`ExecutionStage` among them — "The `ExecutionStage` filter can't be used with the
+//! `ListCommandInvocations` operation, only with `ListCommands`", `CommandFilter$key`) and a
+//! `NextToken` that names no page of this report.
 //!
 //! "If set this returns the response of the command executions and any command output"
 //! (`Details`): the per-step results of each invocation, which are the step the node's agent
@@ -272,18 +273,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // had finished.
         store.materialize_due(::std::time::SystemTime::now());
 
-        // "(Optional) The invocations for a specific command ID": a command id NAMES a
-        // command, so an id no command of this Region carries names none to list.
+        // "(Optional) The invocations for a specific command ID": a command id is one more
+        // CRITERION of this report rather than a resource it reads — an id this Region holds
+        // no command under, or one whose command has no invocation yet, selects none of them,
+        // which is the empty page below rather than a refusal.
         let only = input.command_id.as_deref().filter(|id| !id.is_empty());
-        if let Some(id) = only {
-            if store.command(&region, id).is_none() {
-                // "The specified command ID isn't valid": the refusal names the id that
-                // resolved no command, the way every read of this slice words it.
-                return Err(crate::scaffolded::Scaffolded::invalid_command_id(
-                    crate::state::commands::command_not_found(id),
-                ));
-            }
-        }
         // "(Optional) The command execution details for a specific managed node ID": a node
         // id is CRITERIA here rather than an identity — an invocation's history outlives the
         // node that ran it — so an id nothing was sent to selects no invocation.

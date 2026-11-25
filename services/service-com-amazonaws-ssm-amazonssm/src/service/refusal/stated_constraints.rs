@@ -125,6 +125,22 @@ const CLOUD_CONNECTOR_IAM_ROLE_ARN_PATTERN: &str =
 /// match it was refused for rather than a run a rejected value contains.
 const CHOSEN_NAME_PATTERN: &str = r"^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$";
 
+/// The target a Session Manager connection is opened to, as the live service publishes it for
+/// `StartSession`'s own parameter: this checkout's model bounds `SessionTarget` by its length
+/// alone and declares no expression at all
+/// (`smithy_query(query="shape",shape="SessionTarget")`), while the service holds the value to
+/// the characters the addresses it connects to are spelled with — a managed-node id, a
+/// hybrid-node id, and the colon-separated address of a container target — and publishes the
+/// expression with the whole-value pair it is written in.
+///
+/// RECORDED BEHAVIOUR (corpus `simparity-wire-aws-v1`, fixture
+/// `ssm-sshp-traj-session-manager-ssh-document-and-state-mistakes` step `task#2`): a
+/// `StartSession` whose `Target` carries a character outside this expression is refused with
+/// it quoted, the anchors included — before anything about the target's CONNECTIVITY is read,
+/// which is the other condition that operation refuses and a different claim about the
+/// request.
+const SESSION_TARGET_PATTERN: &str = "^[a-zA-Z0-9_:-]{1,400}$";
+
 /// `com.amazonaws.ssm#OpsAggregatorType`'s expression as the model declares it
 /// (`smithy_query(query="shape",shape="OpsAggregatorType")`), which this service publishes
 /// with the `^` it OPENS with and without the `$` it closes with.
@@ -150,6 +166,7 @@ const PUBLISHED_AS_DECLARED: &[&str] = &[
     CONFIG_CONNECTOR_ARN_PATTERN,
     CLOUD_CONNECTOR_IAM_ROLE_ARN_PATTERN,
     CHOSEN_NAME_PATTERN,
+    SESSION_TARGET_PATTERN,
 ];
 
 /// The expressions this service publishes with the anchor they OPEN with and without the one
@@ -398,6 +415,21 @@ const PATCH_COMPLIANCE_PAGE_SIZE: &[Constraint] =
 /// `task#1`).
 const PREVIEW_DOCUMENT_NAME: &[Constraint] = &[Constraint::Pattern(PREVIEW_DOCUMENT_NAME_PATTERN)];
 
+/// `com.amazonaws.ssm#SessionTarget` at the `target` a session START names: the expression the
+/// live service publishes for that parameter ([`SESSION_TARGET_PATTERN`]), then the length
+/// band the model declares for the shape — the same order the other two ids this service
+/// states an expression and a band for are stated in ([`COMMAND_ID`]).
+///
+/// Scoped to the operation whose parameter the expression belongs to: the sibling connection
+/// report asks about "the managed node ID" and refuses a value outside THAT narrower form in
+/// its own sentence ([`crate::state::sessions::INVALID_TARGET_ID_FORMAT`]), so the two are not
+/// one rule about the shape.
+const SESSION_TARGET: &[Constraint] = &[
+    Constraint::Pattern(SESSION_TARGET_PATTERN),
+    Constraint::MaxLength(400),
+    Constraint::MinLength(1),
+];
+
 /// Every SHAPE of this service whose stated constraint set is its own.
 const STATED_SHAPES: &[StatedShape] = &[
     StatedShape {
@@ -482,6 +514,19 @@ const STATED_SHAPES: &[StatedShape] = &[
         members: &["maxResults"],
         operations: &["DescribeInstancePatches"],
         constraints: PATCH_COMPLIANCE_PAGE_SIZE,
+    },
+    StatedShape {
+        shapes: &["com.amazonaws.ssm#SessionTarget"],
+        declared: Declared {
+            pattern: None,
+            min_length: Some(1),
+            max_length: Some(400),
+            min_value: None,
+            max_value: None,
+        },
+        members: &["target"],
+        operations: &["StartSession"],
+        constraints: SESSION_TARGET,
     },
 ];
 

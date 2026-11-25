@@ -10,6 +10,12 @@
 //! the target echoed as the request named it. Nothing about the SESSIONS of the target is
 //! read: a connected node is ready to RECEIVE a connection whether or not one is open.
 //!
+//! What the report is asked about is "the managed node ID"
+//! (`GetConnectionStatusRequest$Target`), so a value that is no node id at all names nothing
+//! a status could be about and is REFUSED (400 `ValidationException`, "Invalid target ID
+//! format") rather than reported `notconnected` — which would read as a connectivity answer
+//! about a node that cannot exist.
+//!
 //! The rows differ along what the rule generalises over: which kind of target is named (a
 //! registered node, an instance that never registered, one whose role withholds the
 //! registration call, an instance id nothing was launched as, a hybrid-activation node id, a
@@ -34,7 +40,7 @@ use crate::ec2_managed_node_registration::{
     create_profile, emulator, image_id, launch, node_when_registered, Grant, Profile,
     AL2023_PARAMETER, DEADLINE, POLL_PAUSE,
 };
-use crate::parameter_store::{call_in_region, error_code, REGION};
+use crate::parameter_store::{call_in_region, error_code, error_message, REGION};
 
 /// Another Region's endpoint, for the rows that ask it about a node this Region holds.
 const OTHER_REGION: &str = "eu-central-1";
@@ -53,6 +59,11 @@ const MAX_TARGET_CHARS: usize = 400;
 
 /// The published minimum of the same member.
 const MIN_TARGET_CHARS: usize = 1;
+
+/// How the report refuses a target that is not a managed-node ID at all — fixed text, with
+/// nothing of the value echoed (`state::sessions::INVALID_TARGET_ID_FORMAT`), written out here
+/// so the suite pins the sentence rather than echoing whatever the service holds.
+const INVALID_TARGET_ID_FORMAT: &str = "Invalid target ID format";
 
 /// The instance profile a row's instance runs as when it is to become a managed node: its
 /// role carries the AWS-managed policy a client attaches so the agent may register.
@@ -138,13 +149,17 @@ async fn connected_when_reachable(
     }
 }
 
-/// One row of the table: the endpoint asked, the target it is asked about, and the status
-/// the target must be reported in.
+/// One row of the table: the endpoint asked, the target it is asked about, whether that
+/// target is spelled as a managed-node ID at all, and the status it must be reported in when
+/// it is.
 #[derive(Debug, Clone)]
 struct Case {
     case: &'static str,
     region: &'static str,
     target: String,
+    /// Whether the target is a managed-node ID form, which is what the report is about: a
+    /// value that is not is refused instead of being reported on.
+    node_id: bool,
     connected: bool,
 }
 
@@ -204,78 +219,125 @@ async fn a_target_is_connected_exactly_when_this_endpoint_holds_it_as_a_respondi
             case: "a registered node, at its own endpoint",
             region: REGION,
             target: registered.clone(),
+            node_id: true,
             connected: true,
         },
         Case {
             case: "a node of another Region, at its own endpoint",
             region: OTHER_REGION,
             target: elsewhere.clone(),
+            node_id: true,
             connected: true,
         },
         Case {
             case: "a registered node, at another Region's endpoint",
             region: OTHER_REGION,
             target: registered.clone(),
+            node_id: true,
             connected: false,
         },
         Case {
             case: "another Region's node, at this endpoint",
             region: REGION,
             target: elsewhere.clone(),
+            node_id: true,
             connected: false,
         },
         Case {
             case: "an instance launched with no instance profile",
             region: REGION,
             target: no_profile.clone(),
+            node_id: true,
             connected: false,
         },
         Case {
             case: "an instance whose role is granted nothing",
             region: REGION,
             target: no_grant.clone(),
+            node_id: true,
             connected: false,
         },
         Case {
             case: "an instance id nothing was launched as",
             region: REGION,
             target: "i-00000000000000000".to_string(),
+            node_id: true,
             connected: false,
         },
         Case {
             case: "a hybrid-activation node id nothing registered",
             region: REGION,
             target: "mi-0123456789abcdef0".to_string(),
+            node_id: true,
+            connected: false,
+        },
+        Case {
+            case: "the shorter EC2 instance id width",
+            region: REGION,
+            target: "i-0abcdef0".to_string(),
+            node_id: true,
             connected: false,
         },
         Case {
             case: "a value that is no node id at all",
             region: REGION,
             target: "not-a-managed-node".to_string(),
+            node_id: false,
             connected: false,
         },
         Case {
             case: "a target at the published maximum length",
             region: REGION,
             target: "t".repeat(MAX_TARGET_CHARS),
+            node_id: false,
             connected: false,
         },
         Case {
             case: "a target at the published minimum length",
             region: REGION,
             target: "t".repeat(MIN_TARGET_CHARS),
+            node_id: false,
+            connected: false,
+        },
+        Case {
+            case: "an instance id one character short of either width",
+            region: REGION,
+            target: "i-0abcdef".to_string(),
+            node_id: false,
             connected: false,
         },
     ];
 
     for row in &rows {
-        let expected = if row.connected { CONNECTED } else { NOTCONNECTED };
-        let reported = reported_status(&router, row.case, row.region, &row.target).await;
-        assert_eq!(
-            reported, expected,
-            "case {:?}: expected {expected}, got {reported}",
-            row.case
-        );
+        if row.node_id {
+            let expected = if row.connected { CONNECTED } else { NOTCONNECTED };
+            let reported = reported_status(&router, row.case, row.region, &row.target).await;
+            assert_eq!(
+                reported, expected,
+                "case {:?}: expected {expected}, got {reported}",
+                row.case
+            );
+        } else {
+            // "The managed node ID": a target that is no node id names nothing to report on.
+            let (status, body) = connection_status(&router, row.region, &row.target).await;
+            assert_eq!(
+                status, 400,
+                "case {:?}: a target that is no node id is refused, got {status} with {body}",
+                row.case
+            );
+            assert_eq!(
+                error_code(&body),
+                "ValidationException",
+                "case {:?}: expected ValidationException, got {body}",
+                row.case
+            );
+            assert_eq!(
+                error_message(&body),
+                INVALID_TARGET_ID_FORMAT,
+                "case {:?}: expected {INVALID_TARGET_ID_FORMAT:?}, got {body}",
+                row.case
+            );
+        }
 
         // The report and the start cannot disagree about one target: a target the report
         // calls connected is one a session opens to, and every other target is
@@ -390,33 +452,61 @@ async fn the_status_of_a_node_does_not_depend_on_its_sessions() {
     );
 }
 
-/// The published bounds of the target a report may be asked about: the member is served at
-/// each bound and refused one past it, which the modelled constraint decides rather than
-/// anything this operation holds.
+/// The published bounds of the target a report may be asked about, and the node-ID form it has
+/// to take inside them: a value outside the modelled `@length` is refused by the boundary
+/// clause that names the bound, a value inside it that is no node id is refused by the
+/// operation's own sentence, and only a node id is reported on at all.
 #[tokio::test]
-async fn a_target_outside_the_published_length_is_refused() {
+async fn a_target_outside_the_published_length_or_the_node_id_form_is_refused() {
     let router = emulator();
 
-    // (case, the target the request carries, whether it is served)
-    let rows: Vec<(&str, String, bool)> = vec![
-        ("at the minimum", "t".repeat(MIN_TARGET_CHARS), true),
-        ("at the maximum", "t".repeat(MAX_TARGET_CHARS), true),
-        ("below the minimum", String::new(), false),
-        ("past the maximum", "t".repeat(MAX_TARGET_CHARS + 1), false),
+    /// What a row expects of the answer.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Expected {
+        /// A status is reported for the target.
+        Reported,
+        /// The operation's own sentence: the value is no managed-node ID.
+        NotANodeId,
+        /// The boundary clause about the member's modelled length.
+        OutsideTheLength,
+    }
+
+    // (case, the target the request carries, what the endpoint answers)
+    let rows: Vec<(&str, String, Expected)> = vec![
+        (
+            "a node id nothing registered",
+            "i-0abcdef0123456789".to_string(),
+            Expected::Reported,
+        ),
+        (
+            "one character at the published minimum",
+            "t".repeat(MIN_TARGET_CHARS),
+            Expected::NotANodeId,
+        ),
+        (
+            "a target at the published maximum",
+            "t".repeat(MAX_TARGET_CHARS),
+            Expected::NotANodeId,
+        ),
+        ("below the minimum", String::new(), Expected::OutsideTheLength),
+        (
+            "past the maximum",
+            "t".repeat(MAX_TARGET_CHARS + 1),
+            Expected::OutsideTheLength,
+        ),
         (
             "far past the maximum",
             "t".repeat(MAX_TARGET_CHARS * 3),
-            false,
+            Expected::OutsideTheLength,
         ),
     ];
 
-    for (case, target, served) in &rows {
+    for (case, target, expected) in &rows {
         let (status, body) = connection_status(&router, REGION, target).await;
-        if *served {
+        if *expected == Expected::Reported {
             assert_eq!(
                 status, 200,
-                "case {case:?}: a target inside the published length is served, got {status} \
-                 with {body}"
+                "case {case:?}: a node id is reported on, got {status} with {body}"
             );
             let reported = body["Status"].as_str().unwrap_or_default();
             assert_eq!(
@@ -424,17 +514,28 @@ async fn a_target_outside_the_published_length_is_refused() {
                 "case {case:?}: expected {NOTCONNECTED} for a target no node answers for, got \
                  {reported} in {body}"
             );
-        } else {
-            assert_eq!(
-                status, 400,
-                "case {case:?}: a target outside the published length is refused, got {status} \
-                 with {body}"
-            );
-            let code = error_code(&body);
-            assert_eq!(
-                code, "ValidationException",
-                "case {case:?}: expected ValidationException, got {code} in {body}"
-            );
+            continue;
+        }
+        assert_eq!(
+            status, 400,
+            "case {case:?}: this target is refused, got {status} with {body}"
+        );
+        let code = error_code(&body);
+        assert_eq!(
+            code, "ValidationException",
+            "case {case:?}: expected ValidationException, got {code} in {body}"
+        );
+        let message = error_message(&body);
+        match expected {
+            Expected::NotANodeId => assert_eq!(
+                message, INVALID_TARGET_ID_FORMAT,
+                "case {case:?}: expected {INVALID_TARGET_ID_FORMAT:?}, got {message:?}"
+            ),
+            _ => assert!(
+                message.contains("'target'") && message.contains("length"),
+                "case {case:?}: expected the clause naming the member's length bound, got \
+                 {message:?}"
+            ),
         }
     }
 }

@@ -11,7 +11,8 @@
 //! words this condition with, and leaves the ONE record the first end wrote exactly as it was —
 //! the status it carries, the instant it ended at, and the single entry the history holds for
 //! it. A caller therefore learns from the refusal that the session was already closed instead
-//! of being told it closed one that nothing was open.
+//! of being told it closed one that nothing was open — which is the same answer for an id this
+//! endpoint holds no session under at all, because there is no connection behind it either.
 //!
 //! Every call goes through the front door a client uses — `POST /` with
 //! `X-Amz-Target: AmazonSSM.<Operation>` through the multi-service router — and the sessions
@@ -213,11 +214,11 @@ async fn ending_a_session_that_has_already_ended_is_refused() {
     }
 }
 
-/// RULE, the other half: an id this endpoint holds no session under ends nothing, so it is
-/// answered rather than refused and the answer names no session — the refusal above is about
-/// the STATE a session this endpoint holds is in, not about an id it resolves nothing for.
+/// RULE, the other half: an id this endpoint holds no session under is in no state to be
+/// ended either — there is no connection behind it to close — so it is refused with the same
+/// sentence, and the live session beside it is untouched.
 #[tokio::test]
-async fn an_id_this_endpoint_holds_no_session_under_ends_nothing() {
+async fn an_id_this_endpoint_holds_no_session_under_is_refused_too() {
     let router = emulator();
     create_profile(&router, &registering_profile()).await;
     let image = image_id(&router, AL2023_PARAMETER).await;
@@ -237,9 +238,14 @@ async fn an_id_this_endpoint_holds_no_session_under_ends_nothing() {
     ] {
         let (status, body) = terminate(&router, named).await;
         assert_eq!(
-            (status, body["SessionId"].as_str()),
-            (200, None),
-            "case {case:?}: expected the end to name no session, got {status} with {body}"
+            (
+                status,
+                error_code(&body).as_str(),
+                error_message(&body).as_str(),
+                body["SessionId"].as_str(),
+            ),
+            (400, "ValidationException", NOT_IN_A_VALID_STATE, None),
+            "case {case:?}: expected the state refusal, got {status} with {body}"
         );
     }
 
@@ -255,3 +261,4 @@ async fn an_id_this_endpoint_holds_no_session_under_ends_nothing() {
         "expected the live session's own end to be served, got {status} with {ended}"
     );
 }
+

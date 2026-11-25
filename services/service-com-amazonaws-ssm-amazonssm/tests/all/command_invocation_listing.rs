@@ -310,9 +310,9 @@ async fn the_details_switch_decides_whether_the_per_step_results_are_reported() 
 
 /// RULE: a criterion the operation cannot serve is refused rather than ignored — the
 /// `ExecutionStage` filter is the one key this operation does not take ("can't be used with
-/// the `ListCommandInvocations` operation, only with `ListCommands`"), a `CommandId` no command
-/// of the Region carries names none to list, and a `NextToken` this read did not hand out is
-/// not a page of it.
+/// the `ListCommandInvocations` operation, only with `ListCommands`"), a filter value the key
+/// cannot carry is no value to compare, and a `NextToken` this read did not hand out is not a
+/// page of it. A criterion that is merely met by no stored invocation is NOT one of them.
 #[tokio::test]
 async fn a_criterion_the_operation_cannot_serve_is_refused() {
     let emulator = Emulator::new();
@@ -326,11 +326,6 @@ async fn a_criterion_the_operation_cannot_serve_is_refused() {
             "the ExecutionStage filter, which only ListCommands takes",
             json!({ "Filters": [{ "key": "ExecutionStage", "value": "Complete" }] }),
             (400, "InvalidFilterKey"),
-        ),
-        (
-            "a command id no send of this Region minted",
-            json!({ "CommandId": "00000000-0000-0000-0000-000000000000" }),
-            (400, "InvalidCommandId"),
         ),
         (
             "a token this read did not hand out",
@@ -356,22 +351,41 @@ async fn a_criterion_the_operation_cannot_serve_is_refused() {
         );
     }
 
-    // A node id nothing was sent to is CRITERIA rather than an identity: it selects no
-    // invocation instead of being refused.
-    let (status, answered) = list(
-        &emulator,
-        &json!({ "CommandId": command_id, "InstanceId": "i-0abcdef0123456789" }),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case \"a node nothing was sent to\": the listing must be served, got {status}: \
-         {answered}"
-    );
-    assert!(
-        reported(&answered).is_empty(),
-        "case \"a node nothing was sent to\": expected no invocation, got {answered}"
-    );
+    // Every member of the input is CRITERIA rather than an identity, so one no stored
+    // invocation meets selects none instead of being refused: a node id nothing was sent to,
+    // a command id no send of this Region minted, and the two together.
+    let selects_none: Vec<(&str, Value)> = vec![
+        (
+            "a node nothing was sent to",
+            json!({ "CommandId": command_id, "InstanceId": "i-0abcdef0123456789" }),
+        ),
+        (
+            "a command id no send of this Region minted",
+            json!({ "CommandId": "00000000-0000-0000-0000-000000000000" }),
+        ),
+        (
+            "an unminted command id beside a node nothing was sent to",
+            json!({
+                "CommandId": "00000000-0000-0000-0000-000000000000",
+                "InstanceId": "i-0abcdef0123456789",
+            }),
+        ),
+    ];
+    for (why, body) in selects_none {
+        let (status, answered) = list(&emulator, &body).await;
+        assert_eq!(
+            status, 200,
+            "case {why:?}: the listing must be served, got {status}: {answered}"
+        );
+        assert!(
+            answered["CommandInvocations"].is_array(),
+            "case {why:?}: expected the modelled list on the answer, got {answered}"
+        );
+        assert!(
+            reported(&answered).is_empty(),
+            "case {why:?}: expected no invocation, got {answered}"
+        );
+    }
 }
 
 /// RULE: a page holds `MaxResults` invocations and the `NextToken` resumes the listing at the

@@ -15,6 +15,12 @@
 //!
 //! ## Which requests are refused, and with which modelled error
 //!
+//! * A `Target` whose FORM is not one Session Manager connects to is no question about
+//!   connectivity at all: the expression the service publishes for this operation's own
+//!   parameter is a constraint on the INPUT, so it is refused as this service's boundary
+//!   `ValidationException` ahead of this handler
+//!   (`crate::service::refusal`'s stated constraint sets), which is what keeps "fix your
+//!   input" and "the node is not reachable" two different answers.
 //! * A `Target` that is not a managed node of THIS endpoint, or one whose agent is not
 //!   responding (`InstanceInformation$PingStatus`), is `TargetNotConnected`: "The specified
 //!   target managed node for the session isn't fully configured for use with Session
@@ -209,7 +215,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `Target`'s presence and length, `DocumentName`'s pattern and `Reason`'s length
         // are MODELLED constraints, so the centralized walk has already refused anything
-        // outside them.
+        // outside them — and so is the expression this service publishes for `Target`, which
+        // the walk's wrapper states beside them (`crate::service::refusal`). What is left to
+        // this handler is the STATE the request asks about: whether the target is a node this
+        // endpoint can reach, and whether the document it names exists.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(StartSessionErrorModeled::InternalServerError(
                 InternalServerError {

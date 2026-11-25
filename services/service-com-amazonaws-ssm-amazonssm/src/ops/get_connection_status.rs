@@ -16,6 +16,13 @@
 //! target is read, because a node that is connected is ready "to receive Session Manager
 //! connections" whether or not one has been opened.
 //!
+//! What is asked about is "the managed node ID" (`GetConnectionStatusRequest$Target`), so a
+//! value outside the forms a managed node is held under
+//! ([`crate::state::managed_node_id_is_well_formed`]) names no node for a status to be about:
+//! that request is refused ahead of the lookup
+//! ([`crate::state::sessions::INVALID_TARGET_ID_FORMAT`]) rather than answered
+//! `notconnected`, which would read as a connectivity answer about a node that cannot exist.
+//!
 //! This is a REPORT: the one write it makes before reading is materialising the node
 //! registrations the clock already owed
 //! ([`crate::state::node_registration::settle_registrations`]), which was due at the same
@@ -160,6 +167,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // "The managed node ID" (`GetConnectionStatusRequest$Target`): a value outside the
+        // forms a managed node is held under names no node this report could be about, so it
+        // is refused ahead of the lookup rather than answered a status it cannot have. The
+        // reading is this crate's one reading of a node id
+        // ([`crate::state::managed_node_id_is_well_formed`]), so a report and a registration
+        // cannot disagree about which ids name a node.
+        if !crate::state::managed_node_id_is_well_formed(&input.target) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::sessions::INVALID_TARGET_ID_FORMAT.to_string(),
+            ));
+        }
 
         // Session Manager is regional: a node is reached through the endpoint it registered
         // at, which is the Region this request was signed for.

@@ -193,7 +193,10 @@ async fn an_automation_read_refuses_an_id_of_another_kind() {
 }
 
 /// RULE, symmetrically: a Run Command read resolves ids of its own kind, and an automation
-/// execution id is `InvalidCommandId` — worded with the id the request carried.
+/// execution id is `InvalidCommandId` — worded with the id the request carried. The one Run
+/// Command read an id of another kind is NOT refused by is the INVOCATION listing, whose every
+/// member is a criterion: an id it holds no command under selects no invocation and is
+/// reported as the empty page it is.
 #[tokio::test]
 async fn a_run_command_read_refuses_an_id_of_another_kind() {
     let router = router();
@@ -201,7 +204,7 @@ async fn a_run_command_read_refuses_an_id_of_another_kind() {
     let command_id = send_command(&router, "the command that must still resolve").await;
 
     // (case, the operation, the body it takes)
-    let rows: [(&str, &str, Value); 3] = [
+    let rows: [(&str, &str, Value); 2] = [
         (
             "an execution id cancelled as a command",
             "CancelCommand",
@@ -210,11 +213,6 @@ async fn a_run_command_read_refuses_an_id_of_another_kind() {
         (
             "an execution id listed as a command",
             "ListCommands",
-            json!({ "CommandId": execution_id }),
-        ),
-        (
-            "an execution id whose command invocations are listed",
-            "ListCommandInvocations",
             json!({ "CommandId": execution_id }),
         ),
     ];
@@ -238,6 +236,26 @@ async fn a_run_command_read_refuses_an_id_of_another_kind() {
             "case {case:?}: expected {expected:?}, got {message:?}"
         );
     }
+
+    // The invocation listing narrows by that id instead of resolving it: nothing of the other
+    // id space is reported, under the 200 a report of no invocations is.
+    let (status, listed) = call(
+        &router,
+        "ListCommandInvocations",
+        &json!({ "CommandId": execution_id }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"an execution id whose command invocations are listed\": the listing must be \
+         served, got {status} {listed}"
+    );
+    assert_eq!(
+        listed["CommandInvocations"].as_array().map(Vec::len),
+        Some(0),
+        "case \"an execution id whose command invocations are listed\": expected an empty \
+         list, got {listed}"
+    );
 
     // The command's OWN id still resolves.
     let (status, listed) = call(

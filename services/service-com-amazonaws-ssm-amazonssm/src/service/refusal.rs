@@ -319,7 +319,7 @@ const LISTED_VALUE_ORDERS: &StatedEnumValueSets<'static> =
 /// requirement it broke, and nothing of what the caller sent.
 ///
 /// Recorded behaviour of this service, and recorded for every member and every constraint
-/// class of these seven:
+/// class of these eight:
 ///
 /// * `DescribeSessions` — fixture
 ///   `ssm-sshp-traj-session-manager-ssh-document-and-state-mistakes`, step `task#3` (a
@@ -353,6 +353,11 @@ const LISTED_VALUE_ORDERS: &StatedEnumValueSets<'static> =
 ///   `ResourceType` outside `MaintenanceWindowResourceType`, stated
 ///   `Value at 'resourceType' …` over the same value set every other member of that type is
 ///   refused against).
+/// * `StartSession` — fixture
+///   `ssm-sshp-traj-session-manager-ssh-document-and-state-mistakes`, step `task#2` (a
+///   `Target` outside the expression the service publishes for that parameter, stated
+///   `Value at 'target' …`), so the session START withholds the value the session reports
+///   withhold too.
 ///
 /// So the decision belongs to the OPERATION rather than to one member, one list position
 /// or one constraint class — and every OTHER operation quotes the value the framework
@@ -368,6 +373,7 @@ const VALUELESS_OPERATIONS: &[&str] = &[
     "ListOpsItemEvents",
     "DescribeAutomationStepExecutions",
     "DescribeMaintenanceWindowsForTarget",
+    "StartSession",
 ];
 
 /// Whether the clauses of a refusal of `operation` state no value: it is one of

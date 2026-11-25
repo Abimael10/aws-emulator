@@ -15,10 +15,13 @@
 //! refusal that the session was already closed — by a peer, or by the idle timeout — rather
 //! than closing it itself.
 //!
-//! A session id this endpoint holds none of terminates nothing, so the answer carries no
-//! `SessionId` — the member is "the ID of the session that has been terminated", and none
-//! was. A session is reached through the endpoint it was started at, so an id of another
-//! Region's endpoint is one this endpoint holds none of.
+//! A session id this endpoint holds none of is in no state to be ended either: there is no
+//! connection behind it to close, so such a request is refused with the same sentence rather
+//! than reported as an end that happened — the same reading its sibling reconnect takes of an
+//! id it resolves no session for. A session is reached through the endpoint it was started at,
+//! so an id of another Region's endpoint is one this endpoint holds none of. The answer to an
+//! end that WAS performed echoes the session it ended (`SessionId`, "the ID of the session
+//! that has been terminated").
 //!
 //! ## Shape of an operation
 //!
@@ -160,17 +163,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        let Some(session) = store.session_mut(&region, &input.session_id) else {
-            return Ok(TerminateSessionOutput { session_id: None });
-        };
-        // An end is what this call performs, so a session that has already ended is in no
-        // state for it: the model declares no error of its own for the condition, so it is a
-        // 400 `ValidationException`, and nothing of the record the first end wrote is touched.
-        if !session.can_be_terminated() {
+        // An end is what this call performs, so a session that is in no state for one is
+        // refused rather than reported as ended: the model declares no error of its own for
+        // the condition, so it is a 400 `ValidationException`, and nothing of the record this
+        // endpoint holds is touched. An id this endpoint resolves no session for is such a
+        // request too — there is no connection behind it to close.
+        let Some(session) = store
+            .session_mut(&region, &input.session_id)
+            .filter(|session| session.can_be_terminated())
+        else {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::sessions::SESSION_NOT_IN_A_VALID_STATE.to_string(),
             ));
-        }
+        };
         session.terminate(now);
 
         Ok(TerminateSessionOutput {

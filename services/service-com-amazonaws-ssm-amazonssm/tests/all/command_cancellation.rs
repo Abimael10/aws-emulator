@@ -861,15 +861,15 @@ async fn an_unknown_command_id_is_refused_by_name_whatever_resolves_it() {
     )
     .await;
 
-    // One row per operation that resolves a command id, each asked about an id no command of
+    // One row per operation that RESOLVES a command id, each asked about an id no command of
     // this Region carries. `GetCommandInvocation` is not one of them: what it resolves is the
     // PAIR of command and node, so an id no command carries matches no invocation rather than
     // no command, and that refusal is `InvocationDoesNotExist` naming the pair
-    // ([`crate::run_command_validation_order`]).
+    // ([`crate::run_command_validation_order`]). Neither is `ListCommandInvocations`, whose
+    // command id NARROWS the report instead of naming a resource it reads (asserted below).
     let operations: Vec<(&str, CommandIdRequest)> = vec![
         ("CancelCommand", |id| json!({"CommandId": id})),
         ("ListCommands", |id| json!({"CommandId": id})),
-        ("ListCommandInvocations", |id| json!({"CommandId": id})),
     ];
 
     for (operation, body) in operations {
@@ -893,6 +893,28 @@ async fn an_unknown_command_id_is_refused_by_name_whatever_resolves_it() {
                 "case {case:?}: expected the message {expected:?}, got {held:?}"
             );
         }
+    }
+
+    // The same two ids narrow the INVOCATION report to nothing, which is a served page rather
+    // than a refusal: every member of that request is a criterion.
+    for unknown in [UNKNOWN_COMMAND, elsewhere.as_str()] {
+        let case = format!("ListCommandInvocations asked about {unknown}");
+        let case = case.as_str();
+        let (status, parsed) = call(
+            &router,
+            "ListCommandInvocations",
+            &json!({"CommandId": unknown}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with {parsed:?}"
+        );
+        assert_eq!(
+            parsed["CommandInvocations"].as_array().map(Vec::len),
+            Some(0),
+            "case {case:?}: expected an empty list, got {parsed:?}"
+        );
     }
 }
 

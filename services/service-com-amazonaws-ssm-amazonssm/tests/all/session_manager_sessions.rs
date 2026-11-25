@@ -391,8 +391,9 @@ async fn a_started_session_is_reported_until_it_is_terminated() {
         );
     }
 
-    // A session id this endpoint holds none of ends nothing, so the answer names no
-    // session.
+    // A session id this endpoint holds none of is in no state to be ended either: there is no
+    // connection behind it to close, so the request is refused with the sentence Session
+    // Manager words that condition with rather than reported as an end that happened.
     let (status, body) = call_in_region(
         &router,
         REGION,
@@ -401,9 +402,19 @@ async fn a_started_session_is_reported_until_it_is_terminated() {
     )
     .await;
     assert_eq!(
-        status, 200,
-        "case \"an id nothing is held under\": TerminateSession must answer, got {status} with \
-         {body}"
+        status, 400,
+        "case \"an id nothing is held under\": TerminateSession must refuse it, got {status} \
+         with {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ValidationException",
+        "case \"an id nothing is held under\": expected ValidationException, got {body}"
+    );
+    assert_eq!(
+        error_message(&body),
+        "Session is not in a valid state",
+        "case \"an id nothing is held under\": expected the state refusal, got {body}"
     );
     assert!(
         body["SessionId"].is_null(),

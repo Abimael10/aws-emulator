@@ -66,6 +66,22 @@ pub const CONNECTION_STATUS_CONNECTED: &str = "connected";
 /// The `ConnectionStatus` of a target this endpoint cannot reach (same enum).
 pub const CONNECTION_STATUS_NOTCONNECTED: &str = "notconnected";
 
+/// The refusal a connection report answers a target that is not a managed-node ID at all
+/// with: a FIXED sentence with no variable parts — the value a caller sent is not repeated
+/// back to it.
+///
+/// `GetConnectionStatus$Target` is "The managed node ID", so a value outside the id forms
+/// Systems Manager manages a node under ([`super::managed_node_id_is_well_formed`]) names no
+/// node whose agent could be reported on, and the report is refused instead of answering a
+/// status for it. The operation models no error of its own for the condition, so it travels
+/// as this service's boundary refusal ([`crate::scaffolded`]'s validation channel).
+///
+/// RECORDED BEHAVIOUR (corpus `simparity-wire-aws-v1`, fixture
+/// `ssm-sshp-traj-session-manager-ssh-document-and-state-mistakes` step `task#6`): a
+/// `GetConnectionStatus` whose `Target` is not a node id is answered 400
+/// `ValidationException` with exactly this sentence.
+pub const INVALID_TARGET_ID_FORMAT: &str = "Invalid target ID format";
+
 /// How far back a report of ENDED sessions reaches: "Retrieves a list of all active
 /// sessions (both connected and disconnected) or terminated sessions from the past 30
 /// days" (`DescribeSessions`), so a session that ended before that window is no longer
