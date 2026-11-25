@@ -19,8 +19,10 @@
 //! The suites are tables. Their rows differ along what the rule generalises over: the form
 //! each call addresses the cluster and the group by (the generated id or the name, the two
 //! forms the `*Identifier` patterns allow), the length of the token itself at both of
-//! `SBClientToken`'s published bounds, and how far the service has carried the delete it
-//! owes by the time the second call arrives.
+//! `SBClientToken`'s published bounds, how far the service has carried the delete it
+//! owes by the time the second call arrives, and whether the resource the second call
+//! addresses is the one the first delete took out or another one that has taken its name
+//! since.
 //!
 //! Nothing here waits on the wall clock: a transition this service owes is materialised
 //! before the next request is answered.
@@ -655,4 +657,143 @@ async fn a_token_another_operation_used_is_a_cluster_delete_of_its_own() {
         "case {case}: expected the delete to have been carried out rather than replayed \
          as the create, got {status} with {gone}"
     );
+}
+
+/// How a call presenting an accepted group delete's token must be answered once the name
+/// that delete freed belongs to a group created after it.
+#[derive(Debug, Clone, Copy)]
+enum AfterRecreate {
+    /// It addresses the resource the first call took out, so it replays that call's empty
+    /// success.
+    Replayed,
+    /// It addresses a resource that delete never named, so it is no retry of it and
+    /// conflicts instead.
+    Conflicts,
+}
+
+/// Drive the service until the compute node group `name` of `cluster` is no longer held, so
+/// that name is free for a group created again.
+///
+/// Every request carries the delete this service owes one step further — the group is
+/// reported `DELETING`, then `DELETED` for one request, then forgotten — so this looks
+/// again for the CONDITION instead of waiting on the clock, and the deadline is a generous
+/// number of reads rather than a duration.
+async fn await_group_forgotten(
+    router: &MultiServiceRouter,
+    case: &str,
+    cluster: &str,
+    name: &str,
+) {
+    let request = json!({
+        "clusterIdentifier": cluster,
+        "computeNodeGroupIdentifier": name,
+    });
+    let mut last = Value::Null;
+    for _ in 0..64 {
+        let (status, body) = call(router, "GetComputeNodeGroup", &request).await;
+        if (status, error_code(&body).as_str()) == (CLIENT_ERROR_STATUS, "ResourceNotFoundException")
+        {
+            return;
+        }
+        last = body;
+    }
+    panic!("case {case}: the deleted group {name} was still held after 64 reads, last {last}");
+}
+
+#[tokio::test]
+async fn a_replayed_group_delete_leaves_a_recreated_group_alone() {
+    // A retry "has no additional effect": once the group's name is free again and a NEW
+    // group of the cluster holds it, the retry still answers the first call's empty success
+    // and deletes nothing — while a call presenting that token against the id the new group
+    // carries of its own addresses a group the first delete never named, so it is no retry
+    // of it. The rows: which form the second call addresses the group by, at each of
+    // `SBClientToken`'s two published length bounds.
+    let rows = [
+        (
+            "the name the deleted group was created under",
+            Address::Name,
+            longest_token(),
+            AfterRecreate::Replayed,
+        ),
+        (
+            "the id the group created again carries of its own",
+            Address::Id,
+            shortest_token(),
+            AfterRecreate::Conflicts,
+        ),
+    ];
+    for (case, retry_address, token, expected) in rows {
+        let router = emulator();
+        let cluster = active_cluster(&router, case, "regroup-cluster").await;
+        let first_group = active_group(&router, case, &cluster.name, "regrouped").await;
+
+        let (status, deleted) = call(
+            &router,
+            "DeleteComputeNodeGroup",
+            &delete_group(&cluster.name, &first_group.name, Some(&token)),
+        )
+        .await;
+        assert_empty_success(case, status, &deleted);
+
+        // The name is taken again only once the record the delete owed removal of is gone.
+        await_group_forgotten(&router, case, &cluster.name, &first_group.name).await;
+        let second_group = active_group(&router, case, &cluster.name, &first_group.name).await;
+        assert_ne!(
+            second_group.id, first_group.id,
+            "case {case}: the group created again must carry an id of its own, got \
+             {second_group:?}"
+        );
+
+        let (status, answered) = call(
+            &router,
+            "DeleteComputeNodeGroup",
+            &delete_group(
+                &cluster.name,
+                second_group.as_addressed(retry_address),
+                Some(&token),
+            ),
+        )
+        .await;
+        match expected {
+            AfterRecreate::Replayed => assert_empty_success(case, status, &answered),
+            AfterRecreate::Conflicts => assert_eq!(
+                (
+                    status,
+                    error_code(&answered).as_str(),
+                    answered["resourceId"].as_str(),
+                    answered["resourceType"].as_str()
+                ),
+                (
+                    CLIENT_ERROR_STATUS,
+                    "ConflictException",
+                    Some(first_group.id.as_str()),
+                    Some("computenodegroup")
+                ),
+                "case {case}: expected a conflict naming the group the token was used \
+                 for, got {status} with {answered}"
+            ),
+        }
+
+        // Either way the group created again is untouched: the token the first delete used
+        // reaches only the group that delete took out.
+        let (status, read) = call(
+            &router,
+            "GetComputeNodeGroup",
+            &json!({
+                "clusterIdentifier": cluster.name,
+                "computeNodeGroupIdentifier": second_group.id,
+            }),
+        )
+        .await;
+        assert_eq!(
+            (
+                status,
+                read["computeNodeGroup"]["id"].as_str(),
+                read["computeNodeGroup"]["status"].as_str()
+            ),
+            (200, Some(second_group.id.as_str()), Some("ACTIVE")),
+            "case {case}: expected the group created again to stay as it was, got {status} \
+             with {read}"
+        );
+    }
 }

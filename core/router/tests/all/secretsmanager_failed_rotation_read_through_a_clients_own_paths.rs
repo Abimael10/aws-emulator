@@ -677,10 +677,18 @@ async fn a_failed_rotation_is_read_through_a_clients_own_paths() {
     // ... and the rotation it drove promoted the candidate: AWSCURRENT on it, AWSPREVIOUS on
     // the version it replaced, the value its own `createSecret` staged, and the rotation
     // stamped as finished.
+    // The whole of that outcome is ONE condition, and the promotion of the candidate is only
+    // its first part: the rotation is finished when the labels have moved AND the service has
+    // stamped it, so looking for the promotion alone would read the state between the two on a
+    // host slow enough to land there. The deadline is [`POLLS`] looks, generous for every
+    // invocation the rotation makes.
     let mut reported = Value::Null;
     for _ in 0..POLLS {
         reported = described(&router, control, name).await;
-        if staged_versions(&reported, CURRENT_STAGE) == vec![promoted.clone()] {
+        let settled = staged_versions(&reported, CURRENT_STAGE) == vec![promoted.clone()]
+            && staged_versions(&reported, PREVIOUS_STAGE) == vec![original.clone()]
+            && reported.get("LastRotatedDate").is_some();
+        if settled {
             break;
         }
         tokio::time::sleep(POLL).await;
