@@ -234,6 +234,23 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
         "Efs",
         SdkDiagnostic::Attempts,
     ),
+    // Amazon EKS's SDK names it `Eks` — that model's own `sdkId` (`EKS`,
+    // `smithy_query(query="service_info")` on that service's model) with only the initial
+    // capitalised, exactly as Amazon EC2's above and Amazon EFS's and Amazon EMR's beside it
+    // are. The shape is the ATTEMPT-counting one, as the recorded `ResourceStatusReason` of an
+    // `AWS::EKS::Cluster` whose declared subnets cannot place a control plane in two
+    // Availability Zones carries it (in the behavioral corpus `simparity-behavioral-aws-v1`,
+    // check `cloudformation__eks.deploy-cfn-cluster-single-az-subnets-rejected`, whose reason
+    // reads `Resource handler returned message: "<the service's sentence> (Service: Eks, Status
+    // Code: 400, Request ID: …) (SDK Attempt Count: …)" (RequestToken: …, HandlerErrorCode:
+    // InvalidRequest)`). Every type this emulator provisions over this signing name is that
+    // service's (the cluster, its add-on and node group, an access entry and a pod identity
+    // association).
+    (
+        crate::state::provisioner::EKS_SIGNING_NAME,
+        "Eks",
+        SdkDiagnostic::Attempts,
+    ),
     // AWS Elastic Beanstalk's SDK names it `ElasticBeanstalk` — that model's own
     // `awsService.cloudFormationName`, which is its `sdkId` (`Elastic Beanstalk`,
     // `smithy_query(query="service_info")` on that service's model) with the space closed up,
