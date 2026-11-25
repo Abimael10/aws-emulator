@@ -426,8 +426,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// token the launch was made under, and what the launch produced.
 ///
 /// ONE projection, so the answer a launch produces and the answer a repeat of its client
-/// token is given are the same answer. A list with nothing in it is left unfilled: there is
-/// no instance, and no error, to report.
+/// token is given are the same answer.
+///
+/// Both collections this operation answers — the instances it placed and the units it could
+/// not — are REPORTED on every success, each as a member of the answer carrying what it
+/// holds: a launch that placed everything reports no error by answering an EMPTY `Errors`
+/// list, and a launch that placed nothing reports no instance the same way. A collection a
+/// caller reads to find out what happened is only absent when the operation does not report
+/// it at all, so neither is ever dropped for being empty: "nothing in it" and "not reported"
+/// are different answers.
 fn launch_instances_output(
     name: &str,
     client_token: &str,
@@ -436,8 +443,8 @@ fn launch_instances_output(
     LaunchInstancesOutput {
         auto_scaling_group_name: Some(name.to_string()),
         client_token: Some(client_token.to_string()),
-        instances: (!outcome.instances.is_empty()).then_some(outcome.instances),
-        errors: (!outcome.errors.is_empty()).then_some(outcome.errors),
+        instances: Some(outcome.instances),
+        errors: Some(outcome.errors),
     }
 }
 
