@@ -148,10 +148,10 @@ const CORAL_SERVICE_PACKAGE: &str = "com.amazon.coral.service";
 /// not-implemented answer, which says an operation has not been written rather than naming
 /// anything AWS answers, and the authorization refusal, which the layer in front of the
 /// service makes and no recording of this service shows the shape id of.
-const NOT_A_SERVICE_CLASS: &[&str] = &["NotImplemented", "AccessDenied"];
+pub(super) const NOT_A_SERVICE_CLASS: &[&str] = &["NotImplemented", "AccessDenied"];
 
 /// The body member the JSON error renderers name the error shape in.
-const TYPE_MEMBER: &str = "__type";
+pub(super) const TYPE_MEMBER: &str = "__type";
 
 /// The root element of the `awsQuery` error envelope.
 const QUERY_ERROR_ROOT: &str = "<ErrorResponse";
@@ -177,21 +177,21 @@ const RECEIVER_FAULT: &str = "Receiver";
 
 /// The lowest status that reports a failure rather than an answer, and so the lowest one that
 /// names an error class at all.
-const FIRST_FAILURE_STATUS: u16 = 400;
+pub(super) const FIRST_FAILURE_STATUS: u16 = 400;
 
 /// The lowest status whose fault is the service's own.
-const FIRST_SERVER_FAULT_STATUS: u16 = 500;
+pub(super) const FIRST_SERVER_FAULT_STATUS: u16 = 500;
 
 /// The local shape name a discriminator value names: the part after the package, since a
 /// value may already arrive qualified.
-fn local_name(raw: &str) -> &str {
+pub(super) fn local_name(raw: &str) -> &str {
     let raw = raw.trim();
     raw.rsplit('#').next().unwrap_or(raw)
 }
 
 /// The class `named` belongs to, or `None` when it is a name no layer of this service words a
 /// refusal under — a modelled fault, whose own legacy code the framework reports.
-fn class_of(named: &str) -> Option<&'static ErrorClass> {
+pub(super) fn class_of(named: &str) -> Option<&'static ErrorClass> {
     ERROR_CLASSES
         .iter()
         .copied()
@@ -278,7 +278,7 @@ fn with_qualified_type(mut document: Value, shape_id: &str) -> Option<Vec<u8>> {
 ///
 /// Only a renderer that advertised a length needs it corrected; the framework's error renderers
 /// set `content-type` alone and leave framing to the transport.
-fn restated_body(resp: &mut RtResponse, body: Vec<u8>) {
+pub(super) fn restated_body(resp: &mut RtResponse, body: Vec<u8>) {
     if resp.headers().get("content-length").is_some() {
         let length = body.len().to_string();
         let _ = resp.headers_mut().try_insert("content-length", length);

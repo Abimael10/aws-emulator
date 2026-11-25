@@ -12421,6 +12421,7 @@ dependencies = [
  "font8x8",
  "hex",
  "http",
+ "minicbor",
  "opentelemetry-proto",
  "percent-encoding",
  "plotters",

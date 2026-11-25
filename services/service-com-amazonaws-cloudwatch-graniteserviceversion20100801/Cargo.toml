@@ -131,6 +131,14 @@ prost = "0.14"
 # (`state::metric_math::groups_a_metrics_insights_query`).
 sqlparser = "0.59"
 
+# `minicbor`: the error envelope of the `rpcv2Cbor` route reads an ANSWERED CBOR map back
+# whatever members it carries (`service::cbor_error_envelope`), which the schema-driven codec
+# cannot do — it reads a body against a shape it knows. This is the maintained CBOR codec that
+# same framework codec is itself built on (`aws-smithy-cbor`), so no second CBOR implementation
+# enters the tree; the answers this service WRITES are still written through the framework's
+# codec.
+minicbor = { version = "2.3", features = ["alloc"] }
+
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 

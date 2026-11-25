@@ -26,7 +26,10 @@
 //!   API, through [`QueryCompatibleErrors`], so whatever failure it answers names its
 //!   error class the way an `awsQueryCompatible` service names one — the qualified shape id in
 //!   the body and the legacy query code in the `x-amzn-query-error` header
-//!   ([`query_compatible_errors`]) — and through [`ReportingTheRequestId`], so a failure it
+//!   ([`query_compatible_errors`]) — through [`TheCborErrorEnvelope`], so a failure it answers
+//!   on the `rpcv2Cbor` route travels in the envelope that route answers one in — the
+//!   qualified shape id, the message alone beside it, and the status of the fault side
+//!   ([`cbor_error_envelope`]) — and through [`ReportingTheRequestId`], so a failure it
 //!   answers on the query wire names the request it answered ([`request_protocol`]);
 //!   `PutMetricData` is served through
 //!   [`ReportingDroppedEntities`], so an accepted call
@@ -73,12 +76,14 @@ use smithy_server_runtime::{
 use std::sync::Arc;
 
 pub mod authorization;
+pub mod cbor_error_envelope;
 pub mod decimal_floats;
 pub mod query_compatible_errors;
 pub mod request_protocol;
 pub mod submitted_collection_refusal;
 
 use authorization::AuthorizedByIam;
+use cbor_error_envelope::TheCborErrorEnvelope;
 use decimal_floats::RenderingFloatsForTheWire;
 use query_compatible_errors::{
     QueryCompatibleErrors, MISSING_PARAMETER, PARAMETER_VALUE, VALIDATION,
@@ -455,26 +460,34 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// calling principal's own IAM policies before anything is read or written
 /// ([`authorization`]), counted into the usage telemetry this service publishes about its own
 /// API ([`Metering`]), naming the class of whatever failure it answers in full
-/// ([`QueryCompatibleErrors`]), and naming the request it answered — in the `awsQuery` error
-/// envelope and in the header every protocol reports it in ([`ReportingTheRequestId`]).
+/// ([`QueryCompatibleErrors`] on the two text wires, [`TheCborErrorEnvelope`] on the CBOR one,
+/// which also carries that route's own status and member projection), and naming the request
+/// it answered — in the `awsQuery` error envelope and in the header every protocol reports it
+/// in ([`ReportingTheRequestId`]).
 ///
-/// All four are owed by every answer, whichever layer built it, so the chain is stated here
+/// All of them are owed by every answer, whichever layer built it, so the chain is stated here
 /// once rather than at each of the operations whose answer this file owns a part of. The
 /// authorization decision sits OUTSIDE the metering, because a call refused before it is
 /// dispatched is not a call this service served; it sits INSIDE the request-id writer, so its
-/// refusal names the request it answered like every other failure.
+/// refusal names the request it answered like every other failure. The CBOR envelope sits
+/// outside the class naming of the text wires, because each reads only the answers written in
+/// its own protocol: a failure is in exactly one envelope, so only one of the two completes it.
 fn the_way_every_operation_is_served<Eng: Send + Sync + 'static, O: ErasedOperation>(
     engine: Arc<Eng>,
     operation: O,
 ) -> TheWayEveryOperationIsServed<Eng, O> {
-    let metered = QueryCompatibleErrors::new(Metering::new(Arc::clone(&engine), operation));
+    let metered = TheCborErrorEnvelope::new(QueryCompatibleErrors::new(Metering::new(
+        Arc::clone(&engine),
+        operation,
+    )));
     ReportingTheRequestId::new(AuthorizedByIam::new(engine, metered))
 }
 
 /// The chain [`the_way_every_operation_is_served`] builds, named so the field holding it and
 /// that function cannot state it differently.
-type TheWayEveryOperationIsServed<Eng, O> =
-    ReportingTheRequestId<AuthorizedByIam<Eng, QueryCompatibleErrors<Metering<Eng, O>>>>;
+type TheWayEveryOperationIsServed<Eng, O> = ReportingTheRequestId<
+    AuthorizedByIam<Eng, TheCborErrorEnvelope<QueryCompatibleErrors<Metering<Eng, O>>>>,
+>;
 
 /// The same chain as a table entry: [`the_way_every_operation_is_served`] boxed for
 /// [`OperationRoutingTable::add_operation`].
