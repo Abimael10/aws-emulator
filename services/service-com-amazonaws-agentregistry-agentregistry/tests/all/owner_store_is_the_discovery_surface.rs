@@ -26,11 +26,25 @@
 //! (unmodelled: `SearchDiscoverableRegistryRecordsResponse` declares only
 //! `registryRecords`), and a batch-get always carries both required members, with `errors`
 //! PRESENT and EMPTY when every requested record was returned.
+//!
+//! The last three suites follow that rule through the three answers a discovery read owes a
+//! registry the control plane holds: a list read's `registryRecords` is present at every
+//! position of that registry's lifetime and paginated by the `maxResults`/`nextToken` pair
+//! it is `@paginated` over; a `filters` entry carrying any number of values other than one
+//! is refused with its own 400 `ValidationException` BEFORE the registry is resolved, so
+//! what the store holds cannot turn that refusal into a 404; and a batch-get entry that
+//! only partly resolves answers 200 with the records it can return beside one
+//! `RESOURCE_NOT_FOUND` error per requested id it cannot, each echoing the entry's ids.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use service_com_amazonaws_agentregistry_agentregistry::ops::types::{
+    RECORD_TYPE_VALUES, REGISTRY_RECORD_FILTER_NAME_VALUES,
+};
+use service_com_amazonaws_agentregistry_agentregistry::state::DESCRIPTOR_TYPE_KEYS;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region every call below signs for.
@@ -255,6 +269,16 @@ async fn set_record_status(
 // --- the discovery plane's three reads ------------------------------------------------
 
 async fn list_discoverable(router: &MultiServiceRouter, registry: &str) -> Reply {
+    list_discoverable_with(router, registry, json!({})).await
+}
+
+/// The same list read carrying `body`: the page members and the filters a caller may put
+/// on it.
+async fn list_discoverable_with(
+    router: &MultiServiceRouter,
+    registry: &str,
+    body: Value,
+) -> Reply {
     call(
         router,
         "POST",
@@ -262,7 +286,7 @@ async fn list_discoverable(router: &MultiServiceRouter, registry: &str) -> Reply
             "/registries/{}/discoverable-records-list",
             encode_label(registry)
         ),
-        Some(json!({})),
+        Some(body),
     )
     .await
 }
@@ -765,3 +789,500 @@ async fn a_request_this_endpoint_binds_no_route_for_is_refused_as_validation() {
         searched.body
     );
 }
+
+// --- the page, the filter refusal and the batch answer, over one control-plane registry --
+
+/// The `ValidationExceptionReason` the model defaults `ValidationException$reason` to.
+const FIELD_VALIDATION_FAILED: &str = "FieldValidationFailed";
+
+/// A registry id of the shape `RegistryIdentifier` admits (`[a-zA-Z0-9]{12,16}`) that the
+/// control plane holds no registry under, so a read of it is about a registry that is not
+/// there and nothing else.
+const UNHELD_REGISTRY_ID: &str = "zz00noregistry";
+
+/// A record id of the shape `RecordIdentifier` admits (`[a-zA-Z0-9]{12}`) that no registry
+/// below holds. Distinct from [`UNHELD_REGISTRY_ID`], so a failed row says which identifier
+/// it was exercising.
+const UNHELD_RECORD_ID: &str = "zz00norecord";
+
+/// The record type the control plane creates every record of this suite with
+/// (`create_record`), and one of `RECORD_TYPE_VALUES`.
+const CREATED_RECORD_TYPE: &str = "CUSTOM";
+
+/// The descriptor entry key every record of this suite carries, and one of
+/// `DESCRIPTOR_TYPE_KEYS`.
+const CARRIED_DESCRIPTOR_KEY: &str = "custom";
+
+/// `ids` sorted: a list read reports a registry's records in record-id order, which the
+/// order they were created in does not determine.
+fn sorted(mut ids: Vec<String>) -> Vec<String> {
+    ids.sort();
+    ids
+}
+
+/// The record ids `names` stand for, in the order a read reports them.
+fn sorted_ids(ids: &HashMap<&str, String>, names: &[&str]) -> Vec<String> {
+    sorted(names.iter().map(|name| ids[*name].clone()).collect())
+}
+
+/// `count` values the dimension `filter_name` narrows, cycling that dimension's declared
+/// set — which the sibling refusal suite already reads out of the model
+/// ([`crate::registry_read_refusals::dimension_values`]).
+fn filter_values(filter_name: &str, count: usize) -> Vec<&'static str> {
+    crate::registry_read_refusals::dimension_values(filter_name)
+        .into_iter()
+        .cycle()
+        .take(count)
+        .collect()
+}
+
+/// `ListDiscoverableRegistryRecords` answers a PAGE of the registry the control plane
+/// holds: HTTP 200 whose `registryRecords` is PRESENT at every position of that registry's
+/// lifetime — empty while nothing is discoverable, never absent — carrying exactly its
+/// `APPROVED` records, and walked a page at a time through the `maxResults`/`nextToken`
+/// pair the operation is `@paginated` over.
+#[tokio::test]
+async fn a_list_read_carries_a_page_of_the_registry_the_control_plane_holds() {
+    let router = both_planes();
+    let case = "list-page-over-a-registry-lifetime";
+    // A registry the control plane just created and nothing more: it holds no record at all.
+    let (registry_id, _) = registry_with_records(&router, case, true, &[]).await;
+
+    /// What is done to the registry before a row's list read.
+    enum Step {
+        /// Nothing: the registry is read exactly as the control plane left it.
+        AsCreated,
+        /// A record is created in it and left where creation leaves it (`DRAFT`).
+        Create(&'static str),
+        /// A record is submitted and reaches `APPROVED`.
+        Approve(&'static str),
+        /// An approved record is taken off the discovery surface by curation.
+        Deprecate(&'static str),
+    }
+
+    // (case, what happens first, the records a list read reports afterwards). The rows span
+    // what the rule generalises over: how many records the registry holds, how many of them
+    // are discoverable (none, one, two, one again) and whether it holds any at all.
+    let rows: [(&str, Step, &[&str]); 8] = [
+        ("a registry holding no record at all", Step::AsCreated, &[]),
+        (
+            "one record, created and not submitted",
+            Step::Create("alpha"),
+            &[],
+        ),
+        ("that record approved", Step::Approve("alpha"), &["alpha"]),
+        ("a second record created", Step::Create("beta"), &["alpha"]),
+        (
+            "the second record approved",
+            Step::Approve("beta"),
+            &["alpha", "beta"],
+        ),
+        (
+            "the first record deprecated",
+            Step::Deprecate("alpha"),
+            &["beta"],
+        ),
+        ("a third record created", Step::Create("gamma"), &["beta"]),
+        (
+            "the third record approved",
+            Step::Approve("gamma"),
+            &["beta", "gamma"],
+        ),
+    ];
+
+    let mut ids: HashMap<&str, String> = HashMap::new();
+    for (row, step, discoverable) in rows {
+        match step {
+            Step::AsCreated => {}
+            Step::Create(name) => {
+                let created =
+                    create_record(&router, &registry_id, name, &format!("{name} probe")).await;
+                assert_eq!(
+                    created.status, 202,
+                    "case {row:?}: CreateRegistryRecord answers 202, got {} {:?}",
+                    created.status, created.body
+                );
+                let record_id = id_of(created.str_field("recordArn")).to_string();
+                record_reaching(&router, row, &registry_id, &record_id, "DRAFT").await;
+                ids.insert(name, record_id);
+            }
+            Step::Approve(name) => {
+                let record_id = ids[name].clone();
+                submit_record(&router, &registry_id, &record_id).await;
+                record_reaching(&router, row, &registry_id, &record_id, "APPROVED").await;
+            }
+            Step::Deprecate(name) => {
+                let record_id = ids[name].clone();
+                set_record_status(&router, &registry_id, &record_id, "DEPRECATED").await;
+                record_reaching(&router, row, &registry_id, &record_id, "DEPRECATED").await;
+            }
+        }
+
+        let expected = sorted_ids(&ids, discoverable);
+        let listed = list_discoverable(&router, &registry_id).await;
+        assert_eq!(
+            (listed.status, listed.record_ids().map(sorted)),
+            (200, Some(expected)),
+            "case {row:?}: registryRecords is present and carries exactly the discoverable \
+             records, got {} {:?}",
+            listed.status,
+            listed.body
+        );
+        assert_eq!(
+            listed.body.get("nextToken"),
+            None,
+            "case {row:?}: a page carrying every match is not truncated, so it names no \
+             nextToken, got {:?}",
+            listed.body
+        );
+    }
+
+    // The `@paginated` pair over the same records: `maxResults` 1 walks them one page at a
+    // time, each page naming a `nextToken` while more match and none on the last, and no
+    // record repeated or skipped across the walk.
+    let expected = sorted_ids(&ids, &["beta", "gamma"]);
+    let mut collected: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    // Bounded by the number of records that match: one page each, plus the page that ends
+    // the walk.
+    for page_number in 1..=expected.len() + 1 {
+        let row = format!("page {page_number} of a maxResults=1 walk");
+        let mut body = json!({ "maxResults": 1 });
+        if let Some(resume) = &token {
+            body["nextToken"] = json!(resume);
+        }
+        let page = list_discoverable_with(&router, &registry_id, body).await;
+        assert_eq!(
+            page.status, 200,
+            "case {row:?}: a page of a registry the control plane holds answers 200, got {} {:?}",
+            page.status, page.body
+        );
+        let on_page = page.record_ids().unwrap_or_else(|| {
+            panic!(
+                "case {row:?}: registryRecords is present on every page, got {:?}",
+                page.body
+            )
+        });
+        assert!(
+            on_page.len() <= 1,
+            "case {row:?}: a page holds at most the requested 1 record, got {on_page:?}"
+        );
+        collected.extend(on_page);
+        match page.body.get("nextToken").and_then(Value::as_str) {
+            Some(next) => token = Some(next.to_string()),
+            None => break,
+        }
+    }
+    let walked = sorted(collected);
+    assert_eq!(
+        walked, expected,
+        "case \"a maxResults=1 walk\": the pages together report every discoverable record \
+         exactly once, got {walked:?}"
+    );
+}
+
+/// Whether a filter is well formed is a property of the REQUEST: a `filters` entry carrying
+/// any number of values other than one is refused with its own 400 `ValidationException`
+/// before the registry the path names is resolved — so whatever that registry holds, and
+/// whether the control plane holds it at all, never turns the refusal into a 404. A filter
+/// carrying one value the dimension it names has narrows the page instead.
+#[tokio::test]
+async fn a_malformed_filter_is_refused_before_the_registry_is_resolved() {
+    let router = both_planes();
+    let case = "filter-validation-precedes-registry-resolution";
+    let (registry_id, record_ids) =
+        registry_with_records(&router, case, true, &["alpha-agent"]).await;
+    let record_id = record_ids[0].clone();
+    submit_record(&router, &registry_id, &record_id).await;
+    record_reaching(&router, case, &registry_id, &record_id, "APPROVED").await;
+
+    // Both members of `RegistryRecordFilterName`, each carrying a value count
+    // `DiscoverableFilterValues` (@length 1..10) admits but a filter does not — every count
+    // other than one, at the modelled maximum and just above one — against a registry the
+    // control plane holds a discoverable record in and one it holds nothing under. The
+    // values are admissible for the dimension the filter names, so their NUMBER is the only
+    // defect.
+    for filter_name in REGISTRY_RECORD_FILTER_NAME_VALUES {
+        for count in [2, 10] {
+            let values = filter_values(filter_name, count);
+            for (target, registry) in [
+                ("a registry the control plane holds", registry_id.as_str()),
+                (
+                    "a registry the control plane does not hold",
+                    UNHELD_REGISTRY_ID,
+                ),
+            ] {
+                let row = format!("{filter_name} carrying {count} values, against {target}");
+                let expected_message =
+                    format!("Filter {filter_name} must specify exactly one value.");
+                let reply = list_discoverable_with(
+                    &router,
+                    registry,
+                    json!({ "filters": [{ "name": filter_name, "values": values }] }),
+                )
+                .await;
+                assert_eq!(
+                    (
+                        reply.status,
+                        reply.error_type.as_str(),
+                        reply.str_field("__type"),
+                        reply.str_field("message"),
+                        reply.str_field("reason"),
+                    ),
+                    (
+                        400,
+                        "ValidationException",
+                        "ValidationException",
+                        expected_message.as_str(),
+                        FIELD_VALIDATION_FAILED,
+                    ),
+                    "case {row:?}: the filter's own refusal is what is reported, got {} {:?}",
+                    reply.status,
+                    reply.body
+                );
+            }
+        }
+    }
+
+    // The other direction: one value the dimension has narrows the page. The rows span both
+    // dimensions and both answers — the record matches, or nothing does and the page is
+    // present and empty.
+    let other_record_type = RECORD_TYPE_VALUES
+        .iter()
+        .copied()
+        .find(|value| *value != CREATED_RECORD_TYPE)
+        .expect("RecordType declares more than one value");
+    let other_descriptor_key = DESCRIPTOR_TYPE_KEYS
+        .iter()
+        .copied()
+        .find(|key| *key != CARRIED_DESCRIPTOR_KEY)
+        .expect("Descriptors declares more than one entry key");
+    let rows: [(&str, &str, &str, bool); 4] = [
+        (
+            "the record's own type",
+            "recordType",
+            CREATED_RECORD_TYPE,
+            true,
+        ),
+        (
+            "another type the enum declares",
+            "recordType",
+            other_record_type,
+            false,
+        ),
+        (
+            "the descriptor entry key the record carries",
+            "descriptorType",
+            CARRIED_DESCRIPTOR_KEY,
+            true,
+        ),
+        (
+            "a descriptor entry key it does not carry",
+            "descriptorType",
+            other_descriptor_key,
+            false,
+        ),
+    ];
+    for (row, filter_name, value, matches) in rows {
+        let reply = list_discoverable_with(
+            &router,
+            &registry_id,
+            json!({ "filters": [{ "name": filter_name, "values": [value] }] }),
+        )
+        .await;
+        let expected = if matches {
+            vec![record_id.clone()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            (reply.status, reply.record_ids()),
+            (200, Some(expected)),
+            "case {row:?}: a well-formed filter narrows the page of the registry, got {} {:?}",
+            reply.status,
+            reply.body
+        );
+    }
+}
+
+/// One batch-get case: the entry it sends, and the answer that entry is owed.
+struct BatchRow<'a> {
+    case: &'a str,
+    /// The `RegistryIdentifier` the entry names.
+    registry: &'a str,
+    /// The `RecordIdentifier`s the entry asks for.
+    requested: Vec<&'a str>,
+    /// The record ids `registryRecords` carries, in response order.
+    returned: Vec<&'a str>,
+    /// The requested ids `errors` reports, in the order they were asked for.
+    failed: Vec<&'a str>,
+}
+
+/// `BatchGetDiscoverableRegistryRecord` answers HTTP 200 with BOTH required members for an
+/// entry that only partly resolves: the records it can return in `registryRecords`, and one
+/// `RESOURCE_NOT_FOUND` error per requested id it cannot, echoing the entry's `registryId`
+/// and that `recordId` in the format the request supplied it in. A record the registry does
+/// not expose is never the whole call's failure.
+#[tokio::test]
+async fn a_batch_get_answers_both_members_for_an_entry_that_only_partly_resolves() {
+    let router = both_planes();
+    let case = "batch-get-partial-results";
+    let (registry_id, record_ids) =
+        registry_with_records(&router, case, true, &["alpha-agent", "beta-agent"]).await;
+    let approved = record_ids[0].clone();
+    // Created and never submitted, so the control plane holds it and the discovery surface
+    // does not expose it.
+    let draft = record_ids[1].clone();
+    submit_record(&router, &registry_id, &approved).await;
+    record_reaching(&router, case, &registry_id, &approved, "APPROVED").await;
+
+    let held = get_record(&router, &registry_id, &approved).await;
+    let approved_arn = held.str_field("recordArn").to_string();
+    let registry_arn = get_registry(&router, &registry_id)
+        .await
+        .str_field("registryArn")
+        .to_string();
+
+    // The rows span how much of one entry resolves — all of it, part of it, none of it —
+    // why an id does not resolve (held but not discoverable, held by no registry), the order
+    // the ids are asked in, and both forms `RecordIdentifier` and `RegistryIdentifier` admit.
+    let rows: [BatchRow; 6] = [
+        BatchRow {
+            case: "only the approved record",
+            registry: registry_id.as_str(),
+            requested: vec![approved.as_str()],
+            returned: vec![approved.as_str()],
+            failed: vec![],
+        },
+        BatchRow {
+            case: "the approved record named by its ARN",
+            registry: registry_id.as_str(),
+            requested: vec![approved_arn.as_str()],
+            returned: vec![approved.as_str()],
+            failed: vec![],
+        },
+        BatchRow {
+            case: "the approved record beside one the control plane holds unapproved",
+            registry: registry_id.as_str(),
+            requested: vec![approved.as_str(), draft.as_str()],
+            returned: vec![approved.as_str()],
+            failed: vec![draft.as_str()],
+        },
+        BatchRow {
+            case: "the same pair asked for in the other order",
+            registry: registry_id.as_str(),
+            requested: vec![draft.as_str(), approved.as_str()],
+            returned: vec![approved.as_str()],
+            failed: vec![draft.as_str()],
+        },
+        BatchRow {
+            case: "the approved record beside an id no registry holds",
+            registry: registry_id.as_str(),
+            requested: vec![approved.as_str(), UNHELD_RECORD_ID],
+            returned: vec![approved.as_str()],
+            failed: vec![UNHELD_RECORD_ID],
+        },
+        BatchRow {
+            case: "no requested id resolves, the entry naming the registry by ARN",
+            registry: registry_arn.as_str(),
+            requested: vec![draft.as_str(), UNHELD_RECORD_ID],
+            returned: vec![],
+            failed: vec![draft.as_str(), UNHELD_RECORD_ID],
+        },
+    ];
+
+    for BatchRow {
+        case: row,
+        registry,
+        requested,
+        returned,
+        failed,
+    } in rows
+    {
+        let reply = batch_get_discoverable(&router, registry, &requested).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {row:?}: an id that does not resolve is never the whole call's failure, \
+             got {} {:?}",
+            reply.status, reply.body
+        );
+        let reported = reply.record_ids().unwrap_or_else(|| {
+            panic!(
+                "case {row:?}: registryRecords is present on every answer, got {:?}",
+                reply.body
+            )
+        });
+        let expected_records: Vec<String> = returned.iter().map(|id| (*id).to_string()).collect();
+        assert_eq!(
+            reported, expected_records,
+            "case {row:?}: expected exactly {expected_records:?} in registryRecords, got \
+             {reported:?}"
+        );
+
+        let errors = reply.body["errors"].as_array().unwrap_or_else(|| {
+            panic!(
+                "case {row:?}: errors is present on every answer, got {:?}",
+                reply.body
+            )
+        });
+        let echoed: Vec<(String, String, String)> = errors
+            .iter()
+            .map(|error| {
+                (
+                    error["errorCode"].as_str().unwrap_or_default().to_string(),
+                    error["registryId"].as_str().unwrap_or_default().to_string(),
+                    error["recordId"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        let expected_errors: Vec<(String, String, String)> = failed
+            .iter()
+            .map(|id| {
+                (
+                    RESOURCE_NOT_FOUND_CODE.to_string(),
+                    registry.to_string(),
+                    (*id).to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            echoed, expected_errors,
+            "case {row:?}: one error per id that did not resolve, each echoing the entry's \
+             registryId and recordId as supplied under {RESOURCE_NOT_FOUND_CODE}, got \
+             {errors:?}"
+        );
+
+        // What a returned summary carries is the approved content the control plane holds
+        // for that record, whichever form the request named it in.
+        for summary in reply.body["registryRecords"].as_array().into_iter().flatten() {
+            assert_eq!(
+                (
+                    summary["status"].as_str(),
+                    summary["recordArn"].as_str(),
+                    summary["registryArn"].as_str(),
+                    summary["name"].as_str(),
+                    summary["recordType"].as_str(),
+                ),
+                (
+                    Some("APPROVED"),
+                    Some(approved_arn.as_str()),
+                    Some(registry_arn.as_str()),
+                    held.body["name"].as_str(),
+                    held.body["recordType"].as_str(),
+                ),
+                "case {row:?}: the summary reports the record the control plane holds, got \
+                 {summary:?} against {:?}",
+                held.body
+            );
+            let carried = summary["descriptors"][CARRIED_DESCRIPTOR_KEY]["data"].as_str();
+            assert!(
+                carried.is_some()
+                    && carried == held.body["descriptors"][CARRIED_DESCRIPTOR_KEY]["data"].as_str(),
+                "case {row:?}: the summary carries the descriptor the control plane holds, \
+                 got {carried:?} against {:?}",
+                held.body["descriptors"]
+            );
+        }
+    }
+}
+
