@@ -42,6 +42,9 @@ use crate::identity_provider_subscriptions::{
     arn_prefix, as_str, call, harness, provider_union, register, Harness, Reply,
     PAST_THE_OWED_TRANSITION, PRODUCTS,
 };
+// The one derivation of an id that differs from a held instance in its last digit alone,
+// written once for every suite whose rows need one.
+use crate::instance_fleet_resolution::near_miss_on;
 
 /// A directory of the account's fleet (`Active`, so a registration resolves for it), and a
 /// second one, so a rule that names "the" directory is exercised on more than one.
@@ -919,7 +922,7 @@ async fn the_instance_gate_fails_closed_before_anything_else_is_examined() {
     seed(&h).await;
 
     let held = held_instance(0);
-    let near_miss = format!("{}0", &held[..held.len() - 1]);
+    let near_miss = near_miss_on(&held);
     // `InstanceId` is a plain `String` in this service's model, so the rows vary in FORM
     // and SIZE rather than against a pattern: EC2's two id lengths, a near miss on an
     // instance the fleet does hold, its uppercase spelling, and a value that is not an

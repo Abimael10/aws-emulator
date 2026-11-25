@@ -30,6 +30,9 @@ use service_com_amazonaws_licensemanagerusersubscriptions_licensemanagerusersubs
 use crate::identity_provider_subscriptions::{
     call, harness, provider_union, register, Reply, PRODUCTS,
 };
+// The one derivation of an id that differs from a held instance in its last digit alone,
+// written once for every suite whose rows need one.
+use crate::instance_fleet_resolution::near_miss_on;
 
 /// A directory of the account's fleet (`Active`, so a registration resolves for it), which
 /// the well-formed rows name.
@@ -63,10 +66,7 @@ fn unheld_instances() -> Vec<(&'static str, String)> {
     vec![
         ("the 17-hex-digit id form", "i-0123456789abcdef0".to_string()),
         ("the 8-hex-digit id form", "i-0abc1234".to_string()),
-        (
-            "a near miss on a held instance",
-            format!("{}0", &held[..held.len() - 1]),
-        ),
+        ("a near miss on a held instance", near_miss_on(&held)),
         (
             "an uppercase spelling of a held instance",
             held.to_ascii_uppercase(),

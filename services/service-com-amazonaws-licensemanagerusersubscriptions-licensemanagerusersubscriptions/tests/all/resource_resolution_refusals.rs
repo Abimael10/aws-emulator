@@ -55,6 +55,9 @@ use super::identity_provider_subscriptions::{
     provider_union, register, send, start_subscription, Harness, Reply, ACCOUNT, ACCOUNT_VPC,
     PRODUCTS, REGION, SIGNING_NAME,
 };
+// The one derivation of an id that differs from a held instance in its last digit alone,
+// written once for every suite whose rows need one.
+use super::instance_fleet_resolution::near_miss_on;
 
 /// The sentence `DisassociateUser` answers a request that addresses no association
 /// with, from the handler that owns it.
@@ -250,7 +253,7 @@ pub(crate) fn held_instance(index: usize) -> String {
 /// the fleet does hold, and a value that is not an instance id at all.
 fn unheld_instances() -> Vec<(String, String)> {
     let held = held_instance(0);
-    let near_miss = format!("{}0", &held[..held.len() - 1]);
+    let near_miss = near_miss_on(&held);
     vec![
         (
             "the 17-hex-digit id form".to_string(),

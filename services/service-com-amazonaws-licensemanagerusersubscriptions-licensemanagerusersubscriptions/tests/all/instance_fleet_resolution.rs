@@ -23,6 +23,11 @@
 //! one, one instance of a batch, a later launch, this service's own fleet seam, an instance
 //! registered in that seam at runtime), the state EC2 reports it in (`pending`, `running`,
 //! `terminated`), and the form, size and case of an id no instance of the account has.
+//!
+//! An id the account has NO instance of is derived so that it cannot BE one it has — EC2
+//! allocates an identifier unpredictably, so a near miss is a changed digit rather than a
+//! written one ([`near_miss_on`]) — and that premise is established by asking the owner of
+//! instances ([`Fleet::has_instance`]) rather than assumed of a drawn value.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -51,7 +56,11 @@ const AMI: &str = "ami-00112233445566778";
 /// How long EC2 is given to bring an instance to a state its own clock owes it — a launch
 /// to `running`, a termination to `terminated`. Nothing in the emulator sleeps; this is the
 /// test waiting for that clock.
-const EC2_BUDGET: Duration = Duration::from_secs(10);
+///
+/// GENEROUS, by orders of magnitude, against the span that move is owed at: the wait below
+/// ends on the CONDITION, so nothing is gained by bounding it tightly, and a budget close to
+/// that span would make the outcome depend on how fast the host happens to be running.
+const EC2_BUDGET: Duration = Duration::from_secs(60);
 
 /// The `InstanceState$Name` values this suite names: the state a launch starts in, the one
 /// it reaches, and the terminal one a termination reaches.
@@ -82,6 +91,33 @@ const GATED_PATHS: &[(&str, &str)] = &[
     ("ListUserAssociations", "/user/ListUserAssociations"),
     ("DisassociateUser", "/user/DisassociateUser"),
 ];
+
+/// An id that differs from `instance_id` in its LAST digit only: a near miss on it, whatever
+/// digit it ends in.
+///
+/// EC2 allocates an instance identifier UNPREDICTABLY — a launch mints `i-` and 17
+/// hexadecimal digits of a drawn identifier — so the last digit of an id it handed out is not
+/// a value the caller knows. A derivation that WRITES one fixed digit there therefore names
+/// the instance itself whenever that is the digit the id already carries, which is an id the
+/// account HAS rather than one it has none of. The replacement is chosen against the digit
+/// found, and is another lowercase hexadecimal digit, so the near miss keeps the form and the
+/// length of the id it was derived from.
+pub(crate) fn near_miss_on(instance_id: &str) -> String {
+    // The precondition, stated where the four suites that share this helper pass through:
+    // an instance id is a non-empty ASCII value, so its last digit is its last byte.
+    assert!(
+        !instance_id.is_empty() && instance_id.is_ascii(),
+        "an instance id is a non-empty ASCII value, got {instance_id:?}"
+    );
+    let (head, last) = instance_id.split_at(instance_id.len() - 1);
+    let replacement = if last == "0" { "1" } else { "0" };
+    let near_miss = format!("{head}{replacement}");
+    assert_ne!(
+        near_miss, instance_id,
+        "a near miss must differ from the id it was derived from"
+    );
+    near_miss
+}
 
 /// This service and EC2 — the owner of the instances — over ONE shared engine, plus an EC2
 /// client over the router's own in-process callback: the very seam this service's instance
@@ -186,6 +222,29 @@ impl Fleet {
             .find(|instance| instance.instance_id() == Some(instance_id))
             .and_then(|instance| instance.state()?.name().map(|name| name.as_str().to_string()))
             .unwrap_or_else(|| panic!("EC2 must report a state for {instance_id}"))
+    }
+
+    /// Whether the account has an instance of `instance_id`, as the service that OWNS
+    /// instances answers — in any state it reports one in, the terminal `terminated`
+    /// included, since EC2 goes on reporting a terminated instance for a while.
+    ///
+    /// How a row that must name an id the account has NO instance of establishes that
+    /// premise instead of assuming it of a value EC2 drew. A describe of an id EC2 was
+    /// allocated nothing for fails as a whole, which is the same fact asked for here: the
+    /// account has no such instance.
+    pub(crate) async fn has_instance(&self, instance_id: &str) -> bool {
+        self.ec2
+            .describe_instances()
+            .instance_ids(instance_id)
+            .send()
+            .await
+            .is_ok_and(|described| {
+                described
+                    .reservations()
+                    .iter()
+                    .flat_map(::aws_sdk_ec2::types::Reservation::instances)
+                    .any(|instance| instance.instance_id() == Some(instance_id))
+            })
     }
 
     /// Wait until EC2 reports `instance_id` in `state`, and answer it.
@@ -417,18 +476,6 @@ async fn every_instance_the_account_has_carries_the_user_association_plane() {
     }
 }
 
-/// The id `launched` with its LAST character replaced by a DIFFERENT one: an id of EC2's
-/// own form, one character from an instance the account has, that no launch minted.
-///
-/// The replacement is chosen against the character that is there, so the result differs
-/// from `launched` whatever hex digit the launch minted last — a fixed digit would, for one
-/// id in sixteen, name the launched instance itself.
-fn near_miss(launched: &str) -> String {
-    let (head, last) = launched.split_at(launched.len() - 1);
-    let replacement = if last == "0" { '1' } else { '0' };
-    format!("{head}{replacement}")
-}
-
 /// RULE, the other side: an id no instance of the account has is refused, with the same
 /// code, status and sentence on every operation that acts on a caller-named instance — and
 /// an instance EC2 has TERMINATED is no longer one the account has.
@@ -460,7 +507,7 @@ async fn an_id_no_instance_of_the_account_has_is_refused_on_every_gated_operatio
         },
         Row {
             case: "a near miss on a launched instance".to_string(),
-            instance_id: near_miss(&launched),
+            instance_id: near_miss_on(&launched),
         },
         Row {
             case: "an upper-case spelling of a launched instance".to_string(),
@@ -476,9 +523,34 @@ async fn an_id_no_instance_of_the_account_has_is_refused_on_every_gated_operatio
         },
         Row {
             case: format!("an instance EC2 reports {STATE_TERMINATED}"),
-            instance_id: terminated,
+            instance_id: terminated.clone(),
         },
     ];
+
+    // THE PREMISE of the rows above, established by ASKING the service that owns instances
+    // rather than assumed of ids it allocated: the account has no instance of any of them.
+    // The terminated row is the one exception — EC2 goes on reporting that instance in its
+    // terminal state, which is exactly what makes it an instance the account no longer has —
+    // so it is checked against the state EC2 reports it in instead. The other place an
+    // instance of this account can be reported from is this service's own fleet seam, which
+    // holds the seeded ids these rows only spell differently.
+    for row in &rows {
+        let case = &row.case;
+        if row.instance_id == terminated {
+            assert_eq!(
+                fleet.instance_state(&row.instance_id).await,
+                STATE_TERMINATED,
+                "setup: case {case:?}: EC2 must report {} {STATE_TERMINATED}",
+                row.instance_id
+            );
+            continue;
+        }
+        assert!(
+            !fleet.has_instance(&row.instance_id).await,
+            "setup: case {case:?}: the account must have no instance of {}",
+            row.instance_id
+        );
+    }
 
     for row in &rows {
         for (operation, path) in GATED_PATHS {
@@ -523,4 +595,118 @@ async fn an_id_no_instance_of_the_account_has_is_refused_on_every_gated_operatio
         launched,
         "the launched instance must be served, got {summary:?}"
     );
+}
+
+/// Every digit an EC2 instance id can end in: the lowercase hexadecimal alphabet the
+/// identifier of an id is printed in (`i-` and 17 hexadecimal digits), so the table below
+/// spans every id a launch can hand out rather than the digits one run happened to draw.
+const ID_LAST_DIGITS: &[char] = &[
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+];
+
+/// An id of EC2's 17-hex-digit form ending in `digit`, and carrying `digit` as its second
+/// digit as well, so no row's near miss can be another row's instance.
+fn instance_id_ending_in(digit: char) -> String {
+    let instance_id = format!("i-0{digit}a1b2c3d4e5f6a7{digit}");
+    assert_eq!(
+        instance_id.len(),
+        "i-".len() + 17,
+        "an id of EC2's 17-hex-digit form, got {instance_id:?}"
+    );
+    instance_id
+}
+
+/// RULE: whatever digit an instance of the account ends in, an id that differs from it in
+/// that digit alone is an id no instance of the account has, and is refused on every
+/// operation that acts on a caller-named instance with the same code, status and sentence —
+/// while the instance it was derived from is itself served.
+///
+/// The rows span the digit the id ends in (every one of [`ID_LAST_DIGITS`]) and where the
+/// instance came from (this service's own fleet seam, and a launch of EC2's own, whose last
+/// digit EC2 drew rather than the test).
+#[tokio::test]
+async fn a_near_miss_on_an_instance_of_the_account_is_refused_whatever_digit_it_ends_in() {
+    let fleet = Fleet::new();
+    register_provider(&fleet.h).await;
+
+    let mut rows: Vec<Row> = Vec::new();
+    for digit in ID_LAST_DIGITS {
+        let instance_id = instance_id_ending_in(*digit);
+        {
+            let store = fleet.h.engine.state::<ServiceState>();
+            store
+                .lock()
+                .register_account_instance(instance_id.clone(), format!("{REGION}a"));
+        }
+        rows.push(Row {
+            case: format!("an instance of the fleet seam whose id ends in {digit:?}"),
+            instance_id,
+        });
+    }
+    // And one EC2 itself launched, whose last digit the owner of instances drew: the row a
+    // derivation that writes a fixed digit collides with whenever that is the digit drawn.
+    let launched = fleet.launch(1).await;
+    rows.push(Row {
+        case: "an instance EC2 itself launched".to_string(),
+        instance_id: launched[0].clone(),
+    });
+
+    for (index, row) in rows.iter().enumerate() {
+        let case = &row.case;
+
+        // The control first: the instance the near miss is derived from is one the account
+        // has, so the plane serves it.
+        let reply = associate(&fleet.h, &format!("user{index}"), &row.instance_id).await;
+        let body = reply.ok(case);
+        let summary = body
+            .get("InstanceUserSummary")
+            .unwrap_or_else(|| panic!("case {case:?}: no InstanceUserSummary in {body:?}"));
+        assert_eq!(
+            as_str(summary, "InstanceId", case),
+            row.instance_id,
+            "case {case:?}: expected the instance the request named, got {summary:?}"
+        );
+
+        // The near miss differs from it in its last digit alone, and names no instance of
+        // the account: EC2, the owner, reports none of that id, and the only other place an
+        // instance of this account is reported from is the fleet seam this test wrote the
+        // rows into.
+        let near_miss = near_miss_on(&row.instance_id);
+        assert_ne!(
+            near_miss, row.instance_id,
+            "case {case:?}: a near miss must not be the instance it was derived from"
+        );
+        assert!(
+            !fleet.has_instance(&near_miss).await,
+            "setup: case {case:?}: the account must have no instance of {near_miss}"
+        );
+
+        for (operation, path) in GATED_PATHS {
+            let case = format!("{operation}: a near miss on {case}");
+            let reply = call(
+                &fleet.h,
+                path,
+                &json!({
+                    "Username": "someone",
+                    "InstanceId": near_miss,
+                    "IdentityProvider": provider_union(DIRECTORY),
+                }),
+            )
+            .await;
+            assert_eq!(
+                reply.error_type.as_deref(),
+                Some(UNAUTHORIZED_CODE),
+                "case {case:?}: expected {UNAUTHORIZED_CODE}, got {reply:?}"
+            );
+            assert_eq!(
+                reply.status, REFUSAL_STATUS,
+                "case {case:?}: expected HTTP {REFUSAL_STATUS}, got {reply:?}"
+            );
+            assert_eq!(
+                reply.message(),
+                Some(UNAUTHORIZED_MESSAGE),
+                "case {case:?}: wrong refusal sentence in {reply:?}"
+            );
+        }
+    }
 }
