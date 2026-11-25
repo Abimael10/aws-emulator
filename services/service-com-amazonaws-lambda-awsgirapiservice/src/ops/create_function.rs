@@ -1115,6 +1115,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (see `crate::state::concurrency_metering`).
         drop(store);
         crate::state::drive_concurrency_metering(&self.engine);
+        // The function is `Pending` until its provisioning is done, and what Lambda
+        // provisions in that window is the EXECUTION ENVIRONMENT its first invocation runs in
+        // — so one is stood up here rather than on that invocation's path
+        // (see `crate::state::execution::warm_pool::provision`). It is built on a thread of
+        // its own and this call waits for none of it.
+        crate::state::execution::warm_pool::provision(input.runtime.as_deref());
         Ok(created)
     }
 }

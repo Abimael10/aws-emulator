@@ -106,6 +106,12 @@ use rustpython_vm::function::{FuncArgs, OptionalArg};
 use rustpython_vm::builtins::PyModule;
 use rustpython_vm::{AsObject, Interpreter, PyObjectRef, PyRef, PyResult, Settings, VirtualMachine};
 
+// The half of an execution environment's build that no function's configuration is read for,
+// which is why it can stand before the invocation that is served in it arrives.
+mod blank;
+
+pub(super) use blank::Blank;
+
 // What one run may spend and what it came to are the same for every engine, so they are
 // the shared ones ([`super::outcome`]) rather than this interpreter's own.
 pub use super::outcome::{Budget, Completion, Finished, Stop};
@@ -330,6 +336,13 @@ pub fn run_against(request: &Run<'_>, clock: &Clock) -> Finished {
     finished
 }
 
+/// What a run this emulator could not CONTAIN is refused with: the one sentence both ways of
+/// building an environment state it with ([`Prepared::start`], [`Blank::stand_up`]), because
+/// it is the same refusal — an interpreter whose native surface is not the allow-list is
+/// never handed guest code.
+const UNCONTAINED_INTERPRETER: &str =
+    "the interpreter's native modules could not be narrowed to the allow-list";
+
 /// An execution ENVIRONMENT of one function version: the interpreter standing with that
 /// version's handler imported, ready to serve an invocation.
 ///
@@ -350,14 +363,10 @@ pub(super) struct Prepared {
     session: Arc<Session>,
     /// Where the installed trace hook is held, for the life of the environment.
     held: TraceCell,
-    /// The runtime's INVOKE entry point ([`super::bootstrap`]).
-    invoke: PyObjectRef,
-    /// The runtime's BIND entry point, which puts the next invocation's own request on the
-    /// prepared environment.
-    bind: PyObjectRef,
-    /// The two mappings this environment's invocations have their own variables written into,
-    /// captured by the HOST ([`EnvironmentSinks`]).
-    environ: EnvironmentSinks,
+    /// The entry points this environment is driven through ([`super::bootstrap`]), and the
+    /// two mappings its invocations have their own variables written into
+    /// ([`EnvironmentSinks`]).
+    entries: Entries,
     /// The log and the bounds the INITIALIZATION was spent against, until the invocation it
     /// was built for has been served.
     ///
@@ -379,6 +388,14 @@ type Spending = (Arc<Mutex<Capture>>, Arc<Bounds>);
 impl Prepared {
     /// Build the environment and run the INIT phase in it, for `request` — the first
     /// invocation it will serve, whose own bounds the initialization is spent against.
+    ///
+    /// This is ONE pass over both halves of the build, which is what an invocation that finds
+    /// no environment standing for it pays: its own log and bounds are the ones the whole
+    /// build is spent against and the host watches it from the first instant, because all of
+    /// it is inside that invocation's own wait. The half that reads no function's
+    /// configuration can also be stood up BEFORE an invocation arrives, and is adopted by the
+    /// first one that needs an environment ([`Blank`]) — the same two steps, with only this
+    /// emulator's own work ahead of the invocation.
     ///
     /// `Err` carries what an initialization that failed is answered with: the error document
     /// the runtime wrote for it, or the internal failure of an interpreter that could not be
@@ -416,10 +433,7 @@ impl Prepared {
         // guest code.
         if !contained.load(Ordering::SeqCst) {
             return Err(Box::new(settled(
-                Completion::Internal(
-                    "the interpreter's native modules could not be narrowed to the allow-list"
-                        .to_string(),
-                ),
+                Completion::Internal(UNCONTAINED_INTERPRETER.to_string()),
                 &bounds,
                 &capture,
                 Duration::ZERO,
@@ -433,22 +447,41 @@ impl Prepared {
         // The host's own watch over the initialization, sampling the clock from OUTSIDE the
         // guest for as long as it lasts ([`watch_run`]).
         watch_run(&bounds);
-        let initialized = interpreter.enter(|vm| {
-            match initialize(vm, request, &input, &session, &bounds, &held) {
+        let built = interpreter.enter(|vm| {
+            let entries = match stand_up(vm, &session, &held) {
+                Ok(entries) => entries,
+                Err(exception) => return Err(formatted_exception(vm, &exception)),
+            };
+            let initialized = match initialize(vm, request, &input, &entries, &bounds) {
                 Ok(initialized) => initialized,
                 Err(exception) => {
                     Initialized::Answered(Completion::Internal(formatted_exception(vm, &exception)))
                 }
-            }
+            };
+            Ok((entries, initialized))
         });
+        let (entries, initialized) = match built {
+            Ok(built) => built,
+            // The environment itself could not be stood up, so there is nothing to keep: the
+            // interpreter is finalized here, exactly as it is after a run.
+            Err(why) => {
+                interpreter.finalize(None);
+                held.borrow_mut().take();
+                return Err(Box::new(settled(
+                    Completion::Internal(why),
+                    &bounds,
+                    &capture,
+                    Duration::ZERO,
+                    true,
+                )));
+            }
+        };
         match initialized {
-            Initialized::Ready(entries) => Ok(Self {
+            Initialized::Ready => Ok(Self {
                 interpreter,
                 session,
                 held,
-                invoke: entries.invoke,
-                bind: entries.bind,
-                environ: entries.environ,
+                entries,
                 initializing: ::std::cell::RefCell::new(Some((capture, bounds))),
                 // Taken on the environment's OWN thread, which is the one every invocation
                 // served in it runs on: what it has faulted in beyond this is what the
@@ -457,7 +490,8 @@ impl Prepared {
             }),
             Initialized::Answered(completion) => {
                 // Nothing of a failed initialization is kept: the interpreter is finalized
-                // here, exactly as it is after a run.
+                // here, exactly as it is after a run, and the objects it built go first.
+                drop(entries);
                 interpreter.finalize(None);
                 held.borrow_mut().take();
                 Err(Box::new(settled(
@@ -615,17 +649,13 @@ impl Prepared {
             interpreter,
             session: _,
             held,
-            invoke,
-            bind,
-            environ,
+            entries,
             initializing: _,
             faulted_at_build: _,
         } = self;
-        drop(invoke);
-        drop(bind);
-        // The mappings this environment wrote every invocation's variables through are the
-        // interpreter's objects, so they go before it is finalized.
-        drop(environ);
+        // The entry points and the mappings this environment wrote every invocation's
+        // variables through are the interpreter's objects, so they go before it is finalized.
+        drop(entries);
         interpreter.finalize(None);
         // Only now: the hook and this cell hold each other, so emptying it is what lets the
         // one the environment installed go.
@@ -912,8 +942,8 @@ fn settled(
 
 /// What building an environment came to.
 enum Initialized {
-    /// The environment is standing, with these entry points to serve invocations through.
-    Ready(Entries),
+    /// The environment is standing, with the function's own initialization done in it.
+    Ready,
     /// The initialization answered rather than completed, and this is what it answered.
     Answered(Completion),
 }
@@ -924,27 +954,26 @@ struct Entries {
     invoke: PyObjectRef,
     /// Binding the next invocation's request onto the environment.
     bind: PyObjectRef,
+    /// The INIT phase: the import of the handler's own module, which the function this
+    /// environment is adopted by is read for.
+    initialize: PyObjectRef,
     /// Where this environment's invocations have their variables written
     /// ([`EnvironmentSinks`]).
     environ: EnvironmentSinks,
 }
 
-/// Install the host surface, evaluate the runtime source and run the INIT phase.
-fn initialize(
-    vm: &VirtualMachine,
-    request: &Run<'_>,
-    input: &str,
-    session: &Arc<Session>,
-    bounds: &Arc<Bounds>,
-    held: &TraceCell,
-) -> PyResult<Initialized> {
-    let environ = prepare(
-        vm,
-        request.environment,
-        request.architecture,
-        request.budget.recursion_limit,
-        session,
-    )?;
+/// Install the host surface every execution environment has and evaluate the runtime source
+/// in it: the whole of the build that reads no function's configuration.
+///
+/// None of it depends on which function is served here, which is why it can be stood up
+/// before there is an invocation to serve at all ([`blank`]): the interpreter is the same one
+/// whatever function adopts it, the surface it is narrowed to is the same surface, and the
+/// runtime source is this emulator's own.
+///
+/// The TRACE HOOK is installed last, once the runtime's own source has been evaluated, so
+/// none of this emulator's own frames is traced and nothing of this work is charged to a run.
+fn stand_up(vm: &VirtualMachine, session: &Arc<Session>, held: &TraceCell) -> PyResult<Entries> {
+    let environ = prepare(vm, session)?;
     let scope = vm.new_scope_with_builtins();
     let code = vm
         .compile(
@@ -959,10 +988,23 @@ fn initialize(
     let entries = Entries {
         invoke: scope.globals.get_item("__lambda_invoke", vm)?,
         bind: scope.globals.get_item("__lambda_bind", vm)?,
+        initialize: scope.globals.get_item("__lambda_prepare", vm)?,
         environ,
     };
-    let prepared = scope.globals.get_item("__lambda_prepare", vm)?;
     install_trace_hook(vm, session, held)?;
+    Ok(entries)
+}
+
+/// Apply the FUNCTION's own configuration to a standing environment and run the INIT phase
+/// in it, for `request` — the first invocation that environment serves.
+fn initialize(
+    vm: &VirtualMachine,
+    request: &Run<'_>,
+    input: &str,
+    entries: &Entries,
+    bounds: &Arc<Bounds>,
+) -> PyResult<Initialized> {
+    install_function_surface(vm, &entries.environ, request)?;
     // The interpreter is standing and nothing of the RUN's own code has been read yet, so
     // this is where the memory the run itself takes is measured from, and where the span its
     // initialization is allowed starts running. The host takes both, never the guest.
@@ -971,7 +1013,9 @@ fn initialize(
     // The INIT phase, under the span an initialization is allowed rather than the
     // function's `Timeout`. It answers nothing when the environment is ready, and the
     // document of a failure that belongs to no invocation when it is not.
-    let answered = prepared.call((vm.ctx.new_str(input.to_owned()),), vm)?;
+    let answered = entries
+        .initialize
+        .call((vm.ctx.new_str(input.to_owned()),), vm)?;
     let answered: String = answered.try_into_value(vm)?;
     if !answered.is_empty() {
         return Ok(Initialized::Answered(read_completion(
@@ -980,7 +1024,64 @@ fn initialize(
             Phase::Initialization,
         )));
     }
-    Ok(Initialized::Ready(entries))
+    Ok(Initialized::Ready)
+}
+
+/// Install everything of the host surface that one FUNCTION's configuration states, onto an
+/// environment whose function-independent surface is already standing ([`stand_up`]): what
+/// the execution environment IS, the variables the invocation runs with, how deep its calls
+/// may nest and which release of the language its runtime names.
+///
+/// This is the half of the build that cannot be stood up before the function is known, and
+/// it happens before a line of the function's own code is read — the order the installations
+/// are in among themselves is the order they were in when one call did both halves.
+///
+/// WHY it may happen after the rest of the surface and after this emulator's own runtime
+/// source has been evaluated, which is what changed when the build was split in two. Each of
+/// these is READ at the instant a program asks for it, and the only reader of any of them is
+/// the GUEST, whose first line runs in the INIT phase below:
+///
+/// * what the environment IS is an attribute [`super::host_posix::module`]'s `uname` answers
+///   from when it is CALLED, and the ordering the codec registry needed is the one that is
+///   still in place — the patched `io` and the COMPLETE `os`, which [`prepare`] installs
+///   before it ([`super::host_posix::install_data_surface`]) — rather than the identity of a
+///   function nothing had yet;
+/// * the invocation's own variables are written into the mappings the host captured, and
+///   nothing of this emulator's own runtime reads a variable while it is evaluated: the
+///   runtime's library directory and its log settings are read out of the request document
+///   the INIT phase is handed ([`super::bootstrap`]'s `_runtime_library`, `_main_prepare`),
+///   not out of `os.environ`;
+/// * the release and the implementation are what `sys` reports, read by the guest's own
+///   imports (the standard library modules this runtime supplies read them at THEIR import,
+///   which is a guest import — [`super::guest_sysconfig`]), and the one reading the
+///   interpreter itself fixed before any of this (`importlib`'s cache tag) was already fixed
+///   when the interpreter was built, in this order and in the one before it.
+///
+/// What a run observes is therefore the same either way, which
+/// `tests/all/pre_provisioned_execution_environments.rs` pins over an environment that was
+/// stood up before the invocation: the machine, the release, the implementation and the
+/// variables a run reports are its own function's.
+fn install_function_surface(
+    vm: &VirtualMachine,
+    environ: &EnvironmentSinks,
+    request: &Run<'_>,
+) -> PyResult<()> {
+    // What the execution environment this run is in IS, which `os.uname` answers and the
+    // standard library's `platform` module is built on: the HOST states it, from the
+    // function's own configuration ([`super::host_posix::install_environment_identity`]),
+    // rather than anything of the machine this process is on.
+    super::host_posix::install_environment_identity(vm, request.environment, request.architecture)?;
+    // The variables the invocation runs with, written into the mappings the host captured
+    // while no guest code had run ([`EnvironmentSinks`]). Nothing is REPLACED: this is the
+    // first invocation this environment serves, so there is nothing in them yet.
+    environ.install(vm, request.environment, false)?;
+    clamp_recursion(vm, request.budget.recursion_limit)?;
+    // WHICH RELEASE of the language this execution environment is and WHICH IMPLEMENTATION of
+    // it, both of which the function's own `Runtime` names ([`super::python_release`]).
+    // Installed LAST, so the identity the run reports is read by the guest's own imports and
+    // by nothing else.
+    super::python_release::install(vm, request.environment, request.architecture)?;
+    Ok(())
 }
 
 /// Serve one invocation in a prepared environment: bind its request, then run the handler.
@@ -1013,7 +1114,7 @@ fn served(
     bounds: &Arc<Bounds>,
     reused: bool,
 ) -> PyResult<Completion> {
-    prepared.environ.install(vm, environment, reused)?;
+    prepared.entries.environ.install(vm, environment, reused)?;
     if reused {
         bounds.measure_memory_from_here();
     }
@@ -1022,7 +1123,10 @@ fn served(
     // members ([`super::bootstrap`]), neither of which is the handler's run — so both happen
     // before the invoke phase is begun below and the handler is told it has its whole
     // `Timeout` left when it is entered.
-    let bound = prepared.bind.call((vm.ctx.new_str(input.to_owned()),), vm)?;
+    let bound = prepared
+        .entries
+        .bind
+        .call((vm.ctx.new_str(input.to_owned()),), vm)?;
     let bound: String = bound.try_into_value(vm)?;
     if !bound.is_empty() {
         return Ok(read_completion(
@@ -1035,7 +1139,10 @@ fn served(
     // deadline is the function's `Timeout`, and the instant it falls at is what the handler
     // is told it has left.
     let deadline_epoch_ms = bounds.start();
-    let answered = prepared.invoke.call((vm.ctx.new_int(deadline_epoch_ms),), vm)?;
+    let answered = prepared
+        .entries
+        .invoke
+        .call((vm.ctx.new_int(deadline_epoch_ms),), vm)?;
     let text: String = answered.try_into_value(vm)?;
     Ok(read_completion(
         &text,
@@ -1148,17 +1255,14 @@ fn interpreter(contained: &Arc<AtomicBool>) -> Interpreter {
     })
 }
 
-/// Install everything the guest sees of the host, before any guest code runs: the modules
-/// this emulator supplies in place of the ones it does not register, the refusals that
-/// replace the host-reaching calls of the two it does, the bounds, and the log the
-/// handler's output goes into.
-fn prepare(
-    vm: &VirtualMachine,
-    environment: &BTreeMap<String, String>,
-    architecture: &str,
-    recursion_limit: usize,
-    session: &Arc<Session>,
-) -> PyResult<EnvironmentSinks> {
+/// Install everything the guest sees of the host that is the same for EVERY execution
+/// environment, before any guest code runs: the modules this emulator supplies in place of
+/// the ones it does not register, the refusals that replace the host-reaching calls of the
+/// two it does, and the log the handler's output goes into.
+///
+/// What ONE function's configuration states is installed beside it, by
+/// [`install_function_surface`], when an environment is adopted by a function.
+fn prepare(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<EnvironmentSinks> {
     let modules = vm.sys_module.as_object().get_attr("modules", vm)?;
     // Every allow-listed native module is created ONCE, here, so each is the single
     // patched object `sys.modules` holds from now on. Nothing is imported from a host
@@ -1172,19 +1276,15 @@ fn prepare(
     // the `open` flags — installed before any import of `os`, because that is where `os`
     // takes them from ([`super::host_posix::install_data_surface`]).
     super::host_posix::install_data_surface(vm)?;
-    // What the execution environment this run is in IS, which `os.uname` answers and the
-    // standard library's `platform` module is built on: the HOST states it, from the
-    // function's own configuration ([`super::host_posix::install_environment_identity`]),
-    // rather than anything of the machine this process is on.
-    super::host_posix::install_environment_identity(vm, environment, architecture)?;
-    // The codec registry, AFTER the two installations above: whatever it imports then sees
-    // the same patched `io` and the same complete `os` every later import sees, so it can
-    // hold neither an unpatched way of opening a host file nor a half-built `os`.
+    // The codec registry, AFTER the installation above: whatever it imports then sees the
+    // same patched `io` and the same complete `os` every later import sees, so it can hold
+    // neither an unpatched way of opening a host file nor a half-built `os`.
     install_codec_registry(vm)?;
     // The mappings the invocation's environment is written into, captured by the HOST while
-    // no guest code has run ([`EnvironmentSinks`]).
+    // no guest code has run ([`EnvironmentSinks`]). What is written THROUGH them is the
+    // adopting function's ([`install_function_surface`]): an environment no function has
+    // adopted yet holds no variable of one.
     let environ = EnvironmentSinks::capture(vm)?;
-    environ.install(vm, environment, false)?;
     refuse_guest_threads(vm)?;
     clamp_guest_sleep(vm, session)?;
     // Put the host module in `sys.modules` under the name the runtime source imports it
@@ -1225,13 +1325,6 @@ fn prepare(
     vm.sys_module
         .as_object()
         .set_attr("builtin_module_names", vm.ctx.new_tuple(names), vm)?;
-    clamp_recursion(vm, recursion_limit)?;
-    // WHICH RELEASE of the language this execution environment is and WHICH IMPLEMENTATION of
-    // it, both of which the function's own `Runtime` names ([`super::python_release`]).
-    // Installed LAST, so every module the host itself imported on the way up was imported by
-    // the interpreter as it was built, and the identity the run reports is read by the guest's
-    // own imports and by nothing else.
-    super::python_release::install(vm, environment, architecture)?;
     Ok(environ)
 }
 

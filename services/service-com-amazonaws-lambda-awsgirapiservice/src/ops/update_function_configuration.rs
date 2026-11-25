@@ -934,9 +934,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Answered by reading the record back out of the store, so
         // `GetFunctionConfiguration` reports exactly what this call persisted.
         let stored = record.config.clone();
-        Ok(function_configuration(
-            record.configuration(crate::state::VERSION_LATEST, &stored),
-        ))
+        let reported = record.configuration(crate::state::VERSION_LATEST, &stored);
+        // A configuration change is a new revision of the function, so no environment built
+        // before it serves an invocation made after it: the instance Lambda provisions in the
+        // window this update opened is an EXECUTION ENVIRONMENT stood up off the next
+        // invocation's path (see `crate::state::execution::warm_pool::provision`).
+        crate::state::execution::warm_pool::provision(stored.runtime.as_deref());
+        Ok(function_configuration(reported))
     }
 }
 

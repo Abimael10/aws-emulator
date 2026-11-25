@@ -41,6 +41,17 @@
 //! not kept ([`reusable`]) — which is what AWS does with the environment of a run its timeout
 //! ended. One of the bounds above being reached retires it. And so does the pool dropping it
 //! to make room for another.
+//!
+//! Beside the initialized environments this module keeps a few BLANK ones ([`Blanks`]): the
+//! half of an environment that reads no function's configuration at all
+//! ([`python::Blank`]) — the interpreter, the narrowing of its native surface and this
+//! emulator's own runtime — stood up while a function is being PROVISIONED ([`provision`])
+//! rather than on the path of its first invocation. AWS builds the environment of a function
+//! while the function is not yet `Active`, so the first delivery to it does not pay for one;
+//! here the same holds, because the first invocation ADOPTS a standing blank and pays its own
+//! initialization alone. They are held under the same idle span and a count of their own
+//! ([`MAX_STANDING_BLANKS`]), and an invocation that finds none standing stands one up itself,
+//! so what this changes is who pays for that work and never what a run observes.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::mpsc::{channel, Receiver, SendError, Sender};
@@ -308,9 +319,122 @@ struct Answered {
     grown: u64,
 }
 
-/// Start an environment: a thread that builds one for the first invocation it is handed and
-/// then serves invocation after invocation.
-fn start() -> Option<Standing> {
+/// Stand an execution environment up for a function that is being PROVISIONED, so the first
+/// invocation of that function is the handler's own run and not the build of an interpreter.
+///
+/// What is stood up is the half of an environment that reads no function's configuration
+/// ([`python::Blank`]), which is by far the larger half: the interpreter, the host surface it
+/// is narrowed to and this emulator's own runtime source. The invocation that arrives later
+/// ADOPTS it — the function's own configuration is applied to it and the handler's module is
+/// imported then, which is the INIT phase and the `Init Duration` of a cold start.
+///
+/// Called from the operations that provision a function — creating one, and changing the code
+/// or the configuration of one — because that is the window AWS builds an environment in: the
+/// function reports a non-terminal `State` or `LastUpdateStatus` while it is open, and a
+/// caller that polls until it closes has an environment waiting for its first invocation.
+/// Only a function whose runtime runs on the interpreter this module stands up is provisioned
+/// for; a function of any other runtime has no environment of this kind.
+///
+/// It never BLOCKS the caller: the environment is built on a thread of its own, and an
+/// operation that asks for one is answered whether or not it is standing yet.
+pub fn provision(runtime: Option<&str>) {
+    if super::engine_for(runtime) != Some(super::Engine::Python) {
+        return;
+    }
+    let asked = {
+        let mut standing = blanks().lock().unwrap_or_else(PoisonError::into_inner);
+        asked_for(&mut standing)
+    };
+    if asked {
+        stand_up_blank();
+    }
+}
+
+/// Whether one more blank environment is asked for, and claimed when it is: [`provision`]'s
+/// whole decision, with nothing of the process in it.
+///
+/// A blank past [`IDLE_LIFETIME`] is retired first, for the reason the initialized ones are
+/// ([`retire_the_idle_span`]): the span is enforced wherever the pool is next used.
+fn asked_for(blanks: &mut Blanks) -> bool {
+    retire_the_blank_idle_span(blanks);
+    // As many as this process keeps are standing or on their way, so this provisioning asks
+    // for none: what is already standing serves the next invocation that needs an
+    // environment, whichever function it is of.
+    if blanks.waiting.len() + blanks.building >= MAX_STANDING_BLANKS {
+        return false;
+    }
+    // Claimed from HERE rather than when the build finishes, so provisionings at the same
+    // instant never stand more up than this process keeps.
+    blanks.building += 1;
+    true
+}
+
+/// Start the thread of one BLANK environment: it stands the function-independent half of an
+/// environment up and parks itself for the first invocation that needs one.
+///
+/// The claim this provisioning made on the count of environments being stood up
+/// ([`Blanks::building`]) is released by a GUARD rather than by each arm, so it is given back
+/// however the build ends — the environment standing, the build failing, or the thread
+/// unwinding out of it — and a provisioning that came to nothing can never leave the count
+/// claimed for a build that is no longer happening.
+fn stand_up_blank() {
+    let (jobs, incoming) = channel();
+    let spawned = ::std::thread::Builder::new()
+        .name("lambda-execution-environment".to_string())
+        .stack_size(super::RUN_STACK_BYTES)
+        .spawn(move || {
+            let claim = Building;
+            let clock = Clock::host();
+            match python::Blank::stand_up(&clock) {
+                // Parked only once it really is standing, so a build that failed hands
+                // nothing to an invocation: the handle goes into the pool and this thread
+                // keeps the environment itself, which belongs to this thread.
+                Ok(blank) => {
+                    let held = parked(Standing { jobs });
+                    // The build is over, whether or not the pool had room for what it built.
+                    drop(claim);
+                    match held {
+                        Parked::Waiting => serve_in(incoming, blank, &clock, None),
+                        // As many are standing as this process keeps, so this one is not: it
+                        // is torn down here rather than held outside that bound.
+                        Parked::Refused => blank.discard(),
+                    }
+                }
+                Err(why) => {
+                    ::tracing::debug!(
+                        why,
+                        "an execution environment this emulator was standing up ahead of an \
+                         invocation could not be stood up, so the first invocation that needs \
+                         one builds its own"
+                    );
+                }
+            }
+        });
+    if spawned.is_err() {
+        // No thread took the claim, so it is given back here.
+        building_ended();
+    }
+}
+
+/// One blank environment being stood up, as the pool counts it: the claim
+/// [`asked_for`] made, given back when this is dropped.
+struct Building;
+
+impl Drop for Building {
+    fn drop(&mut self) {
+        building_ended();
+    }
+}
+
+/// Start an environment for an invocation that is waiting for one NOW: a thread that stands
+/// the environment up, lets that invocation adopt it and then serves invocation after
+/// invocation.
+///
+/// The handle is answered at once rather than when the environment stands, so the invocation
+/// is already on its way to the thread while the thread is building: what it waits for is the
+/// build and its own initialization, which is what an invocation that finds nothing standing
+/// pays.
+fn building() -> Option<Standing> {
     let (jobs, incoming) = channel();
     ::std::thread::Builder::new()
         .name("lambda-execution-environment".to_string())
@@ -320,18 +444,53 @@ fn start() -> Option<Standing> {
     Some(Standing { jobs })
 }
 
-/// One execution environment's whole life, on its own thread.
+/// An environment for the invocation on its way to it: the blank one already standing when
+/// there is one, and a thread that builds one when there is not.
+fn start() -> Option<Standing> {
+    adopted_blank().or_else(building)
+}
+
+/// One execution environment's whole life, on its own thread, for an invocation that is
+/// already on its way to it.
 fn serve_jobs(jobs: Receiver<Job>) {
-    // Nothing is built before there is an invocation to serve: the first one that arrives is
-    // what the environment is built for, and it is the invocation that pays the INIT phase.
+    // The build begins before the invocation is taken out of the channel, because this
+    // invocation waits for it: it found no environment standing, so standing one up is on its
+    // path ([`python::Prepared::start`]).
+    let building = Instant::now();
+    let clock = Clock::host();
+    match python::Blank::stand_up(&clock) {
+        Ok(blank) => serve_in(jobs, blank, &clock, Some(building)),
+        Err(why) => {
+            // No environment could be stood up at all. The invocation on its way here is
+            // answered that, because nothing of it ran.
+            if let Ok(first) = jobs.recv() {
+                let _ = first.answer.send(Answered {
+                    finished: reported(why),
+                    reusable: false,
+                    grown: 0,
+                });
+            }
+        }
+    }
+}
+
+/// One execution environment's whole life once its blank half is STANDING: the first
+/// invocation that arrives adopts it, and it then serves invocation after invocation.
+///
+/// `building` is when the build of that half began, for an invocation that waited for it, and
+/// `None` for an environment that was already standing when the invocation arrived — which is
+/// what decides how much of the wait the invocation that adopts it is reported to have spent.
+fn serve_in(jobs: Receiver<Job>, blank: python::Blank, clock: &Clock, building: Option<Instant>) {
     let Ok(first) = jobs.recv() else {
+        // Nothing will adopt this environment: the pool dropped it, or this process is going
+        // down. It is torn down rather than left standing.
+        blank.discard();
         return;
     };
-    let clock = Clock::host();
-    let initializing = Instant::now();
+    let initializing = building.unwrap_or_else(Instant::now);
     // The log STREAM this execution environment writes to: one stream per environment, which
     // is what makes the invocations a standing environment serves share a stream and a new
-    // environment open one of its own. It is the stream the invocation that BUILT the
+    // environment open one of its own. It is the stream the invocation that ADOPTED the
     // environment was composed with, and every later invocation served here is told the same
     // one — so what the runtime reports as its stream and what the delivery writes to are the
     // environment's own ([`super::log_stream_name`]).
@@ -343,7 +502,7 @@ fn serve_jobs(jobs: Receiver<Job>) {
     // What the environment is finally torn down against: the budget of the LAST invocation it
     // served, so a guest `atexit` callback is bounded like the handlers were.
     let mut budget = first.served.budget;
-    let prepared = match python::Prepared::start(&first.served.as_run(), &clock) {
+    let prepared = match blank.adopt(&first.served.as_run(), clock) {
         Ok(prepared) => prepared,
         Err(failed) => {
             // An initialization that failed is answered to the invocation that asked for it,
@@ -371,11 +530,12 @@ fn serve_jobs(jobs: Receiver<Job>) {
                 .environment
                 .insert(super::LOG_STREAM_VARIABLE.to_string(), stream);
         }
-        let mut finished = prepared.invoke(&job.served.as_run(), &clock);
+        let mut finished = prepared.invoke(&job.served.as_run(), clock);
         finished.log_stream = log_stream.clone();
-        // The invocation that BUILT the environment waited for the initialization as well as
-        // for its own run, so that is what its duration is. Every later invocation waited for
-        // its own run alone, which is the whole point of the environment still standing.
+        // The invocation that ADOPTED the environment waited for its own initialization in it
+        // as well as for its own run, so that is what its duration is. Every later invocation
+        // waited for its own run alone, which is the whole point of the environment still
+        // standing.
         if let Some(initializing) = cold.take() {
             let whole = initializing.elapsed();
             // What the INITIALIZATION itself took: the whole wait, less the handler's own run
@@ -423,7 +583,7 @@ fn serve_jobs(jobs: Receiver<Job>) {
             Err(_) => break,
         }
     }
-    prepared.finalize(budget, &clock);
+    prepared.finalize(budget, clock);
 }
 
 /// Whether the environment that served an invocation may serve another.
@@ -592,6 +752,155 @@ fn retire_longest_idle(pool: &mut Pool) -> bool {
     pool.held = pool.held.saturating_sub(1);
     pool.held_bytes = pool.held_bytes.saturating_sub(retired.grown);
     true
+}
+
+/// The BLANK environments of this process: the ones standing with no function in them yet.
+///
+/// They are held apart from the initialized ones above because WHICH invocation each may
+/// serve is the one thing they do not decide: a blank environment has adopted no function, so
+/// the next invocation that needs an environment of any key at all is served in it.
+#[derive(Default)]
+struct Blanks {
+    /// The blank environments standing in wait, in the order they were stood up — so the last
+    /// of the list is the freshest.
+    waiting: Vec<Waiting>,
+    /// How many are being stood up right now, counted from the instant one is asked for
+    /// ([`provision`]) so that provisionings at the same instant never stand more up than
+    /// this process keeps.
+    building: usize,
+    /// How many standing blanks invocations have ADOPTED since this process started
+    /// ([`adopted_blanks`]).
+    adopted: u64,
+}
+
+/// One blank environment standing in wait, and since when.
+struct Waiting {
+    /// Where its thread takes the invocation that adopts it. Dropping this ends that thread,
+    /// which tears the environment down ([`python::Blank::discard`]).
+    jobs: Sender<Job>,
+    /// When it finished standing up.
+    since: Instant,
+}
+
+/// How many execution environments this process stands up AHEAD of the invocations that adopt
+/// them.
+///
+/// A blank environment holds an interpreter of this host whether or not an invocation ever
+/// comes for it, so this is deliberately small: it is what a function being provisioned asks
+/// for, and the next function provisioned while they stand asks for none. AWS states no
+/// number for what it keeps warm for a function nobody has invoked, so this is this host's
+/// own — enough that the functions a client creates in one burst each find an environment
+/// waiting, and far below what the initialized environments beside them may hold
+/// ([`MAX_IDLE_ENVIRONMENTS`]).
+const MAX_STANDING_BLANKS: usize = 2;
+
+/// The blank environments of this process.
+fn blanks() -> &'static Mutex<Blanks> {
+    static BLANKS: OnceLock<Mutex<Blanks>> = OnceLock::new();
+    BLANKS.get_or_init(|| Mutex::new(Blanks::default()))
+}
+
+/// How many blank environments are STANDING in this process right now: the ones a function's
+/// provisioning stood up and no invocation has adopted yet.
+///
+/// A reading of this module's own pool, like [`super::abandoned_runs`] is of its run
+/// accounting: it answers what is standing and changes nothing.
+#[must_use]
+pub fn standing_blanks() -> usize {
+    blanks()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .waiting
+        .len()
+}
+
+/// How many blank environments invocations of this process have ADOPTED since it started.
+///
+/// Each one is an invocation that found an environment standing and therefore paid none of
+/// the build it would otherwise have waited for. The count never falls, for the same reason
+/// [`standing_blanks`] exists: it is a reading, and reading it changes nothing.
+#[must_use]
+pub fn adopted_blanks() -> u64 {
+    blanks()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .adopted
+}
+
+/// Whether a blank environment that has just been stood up was taken into the pool.
+enum Parked {
+    /// It is in the pool, waiting for the invocation that adopts it.
+    Waiting,
+    /// As many are standing as this process keeps, so this one is not held at all.
+    Refused,
+}
+
+/// Hold `standing`, which has just finished standing up, for the first invocation that needs
+/// an environment.
+fn parked(standing: Standing) -> Parked {
+    let mut blanks = blanks().lock().unwrap_or_else(PoisonError::into_inner);
+    parked_in(&mut blanks, standing)
+}
+
+/// [`parked`], on the pool handed in: the whole decision, with nothing of the process in it.
+///
+/// Every blank past [`IDLE_LIFETIME`] is retired first, for the reason the initialized ones
+/// are ([`retire_the_idle_span`]). The claim the build held is NOT given back here: it is the
+/// caller's guard that gives it back ([`Building`]), so a build that never reached this point
+/// gives it back too.
+fn parked_in(blanks: &mut Blanks, standing: Standing) -> Parked {
+    retire_the_blank_idle_span(blanks);
+    if blanks.waiting.len() >= MAX_STANDING_BLANKS {
+        return Parked::Refused;
+    }
+    blanks.waiting.push(Waiting {
+        jobs: standing.jobs,
+        since: Instant::now(),
+    });
+    Parked::Waiting
+}
+
+/// Give back the claim one build held on the count of environments being stood up: the
+/// thread could not be started, or the build on it is over ([`Building`]).
+fn building_ended() {
+    let mut blanks = blanks().lock().unwrap_or_else(PoisonError::into_inner);
+    ended_in(&mut blanks);
+}
+
+/// [`building_ended`], on the pool handed in.
+fn ended_in(blanks: &mut Blanks) {
+    blanks.building = blanks.building.saturating_sub(1);
+}
+
+/// Take a blank environment for an invocation that needs one, when one is standing.
+fn adopted_blank() -> Option<Standing> {
+    let mut blanks = blanks().lock().unwrap_or_else(PoisonError::into_inner);
+    taken_blank_from(&mut blanks)
+}
+
+/// [`adopted_blank`], on the pool handed in: the whole decision, with nothing of the process
+/// in it.
+///
+/// The freshest is taken and every one behind it that has stood past [`IDLE_LIFETIME`] is
+/// dropped, which ends its thread — the same reading [`taken_from`] serves an initialized
+/// environment by.
+fn taken_blank_from(blanks: &mut Blanks) -> Option<Standing> {
+    while let Some(waiting) = blanks.waiting.pop() {
+        if waiting.since.elapsed() < IDLE_LIFETIME {
+            blanks.adopted = blanks.adopted.saturating_add(1);
+            return Some(Standing {
+                jobs: waiting.jobs,
+            });
+        }
+    }
+    None
+}
+
+/// Drop every blank environment that has stood unused for [`IDLE_LIFETIME`].
+fn retire_the_blank_idle_span(blanks: &mut Blanks) {
+    blanks
+        .waiting
+        .retain(|waiting| waiting.since.elapsed() < IDLE_LIFETIME);
 }
 
 #[cfg(test)]
@@ -925,5 +1234,148 @@ mod tests {
                 completion
             );
         }
+    }
+
+    /// Which RUNTIMES a function's provisioning stands an environment up for: only the ones
+    /// whose runs happen in the interpreter this module stands up, because an environment of
+    /// that kind is the only one there is to stand up ahead of an invocation.
+    ///
+    /// The rows are one per kind of `Runtime` a function can carry.
+    #[test]
+    fn only_a_function_of_the_interpreters_own_runtime_is_provisioned_for() {
+        let cases: &[(&str, Option<&str>, bool)] = &[
+            ("a python runtime", Some("python3.12"), true),
+            ("another release of it", Some("python3.13"), true),
+            ("a node runtime", Some("nodejs22.x"), false),
+            ("a runtime no engine of this emulator runs", Some("go1.x"), false),
+            ("an image package, which names no runtime", None, false),
+        ];
+        for (case, runtime, expected) in cases {
+            let actual = super::super::engine_for(*runtime) == Some(super::super::Engine::Python);
+            assert_eq!(
+                actual, *expected,
+                "case {case}: expected an environment to be stood up for it to be {expected}, \
+                 got {actual}"
+            );
+        }
+    }
+
+    /// What the pool of BLANK environments does with the ones it is handed: it stands no more
+    /// up than this process keeps, counts one that is on its way as one of them, serves the
+    /// freshest to the invocation that needs an environment, and serves none that has stood
+    /// past the idle span — each blank it does not keep having its channel closed, which is
+    /// what tears that environment down.
+    #[test]
+    fn the_blank_pool_stands_up_what_it_keeps_and_serves_it_to_any_invocation() {
+        let mut blanks = Blanks::default();
+        // Up to the count this process keeps, every provisioning asks for one more; past it,
+        // none does — and the one already on its way counts.
+        for index in 0..MAX_STANDING_BLANKS {
+            assert!(
+                asked_for(&mut blanks),
+                "case {index} standing up: a provisioning must ask for one more"
+            );
+        }
+        assert_eq!(
+            blanks.building, MAX_STANDING_BLANKS,
+            "case every one on its way: expected {MAX_STANDING_BLANKS} being stood up, got {}",
+            blanks.building
+        );
+        assert!(
+            !asked_for(&mut blanks),
+            "case as many on their way as this process keeps: no further one may be asked for"
+        );
+        // Each one that stands is parked, and the claim its build held is given back by the
+        // guard the thread holds ([`Building`]), which is what this stands in for.
+        let mut channels = Vec::new();
+        for index in 0..MAX_STANDING_BLANKS {
+            let (standing, incoming) = environment();
+            assert!(
+                matches!(parked_in(&mut blanks, standing), Parked::Waiting),
+                "case {index} stood up: it must be held for the next invocation"
+            );
+            ended_in(&mut blanks);
+            channels.push(incoming);
+        }
+        assert_eq!(
+            (blanks.waiting.len(), blanks.building),
+            (MAX_STANDING_BLANKS, 0),
+            "case every one stood up: expected {MAX_STANDING_BLANKS} standing and none on \
+             their way, got {} and {}",
+            blanks.waiting.len(),
+            blanks.building
+        );
+        // One more than this process keeps is not held at all: it is refused, and its channel
+        // is closed when the caller tears it down.
+        let (standing, refused) = environment();
+        assert!(
+            matches!(parked_in(&mut blanks, standing), Parked::Refused),
+            "case one more than this process keeps: it must not be held"
+        );
+        drop(refused);
+        // An invocation of ANY key adopts a standing blank, because a blank has adopted no
+        // function yet.
+        let taken = taken_blank_from(&mut blanks);
+        assert!(
+            taken.is_some(),
+            "case an invocation that needs an environment: a standing blank must be served to it"
+        );
+        assert_eq!(
+            (blanks.waiting.len(), blanks.adopted),
+            (MAX_STANDING_BLANKS - 1, 1),
+            "case one adopted: expected {} standing and one adopted, got {} and {}",
+            MAX_STANDING_BLANKS - 1,
+            blanks.waiting.len(),
+            blanks.adopted
+        );
+        drop(taken);
+
+        // A blank that has stood past the idle span is not served from: it is retired, and the
+        // invocation that looked for one stands up its own.
+        let mut blanks = Blanks::default();
+        let (standing, incoming) = environment();
+        assert!(asked_for(&mut blanks), "case the idle span: one is asked for");
+        let _ = parked_in(&mut blanks, standing);
+        ended_in(&mut blanks);
+        for waiting in blanks.waiting.iter_mut() {
+            waiting.since -= IDLE_LIFETIME;
+        }
+        assert!(
+            taken_blank_from(&mut blanks).is_none(),
+            "case a blank past its idle span: it must not be served from"
+        );
+        assert!(
+            incoming.recv().is_err(),
+            "case a blank past its idle span: its thread must see its channel closed"
+        );
+        assert_eq!(
+            (blanks.waiting.len(), blanks.adopted),
+            (0, 0),
+            "case a blank past its idle span: nothing is held and nothing was adopted, got {} \
+             and {}",
+            blanks.waiting.len(),
+            blanks.adopted
+        );
+    }
+
+    /// A blank this process asked for and did not get leaves nothing claimed: the next
+    /// provisioning asks for one again.
+    #[test]
+    fn a_blank_that_did_not_stand_up_leaves_nothing_claimed() {
+        let mut blanks = Blanks::default();
+        assert!(
+            asked_for(&mut blanks),
+            "case the first provisioning: one is asked for"
+        );
+        ended_in(&mut blanks);
+        assert_eq!(
+            blanks.building, 0,
+            "case a build that did not stand: nothing may be left claimed, got {}",
+            blanks.building
+        );
+        assert!(
+            asked_for(&mut blanks),
+            "case the provisioning after it: one must be asked for again"
+        );
     }
 }

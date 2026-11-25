@@ -728,9 +728,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(config) = record.config_of(&reported_version).cloned() else {
             return Err(service_error("The updated function could not be read back"));
         };
-        Ok(function_configuration(
-            record.unqualified_configuration(&reported_version, &config),
-        ))
+        let runtime = record.config.runtime.clone();
+        let reported = record.unqualified_configuration(&reported_version, &config);
+        // A code change is a new revision of the function, so no environment built before it
+        // serves an invocation made after it: Lambda provisions a new instance of the
+        // function in the window this update opened, which is an EXECUTION ENVIRONMENT stood
+        // up off the next invocation's path
+        // (see `crate::state::execution::warm_pool::provision`).
+        crate::state::execution::warm_pool::provision(runtime.as_deref());
+        Ok(function_configuration(reported))
     }
 }
 
