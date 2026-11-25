@@ -736,15 +736,14 @@ async fn data_that_states_no_value_for_an_attribute_the_template_names_is_refuse
 #[tokio::test]
 async fn rendering_data_that_is_no_set_of_key_value_pairs_is_refused() {
     // The model: `TemplateData` "is a set of key-value pairs", so a JSON value that is no
-    // object states no values for anything. The rows span what else text can be, with the
-    // sentence each is refused with: text the JSON reader cannot read at all is reported as
-    // the parse that failed, and a JSON value that IS read but is no object is reported as
-    // data that is not what the member has to be.
+    // object states no values for anything. The rows span what else text can be: text the
+    // JSON reader cannot read at all and a JSON value that IS read but is no object are one
+    // failure of the member, refused in the one sentence AWS words it with.
     for (case, data, sentence) in [
         (
             "text that is no JSON at all",
             "not json",
-            "Unable to parse template data (invalid JSON).",
+            "Template rendering data is invalid",
         ),
         (
             "a JSON array",
@@ -762,7 +761,7 @@ async fn rendering_data_that_is_no_set_of_key_value_pairs_is_refused() {
         (
             "an object that never closes",
             r#"{"name":"Ada""#,
-            "Unable to parse template data (invalid JSON).",
+            "Template rendering data is invalid",
         ),
     ] {
         let ses = Ses::new();

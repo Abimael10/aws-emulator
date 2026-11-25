@@ -302,13 +302,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The values the template's message variables take for a destination the request
-        // states none of its own for. A bulk send that carries no default data at all is
-        // ACCEPTED and states no value for any variable, which is not how a SINGLE send
-        // reads the same absence (`crate::ops::send_email` is recorded refusing it, and the
-        // bulk surface is recorded accepting an entry whose destination is the only thing
-        // wrong with the call): each surface is worded and ordered as it is recorded.
+        // states none of its own for. A bulk send STATES that default set: a request whose
+        // default content carries no `TemplateData` member has not stated it at all, which is
+        // a failure of the REQUEST and is refused here — ahead of every gate on the account
+        // and its identities below, so what the request has not said is reported whatever
+        // state the sender is in. Each surface words the same absence as it is recorded
+        // wording it: this is not the sentence the SINGLE send states
+        // (`crate::ops::send_email`).
         let default_variables = match template.template_data.as_deref() {
-            None => ::serde_json::Value::Object(::serde_json::Map::new()),
+            None => return Err(bad_request(NO_DEFAULT_TEMPLATE_DATA)),
             Some(raw) => match crate::state::template_rendering::message_variables(raw) {
                 Ok(variables) => variables,
                 Err(defect) => return Err(bad_request(defect)),
@@ -711,6 +713,19 @@ const TEMPLATE_CONTENT_REQUIRED: &str = "Template content must be specified";
 /// (`crate::ops::send_email`): the two surfaces are recorded stating it differently, and a
 /// client reading one must not be handed the other's sentence.
 const NO_TEMPLATE_NAMED: &str = "TemplateName and TemplateArn both can not be empty";
+
+/// How this operation refuses a request whose default content states no values for the
+/// template's message variables at all — a `Template` carrying no `TemplateData` member.
+///
+/// `Template$TemplateData` is "an object that defines the values to use for message
+/// variables in the template", and on this surface it is the DEFAULT set: the values every
+/// destination's message is rendered from unless that entry replaces them
+/// (`BulkEmailEntry$ReplacementEmailContent`). A request that carries the member has stated
+/// that set — the empty object states it and states no variable — and a request that carries
+/// no such member has not stated it, which is what this sentence reports: wholly fixed text,
+/// echoing nothing of the request. Worded as THIS operation words it, which is not how the
+/// single send reports the same absence (`crate::ops::send_email`).
+const NO_DEFAULT_TEMPLATE_DATA: &str = "The default template data does not exist";
 
 /// How this operation refuses a request that states no sending identity at all — one
 /// carrying no `FromEmailAddress`.

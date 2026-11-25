@@ -319,11 +319,11 @@ async fn a_refused_create_persists_nothing_so_the_name_stays_reusable() {
 }
 
 /// The forms rendering data takes when it is not the object the model says it is, with the
-/// sentence each is refused with: text the JSON reader cannot read at all is reported as the
-/// parse that failed, and a JSON value that IS read but is no set of key-value pairs is
-/// reported as data that is not what the member has to be.
+/// sentence each is refused with: text the JSON reader cannot read at all and a JSON value
+/// that IS read but is no set of key-value pairs are one failure of the member, so one
+/// sentence refuses them all.
 const MALFORMED_DATA: [(&str, &str, &str); 7] = [
-    ("text that is no JSON at all", "name=Ada", UNPARSEABLE_RENDERING_DATA),
+    ("text that is no JSON at all", "name=Ada", INVALID_RENDERING_DATA),
     ("a JSON array", r#"["name","Ada"]"#, INVALID_RENDERING_DATA),
     ("a JSON string", r#""Ada""#, INVALID_RENDERING_DATA),
     ("a JSON number", "42", INVALID_RENDERING_DATA),
@@ -332,17 +332,13 @@ const MALFORMED_DATA: [(&str, &str, &str); 7] = [
     (
         "an object that never closes",
         r#"{"name":"Ada""#,
-        UNPARSEABLE_RENDERING_DATA,
+        INVALID_RENDERING_DATA,
     ),
 ];
 
 /// AWS's sentence for rendering data that is not a set of key-value pairs: fixed text with
 /// no variable part and no trailing full stop.
 const INVALID_RENDERING_DATA: &str = "Template rendering data is invalid";
-
-/// AWS's sentence for rendering data the JSON reader cannot read at all: fixed text, with a
-/// trailing full stop.
-const UNPARSEABLE_RENDERING_DATA: &str = "Unable to parse template data (invalid JSON).";
 
 #[tokio::test]
 async fn malformed_rendering_data_is_refused_in_one_sentence_whoever_read_it() {

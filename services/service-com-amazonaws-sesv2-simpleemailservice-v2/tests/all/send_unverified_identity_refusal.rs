@@ -258,13 +258,10 @@ const HTML: &str = "<p>Hi {{name}}</p>";
 /// Well-formed template data for that template.
 const DATA: &str = "{\"name\":\"Ada\"}";
 
-/// The sentence this service answers for template data that is no set of key-value pairs,
-/// which `TestRenderEmailTemplate` answers the same data with.
+/// The sentence this service answers for template data that is no set of key-value pairs —
+/// JSON the reader cannot read at all included — which `TestRenderEmailTemplate` answers the
+/// same data with.
 const INVALID_DATA: &str = "Template rendering data is invalid";
-
-/// The sentence this service answers for template data the JSON reader cannot read at all,
-/// which `TestRenderEmailTemplate` answers the same data with.
-const UNPARSEABLE_DATA: &str = "Unable to parse template data (invalid JSON).";
 
 /// The sentence a templated send is refused with when it states no values for the template's
 /// message variables at all.
@@ -529,7 +526,7 @@ async fn template_data_is_refused_first_then_the_sender_then_the_template_name()
             sender: "stranger@example.com",
             names: Names::Stored,
             data: Some("{\"name\": "),
-            expect: Expect::BadRequest(UNPARSEABLE_DATA),
+            expect: Expect::BadRequest(INVALID_DATA),
         },
         TemplatedRow {
             case: "a JSON list rather than a set of key-value pairs, with an unverified \
@@ -551,7 +548,7 @@ async fn template_data_is_refused_first_then_the_sender_then_the_template_name()
             sender: "stranger@example.com",
             names: Names::Absent("absent"),
             data: Some("name=Ada"),
-            expect: Expect::BadRequest(UNPARSEABLE_DATA),
+            expect: Expect::BadRequest(INVALID_DATA),
         },
         TemplatedRow {
             case: "a JSON string rather than an object, with the content carried inline and \
@@ -593,7 +590,7 @@ async fn template_data_is_refused_first_then_the_sender_then_the_template_name()
             sender: "ada@verified.example",
             names: Names::Stored,
             data: Some("{\"name\": "),
-            expect: Expect::BadRequest(UNPARSEABLE_DATA),
+            expect: Expect::BadRequest(INVALID_DATA),
         },
         TemplatedRow {
             case: "a verified sender and a template name that does not exist: the name is \

@@ -370,10 +370,10 @@ fn request(data: Option<&str>, entries: Vec<Value>) -> Value {
 async fn the_default_template_data_has_to_be_a_set_of_key_value_pairs() {
     // The rows span the ways default template data can fail to supply message variables:
     // every JSON value that is no object — a list, each kind of scalar — and text the JSON
-    // reader cannot read at all, which is reported as the parse that failed. The accepted
-    // rows below are the counter-case, and they include the member left out altogether: a
-    // bulk send with no default data states no value for any variable rather than being
-    // malformed.
+    // reader cannot read at all, which is one failure of the member and is refused in one
+    // sentence. The member left out ALTOGETHER is the distinct refusal
+    // `tests/all/bulk_default_template_data.rs` pins; the accepted rows below are the
+    // counter-case.
     let refused: &[(&str, Option<&str>, &str)] = &[
         (
             "a JSON list",
@@ -403,12 +403,12 @@ async fn the_default_template_data_has_to_be_a_set_of_key_value_pairs() {
         (
             "text that is no JSON at all",
             Some("name=reader"),
-            "Unable to parse template data (invalid JSON).",
+            "Template rendering data is invalid",
         ),
         (
             "an unterminated JSON object",
             Some("{\"name\":"),
-            "Unable to parse template data (invalid JSON).",
+            "Template rendering data is invalid",
         ),
     ];
 
@@ -444,10 +444,9 @@ async fn the_default_template_data_has_to_be_a_set_of_key_value_pairs() {
         );
     }
 
-    // The values that ARE a set of key-value pairs, including the two empty ones a caller
-    // may send (`EmailTemplateData` is `length: min 0`) and the member left out entirely.
+    // The values that ARE a set of key-value pairs, including the empty ones a caller may
+    // send (`EmailTemplateData` is `length: min 0`).
     for (case, data) in [
-        ("no TemplateData member at all", None),
         ("the empty string", Some("")),
         ("an empty JSON object", Some("{}")),
         ("one pair", Some("{\"name\":\"Ada\"}")),
@@ -981,7 +980,7 @@ async fn an_entry_that_names_no_message_is_the_only_one_that_fails() {
                 }},
             }),
             "INVALID_PARAMETER",
-            "Unable to parse template data (invalid JSON).",
+            "Template rendering data is invalid",
         ),
     ];
 
@@ -1902,7 +1901,7 @@ async fn a_templated_send_that_names_no_renderable_template_is_refused() {
             json!({"Template": {"TemplateName": TEMPLATE, "TemplateData": "name=Ada"}}),
             400,
             "BadRequestException",
-            "Unable to parse template data (invalid JSON).".to_string(),
+            "Template rendering data is invalid".to_string(),
         ),
         (
             "a template naming neither a stored template nor content of its own",
