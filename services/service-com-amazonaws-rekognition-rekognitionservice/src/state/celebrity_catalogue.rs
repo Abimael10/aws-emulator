@@ -23,21 +23,22 @@
 //! `CompareFaces` reports a `Similarity` from — is what resolves a submitted face against the
 //! catalogue:
 //!
-//! * a measured face is the entry whose reference face it RESEMBLES MOST, provided it
-//!   resembles it by more than chance ([`MINIMUM_RESEMBLANCE`]), and the resemblance measured
-//!   for it is the `MatchConfidence` reported with it — "the confidence, in percentage, that
-//!   Amazon Rekognition has that the recognized face is the celebrity"
-//!   (`smithy_query(query="shape",shape="Celebrity")`);
+//! * a measured face is the entry whose reference face it RESEMBLES MOST of those the answer
+//!   has not already named, and the resemblance measured for it is the `MatchConfidence`
+//!   reported with it — "the confidence, in percentage, that Amazon Rekognition has that the
+//!   recognized face is the celebrity" (`smithy_query(query="shape",shape="Celebrity")`), so a
+//!   caller reads off the answer how near the match it was given was;
 //! * one entry is one PERSON, so an entry is matched at most once per answer and the face
 //!   that resembles it most takes it: the same person is not reported twice in one image.
 //!   Two faces of one image that resemble one entry alike are therefore reported as two
 //!   different people rather than one of them being dropped from the answer, because the
 //!   partition reports every face it measured and the catalogue is what names them;
-//! * a face that resembles NO entry of the catalogue above that floor — a patch whose light
-//!   and dark does not rise and fall with any reference face's, which includes a flat patch
-//!   that resembles nothing at all — is not identified, and is reported on the unrecognized
-//!   side of the partition, which is where the operation itself puts a face it does not
-//!   recognise.
+//! * a face that resembles NO entry of the catalogue AT ALL ([`MINIMUM_RESEMBLANCE`]) — one
+//!   whose light and dark rises and falls with no reference face's, which includes a flat
+//!   patch that resembles nothing, itself included — is not identified, and neither is a face
+//!   the catalogue has run out of people for, since one entry is one person. Either way it is
+//!   reported on the unrecognized side of the partition, which is where the operation itself
+//!   puts a face it does not recognise.
 //!
 //! The catalogue is READ, never written: it is seeded state, the same for every caller, so two
 //! identical calls answer identically and a recognition persists nothing. Its entries are what
@@ -51,18 +52,21 @@ use crate::ops::types::{Celebrity, ComparedFace, KnownGender};
 /// measured on, so the two correlate cell for cell.
 const REFERENCE_CELLS: usize = APPEARANCE_GRID * APPEARANCE_GRID;
 
-/// How much a measured face must resemble a reference face to BE that celebrity, on the 0..100
-/// scale [`FaceAppearance::similarity_to`] measures a resemblance on.
+/// The resemblance a measured face must EXCEED to BE a catalogue entry's celebrity, on the
+/// 0..100 scale [`FaceAppearance::similarity_to`] measures a resemblance on.
 ///
-/// AWS publishes no number for the confidence at which its own catalogue reports a match, so
-/// this is the EMULATOR's floor, and it is set where a measured resemblance stops being
-/// CHANCE: both grids are centred and scaled to unit length, so two unrelated ones correlate
-/// around zero with a standard deviation of one over the square root of their
-/// [`REFERENCE_CELLS`] cells — 12.5 on this scale — and the floor is twice that. A face that
-/// resembles every entry by less has been matched to none of them: it resembles the nearest no
-/// more than two unrelated faces resemble each other, and is reported as an unrecognized face
-/// rather than as a celebrity nothing identified.
-pub const MINIMUM_RESEMBLANCE: f32 = 25.0;
+/// It is ZERO, exclusive: what makes a face one entry of the catalogue rather than another is
+/// being NEAREST to that entry, and what makes it a celebrity at all is resembling that entry
+/// at all — its own light and dark rising and falling WITH that reference face's, which is a
+/// positive correlation. Nothing above that is a floor this emulator can set honestly: a
+/// PHOTOGRAPHED face is measured on whatever its own box holds — hair, shadow, a collar, the
+/// ground behind the head — so its grid correlates with any reference face at a level a floor
+/// set above chance excludes, and a catalogue behind such a floor can name no face in a
+/// photograph at all, which is reported as an image of nobody recognisable rather than as the
+/// recognition it is. The strength of each match is reported instead, as the
+/// `MatchConfidence` the entry is carried with, where a caller can see it; a face that
+/// correlates with no entry positively, a flat patch included, is still named by none of them.
+pub const MINIMUM_RESEMBLANCE: f32 = 0.0;
 
 /// The `KnownGenderType` values a catalogue entry's `KnownGender` may carry: "the known
 /// gender identity can be Male, Female, Nonbinary, or Unlisted"
@@ -469,7 +473,7 @@ impl CelebrityCatalogue {
     /// Which celebrity, if any, each of `faces` IS: for every measured appearance in turn, the
     /// entry whose reference face it resembles most of those not already taken by an earlier
     /// face of the same answer, and `None` for a face that resembles no entry of the catalogue
-    /// by more than chance ([`MINIMUM_RESEMBLANCE`]).
+    /// at all ([`MINIMUM_RESEMBLANCE`]).
     ///
     /// The faces are offered in the order the answer reports them, which is largest first, so
     /// a contested entry goes to the larger face of the image.
@@ -483,10 +487,10 @@ impl CelebrityCatalogue {
                     continue;
                 }
                 let resemblance = face.similarity_to(&entry.reference);
-                // A face resembles an entry when its own light and dark rise and fall with
-                // that reference face's by more than two unrelated grids would: below
-                // `MINIMUM_RESEMBLANCE` the nearest entry is no nearer than chance.
-                if resemblance >= MINIMUM_RESEMBLANCE
+                // A face resembles an entry when its own light and dark rise and fall WITH
+                // that reference face's at all; of the entries it resembles, it is the one it
+                // resembles most.
+                if resemblance > MINIMUM_RESEMBLANCE
                     && best.is_none_or(|(_, most)| resemblance > most)
                 {
                     best = Some((index, resemblance));
@@ -626,27 +630,213 @@ mod tests {
         }
     }
 
-    /// Every match the catalogue reports is above the floor, and the floor is above the level
-    /// two unrelated grids correlate at: one over the square root of the grid's cells.
+    /// Every match the catalogue reports is a resemblance it MEASURED — a `Percent`, above
+    /// [`MINIMUM_RESEMBLANCE`] and no more than the top of the scale — and, offered on its
+    /// own, a face is reported as the NEAREST entry of the catalogue: no entry resembles it
+    /// more than the one it was named as. A FAINT resemblance is a match like any other: what
+    /// names a face is being nearest, and how near it was is reported rather than being the
+    /// difference between a celebrity and an anonymous face.
     #[test]
-    fn the_resemblance_floor_is_above_the_level_two_unrelated_grids_correlate_at() {
-        let chance = 100.0 / (REFERENCE_CELLS as f32).sqrt();
-        assert!(
-            MINIMUM_RESEMBLANCE > chance,
-            "case {:?}: the floor {MINIMUM_RESEMBLANCE} must stand above chance, {chance}",
-            "the floor against chance"
-        );
+    fn a_reported_match_is_the_nearest_entry_and_carries_the_resemblance_measured_for_it() {
         let catalogue = CelebrityCatalogue::default();
-        let faces: Vec<FaceAppearance> = SEEDED
+        // Each row is a grid of its own: the reference faces themselves, two faces the
+        // catalogue was not built from — a slope of light across the box, and a grid whose
+        // every other cell is dark — and each reference face mixed with that slope in a
+        // growing proportion, which is a face that resembles its entry ever more faintly.
+        let slope: Vec<f32> = (0..REFERENCE_CELLS).map(|cell| cell as f32).collect();
+        let mut faces: Vec<(String, FaceAppearance)> = SEEDED
             .iter()
-            .map(|seeded| FaceAppearance::of_cell_tones(seeded.portrait.cells()))
+            .map(|seeded| {
+                (
+                    seeded.id.to_string(),
+                    FaceAppearance::of_cell_tones(seeded.portrait.cells()),
+                )
+            })
             .collect();
-        for (index, identified) in catalogue.identify(&faces).into_iter().enumerate() {
-            let confidence = identified.map(|found| found.match_confidence());
-            assert!(
-                confidence.is_some_and(|confidence| confidence >= MINIMUM_RESEMBLANCE),
-                "case {index}: a reported match is above the floor, got {confidence:?}"
-            );
+        faces.push((
+            "a slope of light across the box".to_string(),
+            FaceAppearance::of_cell_tones(slope.clone()),
+        ));
+        faces.push((
+            "every other cell dark".to_string(),
+            FaceAppearance::of_cell_tones(
+                (0..REFERENCE_CELLS)
+                    .map(|cell| if cell.is_multiple_of(2) { 40.0 } else { 200.0 })
+                    .collect(),
+            ),
+        ));
+        for seeded in &SEEDED {
+            for weight in [2.0_f32, 8.0, 32.0] {
+                let mixed: Vec<f32> = seeded
+                    .portrait
+                    .cells()
+                    .into_iter()
+                    .zip(slope.iter())
+                    .map(|(tone, slope)| tone + weight * slope)
+                    .collect();
+                faces.push((
+                    format!("{} under a slope of {weight}", seeded.id),
+                    FaceAppearance::of_cell_tones(mixed),
+                ));
+            }
         }
+        // Patterns no face carries: stripes and chequers of several periods, a bright frame,
+        // one dark cell. A grid of this kind rises and falls with a reference face hardly at
+        // all, which is what a FAINT resemblance is.
+        let span = APPEARANCE_GRID;
+        let patterns: Vec<(&str, Vec<f32>)> = vec![
+            (
+                "columns in stripes",
+                (0..REFERENCE_CELLS)
+                    .map(|cell| {
+                        if (cell % span).is_multiple_of(2) {
+                            40.0
+                        } else {
+                            210.0
+                        }
+                    })
+                    .collect(),
+            ),
+            (
+                "rows in stripes",
+                (0..REFERENCE_CELLS)
+                    .map(|cell| {
+                        if (cell / span).is_multiple_of(2) {
+                            40.0
+                        } else {
+                            210.0
+                        }
+                    })
+                    .collect(),
+            ),
+            (
+                "chequers two cells wide",
+                (0..REFERENCE_CELLS)
+                    .map(|cell| {
+                        if ((cell % span) / 2 + (cell / span) / 2).is_multiple_of(2) {
+                            60.0
+                        } else {
+                            190.0
+                        }
+                    })
+                    .collect(),
+            ),
+            (
+                "a bright frame around the box",
+                (0..REFERENCE_CELLS)
+                    .map(|cell| {
+                        let (row, column) = (cell / span, cell % span);
+                        let edge = row == 0 || column == 0 || row == span - 1
+                            || column == span - 1;
+                        if edge {
+                            220.0
+                        } else {
+                            80.0
+                        }
+                    })
+                    .collect(),
+            ),
+            (
+                "one dark cell in the middle",
+                (0..REFERENCE_CELLS)
+                    .map(|cell| if cell == REFERENCE_CELLS / 2 + 4 { 20.0 } else { 180.0 })
+                    .collect(),
+            ),
+            (
+                "a sweep across the diagonal",
+                (0..REFERENCE_CELLS)
+                    .map(|cell| ((cell % span) * 7 + (cell / span) * 3) as f32 % 97.0)
+                    .collect(),
+            ),
+        ];
+        for (case, cells) in patterns {
+            faces.push((case.to_string(), FaceAppearance::of_cell_tones(cells)));
+        }
+        // The level two unrelated grids of this many cells correlate at: one over the square
+        // root of their cells. A resemblance below it is FAINT — nearer than nothing, and no
+        // nearer than chance — and the rows below include such a face.
+        // A match a long way below the top of the scale — the kind of reading a PHOTOGRAPHED
+        // face gives, where the box the appearance is measured over carries hair, shadow and
+        // whatever stands behind the head beside the face itself. The table has to include
+        // one, or it says nothing about a faint match being a match.
+        const FAINT: f32 = 20.0;
+        let mut faint_matches = 0_usize;
+        let mut measured: Vec<String> = Vec::new();
+        for (case, face) in &faces {
+            let nearest = catalogue
+                .entries()
+                .iter()
+                .map(|entry| face.similarity_to(&entry.reference))
+                .fold(0.0_f32, f32::max);
+            measured.push(format!("{case}:{nearest:.1}"));
+            let identified = catalogue.identify(std::slice::from_ref(face));
+            let confidence = identified[0].map(|found| found.match_confidence());
+            if nearest > MINIMUM_RESEMBLANCE {
+                assert!(
+                    confidence
+                        .is_some_and(|measured| (measured - nearest).abs() < 0.01
+                            && measured > MINIMUM_RESEMBLANCE
+                            && measured <= 100.0),
+                    "case {case:?}: the nearest entry is at {nearest}, so that is the match \
+                     reported, got {confidence:?}"
+                );
+                if nearest < FAINT {
+                    faint_matches += 1;
+                }
+            } else {
+                assert!(
+                    confidence.is_none(),
+                    "case {case:?}: a face no entry resembles is identified as none of them, \
+                     got {confidence:?}"
+                );
+            }
+        }
+        assert!(
+            faint_matches > 0,
+            "case {:?}: the table must include a face named on a resemblance below {FAINT}, \
+             got {faint_matches} of {measured:?}",
+            "a faint resemblance"
+        );
+    }
+
+    /// One entry is one PERSON, so a catalogue of a given size names at most that many faces
+    /// of one answer: an answer carrying more faces than the catalogue holds entries reports
+    /// the rest on the unrecognized side rather than naming one person twice.
+    #[test]
+    fn an_answer_with_more_faces_than_the_catalogue_holds_leaves_the_rest_unidentified() {
+        let catalogue = CelebrityCatalogue::default();
+        let held = catalogue.entries().len();
+        let crowd: Vec<FaceAppearance> = (0..held + 2)
+            .map(|index| {
+                FaceAppearance::of_cell_tones(SEEDED[index % SEEDED.len()].portrait.cells())
+            })
+            .collect();
+        let identified = catalogue.identify(&crowd);
+        let named: Vec<String> = identified
+            .iter()
+            .filter_map(|found| found.map(|found| found.entry().id().to_string()))
+            .collect();
+        assert!(
+            named.len() <= held,
+            "case {:?}: at most the {held} entries held can be named, got {named:?}",
+            "more faces than entries"
+        );
+        let mut distinct = named.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            named.len(),
+            "case {:?}: one entry is one person, got {named:?}",
+            "more faces than entries"
+        );
+        let unidentified = identified.iter().filter(|found| found.is_none()).count();
+        assert!(
+            unidentified >= crowd.len() - held,
+            "case {:?}: the {} face(s) past the catalogue's {held} entries are unidentified, \
+             got {unidentified}",
+            "more faces than entries",
+            crowd.len() - held
+        );
     }
 }

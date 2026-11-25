@@ -60,7 +60,7 @@ const GRAIN_SEED: u64 = 0x5245_4b5f_5048_4f54;
 /// face is turned to the camera at all (a subject photographed from behind shows hair and
 /// no features).
 #[derive(Debug, Clone, Copy)]
-struct Subject {
+pub(crate) struct Subject {
     eyes_x: f32,
     eyes_y: f32,
     /// The distance between the two eyes, which every other distance below is a multiple
@@ -70,7 +70,7 @@ struct Subject {
 }
 
 impl Subject {
-    fn new(eyes_x: f32, eyes_y: f32, eye_span: f32) -> Self {
+    pub(crate) fn new(eyes_x: f32, eyes_y: f32, eye_span: f32) -> Self {
         Self {
             eyes_x,
             eyes_y,
@@ -81,21 +81,21 @@ impl Subject {
 
     /// The same person photographed from behind: the hair and the shoulders are there, the
     /// face is not.
-    fn turned_away(mut self) -> Self {
+    pub(crate) fn turned_away(mut self) -> Self {
         self.facing = false;
         self
     }
 
-    fn left_eye(&self) -> (f32, f32) {
+    pub(crate) fn left_eye(&self) -> (f32, f32) {
         (self.eyes_x - self.eye_span / 2.0, self.eyes_y)
     }
 
-    fn right_eye(&self) -> (f32, f32) {
+    pub(crate) fn right_eye(&self) -> (f32, f32) {
         (self.eyes_x + self.eye_span / 2.0, self.eyes_y)
     }
 
     /// Where the mouth sits: about one interocular distance below the eye line.
-    fn mouth_centre(&self) -> (f32, f32) {
+    pub(crate) fn mouth_centre(&self) -> (f32, f32) {
         (self.eyes_x, self.eyes_y + 1.05 * self.eye_span)
     }
 
@@ -113,23 +113,23 @@ impl Subject {
 
 /// One drawn photograph: the frame, the light it was taken in and the people in it.
 #[derive(Debug, Clone)]
-struct Photograph {
-    width: u32,
-    height: u32,
+pub(crate) struct Photograph {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
     /// The background at the top and at the bottom of the frame: a photograph is never one
     /// flat tone, so the background runs between the two.
-    sky: u8,
+    pub(crate) sky: u8,
     floor: u8,
-    skin: u8,
+    pub(crate) skin: u8,
     /// How much the grain of the film perturbs every pixel, in grey levels.
     grain: u8,
-    subjects: Vec<Subject>,
+    pub(crate) subjects: Vec<Subject>,
 }
 
 impl Photograph {
     /// A head-and-shoulders portrait: one person, centred, in an evenly lit frame. The base
     /// every case below varies from.
-    fn portrait() -> Self {
+    pub(crate) fn portrait() -> Self {
         Self {
             width: 320,
             height: 320,
@@ -141,25 +141,25 @@ impl Photograph {
         }
     }
 
-    fn with_size(mut self, width: u32, height: u32) -> Self {
+    pub(crate) fn with_size(mut self, width: u32, height: u32) -> Self {
         self.width = width;
         self.height = height;
         self
     }
 
-    fn with_subjects(mut self, subjects: Vec<Subject>) -> Self {
+    pub(crate) fn with_subjects(mut self, subjects: Vec<Subject>) -> Self {
         self.subjects = subjects;
         self
     }
 
-    fn with_light(mut self, sky: u8, floor: u8, skin: u8) -> Self {
+    pub(crate) fn with_light(mut self, sky: u8, floor: u8, skin: u8) -> Self {
         self.sky = sky;
         self.floor = floor;
         self.skin = skin;
         self
     }
 
-    fn with_grain(mut self, grain: u8) -> Self {
+    pub(crate) fn with_grain(mut self, grain: u8) -> Self {
         self.grain = grain;
         self
     }
@@ -167,7 +167,7 @@ impl Photograph {
     /// The pixels of this photograph: the lit background, then each person from the back
     /// forwards — clothing, hair, head, and the features of a face turned to the camera —
     /// and the grain of the film over all of it.
-    fn render(&self) -> GrayImage {
+    pub(crate) fn render(&self) -> GrayImage {
         let mut image = GrayImage::from_pixel(self.width, self.height, Luma([self.sky]));
         let height = self.height.max(1) as f32;
         for y in 0..self.height {
@@ -305,7 +305,7 @@ impl Photograph {
         }
     }
 
-    fn bytes(&self, format: ImageFormat) -> Vec<u8> {
+    pub(crate) fn bytes(&self, format: ImageFormat) -> Vec<u8> {
         encode(&self.render(), format)
     }
 }

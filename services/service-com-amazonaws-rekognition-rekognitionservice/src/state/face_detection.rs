@@ -52,13 +52,16 @@
 //!    with that contrast ([`MAX_SKIN_TEXTURE_RATIO`]) — skin is a smooth region, while a
 //!    region whose intensity swings as much as the features do is texture or noise — the
 //!    box stands out from the ring around it by [`MIN_REGION_CONTRAST`] (figure against
-//!    ground, where there is a ring to measure), [`MIN_FACE_SKIN_FRACTION`] of the box is
-//!    that same skin, so the box is mostly the face rather than mostly whatever surrounds
-//!    it, the skin just OUTSIDE one of the two eyes stands above them too
+//!    ground, where there is a ring to measure), [`MIN_FACE_SKIN_FRACTION`] of the INNER
+//!    FACE — the region between the temples that runs from the brow to the chin
+//!    ([`INNER_FACE_HALF_WIDTH_IN_SPANS`], [`INNER_FACE_BROW_IN_SPANS`],
+//!    [`INNER_FACE_CHIN_IN_SPANS`]) — is that same skin, so the face itself is mostly face
+//!    rather than mostly whatever else its region holds, the skin just OUTSIDE one of the
+//!    two eyes stands above them too
 //!    ([`MIN_TEMPLE_CONTRAST_RATIO`]) — the eyes of a face have face on both sides of them,
 //!    while two dark blobs with only background outside them flank something that is not a
 //!    face — and there is a wide dark feature where a mouth belongs. A pair with no mouth,
-//!    no smooth skin between the eyes, no skin across its box or beside it, or no
+//!    no smooth skin between the eyes, no skin across the face itself or beside it, or no
 //!    separation from its surroundings is reported as nothing at all.
 //! 7. **Score** — the `Confidence` reported is the detector's own measured agreement: how
 //!    alike the two eyes are, how level, how far the bridge stands above them in intensity
@@ -226,11 +229,32 @@ pub const QUALITY_BAR_LOW: f32 = 1.0;
 pub const QUALITY_BAR_MEDIUM: f32 = 3.0;
 pub const QUALITY_BAR_HIGH: f32 = 6.0;
 
-/// How much of a face's box must be the face's own SKIN — the tone measured between and
-/// below its eyes — for the box to be a face at all: a box that is in the majority
-/// something else (the background, a garment, hair, the side of a neck) is a region of the
+/// How much of a face's INNER FACE must be the face's own SKIN — the tone measured between
+/// and below its eyes — for the pair to be a face at all: a region that is in the majority
+/// something else (the background, a garment, hair, the side of a neck) is a part of the
 /// picture a pair of dark specks lined up in, not a face.
-pub const MIN_FACE_SKIN_FRACTION: f32 = 0.5;
+///
+/// The fraction is measured over the inner face rather than over the whole derived box,
+/// because a face's box is NOT all face: the proportions put its top edge above the
+/// hairline and its bottom edge below the chin, and its corners fall outside the head
+/// altogether, so hair, neck, clothing and background take up much of it — on a
+/// photograph, the majority of it. What a face IS skin over is the region the inner face
+/// covers, and the only tones inside that region that are not skin are the face's own dark
+/// features: the brows, the eyes, the nostrils, the mouth and the shadow each casts, which
+/// together take up about a third of it. The bar is therefore three fifths — a clear
+/// majority, with the rest of the margin left to the shading that falls across a
+/// photographed face.
+pub const MIN_FACE_SKIN_FRACTION: f32 = 0.6;
+
+/// The INNER FACE, in multiples of the eye span and relative to the eye line: how far to
+/// each side of the face's own axis it reaches, and how far above and below that line it
+/// runs. These are the standard facial proportions — the temples sit about half an
+/// interocular distance out from the axis, the brow about a quarter of one above the eye
+/// line and the chin about one and a quarter below it — so the region is the face from brow
+/// to chin and from temple to temple, and nothing outside the head.
+pub const INNER_FACE_HALF_WIDTH_IN_SPANS: f32 = 0.55;
+pub const INNER_FACE_BROW_IN_SPANS: f32 = 0.25;
+pub const INNER_FACE_CHIN_IN_SPANS: f32 = 1.25;
 
 /// How far from that skin's own tone a pixel may sit and still BE that skin, as a fraction
 /// of how far the skin stands above the face's dark features: the features set into a face
@@ -1083,12 +1107,21 @@ fn candidate(pixels: &Pixels, blobs: &[Blob], first: usize, second: usize) -> Op
     if !stands_out(pixels, &rect, span) {
         return None;
     }
-    // A face's box is mostly the FACE: the skin measured between and below its eyes covers
-    // it, with the features set into that skin. A box that is in the majority something
-    // else was not read off a face.
+    // A face is mostly the FACE: the skin measured between and below its eyes covers the
+    // region from the brow to the chin and from temple to temple, with the features set into
+    // that skin. The box the proportions derive runs above the hairline and below the chin
+    // and its corners fall outside the head altogether, so on a photograph most of THAT is
+    // hair, clothing and whatever stands behind the head; what has to be the face is the
+    // face. A region that is in the majority something else was not read off one.
     let skin = (bridge + cheeks) / 2.0;
-    if skin_coverage(pixels, pixels.rect(rect.bounds()), skin, contrast) < MIN_FACE_SKIN_FRACTION
-    {
+    let inner_face = pixels.around(
+        mid_x,
+        mid_y + (INNER_FACE_CHIN_IN_SPANS - INNER_FACE_BROW_IN_SPANS) / 2.0 * span,
+        INNER_FACE_HALF_WIDTH_IN_SPANS * span,
+        (INNER_FACE_CHIN_IN_SPANS + INNER_FACE_BROW_IN_SPANS) / 2.0 * span,
+    );
+    let coverage = skin_coverage(pixels, inner_face, skin, contrast);
+    if coverage < MIN_FACE_SKIN_FRACTION {
         return None;
     }
     // The eyes are set INTO a face: outside each of them the face carries on toward the side
