@@ -188,7 +188,11 @@ async fn a_client_that_dials_what_the_api_published_reaches_this_emulator() {
 }
 
 /// The scheme, the authority and the path a published URI carries, read out of the URI itself.
-fn split_uri(case: &str, uri: &str) -> (String, String, String) {
+///
+/// Shared with the suite that follows the same discovery path on an `OPENID_CONNECT` API
+/// ([`crate::graphql_api_open_id_connect_published_uri`]), so the tree holds ONE reading of how
+/// a client parses what a GraphQL API published.
+pub(crate) fn split_uri(case: &str, uri: &str) -> (String, String, String) {
     let (scheme, rest) = uri
         .split_once("://")
         .unwrap_or_else(|| panic!("case {case:?}: expected a published uri, got {uri:?}"));
