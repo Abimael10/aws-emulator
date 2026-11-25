@@ -16,14 +16,23 @@
 //! `NextMarker` and `IsTruncated` arrive exactly when selected distributions remain.
 //!
 //! `ResourceArn` is "the ARN of the CloudFront resource that you've shared with other Amazon
-//! Web Services accounts", so it is read the way the whole cross-account sharing surface reads
-//! that one member ([`crate::state::resource_policy_arn_refusal`], which the resource-policy
-//! operations go through): a value that is no ARN at all is refused on its FORM, an ARN naming
-//! any other resource type is refused on the TYPE it names — a distribution reaches a resource
-//! of ANOTHER account through `VpcOriginConfig$OwnerAccountId` alone, which is why the VPC
-//! origin is the one shareable resource type of this service — and only an ARN of that type is
-//! resolved against the store, where one naming nothing is reported ABSENT rather than
-//! answered with a page of nothing.
+//! Web Services accounts", so WHICH values it accepts is the judgement the whole cross-account
+//! sharing surface makes about that one member ([`crate::state::resource_policy_arn_refusal`],
+//! which the resource-policy operations go through): a value that is no ARN at all is refused on
+//! its FORM, an ARN naming any other resource type is refused on the TYPE it names — a
+//! distribution reaches a resource of ANOTHER account through `VpcOriginConfig$OwnerAccountId`
+//! alone, which is why the VPC origin is the one shareable resource type of this service — and
+//! only an ARN of that type is resolved against the store, where one naming nothing is reported
+//! ABSENT rather than answered with a page of nothing.
+//!
+//! The condition is shared; the SENTENCE each operation puts on the wire is its own, so the two
+//! argument refusals here are this listing's: a value that is no ARN is refused with the syntax
+//! sentence that echoes the submitted `ResourceArn`
+//! ([`crate::state::invalid_resource_arn_syntax`]), and an ARN naming a type this listing does
+//! not cover with the fixed resource-type sentence
+//! ([`crate::state::invalid_resource_type_parameter`]) — judged before existence, so the ARN of
+//! a resource that exists under an uncovered type and the same ARN naming nothing are refused
+//! alike.
 //!
 //! This emulator serves ONE account ([`::engine::emulator_account_id`]), so every resource it
 //! holds was created by the caller through this control plane and every distribution it lists
@@ -213,20 +222,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // read as an ARN is refused on its form, an ARN naming another resource type is refused
         // on that type, and an ARN of the shareable type naming no resource this store holds is
         // reported absent — an empty page would claim the resource exists and is used by no
-        // distribution. The sentences are the ones this service's other READ of a shared
-        // resource puts on the wire.
+        // distribution. The two ARGUMENT refusals are worded as THIS operation words them, the
+        // form one carrying the value the request submitted; the absent answer is the sentence
+        // this service states for the class.
         if let Some(refusal) =
             crate::state::resource_policy_arn_refusal(&store, &input.resource_arn)
         {
             return Err(match refusal {
                 crate::state::ResourceArnRefusal::Malformed => {
                     ListDistributionsByOwnedResourceErrorModeled::InvalidArgument(
-                        crate::state::malformed_arn(),
+                        crate::state::invalid_resource_arn_syntax(&input.resource_arn),
                     )
                 }
                 crate::state::ResourceArnRefusal::WrongType => {
                     ListDistributionsByOwnedResourceErrorModeled::InvalidArgument(
-                        crate::state::invalid_resource_policy_arn(),
+                        crate::state::invalid_resource_type_parameter(),
                     )
                 }
                 crate::state::ResourceArnRefusal::AbsentResource => {
@@ -246,7 +256,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(resource_id) = crate::state::resource_policy_resource(&input.resource_arn)
         else {
             return Err(ListDistributionsByOwnedResourceErrorModeled::InvalidArgument(
-                crate::state::invalid_resource_policy_arn(),
+                crate::state::invalid_resource_type_parameter(),
             )
             .into());
         };

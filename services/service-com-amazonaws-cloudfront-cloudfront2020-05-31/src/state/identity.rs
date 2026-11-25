@@ -332,6 +332,50 @@ pub fn malformed_arn() -> crate::ops::types::InvalidArgument {
     }
 }
 
+/// The sentence the OWNED-RESOURCE listing refuses a `ResourceArn` that is no ARN at all
+/// with: the fixed text says the value's SYNTAX could not be read, and the one variable part
+/// is the value the request carried, echoed verbatim at the end so a caller submitting
+/// several ARNs learns WHICH one it has to fix.
+///
+/// The form condition itself is the service-wide one ([`MALFORMED_ARN_MESSAGE`]) — the value
+/// does not open with [`ARN_PREFIX`] — so this sentence states it, wrapped in this surface's
+/// own words rather than restated. Recorded behaviour.
+pub fn invalid_resource_arn_syntax_message(resource_arn: &str) -> String {
+    format!("Resource has invalid syntax: {MALFORMED_ARN_MESSAGE}: {resource_arn}")
+}
+
+/// The modelled `InvalidArgument` (HTTP 400) the owned-resource listing refuses a
+/// `ResourceArn` that cannot be READ as an ARN with — "An argument is invalid."
+///
+/// Decided from the REQUEST alone, before anything is resolved against the store: a value
+/// that is no ARN names no resource to look up.
+pub fn invalid_resource_arn_syntax(resource_arn: &str) -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(invalid_resource_arn_syntax_message(resource_arn)),
+    }
+}
+
+/// The sentence the OWNED-RESOURCE listing refuses a well-formed `ResourceArn` naming a
+/// resource TYPE it does not cover with: the whole text is fixed — it names the parameter
+/// that is wrong and the part of it that is wrong — so nothing of the request or of the store
+/// reaches it. Recorded behaviour.
+pub const INVALID_RESOURCE_TYPE_PARAMETER_MESSAGE: &str =
+    "Invalid parameter received. Resource Type";
+
+/// The modelled `InvalidArgument` (HTTP 400) the owned-resource listing refuses an ARN whose
+/// resource part names a type other than the shareable one with — "An argument is invalid."
+///
+/// Decided from the PARSED ARN, before it is resolved against the store: the type a
+/// `ResourceArn` names is a property of the value submitted, so an ARN of an unsupported type
+/// is refused the same way whether or not this service holds anything it could name — which
+/// is what keeps the absent answer ([`resource_policy_resource_absent`]) for an ARN of the
+/// type this listing does cover.
+pub fn invalid_resource_type_parameter() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(INVALID_RESOURCE_TYPE_PARAMETER_MESSAGE.to_string()),
+    }
+}
+
 /// Whether `value` can be READ as an ARN at all.
 ///
 /// An ARN is `arn:<partition>:<service>:<region>:<account>:<resource>`

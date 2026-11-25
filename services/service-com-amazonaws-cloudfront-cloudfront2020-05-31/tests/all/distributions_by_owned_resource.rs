@@ -10,11 +10,12 @@
 //! the distribution; the page contract is the one every CloudFront distribution listing states
 //! (`MaxItems` bounds the page and is echoed, `Marker` resumes after the id the previous page
 //! ended at, `NextMarker` and `IsTruncated` arrive exactly when matching distributions remain,
-//! `Quantity` states the length of `Items`); and the `ResourceArn` is read the way the whole
-//! cross-account sharing surface reads that member — a value that is no ARN at all is refused
+//! `Quantity` states the length of `Items`); and the `ResourceArn` is judged the way the whole
+//! cross-account sharing surface judges that member — a value that is no ARN at all is refused
 //! on its FORM, an ARN naming another resource type on the TYPE it names, and an ARN of the
 //! shareable type naming no resource this store holds is `EntityNotFound` (HTTP 404) rather
-//! than a page of nothing.
+//! than a page of nothing — each refusal worded as THIS operation words it, which
+//! [`crate::distributions_by_owned_resource_refusal_wording`] spans on its own.
 //!
 //! The rows below span what that rule generalises over: WHICH origin of a distribution names
 //! the shared resource (the only one, the second of two, the last of three), how many origins
@@ -32,7 +33,7 @@
 //! resource-policy writer are the sibling suites' own.
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    INVALID_RESOURCE_POLICY_ARN_MESSAGE, MALFORMED_ARN_MESSAGE, MAX_ITEMS,
+    invalid_resource_arn_syntax_message, INVALID_RESOURCE_TYPE_PARAMETER_MESSAGE, MAX_ITEMS,
     MAX_ITEMS_INVALID_MESSAGE, NO_SUCH_RESOURCE_MESSAGE, RESOURCE_POLICY_RESOURCE_TYPE,
 };
 use smithy_server_runtime::MultiServiceRouter;
@@ -119,7 +120,7 @@ struct Shared {
 /// `GET /2020-05-31/distributionsByOwnedResource/{ResourceArn}` plus the query the caller
 /// pages with — the route the model binds this operation to. The ARN travels as ONE path
 /// label, so its separators are percent-encoded the way an SDK client encodes them.
-async fn list_by_owned_resource(
+pub(crate) async fn list_by_owned_resource(
     router: &MultiServiceRouter,
     resource_arn: &str,
     query: &str,
@@ -628,36 +629,36 @@ async fn a_resource_arn_the_surface_cannot_act_on_is_refused() {
     let distribution_arn = format!("arn:aws:cloudfront::{ACCOUNT_ID}:distribution/{held_distribution}");
 
     // (case, the ResourceArn submitted, the status expected, the sentence expected)
-    let mut rows: Vec<(String, String, u16, &str)> = vec![
+    let mut rows: Vec<(String, String, u16, String)> = vec![
         (
             "no ARN at all: the resource's bare id".to_string(),
             held.id.clone(),
             400,
-            MALFORMED_ARN_MESSAGE,
+            invalid_resource_arn_syntax_message(&held.id),
         ),
         (
             "no ARN at all: another word".to_string(),
             "not-an-arn".to_string(),
             400,
-            MALFORMED_ARN_MESSAGE,
+            invalid_resource_arn_syntax_message("not-an-arn"),
         ),
         (
             "the ARN of a distribution that exists".to_string(),
             distribution_arn,
             400,
-            INVALID_RESOURCE_POLICY_ARN_MESSAGE,
+            INVALID_RESOURCE_TYPE_PARAMETER_MESSAGE.to_string(),
         ),
         (
             "an ARN of another service".to_string(),
             format!("arn:aws:s3:::bucket-{ACCOUNT_ID}"),
             400,
-            INVALID_RESOURCE_POLICY_ARN_MESSAGE,
+            INVALID_RESOURCE_TYPE_PARAMETER_MESSAGE.to_string(),
         ),
         (
             "the shareable type with a body nothing holds".to_string(),
             format!("arn:aws:cloudfront::{ACCOUNT_ID}:{RESOURCE_POLICY_RESOURCE_TYPE}/vo_ABSENT"),
             404,
-            NO_SUCH_RESOURCE_MESSAGE,
+            NO_SUCH_RESOURCE_MESSAGE.to_string(),
         ),
         (
             "a held resource's id under ANOTHER account".to_string(),
@@ -666,7 +667,7 @@ async fn a_resource_arn_the_surface_cannot_act_on_is_refused() {
                 held.id
             ),
             404,
-            NO_SUCH_RESOURCE_MESSAGE,
+            NO_SUCH_RESOURCE_MESSAGE.to_string(),
         ),
     ];
     // Every other CloudFront resource type this service addresses by a route of its own: an
@@ -676,7 +677,7 @@ async fn a_resource_arn_the_surface_cannot_act_on_is_refused() {
             format!("an ARN naming a {kind}"),
             format!("arn:aws:cloudfront::{ACCOUNT_ID}:{kind}/ABCDEF1234567"),
             400,
-            INVALID_RESOURCE_POLICY_ARN_MESSAGE,
+            INVALID_RESOURCE_TYPE_PARAMETER_MESSAGE.to_string(),
         )
     }));
 
