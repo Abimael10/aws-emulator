@@ -175,6 +175,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A session name is scoped to an account and a region, so resolving one needs the
         // region the request signed for.
         let region = crate::state::request_region(ctx.parts());
+        // And a session exists only because the CONTROL plane created it: this data plane
+        // models no create, so what it resolves a name against is the directory both
+        // services read.
+        let created =
+            crate::state::control_plane_holds_session(&*self.engine, &input.training_session_name);
 
         // Which model serves the request — the checkpoint the caller named, else the one
         // the session currently resolves to — and every refusal around it, come from the
@@ -187,6 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &region,
                 input.model_package_arn.as_deref(),
                 now,
+                created,
             )
         };
         let model_package_arn = match model_package_arn {

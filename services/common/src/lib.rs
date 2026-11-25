@@ -333,6 +333,11 @@ pub mod agentic_rft_jobs;
 /// data plane that serves its operations and read by the SageMaker control plane that
 /// reports the session.
 pub mod training_session_usage;
+/// Which SageMaker training sessions the control plane holds, written by the SageMaker
+/// control plane — which creates and deletes them — and read by the SageMaker Training
+/// Session Runtime data plane, which creates none and so cannot otherwise tell a session
+/// of this account from a name that was never created.
+pub mod training_sessions;
 /// The inventory of which AgentCore Memory containers and code interpreters the account
 /// holds, written by the Bedrock AgentCore CONTROL plane — which creates and deletes them —
 /// and read by the AgentCore DATA plane, which creates neither and so cannot tell a

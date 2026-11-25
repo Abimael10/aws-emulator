@@ -269,6 +269,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(account) = crate::state::training_session_usage(&*self.engine) {
             account.lock().open(&input.training_session_name);
         }
+        // This create is the ONLY thing that makes the session exist, and the data plane
+        // that serves its operations is another crate with another store: it resolves the
+        // name a request carries through the one directory both read, so a session is
+        // registered here and refused there until it is.
+        if let Some(directory) = crate::state::training_session_directory(&*self.engine) {
+            directory
+                .lock()
+                .register(::service_common::training_sessions::TrainingSessionRecord {
+                    name: input.training_session_name.clone(),
+                    arn: arn.clone(),
+                });
+        }
 
         crate::state::record_state_change(Self::NAME, &arn, ctx);
         Ok(CreateTrainingSessionOutput {

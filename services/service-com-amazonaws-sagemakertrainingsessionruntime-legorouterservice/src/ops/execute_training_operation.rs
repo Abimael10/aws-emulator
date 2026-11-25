@@ -173,10 +173,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A training operation is submitted against a session the control plane already
+        // created, and this data plane creates none: a name no `CreateTrainingSession`
+        // minted resolves to nothing, which is the modelled 404.
+        if !crate::state::control_plane_holds_session(&*self.engine, &input.training_session_name)
+        {
+            return Err(
+                ExecuteTrainingOperationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::session_not_found(
+                            &input.training_session_name,
+                            &crate::state::request_region(ctx.parts()),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A body that set more than one `operationConfig` member asks for no single
+        // operation, and is refused HERE rather than where it was read: resolution comes
+        // first on this surface, so a submit naming a session that does not exist reports
+        // the session rather than the body. Nothing ambiguous is executed either way.
+        if input.operation_config.ambiguous() {
+            return Err(ExecuteTrainingOperationErrorModeled::ValidationException(
+                ValidationException {
+                    message: super::types::operation_config_arity_message(),
+                },
+            )
+            .into());
+        }
+
         // The modelled constraints (the label's length and pattern, `sequenceNumber`'s
-        // minimum, exactly one union member) are refused before this handler runs; what
-        // is left are the rules the model states in prose.
-        if let Err(reason) = crate::state::validate_operation_config(&input.operation_config) {
+        // minimum) are refused before this handler runs; what is left are the rules the
+        // model states in prose.
+        if let Err(reason) = crate::state::validate_operation_config(input.operation_config.config())
+        {
             return Err(ExecuteTrainingOperationErrorModeled::ValidationException(
                 ValidationException { message: reason },
             )
@@ -187,7 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let fingerprint = crate::state::training_request_fingerprint(
             input.sequence_number,
-            &input.operation_config,
+            input.operation_config.config(),
         );
         let mut store = state.lock();
         let Some(session) = store.session_for_submit(&input.training_session_name, now) else {
@@ -279,7 +311,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A save operation's model package ARN is minted here, from the region THIS
         // request was signed for, so the ARN a later poll reports does not depend on who
         // polled; the checkpoint itself is published when the operation completes.
-        let reserved = match &input.operation_config {
+        let reserved = match input.operation_config.config() {
             OperationConfig::saveWeights(_) | OperationConfig::saveState(_) => {
                 Some(session.reserve_checkpoint(&region))
             }
@@ -292,7 +324,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 sequence_number: input.sequence_number,
                 client_token: input.client_token.clone(),
                 request_fingerprint: fingerprint,
-                config: input.operation_config,
+                config: input.operation_config.into_config(),
                 status: crate::state::STATUS_PENDING,
                 result: None,
                 error_details: None,

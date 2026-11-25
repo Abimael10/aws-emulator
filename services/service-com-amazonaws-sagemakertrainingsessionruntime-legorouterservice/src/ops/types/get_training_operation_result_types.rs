@@ -11,7 +11,14 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-sagemakertrainingsessionruntime-legorouterservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.sagemakertrainingsessionruntime#GetTrainingOperationResultInput")]
+// `skip_validation = ["trainingSessionName", "operationId"]`: the same two URI labels, for
+// the same reason, as `GetSamplingOperationResultInput` — this read resolves the operation
+// and reports an identifier it cannot resolve as not found, rather than refusing the
+// identifier's syntax at the boundary.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.sagemakertrainingsessionruntime#GetTrainingOperationResultInput",
+    skip_validation = ["trainingSessionName", "operationId"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct GetTrainingOperationResultInput {
     pub training_session_name: String,

@@ -77,4 +77,137 @@ pub const REQUEST_STATUS_VALUES: &[&str] = &["Completed", "Failed", "InProgress"
 /// The values `StopReason` accepts on the wire.
 pub const STOP_REASON_VALUES: &[&str] = &["length", "stop"];
 
+/// How a request whose union-typed member does not carry exactly one member is refused:
+/// the INPUT MEMBER a client has to fix, then the member names the model declares for
+/// that union, in the order it declares them.
+///
+/// The arity rule is the union's own ("Exactly one member must be set to specify the
+/// operation type", `SampleOperationConfig`), and what a caller is told has to name the
+/// request's member rather than the Smithy shape id, which no client of this API ever
+/// sees. Stated once here because both submit operations carry such a member, and both
+/// arity failures — no member set and more than one — are the same rule.
+pub fn union_arity_message(
+    schema: &'static ::aws_smithy_schema::Schema,
+    input_member: &str,
+) -> String {
+    let members: Vec<&str> = schema
+        .members()
+        .iter()
+        .filter_map(|member| member.member_name())
+        .collect();
+    format!(
+        "{input_member} must contain exactly one of: {}",
+        members.join(", ")
+    )
+}
+
+/// [`union_arity_message`] as the boundary refuses it, for the body that carries NO
+/// member at all: nothing can be built from it, so it is refused where it is read.
+pub fn union_arity_refusal(
+    schema: &'static ::aws_smithy_schema::Schema,
+    input_member: &str,
+) -> ::aws_smithy_schema::serde::SerdeError {
+    ::aws_smithy_schema::serde::SerdeError::custom(union_arity_message(schema, input_member))
+}
+
+/// A union-typed input member as the REQUEST carried it.
+#[derive(Debug, Clone)]
+pub struct SubmittedUnion<T> {
+    /// The member the request would be served as: the LAST one the wire carried, which is
+    /// the one a lenient reader is left holding.
+    pub config: T,
+    /// Every OTHER member the body set, in the order the wire carried them — empty for a
+    /// well-formed request, which carries exactly one.
+    ///
+    /// They are kept because they are a caller's input too: the validating walk reads this
+    /// value back ([`SubmittedUnion::serialize_members`]), so every member the request
+    /// carried is judged against its own constraints and a broken one is reported
+    /// whichever member the request would be served as.
+    pub others: Vec<T>,
+}
+
+impl<T> SubmittedUnion<T> {
+    /// Whether the body set MORE than one member, which is a request no single variant
+    /// answers. The handler refuses it ([`union_arity_message`]) once it has RESOLVED the
+    /// resource the request names, which is the order this service's recordings show;
+    /// nothing ambiguous is ever executed.
+    pub fn ambiguous(&self) -> bool {
+        !self.others.is_empty()
+    }
+
+    /// The member the request would be served as.
+    pub fn config(&self) -> &T {
+        &self.config
+    }
+
+    /// [`Self::config`], taken by value for a handler that stores it.
+    pub fn into_config(self) -> T {
+        self.config
+    }
+}
+
+/// The union writes itself: the member schema of each member that was set, which is what
+/// makes the validating walk spell a constraint violation's path through that member.
+impl<T: ::aws_smithy_schema::serde::SerializableStruct> ::aws_smithy_schema::serde::SerializableStruct
+    for SubmittedUnion<T>
+{
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        for member in self.others.iter().chain(::std::iter::once(&self.config)) {
+            ::aws_smithy_schema::serde::SerializableStruct::serialize_members(member, serializer)?;
+        }
+        Ok(())
+    }
+}
+
+/// Read a union-typed input member so that the refusal of a malformed one names the
+/// request's own member chain.
+///
+/// `variant` is asked for each member the codec finds in the body, by its wire name, and
+/// answers how that member reads — `None` for a name the union does not declare, which
+/// the codec skips. Two things come out of here that the generated reader cannot state,
+/// because it is the ENCLOSING member and the SET VARIANT that name them:
+///
+/// * the arity rule for a body carrying NO member, refused as [`union_arity_refusal`]
+///   words it (a body carrying several is carried on as
+///   [`SubmittedUnion::ambiguous`], for the handler to refuse after resolution);
+/// * a required member absent from the variant that WAS set, reported at its full input
+///   path (`<input member>.<variant>.<member>`), because the variant is the step between
+///   them and a path missing it names a member the union does not have. The constraint
+///   walk already spells a path that way for a value that is present but out of bounds —
+///   it writes the value through the variant's own member schema — so this makes the
+///   ABSENT-member path agree with it.
+pub fn read_submitted_union<T>(
+    deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    schema: &'static ::aws_smithy_schema::Schema,
+    input_member: &'static str,
+    mut variant: impl FnMut(
+        &str,
+        &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> Option<Result<T, ::aws_smithy_schema::serde::SerdeError>>,
+) -> Result<SubmittedUnion<T>, ::aws_smithy_schema::serde::SerdeError> {
+    let mut set: Vec<T> = Vec::new();
+    deserializer.read_struct(schema, &mut |member, reader| {
+        let name = member.member_name().unwrap_or_default();
+        let Some(read) = variant(name, reader) else {
+            return Ok(());
+        };
+        // The variant is the path step between the input member and the member that was
+        // missing, so it is named as the failure passes back out.
+        let read = read.map_err(|error| ::aws_smithy_schema_server::within_member(error, name))?;
+        set.push(read);
+        Ok(())
+    })?;
+    // A body that set no member at all cannot be read into any variant, so it is refused
+    // here; one that set several is carried on for the handler to refuse after resolution.
+    let Some(config) = set.pop() else {
+        return Err(union_arity_refusal(schema, input_member));
+    };
+    Ok(SubmittedUnion {
+        config,
+        others: set,
+    })
+}
 

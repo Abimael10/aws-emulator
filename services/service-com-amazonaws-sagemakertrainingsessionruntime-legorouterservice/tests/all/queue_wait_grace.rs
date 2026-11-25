@@ -39,14 +39,49 @@ const PENDING: &str = "Pending";
 
 /// One emulator: a shared engine with this service mounted on the production router, so
 /// every case drives the same dispatch path the binary does.
-fn emulator() -> MultiServiceRouter {
+///
+/// The engine is held beside the router because a training session EXISTS only because the
+/// SageMaker control plane created it: this data plane models no create and resolves the
+/// name a request carries through the directory both services read, so each case registers
+/// the sessions it submits against ([`Emulator::create_session`]).
+struct Emulator {
+    router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
+}
+
+impl Emulator {
+    /// Register `name` the way the SageMaker control plane's `CreateTrainingSession` does.
+    fn create_session(&self, name: &str) {
+        self.engine
+            .state::<service_common::training_sessions::TrainingSessionDirectory>()
+            .lock()
+            .register(service_common::training_sessions::TrainingSessionRecord {
+                name: name.to_string(),
+                arn: engine::emulator_arn(
+                    "sagemaker",
+                    REGION,
+                    &format!("training-session/{name}"),
+                ),
+            });
+    }
+}
+
+impl std::ops::Deref for Emulator {
+    type Target = MultiServiceRouter;
+
+    fn deref(&self) -> &Self::Target {
+        &self.router
+    }
+}
+
+fn emulator() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The cases assert behaviour, not signatures; the emulator verifies signatures itself
     // and a service never checks them.
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    Emulator { router, engine }
 }
 
 async fn call(
@@ -156,6 +191,7 @@ async fn a_store_full_of_waiting_sessions_still_serves_a_submit_naming_a_new_one
             .collect();
         let mut held = Vec::new();
         for session in &waiting {
+            router.create_session(session);
             let mut ids = Vec::new();
             for sequence in queued {
                 ids.push(submit_ok(&router, case, session, *sequence).await);
@@ -166,6 +202,7 @@ async fn a_store_full_of_waiting_sessions_still_serves_a_submit_naming_a_new_one
         // The store is full and nothing in it can settle, yet a submit naming a session it
         // does not hold is served.
         let newest = waiting.len() - 1;
+        router.create_session("one-more");
         let (status, response) = submit(&router, "one-more", 1).await;
         assert_eq!(
             status, 200,

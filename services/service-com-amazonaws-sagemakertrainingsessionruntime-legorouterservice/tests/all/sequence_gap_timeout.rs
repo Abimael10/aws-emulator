@@ -34,17 +34,48 @@ const REGION: &str = "us-west-2";
 const SEQUENCE_FLOOR: i64 = 1;
 const SEQUENCE_CEILING: i64 = i32::MAX as i64;
 
-/// Long enough for a clock-owed transition (`crate::state::EXECUTION_SPAN`, 500 ms) to
-/// have fallen due, with slack for a loaded test machine.
-const PAST_THE_SPAN: Duration = Duration::from_millis(900);
-
 /// One emulator: a shared engine with this service mounted on the production router.
-fn emulator() -> MultiServiceRouter {
+///
+/// The engine is held beside the router because a training session EXISTS only because the
+/// SageMaker control plane created it: this data plane models no create and resolves the
+/// name a request carries through the directory both services read, so each case registers
+/// the session it submits against ([`Emulator::create_session`]).
+struct Emulator {
+    router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
+}
+
+impl Emulator {
+    /// Register `name` the way the SageMaker control plane's `CreateTrainingSession` does.
+    fn create_session(&self, name: &str) {
+        self.engine
+            .state::<service_common::training_sessions::TrainingSessionDirectory>()
+            .lock()
+            .register(service_common::training_sessions::TrainingSessionRecord {
+                name: name.to_string(),
+                arn: engine::emulator_arn(
+                    "sagemaker",
+                    REGION,
+                    &format!("training-session/{name}"),
+                ),
+            });
+    }
+}
+
+impl std::ops::Deref for Emulator {
+    type Target = MultiServiceRouter;
+
+    fn deref(&self) -> &Self::Target {
+        &self.router
+    }
+}
+
+fn emulator() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    Emulator { router, engine }
 }
 
 async fn call(router: &MultiServiceRouter, method: &str, path: &str, body: Option<Value>) -> Value {
@@ -128,6 +159,27 @@ fn is_terminal(status: &str) -> bool {
     matches!(status, "Completed" | "Failed" | "Skipped")
 }
 
+/// How many times a condition is looked for before a case gives up, and how long the loop
+/// waits before looking again — a budget far above the service's own execution span, so a
+/// loaded host still passes.
+const POLL_BUDGET: u32 = 60;
+const LOOK_AGAIN: Duration = Duration::from_millis(50);
+
+/// Wait until the operation `id` of `session` reaches a terminal status.
+///
+/// Waits for the CONDITION rather than for a span of wall clock: the transition is owed at
+/// an instant the service stored, so the loop looks again until it has happened or a
+/// generous deadline passes.
+async fn poll_to_terminal(router: &MultiServiceRouter, session: &str, id: &str, case: &str) {
+    for _ in 0..POLL_BUDGET {
+        if is_terminal(&status(router, session, id, case).await) {
+            return;
+        }
+        tokio::time::sleep(LOOK_AGAIN).await;
+    }
+    panic!("case {case:?}: {id} did not settle within the poll budget");
+}
+
 /// A submit at either end of the sequence-number range is answered, and the queue stays
 /// finite: the slot at the head executes, and an operation behind a gap waits.
 #[tokio::test]
@@ -149,14 +201,21 @@ async fn a_submit_at_each_end_of_the_sequence_range_is_served() {
     for (case, sequences) in rows {
         let router = emulator();
         let session = "sequence-ends";
+        router.create_session(session);
         let mut submitted: Vec<(i64, String)> = Vec::new();
         for sequence in sequences {
             let id = submit(&router, session, *sequence, case).await;
             submitted.push((*sequence, id));
         }
-        // Give the clock time to make the head operation's transition due; nothing here
-        // waits on the gap, which the session blocks on until its operation arrives.
-        tokio::time::sleep(PAST_THE_SPAN).await;
+        // Wait for the CONDITION rather than for a span of wall clock: an operation at
+        // the head of ANOTHER session's queue settling is what tells this case a
+        // transition has really fallen due, so a row behind a gap has had exactly that
+        // long to execute and has not. Nothing here waits on the gap itself, which the
+        // session blocks on until its operation arrives.
+        let ticking = "sequence-ends-clock";
+        router.create_session(ticking);
+        let ticking_id = submit(&router, ticking, SEQUENCE_FLOOR, case).await;
+        poll_to_terminal(&router, ticking, &ticking_id, case).await;
 
         for (sequence, id) in &submitted {
             let reported = status(&router, session, id, case).await;

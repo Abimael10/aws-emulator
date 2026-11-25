@@ -172,34 +172,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        // A session this emulator has never seen is NOT materialised by a read: only a
-        // submit brings a session's runtime record into existence.
+        // What this read resolves is the OPERATION, so that is what an unresolvable
+        // request reports missing: a session this emulator holds no record of holds no
+        // operation either, and both misses are the one 404 naming the operation id the
+        // request carried. A session is NOT materialised by a read in either case.
+        let not_found = || -> Self::Error {
+            GetTrainingOperationResultErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::operation_not_found(&input.operation_id),
+                },
+            )
+            .into()
+        };
         let Some(session) = store.advance_session(&input.training_session_name, now) else {
-            return Err(
-                GetTrainingOperationResultErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!(
-                            "Training session {} does not exist.",
-                            input.training_session_name
-                        ),
-                    },
-                )
-                .into(),
-            );
+            return Err(not_found());
         };
         let Some(op) = session.training_ops.get(&input.operation_id) else {
-            return Err(
-                GetTrainingOperationResultErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!(
-                            "Training operation {} does not exist, or does not belong to \
-                             training session {}.",
-                            input.operation_id, input.training_session_name
-                        ),
-                    },
-                )
-                .into(),
-            );
+            return Err(not_found());
         };
 
         let output = GetTrainingOperationResultOutput {

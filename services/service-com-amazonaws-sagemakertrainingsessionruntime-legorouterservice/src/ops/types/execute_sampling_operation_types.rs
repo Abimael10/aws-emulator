@@ -15,7 +15,49 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-sagemakertrainingsessio
 #[derive(Debug, Clone)]
 pub struct ExecuteSamplingOperationInput {
     pub training_session_name: String,
-    pub operation_config: SampleOperationConfig,
+    pub operation_config: SubmittedSampleOperationConfig,
+}
+
+/// `operationConfig` AS THE REQUEST CARRIES IT: the modelled union, read so that the
+/// refusal of a malformed one names the request's own member chain
+/// ([`read_submitted_union`], which states what this adds and why).
+///
+/// The union itself ([`SampleOperationConfig`]) round-trips through the generated codec,
+/// and everything downstream of the boundary holds that value (`.config`).
+pub type SubmittedSampleOperationConfig = SubmittedUnion<SampleOperationConfig>;
+
+impl ::aws_smithy_schema_server::DeserializableStruct for SubmittedSampleOperationConfig {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        use ::aws_smithy_schema_server::DeserializableStruct as _;
+
+        read_submitted_union(
+            deserializer,
+            &SampleOperationConfig::SCHEMA,
+            "operationConfig",
+            |member, reader| match member {
+                "sample" => Some(
+                    SampleConfig::deserialize(reader).map(SampleOperationConfig::Sample),
+                ),
+                "computeLogprobs" => Some(
+                    ComputeLogprobsConfig::deserialize(reader)
+                        .map(SampleOperationConfig::computeLogprobs),
+                ),
+                "loadWeightsForSampling" => Some(
+                    LoadWeightsForSamplingConfig::deserialize(reader)
+                        .map(SampleOperationConfig::loadWeightsForSampling),
+                ),
+                _ => None,
+            },
+        )
+    }
+}
+
+/// How a sampling submit refuses a body that set more than one `operationConfig` member,
+/// once the session it names has been resolved.
+pub fn sample_operation_config_arity_message() -> String {
+    union_arity_message(&SampleOperationConfig::SCHEMA, "operationConfig")
 }
 
 #[smithy_macros::smithy(union_for = "com.amazonaws.sagemakertrainingsessionruntime#SampleOperationConfig")]

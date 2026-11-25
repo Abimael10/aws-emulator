@@ -30,6 +30,11 @@ hex = { workspace = true }
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
+[dev-dependencies]
+# Declares one module per `tests/all/<suite>.rs`, so the crate's integration tests are
+# one target rooted at `tests/all/main.rs` with nothing to declare per suite.
+automod = { workspace = true }
+
 [lints.rust]
 # As the workspace sets for every crate.
 unsafe_code = "forbid"

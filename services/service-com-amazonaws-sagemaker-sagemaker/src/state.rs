@@ -3354,6 +3354,36 @@ pub fn training_session_usage<Eng: Send + Sync + 'static>(
         )
 }
 
+/// The SHARED directory of training sessions THIS service creates, in the shared engine:
+/// call it with a handler's `&*self.engine`.
+///
+/// `CreateTrainingSession` is the only call that makes a training session exist, and the
+/// data plane that serves the operations submitted against it (the SageMaker Training
+/// Session Runtime) models no create of its own: a runtime request carries a session name
+/// and nothing else, so that service can only tell a session of this account from a name
+/// that was never created because THIS one recorded it
+/// ([`::service_common::training_sessions::TrainingSessionDirectory`]). The engine keys
+/// state by TYPE, so a copy of its own inside [`ComAmazonawsSagemakerSagemakerState`]
+/// would be invisible to that reader.
+///
+/// LOCK ORDER: as for [`training_session_usage`] — a caller takes [`service_state`] first
+/// and this directory second, and no reader holds this one while taking another store, so
+/// the order cannot invert.
+///
+/// Answer `None` by leaving the directory unwritten: the record is an aid to another
+/// service, never part of this operation's own answer.
+pub fn training_session_directory<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::training_sessions::TrainingSessionDirectory>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::training_sessions::TrainingSessionDirectory,
+            >,
+        )
+}
+
 /// The message a handler refuses with when the service is mounted on an engine that
 /// holds no store for it. Unreachable in the assembled emulator (the router mounts
 /// every service on the one shared `InMemoryEngine`); stated once so no handler

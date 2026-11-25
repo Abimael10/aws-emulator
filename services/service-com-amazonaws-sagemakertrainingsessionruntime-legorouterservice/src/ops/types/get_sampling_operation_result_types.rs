@@ -11,7 +11,18 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-sagemakertrainingsessionruntime-legorouterservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.sagemakertrainingsessionruntime#GetSamplingOperationResultInput")]
+// `skip_validation = ["trainingSessionName", "operationId"]`: the modelled `@length` and
+// `@pattern` of `TrainingSessionName` / `OperationId` are NOT enforced on this read. What
+// this operation answers for an identifier is decided by RESOLVING it — an id outside that
+// syntax resolves to nothing, so the modelled `ResourceNotFoundException` is what reports
+// it (the handler's own lookup, echoing the label verbatim), and a 400 would send a poller
+// down a validation branch where AWS reports the resource does not exist. See
+// `get_training_operation_result_types` for the sibling read, and
+// `execute_sampling_operation_types` for the submit surface that does keep the check.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.sagemakertrainingsessionruntime#GetSamplingOperationResultInput",
+    skip_validation = ["trainingSessionName", "operationId"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct GetSamplingOperationResultInput {
     pub training_session_name: String,

@@ -7,7 +7,9 @@
 //! created, then polls for each one's result. This module holds everything the six
 //! handlers share, so no two operations grow their own copy of it:
 //!
-//! * the **session records** (`sessions`), materialised on first use of a session name
+//! * the **session records** (`sessions`), this data plane's own view of a session the
+//!   SageMaker control plane created, materialised on the first call against a name that
+//!   directory holds ([`control_plane_holds_session`]) and refused for one it does not,
 //!   because this runtime service models no create operation of its own;
 //! * each session's **training queue** (`sequence_index` + `next_sequence_number`),
 //!   which is what makes operations execute in sequence-number order;
@@ -648,11 +650,17 @@ impl ComAmazonawsSagemakertrainingsessionruntimeLegorouterserviceState {
         Some(session)
     }
 
-    /// The session `name` names, for a SUBMIT, materialising the record on first use.
+    /// The session `name` names, for a SUBMIT, materialising this service's own record of
+    /// a session the CONTROL PLANE already created.
     ///
-    /// This runtime service models no create operation — sessions are created by the
-    /// SageMaker control plane — so the first submit against a name is what brings the
-    /// runtime record into existence.
+    /// This runtime service models no create operation — a session exists only because
+    /// `CreateTrainingSession` minted it — so a caller must resolve the name against the
+    /// directory both services read ([`control_plane_holds_session`]) BEFORE asking for
+    /// the record here: a name no session was created for is answered
+    /// `ResourceNotFoundException` ([`session_not_found`]), never by bringing a record
+    /// into existence. What this materialises is the data plane's own view of a session
+    /// that does exist: its queue, its operations and its checkpoints, which only traffic
+    /// against it fills.
     ///
     /// Answers `None` when the store holds [`MAX_SESSIONS`] and none of them can be
     /// released: a session is released only once nothing in it is still owed, so an
@@ -756,6 +764,60 @@ pub fn publish_session_usage<Eng: Send + Sync + 'static>(
     if let Some(account) = training_session_usage(engine) {
         account.lock().publish(name, usage);
     }
+}
+
+/// The SHARED directory of the training sessions the SageMaker control plane created: call
+/// it with a handler's `&*self.engine`.
+///
+/// This service is the DATA PLANE of a training session and models no create of its own:
+/// a request carries a `trainingSessionName` and nothing else, so the only way to tell a
+/// session of this account from a name that was never created is the record the control
+/// plane wrote when `CreateTrainingSession` minted it
+/// ([`::service_common::training_sessions::TrainingSessionDirectory`]). The engine keys
+/// state by TYPE, so a copy of its own inside this service's state would be invisible to
+/// that writer.
+///
+/// LOCK ORDER: a caller takes this directory BEFORE [`service_state`] and holds neither
+/// while taking the other, so the order cannot invert.
+pub fn training_session_directory<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::training_sessions::TrainingSessionDirectory>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::training_sessions::TrainingSessionDirectory,
+            >,
+        )
+}
+
+/// Whether the SageMaker control plane holds a training session called `name`, which is
+/// what every data-plane call against a session has to resolve before it serves anything.
+///
+/// A name the directory does not hold is a session that was never created, so the call is
+/// refused with the modelled `ResourceNotFoundException` ([`session_not_found`]) rather
+/// than served against a record this service invented.
+pub fn control_plane_holds_session<Eng: Send + Sync + 'static>(engine: &Eng, name: &str) -> bool {
+    training_session_directory(engine).is_some_and(|directory| directory.lock().holds(name))
+}
+
+/// The `ResourceNotFoundException` message `GetTrainingOperationResult` carries for an
+/// operation id that does not resolve: `Operation not found: <operationId>`.
+///
+/// The operation is what the read resolves, so the operation is what the refusal names —
+/// the id the request's URI carried, echoed verbatim — whether the session holding it is
+/// unknown too. Deliberately different text from [`sample_request_not_found`], so a
+/// caller polling the two sibling routes can tell which lookup missed.
+pub fn operation_not_found(operation_id: &str) -> String {
+    format!("Operation not found: {operation_id}")
+}
+
+/// The `ResourceNotFoundException` message `GetSamplingOperationResult` carries for an
+/// operation id that does not resolve: `Sample request not found: <operationId>`.
+///
+/// See [`operation_not_found`]: the sampling route words the same condition its own way.
+pub fn sample_request_not_found(operation_id: &str) -> String {
+    format!("Sample request not found: {operation_id}")
 }
 
 /// The region a request is addressed to: the third field of its SigV4 credential scope,
@@ -1095,17 +1157,21 @@ pub enum SampleRefusal {
 /// The checkpoint an inference call runs against, resolved from persisted session state.
 ///
 /// Both inference operations take the same input members and model the same errors, so
-/// they resolve their target through this one function: a session this emulator has never
-/// seen is NOT materialised by an inference call (only a submit brings a session's runtime
-/// record into existence), a named model package must be one of the session's own
-/// checkpoints, and a caller that names none gets the checkpoint the session currently
-/// resolves to ([`Session::current_checkpoint`]).
+/// they resolve their target through this one function: a session the CONTROL plane never
+/// created does not exist at all (`created`, read from the directory both services share
+/// through [`control_plane_holds_session`] — this service models no create, so that
+/// record is the only thing that makes a session exist), a session that does exist but
+/// has no runtime record yet holds no checkpoint to sample, a named model package must be
+/// one of the session's own checkpoints, and a caller that names none gets the checkpoint
+/// the session currently resolves to ([`Session::current_checkpoint`]). An inference call
+/// never materialises a session record: only a submit does that.
 pub fn resolve_sample_checkpoint(
     store: &mut ComAmazonawsSagemakertrainingsessionruntimeLegorouterserviceState,
     training_session_name: &str,
     region: &str,
     model_package_arn: Option<&str>,
     now: SystemTime,
+    created: bool,
 ) -> Result<String, SampleRefusal> {
     if let Some(arn) = model_package_arn {
         if let Err(reason) = validate_model_package_arn("modelPackageArn", arn) {
@@ -1113,10 +1179,18 @@ pub fn resolve_sample_checkpoint(
         }
     }
 
-    let Some(session) = store.advance_session(training_session_name, now) else {
+    if !created {
         return Err(SampleRefusal::NotFound(session_not_found(
             training_session_name,
             region,
+        )));
+    }
+
+    let Some(session) = store.advance_session(training_session_name, now) else {
+        // The control plane holds the session, so what is missing is a checkpoint: no
+        // traffic has written one, which is the conflict below rather than a not-found.
+        return Err(SampleRefusal::Conflict(no_checkpoint_to_sample(
+            training_session_name,
         )));
     };
 
@@ -1130,13 +1204,24 @@ pub fn resolve_sample_checkpoint(
         Some(arn) => Ok(arn.to_string()),
         None => match session.current_checkpoint() {
             Some(checkpoint) => Ok(checkpoint.model_package_arn.clone()),
-            None => Err(SampleRefusal::Conflict(format!(
-                "Training session {training_session_name} has no model checkpoint to sample \
-                 from: write one with a saveWeights or saveState operation, or name a model \
-                 package on the X-Amzn-SageMaker-Model-Package header."
+            None => Err(SampleRefusal::Conflict(no_checkpoint_to_sample(
+                training_session_name,
             ))),
         },
     }
+}
+
+/// Why an inference call against a session that holds no checkpoint conflicts: there is no
+/// model to serve the request from until one has been written.
+///
+/// Stated once because both paths to that condition answer it — the session with no
+/// runtime record at all, and the one whose record holds no checkpoint.
+fn no_checkpoint_to_sample(training_session_name: &str) -> String {
+    format!(
+        "Training session {training_session_name} has no model checkpoint to sample from: \
+         write one with a saveWeights or saveState operation, or name a model package on \
+         the X-Amzn-SageMaker-Model-Package header."
+    )
 }
 
 /// The fingerprint of an `ExecuteTrainingOperation` request's parameters: a SHA-256

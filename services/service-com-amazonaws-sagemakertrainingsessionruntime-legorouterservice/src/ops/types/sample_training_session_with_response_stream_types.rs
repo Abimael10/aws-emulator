@@ -11,7 +11,17 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-sagemakertrainingsessionruntime-legorouterservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.sagemakertrainingsessionruntime#SampleTrainingSessionWithResponseStreamInput")]
+// `skip_validation = ["trainingSessionName"]`: `TrainingSessionName`'s modelled `@length`
+// and `@pattern` are NOT enforced on this surface. What this operation answers for a
+// session name is decided by RESOLVING it — a name outside that syntax names no session,
+// so the modelled `ResourceNotFoundException` is what reports it (the handler's own
+// lookup), and a 400 would hide the not-found a streaming client has to handle. The
+// submit surfaces (`ExecuteSamplingOperation`, `ExecuteTrainingOperation`) keep the
+// boundary check, which is the asymmetry this service's recordings show.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.sagemakertrainingsessionruntime#SampleTrainingSessionWithResponseStreamInput",
+    skip_validation = ["trainingSessionName"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct SampleTrainingSessionWithResponseStreamInput {
     pub training_session_name: String,

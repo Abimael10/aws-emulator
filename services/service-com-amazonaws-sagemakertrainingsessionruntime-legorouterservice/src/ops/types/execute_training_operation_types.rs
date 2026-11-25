@@ -17,7 +17,56 @@ pub struct ExecuteTrainingOperationInput {
     pub training_session_name: String,
     pub sequence_number: i32,
     pub client_token: Option<String>,
-    pub operation_config: OperationConfig,
+    pub operation_config: SubmittedOperationConfig,
+}
+
+/// `operationConfig` AS THE REQUEST CARRIES IT: the modelled union, read so that the
+/// refusal of a malformed one names the request's own member chain
+/// ([`read_submitted_union`], which states what this adds and why) — the same reading the
+/// sampling submit's own union member takes ([`SubmittedSampleOperationConfig`]).
+///
+/// The union itself ([`OperationConfig`]) round-trips through the generated codec, and
+/// everything downstream of the boundary holds that value (`.config`).
+pub type SubmittedOperationConfig = SubmittedUnion<OperationConfig>;
+
+impl ::aws_smithy_schema_server::DeserializableStruct for SubmittedOperationConfig {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        use ::aws_smithy_schema_server::DeserializableStruct as _;
+
+        read_submitted_union(
+            deserializer,
+            &OperationConfig::SCHEMA,
+            "operationConfig",
+            |member, reader| match member {
+                "forward" => Some(ForwardConfig::deserialize(reader).map(OperationConfig::Forward)),
+                "forwardBackward" => Some(
+                    ForwardBackwardConfig::deserialize(reader)
+                        .map(OperationConfig::forwardBackward),
+                ),
+                "optimizerStep" => Some(
+                    OptimizerStepConfig::deserialize(reader).map(OperationConfig::optimizerStep),
+                ),
+                "saveWeights" => Some(
+                    SaveWeightsConfig::deserialize(reader).map(OperationConfig::saveWeights),
+                ),
+                "saveState" => {
+                    Some(SaveStateConfig::deserialize(reader).map(OperationConfig::saveState))
+                }
+                "loadState" => {
+                    Some(LoadStateConfig::deserialize(reader).map(OperationConfig::loadState))
+                }
+                _ => None,
+            },
+        )
+    }
+}
+
+/// How a training submit refuses a body that set more than one `operationConfig` member,
+/// once the session it names has been resolved.
+pub fn operation_config_arity_message() -> String {
+    union_arity_message(&OperationConfig::SCHEMA, "operationConfig")
 }
 
 #[smithy_macros::smithy(union_for = "com.amazonaws.sagemakertrainingsessionruntime#OperationConfig")]

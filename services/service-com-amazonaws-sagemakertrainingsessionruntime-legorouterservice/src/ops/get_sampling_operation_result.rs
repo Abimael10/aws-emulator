@@ -167,33 +167,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        // A session this emulator has never seen is NOT materialised by a read.
+        // What this read resolves is the SAMPLE REQUEST, so that is what an unresolvable
+        // request reports missing: a session this emulator holds no record of holds no
+        // sampling operation either, and both misses are the one 404 naming the operation
+        // id the request carried. A session is NOT materialised by a read in either case.
+        let not_found = || -> Self::Error {
+            GetSamplingOperationResultErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::sample_request_not_found(&input.operation_id),
+                },
+            )
+            .into()
+        };
         let Some(session) = store.advance_session(&input.training_session_name, now) else {
-            return Err(
-                GetSamplingOperationResultErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!(
-                            "Training session {} does not exist.",
-                            input.training_session_name
-                        ),
-                    },
-                )
-                .into(),
-            );
+            return Err(not_found());
         };
         let Some(op) = session.sampling_ops.get(&input.operation_id) else {
-            return Err(
-                GetSamplingOperationResultErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!(
-                            "Sampling operation {} does not exist, or does not belong to \
-                             training session {}.",
-                            input.operation_id, input.training_session_name
-                        ),
-                    },
-                )
-                .into(),
-            );
+            return Err(not_found());
         };
 
         let output = GetSamplingOperationResultOutput {

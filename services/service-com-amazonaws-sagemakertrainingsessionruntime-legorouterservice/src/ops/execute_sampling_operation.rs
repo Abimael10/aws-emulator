@@ -153,7 +153,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ExecuteSamplingOperationErrorModeled::InternalServerException(
                 InternalServerException {
@@ -163,11 +162,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A sampling operation is submitted against a session the control plane already
+        // created, and this data plane creates none: a name no `CreateTrainingSession`
+        // minted resolves to nothing, which is the modelled 404 — reported before the
+        // request body is judged, the way resolution precedes validation on this surface.
+        if !crate::state::control_plane_holds_session(&*self.engine, &input.training_session_name)
+        {
+            return Err(
+                ExecuteSamplingOperationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::session_not_found(
+                            &input.training_session_name,
+                            &crate::state::request_region(ctx.parts()),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A body that set more than one `operationConfig` member asks for no single
+        // operation, and is refused HERE rather than where it was read: resolution comes
+        // first on this surface, so a submit naming a session that does not exist reports
+        // the session rather than the body. Nothing ambiguous is executed either way.
+        if input.operation_config.ambiguous() {
+            return Err(ExecuteSamplingOperationErrorModeled::ValidationException(
+                ValidationException {
+                    message: super::types::sample_operation_config_arity_message(),
+                },
+            )
+            .into());
+        }
+
         // The modelled constraints (the label, `numSamples`' 1..1000 range,
-        // `maxTokens`' range, exactly one union member) are refused before this handler
-        // runs; what is left are the rules the model states in prose.
+        // `maxTokens`' range) are refused before this handler runs; what is left are the
+        // rules the model states in prose.
         if let Err(reason) =
-            crate::state::validate_sample_operation_config(&input.operation_config)
+            crate::state::validate_sample_operation_config(input.operation_config.config())
         {
             return Err(ExecuteSamplingOperationErrorModeled::ValidationException(
                 ValidationException { message: reason },
@@ -209,7 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             operation_id.clone(),
             crate::state::SamplingOp {
                 operation_id: operation_id.clone(),
-                config: input.operation_config,
+                config: input.operation_config.into_config(),
                 status: crate::state::STATUS_PENDING,
                 result: None,
                 error_details: None,

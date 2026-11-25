@@ -44,6 +44,23 @@ use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+use std::sync::LazyLock;
+
+/// This service's Smithy model: the one source for which of its members are `@sensitive`,
+/// and so for which values a refusal states none.
+const MODEL_JSON: &str =
+    include_str!("../smithy-model/com-amazonaws-sagemakertrainingsessionruntime-legorouterservice.json");
+
+/// The members of this model whose value a refusal WITHHOLDS, read off [`MODEL_JSON`]
+/// rather than listed here.
+///
+/// This model marks the data a caller submits to the model itself: a sampling or
+/// log-probability request's `prompt` and the `ModelInput` it carries, and the encoded
+/// text chunks inside it. A clause about one of those names the member and the
+/// requirement and states no value — neither the submitted bytes nor the `null` the
+/// framework writes for a member that was not there at all.
+static WITHHELD_MEMBERS: LazyLock<service_common::sensitive_members::WithheldMembers> =
+    LazyLock::new(|| service_common::sensitive_members::WithheldMembers::from_model(MODEL_JSON));
 
 /// The `com-amazonaws-sagemakertrainingsessionruntime-legorouterservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -116,7 +133,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // WITHOUT the `^`/`$` anchors the Smithy pattern carries. That wording is shared
         // by every service on a JSON protocol, so it lives in `service-common`; the
         // check itself still uses the model's pattern as written.
-        service_common::aws_validation_refusal(refusal)
+        //
+        // One further rendering is this model's own: a member it marks `@sensitive` is
+        // one the service does not disclose, so its clause states NO value at all —
+        // which, for a member that was absent, means the clause reads `Value at '<path>'`
+        // rather than `Value null at '<path>'`. WHICH members those are is read from the
+        // model ([`WITHHELD_MEMBERS`]), since the runtime schemas carry the constraint
+        // traits and not `@sensitive`.
+        service_common::validation_message::aws_validation_refusal_withholding(refusal, |path| {
+            WITHHELD_MEMBERS.withholds_value(path)
+        })
     }
 
     fn override_routing_error(

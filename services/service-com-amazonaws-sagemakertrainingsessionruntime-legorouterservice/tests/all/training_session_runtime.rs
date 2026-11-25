@@ -53,23 +53,58 @@ const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 /// checkpoint ARNs they read back must carry.
 const REGION: &str = "us-west-2";
 
-/// Long enough for a clock-owed transition (`crate::state::EXECUTION_SPAN`, 500 ms) to
-/// have fallen due, with slack for a loaded test machine.
-const PAST_THE_SPAN: Duration = Duration::from_millis(900);
-
-/// How many polls a terminal status is waited for before the case fails.
+/// How many polls a terminal status is waited for before the case fails. Far above the
+/// service's own execution span, so a loaded host still passes.
 const POLL_BUDGET: u32 = 40;
 
 /// One emulator: a shared engine with this service mounted on the production router, so
 /// the tests drive the same dispatch path the binary does.
-fn emulator() -> MultiServiceRouter {
+///
+/// The engine is held beside the router because a training session EXISTS only because
+/// the SageMaker control plane created it: this data plane models no create and resolves
+/// the name a request carries through the directory both services read, so each case
+/// registers the sessions it is about ([`Emulator::create_session`]) and a name it does
+/// not register is a session that was never created.
+struct Emulator {
+    router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
+}
+
+impl Emulator {
+    /// Register `name` the way the SageMaker control plane's `CreateTrainingSession`
+    /// does: the one call that makes a training session exist, which this crate's own
+    /// model declares nothing for.
+    fn create_session(&self, name: &str) {
+        self.engine
+            .state::<service_common::training_sessions::TrainingSessionDirectory>()
+            .lock()
+            .register(service_common::training_sessions::TrainingSessionRecord {
+                name: name.to_string(),
+                arn: engine::emulator_arn(
+                    "sagemaker",
+                    REGION,
+                    &format!("training-session/{name}"),
+                ),
+            });
+    }
+}
+
+impl std::ops::Deref for Emulator {
+    type Target = MultiServiceRouter;
+
+    fn deref(&self) -> &Self::Target {
+        &self.router
+    }
+}
+
+fn emulator() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The tests assert behaviour, not signatures; the emulator verifies signatures
     // itself and a service never checks them.
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    Emulator { router, engine }
 }
 
 /// What the emulator answered.
@@ -243,8 +278,31 @@ async fn submit_training_ok(
 
 /// Poll a training operation until its status is terminal, answering the last answer.
 async fn poll_training_to_terminal(router: &MultiServiceRouter, session: &str, id: &str) -> Answer {
+    poll_training_to_terminal_in(router, session, id, REGION).await
+}
+
+/// [`poll_training_to_terminal`], reading in `region`, so a case about what the request's
+/// own Region produced reads it back under that Region.
+///
+/// Waits for the CONDITION rather than for a span of wall clock: the operation's
+/// transition is owed at an instant the service stored, so the loop looks again until it
+/// has happened or a generous budget runs out.
+async fn poll_training_to_terminal_in(
+    router: &MultiServiceRouter,
+    session: &str,
+    id: &str,
+    region: &str,
+) -> Answer {
     for _ in 0..POLL_BUDGET {
-        let answer = get_training(router, session, id).await;
+        let answer = call_in_region(
+            router,
+            "GET",
+            &format!("/v1/training-sessions/{session}/operations/{id}"),
+            bytes::Bytes::new(),
+            region,
+            &[],
+        )
+        .await;
         assert_eq!(
             answer.status, 200,
             "case {id}: a poll of a stored operation must answer HTTP 200, got {} {}",
@@ -367,6 +425,7 @@ async fn write_checkpoint(
 async fn every_training_operation_member_answers_from_stored_state() {
     let router = emulator();
     let session = "member-table";
+    router.create_session(session);
     // Written first so the `loadState` rows have a checkpoint to name. `saveState`
     // carries optimizer state, `saveWeights` does not.
     let state_arn = write_checkpoint(&router, session, 1, true).await;
@@ -491,6 +550,7 @@ async fn every_training_operation_member_answers_from_stored_state() {
 async fn every_sampling_operation_member_answers_from_stored_state() {
     let router = emulator();
     let session = "sampling-members";
+    router.create_session(session);
     let checkpoint = write_checkpoint(&router, session, 1, false).await;
 
     let cases: Vec<(&str, Value, &str, Option<&str>)> = vec![
@@ -571,6 +631,7 @@ async fn checkpoint_arns_carry_the_requests_region_and_an_incrementing_version()
     for region in ["us-west-2", "eu-central-1", "ap-southeast-3"] {
         let router = emulator();
         let session = "arn-table";
+        router.create_session(session);
         for version in 1..=3i64 {
             let body = json!({
                 "sequenceNumber": version,
@@ -593,16 +654,7 @@ async fn checkpoint_arns_carry_the_requests_region_and_an_incrementing_version()
                 String::from_utf8_lossy(&answer.body)
             );
             let id = answer.text("operationId");
-            tokio::time::sleep(PAST_THE_SPAN).await;
-            let answer = call_in_region(
-                &router,
-                "GET",
-                &format!("/v1/training-sessions/{session}/operations/{id}"),
-                bytes::Bytes::new(),
-                region,
-                &[],
-            )
-            .await;
+            let answer = poll_training_to_terminal_in(&router, session, &id, region).await;
             let arn = answer.json()["operationResult"]["saveState"]["modelPackageArn"]
                 .as_str()
                 .unwrap_or_default()
@@ -628,6 +680,7 @@ async fn checkpoint_arns_carry_the_requests_region_and_an_incrementing_version()
 async fn a_checkpoint_operation_settles_only_once_its_due_instant_has_passed() {
     let router = emulator();
     let session = "clock";
+    router.create_session(session);
     let id = submit_training_ok(&router, session, 1, json!({"saveState": {}})).await;
 
     let immediate = get_training(&router, session, &id).await;
@@ -643,8 +696,10 @@ async fn a_checkpoint_operation_settles_only_once_its_due_instant_has_passed() {
         immediate.json()
     );
 
-    tokio::time::sleep(PAST_THE_SPAN).await;
-    let first = get_training(&router, session, &id).await;
+    // Wait for the CONDITION the clock owes rather than for a span of wall clock: the
+    // poll loop looks again until the transition has been applied or its generous budget
+    // runs out.
+    let first = poll_training_to_terminal(&router, session, &id).await;
     let second = get_training(&router, session, &id).await;
     assert_eq!(
         first.text("status"),
@@ -667,12 +722,16 @@ async fn a_checkpoint_operation_settles_only_once_its_due_instant_has_passed() {
 async fn a_queued_backlog_drains_on_the_instants_the_clock_owed() {
     let router = emulator();
     let session = "backlog";
+    router.create_session(session);
     let mut ids = Vec::new();
     for sequence in 1..=3i64 {
         ids.push(submit_training_ok(&router, session, sequence, json!({"saveState": {}})).await);
     }
-    // Three spans plus slack, with no poll in between to drive the queue.
-    tokio::time::sleep(3 * PAST_THE_SPAN).await;
+    // The LAST slot is what the whole backlog has to drain for, so that is the condition
+    // waited on — and nothing in between is read, so the earlier slots were settled by
+    // the instants the clock owed them and not by a poll of their own.
+    let last = ids.last().expect("three operations were submitted");
+    poll_training_to_terminal(&router, session, last).await;
     for (index, id) in ids.iter().enumerate() {
         let answer = get_training(&router, session, id).await;
         assert_eq!(
@@ -696,6 +755,7 @@ async fn a_queued_backlog_drains_on_the_instants_the_clock_owed() {
 async fn a_repeated_client_token_answers_the_same_operation_id() {
     let router = emulator();
     let session = "idempotency";
+    router.create_session(session);
     // Tokens spanning `ClientToken`'s 1..128 length and `^[a-zA-Z0-9-]+$` pattern.
     let tokens = [
         "a",
@@ -819,6 +879,7 @@ async fn a_repeated_client_token_answers_the_same_operation_id() {
 async fn a_taken_or_passed_sequence_number_conflicts() {
     let router = emulator();
     let session = "ordering";
+    router.create_session(session);
     for sequence in [1i64, 2, 3] {
         let id = submit_training_ok(&router, session, sequence, json!({"saveState": {}})).await;
         poll_training_to_terminal(&router, session, &id).await;
@@ -854,7 +915,13 @@ async fn a_taken_or_passed_sequence_number_conflicts() {
 
     // "If a gap exists, the session blocks until the missing operation arrives": the
     // queued operation does not execute while slots 4..8 are empty, however long passes.
-    tokio::time::sleep(PAST_THE_SPAN).await;
+    // What is waited on is an operation of ANOTHER session settling — a condition, not a
+    // span of wall clock — which is reached only once a transition has really fallen due,
+    // so the gapped operation has had that long to execute and has not.
+    let elsewhere = "ordering-clock";
+    router.create_session(elsewhere);
+    let ticking = submit_training_ok(&router, elsewhere, 1, json!({"saveState": {}})).await;
+    poll_training_to_terminal(&router, elsewhere, &ticking).await;
     let blocked = get_training(&router, session, &queued).await;
     assert_eq!(
         blocked.text("status"),
@@ -898,14 +965,17 @@ async fn a_full_store_releases_a_session_nothing_is_owed_on_rather_than_refusing
         .collect();
     let mut blocked_ops = Vec::with_capacity(blocked.len());
     for session in &blocked {
+        router.create_session(session);
         blocked_ops.push(submit_training_ok(&router, session, 2, json!({"saveState": {}})).await);
     }
     // And one session that HAS settled, which is the one a release must take first.
+    router.create_session("settled");
     let settled_op = submit_training_ok(&router, "settled", 1, json!({"saveState": {}})).await;
     poll_training_to_terminal(&router, "settled", &settled_op).await;
 
     // The store is full. A submit against a new name is accepted, and what it released is
     // the settled session, not one of the blocked ones.
+    router.create_session("fresh-one");
     let fresh_op = submit_training_ok(&router, "fresh-one", 1, json!({"saveState": {}})).await;
     let released = get_training(&router, "settled", &settled_op).await;
     assert_eq!(
@@ -926,6 +996,7 @@ async fn a_full_store_releases_a_session_nothing_is_owed_on_rather_than_refusing
     // The store is full again and nothing has settled — the operation the previous submit
     // created is still executing — so the release takes the OLDEST blocked session, and
     // the next-oldest stays.
+    router.create_session("fresh-two");
     let second_op = submit_training_ok(&router, "fresh-two", 1, json!({"saveState": {}})).await;
     let oldest = get_training(&router, &blocked[0], &blocked_ops[0]).await;
     assert_eq!(
@@ -964,6 +1035,10 @@ async fn a_full_store_releases_a_session_nothing_is_owed_on_rather_than_refusing
 #[tokio::test]
 async fn an_unknown_session_or_operation_is_not_found() {
     let router = emulator();
+    // The two sessions the control plane created; every other name below is one no create
+    // ever named.
+    router.create_session("known");
+    router.create_session("other-session");
     let training = submit_training_ok(&router, "known", 1, json!({"saveState": {}})).await;
     let sampling = submit_sampling(
         &router,
@@ -975,7 +1050,6 @@ async fn an_unknown_session_or_operation_is_not_found() {
     // A second session, so "belongs to another session" is a real case and not just an
     // id this emulator never minted.
     let other = submit_training_ok(&router, "other-session", 1, json!({"saveState": {}})).await;
-
     let cases: Vec<(&str, String)> = vec![
         (
             "a session never submitted to",
@@ -1057,6 +1131,7 @@ async fn an_unknown_session_or_operation_is_not_found() {
 async fn an_invalid_request_is_refused_with_validation_exception() {
     let router = emulator();
     let session = "refusals";
+    router.create_session(session);
 
     let training_cases: Vec<(&str, Value)> = vec![
         (
@@ -1261,6 +1336,7 @@ async fn an_invalid_request_is_refused_with_validation_exception() {
 async fn a_request_at_each_published_bound_is_accepted() {
     let router = emulator();
     let session = "bounds";
+    router.create_session(session);
 
     for (case, num_samples, max_tokens, topk) in [
         ("the lowest numSamples and maxTokens", 1i64, 512i64, 0i64),
@@ -1306,7 +1382,9 @@ async fn a_request_at_each_published_bound_is_accepted() {
         // A fresh session per row, so each one submits into the same free slot. The name
         // stays inside `TrainingSessionName`'s `^[a-zA-Z0-9-]+$` pattern.
         let suffix = threshold.replace('_', "-");
-        let answer = submit_training(&router, &format!("{session}-{suffix}-{value}"), body).await;
+        let row_session = format!("{session}-{suffix}-{value}");
+        router.create_session(&row_session);
+        let answer = submit_training(&router, &row_session, body).await;
         assert_eq!(
             answer.status,
             200,
@@ -1327,6 +1405,7 @@ async fn a_request_at_each_published_bound_is_accepted() {
 async fn sample_training_session_answers_from_the_sessions_checkpoint() {
     let router = emulator();
     let session = "inference";
+    router.create_session(session);
 
     // A session this emulator has never seen.
     let absent = call_in_region(
@@ -1548,6 +1627,7 @@ async fn sample_with_response_stream(
 async fn the_streaming_inference_call_frames_server_sent_events() {
     let router = emulator();
     let session = "streaming";
+    router.create_session(session);
     let checkpoint = write_checkpoint(&router, session, 1, true).await;
 
     // Payloads of several sizes: the chunk reports the size that arrived and the body is
@@ -1652,6 +1732,7 @@ async fn the_streaming_inference_call_frames_server_sent_events() {
 async fn the_streaming_inference_call_refuses_what_the_synchronous_one_refuses() {
     let router = emulator();
     let session = "streaming-refusals";
+    router.create_session(session);
 
     // A session this emulator has never seen is not materialised by an inference call,
     // and the refusal reports the whole identity the lookup failed on: the session name,
@@ -1770,9 +1851,11 @@ async fn the_session_store_still_accepts_a_submit_once_it_is_full_of_blocked_ses
     // queue starts at sequence number 1, so a slot above that never executes and the
     // session never settles.
     for index in 0..MAX_SESSIONS {
+        let session = format!("blocked-{index}");
+        router.create_session(&session);
         let answer = submit_training(
             &router,
-            &format!("blocked-{index}"),
+            &session,
             json!({
                 "sequenceNumber": 5,
                 "operationConfig": {"saveState": {}},
@@ -1791,6 +1874,7 @@ async fn the_session_store_still_accepts_a_submit_once_it_is_full_of_blocked_ses
     // The store is full of sessions that can never settle; a submit naming a fresh
     // session is still served, and so is the one after it.
     for name in ["after-the-bound", "after-the-bound-two"] {
+        router.create_session(name);
         let answer = submit_training(
             &router,
             name,
