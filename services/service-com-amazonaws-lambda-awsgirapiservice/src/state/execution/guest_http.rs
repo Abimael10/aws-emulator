@@ -811,8 +811,17 @@ def setdefaulttimeout(timeout):
     return None
 
 
-def socketpair(*_arguments, **_keywords):
-    raise error(_UNREACHABLE)
+def socketpair(family=AF_UNIX, type=SOCK_STREAM, proto=0):
+    """A pair of connected sockets, both ends in THIS process.
+
+    Nothing of the host is involved — a pair is two byte queues and the two ends that read and
+    write them ([`_lambda_pipes`]) — so this is served rather than refused: it is what the
+    standard library's own event loop opens as its wakeup pipe, and what a program that wants
+    a channel between two parts of itself opens.
+    """
+    import _lambda_pipes
+
+    return _lambda_pipes.socketpair(family, type, proto)
 
 
 def create_connection(

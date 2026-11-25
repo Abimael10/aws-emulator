@@ -592,6 +592,9 @@ impl FunctionRecord {
             checkpoint_token: crate::state::mint_checkpoint_token(),
             // Nothing has been checkpointed yet, so no duplicate request can be identified.
             answered_checkpoint: None,
+            // Nor has the run taken any wait for something outside itself, so there is no
+            // callback for a client to signal yet (`crate::state::durable_callbacks`).
+            callbacks: BTreeMap::new(),
         };
         // The history opens with the event the start itself is: "The input payload
         // provided for the durable execution" and "the maximum amount of time that the

@@ -50,11 +50,18 @@
 //! * `Duration` is the span type the model's own operations take, with the constructors a
 //!   handler writes (`from_millis`, `from_seconds`, `from_minutes`, `from_hours`,
 //!   `from_days`) and the readings it gives back.
+//! * `context.wait_for_callback(…)` waits for something OUTSIDE the execution to finish: the
+//!   durable context MINTS a callback id, hands it to the callable the handler gave so the
+//!   handler can send it wherever the external work is, and then waits for a client to signal
+//!   that id through `SendDurableExecutionCallbackSuccess`, `…Failure` or `…Heartbeat`. The
+//!   callback and the window it is open for are the HOST's
+//!   ([`super::super::durable_callbacks`]), which is where the `CallbackStarted` history event
+//!   carrying the id is appended; `WaitForCallbackConfig` is the configuration a handler names
+//!   the timeouts in.
 //!
-//! What it does NOT do: the CALLBACK operations of the model
-//! (`context.wait_for_callback`), which mint a callback id a client then signals. A handler
-//! reaching for a callback is answered the attribute error of a name this runtime does not
-//! supply, rather than a callback id nothing can be signalled through.
+//! What it does NOT do: the CHAINED INVOCATION operations of the model, which start another
+//! execution. A handler reaching for one is answered the attribute error of a name this runtime
+//! does not supply, rather than a handle to an execution nothing started.
 
 use super::package::PackageModule;
 
@@ -95,12 +102,18 @@ pub fn runtime_modules() -> Vec<PackageModule> {
 const DURABLE_SDK_CONFIG_SOURCE: &str =
     r#""""The configuration of the durable-execution programming model's operations."""
 
-from aws_durable_execution_sdk_python import Duration, RetryStrategyConfig, StepConfig
+from aws_durable_execution_sdk_python import (
+    Duration,
+    RetryStrategyConfig,
+    StepConfig,
+    WaitForCallbackConfig,
+)
 
 __all__ = [
     "Duration",
     "RetryStrategyConfig",
     "StepConfig",
+    "WaitForCallbackConfig",
 ]
 "#;
 
@@ -133,10 +146,13 @@ _host = __import__("_lambda_host")
 
 __all__ = [
     "CallableRuntimeError",
+    "CallbackFailureError",
+    "CallbackTimeoutError",
     "Duration",
     "DurableContext",
     "RetryStrategyConfig",
     "StepConfig",
+    "WaitForCallbackConfig",
     "create_retry_strategy",
     "durable_execution",
     "durable_step",
@@ -150,6 +166,19 @@ class CallableRuntimeError(Exception):
     are spent, the execution fails with this error carrying the message the work's own
     exception carried.
     """
+
+
+class CallbackTimeoutError(Exception):
+    """What a WAIT FOR CALLBACK whose window closed raises.
+
+    The callback was open for the timeout its configuration named; once that window closed
+    nothing can signal it any more, so the wait raises here and the execution fails with it
+    unless the handler catches it.
+    """
+
+
+class CallbackFailureError(Exception):
+    """What a WAIT FOR CALLBACK a client FAILED raises, carrying that client's own error."""
 
 
 class Duration:
@@ -236,6 +265,28 @@ class StepConfig:
 
     def __repr__(self):
         return "StepConfig(name=%r, retry_strategy=%r)" % (self.name, self.retry_strategy)
+
+
+class WaitForCallbackConfig:
+    """The configuration one WAIT FOR CALLBACK runs under.
+
+    `timeout` is how long the callback stays open: once it passes, nothing can signal the
+    callback any more and the wait raises `CallbackTimeoutError`. `heartbeat_timeout` is how
+    long the wait goes without a heartbeat before the callback closes the same way; a
+    configuration that names none asks for no heartbeats at all.
+    """
+
+    def __init__(self, timeout=None, heartbeat_timeout=None, name=None, **options):
+        self.timeout = timeout
+        self.heartbeat_timeout = heartbeat_timeout
+        self.name = name
+        self.options = options
+
+    def __repr__(self):
+        return "WaitForCallbackConfig(timeout=%r, heartbeat_timeout=%r)" % (
+            self.timeout,
+            self.heartbeat_timeout,
+        )
 
 
 def _seconds_of(duration):
@@ -349,6 +400,86 @@ def _result_payload(value):
         return None
 
 
+# How long this model waits between two readings of a callback it is waiting on, in seconds.
+#
+# The window a callback is open for is the HOST's, and so is the instant it closes, so a reading
+# only ever reports what already happened: this is how often the wait looks. Short against the
+# shortest timeout a handler would configure, and long enough that a wait of minutes is a
+# handful of readings a second rather than a spin.
+_CALLBACK_POLL_SECONDS = 0.05
+
+
+def _whole_seconds(duration):
+    """`duration` as the whole number of seconds a timeout is named in, and 0 for none.
+
+    `CallbackOptions$TimeoutSeconds` and `HeartbeatTimeoutSeconds` are whole numbers of
+    seconds, and 0 is what each of them means by "not specified": no timeout, and heartbeats
+    disabled.
+    """
+    if duration is None:
+        return 0
+    try:
+        seconds = _seconds_of(duration)
+    except TypeError:
+        return 0
+    if seconds <= 0:
+        return 0
+    return int(seconds + 0.5)
+
+
+def _callback_call(asked):
+    """One call about a CALLBACK of this execution, with what the host refused raised.
+
+    The REFUSAL of the call itself travels under its own member: a callback a client FAILED
+    carries an error of its own, which is the waiting handler's answer rather than a refusal.
+    """
+    answered = _json.loads(_host.durable_callback(_json.dumps(asked)))
+    refused = answered.get("refused")
+    if refused:
+        raise CallableRuntimeError(refused)
+    return answered
+
+
+def _hand_callback_to(work, context, callback_id):
+    """Hand `callback_id` to the handler's own callable, which is what carries it outside.
+
+    The callable is called with the arguments it takes: the id alone, the context and the id,
+    or neither — so a handler writes the callable the way it reads best and the id reaches it
+    either way.
+    """
+    if work is None:
+        return None
+    if not callable(work):
+        raise TypeError(
+            "a callback's work is a callable that is handed the callback id, not %r"
+            % (type(work),)
+        )
+    target = getattr(work, "__wrapped__", work)
+    code = getattr(target, "__code__", None)
+    if code is None:
+        call = getattr(target, "__call__", None)
+        code = getattr(call, "__code__", None)
+        if code is not None and hasattr(call, "__self__"):
+            # A bound call carries its own object, which is not one of the arguments the
+            # caller supplies.
+            return _called_with(work, max(code.co_argcount - 1, 0), context, callback_id)
+    if code is None:
+        return work(callback_id)
+    takes = code.co_argcount
+    if hasattr(target, "__self__"):
+        takes = max(takes - 1, 0)
+    return _called_with(work, takes, context, callback_id)
+
+
+def _called_with(work, takes, context, callback_id):
+    """Call `work` with as many of the context and the callback id as it takes."""
+    if takes == 0:
+        return work()
+    if takes == 1:
+        return work(callback_id)
+    return work(context, callback_id)
+
+
 def _named_like(wrapper, target):
     """Carry `target`'s own name and documentation onto the wrapper around it."""
     for member in ("__name__", "__qualname__", "__doc__", "__module__"):
@@ -419,6 +550,7 @@ class DurableContext:
         self._context = context
         self._steps = 0
         self._waits = 0
+        self._callbacks = 0
 
     def __getattr__(self, name):
         return getattr(self._context, name)
@@ -466,6 +598,71 @@ class DurableContext:
         self._checkpoint(
             "SUCCEED", identifier, name, 1, operation="WAIT", wait_seconds=seconds
         )
+
+    def wait_for_callback(self, work=None, config=None, name=None, timeout=None, **options):
+        """Wait for something OUTSIDE this execution to finish, and answer what it sent.
+
+        The durable context MINTS a callback id and hands it to `work` — the callable the
+        handler gave, which is how the handler sends that id wherever the external work is —
+        and then waits for a client to signal it: `SendDurableExecutionCallbackSuccess` is what
+        this call answers, `SendDurableExecutionCallbackFailure` is what it raises, and
+        `SendDurableExecutionCallbackHeartbeat` keeps the window open while the external work
+        is still running.
+
+        The window is the `timeout` the configuration named: once it closes, nothing can signal
+        the callback any more and this raises `CallbackTimeoutError`. Like every other way a
+        handler spends time, the wait is spent INSIDE the invocation, so a wait the function's
+        own `Timeout` cuts off ends the run as any other unfinished handler's does.
+        """
+        held = config if config is not None else options.get("callback_config")
+        if timeout is None:
+            timeout = _member(held, "timeout", "timeout_seconds", "timeoutSeconds")
+        heartbeat = _member(
+            held, "heartbeat_timeout", "heartbeat_timeout_seconds", "heartbeatTimeoutSeconds"
+        )
+        if name is None:
+            name = _member(held, "name")
+        self._callbacks += 1
+        identifier = "callback-%d" % self._callbacks
+        asked = {
+            "action": "START",
+            "id": identifier,
+            "timeoutSeconds": _whole_seconds(timeout),
+            "heartbeatTimeoutSeconds": _whole_seconds(heartbeat),
+        }
+        if name is not None:
+            asked["name"] = str(name)
+        started = _callback_call(asked)
+        callback_id = started["callbackId"]
+        # The handler's own callable is what carries the id to the external system, so it is
+        # called with the id the context minted — and with this context too, for a callable
+        # that takes one.
+        _hand_callback_to(work, self, callback_id)
+        while True:
+            answered = _callback_call({"action": "POLL", "callbackId": callback_id})
+            state = answered.get("state")
+            if state == "SUCCEEDED":
+                result = answered.get("result")
+                if result is None:
+                    return None
+                try:
+                    return _json.loads(result)
+                except ValueError:
+                    # A client may send a result that is not JSON, and what the waiting
+                    # handler receives is then the text itself.
+                    return result
+            if state == "FAILED":
+                error = answered.get("error") or {}
+                raise CallbackFailureError(
+                    error.get("errorMessage") or error.get("errorType") or ""
+                )
+            if state == "TIMED_OUT":
+                error = answered.get("error") or {}
+                raise CallbackTimeoutError(error.get("errorMessage") or "")
+            # Still waiting: the window is the host's, and so is the instant it closes. The
+            # wait between two readings is the standard library's own sleep, which this runtime
+            # clamps to what is left of the invocation.
+            time.sleep(_CALLBACK_POLL_SECONDS)
 
     def step(self, work, *args, **kwargs):
         """Run one STEP of this execution and answer what its work returned.

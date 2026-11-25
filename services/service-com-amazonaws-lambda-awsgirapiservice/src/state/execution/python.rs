@@ -668,6 +668,15 @@ pub(super) struct Session {
     /// ([`super::guest_socket`]). Held by the environment, like the session itself, and given
     /// up with the invocation that opened them.
     sockets: super::guest_socket::Sockets,
+    /// The DATABASES this environment holds open ([`super::guest_sqlite`]), and the engine
+    /// behind them.
+    ///
+    /// Held by the environment and NOT given up between invocations, unlike the connections
+    /// above: a database is memory the handler's own code allocated — a handler that opens one
+    /// in its module body and keeps it in a global reads it again in the next invocation that
+    /// environment serves, exactly as it reads any other module global — and it goes when the
+    /// environment does.
+    databases: super::guest_sqlite::Databases,
     /// The FILE SYSTEMS the invocation being served has mounted
     /// ([`super::guest_file_system`]): the trees the host answers this environment's
     /// filesystem calls on paths of those mounts out of. Resolved per invocation, so what a
@@ -706,6 +715,7 @@ impl Session {
             calls: AtomicU64::new(0),
             children: AtomicU64::new(0),
             sockets: super::guest_socket::Sockets::default(),
+            databases: super::guest_sqlite::Databases::default(),
             file_systems: Mutex::new(super::guest_file_system::GuestFileSystems::attach(
                 file_systems,
             )),
@@ -840,6 +850,14 @@ impl Session {
             document,
             within,
         ))
+    }
+
+    /// ONE call the invocation being served made on a DATABASE of this execution environment
+    /// ([`super::guest_sqlite`]): the databases are the ENVIRONMENT's, so a connection a
+    /// handler opened in its module body is still open for the next invocation it serves, and
+    /// every statement is compiled and run by the engine this crate embeds.
+    fn database_call(&self, verb: &str, document: &str, within: Duration) -> String {
+        self.databases.answered(verb, document, within)
     }
 
     /// Whether the invocation being served may make one more call into this emulator, which
@@ -1658,8 +1676,10 @@ fn runtime_modules() -> ::serde_json::Map<String, ::serde_json::Value> {
 /// the socket module a Python program expects of its operating system, the HTTP client
 /// built on one and the TLS layer beside it ([`super::guest_http`]), the waiting
 /// interface the standard library's own `selectors` is built out of
-/// ([`super::guest_select`]), and the signal and child-process interfaces beside them
-/// ([`super::guest_signal`], [`super::guest_process`]). Resolved before the frozen standard
+/// ([`super::guest_select`]), the signal and child-process interfaces beside them
+/// ([`super::guest_signal`], [`super::guest_process`]) and the database interface whose
+/// statements run on the engine this crate embeds ([`super::guest_sqlite`]). Resolved before
+/// the frozen standard
 /// library and after the deployment package's own entries and the content the function's
 /// layers mount, which is where a runtime's own standard library sits.
 fn runtime_stdlib() -> ::serde_json::Map<String, ::serde_json::Value> {
@@ -1668,6 +1688,10 @@ fn runtime_stdlib() -> ::serde_json::Map<String, ::serde_json::Value> {
         .chain(super::guest_select::runtime_stdlib_modules())
         .chain(super::guest_signal::runtime_stdlib_modules())
         .chain(super::guest_process::runtime_stdlib_modules())
+        .chain(super::guest_sqlite::runtime_stdlib_modules())
+        .chain(super::guest_zoneinfo::runtime_stdlib_modules())
+        .chain(super::guest_sysconfig::runtime_stdlib_modules())
+        .chain(super::guest_pipes::runtime_stdlib_modules())
         .map(|module| (module.path, ::serde_json::Value::String(module.source)))
         .collect()
 }
@@ -2118,6 +2142,52 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<PyRef<Py
             Ok(vm.ctx.new_str(answered).into())
         },
     );
+    // ONE CALL a handler makes on a DATABASE of this execution environment, which the
+    // `sqlite3` module of this runtime's standard library performs
+    // ([`super::guest_sqlite`]). The databases, the engine's own containment and the bounds on
+    // one statement are all that module's; the bound that is this run's — a statement never
+    // outlives the invocation that asked for it — is held here, where no guest code can reach
+    // it. It is no call into another service, so it spends none of the per-run call count.
+    let querying = Arc::clone(session);
+    set_function(
+        vm,
+        &module,
+        "sqlite",
+        move |args: FuncArgs, vm: &VirtualMachine| {
+            let (verb, document): (String, String) = args.bind(vm)?;
+            let call_bounds = querying.bounds();
+            // A run whose budget is already spent runs no further statement: the latched stop
+            // is its answer, so work it starts afterwards is work nothing will report.
+            if let Some(stop) = call_bounds.stopped() {
+                return Err(vm.new_runtime_error(stop.reason().to_owned()));
+            }
+            let remaining = call_bounds.remaining();
+            if remaining.is_zero() {
+                return Err(vm.new_runtime_error(Stop::Deadline.reason().to_owned()));
+            }
+            Ok(vm
+                .ctx
+                .new_str(querying.database_call(&verb, &document, remaining))
+                .into())
+        },
+    );
+    // ONE reading of a TIME ZONE the handler named, which the `zoneinfo` package of this
+    // runtime's standard library performs ([`super::guest_zoneinfo`]): the zones, and every
+    // offset, daylight-saving reading and abbreviation of one, are the compiled-in IANA
+    // database's. Nothing is dispatched, no host path is opened and no bound is spent: it is
+    // the environment's own database, read as data.
+    set_function(
+        vm,
+        &module,
+        "zone",
+        move |args: FuncArgs, vm: &VirtualMachine| {
+            let (verb, named): (String, String) = args.bind(vm)?;
+            Ok(vm
+                .ctx
+                .new_str(super::guest_zoneinfo::answered(&verb, &named))
+                .into())
+        },
+    );
     // ONE CHECKPOINT of the durable execution this invocation is the run of: the runtime's
     // own durable-execution SDK reports each step it starts, succeeds at or fails an attempt
     // of through here, and the HOST is what writes it onto that execution's history
@@ -2148,6 +2218,46 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<PyRef<Py
                 journal.record(&document);
             }
             Ok(vm.ctx.none())
+        },
+    );
+    // ONE CALLBACK of that same durable execution: the wait the handler takes for something
+    // OUTSIDE the execution to finish ([`super::super::durable_callbacks`]). The run MINTS the
+    // callback through here — which is what appends the `CallbackStarted` event the id travels
+    // in — and reads what that callback has come to while it waits. Nothing is dispatched and
+    // no service answers, so this spends neither the call count nor the deadline; what the
+    // guest decides is only which of its own waits it is asking about. The bound is the one a
+    // checkpoint carries, held where no guest code can reach it.
+    let waiting = Arc::clone(session);
+    set_function(
+        vm,
+        &module,
+        "durable_callback",
+        move |args: FuncArgs, vm: &VirtualMachine| {
+            let document: String = args.bind(vm)?;
+            // The one bound this seam has, held here where no guest code can reach it, exactly
+            // as the checkpoint seam above holds it: a handler decides what it asks about, so
+            // a document larger than one checkpoint may carry is REFUSED rather than written.
+            if document.len() > super::super::durable_steps::MAX_CHECKPOINT_BYTES {
+                return Err(vm.new_runtime_error(format!(
+                    "a durable execution's callback may carry at most {} bytes",
+                    super::super::durable_steps::MAX_CHECKPOINT_BYTES
+                )));
+            }
+            let Some(journal) = waiting.durable() else {
+                // An invocation that is no durable execution's run has no execution to mint a
+                // callback on, and says so rather than answering an id nothing can signal.
+                return Ok(vm
+                    .ctx
+                    .new_str(
+                        ::serde_json::json!({
+                            "refused": "this invocation is no durable execution's run, so it \
+                                        has no callback to wait for",
+                        })
+                        .to_string(),
+                    )
+                    .into());
+            };
+            Ok(vm.ctx.new_str(journal.callback(&document)).into())
         },
     );
     // What the SDK's own PAGINATOR for one operation drives: the input member a continuation
@@ -2289,7 +2399,10 @@ const HOST_MODULE_FUNCTIONS: &[&str] = &[
     "pagination",
     "error_shapes",
     "net",
+    "sqlite",
+    "zone",
     "durable",
+    "durable_callback",
     "ephemeral",
     "files",
     "library_source",
@@ -2470,8 +2583,46 @@ fn refuse_guest_threads(vm: &VirtualMachine) -> PyResult<()> {
         threads.set_attr(attribute, refusing.clone(), vm)?;
         installed_refusal(vm, &threads, attribute, &refusing, "_thread")?;
     }
+    install_thread_local(vm)?;
     Ok(())
 }
+
+/// Install the THREAD-LOCAL type of that same `_thread` module, which is what
+/// `threading.local` is and what the standard library's own modules keep their per-thread
+/// state in.
+///
+/// An invocation runs on ONE thread — a handler can start none ([`refuse_guest_threads`]) — so
+/// the data one thread holds is the data the object holds, which is ordinary attribute lookup:
+/// an attribute SET on the object is read back off it, and one the object does not carry falls
+/// back to the CLASS's own, exactly as a thread-local does for a subclass that declares a
+/// default (`asyncio.events`'s own `_RunningLoop.loop_pid` is such a default, and the engine's
+/// thread-less stub answers an `AttributeError` for it instead).
+fn install_thread_local(vm: &VirtualMachine) -> PyResult<()> {
+    let threads = vm.import("_thread", 0)?;
+    for name in ["local", "_local"] {
+        let built = super::host_posix::built_type(vm, "local", THREAD_LOCAL_SOURCE)?;
+        threads.set_attr(name, built, vm)?;
+        if threads.get_attr(name, vm).is_err() {
+            return Err(vm.new_runtime_error(format!(
+                "the thread-local type _thread.{name} could not be installed, so no function is \
+                 run in this interpreter"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `_thread.local`: the type the standard library keeps per-thread state in; see
+/// [`install_thread_local`].
+const THREAD_LOCAL_SOURCE: &str = r#"
+class local:
+    """Data held for one thread, of which an invocation runs exactly one."""
+
+    def __new__(cls, *args, **kwargs):
+        if (args or kwargs) and cls.__init__ is local.__init__:
+            raise TypeError("Initialization arguments are not supported")
+        return object.__new__(cls)
+"#;
 
 /// Put one host function on `module` under `name`.
 ///
@@ -3930,6 +4081,7 @@ mod tests {
             "child",
             "db_auth_token",
             "durable",
+            "durable_callback",
             "ephemeral",
             "error_shapes",
             "files",
@@ -3940,7 +4092,9 @@ mod tests {
             "presign",
             "record",
             "request",
-            "sleep"
+            "sleep",
+            "sqlite",
+            "zone"
         ]);
         assert_eq!(
             reachable, expected,

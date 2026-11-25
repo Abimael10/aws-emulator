@@ -165,6 +165,22 @@ pub mod guest_signal;
 /// handler, a client library it vendors, or the frozen `asyncio` imports.
 pub mod guest_process;
 
+/// The DATABASE interface of that same standard library — the `sqlite3` module a handler
+/// imports — and the in-process SQLite engine its statements run on.
+pub mod guest_sqlite;
+
+/// The TIME ZONE interface of that same standard library — the `zoneinfo` package a handler
+/// imports — and the IANA database its zones are read from.
+pub mod guest_zoneinfo;
+
+/// The CONNECTED PAIRS a run holds inside this process, which the socket interface answers for
+/// `socketpair` and the waiting interface reports readiness on.
+pub mod guest_pipes;
+
+/// The CONFIGURATION interface of that same standard library — the `sysconfig` module a
+/// handler, or a module of the library itself, imports to ask about the installation.
+pub mod guest_sysconfig;
+
 /// What a call of that interface PERFORMS: one program of the execution environment, resolved
 /// against its own `PATH` and mounts and run over its filesystem in this process.
 pub mod guest_child_process;

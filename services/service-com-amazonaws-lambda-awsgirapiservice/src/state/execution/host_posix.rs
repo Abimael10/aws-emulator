@@ -455,7 +455,10 @@ pub(crate) fn install_data_surface(
 }
 
 /// The type `source` defines under the name `name`, built in a scope of its own.
-fn built_type(
+///
+/// `pub(crate)` so the sibling installers of this runtime's own surface build a type the same
+/// way ([`super::python`]'s thread-local).
+pub(crate) fn built_type(
     vm: &::rustpython_vm::VirtualMachine,
     name: &str,
     source: &str,

@@ -63,8 +63,8 @@ const CEILING_OUT_OF_REACH: u64 = 32_768 * 1024 * 1024;
 
 /// The names the host installs on the module a run can reach (`state::execution::python`
 /// installs `log`, `record`, `sleep`, `aws`, `child`, `db_auth_token`, `request`, `presign`,
-/// `pagination`, `error_shapes`, `net`, `durable`, `files` and `library_source`), in the order
-/// a sorted reading of them answers.
+/// `pagination`, `error_shapes`, `net`, `sqlite`, `zone`, `durable`, `durable_callback`,
+/// `files` and `library_source`), in the order a sorted reading of them answers.
 ///
 /// None of them begins a phase of the run or raises a bound of it. A name added to the host
 /// module has to be added here too, which is the point of reading the surface rather than a
@@ -74,6 +74,7 @@ const SURFACE: &[&str] = &[
     "child",
     "db_auth_token",
     "durable",
+    "durable_callback",
     "ephemeral",
     "error_shapes",
     "files",
@@ -85,6 +86,8 @@ const SURFACE: &[&str] = &[
     "record",
     "request",
     "sleep",
+    "sqlite",
+    "zone",
 ];
 
 /// The names a PHASE of a run, or a BOUND the host reads the run against, would be carried

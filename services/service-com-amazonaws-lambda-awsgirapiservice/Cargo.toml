@@ -329,6 +329,27 @@ rustpython-ruff_python_trivia = "=0.16.5"
 rustpython-ruff_source_file = "=0.16.5"
 rustpython-ruff_text_size = "=0.16.5"
 nix = { version = "0.31", default-features = false, features = ["resource"] }
+# The DATABASE ENGINE the `sqlite3` module of the Python standard library this runtime
+# supplies runs its statements on (`state::execution::guest_sqlite`): the `bundled` SQLite
+# already in this workspace, at the version and feature set every other in-process database
+# of this emulator builds (`services/common`, and the Athena, Redshift Data and RDS Data
+# services). `column_decltype` carries the declared type of a column, which is what
+# `detect_types` converts a value by; `limits` installs the per-connection bounds on a
+# statement, a value and a database; `hooks` carries the default-deny authorizer that confines
+# a handler's SQL to its own database and the progress handler that bounds one statement's run;
+# `serialize` answers the BYTE IMAGE of a database, which is what the file a handler named it by
+# holds in the function's ephemeral storage, and `backup` carries the `DatabaseName` that call
+# names the main database by.
+# An in-process library over data: it opens no listener, writes no host file (every database is
+# opened in memory, with its temp store in memory too) and spawns nothing.
+rusqlite = { version = "0.41", features = [
+    "backup",
+    "bundled",
+    "column_decltype",
+    "hooks",
+    "limits",
+    "serialize",
+] }
 # The TRAFFIC SPLIT an alias with a `RoutingConfig` performs: one uniform draw per
 # invocation decides which of the two versions that invocation runs on
 # (`state::alias_routing`).

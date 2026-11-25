@@ -16915,6 +16915,7 @@ dependencies = [
  "rand 0.9.5",
  "regex",
  "rquickjs",
+ "rusqlite",
  "rustls",
  "rustpython-pylib",
  "rustpython-ruff_python_ast",

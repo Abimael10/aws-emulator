@@ -41,6 +41,14 @@
 
 use super::*;
 
+// The four details members a CALLBACK's own events carry, which this service's shapes declare
+// beside the ones a step and a wait carry: `super::*` re-exports what the state module itself
+// uses, and these are reached through the operations' own types.
+use crate::ops::{
+    CallbackFailedDetails, CallbackStartedDetails, CallbackSucceededDetails,
+    CallbackTimedOutDetails,
+};
+
 /// The member names of the document the runtime's durable SDK reports one checkpoint as.
 ///
 /// They are the model's own members of an `OperationUpdate`: the operation's `Type`, the
@@ -64,6 +72,14 @@ const NEXT_ATTEMPT_DELAY_MEMBER: &str = "nextAttemptDelaySeconds";
 /// See [`TYPE_MEMBER`]: the span a WAIT was asked for, which is the model's own
 /// `WaitOptions$WaitSeconds` ("the number of seconds to wait").
 const WAIT_SECONDS_MEMBER: &str = "waitSeconds";
+
+/// See [`TYPE_MEMBER`]: the id of the CALLBACK an operation of that type is the wait for,
+/// which `CallbackStartedDetails$CallbackId` reports.
+const CALLBACK_ID_MEMBER: &str = "callbackId";
+/// See [`TYPE_MEMBER`]: the `CallbackOptions$TimeoutSeconds` the callback was configured with.
+const CALLBACK_TIMEOUT_MEMBER: &str = "timeoutSeconds";
+/// See [`TYPE_MEMBER`]: the `CallbackOptions$HeartbeatTimeoutSeconds` it was configured with.
+const CALLBACK_HEARTBEAT_MEMBER: &str = "heartbeatTimeoutSeconds";
 
 /// The `OperationType` of the unit of work a durable handler runs through `context.step(…)`
 /// (`smithy_query(query="shape", shape="OperationType")`: `EXECUTION`, `CONTEXT`, `STEP`,
@@ -222,6 +238,16 @@ pub struct Checkpoint {
     /// The span a WAIT was asked for, in seconds, which `WaitOptions$WaitSeconds` names and
     /// `WaitStartedDetails$Duration` reports.
     pub wait_seconds: Option<i32>,
+    /// The id of the CALLBACK this operation is the wait for, which
+    /// `CallbackStartedDetails$CallbackId` reports — minted where the callback is
+    /// ([`super::durable_callbacks::mint_callback_id`]).
+    pub callback_id: Option<String>,
+    /// The `CallbackOptions$TimeoutSeconds` the callback was configured with, which
+    /// `CallbackStartedDetails$Timeout` reports.
+    pub callback_timeout_seconds: Option<i32>,
+    /// The `CallbackOptions$HeartbeatTimeoutSeconds` it was configured with, which
+    /// `CallbackStartedDetails$HeartbeatTimeout` reports.
+    pub callback_heartbeat_timeout_seconds: Option<i32>,
 }
 
 impl Checkpoint {
@@ -241,6 +267,14 @@ impl Checkpoint {
             (CONTEXT_TYPE, START_ACTION) => Some(EVENT_TYPE_CONTEXT_STARTED),
             (CONTEXT_TYPE, SUCCEED_ACTION) => Some(EVENT_TYPE_CONTEXT_SUCCEEDED),
             (CONTEXT_TYPE, FAIL_ACTION) => Some(EVENT_TYPE_CONTEXT_FAILED),
+            // A CALLBACK: the one the handler minted and is waiting on, the one a client
+            // completed or failed, and the one whose window the clock closed — which is the
+            // operation being CANCELLED, the action the model has for an operation nothing
+            // completed ([`super::durable_callbacks`]).
+            (CALLBACK_TYPE, START_ACTION) => Some(EVENT_TYPE_CALLBACK_STARTED),
+            (CALLBACK_TYPE, SUCCEED_ACTION) => Some(EVENT_TYPE_CALLBACK_SUCCEEDED),
+            (CALLBACK_TYPE, FAIL_ACTION) => Some(EVENT_TYPE_CALLBACK_FAILED),
+            (CALLBACK_TYPE, CANCEL_ACTION) => Some(EVENT_TYPE_CALLBACK_TIMED_OUT),
             _ => None,
         }
     }
@@ -275,6 +309,11 @@ impl Checkpoint {
             payload: text(PAYLOAD_MEMBER),
             error: checkpoint_error(update.get(ERROR_MEMBER)),
             wait_seconds: whole(WAIT_SECONDS_MEMBER).filter(|seconds| *seconds >= 0),
+            callback_id: text(CALLBACK_ID_MEMBER),
+            callback_timeout_seconds: whole(CALLBACK_TIMEOUT_MEMBER)
+                .filter(|seconds| *seconds >= 0),
+            callback_heartbeat_timeout_seconds: whole(CALLBACK_HEARTBEAT_MEMBER)
+                .filter(|seconds| *seconds >= 0),
         })
     }
 }
@@ -398,6 +437,30 @@ pub fn append_checkpoint(
         EVENT_TYPE_CONTEXT_FAILED => {
             event.context_failed_details = Some(ContextFailedDetails { error: failure() });
         }
+        // The CALLBACK events, each carrying the one details member of its own type: the id the
+        // handler's durable context minted and the timeouts it was configured with, the result
+        // a client completed it with, and the error a failure or a closed window carried.
+        EVENT_TYPE_CALLBACK_STARTED => {
+            // `CallbackStartedDetails$CallbackId` is REQUIRED: a checkpoint of a callback
+            // starting that names no id is not an event this history can take.
+            let Some(callback_id) = checkpoint.callback_id.clone() else {
+                return false;
+            };
+            event.callback_started_details = Some(CallbackStartedDetails {
+                callback_id,
+                timeout: checkpoint.callback_timeout_seconds,
+                heartbeat_timeout: checkpoint.callback_heartbeat_timeout_seconds,
+            });
+        }
+        EVENT_TYPE_CALLBACK_SUCCEEDED => {
+            event.callback_succeeded_details = Some(CallbackSucceededDetails { result: result() });
+        }
+        EVENT_TYPE_CALLBACK_FAILED => {
+            event.callback_failed_details = Some(CallbackFailedDetails { error: failure() });
+        }
+        EVENT_TYPE_CALLBACK_TIMED_OUT => {
+            event.callback_timed_out_details = Some(CallbackTimedOutDetails { error: failure() });
+        }
         // Every event [`Checkpoint::event_type`] names is built above; a type it does not
         // name reached none of these arms.
         _ => return false,
@@ -449,6 +512,32 @@ impl DurableStepJournal {
             function: function.to_string(),
             execution: execution.to_string(),
         }
+    }
+
+    /// Answer ONE call the run made about a CALLBACK of the execution it is the run of: the
+    /// callback a `wait_for_callback` MINTS, and what that callback has come to while the
+    /// handler waits on it ([`super::durable_callbacks`]).
+    ///
+    /// `document` is the JSON the runtime's own durable SDK states the call as. The one bound
+    /// that is this seam's is the same one a checkpoint carries ([`MAX_CHECKPOINT_BYTES`]), so
+    /// a handler cannot turn a callback into an unbounded write.
+    #[must_use]
+    pub fn callback(&self, document: &str) -> String {
+        if document.len() > MAX_CHECKPOINT_BYTES {
+            return ::serde_json::json!({
+                "refused": format!(
+                    "a durable execution's callback may carry at most {MAX_CHECKPOINT_BYTES} \
+                     bytes"
+                ),
+            })
+            .to_string();
+        }
+        super::durable_callbacks::answered_for_run(
+            &self.state,
+            &self.function,
+            &self.execution,
+            document,
+        )
     }
 
     /// Record the checkpoint `document` reports, as the history event it is.

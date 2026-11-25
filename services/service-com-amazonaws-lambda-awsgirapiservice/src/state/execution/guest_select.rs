@@ -23,17 +23,24 @@
 //!   sets, or a `poll` with no registration, waits out the timeout it was given against the
 //!   invocation's own clock (`time.sleep`, which this runtime clamps to what is left of the
 //!   run) and answers that nothing became ready;
-//! * a wait on a DESCRIPTOR is not, and no call here pretends otherwise: a Lambda function
-//!   in this emulator holds no host descriptor at all — its sockets reach only the
-//!   in-process X-Ray daemon ([`super::guest_http`]) and its files are refused
+//! * a wait on a DESCRIPTOR this runtime really holds is served from what that descriptor has:
+//!   the ends of a connected pair the run opened inside this process
+//!   ([`super::guest_pipes`], which is what `socket.socketpair()` answers and what the
+//!   standard library's own event loop watches) are reported readable when the bytes their
+//!   peer wrote are standing in them and writable while they can take a write. An invocation
+//!   runs on ONE thread, so a descriptor that is not ready cannot become ready while the wait
+//!   sleeps: the wait is the time it was given, and then nothing;
+//! * a wait on any OTHER descriptor is not served, and no call here pretends otherwise: a
+//!   Lambda function in this emulator holds no host descriptor at all — its sockets reach only
+//!   this emulator's own planes ([`super::guest_http`]) and its files are refused
 //!   ([`super::python`]) — so each call answers for a descriptor that is not open exactly
 //!   as the system call it stands for does: `select` raises `OSError` with `EBADF`, `poll`
 //!   reports the registration as `POLLNVAL`, and `epoll` refuses the registration with
 //!   `EBADF`. A negative descriptor is the language's own `ValueError`, as it is in
 //!   CPython.
 //!
-//! Nothing here invents readiness: a descriptor is never reported ready, because there is
-//! none for anything to be ready on.
+//! Nothing here invents readiness: a descriptor is reported ready only when the pair end it
+//! names really has something for the call that asked.
 
 use super::package::PackageModule;
 
@@ -61,10 +68,12 @@ pub fn runtime_stdlib_modules() -> Vec<PackageModule> {
 /// define, and the two multiplexers this platform has are the two defined here, so the
 /// default selector a program gets is the one it would get on the advertised runtime.
 const SELECT_SOURCE: &str = r#"
-"""The waiting interface of this runtime: a function holds no descriptor to wait on."""
+"""The waiting interface of this runtime: a wait is served from what the run really holds."""
 
 import errno
 import time
+
+import _lambda_pipes as _pipes
 
 # What `select.error` is in a current Python: the builtin error, which is what a caller
 # catches.
@@ -184,24 +193,31 @@ def _waited(seconds):
 def select(rlist, wlist, xlist, timeout=None):
     """Wait until one of the named descriptors is ready, or until `timeout` passes.
 
-    A function of this runtime holds no host descriptor, so a named descriptor is one that
-    is not open — which is the `EBADF` a `select` call answers for it — and the three empty
-    sets are a wait for the time alone.
+    A descriptor this runtime holds — one end of a connected pair opened inside this process —
+    is answered from what it has; any other is a descriptor that is not open, which is the
+    `EBADF` a `select` call answers for it. The three empty sets are a wait for the time alone.
     """
-    watched = []
+    sets = []
     for named in (rlist, wlist, xlist):
         try:
-            entries = list(named)
+            sets.append(list(named))
         except TypeError:
             raise TypeError("arguments 1-3 must be sequences") from None
-        watched.extend(_descriptor(entry) for entry in entries)
+    for entries in sets:
+        for entry in entries:
+            if _pipes.held(_descriptor(entry)) is None:
+                raise error(errno.EBADF, _BAD_DESCRIPTOR)
     waited = None
     if timeout is not None:
         waited = _seconds(timeout)
         if waited < 0:
             raise ValueError("timeout must be non-negative")
-    if watched:
-        raise error(errno.EBADF, _BAD_DESCRIPTOR)
+    ready_read = [entry for entry in sets[0] if _pipes.readable(_descriptor(entry))]
+    ready_write = [entry for entry in sets[1] if _pipes.writable(_descriptor(entry))]
+    if ready_read or ready_write:
+        return ready_read, ready_write, []
+    # Nothing is ready, and an invocation runs on ONE thread: no descriptor can become ready
+    # while this call sleeps, so the wait is the time it was given and then nothing.
     _waited(waited)
     return [], [], []
 
@@ -209,9 +225,10 @@ def select(rlist, wlist, xlist, timeout=None):
 class poll(object):
     """The `poll` multiplexer of this runtime.
 
-    The registration is this object's own, and a descriptor is reported the way `poll`
-    reports one that is not open: `POLLNVAL`, immediately. Nothing is dropped from the
-    registration for it, exactly as nothing is on a host.
+    The registration is this object's own. A descriptor this runtime holds is reported from
+    what it has, and one it does not is reported the way `poll` reports a descriptor that is
+    not open: `POLLNVAL`, immediately. Nothing is dropped from the registration for it, exactly
+    as nothing is on a host.
     """
 
     def __init__(self):
@@ -233,18 +250,40 @@ class poll(object):
         del self._watched[found]
 
     def poll(self, timeout=None):
-        """What the registered descriptors answer: each of them is invalid, so it is
-        answered at once; a registration of none at all is a wait for the time alone,
-        where `timeout` is MILLISECONDS and a negative one means nothing bounds it."""
-        if self._watched:
-            return [(fd, POLLNVAL) for fd in sorted(self._watched)]
+        """What the registered descriptors answer, where `timeout` is MILLISECONDS and a
+        negative one means nothing bounds the wait."""
+        answered = _reported(self._watched, POLLIN, POLLOUT, POLLNVAL)
+        if answered:
+            return answered
         if timeout is not None:
             milliseconds = _milliseconds(timeout)
             if milliseconds >= 0:
                 _waited(milliseconds / 1000.0)
                 return []
-        # No registration, and nothing bounds the wait.
+        # Nothing is ready and nothing bounds the wait.
         _waited(None)
+
+
+def _reported(watched, read_bit, write_bit, invalid_bit):
+    """What the registrations in `watched` answer right now, oldest descriptor first.
+
+    A descriptor this runtime does not hold is reported invalid; one it holds is reported for
+    whichever of the registered events it really has.
+    """
+    answered = []
+    for fd in sorted(watched):
+        mask = watched[fd]
+        if _pipes.held(fd) is None:
+            answered.append((fd, invalid_bit))
+            continue
+        events = 0
+        if mask & read_bit and _pipes.readable(fd):
+            events |= read_bit
+        if mask & write_bit and _pipes.writable(fd):
+            events |= write_bit
+        if events:
+            answered.append((fd, events))
+    return answered
 
 
 class epoll(object):
@@ -252,11 +291,12 @@ class epoll(object):
 
     `epoll` is told which descriptor to watch while it is registered rather than while it
     waits, so a descriptor that is not open is refused there — `EBADF`, which is what
-    `epoll_ctl` answers — and a wait with nothing registered is a wait for the time alone.
+    `epoll_ctl` answers — and a wait with nothing ready is a wait for the time alone.
     """
 
     def __init__(self, sizehint=-1, flags=0):
         self._closed = False
+        self._watched = {}
 
     @classmethod
     def fromfd(cls, fd):
@@ -276,40 +316,59 @@ class epoll(object):
 
     def close(self):
         self._closed = True
+        self._watched = {}
 
     def fileno(self):
-        """This object watches nothing, so it holds no descriptor of its own."""
+        """This object is held in this process rather than by a descriptor of the operating
+        system, so it holds none of its own."""
         return -1
 
     def _open(self):
         if self._closed:
             raise ValueError("I/O operation on closed epoll object")
 
+    def _watchable(self, fd):
+        found = _descriptor(fd)
+        if _pipes.held(found) is None:
+            raise error(errno.EBADF, _BAD_DESCRIPTOR)
+        return found
+
     def register(self, fd, eventmask=_EPOLL_DEFAULT):
         self._open()
-        _descriptor(fd)
-        raise error(errno.EBADF, _BAD_DESCRIPTOR)
+        found = self._watchable(fd)
+        if found in self._watched:
+            raise FileExistsError(errno.EEXIST, "File exists")
+        self._watched[found] = int(eventmask)
 
     def modify(self, fd, eventmask):
         self._open()
-        _descriptor(fd)
-        raise error(errno.EBADF, _BAD_DESCRIPTOR)
+        found = self._watchable(fd)
+        if found not in self._watched:
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory")
+        self._watched[found] = int(eventmask)
 
     def unregister(self, fd):
         self._open()
-        _descriptor(fd)
-        raise error(errno.EBADF, _BAD_DESCRIPTOR)
+        found = _descriptor(fd)
+        if found not in self._watched:
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory")
+        del self._watched[found]
 
     def poll(self, timeout=None, maxevents=-1):
-        """Nothing is registered, because no registration is accepted, so this is the wait
-        for the time alone — in SECONDS, where `None` or a negative value means nothing
-        bounds it."""
+        """What the registered descriptors answer, where `timeout` is SECONDS and `None` or a
+        negative value means nothing bounds the wait."""
         self._open()
+        answered = _reported(self._watched, EPOLLIN, EPOLLOUT, EPOLLHUP)
+        held = int(maxevents)
+        if held >= 0:
+            answered = answered[:held]
+        if answered:
+            return answered
         if timeout is not None:
             seconds = _seconds(timeout)
             if seconds >= 0:
                 _waited(seconds)
                 return []
-        # No registration, and nothing bounds the wait.
+        # Nothing is ready and nothing bounds the wait.
         _waited(None)
 "#;

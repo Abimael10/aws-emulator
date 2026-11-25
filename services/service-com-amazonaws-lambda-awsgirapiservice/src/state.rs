@@ -521,6 +521,18 @@ pub use durable_checkpoint::{
     mint_checkpoint_token, AnsweredCheckpoint, INVALID_CHECKPOINT_TOKEN_MESSAGE,
 };
 
+/// The CALLBACKS of a durable execution live in [`durable_callbacks`], beside the execution
+/// they belong to: the id a handler's `wait_for_callback` mints, the window it is open for, and
+/// what a client signalling it does to the execution's history.
+pub mod durable_callbacks;
+pub use durable_callbacks::{
+    callback_address, callback_data_key, callback_not_found_message,
+    callbacks_updated_since_last_checkpoint, mint_callback_id, signal_callback, CallbackAddress,
+    CallbackRecord, CallbackRefusal, CallbackSignal, CALLBACK_CLOSED_MESSAGE, CALLBACK_TYPE,
+    EVENT_TYPE_CALLBACK_FAILED, EVENT_TYPE_CALLBACK_STARTED, EVENT_TYPE_CALLBACK_SUCCEEDED,
+    EVENT_TYPE_CALLBACK_TIMED_OUT,
+};
+
 /// The EventBridge events a durable execution's status changes OWE the account's default
 /// event bus live in [`durable_events`], beside the record whose statuses they report: one
 /// event per status an execution moves into, published off the response path, with the clock
@@ -2167,6 +2179,14 @@ pub struct DurableExecutionRecord {
     /// handled correctly. If provided, Lambda uses this token to detect and handle duplicate
     /// requests within a 15-minute window."
     pub answered_checkpoint: Option<AnsweredCheckpoint>,
+    /// The CALLBACKS this execution has minted, keyed by the id a client addresses each one
+    /// by ([`durable_callbacks`]).
+    ///
+    /// A callback is the wait a handler takes for something outside the execution to finish,
+    /// so it is held for as long as the execution is: what a client signalled it with is part
+    /// of what happened to the execution. Bounded by
+    /// [`durable_callbacks::MAX_EXECUTION_CALLBACKS`].
+    pub callbacks: BTreeMap<String, durable_callbacks::CallbackRecord>,
 }
 
 impl DurableExecutionRecord {
@@ -2181,6 +2201,11 @@ impl DurableExecutionRecord {
         if self.status != EXECUTION_STATUS_RUNNING {
             return;
         }
+        // Whatever the clock owed the execution's own CALLBACKS first: a callback whose window
+        // closed is closed at the instant it closed, which is before any `ExecutionTimeout`
+        // that fell due afterwards closes the history
+        // ([`DurableExecutionRecord::timeout_callbacks`]).
+        self.timeout_callbacks(now);
         if let Some(due) = self.timeout_due.filter(|due| now >= *due) {
             self.status = EXECUTION_STATUS_TIMED_OUT.to_string();
             self.ended = Some(due);

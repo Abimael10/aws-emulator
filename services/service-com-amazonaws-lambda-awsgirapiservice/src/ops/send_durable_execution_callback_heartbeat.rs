@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendDurableExecutionCallbackHeartbeat
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendDurableExecutionCallbackHeartbeat`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendDurableExecutionCallbackHeartbeat::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +136,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendDurableExecutionCallbackHeartbeat` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendDurableExecutionCallbackHeartbeatErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendDurableExecutionCallbackHeartbeat"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                SendDurableExecutionCallbackHeartbeatErrorModeled::ServiceException(
+                    ServiceException {
+                        r#type: None,
+                        message: Some("Lambda state is not reachable on this engine".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let now = ::std::time::SystemTime::now();
+        // "Sends a heartbeat for a callback operation to indicate that the external system is
+        // still processing": the callback stays open and the next heartbeat is due its
+        // `HeartbeatTimeoutSeconds` from now. The call carries no data of the execution, which
+        // is why this operation binds no KMS failure.
+        crate::state::signal_callback(
+            &state,
+            &input.callback_id,
+            &crate::state::CallbackSignal::Heartbeat,
+            now,
+        )
+        .map_err(|refused| refusal(refused, &input.callback_id))?;
+        let _ = ctx;
+        Ok(SendDurableExecutionCallbackHeartbeatOutput {})
     }
+}
+
+/// How a callback this call could not be applied to is refused.
+///
+/// An id that addresses no callback this emulator holds is the modelled 404: the resource the
+/// request names does not exist. One that addresses a callback whose window has CLOSED — or one
+/// a client has already signalled — is the modelled `CallbackTimeoutException`, whose own
+/// sentence says exactly that.
+fn refusal(
+    refused: crate::state::CallbackRefusal,
+    callback_id: &str,
+) -> SendDurableExecutionCallbackHeartbeatError {
+    match refused {
+        crate::state::CallbackRefusal::NotFound => {
+            SendDurableExecutionCallbackHeartbeatErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    r#type: None,
+                    message: Some(crate::state::callback_not_found_message(callback_id)),
+                },
+            )
+        }
+        crate::state::CallbackRefusal::Closed => {
+            SendDurableExecutionCallbackHeartbeatErrorModeled::CallbackTimeoutException(
+                CallbackTimeoutException {
+                    r#type: None,
+                    message: Some(crate::state::CALLBACK_CLOSED_MESSAGE.to_string()),
+                },
+            )
+        }
+    }
+    .into()
 }
