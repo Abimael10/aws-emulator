@@ -641,6 +641,13 @@ pub struct DataLakeDatasetRecord {
 }
 
 impl DataLakeDatasetRecord {
+    /// Record a change made at `now`: a mutation of a dataset moves `lastModifiedTime` and
+    /// nothing else, exactly as [`DataLakeNamespaceRecord::touch`] does for a namespace.
+    /// The stamp the create set stays in `createdTime`.
+    pub fn touch(&mut self, now: SystemTime) {
+        self.last_modified_time = now;
+    }
+
     /// This record as the modelled `DataLakeDataset` shape every dataset operation
     /// returns.
     pub fn to_wire(&self) -> DataLakeDataset {

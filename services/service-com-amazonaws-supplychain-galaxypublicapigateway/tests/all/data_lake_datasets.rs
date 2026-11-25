@@ -56,14 +56,16 @@ impl Emulator {
         Self { router }
     }
 
-    /// Send one request signed for `region` and return its HTTP status and JSON body.
-    async fn send_in(
+    /// Send one request signed for `region` and return its HTTP status, the
+    /// `x-amzn-errortype` response header — the header restJson1 names the error shape in,
+    /// and the one this service's CORS configuration exposes — and its JSON body.
+    async fn dispatch_in(
         &self,
         region: &str,
         method: &str,
         path: &str,
         body: Option<Value>,
-    ) -> (u16, Value) {
+    ) -> (u16, Option<String>, Value) {
         let body_bytes = match &body {
             Some(value) => Bytes::from(serde_json::to_vec(value).expect("serialize request body")),
             None => Bytes::new(),
@@ -87,6 +89,11 @@ impl Emulator {
 
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
+        let error_type = response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         let bytes = response.into_body();
         let json = if bytes.is_empty() {
             Value::Null
@@ -98,6 +105,18 @@ impl Emulator {
                 )
             })
         };
+        (status, error_type, json)
+    }
+
+    /// Send one request signed for `region`, keeping only its status and body.
+    async fn send_in(
+        &self,
+        region: &str,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> (u16, Value) {
+        let (status, _error_type, json) = self.dispatch_in(region, method, path, body).await;
         (status, json)
     }
 
@@ -143,12 +162,135 @@ impl Emulator {
         self.send("GET", &dataset_path(instance_id, namespace, name), None)
             .await
     }
+
+    /// `GetDataLakeDataset` for one triple, keeping the `x-amzn-errortype` header too.
+    async fn read_dataset(
+        &self,
+        instance_id: &str,
+        namespace: &str,
+        name: &str,
+    ) -> (u16, Option<String>, Value) {
+        self.dispatch_in(REGION, "GET", &dataset_path(instance_id, namespace, name), None)
+            .await
+    }
+
+    /// `UpdateDataLakeDataset` for one triple — PATCH on the dataset URI — with `request`
+    /// as its body.
+    async fn update_dataset(
+        &self,
+        instance_id: &str,
+        namespace: &str,
+        name: &str,
+        request: Value,
+    ) -> (u16, Option<String>, Value) {
+        self.dispatch_in(
+            REGION,
+            "PATCH",
+            &dataset_path(instance_id, namespace, name),
+            Some(request),
+        )
+        .await
+    }
+
+    /// `DeleteDataLakeDataset` for one triple.
+    async fn delete_dataset(&self, instance_id: &str, namespace: &str, name: &str) -> (u16, Value) {
+        self.send("DELETE", &dataset_path(instance_id, namespace, name), None)
+            .await
+    }
+
+    /// `CreateDataLakeNamespace` for `name`.
+    async fn create_namespace(&self, instance_id: &str, name: &str) -> (u16, Value) {
+        self.send("PUT", &namespace_path(instance_id, name), Some(json!({})))
+            .await
+    }
+
+    /// `GetDataLakeNamespace` for `name`, keeping the `x-amzn-errortype` header too.
+    async fn read_namespace(&self, instance_id: &str, name: &str) -> (u16, Option<String>, Value) {
+        self.dispatch_in(REGION, "GET", &namespace_path(instance_id, name), None)
+            .await
+    }
+
+    /// `DeleteDataLakeNamespace` for `name`.
+    async fn delete_namespace(&self, instance_id: &str, name: &str) -> (u16, Value) {
+        self.send("DELETE", &namespace_path(instance_id, name), None)
+            .await
+    }
+
+    /// `ListDataLakeDatasets` for one namespace.
+    async fn list_datasets(&self, instance_id: &str, namespace: &str) -> (u16, Value) {
+        self.send(
+            "GET",
+            &format!("/api/datalake/instance/{instance_id}/namespaces/{namespace}/datasets"),
+            None,
+        )
+        .await
+    }
 }
 
 /// The URI every dataset operation is addressed at, as the model's `http` trait spells
 /// it: `/api/datalake/instance/{instanceId}/namespaces/{namespace}/datasets/{name}`.
 fn dataset_path(instance_id: &str, namespace: &str, name: &str) -> String {
     format!("/api/datalake/instance/{instance_id}/namespaces/{namespace}/datasets/{name}")
+}
+
+/// The URI every namespace operation is addressed at, as the model's `http` trait spells
+/// it: `/api/datalake/instance/{instanceId}/namespaces/{name}`.
+fn namespace_path(instance_id: &str, name: &str) -> String {
+    format!("/api/datalake/instance/{instance_id}/namespaces/{name}")
+}
+
+/// The sentence a dataset operation refuses a triple the data lake does not hold with,
+/// written out HERE rather than read from the crate so a drift in the handlers' wording
+/// fails this suite instead of travelling with it. Its SOURCE is the recorded wire
+/// response of a read of a dataset that was deleted: the fixed text is "Dataset " and
+/// " not exist in namespace ", and the only variable parts are the two `@httpLabel`
+/// members of the request — never the `instanceId`.
+fn dataset_not_found_sentence(name: &str, namespace: &str) -> String {
+    format!("Dataset {name} not exist in namespace {namespace}")
+}
+
+/// The sentence a namespace operation refuses a name the data lake does not hold with;
+/// its SOURCE is the recorded wire response of a read of a namespace that was deleted,
+/// whose fixed text is "Namespace " and " not exist" with the `name` `@httpLabel` as its
+/// only variable part.
+fn namespace_not_found_sentence(name: &str) -> String {
+    format!("Namespace {name} not exist")
+}
+
+/// Assert that `response` is the refusal a client must see: the modelled HTTP status, the
+/// error shape named BOTH in the `x-amzn-errortype` header a restJson1 client resolves it
+/// from and in the body envelope, and the service's own sentence.
+fn assert_refusal(
+    case: &str,
+    expected_status: u16,
+    shape: &str,
+    expected_message: &str,
+    response: &(u16, Option<String>, Value),
+) {
+    let (status, error_type, body) = response;
+    assert_eq!(
+        *status, expected_status,
+        "case {case}: expected HTTP {expected_status}, got {status} with {body}"
+    );
+    let error_type = error_type.as_deref().unwrap_or_else(|| {
+        panic!("case {case}: the refusal carries no x-amzn-errortype header: {body}")
+    });
+    assert!(
+        error_type.contains(shape),
+        "case {case}: expected an x-amzn-errortype naming {shape}, got {error_type:?}"
+    );
+    assert!(
+        body.get("__type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains(shape),
+        "case {case}: expected a {shape} envelope, got {body}"
+    );
+    assert_eq!(
+        body.get("message").and_then(Value::as_str),
+        Some(expected_message),
+        "case {case}: expected the service's sentence {expected_message:?}, got {body}"
+    );
 }
 
 /// Look again until the deletion of `instance_id` has SETTLED — until `GetInstance`
@@ -856,3 +998,381 @@ async fn a_create_past_the_dataset_cap_is_a_quota_refusal() {
         "case first stored dataset: still readable at the cap, got {status} with {body}"
     );
 }
+
+/// One row of the update table: which namespace holds the dataset, what description its
+/// create carried, the body the update sends and the description the dataset must carry
+/// afterwards.
+struct UpdateRow {
+    case: &'static str,
+    namespace: &'static str,
+    name: &'static str,
+    created_description: Option<String>,
+    request: Value,
+    expected_description: Option<String>,
+}
+
+/// The rows spanning what the update rule generalises over: whether the dataset was
+/// created with a description, whether the update names one, whether the value it names
+/// differs from the stored one, both published bounds of the `DataLakeDatasetDescription`
+/// shape (`@length` 1..500, source: the `description` member of
+/// `UpdateDataLakeDatasetRequest`), and which namespace holds the dataset.
+fn update_rows(custom_namespace: &'static str) -> Vec<UpdateRow> {
+    vec![
+        UpdateRow {
+            case: "sets a description on a dataset created without one",
+            namespace: "default",
+            name: "described_later",
+            created_description: None,
+            request: json!({ "description": "named after the fact" }),
+            expected_description: Some("named after the fact".to_string()),
+        },
+        UpdateRow {
+            case: "replaces the stored description",
+            namespace: "asc",
+            name: "inbound_order",
+            created_description: Some("as created".to_string()),
+            request: json!({ "description": "as updated" }),
+            expected_description: Some("as updated".to_string()),
+        },
+        UpdateRow {
+            case: "repeats the stored description",
+            namespace: custom_namespace,
+            name: "unchanged_value",
+            created_description: Some("steady".to_string()),
+            request: json!({ "description": "steady" }),
+            expected_description: Some("steady".to_string()),
+        },
+        UpdateRow {
+            case: "names no description at all",
+            namespace: custom_namespace,
+            name: "untouched",
+            created_description: Some("kept".to_string()),
+            request: json!({}),
+            expected_description: Some("kept".to_string()),
+        },
+        UpdateRow {
+            case: "description at the modelled 1-character minimum",
+            namespace: "default",
+            name: "shortest_description",
+            created_description: Some("as created".to_string()),
+            request: json!({ "description": "x" }),
+            expected_description: Some("x".to_string()),
+        },
+        UpdateRow {
+            case: "description at the modelled 500-character maximum",
+            namespace: "default",
+            name: "longest_description",
+            created_description: None,
+            request: json!({ "description": "d".repeat(500) }),
+            expected_description: Some("d".repeat(500)),
+        },
+    ]
+}
+
+/// RULE: an update of a data-lake resource rewrites only the member the request names and
+/// answers with the record it leaves in the store, so a named `description` replaces the
+/// stored one, an omitted one leaves it alone, every other member keeps the value the
+/// create persisted, and `GetDataLakeDataset` reports exactly what the update answered.
+#[tokio::test]
+async fn a_dataset_description_round_trips_through_update_and_get() {
+    let emulator = Emulator::new();
+    let instance_id = emulator.create_instance("update").await;
+    let custom_namespace = "orders_2024";
+    let (status, body) = emulator
+        .create_namespace(&instance_id, custom_namespace)
+        .await;
+    assert_eq!(
+        status, 200,
+        "the custom namespace must be created first, got {status} with {body}"
+    );
+
+    for row in update_rows(custom_namespace) {
+        let case = row.case;
+        let mut create_request = json!({ "schema": minimal_schema() });
+        if let Some(description) = &row.created_description {
+            create_request["description"] = json!(description);
+        }
+        let (status, body) = emulator
+            .create_dataset(REGION, &instance_id, row.namespace, row.name, create_request)
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: CreateDataLakeDataset expected 200, got {status} with {body}"
+        );
+        let created = dataset_of(case, &body);
+
+        let (status, _error_type, body) = emulator
+            .update_dataset(&instance_id, row.namespace, row.name, row.request.clone())
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: UpdateDataLakeDataset expected 200, got {status} with {body}"
+        );
+        let updated = dataset_of(case, &body);
+
+        assert_eq!(
+            updated.get("description").and_then(Value::as_str),
+            row.expected_description.as_deref(),
+            "case {case}: expected the description {:?}, got {updated}",
+            row.expected_description
+        );
+        for member in ["instanceId", "namespace", "name", "arn", "schema", "createdTime"] {
+            assert_eq!(
+                updated.get(member),
+                created.get(member),
+                "case {case}: the update must leave `{member}` as the create persisted it, got \
+                 {updated}"
+            );
+        }
+        let created_time = created
+            .get("createdTime")
+            .and_then(Value::as_f64)
+            .unwrap_or_else(|| panic!("case {case}: createdTime must be a timestamp: {created}"));
+        let last_modified = updated
+            .get("lastModifiedTime")
+            .and_then(Value::as_f64)
+            .unwrap_or_else(|| {
+                panic!("case {case}: lastModifiedTime must be a timestamp: {updated}")
+            });
+        assert!(
+            last_modified >= created_time,
+            "case {case}: lastModifiedTime {last_modified} must not precede createdTime \
+             {created_time}"
+        );
+        // A write that moves nothing is not a modification, so the stamp the create set
+        // stands.
+        if row.expected_description == row.created_description {
+            assert_eq!(
+                updated.get("lastModifiedTime"),
+                created.get("lastModifiedTime"),
+                "case {case}: an update that changes nothing must not move lastModifiedTime, got \
+                 {updated}"
+            );
+        }
+
+        let (status, body) = emulator
+            .get_dataset(&instance_id, row.namespace, row.name)
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: GetDataLakeDataset expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            dataset_of(case, &body),
+            updated,
+            "case {case}: the dataset read back must equal the one the update answered, got {body}"
+        );
+    }
+}
+
+/// RULE: an update is addressed by the whole triple, so a triple the data lake holds no
+/// dataset under — including the triple of one a delete already removed — is refused
+/// `ResourceNotFoundException` (404) with the service's own sentence and writes nothing.
+#[tokio::test]
+async fn an_update_of_an_absent_dataset_is_a_not_found_that_writes_nothing() {
+    let emulator = Emulator::new();
+    let instance_id = emulator.create_instance("absent update").await;
+    let other = emulator.create_instance("other instance").await;
+
+    // A dataset that exists and is then removed, so one row addresses a triple that was
+    // live a moment earlier.
+    let (status, body) = emulator
+        .create_dataset(REGION, &instance_id, "default", "deleted", json!({ "schema": minimal_schema() }))
+        .await;
+    assert_eq!(
+        status, 200,
+        "the dataset to delete must be created first, got {status} with {body}"
+    );
+    let (status, body) = emulator
+        .delete_dataset(&instance_id, "default", "deleted")
+        .await;
+    assert_eq!(
+        status, 200,
+        "DeleteDataLakeDataset expected 200, got {status} with {body}"
+    );
+
+    // Rows differing along which part of the triple names nothing: the dataset name, the
+    // namespace, the instance — plus the triple of a dataset that was deleted.
+    let rows: Vec<(&str, &str, &str, &str)> = vec![
+        ("a name no dataset was created under", instance_id.as_str(), "default", "never_created"),
+        ("the triple of a deleted dataset", instance_id.as_str(), "default", "deleted"),
+        ("a namespace nobody created", instance_id.as_str(), "shipments", "lines"),
+        ("another instance's triple", other.as_str(), "default", "deleted"),
+        (
+            "a well-formed instance id no instance holds",
+            "00000000-0000-0000-0000-000000000000",
+            "asc",
+            "inbound_order",
+        ),
+    ];
+
+    for (case, instance, namespace, name) in rows {
+        let response = emulator
+            .update_dataset(instance, namespace, name, json!({ "description": "no such dataset" }))
+            .await;
+        assert_refusal(
+            case,
+            404,
+            "ResourceNotFoundException",
+            &dataset_not_found_sentence(name, namespace),
+            &response,
+        );
+        let message = response.2.get("message").and_then(Value::as_str).unwrap_or_default();
+        assert!(
+            !message.contains(instance),
+            "case {case}: the sentence must not carry the instanceId, got {message:?}"
+        );
+
+        // A refused update writes nothing, so the triple it addressed still names no
+        // dataset.
+        let (status, body) = emulator.get_dataset(instance, namespace, name).await;
+        assert_eq!(
+            status, 404,
+            "case {case}: a refused update must create nothing, got {status} with {body}"
+        );
+    }
+}
+
+/// RULE: a delete makes the resource it names non-existent, so every read of it afterwards
+/// is the modelled `ResourceNotFoundException` (404) carrying the error shape in
+/// `x-amzn-errortype` and the service's name-bearing sentence — never a 200 projection of
+/// the record the delete removed — and no listing of the data lake reports it any more.
+#[tokio::test]
+async fn deleted_data_lake_resources_stop_being_readable() {
+    let emulator = Emulator::new();
+    let instance_id = emulator.create_instance("teardown").await;
+
+    // Rows spanning the names the rule generalises over: both published length bounds of
+    // `DataLakeNamespaceName` (1..50) and `DataLakeDatasetName` (1..75), digits and
+    // underscores, and a dataset whose create carried a description.
+    let rows: Vec<(&str, String, String, Value)> = vec![
+        (
+            "single-character names",
+            "n".to_string(),
+            "d".to_string(),
+            json!({ "schema": minimal_schema() }),
+        ),
+        (
+            "digits and underscores",
+            "zone_42_raw".to_string(),
+            "shipment_lines_2024".to_string(),
+            json!({ "schema": minimal_schema(), "description": "deleted later" }),
+        ),
+        (
+            "names at the modelled length maxima",
+            // 50 characters of `^[a-z0-9_]+$`: `DataLakeNamespaceName`'s upper bound.
+            format!("z{}0", "_9".repeat(24)),
+            // 75 characters of `^[a-z0-9_]+$`: `DataLakeDatasetName`'s upper bound.
+            format!("d{}", "_9".repeat(37)),
+            json!({ "schema": schema_over_every_field_type() }),
+        ),
+    ];
+
+    for (case, namespace, name, create_request) in rows {
+        let (status, body) = emulator.create_namespace(&instance_id, &namespace).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: CreateDataLakeNamespace expected 200, got {status} with {body}"
+        );
+        let (status, body) = emulator
+            .create_dataset(REGION, &instance_id, &namespace, &name, create_request)
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: CreateDataLakeDataset expected 200, got {status} with {body}"
+        );
+
+        // Both resources are readable while they exist, so the 404s below are the delete's
+        // work and not a dataset that was never there.
+        let (status, _error_type, body) = emulator.read_dataset(&instance_id, &namespace, &name).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: the live dataset must be readable, got {status} with {body}"
+        );
+        let (status, _error_type, body) = emulator.read_namespace(&instance_id, &namespace).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: the live namespace must be readable, got {status} with {body}"
+        );
+
+        let (status, body) = emulator.delete_dataset(&instance_id, &namespace, &name).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: DeleteDataLakeDataset expected 200, got {status} with {body}"
+        );
+
+        let response = emulator.read_dataset(&instance_id, &namespace, &name).await;
+        assert_refusal(
+            &format!("{case}: read of the deleted dataset"),
+            404,
+            "ResourceNotFoundException",
+            &dataset_not_found_sentence(&name, &namespace),
+            &response,
+        );
+
+        // The namespace that held it stops reporting it as well, so no reader of this data
+        // lake still has it.
+        let (status, body) = emulator.list_datasets(&instance_id, &namespace).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: ListDataLakeDatasets expected 200, got {status} with {body}"
+        );
+        let listed = body
+            .get("datasets")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            listed.is_empty(),
+            "case {case}: the namespace must report no dataset after the delete, got {listed:?}"
+        );
+
+        let (status, body) = emulator.delete_namespace(&instance_id, &namespace).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: DeleteDataLakeNamespace expected 200, got {status} with {body}"
+        );
+
+        let response = emulator.read_namespace(&instance_id, &namespace).await;
+        assert_refusal(
+            &format!("{case}: read of the deleted namespace"),
+            404,
+            "ResourceNotFoundException",
+            &namespace_not_found_sentence(&namespace),
+            &response,
+        );
+        let message = response.2.get("message").and_then(Value::as_str).unwrap_or_default();
+        assert!(
+            !message.contains(instance_id.as_str()),
+            "case {case}: the namespace sentence must not carry the instanceId, got {message:?}"
+        );
+
+        // A repeat of either delete finds nothing, which is what makes a "wait until gone"
+        // poll loop terminate.
+        let (status, body) = emulator.delete_namespace(&instance_id, &namespace).await;
+        assert_eq!(
+            status, 404,
+            "case {case}: a repeat namespace delete expected 404, got {status} with {body}"
+        );
+        let (status, body) = emulator.delete_dataset(&instance_id, &namespace, &name).await;
+        assert_eq!(
+            status, 404,
+            "case {case}: a repeat dataset delete expected 404, got {status} with {body}"
+        );
+
+        // The name is free again: a fresh namespace of the same name starts empty, so the
+        // delete removed the record rather than hiding it.
+        let (status, body) = emulator.create_namespace(&instance_id, &namespace).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: the namespace name is free again, got {status} with {body}"
+        );
+        let (status, _error_type, body) = emulator.read_dataset(&instance_id, &namespace, &name).await;
+        assert_eq!(
+            status, 404,
+            "case {case}: a re-created namespace carries none of the removed datasets, got \
+             {status} with {body}"
+        );
+    }
+}
+
