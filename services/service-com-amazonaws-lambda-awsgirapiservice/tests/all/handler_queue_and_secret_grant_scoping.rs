@@ -377,7 +377,12 @@ fn body_of(case_index: usize, call_index: usize) -> String {
 
 /// The sentence IAM words an implicit deny with: who was refused, which action, on which
 /// resource, and that no identity-based policy allows it.
-fn implicit_deny(principal: &str, action: &str, resource: &str) -> String {
+///
+/// `pub(crate)` because this sentence is one rule: every suite that reads a refusal of a
+/// handler's own SDK call back out of the payload
+/// (`tests/all/handler_sdk_permission_probe_verdicts.rs`) compares against this one wording,
+/// so a change in how AWS words it is made here and nowhere else.
+pub(crate) fn implicit_deny(principal: &str, action: &str, resource: &str) -> String {
     format!(
         "User: {principal} is not authorized to perform: {action} on resource: {resource} \
          because no identity-based policy allows the {action} action"
@@ -455,7 +460,16 @@ async fn given_secret(router: &MultiServiceRouter, case: &str, name: &str, value
 /// `wanted` is how many the caller expects: the loop looks again until it has them or the
 /// generous deadline passes, so a host that is slow to make a message available cannot decide
 /// the outcome, and a caller expecting none takes one look and reports what it found.
-async fn drained(router: &MultiServiceRouter, case: &str, url: &str, wanted: usize) -> Vec<String> {
+///
+/// `pub(crate)` for the reason [`implicit_deny`] is: the suites that read what a handler's own
+/// send left on a queue (`tests/all/handler_sdk_permission_probe_verdicts.rs`) drain it this one
+/// way rather than keeping a copy of the loop.
+pub(crate) async fn drained(
+    router: &MultiServiceRouter,
+    case: &str,
+    url: &str,
+    wanted: usize,
+) -> Vec<String> {
     let deadline = Instant::now() + BUDGET;
     let mut held: Vec<String> = Vec::new();
     loop {
