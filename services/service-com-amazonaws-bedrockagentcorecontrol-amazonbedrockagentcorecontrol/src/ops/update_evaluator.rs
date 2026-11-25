@@ -235,6 +235,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // leaves out leaves the stored one alone, and the evaluator reports `UPDATING` until
         // the clock owes it `ACTIVE` — which is why the change is accepted with 202 rather
         // than reported complete.
+        //
+        // What the change would leave has to satisfy the same instructions rule a create does:
+        // the configuration and the level the evaluator would then carry — the ones the request
+        // names, or the stored ones it leaves alone — are checked together, so an update cannot
+        // leave behind an evaluator a create of the same body would have been refused.
+        let level = input.level.clone().unwrap_or_else(|| record.level.clone());
+        let config = input
+            .evaluator_config
+            .clone()
+            .unwrap_or_else(|| record.evaluator_config.clone());
+        crate::state::validate_evaluator_instructions(&config, &level)
+            .map_err(UpdateEvaluatorErrorModeled::ValidationException)?;
+
         let client_token = input.client_token.clone();
         let evaluator_id = input.evaluator_id.clone();
         record.accept_update(input, now);

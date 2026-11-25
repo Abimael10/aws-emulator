@@ -184,6 +184,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
+
+        // An LLM-as-a-Judge evaluator's instructions have to reference at least one of the
+        // placeholders the requested level allows, or the judge model would be prompted with
+        // none of the evaluated agent's data. Checked before the store is touched, so a
+        // refused request leaves no evaluator behind for the caller to clean up.
+        crate::state::validate_evaluator_instructions(&input.evaluator_config, &input.level)
+            .map_err(CreateEvaluatorErrorModeled::ValidationException)?;
+
         let mut store = state.lock();
         // An evaluator whose deletion the clock has already made due is gone before this
         // call looks at the account's names, so the name it held is free for this create.
@@ -229,8 +237,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let evaluator_id = store.mint_evaluator_id(&input.evaluator_name, now);
         let name = input.evaluator_name.clone();
         let client_token = input.client_token.clone();
-        // A new evaluator is creating, not active: the transition to `ACTIVE` is owed by the
-        // clock rather than by this call, which is why the create is accepted with 202.
+        // The evaluator is a configuration this control plane holds rather than a provisioned
+        // resource, so the create settles it: the record is stored, and reported, in its
+        // terminal `ACTIVE` status with no transition left for the clock to make due.
         let record =
             crate::state::EvaluatorRecord::created(&region, evaluator_id.clone(), input, now);
         let output = record.create_output(now);

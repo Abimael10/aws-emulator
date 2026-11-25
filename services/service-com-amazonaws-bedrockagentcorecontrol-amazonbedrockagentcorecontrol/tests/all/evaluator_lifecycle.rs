@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The custom evaluator end to end over HTTP: what `CreateEvaluator` persists, how
-//! `GetEvaluator` reports it, the statuses the clock owes it, what an accepted
+//! `GetEvaluator` reports it, the status it carries from the create on, what an accepted
 //! `UpdateEvaluator` changes, and what a deletion leaves a later call to see.
 //!
 //! Every row drives the operations as a client does — one shared engine behind one router —
@@ -143,7 +143,8 @@ fn error_code(body: &Value) -> String {
 }
 
 /// An LLM-as-a-Judge configuration, the `EvaluatorConfig` member that carries instructions
-/// and a rating scale.
+/// and a rating scale. The instructions a row passes reference one of the placeholders the
+/// level allows, which `evaluator_instructions_placeholders.rs` is the suite for.
 fn llm_as_a_judge(instructions: &str) -> Value {
     json!({"llmAsAJudge": {
         "instructions": instructions,
@@ -199,7 +200,7 @@ fn rows() -> Vec<Row> {
             body: json!({
                 "evaluatorName": "judgeQuality",
                 "description": "the evaluator the suite reads back",
-                "evaluatorConfig": llm_as_a_judge("Rate the agent's answer."),
+                "evaluatorConfig": llm_as_a_judge("Rate the agent's answer given {{context}}."),
                 "level": "SESSION",
                 "kmsKeyArn": KMS_KEY,
                 "tags": {"owner": "agentcore", "tier": "test"}
@@ -230,7 +231,7 @@ fn rows() -> Vec<Row> {
 }
 
 /// What `CreateEvaluator` persists is what a read of the evaluator reports: the whole
-/// configuration the create carried, the id and ARN it minted, the status it enters, the type
+/// configuration the create carried, the id and ARN it minted, the status it carries, the type
 /// its configuration makes it and the provider a customer-created evaluator carries.
 #[tokio::test]
 async fn a_created_evaluator_reads_back() {
@@ -248,8 +249,8 @@ async fn a_created_evaluator_reads_back() {
         let expected_arn = format!("arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT}:evaluator/{id}");
         assert_eq!(
             (text(&created, "evaluatorArn"), text(&created, "status")),
-            (expected_arn.clone(), "CREATING".to_string()),
-            "case {case:?}: the create reports the evaluator's ARN and the status it enters, \
+            (expected_arn.clone(), "ACTIVE".to_string()),
+            "case {case:?}: the create reports the evaluator's ARN and the status it carries, \
              got {created}"
         );
         assert!(
@@ -303,13 +304,12 @@ async fn a_created_evaluator_reads_back() {
             "case {case:?}: no online evaluation configuration references this evaluator, so it \
              is not locked, got {fetched}"
         );
-        // The read reports the status the one record carries at the instant it is read: the
-        // transient one until the transition the clock owes comes due, the settled one
-        // afterwards, and nothing else. The transition itself is asserted by polling for it
-        // in `a_created_evaluator_settles_from_creating_to_active`.
+        // The read reports the status the one record carries, which a create leaves terminal:
+        // nothing about a custom evaluator is provisioned, so no transition is outstanding for
+        // a read to materialise.
         let read_status = text(&fetched, "status");
-        assert!(
-            read_status == "CREATING" || read_status == "ACTIVE",
+        assert_eq!(
+            read_status, "ACTIVE",
             "case {case:?}: the read reports the status the record carries, got \
              {read_status:?} ({fetched})"
         );
@@ -330,7 +330,7 @@ async fn a_name_this_account_already_holds_is_a_conflict() {
     let router = router();
     let body = json!({
         "evaluatorName": "uniqueJudge",
-        "evaluatorConfig": llm_as_a_judge("Rate the first answer."),
+        "evaluatorConfig": llm_as_a_judge("Rate the first answer given {{context}}."),
         "level": "TRACE"
     });
     let (status, created) = create_evaluator(&router, &body).await;
@@ -377,7 +377,7 @@ async fn a_repeated_client_token_answers_with_the_first_evaluator() {
     let body = json!({
         "evaluatorName": "idempotentJudge",
         "clientToken": token,
-        "evaluatorConfig": llm_as_a_judge("Rate the answer once."),
+        "evaluatorConfig": llm_as_a_judge("Rate the answer once given {{context}}."),
         "level": "SESSION"
     });
     let (status, first) = create_evaluator(&router, &body).await;
@@ -387,7 +387,7 @@ async fn a_repeated_client_token_answers_with_the_first_evaluator() {
     );
 
     let mut again = body.clone();
-    again["evaluatorConfig"] = llm_as_a_judge("Rate the answer twice.");
+    again["evaluatorConfig"] = llm_as_a_judge("Rate the answer twice given {{context}}.");
     let (status, replayed) = create_evaluator(&router, &again).await;
     assert_eq!(
         (status, text(&replayed, "evaluatorId")),
@@ -485,37 +485,68 @@ async fn poll_until_status(router: &MultiServiceRouter, id: &str, wanted: &str) 
     last
 }
 
-/// The clock-owed transition: an evaluator read straight after the create is still
-/// `CREATING`, and reports `ACTIVE` once the span the create owes has passed.
+/// A created evaluator is already in its terminal status: the create reports `ACTIVE` and
+/// every read of it afterwards reports `ACTIVE` too, so a caller gating on "active before
+/// use" is satisfied by the create itself and never polls for a transition.
+///
+/// The rows differ in the `EvaluatorConfig` member the create carries and in the level it
+/// evaluates at: no configuration of a custom evaluator is provisioned, so none of them enters
+/// a transient status.
 #[tokio::test]
-async fn a_created_evaluator_settles_from_creating_to_active() {
+async fn a_created_evaluator_is_active_on_the_create_and_on_every_read() {
     let router = router();
-    let (status, created) = create_evaluator(
-        &router,
-        &json!({
-            "evaluatorName": "settlingJudge",
-            "evaluatorConfig": llm_as_a_judge("Rate the settling answer."),
-            "level": "SESSION"
-        }),
-    )
-    .await;
-    assert_eq!(
-        status, 202,
-        "case \"the create\": expected HTTP 202, got {status} ({created})"
-    );
-    assert_eq!(
-        text(&created, "status"),
-        "CREATING",
-        "case \"straight after the create\": a new evaluator enters CREATING, got {created}"
-    );
-    let id = text(&created, "evaluatorId");
 
-    let settled = poll_until_status(&router, &id, "ACTIVE").await;
-    assert_eq!(
-        text(&settled, "status"),
-        "ACTIVE",
-        "case \"past the settle span\": the CREATING -> ACTIVE transition is due, got {settled}"
-    );
+    // (case, the evaluator's name, the configuration it carries, the level it evaluates at)
+    let rows: [(&str, &str, Value, &str); 3] = [
+        (
+            "an LLM-as-a-Judge evaluator at session level",
+            "settlingJudge",
+            llm_as_a_judge("Rate the settling answer given {{context}}."),
+            "SESSION",
+        ),
+        (
+            "a code-based evaluator at tool-call level",
+            "settlingCode",
+            code_based(),
+            "TOOL_CALL",
+        ),
+        (
+            "a derived evaluator at trace level",
+            "settlingDerived",
+            derived(),
+            "TRACE",
+        ),
+    ];
+
+    for (case, name, config, level) in rows {
+        let (status, created) = create_evaluator(
+            &router,
+            &json!({
+                "evaluatorName": name,
+                "evaluatorConfig": config,
+                "level": level
+            }),
+        )
+        .await;
+        assert_eq!(
+            (status, text(&created, "status").as_str()),
+            (202, "ACTIVE"),
+            "case {case:?}: the create reports the terminal status, got {status} ({created})"
+        );
+        let id = text(&created, "evaluatorId");
+
+        // Read twice: the status the create reported is the status every later read reports,
+        // so nothing moves the evaluator out of it and nothing is owed to it.
+        for read in ["the read straight after the create", "a repeated read"] {
+            let (status, fetched) = get_evaluator(&router, &id).await;
+            assert_eq!(
+                (status, text(&fetched, "status").as_str()),
+                (200, "ACTIVE"),
+                "case {case:?} ({read}): expected the evaluator to read back ACTIVE, got \
+                 {status} ({fetched})"
+            );
+        }
+    }
 }
 
 /// An accepted update replaces the members the request carries and leaves the ones it does
@@ -528,7 +559,7 @@ async fn an_accepted_update_patches_the_members_it_carries() {
     let created_body = json!({
         "evaluatorName": "patchedJudge",
         "description": "the description the create persisted",
-        "evaluatorConfig": llm_as_a_judge("Rate the answer before the update."),
+        "evaluatorConfig": llm_as_a_judge("Rate the answer before the update given {{context}}."),
         "level": "TRACE",
         "kmsKeyArn": KMS_KEY
     });
@@ -547,7 +578,7 @@ async fn an_accepted_update_patches_the_members_it_carries() {
             json!({"description": "the description the update carried"}),
             json!({
                 "description": "the description the update carried",
-                "evaluatorConfig": llm_as_a_judge("Rate the answer before the update."),
+                "evaluatorConfig": llm_as_a_judge("Rate the answer before the update given {{context}}."),
                 "level": "TRACE",
                 "evaluatorType": "Custom",
                 "kmsKeyArn": KMS_KEY
@@ -624,27 +655,27 @@ async fn an_accepted_update_patches_the_members_it_carries() {
     }
 }
 
-/// An evaluator whose own create is still settling takes a change and takes a deletion: the
-/// only state a write collides with is a deletion already accepted, which
+/// An evaluator is active from the create on, and takes a change and a deletion straight
+/// after it: the only state a write collides with is a deletion already accepted, which
 /// `a_deleted_evaluator_is_refused_a_change_and_then_gone` asserts.
 #[tokio::test]
-async fn an_evaluator_still_creating_takes_a_change_and_a_deletion() {
+async fn an_evaluator_takes_a_change_and_a_deletion_straight_after_the_create() {
     let router = router();
     let body = json!({
         "evaluatorName": "busyJudge",
-        "evaluatorConfig": llm_as_a_judge("Rate the busy answer."),
+        "evaluatorConfig": llm_as_a_judge("Rate the busy answer given {{context}}."),
         "level": "SESSION"
     });
     let (status, created) = create_evaluator(&router, &body).await;
     assert_eq!(
         (status, text(&created, "status").as_str()),
-        (202, "CREATING"),
+        (202, "ACTIVE"),
         "case \"the create\": got {status} ({created})"
     );
     let id = text(&created, "evaluatorId");
 
-    // The change is asked for while the create's own transition is still owed: it is accepted,
-    // and what it carried is what the evaluator reports once the clock settles it.
+    // The change is asked for in the call right after the create: it is accepted, and what it
+    // carried is what the evaluator reports once the clock settles the change.
     let (status, accepted) = update_evaluator(&router, &id, &json!({"level": "TRACE"})).await;
     assert_eq!(
         (status, text(&accepted, "status").as_str()),
@@ -663,24 +694,23 @@ async fn an_evaluator_still_creating_takes_a_change_and_a_deletion() {
          carried, got {settled}"
     );
 
-    // A DELETION asked of an evaluator still creating is accepted too: the resource is on its
-    // way out whatever it was doing.
-    let (status, creating) = create_evaluator(
+    // A DELETION asked for in the call right after a create is accepted too.
+    let (status, fresh) = create_evaluator(
         &router,
         &json!({
-            "evaluatorName": "removedWhileCreating",
+            "evaluatorName": "removedRightAway",
             "evaluatorConfig": code_based(),
             "level": "TRACE"
         }),
     )
     .await;
     assert_eq!(
-        (status, text(&creating, "status").as_str()),
-        (202, "CREATING"),
-        "case \"the create of the evaluator deleted while creating\": got {status} ({creating})"
+        (status, text(&fresh, "status").as_str()),
+        (202, "ACTIVE"),
+        "case \"the create of the evaluator deleted right away\": got {status} ({fresh})"
     );
-    let creating_id = text(&creating, "evaluatorId");
-    let (status, accepted) = delete_evaluator(&router, &creating_id).await;
+    let fresh_id = text(&fresh, "evaluatorId");
+    let (status, accepted) = delete_evaluator(&router, &fresh_id).await;
     assert_eq!(
         (status, text(&accepted, "status").as_str()),
         (202, "DELETING"),
@@ -841,7 +871,7 @@ async fn an_evaluator_a_running_evaluation_uses_is_locked_for_modification() {
             &router,
             &json!({
                 "evaluatorName": evaluator_name,
-                "evaluatorConfig": llm_as_a_judge("Rate the referenced answer."),
+                "evaluatorConfig": llm_as_a_judge("Rate the referenced answer given {{context}}."),
                 "level": "SESSION"
             }),
         )
@@ -928,7 +958,7 @@ async fn an_evaluator_a_running_evaluation_uses_is_locked_for_modification() {
 #[tokio::test]
 async fn metadata_only_withholds_the_instructions_and_the_rating_scale() {
     let router = router();
-    let config = llm_as_a_judge("Rate the withheld answer.");
+    let config = llm_as_a_judge("Rate the withheld answer given {{context}}.");
     let (status, created) = create_evaluator(
         &router,
         &json!({
@@ -951,13 +981,13 @@ async fn metadata_only_withholds_the_instructions_and_the_rating_scale() {
         (
             "no includedData, which is ALL_DATA",
             None,
-            "Rate the withheld answer.",
+            "Rate the withheld answer given {{context}}.",
             config["llmAsAJudge"]["ratingScale"].clone(),
         ),
         (
             "ALL_DATA",
             Some("ALL_DATA"),
-            "Rate the withheld answer.",
+            "Rate the withheld answer given {{context}}.",
             config["llmAsAJudge"]["ratingScale"].clone(),
         ),
         (

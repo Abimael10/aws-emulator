@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The custom evaluator (`/evaluators/`): one [`EvaluatorRecord`] per `evaluatorId`, holding
-//! everything `CreateEvaluator` persisted, the `CREATING` -> `ACTIVE` and
-//! `UPDATING` -> `ACTIVE` transitions the clock owes it, the removal an accepted deletion
-//! owes it, and the refusals a missing, busy or in-use evaluator is reported with.
+//! everything `CreateEvaluator` persisted, the `UPDATING` -> `ACTIVE` transition the clock
+//! owes a modified one, the removal an accepted deletion owes it, and the refusals a missing,
+//! busy, in-use or unusably configured evaluator is reported with.
 //!
 //! Lives beside the stores in [`super`] rather than in any one `ops/` file, so the create,
 //! the read, the update and the delete of an evaluator cannot drift from each other.
@@ -19,7 +19,7 @@ use super::*;
 use crate::ops::types::{
     CreateEvaluatorInput, CreateEvaluatorOutput, DeleteEvaluatorOutput, EvaluatorConfig,
     EvaluatorReference, GetEvaluatorOutput, LlmAsAJudgeEvaluatorConfig, RatingScale,
-    UpdateEvaluatorInput, UpdateEvaluatorOutput,
+    UpdateEvaluatorInput, UpdateEvaluatorOutput, ValidationException, ValidationExceptionField,
 };
 
 /// The ARN resource type an evaluator carries: `CustomEvaluatorArn` ends in
@@ -39,8 +39,9 @@ pub fn evaluator_arn(region: &str, evaluator_id: &str) -> String {
 /// `EvaluatorStatus` members this service drives. The enum's full value list is
 /// `ACTIVE | CREATING | CREATE_FAILED | UPDATING | UPDATE_FAILED | DELETING`
 /// (`smithy_query shape=EvaluatorStatus`); the two failed members belong to a provisioning
-/// or a modification that failed, which nothing here makes happen.
-pub const EVALUATOR_STATUS_CREATING: &str = "CREATING";
+/// or a modification that failed, which nothing here makes happen, and `CREATING` belongs to
+/// a provisioning step a custom evaluator has none of — the create itself settles it
+/// ([`EvaluatorRecord::created`]).
 pub const EVALUATOR_STATUS_ACTIVE: &str = "ACTIVE";
 pub const EVALUATOR_STATUS_UPDATING: &str = "UPDATING";
 pub const EVALUATOR_STATUS_DELETING: &str = "DELETING";
@@ -68,15 +69,15 @@ pub const EVALUATOR_PROVIDER_CUSTOM: &str = "Custom";
 /// other member, `ALL_DATA`, is the default and returns the whole configuration.
 pub const INCLUDED_DATA_METADATA_ONLY: &str = "METADATA_ONLY";
 
-/// How long a freshly created or updated evaluator stays in its transient status before the
-/// clock owes it `ACTIVE`, and how long one whose deletion was accepted stays readable in
-/// `DELETING` before the clock owes its removal.
+/// How long an updated evaluator stays in its transient status before the clock owes it
+/// `ACTIVE`, and how long one whose deletion was accepted stays readable in `DELETING` before
+/// the clock owes its removal.
 ///
-/// The create, the update and the delete are each accepted with HTTP 202 and report a
-/// transient status (`smithy_query operation=CreateEvaluator,UpdateEvaluator,DeleteEvaluator`),
-/// and AWS documents no duration for any of those transitions, so the span is chosen: the
-/// same one the sibling resources' transitions take ([`super::REGISTRY_SETTLE_DELAY`]), long
-/// enough that a caller acting straight after the call still observes the transient status.
+/// The update and the delete are each accepted with HTTP 202 and report a transient status
+/// (`smithy_query operation=UpdateEvaluator,DeleteEvaluator`), and AWS documents no duration
+/// for either transition, so the span is chosen: the same one the sibling resources'
+/// transitions take ([`super::REGISTRY_SETTLE_DELAY`]), long enough that a caller acting
+/// straight after the call still observes the transient status.
 pub const EVALUATOR_SETTLE_DELAY: Duration = super::REGISTRY_SETTLE_DELAY;
 
 /// How many evaluators this emulator will hold.
@@ -144,6 +145,103 @@ pub fn evaluator_locked_conflict(evaluator_id: &str) -> ConflictException {
     }
 }
 
+/// The member of an LLM-as-a-Judge configuration a refusal of its instructions names, both in
+/// the `fieldList` entry it carries and in the sentence that names it: `instructions` is the
+/// member of `LlmAsAJudgeEvaluatorConfig` that holds the prompt
+/// (`smithy_query shape=LlmAsAJudgeEvaluatorConfig`).
+const EVALUATOR_INSTRUCTIONS_MEMBER: &str = "instructions";
+
+/// The placeholders an LLM-as-a-Judge evaluator's `instructions` may reference: the evaluated
+/// agent's own data the service substitutes into the prompt before the judge model reads it,
+/// which is what makes instructions "evaluation instructions that guide the language model in
+/// assessing agent performance"
+/// (`smithy_query doc shape=LlmAsAJudgeEvaluatorConfig member=instructions`).
+///
+/// The names, and the order a refusal lists them in, are the set the service itself publishes
+/// when it refuses instructions that reference none of them; the service publishes one set,
+/// which is therefore what each level allows ([`INSTRUCTION_PLACEHOLDERS_BY_LEVEL`]).
+const INSTRUCTION_PLACEHOLDERS: &[&str] = &[
+    "available_tools",
+    "context",
+    "actual_tool_trajectory",
+    "expected_tool_trajectory",
+    "assertions",
+];
+
+/// The placeholders each `EvaluatorLevel` allows: one row per value of the enum
+/// (`smithy_query shape=EvaluatorLevel`), so the check and the sentence that reports it are
+/// keyed off the level the request evaluates at rather than off one level's set.
+const INSTRUCTION_PLACEHOLDERS_BY_LEVEL: &[(&str, &[&str])] = &[
+    ("TOOL_CALL", INSTRUCTION_PLACEHOLDERS),
+    ("TRACE", INSTRUCTION_PLACEHOLDERS),
+    ("SESSION", INSTRUCTION_PLACEHOLDERS),
+];
+
+/// The placeholders `level` allows an evaluator's instructions to reference.
+///
+/// A level this service publishes no set of its own for is held to the set every level shares,
+/// so instructions are never accepted unchecked.
+pub fn allowed_instruction_placeholders(level: &str) -> &'static [&'static str] {
+    INSTRUCTION_PLACEHOLDERS_BY_LEVEL
+        .iter()
+        .find(|(candidate, _)| *candidate == level)
+        .map_or(INSTRUCTION_PLACEHOLDERS, |(_, allowed)| *allowed)
+}
+
+/// Whether `config`'s instructions can be evaluated at `level`: an LLM-as-a-Judge evaluator's
+/// instructions must reference at least one of the placeholders that level allows, or the
+/// judge model is handed a prompt with none of the evaluated agent's data in it.
+///
+/// A placeholder is referenced by its name occurring in the instructions — the service
+/// substitutes the data wherever the name is written — so the instructions are searched for
+/// each allowed name. Every other `EvaluatorConfig` member carries no instructions
+/// (`smithy_query shape=EvaluatorConfig`), so there is nothing to check for it.
+///
+/// Shared by the create and the update rather than written in either, so one request body
+/// cannot be accepted by one and refused by the other.
+pub fn validate_evaluator_instructions(
+    config: &EvaluatorConfig,
+    level: &str,
+) -> Result<(), ValidationException> {
+    let EvaluatorConfig::llmAsAJudge(judge) = config else {
+        return Ok(());
+    };
+    let allowed = allowed_instruction_placeholders(level);
+    if allowed
+        .iter()
+        .any(|placeholder| judge.instructions.contains(placeholder))
+    {
+        return Ok(());
+    }
+    Err(instructions_without_a_placeholder(level, allowed))
+}
+
+/// The modelled validation error for instructions that reference none of the placeholders the
+/// requested level allows: what the instructions must contain, the level they were submitted
+/// for and the names that level allows.
+///
+/// The sentence is fixed; its variable parts are the level the request evaluates at, as the
+/// enum spells it, and the placeholder names that level allows, listed in the order the
+/// service publishes them. The same sentence is carried on the error and on the single
+/// `fieldList` entry that names the offending member, which is what lets a caller point at the
+/// field rather than parse the message. `reason` says a field of the request failed
+/// validation.
+fn instructions_without_a_placeholder(level: &str, allowed: &[&str]) -> ValidationException {
+    let message = format!(
+        "Instructions must contain at least one of the allowed placeholders for {level} \
+         level: {}",
+        allowed.join(", ")
+    );
+    ValidationException {
+        reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: EVALUATOR_INSTRUCTIONS_MEMBER.to_string(),
+            message: message.clone(),
+        }]),
+        message,
+    }
+}
+
 /// One evaluator: everything `CreateEvaluator` persisted for it and the transitions the clock
 /// owes it.
 ///
@@ -181,8 +279,9 @@ pub struct EvaluatorRecord {
 
 impl EvaluatorRecord {
     /// The evaluator a create stores for the request `requested` in `region`, under the id
-    /// that create minted: `CREATING`, with the transition to `ACTIVE` owed by the clock
-    /// rather than by the call.
+    /// that create minted: `ACTIVE`, the terminal status, from the create on — a custom
+    /// evaluator is a configuration this control plane holds, not a provisioned resource, so
+    /// the create leaves no work for the clock to finish.
     pub fn created(
         region: &str,
         evaluator_id: String,
@@ -200,9 +299,9 @@ impl EvaluatorRecord {
             tags: sorted_map(requested.tags),
             created_at: now,
             updated_at: now,
-            transient_status: EVALUATOR_STATUS_CREATING.to_string(),
+            transient_status: EVALUATOR_STATUS_ACTIVE.to_string(),
             settled_status: EVALUATOR_STATUS_ACTIVE.to_string(),
-            settles_at: now + EVALUATOR_SETTLE_DELAY,
+            settles_at: now,
             removal_due_at: None,
         }
     }
@@ -247,7 +346,7 @@ impl EvaluatorRecord {
     /// stored them.
     ///
     /// The evaluator reports `UPDATING` until the clock owes it `ACTIVE` one settle span
-    /// later, as the create's own transition is owed.
+    /// later.
     pub fn accept_update(&mut self, requested: UpdateEvaluatorInput, now: SystemTime) {
         if let Some(description) = requested.description {
             self.description = Some(description);
