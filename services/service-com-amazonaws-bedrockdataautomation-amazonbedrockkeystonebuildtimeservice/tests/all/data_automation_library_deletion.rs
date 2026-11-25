@@ -740,3 +740,95 @@ async fn an_update_of_the_project_decides_whether_the_library_can_be_deleted() {
         }
     }
 }
+
+/// RULE: the in-use refusal follows from a project of this account referencing the library
+/// and from nothing else — not from the referring project's own stage or type, and not from
+/// what the library itself carries — it is REPEATABLE (a refused attempt performs nothing, so
+/// no removal is ever owed and the library keeps reading `ACTIVE`), and once the last
+/// referrer is gone the identical delete is accepted and the removal it owes settles into the
+/// modelled 404 with the service's fixed sentence.
+///
+/// The rows differ along the referring project's `projectStage` and `projectType` — the
+/// values the model admits (`smithy_query(query="shape",shape="DataAutomationProjectStage")`
+/// -> `["DEVELOPMENT", "LIVE"]`, `DataAutomationProjectType` -> `["ASYNC", "SYNC"]`),
+/// including a create that specifies neither and takes the service's defaults — and along
+/// whether the target library carries an ingestion job of its own, so neither the referrer's
+/// shape nor the library's contents can be what decides the refusal.
+#[tokio::test]
+async fn the_in_use_refusal_follows_only_from_a_project_referencing_the_library() {
+    // (case, the referrer's projectStage, its projectType, whether an ingestion job was
+    //  submitted against the target library before the delete is attempted)
+    let rows: [(&str, Option<&str>, Option<&str>, bool); 5] = [
+        (
+            "a DEVELOPMENT-stage ASYNC referrer",
+            Some("DEVELOPMENT"),
+            Some("ASYNC"),
+            false,
+        ),
+        ("a LIVE-stage referrer", Some("LIVE"), None, false),
+        ("a SYNC-type referrer", None, Some("SYNC"), false),
+        (
+            "a referrer specifying neither stage nor type",
+            None,
+            None,
+            false,
+        ),
+        (
+            "a referenced library carrying an ingestion job of its own",
+            None,
+            None,
+            true,
+        ),
+    ];
+    for (case, stage, project_type, with_job) in rows {
+        let (router, engine) = emulator();
+        let target = create_library(&router, "referenced_library").await;
+        if with_job {
+            submit_job(&router, &target, "referenced-entity").await;
+        }
+
+        let mut body = project_body(Some("referring-project"), std::slice::from_ref(&target));
+        if let Some(stage) = stage {
+            body["projectStage"] = json!(stage);
+        }
+        if let Some(kind) = project_type {
+            body["projectType"] = json!(kind);
+        }
+        let (status, created) = call(&router, "PUT", "/data-automation-projects/", &body).await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: expected CreateDataAutomationProject 201, got {status} with \
+             {created:?}"
+        );
+        let project = string_at(&created, "projectArn", case);
+
+        // Asked for twice: the refusal is the same answer every time and writes nothing, so
+        // a second attempt can neither find a removal the first one owed nor accumulate one.
+        for attempt in 1..=2 {
+            assert_referenced_refusal(
+                &router,
+                &engine,
+                &target,
+                &format!("{case}: attempt #{attempt}"),
+            )
+            .await;
+        }
+
+        // The reference is let go of on the PROJECT side, and from that instant the identical
+        // delete is accepted and the removal it owes settles on its own.
+        delete_project(&router, &project, case).await;
+        assert_delete_accepted(&router, &target, case).await;
+        let released = poll_until_released(&router, &target, case).await;
+        assert_eq!(
+            error_code(&released),
+            "ResourceNotFoundException",
+            "case {case:?}: expected a ResourceNotFoundException, got {released:?}"
+        );
+        assert_eq!(
+            released.get("message").and_then(Value::as_str),
+            Some(state::LIBRARY_ARN_NOT_FOUND_MESSAGE),
+            "case {case:?}: expected {:?}, got {released:?}",
+            state::LIBRARY_ARN_NOT_FOUND_MESSAGE
+        );
+    }
+}
