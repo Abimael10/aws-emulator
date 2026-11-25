@@ -55,10 +55,12 @@ use crate::identity_authorization::{form_encode, xml_element};
 use service_com_amazonaws_appsync_awsdeepdishcontrolplaneservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The `Type` Certificate Manager reports for a certificate it issued, and for one a client
-/// imported. Source: `smithy_query(query="shape",shape="CertificateType")` of the acm model.
+/// The `Type` Certificate Manager reports for a certificate it issued publicly, for one a
+/// client imported, and for one a PRIVATE certificate authority issued. Source:
+/// `smithy_query(query="shape",shape="CertificateType")` of the acm model.
 const TYPE_AMAZON_ISSUED: &str = "AMAZON_ISSUED";
 const TYPE_IMPORTED: &str = "IMPORTED";
+const TYPE_PRIVATE: &str = "PRIVATE";
 
 /// A private certificate authority ARN of the form `CertificateAuthorityArn`'s pattern
 /// requires. Source:
@@ -442,7 +444,10 @@ fn rows() -> Vec<Row> {
             label: "a certificate a private certificate authority issued",
             domain_name: PRIVATE_NAME,
             issuance: Issuance::PrivateAuthority,
-            managed_type: Some(TYPE_AMAZON_ISSUED),
+            // A certificate issued through a private certificate authority is that
+            // authority's, which is the type Certificate Manager reports for it;
+            // `AMAZON_ISSUED` is its own public authority's.
+            managed_type: Some(TYPE_PRIVATE),
             private_authority: true,
             accepted: false,
         },

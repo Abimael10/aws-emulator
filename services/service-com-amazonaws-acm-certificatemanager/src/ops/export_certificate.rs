@@ -2,16 +2,20 @@
 
 //! @op ExportCertificate
 //! IMPLEMENTED: resolves the `CertificateArn` against this service's certificate store
-//! and answers the export of the record stored under it — classifying an ARN that names
-//! no ACM certificate, an ARN naming no stored certificate, a certificate export was
-//! never allowed for, an ARN under which no ISSUED certificate stands, and a certificate
-//! whose material ACM does not hold yet, each with the modelled error that reports
+//! and answers the export of the record stored under it — the certificate, the chain its
+//! issuing authority leads, and the private key of the pair ACM minted for it, encrypted
+//! under the passphrase the request assigned to it — classifying an ARN that names
+//! no ACM certificate, an ARN naming no stored certificate, a certificate export does not
+//! apply to, an ARN under which no ISSUED certificate stands, and a certificate
+//! whose material ACM does not hold, each with the modelled error that reports
 //! exactly that condition.
 //!
-//! Export is opt-in at creation and cannot be turned on afterwards
-//! (`CertificateOptions$Export`), so a certificate created without it — which every
-//! imported certificate is, `ImportCertificate` carrying no options — is one this
-//! operation can never export, and is refused rather than told to retry.
+//! WHICH certificates export applies to is their provenance
+//! ([`crate::state::Certificate::is_exportable`]): "exports a private certificate issued
+//! by a private certificate authority (CA) or a public certificate for use anywhere"
+//! (this operation's doc), where the opt-in that "cannot [be updated] after the the
+//! certificate is created" (`CertificateOptions$Export`) governs the PUBLIC half of that
+//! sentence alone.
 //!
 //! ## Shape of an operation
 //!
@@ -174,10 +178,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        // The `Passphrase` is "to associate with the encrypted exported private key",
-        // read by whoever decrypts the key this call hands back. Nothing else about the
-        // request depends on it, and it is neither stored nor reported.
-        let _ = &input.passphrase;
 
         // Unreachable in the assembled emulator (the engine is the shared store), and
         // this operation models no server fault, so the modelled validation failure is
@@ -200,15 +200,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A read of one record, except for the outcomes the clock already owes: a
-        // request whose validation fell due before this call is answered as it stands
-        // now rather than as it stood when it was made.
-        let mut store = state.lock();
-        store.materialize_due_in(&*self.engine, ::std::time::SystemTime::now());
-        let Some(certificate) = store.certificates.get(&input.certificate_arn) else {
-            return Err(ExportCertificateErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::certificate_not_found_message(
+        // A read of one record, except for the outcomes the clock already owes: a request
+        // whose validation fell due before this call is answered as it stands now rather
+        // than as it stood when it was made. The store is released as soon as the material
+        // has been taken off the record, so the key derivation below holds no lock.
+        let material = {
+            let mut store = state.lock();
+            store.materialize_due_in(&*self.engine, ::std::time::SystemTime::now());
+            let Some(certificate) = store.certificates.get(&input.certificate_arn) else {
+                return Err(ExportCertificateErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::certificate_not_found_message(
+                            &input.certificate_arn,
+                        )),
+                    },
+                )
+                .into());
+            };
+
+            // Which certificates this operation applies to at all is decided by their
+            // provenance ([`crate::state::Certificate::is_exportable`]): a private CA's
+            // certificate is exportable, a public one only with the opt-in that "cannot [be
+            // updated] after the the certificate is created" (`CertificateOptions$Export`
+            // doc), and an imported one never. A certificate outside that set is an input
+            // this operation does not apply to, which is what `ValidationException` reports
+            // ("the supplied input failed to satisfy constraints of an Amazon Web Services
+            // service"). It is reported with this surface's own sentence, and NOT with the
+            // retry-now signal below: a caller must not poll a call that can never succeed.
+            if !certificate.is_exportable() {
+                return Err(ExportCertificateErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::not_export_enabled_message(
+                            &input.certificate_arn,
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            // "An Amazon Resource Name (ARN) of the issued certificate"
+            // (`ExportCertificateRequest$CertificateArn` doc): this operation addresses one
+            // kind of certificate, the ISSUED one, so a record in any other
+            // `CertificateStatus` — still awaiting its domain validation, or past it
+            // without being issued — is an ARN under which there is no issued certificate
+            // to export. That is the condition `ResourceNotFoundException` reports ("the
+            // specified certificate cannot be found"), named with the sentence for an ARN
+            // that resolves while the certificate the argument addresses does not, and NOT
+            // with the retry-now signal below: the status is the record's current one, not
+            // a step on the way to export.
+            if certificate.status != crate::state::STATUS_ISSUED {
+                return Err(ExportCertificateErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::issued_certificate_not_found_message(
+                            &input.certificate_arn,
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            // "The exported file contains the certificate, the certificate chain, and the
+            // encrypted private key associated with the public key that is embedded in the
+            // certificate" (this operation's doc): all three come off the record, which
+            // holds them for a certificate ACM had a private certificate authority issue —
+            // the certificate that CA signed, the chain it leads with, and the key pair ACM
+            // minted and the CA certified.
+            certificate.certificate_body.clone().zip(
+                certificate
+                    .private_key
+                    .clone()
+                    .map(|key| (key, certificate.certificate_chain.clone())),
+            )
+        };
+
+        // The key leaves ACM encrypted under the passphrase this request assigned to it and
+        // under nothing else ([`crate::state::passphrase_encrypted_pkcs8`]). Derivation is
+        // CPU work of a FIXED cost — the iteration count is this service's own, not a value
+        // a caller picks — and it is done with the store already released, so no other
+        // request of this service waits on it.
+        let exported = material.and_then(|(certificate_pem, (private_key, chain_pem))| {
+            crate::state::passphrase_encrypted_pkcs8(private_key.pkcs8_der(), &input.passphrase)
+                .map(|private_key_pem| (certificate_pem, chain_pem, private_key_pem))
+        });
+        let Some((certificate_pem, certificate_chain_pem, private_key_pem)) = exported else {
+            // A certificate whose material ACM does not hold has nothing to export, which
+            // is the condition `RequestInProgressException` reports: "the certificate
+            // request is in process and the certificate in your account has not yet been
+            // issued". That is the record of a request ACM carried no issuance out for —
+            // a public certificate, whose authority signs nothing in this emulator, and a
+            // private one whose CA no Private CA store here holds — the same gap
+            // `GetCertificate` reports with the same modelled error and the same sentence
+            // for the same record.
+            return Err(ExportCertificateErrorModeled::RequestInProgressException(
+                RequestInProgressException {
+                    message: Some(crate::state::certificate_not_yet_issued_message(
                         &input.certificate_arn,
                     )),
                 },
@@ -216,69 +301,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // "You can opt in to allow the export of your certificates by specifying
-        // ENABLED. You cannot update the value of Export after the the certificate is
-        // created" (`CertificateOptions$Export` doc): whether a certificate may ever
-        // leave ACM was decided when it was created, so a certificate created without
-        // that opt-in can never be exported — an input this operation does not apply
-        // to, which is what `ValidationException` reports ("the supplied input failed
-        // to satisfy constraints of an Amazon Web Services service"). It is reported
-        // with this surface's own sentence, and NOT with the retry-now signal below: a
-        // caller must not poll a call that can never succeed.
-        if !certificate.export_allowed() {
-            return Err(ExportCertificateErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(crate::state::not_export_enabled_message(
-                        &input.certificate_arn,
-                    )),
-                },
-            )
-            .into());
+        // "Indicates whether the certificate has been exported"
+        // (`AcmCertificateMetadata$Exported` doc): this call is what makes that true, and
+        // it is the fact `RevokeCertificate` rests on ("you can only revoke certificates
+        // that have been previously exported"). Recorded only once the export has
+        // succeeded, so a refused call leaves the record as it was — and only if the record
+        // is still there, since the store was released while the key was encrypted.
+        if let Some(certificate) = state.lock().certificates.get_mut(&input.certificate_arn) {
+            certificate.exported = true;
         }
 
-        // "An Amazon Resource Name (ARN) of the issued certificate"
-        // (`ExportCertificateRequest$CertificateArn` doc): this operation addresses one
-        // kind of certificate, the ISSUED one, so a record in any other
-        // `CertificateStatus` — still awaiting its domain validation, or past it without
-        // being issued — is an ARN under which there is no issued certificate to export.
-        // That is the condition `ResourceNotFoundException` reports ("the specified
-        // certificate cannot be found"), named with the sentence for an ARN that
-        // resolves while the certificate the argument addresses does not, and NOT with
-        // the retry-now signal below: the status is the record's current one, not a step
-        // on the way to export.
-        if certificate.status != crate::state::STATUS_ISSUED {
-            return Err(ExportCertificateErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::issued_certificate_not_found_message(
-                        &input.certificate_arn,
-                    )),
-                },
-            )
-            .into());
-        }
-
-        // "The exported file contains the certificate, the certificate chain, and the
-        // encrypted private key associated with the public key that is embedded in the
-        // certificate" (this operation's doc): all three are material of a key pair ACM
-        // generated itself, which is the only private key it ever holds — a client's own
-        // key arrives with an import, and an imported certificate is refused above.
-        //
-        // A certificate whose request has not produced that material has nothing to
-        // export, which is the condition `RequestInProgressException` reports: "the
-        // certificate request is in process and the certificate in your account has not
-        // yet been issued". This service mints no key pair for a certificate it was
-        // asked to issue, so that material is what it does not hold for the record
-        // reaching here — the same gap `GetCertificate` reports with the same modelled
-        // error and the same sentence for the same record. No recording of this
-        // operation words that refusal, so the sentence is the one recorded for the gap
-        // itself rather than a second wording for one condition.
-        Err(ExportCertificateErrorModeled::RequestInProgressException(
-            RequestInProgressException {
-                message: Some(crate::state::certificate_not_yet_issued_message(
-                    &input.certificate_arn,
-                )),
-            },
-        )
-        .into())
+        Ok(ExportCertificateOutput {
+            certificate: Some(certificate_pem),
+            // "This does not include the certificate that you are exporting"
+            // (`ExportCertificateResponse$CertificateChain` doc): the chain is the issuing
+            // authority's own certificates, which is what the record holds beside the
+            // leaf.
+            certificate_chain: certificate_chain_pem,
+            private_key: Some(private_key_pem),
+        })
     }
 }

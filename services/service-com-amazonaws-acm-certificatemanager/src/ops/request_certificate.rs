@@ -6,9 +6,15 @@
 //! `DomainValidationOptions` (each entry must
 //! name a domain the certificate covers, with a `ValidationDomain` equal to that
 //! domain or a superdomain of it), mints a certificate ARN, persists the certificate
-//! record (status `PENDING_VALIDATION`, type `AMAZON_ISSUED`) with one validation
+//! record (status `PENDING_VALIDATION`, type `AMAZON_ISSUED` for a public request and
+//! `PRIVATE` for one naming a private certificate authority) with one validation
 //! entry per domain name, and returns the ARN. An `IdempotencyToken` re-sent with the
 //! same request parameters resolves to the certificate already created for it.
+//!
+//! A request naming a `CertificateAuthorityArn` is issued by THAT authority: ACM mints the
+//! certificate's key pair, has the private CA sign a certificate for it
+//! ([`crate::state::issue_through_private_ca`]) and owes the request what the CA answered
+//! — the issuance, or the failure the `FailureReason` of its refusal names.
 //!
 //! `PENDING_VALIDATION` is not a status the certificate is stuck in: the call records
 //! the outcome the clock owes it ([`crate::state::PendingValidation`]) and the instant
@@ -336,6 +342,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         });
 
+        // The key pair of a certificate a PRIVATE certificate authority will issue is
+        // minted HERE — before the store is locked, and on the blocking pool rather than on
+        // the async worker. Minting is CPU work whose cost the CALLER chooses with
+        // `KeyAlgorithm` (searching for RSA primes takes orders of magnitude longer than
+        // generating an EC key), so it runs where a long one cannot occupy a runtime worker
+        // and holds no lock while it runs: no other request of this service waits on the
+        // store for it, and the request's own timeout and the emulator's shutdown keep
+        // their yield point. The blocking pool is what bounds how many run at once. It is
+        // the same place `CreateCertificateAuthority` mints a CA's key pair, for the same
+        // reason.
+        //
+        // The pair is what the certification request published to the authority is over and
+        // what the certificate it signs then certifies, so it is minted once per request
+        // and never re-minted. A public request mints none: ACM's own authority signs
+        // nothing in this emulator.
+        let minted = match input.certificate_authority_arn {
+            Some(_) => {
+                let minting_key_algorithm = key_algorithm.clone();
+                let covered_names = names.clone();
+                ::tokio::task::spawn_blocking(move || {
+                    crate::state::mint_leaf_material(&minting_key_algorithm, &covered_names)
+                })
+                .await
+                // Only a panicking mint or a runtime that is shutting down answers here,
+                // neither of which this operation models an error for — so the refusal is
+                // the wrapper's, exactly as for a store this request cannot reach.
+                .map_err(|_| {
+                    crate::scaffolded::Scaffolded::validation(
+                        "the certificate's key pair could not be minted",
+                    )
+                })?
+            }
+            None => None,
+        };
+
         // ONE instant answers the whole request: it materialises the outcomes the
         // clock already owes and dates the certificate this call creates.
         let now = std::time::SystemTime::now();
@@ -415,17 +456,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        // Which outcome the clock owes this request is decided from the request and the
-        // public DNS, before the record is built — it depends on every name the
+        // Which outcome the clock owes this request is decided from the request, the
+        // public DNS and — for a request naming a private certificate authority — that
+        // authority's answer, before the record is built: it depends on every name the
         // certificate covers, not on the one `DomainName` named.
-        let outcome = validation_outcome(&*self.engine, &input, &names);
+        let outcome = validation_outcome(&*self.engine, &input, &names, minted, now);
 
         let certificate = crate::state::Certificate {
             arn: arn.clone(),
             domain_name: input.domain_name.clone(),
             subject_alternative_names: names,
             status: crate::state::STATUS_PENDING_VALIDATION.to_string(),
-            cert_type: crate::state::TYPE_AMAZON_ISSUED.to_string(),
+            // "The Amazon Resource Name (ARN) of the private certificate authority (CA)
+            // that will be used to issue the certificate"
+            // (`RequestCertificateRequest$CertificateAuthorityArn` doc): a request naming
+            // one asks for a certificate a PRIVATE authority issues, which is the
+            // `CertificateType` such a certificate carries; `AMAZON_ISSUED` is ACM's own
+            // public authority's.
+            cert_type: match input.certificate_authority_arn {
+                Some(_) => crate::state::TYPE_PRIVATE.to_string(),
+                None => crate::state::TYPE_AMAZON_ISSUED.to_string(),
+            },
             // The X.509 identity ACM fixes when it accepts the request: the subject
             // distinguished name of the certificate's common name, the CA that will
             // sign it and the algorithm that CA signs with.
@@ -483,9 +534,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             not_after: None,
             // No certificate authority has signed anything for this request yet, so
             // there is no PEM material to hand out: `GetCertificate` answers the
-            // documented "has not yet been issued" refusal until there is.
+            // documented "has not yet been issued" refusal until there is. A private
+            // request's material is already signed at this point, and the record takes it
+            // when the issuance the clock owes falls due
+            // ([`crate::state::Certificate::materialize_due`]) — not before, so a caller
+            // reading straight back still sees the request pending.
             certificate_body: None,
             certificate_chain: None,
+            // The key pair of a private certificate arrives with that same issuance; no
+            // other certificate ACM requests has one at all.
+            private_key: None,
             tags,
         };
 
@@ -507,13 +565,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// How the validation of the certificate this request creates will resolve, as the
-/// request and the public DNS it names domains in decide it.
+/// request, the private certificate authority it may name and the public DNS it names
+/// domains in decide it.
 ///
-/// Three outcomes:
+/// A request naming a `CertificateAuthorityArn` is answered by that authority: "if you
+/// are requesting a private certificate, domain validation is not required"
+/// (`RequestCertificate` doc), so there is nothing to prove and what remains is whether
+/// the CA issues the certificate from the material `minted` holds
+/// ([`crate::state::issue_through_private_ca`]) —
 ///
-/// * "If you are requesting a private certificate, domain validation is not required"
-///   (`RequestCertificate` doc), so a request naming a private certificate authority
-///   has nothing left to prove and is ISSUED.
+/// * it signed one, so the request is owed that issuance, with the certificate, the
+///   CA-led chain and the key pair ACM minted for it;
+/// * it is a CA ACM does not issue through, or it refused the issuance, so the request
+///   is owed the failure the `FailureReason` of that refusal names;
+/// * neither, because no Private CA store in this engine holds that CA and so nothing
+///   could be signed through it, which is the issuance the request is owed with no
+///   material behind it.
+///
+/// For a PUBLIC request the other three outcomes stand as they did:
+///
 /// * A request naming a domain no evidence from this account could cover — a name the
 ///   PROVIDER itself operates and delegates to no account, or one the registries
 ///   reserve rather than delegate which no public hosted zone of the account is
@@ -542,12 +612,28 @@ fn validation_outcome<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
     engine: &Eng,
     input: &RequestCertificateInput,
     names: &[String],
+    minted: Option<crate::state::MintedLeafMaterial>,
+    now: std::time::SystemTime,
 ) -> crate::state::ValidationOutcome {
-    if input.certificate_authority_arn.is_some() {
-        crate::state::ValidationOutcome::Issued
-    } else if let Some(unvalidatable_name) =
-        crate::state::first_unvalidatable_name_in(engine, names)
-    {
+    if let Some(certificate_authority_arn) = input.certificate_authority_arn.as_deref() {
+        return match crate::state::issue_through_private_ca(
+            engine,
+            certificate_authority_arn,
+            minted,
+            now,
+        ) {
+            crate::state::PrivateCaOutcome::Issued(issuance) => {
+                crate::state::ValidationOutcome::IssuedPrivately(issuance)
+            }
+            crate::state::PrivateCaOutcome::Failed { failure_reason } => {
+                crate::state::ValidationOutcome::Rejected { failure_reason }
+            }
+            crate::state::PrivateCaOutcome::NoIssuance => {
+                crate::state::ValidationOutcome::Issued
+            }
+        };
+    }
+    if let Some(unvalidatable_name) = crate::state::first_unvalidatable_name_in(engine, names) {
         crate::state::ValidationOutcome::Failed { unvalidatable_name }
     } else {
         crate::state::ValidationOutcome::TimedOut

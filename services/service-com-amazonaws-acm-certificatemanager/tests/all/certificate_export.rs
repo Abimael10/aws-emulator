@@ -5,11 +5,11 @@
 //! RULE under test: `ExportCertificate` classifies the certificate the request names
 //! against the store and answers the modelled error for the condition it is in — an ARN
 //! that names no ACM certificate, an ARN naming no stored certificate, a certificate
-//! export was never allowed for (which every certificate created without the `Export`
-//! opt-in is, and the opt-in "cannot [be updated] after the the certificate is
-//! created"), an ARN under which no ISSUED certificate stands — the member names "an
-//! ARN of the issued certificate" — and a certificate whose material ACM holds none of
-//! yet. Every one of these is HTTP 400 with its own code and sentence, and none of them
+//! export does not apply to (a public certificate created without the `Export` opt-in,
+//! which "cannot [be updated] after the the certificate is created", and every imported
+//! one), an ARN under which no ISSUED certificate stands — the member names "an
+//! ARN of the issued certificate" — and a certificate whose material ACM holds none of.
+//! Every one of these is HTTP 400 with its own code and sentence, and none of them
 //! is a server fault.
 //!
 //! The table spans the classes the rule generalises over: both kinds of certificate a
@@ -18,6 +18,11 @@
 //! and an ARN naming another kind of ACM resource — and, so the classification is shown
 //! to be independent of the passphrase, a passphrase at each end of the modelled
 //! `@length 4..128` range plus one byte past its lower bound.
+//!
+//! The export a private certificate SERVES is the subject of
+//! `crate::private_ca_certificate_issuance`, which drives it through a private
+//! certificate authority this emulator holds; the private-CA rows here name an authority
+//! no Private CA store holds, so no material was ever signed for them.
 
 use serde_json::{json, Value};
 
@@ -194,11 +199,17 @@ async fn export_classifies_the_certificate_the_request_names() {
             expected_not_export_enabled_message(&default_option),
         ),
         (
+            // A certificate a PRIVATE authority issues is exportable whatever the export
+            // option says — "exports a private certificate issued by a private
+            // certificate authority (CA) or a public certificate for use anywhere"
+            // (`ExportCertificate` doc) — so what this row is refused for is the
+            // material: the authority it names is one no Private CA store here holds, so
+            // nothing was signed for it.
             "an issued certificate created with Export DISABLED",
             &disabled,
             b"Sim2RealPass123".to_vec(),
-            "ValidationException",
-            expected_not_export_enabled_message(&disabled),
+            "RequestInProgressException",
+            expected_not_yet_issued_message(&disabled),
         ),
         (
             "an unissued certificate created with Export ENABLED",

@@ -25,6 +25,7 @@ mod imported_certificate;
 mod issuance_metrics;
 mod issued_extensions;
 mod key_material;
+mod managed_issuance;
 
 pub use audit_reports::*;
 pub use certificate_chain::*;
@@ -34,6 +35,7 @@ pub use imported_certificate::*;
 pub use issuance_metrics::*;
 pub use issued_extensions::*;
 pub use key_material::*;
+pub use managed_issuance::*;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};

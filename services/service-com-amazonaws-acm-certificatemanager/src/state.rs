@@ -104,9 +104,13 @@
 
 pub mod acme_socket;
 mod dns_validation;
+mod leaf_key_material;
+mod private_ca;
 mod public_delegation;
 
 pub use dns_validation::first_unvalidatable_name_in;
+pub use leaf_key_material::*;
+pub use private_ca::*;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
@@ -530,6 +534,16 @@ pub fn extended_key_usage(oid: &str) -> ExtendedKeyUsageRecord {
 /// `CertificateType`: "For certificates provided by ACM, this value is
 /// `AMAZON_ISSUED`" (`CertificateDetail$Type` doc).
 pub const TYPE_AMAZON_ISSUED: &str = "AMAZON_ISSUED";
+
+/// `CertificateType` of a certificate ACM had a PRIVATE certificate authority issue.
+///
+/// `CertificateDetail$CertificateAuthorityArn` is "the Amazon Resource Name (ARN) of the
+/// private certificate authority (CA) that issued the certificate", and the enum declares
+/// this member beside `AMAZON_ISSUED`
+/// (`smithy_query(query="shape", shape="com.amazonaws.acm#CertificateType")`): a
+/// certificate ACM issued through a private CA is this type, while `AMAZON_ISSUED` is a
+/// certificate ACM's own public authority issued.
+pub const TYPE_PRIVATE: &str = "PRIVATE";
 
 /// `CertificateType` of a certificate a client brought into ACM itself:
 /// `ImportCertificate` "imports a certificate into Certificate Manager (ACM)"
@@ -1005,6 +1019,19 @@ pub enum ValidationOutcome {
     /// nothing left to prove and the request completes — and likewise for a public
     /// request whose domains the published DNS has since proven (`dns_validation`).
     Issued,
+    /// The certificate is issued with the material a PRIVATE certificate authority
+    /// already signed for it (`private_ca`): the same completion as [`Self::Issued`],
+    /// carrying the certificate, its chain and the key pair ACM minted for it, which the
+    /// record takes when the issuance falls due.
+    IssuedPrivately(Box<PrivateIssuance>),
+    /// The request is one ACM will not carry out, and fails with the `FailureReason`
+    /// naming why — the answer a private certificate authority gave the issuance ACM asked
+    /// it for (`private_ca`). Nothing about a domain decided it, so no name carries the
+    /// verdict ([`Certificate::reject`]).
+    Rejected {
+        /// A `FailureReason` value.
+        failure_reason: String,
+    },
     /// The request fails with [`FAILURE_REASON_ADDITIONAL_VERIFICATION_REQUIRED`]
     /// before ACM waits on anything: it names a domain no evidence from this account
     /// could ever cover ([`first_unvalidatable_name_in`]), which is one of the reasons a
@@ -1042,7 +1069,10 @@ impl ValidationOutcome {
     /// the documented [`VALIDATION_WINDOW`].
     pub fn settles_in(&self) -> Duration {
         match self {
-            Self::Issued | Self::Failed { .. } => VALIDATION_SETTLE_DELAY,
+            Self::Issued
+            | Self::IssuedPrivately(_)
+            | Self::Rejected { .. }
+            | Self::Failed { .. } => VALIDATION_SETTLE_DELAY,
             Self::TimedOut => VALIDATION_WINDOW,
         }
     }
@@ -1205,6 +1235,17 @@ pub struct Certificate {
     /// certificate: the chain of trust `GetCertificate` then reports is the
     /// certificate itself.
     pub certificate_chain: Option<String>,
+    /// The private half of the key pair ACM minted for this certificate, for a
+    /// certificate ACM had a private certificate authority issue (`private_ca`). SECRET:
+    /// it is held for the one operation that hands it out — an export, which encrypts it
+    /// under the caller's own passphrase ([`passphrase_encrypted_pkcs8`]) — and
+    /// [`LeafPrivateKey`] keeps it out of every formatted record.
+    ///
+    /// `None` for every other certificate: ACM's public authority signs no certificate in
+    /// this emulator, and the key of an imported one is the client's own, held in the
+    /// shared material directory the service presenting it reads
+    /// ([`certificate_key_material_directory`]).
+    pub private_key: Option<LeafPrivateKey>,
     /// Tag key -> value, as `ListTagsForCertificate` reports them.
     pub tags: BTreeMap<String, String>,
 }
@@ -1281,6 +1322,10 @@ impl Certificate {
         self.pending_validation_email = None;
         match pending.outcome {
             ValidationOutcome::Issued => self.issue(pending.due_at),
+            ValidationOutcome::IssuedPrivately(issuance) => {
+                self.issue_privately(pending.due_at, *issuance);
+            }
+            ValidationOutcome::Rejected { failure_reason } => self.reject(&failure_reason),
             ValidationOutcome::Failed { unvalidatable_name } => {
                 self.fail(
                     FAILURE_REASON_ADDITIONAL_VERIFICATION_REQUIRED,
@@ -1402,6 +1447,31 @@ impl Certificate {
         export_option(self) == EXPORT_ENABLED
     }
 
+    /// Whether this certificate is one `ExportCertificate` applies to at all.
+    ///
+    /// Its PROVENANCE decides it: "exports a private certificate issued by a private
+    /// certificate authority (CA) or a public certificate for use anywhere"
+    /// (`ExportCertificate` doc), where only the public half of that sentence is what the
+    /// opt-in governs — "you can opt in to allow the export of your certificates by
+    /// specifying ENABLED" beside the note that "ACM public certificates created prior to
+    /// June 17, 2025 cannot be exported" (`CertificateOptions$Export`,
+    /// `ExportCertificate` docs). So:
+    ///
+    /// * a certificate a private CA issued ([`TYPE_PRIVATE`]) is exportable, which is what
+    ///   it is for — ACM holds the key pair it minted for it, and the point of a private
+    ///   certificate is to serve something ACM does not terminate;
+    /// * a certificate ACM's own public authority issued is exportable only with that
+    ///   opt-in;
+    /// * a certificate a client imported is not: ACM did not mint its key pair, and the
+    ///   client that brought it in already holds the key.
+    pub fn is_exportable(&self) -> bool {
+        match self.cert_type.as_str() {
+            TYPE_PRIVATE => true,
+            TYPE_IMPORTED => false,
+            _ => self.export_allowed(),
+        }
+    }
+
     /// Whether this certificate is in the state `RevokeCertificate` applies to.
     ///
     /// "Revokes a public ACM certificate. You can only revoke certificates that have
@@ -1449,6 +1519,45 @@ impl Certificate {
             .iter()
             .map(|oid| extended_key_usage(oid))
             .collect();
+    }
+
+    /// Record this certificate as issued at `at` with the material a private certificate
+    /// authority signed for it (`private_ca`).
+    ///
+    /// The same completion as [`Self::issue`] — a private request has nothing left to
+    /// prove either — with the facts that are the CERTIFICATE's own rather than ACM's
+    /// taken off the certificate the CA signed: its serial, its validity window, the
+    /// algorithm it was signed under and the authority that signed it. The material itself
+    /// is what `GetCertificate` reports and what an export hands out, and the private key
+    /// is held for that export alone.
+    fn issue_privately(&mut self, at: SystemTime, issuance: PrivateIssuance) {
+        self.issue(at);
+        self.serial = Some(issuance.serial);
+        self.not_before = Some(issuance.not_before);
+        self.not_after = Some(issuance.not_after);
+        self.signature_algorithm = Some(issuance.signature_algorithm);
+        // The issuer is reported only when the signing CA was configured with a common
+        // name to report; a certificate's issuer is that authority's name, never a
+        // stand-in.
+        if issuance.issuer.is_some() {
+            self.issuer = issuance.issuer;
+        }
+        self.certificate_body = Some(issuance.certificate_pem);
+        self.certificate_chain = issuance.certificate_chain_pem;
+        self.private_key = Some(issuance.private_key);
+    }
+
+    /// Record this certificate's request as failed for `failure_reason`, a verdict about
+    /// the REQUEST rather than about any name it covers.
+    ///
+    /// Nothing was proven and nothing was issued, so the issuance members stay absent and
+    /// every name keeps the `DomainStatus` it was waiting in: the request was refused
+    /// before any domain was judged, and `ValidationStatus` "is the validation status of
+    /// the domain name" (`DomainValidation$ValidationStatus` doc) — which this failure
+    /// says nothing about.
+    fn reject(&mut self, failure_reason: &str) {
+        self.status = STATUS_FAILED.to_string();
+        self.failure_reason = Some(failure_reason.to_string());
     }
 
     /// Record this certificate's request as failed for `reason`, on the name ACM could

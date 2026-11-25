@@ -510,8 +510,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> IssueCertificate<
             ));
         }
 
-        let serial = crate::state::mint_serial(&format!("{ca_arn}|{}", record.next_serial));
-        let arn = format!("{ca_arn}/certificate/{serial}");
         // `TemplateArn` selects the certificate definition: the extensions the certificate
         // carries are the ones that template defines
         // (`crate::state::certificate_template`), and the template the caller named stays
@@ -526,9 +524,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> IssueCertificate<
             input.template_arn.as_deref(),
             input.api_passthrough.as_ref(),
         );
-        let Some(certificate_pem) = crate::state::derive_certificate_pem(
-            record,
-            &serial,
+        // The serial, the ARN, the DER and the instant issuance completes are the CA's own
+        // to mint, so they come from the ONE signing path every certificate this CA issues
+        // goes through ([`crate::state::CertificateAuthorityRecord::sign_issued_certificate`]).
+        let Some(certificate) = record.sign_issued_certificate(
             &crate::state::IssuedCertificateContent {
                 request: &request.info,
                 signing_algorithm: &input.signing_algorithm,
@@ -537,6 +536,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> IssueCertificate<
                 not_before,
                 not_after,
             },
+            input.template_arn,
+            now,
         ) else {
             return Err(invalid_args(
                 "the certificate this request asks for cannot be encoded: the certification \
@@ -544,24 +545,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> IssueCertificate<
                  can carry",
             ));
         };
-        let certificate = crate::state::IssuedCertificate {
-            certificate_pem,
-            certificate_chain_pem: record.issued_chain(),
-            signing_algorithm: input.signing_algorithm,
-            template_arn: input.template_arn,
-            not_before,
-            not_after,
-            issued_at: now,
-            // Issuance completes on the clock, so a caller that reads the certificate
-            // straight back still sees the request in progress.
-            available_at: now + crate::state::SETTLE_AFTER,
-            serial,
-            arn: arn.clone(),
-            // Nothing is revoked at issuance; `RevokeCertificate` is what records one.
-            revocation: None,
-        };
+        let arn = certificate.arn.clone();
 
-        record.next_serial += 1;
         crate::state::record_idempotent(
             &mut record.issue_idempotency,
             Some(idempotency_key),
@@ -569,7 +554,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> IssueCertificate<
             &arn,
             now,
         );
-        record.certificates.insert(arn.clone(), certificate);
 
         // A CA whose CRLs are enabled publishes the CRL a relying party checks its
         // certificates against; the CRL exists from the first certificate the CA issues,

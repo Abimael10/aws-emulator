@@ -7911,12 +7911,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "pkcs5"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e847e2c91a18bfa887dd028ec33f2fe6f25db77db3619024764914affe8b69a6"
+dependencies = [
+ "aes",
+ "cbc",
+ "der 0.7.10",
+ "pbkdf2 0.12.2",
+ "scrypt 0.11.0",
+ "sha2 0.10.9",
+ "spki 0.7.3",
+]
+
+[[package]]
 name = "pkcs8"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f950b2377845cebe5cf8b5165cb3cc1a5e0fa5cfa3e1f7f55707d8fd82e0a7b7"
 dependencies = [
  "der 0.7.10",
+ "pkcs5",
+ "rand_core 0.6.4",
  "spki 0.7.3",
 ]
 
@@ -9091,7 +9108,7 @@ dependencies = [
  "rustpython-literal",
  "rustpython-unicode",
  "rustpython-wtf8",
- "scrypt",
+ "scrypt 0.12.0",
  "sha1 0.11.0",
  "sha2 0.11.1",
  "sha3 0.12.0",
@@ -9520,6 +9537,15 @@ dependencies = [
 
 [[package]]
 name = "salsa20"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97a22f5af31f73a954c10289c93e8a50cc23d971e80ee446f1f6f7137a088213"
+dependencies = [
+ "cipher 0.4.4",
+]
+
+[[package]]
+name = "salsa20"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f874456e72520ff1375a06c588eaf074b0f01f9e9e1aada45bd9b7954a6e42c"
@@ -9584,13 +9610,24 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "scrypt"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0516a385866c09368f0b5bcd1caff3366aace790fcd46e2bb032697bb172fd1f"
+dependencies = [
+ "pbkdf2 0.12.2",
+ "salsa20 0.10.2",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "scrypt"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d87af57419b594aa23fa95f09f0e06d80d84ba01c26148c43844cad6ff4485f0"
 dependencies = [
  "cfg-if",
  "pbkdf2 0.13.0",
- "salsa20",
+ "salsa20 0.11.0",
  "sha2 0.11.1",
 ]
 
@@ -9970,11 +10007,13 @@ dependencies = [
  "hyper",
  "hyper-util",
  "pkcs1",
+ "pkcs5",
  "pkcs8 0.10.2",
  "rcgen",
  "ring",
  "sec1 0.7.3",
  "serde_json",
+ "service-com-amazonaws-acmpca-acmprivateca",
  "service-com-amazonaws-apigatewayv2-apigatewayv2",
  "service-com-amazonaws-ec2-amazonec2",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",

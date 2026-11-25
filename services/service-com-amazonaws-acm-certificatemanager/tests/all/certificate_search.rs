@@ -299,9 +299,19 @@ async fn each_leaf_filter_selects_on_the_stored_record() {
             vec![],
         ),
         (
+            // `CertificateType` is the certificate's provenance: a request naming a
+            // private certificate authority asks that authority for the certificate, so
+            // the three private-CA fixtures are `PRIVATE` and only the public request is
+            // `AMAZON_ISSUED` (`CertificateDetail$Type`,
+            // `CertificateDetail$CertificateAuthorityArn` docs).
             "Type AMAZON_ISSUED",
             json!({ "Filter": { "AcmCertificateMetadataFilter": { "Type": "AMAZON_ISSUED" } } }),
-            all.to_vec(),
+            vec!["failed-rsa4096"],
+        ),
+        (
+            "Type PRIVATE",
+            json!({ "Filter": { "AcmCertificateMetadataFilter": { "Type": "PRIVATE" } } }),
+            issued.to_vec(),
         ),
         (
             "Type IMPORTED, which nothing imported",

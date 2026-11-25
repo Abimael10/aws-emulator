@@ -55,11 +55,26 @@ http-body-util = "0.1"
 # Certificate ids: ACM certificate ARNs end in a v4 UUID.
 uuid = { version = "1", features = ["v4"] }
 # Reads the X.509 certificates `ImportCertificate` accepts: their names, validity,
-# serial, algorithms and key-usage extensions.
+# serial, algorithms and key-usage extensions, and writes the PKCS#10 certification
+# request a private-CA issuance publishes the minted key pair in.
 x509-cert = "0.2"
+# The Private CA store, for the private certificate authority a request may name: whether
+# that CA issues through this service, and the certificate it signs for the request, are
+# that service's own facts and work, reached through the shared engine — which needs the
+# owning service's state TYPE.
+service-com-amazonaws-acmpca-acmprivateca = { workspace = true }
+# Mints the key pair of a certificate this service has a private CA issue, and signs the
+# certification request it publishes for it. Already linked into this emulator by
+# `emulator-server`, which uses it for its own TLS provider.
+aws-lc-rs = "1"
 # Reads the PEM framing and the PKCS#8 structure of the private key an import carries,
-# so an encrypted or mismatched key is refused.
-pkcs8 = { version = "0.10", features = ["pem", "std"] }
+# so an encrypted or mismatched key is refused, and writes the passphrase-encrypted
+# PKCS#8 an export of a private certificate's key hands back (the `encryption` feature).
+pkcs8 = { version = "0.10", features = ["pem", "std", "encryption"] }
+# The PBES2 parameters that encryption is performed under (RFC 8018): PBKDF2-HMAC-SHA256
+# over the caller's passphrase with AES-256-CBC, the scheme OpenSSL reads an encrypted
+# private key back with.
+pkcs5 = { version = "0.7", features = ["alloc", "pbes2"] }
 # The PKCS#1 RSA key structures, for the RSA key size an imported certificate's
 # `KeyAlgorithm` is read from and for matching its private key.
 pkcs1 = "0.7"
@@ -81,9 +96,6 @@ hex = { workspace = true }
 # cryptography library the service verifies them through — never with the code under test.
 # TEST-ONLY.
 ring = "0.17"
-# RSA key GENERATION, which `ring` does not do, so one row of the account-key table can be
-# an RSA key. TEST-ONLY.
-aws-lc-rs = "1"
 # Generates the real certificates and key pairs the import tests feed the service,
 # independently of the DER this crate reads.
 rcgen = "0.13"

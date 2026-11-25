@@ -548,6 +548,10 @@ impl ImportedCertificate {
             // into the store.
             certificate_body: Some(self.body),
             certificate_chain: self.chain,
+            // ACM minted no key pair for an imported certificate: the key is the client's
+            // own, held for the service that PRESENTS the certificate in the shared
+            // material directory rather than on this record.
+            private_key: None,
             tags,
         }
     }
