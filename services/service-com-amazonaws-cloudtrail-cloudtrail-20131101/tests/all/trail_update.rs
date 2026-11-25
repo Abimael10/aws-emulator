@@ -100,6 +100,13 @@ const RESPONSE_MEMBERS: [&str; 13] = [
 async fn updating_a_trail_replaces_only_the_members_it_carries() {
     let emulator = Emulator::new();
     let name = "update-me";
+    // The alias the last row points the trail at, and the fully specified key ARN the
+    // trail reports it as: a `KmsKeyId` is stored as the ARN of the key it resolves to,
+    // whichever of the forms the member accepts the request wrote.
+    emulator.provision_kms_key("alias/LastKey", HOME_REGION);
+    let last_key_arn = emulator
+        .kms_key_arn(HOME_REGION, "alias/LastKey")
+        .expect("the fixture alias names a held key");
     let created = emulator.call("CreateTrail", &full_trail(name)).await;
     let mut previous = created.expect_ok("CreateTrail").clone();
 
@@ -203,7 +210,7 @@ async fn updating_a_trail_replaces_only_the_members_it_carries() {
                 "LogFileValidationEnabled": false,
                 "IsOrganizationTrail": false,
                 "RecursiveLogging": false,
-                "KmsKeyId": "alias/LastKey",
+                "KmsKeyId": last_key_arn,
                 "CloudWatchLogsLogGroupArn":
                     "arn:aws:logs:us-east-1:000000000000:log-group:last:*",
                 "CloudWatchLogsRoleArn": "arn:aws:iam::000000000000:role/last",

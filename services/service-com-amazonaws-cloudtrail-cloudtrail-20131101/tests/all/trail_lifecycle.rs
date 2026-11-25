@@ -228,6 +228,13 @@ async fn a_trail_lives_through_create_read_logging_and_delete() {
 #[tokio::test]
 async fn a_created_trail_reports_the_configuration_it_was_given() {
     let emulator = Emulator::new();
+    // The alias the second row points its trail at, and the fully specified key ARN the
+    // trail reports it as: a `KmsKeyId` is stored as the ARN of the key it resolves to,
+    // whichever of the forms the member accepts the request wrote.
+    emulator.provision_kms_key("alias/MyAliasName", HOME_REGION);
+    let alias_key_arn = emulator
+        .kms_key_arn(HOME_REGION, "alias/MyAliasName")
+        .expect("the fixture alias names a held key");
     // (case, request, expected members of the CreateTrail response)
     let rows: Vec<(&str, Value, Value)> = vec![
         (
@@ -271,7 +278,7 @@ async fn a_created_trail_reports_the_configuration_it_was_given() {
                 "LogFileValidationEnabled": true,
                 "IsOrganizationTrail": true,
                 "RecursiveLogging": false,
-                "KmsKeyId": "alias/MyAliasName",
+                "KmsKeyId": alias_key_arn,
                 "CloudWatchLogsLogGroupArn":
                     "arn:aws:logs:us-east-1:000000000000:log-group:ct:*",
                 "CloudWatchLogsRoleArn": "arn:aws:iam::000000000000:role/ct",

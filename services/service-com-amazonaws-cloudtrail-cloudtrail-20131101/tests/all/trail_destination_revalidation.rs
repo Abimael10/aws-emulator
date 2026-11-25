@@ -5,7 +5,7 @@
 //! A trail delivers its log files — its Insights events among them — into one Amazon S3
 //! bucket, so CloudTrail resolves that bucket and evaluates its bucket policy before it
 //! accepts a configuration naming it: `S3BucketDoesNotExistException` for a destination
-//! no bucket backs and `InsufficientS3BucketPolicyException` (HTTP 403) for one whose
+//! no bucket backs and `InsufficientS3BucketPolicyException` for one whose
 //! policy does not let the CloudTrail service principal write the trail's log files
 //! (`smithy_query(query="operation", operation="UpdateTrail,PutInsightSelectors")` binds
 //! both on both).
@@ -27,6 +27,8 @@
 //! this check — and that is asserted too, so the rule is not read wider than it is.
 
 use serde_json::{json, Value};
+
+use service_com_amazonaws_cloudtrail_cloudtrail_20131101::state::referenced_resources;
 
 use super::emulator::{Emulator, HOME_REGION};
 
@@ -63,9 +65,10 @@ impl Destination {
     fn refusal(self) -> Option<(u16, &'static str)> {
         match self {
             Self::Deleted => Some((BUCKET_ABSENT_STATUS, "S3BucketDoesNotExistException")),
-            Self::PolicyRevoked | Self::AnotherPrincipal | Self::AnotherKeyPrefix => {
-                Some((403, "InsufficientS3BucketPolicyException"))
-            }
+            Self::PolicyRevoked | Self::AnotherPrincipal | Self::AnotherKeyPrefix => Some((
+                referenced_resources::INSUFFICIENT_S3_BUCKET_POLICY_STATUS,
+                "InsufficientS3BucketPolicyException",
+            )),
             Self::Writable => None,
         }
     }
@@ -266,8 +269,6 @@ async fn a_write_of_a_trails_delivery_is_judged_against_the_destination_held_now
 /// an insufficient bucket policy — the same sentence whichever write was refused.
 #[tokio::test]
 async fn an_insufficient_destination_policy_refusal_names_the_bucket() {
-    use service_com_amazonaws_cloudtrail_cloudtrail_20131101::state::referenced_resources;
-
     for write in [
         Write::RedesignateDestination,
         Write::UpdateWithoutDestinationMembers,
@@ -282,7 +283,11 @@ async fn an_insufficient_destination_policy_refusal_names_the_bucket() {
         let reply = emulator
             .call(write.operation(), &write.request(trail, &bucket))
             .await;
-        reply.expect_error(&case, 403, "InsufficientS3BucketPolicyException");
+        reply.expect_error(
+            &case,
+            referenced_resources::INSUFFICIENT_S3_BUCKET_POLICY_STATUS,
+            "InsufficientS3BucketPolicyException",
+        );
         assert_eq!(
             reply.message(),
             referenced_resources::insufficient_s3_bucket_policy_message(&bucket),
@@ -309,7 +314,7 @@ async fn insights_stay_off_after_an_enable_the_destination_refused() {
         .await
         .expect_error(
             "enable Insights on a trail whose destination policy was revoked",
-            403,
+            referenced_resources::INSUFFICIENT_S3_BUCKET_POLICY_STATUS,
             "InsufficientS3BucketPolicyException",
         );
 
@@ -402,7 +407,11 @@ async fn an_update_carrying_no_destination_member_is_refused_all_the_same() {
         }
         let before = configuration(&emulator, trail).await;
         let reply = emulator.call("UpdateTrail", &request).await;
-        reply.expect_error(case, 403, "InsufficientS3BucketPolicyException");
+        reply.expect_error(
+            case,
+            referenced_resources::INSUFFICIENT_S3_BUCKET_POLICY_STATUS,
+            "InsufficientS3BucketPolicyException",
+        );
         let after = configuration(&emulator, trail).await;
         assert_eq!(
             after, before,

@@ -375,16 +375,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutInsightSelecto
                     crate::state::S3_BUCKET_DOES_NOT_EXIST_STATUS,
                 ))
             }
-            referenced::DestinationVerdict::PolicyInsufficient => Some(
-                PutInsightSelectorsErrorModeled::InsufficientS3BucketPolicyException(
-                    InsufficientS3BucketPolicyException {
-                        message: Some(referenced::insufficient_s3_bucket_policy_message(
-                            &delivery.s3_bucket_name,
-                        )),
-                    },
-                )
-                .into(),
-            ),
+            referenced::DestinationVerdict::PolicyInsufficient => {
+                // The model says 403 for an insufficient bucket policy and CloudTrail
+                // answers 400 (`referenced::INSUFFICIENT_S3_BUCKET_POLICY_STATUS`).
+                Some(crate::scaffolded::Scaffolded::modeled_with_status(
+                    PutInsightSelectorsErrorModeled::InsufficientS3BucketPolicyException(
+                        InsufficientS3BucketPolicyException {
+                            message: Some(referenced::insufficient_s3_bucket_policy_message(
+                                &delivery.s3_bucket_name,
+                            )),
+                        },
+                    ),
+                    referenced::INSUFFICIENT_S3_BUCKET_POLICY_STATUS,
+                ))
+            }
         }
     }
 }

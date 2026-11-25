@@ -377,15 +377,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateTrail<Eng> 
         if let Some(topic) = input
             .sns_topic_name
             .as_deref()
-            .filter(|t| t.chars().count() > crate::state::SNS_TOPIC_NAME_MAX_LEN)
+            .filter(|t| !t.is_empty() && !crate::state::referenced_resources::names_a_topic(t))
         {
             return Err(CreateTrailErrorModeled::InvalidSnsTopicNameException(
                 InvalidSnsTopicNameException {
-                    message: Some(format!(
-                        "SnsTopicName is {} characters long; the maximum length is {} characters",
-                        topic.chars().count(),
-                        crate::state::SNS_TOPIC_NAME_MAX_LEN
-                    )),
+                    // A value that is neither a topic name nor a topic ARN names no
+                    // topic, and the refusal names it inside the one sentence CloudTrail
+                    // words that with
+                    // (`referenced_resources::invalid_sns_topic_name_message`).
+                    message: Some(
+                        crate::state::referenced_resources::invalid_sns_topic_name_message(topic),
+                    ),
                 },
             )
             .into());
@@ -432,17 +434,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateTrail<Eng> 
         // whose policy lets CloudTrail publish to it, a `KmsKeyId` naming a key of this
         // Region, and a `CloudWatchLogsLogGroupArn` naming a log group of this account.
         // All of them read another service's store with NO guard of this service's own
-        // held, which is the lock order that module documents.
+        // held, which is the lock order that module documents. What comes back is the
+        // form the trail STORES each reference in.
         let trail_arn = crate::state::trail_arn(&region, &input.name);
         let referenced = self.resolve_referenced_resources(
             &input,
             &region,
             &trail_arn,
             input.s3_key_prefix.as_deref(),
-        );
-        if let Some(refusal) = referenced {
-            return Err(refusal);
-        }
+        )?;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateTrailErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
@@ -509,7 +509,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateTrail<Eng> 
             log_file_validation_enabled: input.enable_log_file_validation.unwrap_or(false),
             cloud_watch_logs_log_group_arn: input.cloud_watch_logs_log_group_arn,
             cloud_watch_logs_role_arn: input.cloud_watch_logs_role_arn,
-            kms_key_id: input.kms_key_id,
+            // The trail keeps its encryption key as the fully specified key ARN the
+            // identifier resolved to, whichever of the four forms the request spelt it
+            // in ([`crate::state::referenced_resources::EncryptionKeyVerdict`]).
+            kms_key_id: referenced.kms_key_id.or(input.kms_key_id),
             // "The default is false, and cannot be true unless the call is made on
             // behalf of [the] management account".
             is_organization_trail: input.is_organization_trail.unwrap_or(false),
@@ -557,7 +560,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateTrail<Eng> 
 
     /// Resolve every resource this request's settings REFERENCE, in the service that
     /// owns each, and hand back the modelled refusal for the first one a trail may not
-    /// be pointed at — or `None` when every reference holds.
+    /// be pointed at — or, when every reference holds, the form the trail stores them in
+    /// ([`ResolvedReferences`]).
     ///
     /// Each resolution reads ANOTHER service's store and takes only that store's lock,
     /// so this runs before the trail registry is reached: the lock order
@@ -568,7 +572,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateTrail<Eng> 
         region: &str,
         trail_arn: &str,
         s3_key_prefix: Option<&str>,
-    ) -> Option<CreateTrailError> {
+    ) -> Result<ResolvedReferences, CreateTrailError> {
         use crate::state::referenced_resources as referenced;
 
         match referenced::destination_verdict(
@@ -582,7 +586,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateTrail<Eng> 
             referenced::DestinationVerdict::NoSuchBucket => {
                 // The model says 404 for a destination that does not exist and
                 // CloudTrail answers 400 (`crate::state::S3_BUCKET_DOES_NOT_EXIST_STATUS`).
-                return Some(crate::scaffolded::Scaffolded::modeled_with_status(
+                return Err(crate::scaffolded::Scaffolded::modeled_with_status(
                     CreateTrailErrorModeled::S3BucketDoesNotExistException(
                         S3BucketDoesNotExistException {
                             message: Some(crate::state::s3_bucket_does_not_exist_message(
@@ -594,16 +598,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateTrail<Eng> 
                 ));
             }
             referenced::DestinationVerdict::PolicyInsufficient => {
-                return Some(
+                // The model says 403 for an insufficient bucket policy and CloudTrail
+                // answers 400 (`referenced::INSUFFICIENT_S3_BUCKET_POLICY_STATUS`).
+                return Err(crate::scaffolded::Scaffolded::modeled_with_status(
                     CreateTrailErrorModeled::InsufficientS3BucketPolicyException(
                         InsufficientS3BucketPolicyException {
                             message: Some(referenced::insufficient_s3_bucket_policy_message(
                                 &input.s3_bucket_name,
                             )),
                         },
-                    )
-                    .into(),
-                );
+                    ),
+                    referenced::INSUFFICIENT_S3_BUCKET_POLICY_STATUS,
+                ));
             }
         }
 
@@ -614,12 +620,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateTrail<Eng> 
             if referenced::notification_topic_verdict(&*self.engine, &topic_arn, trail_arn)
                 == referenced::TopicVerdict::PolicyInsufficient
             {
-                return Some(
+                return Err(
                     CreateTrailErrorModeled::InsufficientSnsTopicPolicyException(
                         InsufficientSnsTopicPolicyException {
-                            message: Some(referenced::insufficient_sns_topic_policy_message(
-                                &topic_arn,
-                            )),
+                            message: Some(
+                                referenced::INSUFFICIENT_SNS_TOPIC_POLICY_MESSAGE.to_string(),
+                            ),
                         },
                     )
                     .into(),
@@ -627,48 +633,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateTrail<Eng> 
             }
         }
 
+        let mut resolved = ResolvedReferences::default();
         if let Some(key_id) = input.kms_key_id.as_deref().filter(|k| !k.is_empty()) {
             match referenced::encryption_key_verdict(&*self.engine, region, key_id) {
-                referenced::EncryptionKeyVerdict::Accepted => {}
-                referenced::EncryptionKeyVerdict::NotFound => {
-                    return Some(
-                        CreateTrailErrorModeled::KmsKeyNotFoundException(KmsKeyNotFoundException {
-                            message: Some(referenced::kms_key_not_found_message(key_id)),
-                        })
-                        .into(),
-                    );
+                referenced::EncryptionKeyVerdict::Accepted { key_arn } => {
+                    resolved.kms_key_id =
+                        Some(key_arn.unwrap_or_else(|| key_id.to_string()));
                 }
-                referenced::EncryptionKeyVerdict::MalformedArn => {
-                    return Some(
-                        CreateTrailErrorModeled::InvalidKmsKeyIdException(
-                            InvalidKmsKeyIdException {
-                                message: Some(referenced::invalid_kms_key_id_message(key_id)),
+                referenced::EncryptionKeyVerdict::EncryptionPolicyInsufficient => {
+                    return Err(
+                        CreateTrailErrorModeled::InsufficientEncryptionPolicyException(
+                            InsufficientEncryptionPolicyException {
+                                message: Some(
+                                    referenced::insufficient_encryption_policy_message(
+                                        &input.s3_bucket_name,
+                                        &referenced::fully_specified_key_arn(region, key_id),
+                                    ),
+                                ),
                             },
                         )
                         .into(),
                     );
                 }
+                referenced::EncryptionKeyVerdict::NotFound => {
+                    return Err(
+                        CreateTrailErrorModeled::KmsKeyNotFoundException(KmsKeyNotFoundException {
+                            message: Some(referenced::kms_key_not_found_message(
+                                &input.s3_bucket_name,
+                                &referenced::fully_specified_key_arn(region, key_id),
+                            )),
+                        })
+                        .into(),
+                    );
+                }
             }
         }
 
-        if let Some(arn) = input
-            .cloud_watch_logs_log_group_arn
-            .as_deref()
-            .filter(|a| !a.is_empty())
-        {
-            if !referenced::log_group_is_valid(&*self.engine, region, arn) {
-                return Some(
-                    CreateTrailErrorModeled::InvalidCloudWatchLogsLogGroupArnException(
-                        InvalidCloudWatchLogsLogGroupArnException {
-                            message: Some(referenced::invalid_log_group_arn_message(arn)),
-                        },
-                    )
-                    .into(),
-                );
+        // The two CloudWatch Logs members are ONE configuration, so they are resolved
+        // together: neither half delivers anything without the other.
+        match referenced::cloud_watch_logs_verdict(
+            &*self.engine,
+            region,
+            non_empty(input.cloud_watch_logs_log_group_arn.as_deref()),
+            non_empty(input.cloud_watch_logs_role_arn.as_deref()),
+        ) {
+            referenced::CloudWatchLogsVerdict::Accepted => {}
+            referenced::CloudWatchLogsVerdict::HalfMissing(half) => {
+                return Err(cloud_watch_logs_half_missing(half));
+            }
+            referenced::CloudWatchLogsVerdict::UnreadableRoleArn => {
+                return Err(CreateTrailErrorModeled::InvalidCloudWatchLogsRoleArnException(
+                    InvalidCloudWatchLogsRoleArnException {
+                        message: Some(referenced::UNREADABLE_ROLE_ARN_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+            referenced::CloudWatchLogsVerdict::UnreadableLogGroupArn => {
+                return Err(log_group_arn_refusal(
+                    referenced::UNREADABLE_LOG_GROUP_ARN_MESSAGE,
+                ));
+            }
+            referenced::CloudWatchLogsVerdict::LogGroupAbsent => {
+                return Err(log_group_arn_refusal(referenced::LOG_GROUP_ABSENT_MESSAGE));
             }
         }
 
-        None
+        Ok(resolved)
     }
+}
+
+/// What resolving the referenced resources settled about the FORM the trail stores a
+/// reference in — everything the registry needs that only the owning service could say.
+#[derive(Debug, Default)]
+struct ResolvedReferences {
+    /// The `KmsKeyId` to persist: the fully specified key ARN the request's identifier
+    /// resolved to, or `None` when the request named no key.
+    kms_key_id: Option<String>,
+}
+
+/// `value`, unless it is empty: an empty `CloudWatchLogsLogGroupArn` or
+/// `CloudWatchLogsRoleArn` names no log group and no role, so it configures no half of
+/// the CloudWatch Logs delivery.
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.filter(|text| !text.is_empty())
+}
+
+/// The refusal for a CloudWatch Logs configuration missing one of its two halves: the
+/// modelled error of the half that is NOT there, carrying the one sentence that states
+/// the pair rule.
+fn cloud_watch_logs_half_missing(
+    half: crate::state::referenced_resources::CloudWatchLogsHalf,
+) -> CreateTrailError {
+    use crate::state::referenced_resources as referenced;
+
+    let message = Some(referenced::LOG_GROUP_AND_ROLE_REQUIRED_MESSAGE.to_string());
+    match half {
+        referenced::CloudWatchLogsHalf::LogGroup => {
+            CreateTrailErrorModeled::InvalidCloudWatchLogsLogGroupArnException(
+                InvalidCloudWatchLogsLogGroupArnException { message },
+            )
+        }
+        referenced::CloudWatchLogsHalf::Role => {
+            CreateTrailErrorModeled::InvalidCloudWatchLogsRoleArnException(
+                InvalidCloudWatchLogsRoleArnException { message },
+            )
+        }
+    }
+    .into()
+}
+
+/// `InvalidCloudWatchLogsLogGroupArnException` carrying `message`, "thrown when the
+/// provided CloudWatch Logs log group is not valid".
+fn log_group_arn_refusal(message: &str) -> CreateTrailError {
+    CreateTrailErrorModeled::InvalidCloudWatchLogsLogGroupArnException(
+        InvalidCloudWatchLogsLogGroupArnException {
+            message: Some(message.to_string()),
+        },
+    )
+    .into()
 }
 

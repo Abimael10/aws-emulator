@@ -396,15 +396,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(topic) = input
             .sns_topic_name
             .as_deref()
-            .filter(|t| t.chars().count() > crate::state::SNS_TOPIC_NAME_MAX_LEN)
+            .filter(|t| !t.is_empty() && !crate::state::referenced_resources::names_a_topic(t))
         {
             return Err(UpdateTrailErrorModeled::InvalidSnsTopicNameException(
                 InvalidSnsTopicNameException {
-                    message: Some(format!(
-                        "SnsTopicName is {} characters long; the maximum length is {} characters",
-                        topic.chars().count(),
-                        crate::state::SNS_TOPIC_NAME_MAX_LEN
-                    )),
+                    // The same rule and the same sentence `CreateTrail` holds the member
+                    // to: a value that is neither a topic name nor a topic ARN names no
+                    // topic (`referenced_resources::invalid_sns_topic_name_message`).
+                    message: Some(
+                        crate::state::referenced_resources::invalid_sns_topic_name_message(topic),
+                    ),
                 },
             )
             .into());
@@ -453,9 +454,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         }
-        if let Some(refusal) = self.resolve_referenced_resources(&input, &region, &held) {
-            return Err(refusal);
-        }
+        let resolved = self.resolve_referenced_resources(&input, &region, &held)?;
 
         let mut store = state.lock();
         let record = locate(&mut store, &input.name, &region)?;
@@ -494,7 +493,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &mut record.cloud_watch_logs_role_arn,
             input.cloud_watch_logs_role_arn,
         );
-        replace_optional(&mut record.kms_key_id, input.kms_key_id);
+        replace_optional(
+            &mut record.kms_key_id,
+            // The trail keeps its encryption key as the fully specified key ARN the
+            // identifier resolved to, whichever form the request spelt it in; an empty
+            // value still drops the association.
+            resolved.kms_key_id.or(input.kms_key_id),
+        );
         if let Some(organization_trail) = input.is_organization_trail {
             record.is_organization_trail = organization_trail;
         }
@@ -528,7 +533,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UpdateTrail<Eng> {
     /// Resolve every resource the RESULTING trail configuration would reference, in the
     /// service that owns each, and hand back the modelled refusal for the first one a
-    /// trail may not be pointed at — or `None` when every reference holds.
+    /// trail may not be pointed at — or, when every reference holds, the form the trail
+    /// stores them in ([`ResolvedReferences`]).
     ///
     /// A member the request leaves out keeps the value the trail already has, so the
     /// settings judged here are the MERGED ones: a request that moves only the key
@@ -544,7 +550,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UpdateTrail<Eng> 
         input: &UpdateTrailInput,
         region: &str,
         held: &HeldDelivery,
-    ) -> Option<UpdateTrailError> {
+    ) -> Result<ResolvedReferences, UpdateTrailError> {
         use crate::state::referenced_resources as referenced;
 
         // Where the trail would deliver after this request: the destination and the key
@@ -553,11 +559,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UpdateTrail<Eng> 
         // was created can have been deleted or had its policy revoked since, and the
         // trail cannot be re-designated against a destination CloudTrail may no longer
         // write to.
+        let bucket = input
+            .s3_bucket_name
+            .as_deref()
+            .unwrap_or(&held.s3_bucket_name);
         {
-            let bucket = input
-                .s3_bucket_name
-                .as_deref()
-                .unwrap_or(&held.s3_bucket_name);
             let prefix = match input.s3_key_prefix.as_deref() {
                 Some(given) => (!given.is_empty()).then_some(given),
                 None => held.s3_key_prefix.as_deref(),
@@ -571,7 +577,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UpdateTrail<Eng> 
             ) {
                 referenced::DestinationVerdict::Accepted => {}
                 referenced::DestinationVerdict::NoSuchBucket => {
-                    return Some(crate::scaffolded::Scaffolded::modeled_with_status(
+                    return Err(crate::scaffolded::Scaffolded::modeled_with_status(
                         UpdateTrailErrorModeled::S3BucketDoesNotExistException(
                             S3BucketDoesNotExistException {
                                 message: Some(crate::state::s3_bucket_does_not_exist_message(
@@ -583,16 +589,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UpdateTrail<Eng> 
                     ));
                 }
                 referenced::DestinationVerdict::PolicyInsufficient => {
-                    return Some(
+                    // The model says 403 for an insufficient bucket policy and
+                    // CloudTrail answers 400
+                    // (`referenced::INSUFFICIENT_S3_BUCKET_POLICY_STATUS`).
+                    return Err(crate::scaffolded::Scaffolded::modeled_with_status(
                         UpdateTrailErrorModeled::InsufficientS3BucketPolicyException(
                             InsufficientS3BucketPolicyException {
                                 message: Some(referenced::insufficient_s3_bucket_policy_message(
                                     bucket,
                                 )),
                             },
-                        )
-                        .into(),
-                    );
+                        ),
+                        referenced::INSUFFICIENT_S3_BUCKET_POLICY_STATUS,
+                    ));
                 }
             }
         }
@@ -602,12 +611,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UpdateTrail<Eng> 
             if referenced::notification_topic_verdict(&*self.engine, &topic_arn, &held.trail_arn)
                 == referenced::TopicVerdict::PolicyInsufficient
             {
-                return Some(
+                return Err(
                     UpdateTrailErrorModeled::InsufficientSnsTopicPolicyException(
                         InsufficientSnsTopicPolicyException {
-                            message: Some(referenced::insufficient_sns_topic_policy_message(
-                                &topic_arn,
-                            )),
+                            message: Some(
+                                referenced::INSUFFICIENT_SNS_TOPIC_POLICY_MESSAGE.to_string(),
+                            ),
                         },
                     )
                     .into(),
@@ -615,49 +624,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UpdateTrail<Eng> 
             }
         }
 
+        let mut resolved = ResolvedReferences::default();
         if let Some(key_id) = input.kms_key_id.as_deref().filter(|k| !k.is_empty()) {
             match referenced::encryption_key_verdict(&*self.engine, region, key_id) {
-                referenced::EncryptionKeyVerdict::Accepted => {}
-                referenced::EncryptionKeyVerdict::NotFound => {
-                    return Some(
-                        UpdateTrailErrorModeled::KmsKeyNotFoundException(KmsKeyNotFoundException {
-                            message: Some(referenced::kms_key_not_found_message(key_id)),
-                        })
-                        .into(),
-                    );
+                referenced::EncryptionKeyVerdict::Accepted { key_arn } => {
+                    resolved.kms_key_id = Some(key_arn.unwrap_or_else(|| key_id.to_string()));
                 }
-                referenced::EncryptionKeyVerdict::MalformedArn => {
-                    return Some(
-                        UpdateTrailErrorModeled::InvalidKmsKeyIdException(
-                            InvalidKmsKeyIdException {
-                                message: Some(referenced::invalid_kms_key_id_message(key_id)),
+                referenced::EncryptionKeyVerdict::EncryptionPolicyInsufficient => {
+                    return Err(
+                        UpdateTrailErrorModeled::InsufficientEncryptionPolicyException(
+                            InsufficientEncryptionPolicyException {
+                                message: Some(
+                                    referenced::insufficient_encryption_policy_message(
+                                        bucket,
+                                        &referenced::fully_specified_key_arn(region, key_id),
+                                    ),
+                                ),
                             },
                         )
                         .into(),
                     );
                 }
+                referenced::EncryptionKeyVerdict::NotFound => {
+                    return Err(
+                        UpdateTrailErrorModeled::KmsKeyNotFoundException(KmsKeyNotFoundException {
+                            message: Some(referenced::kms_key_not_found_message(
+                                bucket,
+                                &referenced::fully_specified_key_arn(region, key_id),
+                            )),
+                        })
+                        .into(),
+                    );
+                }
             }
         }
 
-        if let Some(arn) = input
-            .cloud_watch_logs_log_group_arn
-            .as_deref()
-            .filter(|a| !a.is_empty())
-        {
-            if !referenced::log_group_is_valid(&*self.engine, region, arn) {
-                return Some(
-                    UpdateTrailErrorModeled::InvalidCloudWatchLogsLogGroupArnException(
-                        InvalidCloudWatchLogsLogGroupArnException {
-                            message: Some(referenced::invalid_log_group_arn_message(arn)),
-                        },
-                    )
-                    .into(),
-                );
+        // The two CloudWatch Logs members are ONE configuration, and a request that
+        // configures the delivery carries BOTH of them: "Not required unless you specify
+        // CloudWatchLogsRoleArn" cuts both ways, so a request naming one half alone is
+        // refused whatever the trail already carries, and a request naming neither
+        // leaves the configuration the trail holds untouched.
+        match referenced::cloud_watch_logs_verdict(
+            &*self.engine,
+            region,
+            non_empty(input.cloud_watch_logs_log_group_arn.as_deref()),
+            non_empty(input.cloud_watch_logs_role_arn.as_deref()),
+        ) {
+            referenced::CloudWatchLogsVerdict::Accepted => {}
+            referenced::CloudWatchLogsVerdict::HalfMissing(half) => {
+                return Err(cloud_watch_logs_half_missing(half));
+            }
+            referenced::CloudWatchLogsVerdict::UnreadableRoleArn => {
+                return Err(UpdateTrailErrorModeled::InvalidCloudWatchLogsRoleArnException(
+                    InvalidCloudWatchLogsRoleArnException {
+                        message: Some(referenced::UNREADABLE_ROLE_ARN_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+            referenced::CloudWatchLogsVerdict::UnreadableLogGroupArn => {
+                return Err(log_group_arn_refusal(
+                    referenced::UNREADABLE_LOG_GROUP_ARN_MESSAGE,
+                ));
+            }
+            referenced::CloudWatchLogsVerdict::LogGroupAbsent => {
+                return Err(log_group_arn_refusal(referenced::LOG_GROUP_ABSENT_MESSAGE));
             }
         }
 
-        None
+        Ok(resolved)
     }
+}
+
+/// What resolving the referenced resources settled about the FORM the trail stores a
+/// reference in — everything the registry needs that only the owning service could say.
+#[derive(Debug, Default)]
+struct ResolvedReferences {
+    /// The `KmsKeyId` to persist: the fully specified key ARN the request's identifier
+    /// resolved to, or `None` when the request named no key.
+    kms_key_id: Option<String>,
+}
+
+/// `value`, unless it is empty: an empty `CloudWatchLogsLogGroupArn` or
+/// `CloudWatchLogsRoleArn` names no log group and no role, so it configures no half of
+/// the CloudWatch Logs delivery — the reading [`replace_optional`] stores under.
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.filter(|text| !text.is_empty())
+}
+
+/// The refusal for a CloudWatch Logs configuration missing one of its two halves: the
+/// modelled error of the half that is NOT there, carrying the one sentence that states
+/// the pair rule.
+fn cloud_watch_logs_half_missing(
+    half: crate::state::referenced_resources::CloudWatchLogsHalf,
+) -> UpdateTrailError {
+    use crate::state::referenced_resources as referenced;
+
+    let message = Some(referenced::LOG_GROUP_AND_ROLE_REQUIRED_MESSAGE.to_string());
+    match half {
+        referenced::CloudWatchLogsHalf::LogGroup => {
+            UpdateTrailErrorModeled::InvalidCloudWatchLogsLogGroupArnException(
+                InvalidCloudWatchLogsLogGroupArnException { message },
+            )
+        }
+        referenced::CloudWatchLogsHalf::Role => {
+            UpdateTrailErrorModeled::InvalidCloudWatchLogsRoleArnException(
+                InvalidCloudWatchLogsRoleArnException { message },
+            )
+        }
+    }
+    .into()
+}
+
+/// `InvalidCloudWatchLogsLogGroupArnException` carrying `message`, "thrown when the
+/// provided CloudWatch Logs log group is not valid".
+fn log_group_arn_refusal(message: &str) -> UpdateTrailError {
+    UpdateTrailErrorModeled::InvalidCloudWatchLogsLogGroupArnException(
+        InvalidCloudWatchLogsLogGroupArnException {
+            message: Some(message.to_string()),
+        },
+    )
+    .into()
 }
 
 /// The delivery settings the located trail carries TODAY: what a request that changes

@@ -27,7 +27,9 @@ const OTHER_REGION: &str = "eu-west-1";
 
 /// The HTTP status CloudTrail answers a refused reference with when the model's own
 /// annotation is not the status on the wire: `S3BucketDoesNotExistException` is
-/// `@httpError(404)` and answered 400.
+/// `@httpError(404)` and answered 400, and `InsufficientS3BucketPolicyException` is
+/// `@httpError(403)` and answered 400
+/// (`referenced::INSUFFICIENT_S3_BUCKET_POLICY_STATUS`).
 const BUCKET_ABSENT_STATUS: u16 = 400;
 
 /// This account's id, as every ARN in this suite carries it.
@@ -288,7 +290,7 @@ async fn a_destination_is_accepted_only_when_its_policy_permits_the_delivery() {
         let status = if expected == "S3BucketDoesNotExistException" {
             BUCKET_ABSENT_STATUS
         } else {
-            403
+            referenced::INSUFFICIENT_S3_BUCKET_POLICY_STATUS
         };
         reply.expect_error(case, status, expected);
         if expected == "InsufficientS3BucketPolicyException" {
@@ -466,17 +468,17 @@ async fn a_notification_topic_is_accepted_only_when_its_policy_permits_the_publi
         reply.expect_error(case, 403, expected);
         assert_eq!(
             reply.message(),
-            referenced::insufficient_sns_topic_policy_message(&topic_arn),
-            "case {case}: expected the refusal to name the topic whose policy is \
-             insufficient, got {:?}",
+            referenced::INSUFFICIENT_SNS_TOPIC_POLICY_MESSAGE,
+            "case {case}: expected the one fixed topic-policy refusal text, got {:?}",
             reply.body
         );
     }
 }
 
 /// `CreateTrail` accepts a `KmsKeyId` only when it resolves to a key of this account and
-/// Region, in every form the member documents — and reports back the identifier it was
-/// given, a fully specified key ARN included.
+/// Region, in every form the member documents — reports it back as the fully specified
+/// key ARN whichever form was sent, and splits the two refusals on whether this Region's
+/// endpoint could have served the identifier at all.
 #[tokio::test]
 async fn an_encryption_key_is_accepted_only_when_it_resolves_to_a_key() {
     let emulator = Emulator::without_provisioned_destinations();
@@ -493,7 +495,7 @@ async fn an_encryption_key_is_accepted_only_when_it_resolves_to_a_key() {
         (
             "a key id naming no key",
             "99999999-8888-4777-8666-555555555555".to_string(),
-            "KmsKeyNotFoundException",
+            "InsufficientEncryptionPolicyException",
         ),
         (
             "a fully specified key ARN naming no key",
@@ -501,7 +503,7 @@ async fn an_encryption_key_is_accepted_only_when_it_resolves_to_a_key() {
                 "arn:aws:kms:{HOME_REGION}:{}:key/99999999-8888-4777-8666-555555555555",
                 account()
             ),
-            "KmsKeyNotFoundException",
+            "InsufficientEncryptionPolicyException",
         ),
         (
             "the all-zeros key ARN",
@@ -509,17 +511,17 @@ async fn an_encryption_key_is_accepted_only_when_it_resolves_to_a_key() {
                 "arn:aws:kms:{HOME_REGION}:{}:key/00000000-0000-0000-0000-000000000000",
                 account()
             ),
-            "KmsKeyNotFoundException",
+            "InsufficientEncryptionPolicyException",
         ),
         (
             "an alias naming no key",
             "alias/no-such-alias".to_string(),
-            "KmsKeyNotFoundException",
+            "InsufficientEncryptionPolicyException",
         ),
         (
             "an alias ARN naming no key",
             format!("arn:aws:kms:{HOME_REGION}:{}:alias/no-such-alias", account()),
-            "KmsKeyNotFoundException",
+            "InsufficientEncryptionPolicyException",
         ),
         (
             "a key ARN of another Region",
@@ -527,14 +529,29 @@ async fn an_encryption_key_is_accepted_only_when_it_resolves_to_a_key() {
             "KmsKeyNotFoundException",
         ),
         (
+            "an alias ARN of another Region",
+            format!("arn:aws:kms:{OTHER_REGION}:{}:alias/trail-key", account()),
+            "KmsKeyNotFoundException",
+        ),
+        (
+            "a key ARN of another account",
+            format!("arn:aws:kms:{HOME_REGION}:999999999999:key/{held_id}"),
+            "KmsKeyNotFoundException",
+        ),
+        (
+            "a value in no key-id form at all",
+            "not-a-key-id".to_string(),
+            "KmsKeyNotFoundException",
+        ),
+        (
             "an ARN that is not a KMS ARN at all",
             "arn:aws:s3:::not-a-key".to_string(),
-            "InvalidKmsKeyIdException",
+            "KmsKeyNotFoundException",
         ),
         (
             "a KMS ARN whose resource is neither a key nor an alias",
             format!("arn:aws:kms:{HOME_REGION}:{}:grant/abc", account()),
-            "InvalidKmsKeyIdException",
+            "KmsKeyNotFoundException",
         ),
         ("the held key by its key id", held_id.to_string(), ""),
         (
@@ -560,41 +577,47 @@ async fn an_encryption_key_is_accepted_only_when_it_resolves_to_a_key() {
             .await;
 
         if expected.is_empty() {
+            // Whichever form the request wrote, the trail reports the fully specified
+            // ARN of the key it resolved to.
+            let key_arn = emulator
+                .kms_key_arn(HOME_REGION, &key_id)
+                .unwrap_or_else(|| panic!("case {case}: the fixture key is held"));
             let created = reply.expect_ok(case).clone();
-            // The identifier is reported back as the request wrote it — a fully
-            // specified ARN stays fully specified rather than being cut to the key id.
             assert_eq!(
                 created.get("KmsKeyId").and_then(Value::as_str),
-                Some(key_id.as_str()),
-                "case {case}: expected the created trail to report {key_id}, got {created:?}"
+                Some(key_arn.as_str()),
+                "case {case}: expected the created trail to report {key_arn}, got {created:?}"
             );
             let read = emulator.call("GetTrail", &json!({"Name": name})).await;
             let trail = read.expect_ok(case)["Trail"].clone();
             assert_eq!(
                 trail.get("KmsKeyId").and_then(Value::as_str),
-                Some(key_id.as_str()),
-                "case {case}: expected GetTrail to report {key_id}, got {trail:?}"
+                Some(key_arn.as_str()),
+                "case {case}: expected GetTrail to report {key_arn}, got {trail:?}"
             );
             continue;
         }
 
         reply.expect_error(case, 400, expected);
+        let named = referenced::fully_specified_key_arn(HOME_REGION, &key_id);
         let wanted = if expected == "KmsKeyNotFoundException" {
-            referenced::kms_key_not_found_message(&key_id)
+            referenced::kms_key_not_found_message(bucket, &named)
         } else {
-            referenced::invalid_kms_key_id_message(&key_id)
+            referenced::insufficient_encryption_policy_message(bucket, &named)
         };
         assert_eq!(
             reply.message(),
             wanted,
-            "case {case}: expected the refusal to name the key identifier, got {:?}",
+            "case {case}: expected the refusal to name the trail's bucket and the key \
+             ARN, got {:?}",
             reply.body
         );
     }
 }
 
-/// `CreateTrail` accepts a `CloudWatchLogsLogGroupArn` only when it is a log-group ARN of
-/// this account and Region naming a log group that exists.
+/// `CreateTrail` accepts a CloudWatch Logs destination only as the PAIR it is, and only
+/// when the log-group half is a log-group ARN of this account and Region naming a log
+/// group that exists — each failure carrying the sentence that says which half is wrong.
 #[tokio::test]
 async fn a_cloudwatch_logs_destination_is_accepted_only_when_the_log_group_exists() {
     let emulator = Emulator::without_provisioned_destinations();
@@ -606,90 +629,156 @@ async fn a_cloudwatch_logs_destination_is_accepted_only_when_the_log_group_exist
         account()
     );
     emulator.provision_log_group(&held);
+    let role = format!("arn:aws:iam::{}:role/CloudTrail_CloudWatchLogs_Role", account());
 
-    // (case, the CloudWatchLogsLogGroupArn the request carries, "" for a success)
-    let rows: Vec<(&str, String, bool)> = vec![
+    /// What a row expects of the pair it sends.
+    enum Expected {
+        /// The pair is accepted and read back.
+        Accepted,
+        /// Refused with this error code and this refusal text.
+        Refused(&'static str, &'static str),
+    }
+    use Expected::{Accepted, Refused};
+
+    // (case, the CloudWatchLogsLogGroupArn the request carries, the role half, expected)
+    let rows: Vec<(&str, Option<String>, bool, Expected)> = vec![
         (
             "an ARN naming no log group",
-            format!(
+            Some(format!(
                 "arn:aws:logs:{HOME_REGION}:{}:log-group:never-created:*",
                 account()
+            )),
+            true,
+            Refused(
+                "InvalidCloudWatchLogsLogGroupArnException",
+                referenced::LOG_GROUP_ABSENT_MESSAGE,
             ),
-            false,
         ),
         (
             "a bare log group name rather than an ARN",
-            "/aws/cloudtrail/held".to_string(),
-            false,
+            Some("/aws/cloudtrail/held".to_string()),
+            true,
+            Refused(
+                "InvalidCloudWatchLogsLogGroupArnException",
+                referenced::UNREADABLE_LOG_GROUP_ARN_MESSAGE,
+            ),
         ),
         (
             "a log-group ARN of another Region",
-            format!(
+            Some(format!(
                 "arn:aws:logs:{OTHER_REGION}:{}:log-group:/aws/cloudtrail/held:*",
                 account()
+            )),
+            true,
+            Refused(
+                "InvalidCloudWatchLogsLogGroupArnException",
+                referenced::UNREADABLE_LOG_GROUP_ARN_MESSAGE,
             ),
-            false,
         ),
         (
             "a log-group ARN of another account",
-            format!("arn:aws:logs:{HOME_REGION}:999999999999:log-group:/aws/cloudtrail/held:*"),
-            false,
+            Some(format!(
+                "arn:aws:logs:{HOME_REGION}:999999999999:log-group:/aws/cloudtrail/held:*"
+            )),
+            true,
+            Refused(
+                "InvalidCloudWatchLogsLogGroupArnException",
+                referenced::UNREADABLE_LOG_GROUP_ARN_MESSAGE,
+            ),
         ),
         (
             "an ARN of another service",
-            format!("arn:aws:sns:{HOME_REGION}:{}:a-topic", account()),
-            false,
+            Some(format!("arn:aws:sns:{HOME_REGION}:{}:a-topic", account())),
+            true,
+            Refused(
+                "InvalidCloudWatchLogsLogGroupArnException",
+                referenced::UNREADABLE_LOG_GROUP_ARN_MESSAGE,
+            ),
         ),
         (
             "a logs ARN that addresses no log group",
-            format!(
+            Some(format!(
                 "arn:aws:logs:{HOME_REGION}:{}:destination:/aws/cloudtrail/held",
                 account()
+            )),
+            true,
+            Refused(
+                "InvalidCloudWatchLogsLogGroupArnException",
+                referenced::UNREADABLE_LOG_GROUP_ARN_MESSAGE,
             ),
-            false,
         ),
-        ("the held log group, with the wildcard suffix", held.clone(), true),
+        (
+            "the held log group with no role to write it with",
+            Some(held.clone()),
+            false,
+            Refused(
+                "InvalidCloudWatchLogsRoleArnException",
+                referenced::LOG_GROUP_AND_ROLE_REQUIRED_MESSAGE,
+            ),
+        ),
+        (
+            "a role with no log group to write to",
+            None,
+            true,
+            Refused(
+                "InvalidCloudWatchLogsLogGroupArnException",
+                referenced::LOG_GROUP_AND_ROLE_REQUIRED_MESSAGE,
+            ),
+        ),
+        (
+            "neither half of the pair",
+            None,
+            false,
+            Accepted,
+        ),
+        (
+            "the held log group, with the wildcard suffix",
+            Some(held.clone()),
+            true,
+            Accepted,
+        ),
         (
             "the held log group, without the wildcard suffix",
-            held.trim_end_matches(":*").to_string(),
+            Some(held.trim_end_matches(":*").to_string()),
             true,
+            Accepted,
         ),
     ];
 
-    for (index, (case, arn, accepted)) in rows.into_iter().enumerate() {
+    for (index, (case, arn, with_role, expected)) in rows.into_iter().enumerate() {
         let name = format!("log-group-trail-{index}");
-        let reply = emulator
-            .call(
-                "CreateTrail",
-                &json!({
-                    "Name": name,
-                    "S3BucketName": bucket,
-                    "CloudWatchLogsLogGroupArn": arn,
-                    "CloudWatchLogsRoleArn":
-                        format!("arn:aws:iam::{}:role/CloudTrail_CloudWatchLogs_Role", account()),
-                }),
-            )
-            .await;
-
-        if accepted {
-            let created = reply.expect_ok(case).clone();
-            assert_eq!(
-                created
-                    .get("CloudWatchLogsLogGroupArn")
-                    .and_then(Value::as_str),
-                Some(arn.as_str()),
-                "case {case}: expected the created trail to report {arn}, got {created:?}"
-            );
-            continue;
+        let mut request = json!({"Name": name, "S3BucketName": bucket});
+        if let Some(arn) = &arn {
+            request["CloudWatchLogsLogGroupArn"] = json!(arn);
         }
+        if with_role {
+            request["CloudWatchLogsRoleArn"] = json!(role);
+        }
+        let reply = emulator.call("CreateTrail", &request).await;
 
-        reply.expect_error(case, 400, "InvalidCloudWatchLogsLogGroupArnException");
-        assert_eq!(
-            reply.message(),
-            referenced::invalid_log_group_arn_message(&arn),
-            "case {case}: expected the refusal to name the log-group ARN, got {:?}",
-            reply.body
-        );
+        match expected {
+            Expected::Accepted => {
+                let created = reply.expect_ok(case).clone();
+                assert_eq!(
+                    created
+                        .get("CloudWatchLogsLogGroupArn")
+                        .and_then(Value::as_str),
+                    arn.as_deref(),
+                    "case {case}: expected the created trail to report {arn:?}, got \
+                     {created:?}"
+                );
+            }
+            Expected::Refused(code, message) => {
+                reply.expect_error(case, 400, code);
+                assert_eq!(
+                    reply.message(),
+                    message,
+                    "case {case}: expected the refusal that says which half is wrong, \
+                     got {:?}",
+                    reply.body
+                );
+            }
+        }
     }
 }
 
@@ -745,19 +834,19 @@ async fn an_update_holds_every_reference_to_the_same_rule_and_changes_nothing_wh
         (
             "a destination whose bucket carries no policy",
             json!({"S3BucketName": "update-unpolicied"}),
-            403,
+            referenced::INSUFFICIENT_S3_BUCKET_POLICY_STATUS,
             "InsufficientS3BucketPolicyException",
         ),
         (
             "a destination whose policy grants the write elsewhere",
             json!({"S3BucketName": "update-wrong-prefix"}),
-            403,
+            referenced::INSUFFICIENT_S3_BUCKET_POLICY_STATUS,
             "InsufficientS3BucketPolicyException",
         ),
         (
             "a key prefix the held destination's policy does not cover",
             json!({"S3BucketName": "update-wrong-prefix", "S3KeyPrefix": "logs"}),
-            403,
+            referenced::INSUFFICIENT_S3_BUCKET_POLICY_STATUS,
             "InsufficientS3BucketPolicyException",
         ),
         (
@@ -773,22 +862,39 @@ async fn an_update_holds_every_reference_to_the_same_rule_and_changes_nothing_wh
             "InsufficientSnsTopicPolicyException",
         ),
         (
-            "a key identifier naming no key",
+            "a key identifier of this Region naming no key",
             json!({"KmsKeyId": "77777777-6666-4555-8444-333333333333"}),
             400,
-            "KmsKeyNotFoundException",
+            "InsufficientEncryptionPolicyException",
         ),
         (
             "a key identifier that is not a KMS identifier at all",
             json!({"KmsKeyId": "arn:aws:s3:::not-a-key"}),
             400,
-            "InvalidKmsKeyIdException",
+            "KmsKeyNotFoundException",
         ),
         (
             "a log-group ARN naming no log group",
             json!({
                 "CloudWatchLogsLogGroupArn":
                     format!("arn:aws:logs:{HOME_REGION}:{}:log-group:update-absent:*", account()),
+                "CloudWatchLogsRoleArn":
+                    format!("arn:aws:iam::{}:role/CloudTrail_CloudWatchLogs_Role", account()),
+            }),
+            400,
+            "InvalidCloudWatchLogsLogGroupArnException",
+        ),
+        (
+            "a log group with no role to write it with",
+            json!({"CloudWatchLogsLogGroupArn": held_log_group.clone()}),
+            400,
+            "InvalidCloudWatchLogsRoleArnException",
+        ),
+        (
+            "a role with no log group to write to",
+            json!({
+                "CloudWatchLogsRoleArn":
+                    format!("arn:aws:iam::{}:role/CloudTrail_CloudWatchLogs_Role", account()),
             }),
             400,
             "InvalidCloudWatchLogsLogGroupArnException",
@@ -834,9 +940,13 @@ async fn an_update_holds_every_reference_to_the_same_rule_and_changes_nothing_wh
         )
         .await;
     let updated = updated.expect_ok("every held reference at once").clone();
+    // The key is reported as the fully specified ARN of the key the bare id resolved to.
+    let held_key_arn = emulator
+        .kms_key_arn(HOME_REGION, held_key)
+        .expect("the fixture key is held");
     for (member, want) in [
         ("SnsTopicARN", held_topic_arn.as_str()),
-        ("KmsKeyId", held_key),
+        ("KmsKeyId", held_key_arn.as_str()),
         ("CloudWatchLogsLogGroupArn", held_log_group.as_str()),
     ] {
         assert_eq!(

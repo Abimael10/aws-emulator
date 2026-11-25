@@ -245,6 +245,21 @@ impl Emulator {
         }
     }
 
+    /// The fully specified key ARN the identifier `key_id` resolves to in `region`'s KMS
+    /// store — the form a trail reports its `KmsKeyId` in, whichever of the four forms
+    /// the request wrote. `None` when the identifier names no key the account holds.
+    pub fn kms_key_arn(&self, region: &str, key_id: &str) -> Option<String> {
+        use service_com_amazonaws_kms_trentservice::state as kms;
+
+        let state = kms::service_state(&*self.engine)
+            .expect("the in-memory engine carries the KMS store");
+        let store = state.lock();
+        match store.resolve(region, key_id) {
+            kms::KeyRef::Found(key) => Some(key.arn.clone()),
+            _ => None,
+        }
+    }
+
     /// Record the CloudWatch Logs log group a trail's `CloudWatchLogsLogGroupArn` names —
     /// the `CreateLogGroup` a client makes before pointing a trail at it. A value that is
     /// not a log-group ARN of this account names no group and records nothing.

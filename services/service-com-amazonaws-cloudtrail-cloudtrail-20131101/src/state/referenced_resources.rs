@@ -11,8 +11,9 @@
 //! that does not exist, or against one that does not let CloudTrail use it, could never
 //! deliver a log file. Each failure has its own modelled error:
 //! `S3BucketDoesNotExistException`, `InsufficientS3BucketPolicyException`,
-//! `InsufficientSnsTopicPolicyException`, `KmsKeyNotFoundException`,
-//! `InvalidKmsKeyIdException` and `InvalidCloudWatchLogsLogGroupArnException`.
+//! `InsufficientSnsTopicPolicyException`, `InsufficientEncryptionPolicyException`,
+//! `KmsKeyNotFoundException`, `InvalidCloudWatchLogsLogGroupArnException` and
+//! `InvalidCloudWatchLogsRoleArnException`.
 //!
 //! The resolutions live HERE, once, because both operations that configure a trail
 //! (`CreateTrail` and `UpdateTrail`) apply the same rule to the same members: neither
@@ -211,16 +212,30 @@ pub fn notification_topic_verdict<Eng: Send + Sync + 'static>(
 }
 
 /// What the account's KMS store says about a trail's `KmsKeyId`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncryptionKeyVerdict {
-    /// The identifier names a key this account and Region holds — or the KMS store could
-    /// not be reached, on the terms [`DestinationVerdict::Accepted`] states.
-    Accepted,
-    /// The identifier is well formed but names no key here.
+    /// The identifier names a key this account and Region holds, and the trail stores it
+    /// as the FULLY SPECIFIED key ARN of the key it resolved to — "the value is a fully
+    /// specified ARN to a KMS key"
+    /// (`smithy_query(query="doc",shape="Trail",member="KmsKeyId")`) — whichever of the
+    /// four request forms spelt it.
+    ///
+    /// The ARN is absent only when the KMS store could not be reached at all, on the
+    /// terms [`DestinationVerdict::Accepted`] states: there is no key to name, so the
+    /// identifier the request gave is what the trail keeps.
+    Accepted { key_arn: Option<String> },
+    /// The identifier is a well-formed identifier of a key of the trail's OWN Region and
+    /// account that resolves to no usable key: `InsufficientEncryptionPolicyException`,
+    /// "thrown when the policy on the S3 bucket or KMS key does not have sufficient
+    /// permissions for the operation" — the one a caller fixes by creating the key or
+    /// correcting its key policy.
+    EncryptionPolicyInsufficient,
+    /// The identifier names no key of this Region at all: it is in no form a KMS key or
+    /// alias identifier, or it is an ARN pinned to another Region or another account.
+    /// `KmsKeyNotFoundException`, "thrown when the KMS key does not exist, when the S3
+    /// bucket and the KMS key are not in the same Region" — the one a caller fixes by
+    /// naming a key of this Region.
     NotFound,
-    /// The identifier is an ARN that is not a well-formed KMS key or alias ARN, so it
-    /// names no key anywhere.
-    MalformedArn,
 }
 
 /// Resolve a trail's `KmsKeyId`, in every form the member documents: "an alias name
@@ -230,9 +245,12 @@ pub enum EncryptionKeyVerdict {
 /// differ only in how they SPELL one key, so the one resolver KMS itself uses reads all
 /// of them.
 ///
-/// `region` is the Region the request was signed for: a KMS key is a regional resource,
-/// and the modelled `KmsKeyNotFoundException` covers a key that "does not exist" and one
-/// that is "not in the same Region".
+/// `region` is the Region the request was signed for, and a KMS key is a regional
+/// resource, so the Region is what splits the two refusals the API models: an identifier
+/// this Region's endpoint could have served, which did not resolve, is a key-or-policy
+/// problem ([`EncryptionKeyVerdict::EncryptionPolicyInsufficient`]), while one it could
+/// never serve — a value in no key identifier form, or an ARN of another Region or
+/// account — is a key that is not there ([`EncryptionKeyVerdict::NotFound`]).
 pub fn encryption_key_verdict<Eng: Send + Sync + 'static>(
     engine: &Eng,
     region: &str,
@@ -240,60 +258,176 @@ pub fn encryption_key_verdict<Eng: Send + Sync + 'static>(
 ) -> EncryptionKeyVerdict {
     let Some(state) = ::service_com_amazonaws_kms_trentservice::state::service_state(engine)
     else {
-        return EncryptionKeyVerdict::Accepted;
+        return EncryptionKeyVerdict::Accepted { key_arn: None };
     };
-    let store = state.lock();
-    match store.resolve(region, key_id) {
-        ::service_com_amazonaws_kms_trentservice::state::KeyRef::Found(_) => {
-            EncryptionKeyVerdict::Accepted
+    let resolved = {
+        let store = state.lock();
+        match store.resolve(region, key_id) {
+            ::service_com_amazonaws_kms_trentservice::state::KeyRef::Found(key) => {
+                Some(key.arn.clone())
+            }
+            _ => None,
         }
-        ::service_com_amazonaws_kms_trentservice::state::KeyRef::NotFound => {
-            EncryptionKeyVerdict::NotFound
+    };
+    match resolved {
+        Some(key_arn) => EncryptionKeyVerdict::Accepted {
+            key_arn: Some(key_arn),
+        },
+        None if names_a_key_of_this_region(region, key_id) => {
+            EncryptionKeyVerdict::EncryptionPolicyInsufficient
         }
-        ::service_com_amazonaws_kms_trentservice::state::KeyRef::MalformedArn
-        | ::service_com_amazonaws_kms_trentservice::state::KeyRef::UnauthorizedAccount => {
-            EncryptionKeyVerdict::MalformedArn
-        }
+        None => EncryptionKeyVerdict::NotFound,
     }
 }
 
-/// Whether `arn` is a CloudWatch Logs log-group ARN naming a log group this account and
-/// Region holds.
+/// Whether `key_id` is an identifier THIS Region's KMS endpoint could have served: a key
+/// id or `alias/<name>` of the account's own, or a key or alias ARN of this Region and
+/// account.
 ///
-/// `CloudWatchLogsLogGroupArn` is documented as "a log group name using an Amazon
-/// Resource Name (ARN) … You must use a log group that exists in your account"
-/// (`smithy_query(query="doc",shape="CreateTrailRequest",member="CloudWatchLogsLogGroupArn")`),
-/// so a value that is not such an ARN and one that names no group are the same defect:
-/// the modelled `InvalidCloudWatchLogsLogGroupArnException`, "thrown when the provided
-/// CloudWatch Logs log group is not valid".
-pub fn log_group_is_valid<Eng: Send + Sync + 'static>(
+/// It is what the two modelled refusals are split on ([`encryption_key_verdict`]). The
+/// identifier forms and the key-id grammar are KMS's own
+/// ([`service_com_amazonaws_kms_trentservice::state::names_a_key_id`]), read from there
+/// rather than written again here, so CloudTrail and KMS cannot disagree about which
+/// values name a key.
+fn names_a_key_of_this_region(region: &str, key_id: &str) -> bool {
+    use ::service_com_amazonaws_kms_trentservice::state as kms;
+
+    if let Some(arn) = ::service_common::arn::parse(key_id) {
+        if arn.vendor != kms::ARN_SERVICE
+            || arn.region != region
+            || arn.account != ::engine::emulator_account_id()
+        {
+            return false;
+        }
+        return match arn.resource.split_once('/') {
+            Some((KEY_ARN_RESOURCE_TYPE, id)) => kms::names_a_key_id(id),
+            Some((ALIAS_ARN_RESOURCE_TYPE, name)) => !name.is_empty(),
+            _ => false,
+        };
+    }
+    match key_id.strip_prefix(kms::ALIAS_PREFIX) {
+        Some(name) => !name.is_empty(),
+        None => kms::names_a_key_id(key_id),
+    }
+}
+
+/// The resource type of a KMS key ARN, `arn:aws:kms:<region>:<account>:key/<key id>`.
+const KEY_ARN_RESOURCE_TYPE: &str = "key";
+
+/// The resource type of a KMS ALIAS ARN, `arn:aws:kms:<region>:<account>:alias/<name>` —
+/// the other resource a `KmsKeyId` may name.
+const ALIAS_ARN_RESOURCE_TYPE: &str = "alias";
+
+/// What the account's CloudWatch Logs store says about the log-group half of a trail's
+/// CloudWatch Logs configuration — and about the PAIR that configuration is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudWatchLogsVerdict {
+    /// The trail delivers to no log group, or to a log group this account and Region
+    /// holds with a role to assume for the write.
+    Accepted,
+    /// One half of the configuration is there and the other is not. "Not required unless
+    /// you specify CloudWatchLogsRoleArn"
+    /// (`smithy_query(query="doc",shape="CreateTrailRequest",member="CloudWatchLogsLogGroupArn")`):
+    /// neither half configures a delivery on its own, so the half that is MISSING is the
+    /// one the refusal is reported as.
+    HalfMissing(CloudWatchLogsHalf),
+    /// The role half is not an IAM role ARN of this account at all, so CloudTrail cannot
+    /// read which role it would assume: "You must use a role that exists in your
+    /// account"
+    /// (`smithy_query(query="doc",shape="CreateTrailRequest",member="CloudWatchLogsRoleArn")`).
+    UnreadableRoleArn,
+    /// The log-group half is not a log-group ARN of this account and Region at all, so
+    /// CloudTrail cannot read which log group it names.
+    UnreadableLogGroupArn,
+    /// The log-group half is a log-group ARN of this account and Region naming a log
+    /// group that does not exist: "You must use a log group that exists in your account."
+    LogGroupAbsent,
+}
+
+/// Which half of a trail's CloudWatch Logs configuration a request left out
+/// ([`CloudWatchLogsVerdict::HalfMissing`]). Each half has its own modelled error —
+/// `InvalidCloudWatchLogsLogGroupArnException` and
+/// `InvalidCloudWatchLogsRoleArnException` — so which one is missing decides which error
+/// the pair is refused with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudWatchLogsHalf {
+    /// `CloudWatchLogsLogGroupArn`, the log group the trail's events are delivered to.
+    LogGroup,
+    /// `CloudWatchLogsRoleArn`, the role CloudTrail assumes to write them.
+    Role,
+}
+
+/// Resolve the CloudWatch Logs destination a trail would deliver to: the two members are
+/// one configuration, so they are judged together — the ROLE half first, because a
+/// delivery whose role CloudTrail cannot read writes nothing wherever the log group is —
+/// and the log group the other half names has to be one this account and Region holds.
+///
+/// `log_group_arn` and `role_arn` are the halves the REQUEST carries, and `None` is a
+/// half it does not configure, which an empty value also is: neither names a log group or
+/// a role.
+pub fn cloud_watch_logs_verdict<Eng: Send + Sync + 'static>(
     engine: &Eng,
     region: &str,
-    arn: &str,
-) -> bool {
+    log_group_arn: Option<&str>,
+    role_arn: Option<&str>,
+) -> CloudWatchLogsVerdict {
+    match (log_group_arn, role_arn) {
+        (None, None) => return CloudWatchLogsVerdict::Accepted,
+        (Some(_), None) => {
+            return CloudWatchLogsVerdict::HalfMissing(CloudWatchLogsHalf::Role);
+        }
+        (None, Some(_)) => {
+            return CloudWatchLogsVerdict::HalfMissing(CloudWatchLogsHalf::LogGroup);
+        }
+        (Some(_), Some(_)) => {}
+    }
+    // The role is an IAM role of THIS account — the identity CloudTrail assumes to write
+    // the log stream — read against the tree's one reading of what a role ARN is
+    // ([`service_common::arn::IAM_ROLE`]).
+    let role = role_arn.unwrap_or_default();
+    if !::service_common::arn::IAM_ROLE.admits(role)
+        || ::service_common::arn::parse(role)
+            .is_none_or(|arn| arn.account != ::engine::emulator_account_id())
+    {
+        return CloudWatchLogsVerdict::UnreadableRoleArn;
+    }
+    let arn = log_group_arn.unwrap_or_default();
     let Some(parsed) = ::service_common::arn::parse(arn) else {
-        return false;
+        return CloudWatchLogsVerdict::UnreadableLogGroupArn;
     };
-    if parsed.vendor != "logs"
+    if parsed.vendor != LOG_GROUP_ARN_VENDOR
         || parsed.region != region
         || parsed.account != ::engine::emulator_account_id()
-        || parsed.resource_type() != "log-group"
+        || parsed.resource_type() != LOG_GROUP_ARN_RESOURCE_TYPE
     {
-        return false;
+        return CloudWatchLogsVerdict::UnreadableLogGroupArn;
     }
     let name = ::service_com_amazonaws_cloudwatchlogs_logs_20140328::state::
         log_group_name_from_identifier(arn);
     if !::service_common::cloudwatch_logs::is_log_group_name(name) {
-        return false;
+        return CloudWatchLogsVerdict::UnreadableLogGroupArn;
     }
     let Some(state) =
         ::service_com_amazonaws_cloudwatchlogs_logs_20140328::state::service_state(engine)
     else {
-        return true;
+        return CloudWatchLogsVerdict::Accepted;
     };
-    let store = state.lock();
-    store.log_groups.contains_key(name)
+    let held = {
+        let store = state.lock();
+        store.log_groups.contains_key(name)
+    };
+    if held {
+        CloudWatchLogsVerdict::Accepted
+    } else {
+        CloudWatchLogsVerdict::LogGroupAbsent
+    }
 }
+
+/// The ARN vendor of a CloudWatch Logs resource, and the resource type of a log group's
+/// own ARN: `arn:aws:logs:<region>:<account>:log-group:<name>`.
+const LOG_GROUP_ARN_VENDOR: &str = "logs";
+/// See [`LOG_GROUP_ARN_VENDOR`].
+const LOG_GROUP_ARN_RESOURCE_TYPE: &str = "log-group";
 
 /// What the object store holds of a trail's DELIVERED log files: the instant the newest one
 /// under this trail's own log-file area was written, or `None` for a trail that has
@@ -337,38 +471,126 @@ pub fn insufficient_s3_bucket_policy_message(bucket: &str) -> String {
     format!("Incorrect S3 bucket policy is detected for bucket: {bucket}")
 }
 
-/// The refusal text for `InsufficientSnsTopicPolicyException`: the notification topic
-/// whose access policy does not let CloudTrail publish to it.
+/// The HTTP status an insufficient-bucket-policy refusal answers with.
 ///
-/// No recorded refusal pins this sentence, so it states the same rule the bucket's does
-/// ([`insufficient_s3_bucket_policy_message`]) about the resource it was given — the
-/// topic, named by the ARN the request's `SnsTopicName` resolved to, which is what the
-/// caller changes the policy of.
-pub fn insufficient_sns_topic_policy_message(topic_arn: &str) -> String {
-    format!("Incorrect SNS topic policy is detected for topic: {topic_arn}")
+/// The model annotates `InsufficientS3BucketPolicyException` `@httpError(403)`, but
+/// CloudTrail answers 400 for it on the wire: the recorded response of `CreateTrail`
+/// against an existing bucket that carries no CloudTrail delivery policy is HTTP 400
+/// with that code. The status is what a client's retry and error classification branches
+/// on before the payload, and a misconfigured bucket policy is a request it cannot
+/// satisfy rather than a call it should re-sign. The error CODE and the body stay the
+/// model's; only the status is stated here, through
+/// [`crate::scaffolded::Scaffolded::modeled_with_status`] — the same deviation
+/// [`crate::state::S3_BUCKET_DOES_NOT_EXIST_STATUS`] already carries for the other
+/// refusal of the same destination.
+pub const INSUFFICIENT_S3_BUCKET_POLICY_STATUS: u16 = 400;
+
+/// The refusal text for `InsufficientSnsTopicPolicyException`: a topic the trail may not
+/// be notified through, because the account holds no topic of that name or because the
+/// topic's access policy does not let CloudTrail publish to it.
+///
+/// ENTIRELY FIXED text — it names neither the topic nor the trail: the one sentence
+/// covers both ways the reference fails, which is exactly the pair
+/// [`TopicVerdict::PolicyInsufficient`] stands for. A topic name that is not a topic name
+/// at all is the separate `InvalidSnsTopicNameException`
+/// ([`invalid_sns_topic_name_message`]), which does name the value.
+pub const INSUFFICIENT_SNS_TOPIC_POLICY_MESSAGE: &str =
+    "SNS Topic does not exist or the topic policy is incorrect!";
+
+/// The refusal text for `InvalidSnsTopicNameException`, "thrown when the provided SNS
+/// topic name is not valid": the `SnsTopicName` the request gave, which is its one
+/// variable part.
+pub fn invalid_sns_topic_name_message(topic_name: &str) -> String {
+    format!("Invalid SNS topic name: {topic_name} is found!")
 }
 
-/// The refusal text for `KmsKeyNotFoundException`: the `KmsKeyId` the request named,
-/// inside the rule the model states for that error ("thrown when the KMS key does not
-/// exist, when the S3 bucket and the KMS key are not in the same Region, or when the KMS
-/// key associated with the Amazon SNS topic either does not exist or is not in the same
-/// Region").
-pub fn kms_key_not_found_message(key_id: &str) -> String {
-    format!("KMS key {key_id} does not exist, or is not in the same Region as the trail")
+/// Whether `topic` names a topic at all: the member is "the name of the Amazon SNS topic
+/// defined for notification of log file delivery", and the trail keeps the ARN either
+/// spelling resolves to, so a topic name SNS would accept and the ARN of such a topic are
+/// both values that name one.
+///
+/// The name rule and the ARN form are Amazon SNS's own
+/// ([`service_com_amazonaws_sns_amazonsimplenotificationservice::state::topic_name_is_valid`]),
+/// read from there rather than written again here: a name CloudTrail accepts for a trail
+/// cannot be one Amazon SNS could not hold a topic under. A value in neither form is the
+/// modelled `InvalidSnsTopicNameException` ([`invalid_sns_topic_name_message`]), refused
+/// before any topic is looked up.
+pub fn names_a_topic(topic: &str) -> bool {
+    use ::service_com_amazonaws_sns_amazonsimplenotificationservice::state as sns;
+
+    sns::topic_name_is_valid(topic) || sns::topic_name_from_arn(topic).is_some()
 }
 
-/// The refusal text for `InvalidKmsKeyIdException`, "thrown when the KMS key ARN is not
-/// valid": the value the request gave, which names no key anywhere.
-pub fn invalid_kms_key_id_message(key_id: &str) -> String {
-    format!("KMS key identifier {key_id} is not a valid key id, key ARN, alias name or alias ARN")
+/// The refusal text for `InsufficientEncryptionPolicyException` on a trail's `KmsKeyId`:
+/// the two resources whose policies a log-file delivery needs, the trail's destination
+/// bucket and the key the identifier names.
+///
+/// `bucket` is the `S3BucketName` the trail delivers to and `key_arn` the identifier
+/// expanded to the fully specified ARN of the key or alias it names
+/// ([`fully_specified_key_arn`]), because those are what the caller grants CloudTrail on.
+pub fn insufficient_encryption_policy_message(bucket: &str, key_arn: &str) -> String {
+    format!("Insufficient permissions to access S3 bucket {bucket} or KMS key {key_arn}.")
 }
 
-/// The refusal text for `InvalidCloudWatchLogsLogGroupArnException`, "thrown when the
-/// provided CloudWatch Logs log group is not valid": the ARN the request gave, which
-/// either is not a log-group ARN of this account and Region or names no log group.
-pub fn invalid_log_group_arn_message(arn: &str) -> String {
+/// The refusal text for `KmsKeyNotFoundException` on a trail's `KmsKeyId`, inside the
+/// rule the model states for that error ("thrown when the KMS key does not exist, when
+/// the S3 bucket and the KMS key are not in the same Region").
+///
+/// The two variable parts are the same as
+/// [`insufficient_encryption_policy_message`]'s: the trail's destination bucket and the
+/// identifier as a fully specified ARN, since the sentence is about the two being in one
+/// Region.
+pub fn kms_key_not_found_message(bucket: &str, key_arn: &str) -> String {
     format!(
-        "CloudWatch Logs log group ARN {arn} is not valid: it must name a log group that \
-         exists in your account"
+        "KMS key ID {key_arn} does not exist, or s3 bucket {bucket} and key are not in \
+         the same region."
     )
 }
+
+/// A `KmsKeyId` as the fully specified ARN of the key or alias it names, which is the one
+/// form a trail reports its key in and the form the refusals above name it in.
+///
+/// The member accepts four spellings of one key — "an alias name prefixed by `alias/`, a
+/// fully specified ARN to an alias, a fully specified ARN to a key, or a globally unique
+/// identifier" — so an identifier that is already an ARN is the ARN it is, a bare
+/// `alias/<name>` is that alias of `region`, and anything else is a key id of `region`.
+/// The ARN builders are KMS's own, so the ARN CloudTrail names a key by is the one KMS
+/// issues for it.
+pub fn fully_specified_key_arn(region: &str, key_id: &str) -> String {
+    use ::service_com_amazonaws_kms_trentservice::state as kms;
+
+    if ::service_common::arn::parse(key_id).is_some() {
+        return key_id.to_string();
+    }
+    if key_id.starts_with(kms::ALIAS_PREFIX) {
+        return kms::alias_arn(region, key_id);
+    }
+    kms::key_arn(region, key_id)
+}
+
+/// The refusal text for a CloudWatch Logs log group that does not exist: "You must use a
+/// log group that exists in your account"
+/// (`smithy_query(query="doc",shape="CreateTrailRequest",member="CloudWatchLogsLogGroupArn")`).
+///
+/// FIXED text, with no part derived from the request — one of the three sentences that
+/// tell a caller WHICH half of the CloudWatch Logs configuration is wrong
+/// ([`CloudWatchLogsVerdict`]).
+pub const LOG_GROUP_ABSENT_MESSAGE: &str = "You must specify an existing log group.";
+
+/// The refusal text for a `CloudWatchLogsLogGroupArn` that is not a log-group ARN of this
+/// account and Region: CloudTrail cannot read which log group it names, so there is
+/// nothing to look up. See [`LOG_GROUP_ABSENT_MESSAGE`].
+pub const UNREADABLE_LOG_GROUP_ARN_MESSAGE: &str =
+    "CloudTrail cannot validate the specified log group ARN.";
+
+/// The refusal text for a `CloudWatchLogsRoleArn` that is not an IAM role ARN of this
+/// account: the same sentence the log-group half takes for a value CloudTrail cannot read
+/// as the ARN it needs ([`UNREADABLE_LOG_GROUP_ARN_MESSAGE`]), about the role.
+pub const UNREADABLE_ROLE_ARN_MESSAGE: &str =
+    "CloudTrail cannot validate the specified role ARN.";
+
+/// The refusal text for a CloudWatch Logs configuration with only one of its two halves:
+/// a log group without a role to write it with, or a role with no log group to write to,
+/// configures no delivery. See [`LOG_GROUP_ABSENT_MESSAGE`].
+pub const LOG_GROUP_AND_ROLE_REQUIRED_MESSAGE: &str =
+    "You must specify a log group and a role ARN.";
