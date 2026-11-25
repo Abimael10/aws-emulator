@@ -2287,28 +2287,75 @@ pub const MAX_AUTHORIZERS: usize = 100;
 /// maximum, so without a ceiling one request would choose how large a record is.
 pub const MAX_AUTHORIZER_TAGS: usize = MAX_POLICY_TAGS;
 
-/// How many token signing public keys one authorizer may register.
+/// The fewest token signing public keys an authorizer's `tokenSigningPublicKeys` map
+/// may hold when a write states the member at all.
 ///
-/// `PublicKeyMap` has no modelled maximum, and the map is read on EVERY
-/// `TestInvokeAuthorizer` of that authorizer — a presented signature is checked against
-/// each key until one verifies — so without a ceiling one request would choose how much
-/// signature verification every later request does. The emulator's own ceiling, like
-/// [`MAX_AUTHORIZERS`], and comfortably above what the member exists for: a service
-/// rotating its signing key publishes the new key beside the old one and signs with
-/// either while its fleet moves over. A write past it is refused with the modelled
-/// `InvalidRequestException` ("The request is not valid", HTTP 400) rather than recorded.
-pub const MAX_TOKEN_SIGNING_PUBLIC_KEYS: usize = 8;
+/// `PublicKeyMap` carries no modelled entry count
+/// (`smithy_query(query="shape",shape="PublicKeyMap")`), so the cardinality is the
+/// service's: the member exists so a presented token signature can be verified, and a
+/// map holding nothing verifies nothing — the write is refused rather than recording an
+/// authorizer whose signature validation has no usable key.
+pub const MIN_TOKEN_SIGNING_PUBLIC_KEYS: usize = 1;
 
-/// How this service refuses a write that would register more token signing public keys
-/// than [`MAX_TOKEN_SIGNING_PUBLIC_KEYS`]: one wording for every writer of an
-/// authorizer, so two of them cannot refuse the same request differently. The fixed
-/// text names the member and the limit, and the variable part is how many the request
-/// carried.
-pub fn token_signing_public_keys_limit_message(requested: usize) -> String {
+/// The most token signing public keys an authorizer's `tokenSigningPublicKeys` map may
+/// hold.
+///
+/// Two, which is exactly what the member exists for: a service rotating its signing key
+/// publishes the new key beside the old one and signs with either while its fleet moves
+/// over. It also bounds the work every later `TestInvokeAuthorizer` of that authorizer
+/// does, a presented signature being checked against each registered key until one
+/// verifies. A write past it is refused with the modelled `InvalidRequestException`
+/// ("The request is not valid", HTTP 400) rather than recorded.
+pub const MAX_TOKEN_SIGNING_PUBLIC_KEYS: usize = 2;
+
+/// How this service refuses a write whose `tokenSigningPublicKeys` map is stated but
+/// holds fewer than [`MIN_TOKEN_SIGNING_PUBLIC_KEYS`] keys: one wording for every writer
+/// of an authorizer, so two of them cannot refuse the same request differently. The
+/// sentence states the requirement itself; the one variable part is the authorizer the
+/// request named.
+///
+/// The numerals in it are spelled out because they are part of this refusal's FIXED
+/// text — it is one sentence, not a template over the bounds — which is why they are
+/// written here rather than interpolated from
+/// [`MIN_TOKEN_SIGNING_PUBLIC_KEYS`]/[`MAX_TOKEN_SIGNING_PUBLIC_KEYS`] the way the
+/// ceiling's own refusal names its limit.
+pub fn token_signing_public_keys_cardinality_message(authorizer_name: &str) -> String {
     format!(
-        "an authorizer may register at most {MAX_TOKEN_SIGNING_PUBLIC_KEYS} token signing \
-         public keys; this request carries {requested}"
+        "Token signing keys map for authorizer {authorizer_name} cannot be null or empty. \
+         There must be at least one and at most two token signing public keys in the map"
     )
+}
+
+/// How this service refuses a write whose `tokenSigningPublicKeys` map holds more than
+/// [`MAX_TOKEN_SIGNING_PUBLIC_KEYS`] keys: a map holding too many is a different refusal
+/// from a map holding none — the one states what the member must hold, the other names
+/// the ceiling it passed — and the variable parts are the authorizer the request named
+/// and that ceiling.
+pub fn token_signing_public_keys_excess_message(authorizer_name: &str) -> String {
+    format!(
+        "Token signing keys map for authorizer {authorizer_name} cannot contain more than \
+         {MAX_TOKEN_SIGNING_PUBLIC_KEYS} keys"
+    )
+}
+
+/// Whether a write may register `keys` token signing public keys under this authorizer,
+/// and how it is refused when it may not: `Some(message)` is the
+/// `InvalidRequestException` message both writers of an authorizer answer with — the
+/// map's own requirement when it holds too few, the ceiling when it holds too many —
+/// and `None` means the cardinality is one AWS accepts.
+///
+/// Called only where the request STATES the member: a write that states none leaves the
+/// authorizer's registered keys as they are.
+pub fn token_signing_public_keys_refusal(authorizer_name: &str, keys: usize) -> Option<String> {
+    if keys < MIN_TOKEN_SIGNING_PUBLIC_KEYS {
+        Some(token_signing_public_keys_cardinality_message(
+            authorizer_name,
+        ))
+    } else if keys > MAX_TOKEN_SIGNING_PUBLIC_KEYS {
+        Some(token_signing_public_keys_excess_message(authorizer_name))
+    } else {
+        None
+    }
 }
 
 /// The `status` an authorizer created without one carries.

@@ -173,18 +173,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         // Checked BEFORE the record is reached, so a refused update writes none of the
-        // members it carried: how MANY token signing public keys one authorizer
-        // registers is bounded by the ceiling the create enforces
-        // ([`crate::state::MAX_TOKEN_SIGNING_PUBLIC_KEYS`]), for the same reason —
-        // every later `TestInvokeAuthorizer` of this authorizer checks a presented
-        // signature against each registered key.
+        // members it carried: an update that STATES `tokenSigningPublicKeys` replaces
+        // the whole map, so the map it states has to be one AWS accepts — at least one
+        // key and at most [`crate::state::MAX_TOKEN_SIGNING_PUBLIC_KEYS`] of them, the
+        // same rule the create enforces, so an authorizer cannot be left validating
+        // signatures against no usable key.
         if let Some(keys) = &input.token_signing_public_keys {
-            if keys.len() > crate::state::MAX_TOKEN_SIGNING_PUBLIC_KEYS {
+            if let Some(message) = crate::state::token_signing_public_keys_refusal(
+                &input.authorizer_name,
+                keys.len(),
+            ) {
                 return Err(UpdateAuthorizerErrorModeled::InvalidRequestException(
                     InvalidRequestException {
-                        message: Some(crate::state::token_signing_public_keys_limit_message(
-                            keys.len(),
-                        )),
+                        message: Some(message),
                     },
                 )
                 .into());

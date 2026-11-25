@@ -284,7 +284,8 @@ struct Case {
 /// * whether the create carries `tokenKeyName` and how many `tokenSigningPublicKeys`
 ///   it carries — `PublicKeyMap` is a map of `KeyName` to `KeyValue`
 ///   (`smithy_query(query="shape",shape="PublicKeyMap")`), so the rows cover none,
-///   one and three keys;
+///   one and two keys — the cardinality a write may state is one or two keys, which
+///   the `authorizer_signing_key_cardinality` suite drives on its own;
 /// * which optional booleans it carries — `signingDisabled` and
 ///   `enableCachingForHttp`, each absent, `false` and `true`;
 /// * whether it carries `tags`, which manage the authorizer rather than describe it
@@ -338,7 +339,7 @@ fn cases() -> Vec<Case> {
             enable_caching_for_http: false,
         },
         Case {
-            label: "three signing public keys and HTTP caching enabled",
+            label: "two signing public keys and HTTP caching enabled",
             name: "cached_keys".to_string(),
             region: REGION,
             body: json!({
@@ -347,8 +348,7 @@ fn cases() -> Vec<Case> {
                 "tokenKeyName": "token",
                 "tokenSigningPublicKeys": {
                     "key-1": "-----BEGIN PUBLIC KEY-----\nBBBB\n-----END PUBLIC KEY-----",
-                    "key_2": "-----BEGIN PUBLIC KEY-----\nCCCC\n-----END PUBLIC KEY-----",
-                    "key:3": "",
+                    "key:2": "",
                 },
                 "enableCachingForHttp": true,
             }),

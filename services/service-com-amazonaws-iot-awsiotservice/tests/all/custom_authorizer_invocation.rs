@@ -445,19 +445,19 @@ pub(crate) async fn authorizer_create(
         .iter()
         .map(|(key_name, pem)| (key_name.clone(), Value::String(pem.clone())))
         .collect();
-    rest(
-        router,
-        "iot",
-        "POST",
-        &format!("/authorizer/{name}"),
-        Some(&json!({
-            "authorizerFunctionArn": function_arn,
-            "tokenKeyName": "x-amz-customauthorizer-name",
-            "tokenSigningPublicKeys": keys,
-            "signingDisabled": signing_disabled,
-        })),
-    )
-    .await
+    let mut body = json!({
+        "authorizerFunctionArn": function_arn,
+        "tokenKeyName": "x-amz-customauthorizer-name",
+        "signingDisabled": signing_disabled,
+    });
+    // An authorizer that registers NO signing key states no `tokenSigningPublicKeys`
+    // member at all — a map stated empty registers no key a signature could verify
+    // against and is refused, which the `authorizer_signing_key_cardinality` suite
+    // drives.
+    if !keys.is_empty() {
+        body["tokenSigningPublicKeys"] = Value::Object(keys);
+    }
+    rest(router, "iot", "POST", &format!("/authorizer/{name}"), Some(&body)).await
 }
 
 /// `TestInvokeAuthorizer` on `name` with `body`.
@@ -483,12 +483,13 @@ async fn a_token_signed_with_any_registered_key_reaches_the_authorizer_function(
 
     let first = SigningKey::generate();
     let second = SigningKey::generate();
-    let third = SigningKey::generate();
     let stranger = SigningKey::generate();
+    // The authorizer registers the most keys a write may state (two: a new signing key
+    // published beside the old one), so "any registered key" is tested over every key
+    // an authorizer can hold.
     let registered: BTreeMap<String, String> = [
         ("key1".to_string(), first.public_key_pem.clone()),
         ("key2".to_string(), second.public_key_pem.clone()),
-        ("key3".to_string(), third.public_key_pem.clone()),
     ]
     .into_iter()
     .collect();
@@ -497,7 +498,7 @@ async fn a_token_signed_with_any_registered_key_reaches_the_authorizer_function(
     // A long token, to span the length `Token` admits (1..6144) rather than one size.
     let long_token = "t".repeat(6_000);
     // (case, the token presented, the signature presented, expected status)
-    let rows: [(&str, String, String, u16); 8] = [
+    let rows: [(&str, String, String, u16); 7] = [
         (
             "a short token signed with the first registered key",
             "a".to_string(),
@@ -508,12 +509,6 @@ async fn a_token_signed_with_any_registered_key_reaches_the_authorizer_function(
             "a token signed with the second registered key",
             "second-key-token".to_string(),
             second.sign("second-key-token"),
-            200,
-        ),
-        (
-            "a token signed with the third registered key",
-            "third-key-token".to_string(),
-            third.sign("third-key-token"),
             200,
         ),
         (
@@ -889,8 +884,8 @@ async fn the_number_of_registered_signing_keys_is_bounded() {
                 (
                     "InvalidRequestException",
                     format!(
-                        "an authorizer may register at most {MAX_TOKEN_SIGNING_PUBLIC_KEYS} token \
-                         signing public keys; this request carries {count}"
+                        "Token signing keys map for authorizer {name} cannot contain more than \
+                         {MAX_TOKEN_SIGNING_PUBLIC_KEYS} keys"
                     )
                     .as_str()
                 ),
