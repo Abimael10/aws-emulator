@@ -14,6 +14,18 @@
 //! cannot be loaded is refused with `InvalidECSServiceException` (HTTP 400)
 //! before anything is stored, so a group never points at nothing.
 //!
+//! Loading the pair answers more than whether the service exists: it also reports
+//! HOW that service is deployed. A deployment group drives its target through
+//! CodeDeploy, which an Amazon ECS service only accepts when it was created with
+//! the `CODE_DEPLOY` deployment controller — "the deployment controller is the
+//! mechanism that determines how tasks are deployed for your service"
+//! (`smithy_query(query="shape",shape="DeploymentController")` on that service's
+//! model, whose other types, `ECS` and `EXTERNAL`, are deployed by the Amazon ECS
+//! scheduler and by a third party outside CodeDeploy). A pair naming a service
+//! deployed by anything else is therefore refused under the same
+//! `InvalidECSServiceException`, with the sentence that states that precondition
+//! ([`CODE_DEPLOY_CONTROLLER_REQUIRED`]), and nothing is stored for it either.
+//!
 //! The load is made the way any emulated service reaches another — over Amazon
 //! ECS's own modelled `DescribeServices` through the in-process callback
 //! ([`smithy_server_runtime::OperationContext::callback`]) — so the pair is
@@ -120,6 +132,20 @@ pub fn could_not_load_message(cluster_name: &str, service_name: &str, cause: &st
 /// — the fact is the absence of the service in an answer that named it.
 const SERVICE_NOT_FOUND_CAUSE: &str = "Service not found.";
 
+/// The deployment controller type an Amazon ECS service a deployment group targets
+/// must have been created with: the one that hands its deployments to CodeDeploy
+/// (`DeploymentControllerType`, whose other values are `ECS` and `EXTERNAL`).
+const CODE_DEPLOY_CONTROLLER: &str = "CODE_DEPLOY";
+
+/// How CodeDeploy states the controller precondition on a pair it DID load: a
+/// group may only drive a service that is deployed by CodeDeploy.
+///
+/// Entirely fixed text — it names neither the pair nor the controller the service
+/// does have, because the precondition is a property of the deployment group, not
+/// a reading of one request's values.
+pub const CODE_DEPLOY_CONTROLLER_REQUIRED: &str =
+    "Deployment group's ECS service must be configured for a CODE_DEPLOY deployment controller.";
+
 /// The owner's refusal as the SDK that relayed the load renders it: that service's
 /// own sentence, then the clause naming who refused, with what status, under which
 /// error code, and the id of the request that was refused.
@@ -134,23 +160,22 @@ fn relayed_ecs_refusal(message: &str, status: u16, code: &str, request_id: &str)
     )
 }
 
-/// `None` when this emulator has no reason to think the group's `ecsServices`
-/// could not be loaded; otherwise the `InvalidECSServiceException` message that
-/// refuses the call.
+/// `None` when this emulator has no reason to refuse the group's `ecsServices`;
+/// otherwise the `InvalidECSServiceException` message that refuses the call.
 ///
 /// Every pair the request names is resolved against the service that owns it, in
-/// the order named, and the FIRST one that could not be loaded is what the refusal
-/// states: that is the pair the caller has to change. Deduplicated, so naming one
-/// pair twice costs one load and is one target, and bounded by
-/// [`MAX_ECS_SERVICES_RESOLVED`] rather than by the request. An entry that names no
-/// cluster or no service at all describes no pair to load, so it is left to the
-/// members' own gates.
+/// the order named, and the FIRST one that could not be loaded, or that named a
+/// service CodeDeploy does not deploy, is what the refusal states: that is the
+/// pair the caller has to change. Deduplicated, so naming one pair twice costs one
+/// load and is one target, and bounded by [`MAX_ECS_SERVICES_RESOLVED`] rather
+/// than by the request. An entry that names no cluster or no service at all
+/// describes no pair to load, so it is left to the members' own gates.
 ///
 /// Call it from a handler with no store guard held — the load reaches Amazon ECS's
 /// own handler, which takes that service's lock — and apply the verdict once the
 /// resource the request addresses has been resolved, the way a group's service
 /// role is applied ([`super::service_role::unassumable_role_message`]).
-pub async fn unloadable_ecs_service_message(
+pub async fn ecs_services_refusal_message(
     ctx: &OperationContext<'_>,
     region: &str,
     ecs_services: &[ECSService],
@@ -166,6 +191,12 @@ pub async fn unloadable_ecs_service_message(
             Load::Unloadable(cause) => {
                 return Some(could_not_load_message(cluster_name, service_name, &cause));
             }
+            // The pair LOADED — the service is there — but it is deployed by
+            // something other than CodeDeploy, so a group driving it could never
+            // deploy it.
+            Load::NotCodeDeployControlled => {
+                return Some(CODE_DEPLOY_CONTROLLER_REQUIRED.to_string());
+            }
             // One unanswered load ends the question: a partial answer would refuse
             // a pair for not being in a read nobody made.
             Load::Unanswered => return None,
@@ -176,10 +207,13 @@ pub async fn unloadable_ecs_service_message(
 
 /// What the owner answered about ONE pair.
 enum Load {
-    /// The pair names a service the owner reports.
+    /// The pair names a service the owner reports, deployed by CodeDeploy.
     Loaded,
     /// The pair could not be loaded, for this cause.
     Unloadable(String),
+    /// The pair names a service the owner reports, but one whose deployment
+    /// controller is not [`CODE_DEPLOY_CONTROLLER`].
+    NotCodeDeployControlled,
     /// The owner could not be asked at all, or answered something that is not
     /// about this pair — evidence of nothing.
     Unanswered,
@@ -223,7 +257,8 @@ fn distinct_pairs(ecs_services: &[ECSService]) -> Vec<(&str, &str)> {
 /// cluster reference names nothing (it refuses the read) and that a name within a
 /// cluster it holds names no service (it answers the read and reports no service
 /// for that name), so this service relays the owner's verdict instead of wording a
-/// fact it did not resolve.
+/// fact it did not resolve. The same answer reports the service's deployment
+/// controller, which is what decides whether a deployment group may drive it.
 async fn load(client: &::aws_sdk_ecs::Client, cluster_name: &str, service_name: &str) -> Load {
     use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
 
@@ -242,13 +277,32 @@ async fn load(client: &::aws_sdk_ecs::Client, cluster_name: &str, service_name: 
             // to describe. You may specify up to 10 services to describe in a
             // single operation", each by name or ARN), so the pair is loaded when
             // what it named is either of them.
-            let loaded = output.services().iter().any(|held| {
+            let Some(held) = output.services().iter().find(|held| {
                 held.service_name() == Some(service_name) || held.service_arn() == Some(service_name)
-            });
-            return if loaded {
+            }) else {
+                return Load::Unloadable(SERVICE_NOT_FOUND_CAUSE.to_string());
+            };
+            // And the controller the owner reports for it is the one fact that
+            // decides whether CodeDeploy deploys this service at all. An answer
+            // that reported the service but no controller for it states nothing
+            // about how it is deployed, so — as everywhere in this gate — it
+            // refuses nothing and says so at `warn`.
+            let Some(controller) = held
+                .deployment_controller()
+                .map(|controller| controller.r#type().as_str())
+            else {
+                ::tracing::warn!(
+                    cluster = ?cluster_name,
+                    service = ?service_name,
+                    "the Amazon ECS service a deployment group names reports no deployment \
+                     controller, so the controller precondition is not resolved"
+                );
+                return Load::Loaded;
+            };
+            return if controller == CODE_DEPLOY_CONTROLLER {
                 Load::Loaded
             } else {
-                Load::Unloadable(SERVICE_NOT_FOUND_CAUSE.to_string())
+                Load::NotCodeDeployControlled
             };
         }
         Err(error) => error,

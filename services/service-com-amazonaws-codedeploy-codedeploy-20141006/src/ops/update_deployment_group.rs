@@ -447,13 +447,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // The Amazon ECS services the group would target after this update are
         // resolved against the service that OWNS them, exactly as a created
-        // group's are: a group may not be moved onto a pair that cannot be loaded
-        // either. The load is made with this service's store unlocked and the
-        // verdict applied below, once the group being updated has been resolved
+        // group's are: a group may not be moved onto a pair that cannot be loaded,
+        // or onto a service CodeDeploy does not deploy, either. The load is made
+        // with this service's store unlocked and the verdict applied below, once
+        // the group being updated has been resolved
         // ([`crate::state::ecs_services`]).
         let ecs_refusal = match input.ecs_services.as_deref() {
             Some(ecs_services) => {
-                crate::state::ecs_services::unloadable_ecs_service_message(
+                crate::state::ecs_services::ecs_services_refusal_message(
                     ctx,
                     &crate::state::request_region(ctx.parts()),
                     ecs_services,

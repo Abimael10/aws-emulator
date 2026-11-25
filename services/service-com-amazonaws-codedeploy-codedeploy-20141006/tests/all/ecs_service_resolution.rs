@@ -14,10 +14,16 @@
 //! The table spans what the rule generalises over: which half of the pair is
 //! unknown, how many pairs one request names, which of them is the bad one, which
 //! cluster a service lives in, and whether the group is being created or updated.
+//!
+//! Every service the fixture creates is deployed by CodeDeploy, which is the other
+//! precondition a pair has to satisfy — it has its own suite
+//! (`ecs_service_deployment_controller.rs`, which builds its services out of the
+//! fixture here) — so LOADABILITY is the only thing these rows vary.
 
 use serde_json::{json, Value};
 
 use crate::codedeploy_lifecycle::{error_code, Emulator};
+use crate::server_platform_instance_deployments::element;
 
 /// The cluster the fixture creates, holding [`WEB_SERVICE`].
 const PROD_CLUSTER: &str = "prod";
@@ -45,26 +51,232 @@ const CLUSTER_NOT_FOUND: &str = "Cluster not found.";
 /// `state::SERVICE_NOT_FOUND_MESSAGE`).
 const SERVICE_NOT_FOUND: &str = "Service not found.";
 
-/// Create `cluster` and one service named `service` in it, through Amazon ECS's
-/// OWN front door — never by writing into its store — answering the service ARN
-/// that service minted.
+/// The deployment controller type that hands a service's deployments to CodeDeploy,
+/// which is the one a deployment group may target
+/// (`DeploymentControllerType` of the Amazon ECS model: `ECS`, `CODE_DEPLOY`,
+/// `EXTERNAL`).
+pub(crate) const CODE_DEPLOY_CONTROLLER: &str = "CODE_DEPLOY";
+
+/// The container and the port every service the fixture creates serves on.
+const CONTAINER: &str = "web";
+const CONTAINER_PORT: i64 = 80;
+
+/// The network and the load balancer every service the fixture creates sits in and
+/// behind: a service deployed by CodeDeploy shifts traffic between Elastic Load
+/// Balancing v2 target groups, so Amazon ECS requires it to be bound to one that a
+/// load balancer forwards to.
+pub(crate) struct Network {
+    /// The Amazon VPC the target groups and the service's tasks are in.
+    vpc: String,
+    /// The two subnets the load balancer and the tasks are placed in.
+    subnets: Vec<String>,
+    /// The security group the tasks and the load balancer sit in.
+    group: String,
+    /// The load balancer whose listeners make a target group reachable.
+    load_balancer: String,
+}
+
+/// Create that network through Amazon EC2's and Elastic Load Balancing v2's OWN
+/// front doors, so every id below is one those services minted.
 ///
-/// The smallest service that API accepts: a registered task definition and a
-/// desired count of zero, so nothing is placed and no transition is owed.
-async fn given_ecs_service(emulator: &Emulator, cluster: &str, service: &str) -> String {
+/// `name` keeps one emulator's resources apart from another's.
+pub(crate) async fn given_network(emulator: &Emulator, name: &str) -> Network {
+    let vpc = read(
+        &emulator.ec2_ok("CreateVpc", &[("CidrBlock", "10.90.0.0/16")]).await,
+        "vpcId",
+    );
+    // An internet-facing load balancer sits in PUBLIC subnets, so the network gets
+    // the internet gateway and the default route Elastic Load Balancing requires of
+    // them.
+    let gateway = read(
+        &emulator.ec2_ok("CreateInternetGateway", &[]).await,
+        "internetGatewayId",
+    );
+    emulator
+        .ec2_ok(
+            "AttachInternetGateway",
+            &[
+                ("InternetGatewayId", gateway.as_str()),
+                ("VpcId", vpc.as_str()),
+            ],
+        )
+        .await;
+    let mut subnets = Vec::new();
+    for (cidr, zone) in [
+        ("10.90.1.0/24", "us-east-1a"),
+        ("10.90.2.0/24", "us-east-1b"),
+    ] {
+        subnets.push(read(
+            &emulator
+                .ec2_ok(
+                    "CreateSubnet",
+                    &[
+                        ("VpcId", vpc.as_str()),
+                        ("CidrBlock", cidr),
+                        ("AvailabilityZone", zone),
+                    ],
+                )
+                .await,
+            "subnetId",
+        ));
+    }
+    let route_table = read(
+        &emulator
+            .ec2_ok("CreateRouteTable", &[("VpcId", vpc.as_str())])
+            .await,
+        "routeTableId",
+    );
+    emulator
+        .ec2_ok(
+            "CreateRoute",
+            &[
+                ("RouteTableId", route_table.as_str()),
+                ("DestinationCidrBlock", "0.0.0.0/0"),
+                ("GatewayId", gateway.as_str()),
+            ],
+        )
+        .await;
+    for subnet in &subnets {
+        emulator
+            .ec2_ok(
+                "AssociateRouteTable",
+                &[
+                    ("RouteTableId", route_table.as_str()),
+                    ("SubnetId", subnet.as_str()),
+                ],
+            )
+            .await;
+    }
+    let group = read(
+        &emulator
+            .ec2_ok(
+                "CreateSecurityGroup",
+                &[
+                    ("GroupName", &format!("{name}-group")),
+                    ("GroupDescription", "the tasks and the load balancer"),
+                    ("VpcId", vpc.as_str()),
+                ],
+            )
+            .await,
+        "groupId",
+    );
+    let load_balancer = read(
+        &emulator
+            .elbv2_ok(
+                "CreateLoadBalancer",
+                &[
+                    ("Name", &format!("{name}-alb")),
+                    ("Subnets.member.1", subnets[0].as_str()),
+                    ("Subnets.member.2", subnets[1].as_str()),
+                    ("SecurityGroups.member.1", group.as_str()),
+                ],
+            )
+            .await,
+        "LoadBalancerArn",
+    );
+    Network {
+        vpc,
+        subnets,
+        group,
+        load_balancer,
+    }
+}
+
+/// The text of the first `<tag>` of a query-protocol answer, which every id above
+/// is read out of.
+fn read(body: &str, tag: &str) -> String {
+    element(body, tag).unwrap_or_else(|| panic!("no <{tag}> in {body}"))
+}
+
+/// Create `cluster` and one service named `service` in it, deployed by
+/// `controller`, through Amazon ECS's OWN front door — never by writing into its
+/// store — answering the service ARN that service minted.
+///
+/// `slot` keeps each service's target group and listener apart from the others' on
+/// the one load balancer.
+///
+/// The smallest service that API accepts for the controller it names: a desired
+/// count of zero, so nothing is placed and no transition is owed, and — for a
+/// controller that deploys the service's own revision — a registered task
+/// definition bound to a target group a listener forwards to, which is what Amazon
+/// ECS requires of a service CodeDeploy deploys.
+pub(crate) async fn given_ecs_service(
+    emulator: &Emulator,
+    network: &Network,
+    cluster: &str,
+    service: &str,
+    controller: &str,
+    slot: usize,
+) -> String {
     emulator
         .ecs_ok("CreateCluster", json!({"clusterName": cluster}))
         .await;
+    // "This is used when a service uses the EXTERNAL deployment controller type":
+    // such a service takes the revision its tasks run from the task set its caller
+    // creates, so it names no task definition and binds to no load balancer.
+    if controller == "EXTERNAL" {
+        let created = emulator
+            .ecs_ok(
+                "CreateService",
+                json!({
+                    "cluster": cluster,
+                    "serviceName": service,
+                    "desiredCount": 0,
+                    "deploymentController": {"type": controller},
+                }),
+            )
+            .await;
+        return service_arn(&created, cluster, service);
+    }
     let family = format!("{cluster}-{service}");
     emulator
         .ecs_ok(
             "RegisterTaskDefinition",
             json!({
                 "family": family,
-                "containerDefinitions": [
-                    {"name": "web", "image": "public.ecr.aws/nginx/nginx:latest", "memory": 128}
-                ],
+                "networkMode": "awsvpc",
+                "requiresCompatibilities": ["FARGATE"],
+                "cpu": "256",
+                "memory": "512",
+                "containerDefinitions": [{
+                    "name": CONTAINER,
+                    "image": "public.ecr.aws/nginx/nginx:latest",
+                    "portMappings": [{"containerPort": CONTAINER_PORT, "protocol": "tcp"}],
+                }],
             }),
+        )
+        .await;
+    // The target group the service registers its tasks into, and the listener that
+    // makes it reachable: Amazon ECS refuses a binding to a group no load balancer
+    // forwards to, and a revision in the `awsvpc` network mode needs the `ip`
+    // target type.
+    let target_group = read(
+        &emulator
+            .elbv2_ok(
+                "CreateTargetGroup",
+                &[
+                    ("Name", &format!("tg-{slot}")),
+                    ("Protocol", "HTTP"),
+                    ("Port", &CONTAINER_PORT.to_string()),
+                    ("TargetType", "ip"),
+                    ("VpcId", network.vpc.as_str()),
+                    ("HealthCheckProtocol", "HTTP"),
+                    ("HealthCheckPath", "/"),
+                ],
+            )
+            .await,
+        "TargetGroupArn",
+    );
+    emulator
+        .elbv2_ok(
+            "CreateListener",
+            &[
+                ("LoadBalancerArn", network.load_balancer.as_str()),
+                ("Protocol", "HTTP"),
+                ("Port", &(8000 + slot).to_string()),
+                ("DefaultActions.member.1.Type", "forward"),
+                ("DefaultActions.member.1.TargetGroupArn", target_group.as_str()),
+            ],
         )
         .await;
     let created = emulator
@@ -75,22 +287,58 @@ async fn given_ecs_service(emulator: &Emulator, cluster: &str, service: &str) ->
                 "serviceName": service,
                 "taskDefinition": family,
                 "desiredCount": 0,
+                "launchType": "FARGATE",
+                "deploymentController": {"type": controller},
+                "loadBalancers": [{
+                    "targetGroupArn": target_group,
+                    "containerName": CONTAINER,
+                    "containerPort": CONTAINER_PORT,
+                }],
+                "networkConfiguration": {
+                    "awsvpcConfiguration": {
+                        "subnets": network.subnets,
+                        "securityGroups": [network.group],
+                    }
+                },
             }),
         )
         .await;
+    service_arn(&created, cluster, service)
+}
+
+/// The ARN Amazon ECS minted for the service it just created.
+fn service_arn(created: &Value, cluster: &str, service: &str) -> String {
     created["service"]["serviceArn"]
         .as_str()
         .unwrap_or_else(|| panic!("CreateService {cluster}/{service} answered no serviceArn"))
         .to_string()
 }
 
-/// An emulator holding both clusters above with their one service each, and a
-/// CodeDeploy application on the Amazon ECS compute platform, answering it beside
-/// the ARN Amazon ECS minted for the service of [`PROD_CLUSTER`].
+/// An emulator holding both clusters above with their one CodeDeploy-deployed
+/// service each, and a CodeDeploy application on the Amazon ECS compute platform,
+/// answering it beside the ARN Amazon ECS minted for the service of
+/// [`PROD_CLUSTER`].
 async fn fixture(application: &str) -> (Emulator, String) {
     let emulator = Emulator::with_ecs();
-    let web_arn = given_ecs_service(&emulator, PROD_CLUSTER, WEB_SERVICE).await;
-    given_ecs_service(&emulator, STAGING_CLUSTER, API_SERVICE).await;
+    let network = given_network(&emulator, "resolution").await;
+    let web_arn = given_ecs_service(
+        &emulator,
+        &network,
+        PROD_CLUSTER,
+        WEB_SERVICE,
+        CODE_DEPLOY_CONTROLLER,
+        1,
+    )
+    .await;
+    given_ecs_service(
+        &emulator,
+        &network,
+        STAGING_CLUSTER,
+        API_SERVICE,
+        CODE_DEPLOY_CONTROLLER,
+        2,
+    )
+    .await;
     emulator
         .ok(
             "CreateApplication",

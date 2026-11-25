@@ -83,11 +83,18 @@ impl Emulator {
         Self::mounted(false, false, false, true)
     }
 
-    /// One emulator with Amazon ECS mounted beside CodeDeploy on the SAME engine.
+    /// One emulator with Amazon ECS mounted beside CodeDeploy on the SAME engine,
+    /// together with the two services an Amazon ECS deployment target is WIRED out
+    /// of.
     ///
     /// The cluster and the service a deployment group's `ecsServices` name belong
     /// to Amazon ECS, so a suite about that resolution creates them through that
-    /// service's own front door rather than reaching into its store.
+    /// service's own front door rather than reaching into its store. A service that
+    /// hands its deployments to CodeDeploy shifts traffic between two Elastic Load
+    /// Balancing v2 target groups, which that service requires it to sit behind, and
+    /// those groups and the load balancer in front of them live in an Amazon VPC —
+    /// so both owners are mounted here as well and every resource is created through
+    /// its own API.
     pub(crate) fn with_ecs() -> Self {
         let mut emulator = Self::mounted(false, false, false, false);
         emulator.router.register_service(
@@ -95,6 +102,16 @@ impl Emulator {
                 Arc::clone(&emulator.engine),
             ),
         );
+        emulator.router.register_service(
+            service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::EmulatedService::new(
+                Arc::clone(&emulator.engine),
+            ),
+        );
+        emulator
+            .router
+            .register_service(service_com_amazonaws_ec2_amazonec2::EmulatedService::new(
+                Arc::clone(&emulator.engine),
+            ));
         emulator
     }
 
@@ -289,6 +306,71 @@ impl Emulator {
             "ecs {operation} must succeed, got {status} with {parsed:?}"
         );
         parsed
+    }
+
+    /// One form-encoded query request against the service `signing_name` addresses,
+    /// answering its HTTP status and body.
+    ///
+    /// Both of the query-protocol services an Amazon ECS deployment target is wired
+    /// out of go through here: their parameters travel as a form body and their
+    /// answers come back as XML, and the SigV4 credential scope is what routes the
+    /// request to the signing name; the suite verifies no signature.
+    async fn query(
+        &self,
+        signing_name: &str,
+        version: &str,
+        action: &str,
+        params: &[(&str, &str)],
+    ) -> (u16, String) {
+        let mut body = format!("Action={action}&Version={version}");
+        for (name, value) in params {
+            body.push('&');
+            body.push_str(&form_encode(name));
+            body.push('=');
+            body.push_str(&form_encode(value));
+        }
+        let request = ::http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", format!("{signing_name}.us-east-1.amazonaws.com"))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/{signing_name}/\
+                     aws4_request, SignedHeaders=host, Signature=0000"
+                ),
+            )
+            .body(bytes::Bytes::from(body))
+            .expect("the request is well formed");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        (status, String::from_utf8_lossy(response.body()).to_string())
+    }
+
+    /// One `ec2Query` action against the Amazon EC2 emulator that must succeed,
+    /// answering its XML body. Only meaningful on an [`Emulator::with_ecs`].
+    pub(crate) async fn ec2_ok(&self, action: &str, params: &[(&str, &str)]) -> String {
+        let (status, answered) = self.query("ec2", "2016-11-15", action, params).await;
+        assert_eq!(
+            status, 200,
+            "EC2 {action} must succeed, got {status} with {answered}"
+        );
+        answered
+    }
+
+    /// One `awsQuery` action against the Elastic Load Balancing v2 emulator that
+    /// must succeed, answering its XML body. Only meaningful on an
+    /// [`Emulator::with_ecs`].
+    pub(crate) async fn elbv2_ok(&self, action: &str, params: &[(&str, &str)]) -> String {
+        let (status, answered) = self
+            .query("elasticloadbalancingv2", "2015-12-01", action, params)
+            .await;
+        assert_eq!(
+            status, 200,
+            "ELBv2 {action} must succeed, got {status} with {answered}"
+        );
+        answered
     }
 
     /// One `awsQuery` request against the IAM emulator through the same front

@@ -518,7 +518,11 @@ struct OrderRow {
 /// records that service wrote.
 ///
 /// The smallest service that API accepts: a registered task definition and a
-/// desired count of zero, so nothing is placed and no transition is owed.
+/// desired count of zero, so nothing is placed and no transition is owed. It names
+/// no deployment controller, so Amazon ECS deploys it by its own rolling update —
+/// which is a pair that LOADS and then fails CodeDeploy's controller precondition,
+/// the second of the two `ecsServices` refusals the table below orders the load
+/// balancer ahead of.
 async fn given_ecs_service(router: &MultiServiceRouter, cluster: &str, service: &str) {
     ecs_ok(router, "CreateCluster", &json!({"clusterName": cluster})).await;
     let family = format!("{cluster}-{service}");
@@ -550,7 +554,7 @@ async fn given_ecs_service(router: &MultiServiceRouter, cluster: &str, service: 
 /// is judged before the group's `ecsServices` are resolved against Amazon ECS, so a
 /// group naming no load balancer is refused for the load balancer whether the pair
 /// it targets exists or not — and the Amazon ECS refusal is what a group that DOES
-/// name a load balancer and an unknown pair earns.
+/// name a load balancer and a pair that cannot be targeted earns.
 #[tokio::test]
 async fn the_load_balancer_precondition_is_served_ahead_of_the_ecs_services_gate() {
     let router = build_router();
@@ -591,6 +595,18 @@ async fn the_load_balancer_precondition_is_served_ahead_of_the_ecs_services_gate
             case: "a pair the account holds, with a load balancer",
             group: "dg-held-with-lb",
             ecs_services: json!([{"clusterName": CLUSTER, "serviceName": SERVICE}]),
+            load_balancer_info: Some(target_group_pair()),
+            // The pair LOADS — Amazon ECS holds that service — and is then refused
+            // for the controller it is deployed by, which is the precondition the
+            // CodeDeploy crate's own `ecs_service_deployment_controller` suite
+            // spans. Either way the refusal is the Amazon ECS one, which is what
+            // this table orders the load balancer ahead of.
+            refusal: Some(INVALID_ECS_SERVICE),
+        },
+        OrderRow {
+            case: "no Amazon ECS pair at all, with a load balancer",
+            group: "dg-no-pair-with-lb",
+            ecs_services: json!([]),
             load_balancer_info: Some(target_group_pair()),
             refusal: None,
         },
