@@ -67,6 +67,11 @@ pub fn on_cluster_app_ui_server(ui_type: &str) -> Option<&'static str> {
 /// has one ([`cluster_state::ACTIVE`]) — a cluster that is still coming up is answered the
 /// address of the interface it is coming up to serve — while a cluster that is shutting
 /// down or gone has none at all and nothing to address.
+///
+/// So the gate is the CAPACITY the cluster still holds and not its being up: `STARTING`,
+/// `BOOTSTRAPPING`, `RUNNING` and `WAITING` are each served, and `TERMINATING`,
+/// `TERMINATED` and `TERMINATED_WITH_ERRORS` are each refused with
+/// [`APP_UI_INACTIVE_CLUSTER_MESSAGE`], whose own words are what this reading follows.
 pub fn serves_app_ui_in_state(state: &str) -> bool {
     cluster_state::ACTIVE.contains(&state)
 }
