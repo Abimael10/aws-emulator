@@ -16,7 +16,12 @@
 //! * a pagination token a listing did not issue is refused with the service's own
 //!   sentence for that class, whose only variable part is the operation that mints the
 //!   listing's tokens — not the error shape's API-reference description, and never the
-//!   rejected token echoed back.
+//!   rejected token echoed back;
+//! * a CRL configuration that both omits the CRL Distribution Point extension and names
+//!   the alias that extension would publish is refused by the request-validation stage
+//!   with ONE sentence of its own, whichever call carried the configuration and whatever
+//!   else the configuration states, and it is not the sentence another
+//!   request-validation refusal of the same call carries.
 //!
 //! Every message below is FIXED text for its class: it carries no ARN, id, timestamp or
 //! day count, so each row of each table expects the same sentence.
@@ -30,7 +35,9 @@ use service_com_amazonaws_acmpca_acmprivateca::state::{
 };
 
 use crate::delete_certificate_authority::force_status;
-use crate::private_ca_lifecycle::{root_ca_request, string, wait_for_the_clock, Emulator, ACCOUNT};
+use crate::private_ca_lifecycle::{
+    active_ca, root_ca_request, string, wait_for_the_clock, Emulator, ACCOUNT,
+};
 use crate::resource_policy::error_message;
 
 /// What Amazon Web Services Private CA answers a mutation that names a soft-deleted CA.
@@ -224,6 +231,188 @@ async fn a_mutation_against_a_soft_deleted_ca_is_refused_with_the_restore_senten
             "case {case:?}: two refusals under one error code must not share one sentence"
         );
     }
+}
+
+/// What Amazon Web Services Private CA answers a CRL configuration that both omits the
+/// CRL Distribution Point extension and names the alias that extension would publish,
+/// spelled out here rather than read off the service's own constant so a re-authored
+/// sentence fails this suite.
+const OMITTED_DISTRIBUTION_POINT_WITH_CNAME_MESSAGE: &str =
+    "You can't set a CustomCname if OmitExtension is set to true.";
+
+/// The request body `entry_point` carries to submit `crl` as the CA's CRL configuration:
+/// the create states it on a new CA, the update states it on the one at `arn`.
+fn crl_configuration_request(entry_point: &str, arn: &str, crl: &Value) -> Value {
+    let revocation = json!({"CrlConfiguration": crl.clone()});
+    match entry_point {
+        "CreateCertificateAuthority" => {
+            let mut body = root_ca_request("omitted-cdp-with-cname");
+            body["RevocationConfiguration"] = revocation;
+            body
+        }
+        "UpdateCertificateAuthority" => json!({
+            "CertificateAuthorityArn": arn,
+            "RevocationConfiguration": revocation,
+        }),
+        other => panic!("no request shape for {other}"),
+    }
+}
+
+/// Every string a CRL configuration supplies, so a refusal can be shown to interpolate
+/// none of them.
+fn supplied_strings(crl: &Value) -> Vec<String> {
+    crl.as_object()
+        .map(|members| {
+            members
+                .values()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Both entry points that take a `RevocationConfiguration`, crossed with the CRL
+/// configurations that omit the distribution point extension while naming the alias that
+/// extension would publish: ONE sentence for all of them, and nothing of the request in it.
+///
+/// The rows differ along everything the rule does NOT depend on — the alias named, the
+/// bucket and the object ACL the CRLs would be published to, the CRL kind, the custom path
+/// under the bucket, and the validity period of the CRL
+/// (`CrlConfiguration$ExpirationInDays` is `@range(1..5000)`: both published bounds appear
+/// below) — because the rule is about the two members that cannot be stated together and
+/// about nothing else.
+#[tokio::test]
+async fn a_cname_beside_an_omitted_distribution_point_is_refused_with_one_sentence() {
+    let emulator = Emulator::new();
+    let (arn, _) = active_ca(&emulator, "omitted-cdp-with-cname").await;
+    // What the CA holds going in, which is what every refusal below must leave it with.
+    let held = emulator
+        .ok(
+            "the CA the updates are refused against",
+            "DescribeCertificateAuthority",
+            &json!({"CertificateAuthorityArn": arn}),
+        )
+        .await["CertificateAuthority"]["RevocationConfiguration"]
+        .clone();
+
+    // Each row is enabled, names a bucket and a period (the members an enabled CRL
+    // configuration needs before this rule is reached), omits the extension and names an
+    // alias.
+    let configurations: [(&str, Value); 5] = [
+        (
+            "the smallest configuration the rule applies to",
+            json!({
+                "Enabled": true,
+                "S3BucketName": "example-crl-bucket",
+                "ExpirationInDays": 1,
+                "CustomCname": "crl.example.com",
+                "CrlDistributionPointExtensionConfiguration": {"OmitExtension": true},
+            }),
+        ),
+        (
+            "a publicly readable CRL at the longest period",
+            json!({
+                "Enabled": true,
+                "S3BucketName": "another.crl-bucket",
+                "ExpirationInDays": 5000,
+                "S3ObjectAcl": "PUBLIC_READ",
+                "CustomCname": "revocation.corp.example",
+                "CrlDistributionPointExtensionConfiguration": {"OmitExtension": true},
+            }),
+        ),
+        (
+            "a bucket-owner-controlled CRL under a custom path",
+            json!({
+                "Enabled": true,
+                "S3BucketName": "pca-crl-store",
+                "ExpirationInDays": 7,
+                "S3ObjectAcl": "BUCKET_OWNER_FULL_CONTROL",
+                "CustomPath": "crls/root",
+                "CustomCname": "cdp.example.net",
+                "CrlDistributionPointExtensionConfiguration": {"OmitExtension": true},
+            }),
+        ),
+        (
+            "a partitioned CRL behind an alias",
+            json!({
+                "Enabled": true,
+                "S3BucketName": "partitioned-crl-bucket",
+                "ExpirationInDays": 30,
+                "CrlType": "PARTITIONED",
+                "CustomCname": "partition.example.org",
+                "CrlDistributionPointExtensionConfiguration": {"OmitExtension": true},
+            }),
+        ),
+        (
+            "an alias at the longest the member takes",
+            json!({
+                "Enabled": true,
+                "S3BucketName": "long-cname-crl-bucket",
+                "ExpirationInDays": 365,
+                // `CrlConfiguration$CustomCname` is @length(0..253).
+                "CustomCname": format!("{}.example.com", "a".repeat(253 - ".example.com".len())),
+                "CrlDistributionPointExtensionConfiguration": {"OmitExtension": true},
+            }),
+        ),
+    ];
+
+    for (row, crl) in &configurations {
+        for entry_point in ["CreateCertificateAuthority", "UpdateCertificateAuthority"] {
+            let case = format!("{row} through {entry_point}");
+            let body = crl_configuration_request(entry_point, &arn, crl);
+            let answer = emulator
+                .refused(&case, entry_point, &body, "ValidationException")
+                .await;
+            let message = error_message(&answer, &case);
+            assert_eq!(
+                message, OMITTED_DISTRIBUTION_POINT_WITH_CNAME_MESSAGE,
+                "case {case:?}: expected {OMITTED_DISTRIBUTION_POINT_WITH_CNAME_MESSAGE:?}, got \
+                 {message:?}"
+            );
+            for supplied in supplied_strings(crl) {
+                assert!(
+                    !message.contains(&supplied),
+                    "case {case:?}: the sentence is fixed text, so it must not carry \
+                     {supplied:?}, got {message:?}"
+                );
+            }
+        }
+    }
+
+    // A sibling refusal of the same operations under the same error code keeps its own
+    // sentence: an enabled CRL configuration naming no bucket is refused about the member
+    // it left out, not about the alias.
+    for entry_point in ["CreateCertificateAuthority", "UpdateCertificateAuthority"] {
+        let case = format!("an enabled CRL with no bucket through {entry_point}");
+        let body = crl_configuration_request(
+            entry_point,
+            &arn,
+            &json!({"Enabled": true, "ExpirationInDays": 7}),
+        );
+        let answer = emulator
+            .refused(&case, entry_point, &body, "ValidationException")
+            .await;
+        let sibling = error_message(&answer, &case);
+        assert_ne!(
+            sibling, OMITTED_DISTRIBUTION_POINT_WITH_CNAME_MESSAGE,
+            "case {case:?}: two refusals under one error code must not share one sentence"
+        );
+    }
+
+    // None of the refusals wrote: the CA still reports the configuration it held.
+    let described = emulator
+        .ok(
+            "the CA after every refusal",
+            "DescribeCertificateAuthority",
+            &json!({"CertificateAuthorityArn": arn}),
+        )
+        .await;
+    let reported = described["CertificateAuthority"]["RevocationConfiguration"].clone();
+    assert_eq!(
+        reported, held,
+        "a refused configuration must leave the CA as it was, got {described:?}"
+    );
 }
 
 /// Every paginated listing of this service, crossed with the ways a `NextToken` fails to

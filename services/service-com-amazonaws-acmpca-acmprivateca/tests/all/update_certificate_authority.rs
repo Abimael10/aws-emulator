@@ -524,8 +524,7 @@ async fn an_update_this_operation_cannot_carry_out_is_refused_with_invalid_args(
 /// extension and names the alias that extension would publish, spelled out here rather than
 /// read off the service's own constant so a re-authored sentence fails this suite.
 const OMITTED_DISTRIBUTION_POINT_WITH_CNAME_MESSAGE: &str =
-    "RevocationConfiguration.CrlConfiguration.CrlDistributionPointExtensionConfiguration \
-     cannot be enabled with a custom CNAME set.";
+    "You can't set a CustomCname if OmitExtension is set to true.";
 
 /// A CRL configuration cannot both omit the distribution point extension and name the alias
 /// that extension would publish: "This configuration cannot be enabled with a custom CNAME

@@ -1673,10 +1673,11 @@ pub enum RevocationConfigurationFault {
 /// enabled with a custom CNAME set."
 /// (`CrlDistributionPointExtensionConfiguration$OmitExtension`.)
 ///
-/// Fixed text, naming the member whose value cannot stand beside the other.
+/// Fixed text for the class, worded as Amazon Web Services Private CA words it: the two
+/// members that cannot be stated together are named by their MODELLED names, and nothing of
+/// the request — no alias, bucket, ARN or member path — is interpolated.
 pub const OMITTED_DISTRIBUTION_POINT_WITH_CNAME_MESSAGE: &str =
-    "RevocationConfiguration.CrlConfiguration.CrlDistributionPointExtensionConfiguration \
-     cannot be enabled with a custom CNAME set.";
+    "You can't set a CustomCname if OmitExtension is set to true.";
 
 /// What Amazon Web Services Private CA answers when an S3 bucket a request names is not
 /// there: one sentence about the bucket, naming no bucket of its own.
