@@ -23,7 +23,15 @@
 //!   ever reached reports the member not at all;
 //! * a `SecretId` that names no secret is `ResourceNotFoundException`, and a
 //!   secret inside its recovery window — which still exists — is
-//!   `InvalidRequestException`.
+//!   `InvalidRequestException`;
+//! * the candidate a cancelled rotation left staked is the one the NEXT
+//!   `RotateSecret` works on: that call resumes the cancelled rotation on the id it
+//!   already holds — so it reports that id, mints no version for the token it
+//!   carried and is not refused for the outstanding candidate — while a rotation
+//!   nobody cancelled keeps the documented refusal for a rotation still in progress;
+//! * a rotation that was configured but never STARTED stakes no candidate at all,
+//!   so the cancel of it clears only the schedule and the rotation after it is a
+//!   rotation of its own, on the version the call names.
 //!
 //! Every test is a TABLE over the class its rule generalises: how the rotation
 //! schedule is expressed (days, a `rate()` interval, a `cron()` expression),
@@ -33,6 +41,7 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_secretsmanager_secretsmanager::state::ROTATION_IN_PROGRESS_MESSAGE;
 use service_com_amazonaws_secretsmanager_secretsmanager::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -794,4 +803,382 @@ async fn cancel_refuses_an_unknown_or_deleted_secret() {
         live_arn,
         "expected the live secret's own cancel to still answer, got {cancelled}"
     );
+}
+
+/// The staging label a rotation stakes on the version it is creating, and the one the
+/// secret's current value carries (`DescribeSecretResponse$VersionIdsToStages`, this
+/// service's Smithy model).
+const PENDING_STAGE: &str = "AWSPENDING";
+const CURRENT_STAGE: &str = "AWSCURRENT";
+
+/// Every version `member` reports `stage` on, in the order the map lists them.
+fn versions_with_stage(parsed: &Value, member: &str, stage: &str) -> Vec<String> {
+    parsed
+        .get(member)
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter(|(_, stages)| {
+                    stages
+                        .as_array()
+                        .is_some_and(|stages| stages.iter().any(|held| held == stage))
+                })
+                .map(|(version_id, _)| version_id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every version id `member` carries at all, whatever labels it holds.
+fn version_ids(parsed: &Value, member: &str) -> Vec<String> {
+    parsed
+        .get(member)
+        .and_then(Value::as_object)
+        .map(|map| map.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// How the `RotateSecret` that follows a cancel names the version it asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AsksFor {
+    /// A `ClientRequestToken` the secret has no version under, which is what a client
+    /// that knows nothing of the cancelled candidate generates.
+    AFreshVersion,
+    /// No token at all, so the service would otherwise mint an id of its own.
+    WhateverTheServiceMints,
+    /// The cancelled candidate's own id, the token a client retrying that rotation
+    /// carries.
+    TheCancelledCandidate,
+}
+
+/// One row of [`the_cancelled_candidate_is_what_the_next_rotation_resumes`]: how the
+/// schedule is expressed, what the resuming call asks for, and whether that call asks to
+/// rotate now.
+type ResumeRow = (&'static str, Value, AsksFor, bool);
+
+/// A rotation this service STARTED and `CancelRotateSecret` cancelled leaves its
+/// candidate staked `AWSPENDING`, and the next `RotateSecret` resumes THAT rotation: it
+/// answers with the candidate's id, stakes no version for the token it carried, and is
+/// not refused for the outstanding candidate.
+///
+/// Whether the candidate is still the one to resume afterwards follows from what the
+/// resuming call did with it: a call that started the rotation again is driving it, so a
+/// further rotation beside it earns the documented in-progress refusal, while a call that
+/// asked not to rotate now started nothing, so the candidate is still outstanding and is
+/// resumed again.
+///
+/// The rows differ along how the schedule is expressed, what the resuming call asks for
+/// (a fresh token, no token at all, the candidate's own id) and whether it asks to rotate
+/// immediately.
+#[tokio::test]
+async fn the_cancelled_candidate_is_what_the_next_rotation_resumes() {
+    let rows: &[ResumeRow] = &[
+        (
+            "a days schedule, resumed by a call carrying a fresh token and rotating now",
+            json!({"AutomaticallyAfterDays": 30}),
+            AsksFor::AFreshVersion,
+            true,
+        ),
+        (
+            "a rate in days, resumed by a call carrying no token and rotating now",
+            json!({"ScheduleExpression": "rate(10 days)"}),
+            AsksFor::WhateverTheServiceMints,
+            true,
+        ),
+        (
+            "a rate in hours at the documented four-hour floor, resumed by a call naming the \
+             candidate itself and rotating now",
+            json!({"ScheduleExpression": "rate(4 hours)"}),
+            AsksFor::TheCancelledCandidate,
+            true,
+        ),
+        (
+            "a cron schedule, resumed by a call carrying a fresh token and asking not to rotate \
+             now",
+            json!({"ScheduleExpression": "cron(0 8 1 * ? *)"}),
+            AsksFor::AFreshVersion,
+            false,
+        ),
+        (
+            "a days schedule at the documented minimum, resumed by a call carrying no token and \
+             asking not to rotate now",
+            json!({"AutomaticallyAfterDays": 1}),
+            AsksFor::WhateverTheServiceMints,
+            false,
+        ),
+    ];
+
+    for (index, (case, rules, asks_for, rotate_now)) in rows.iter().enumerate() {
+        let router = emulator();
+        let name = format!("resumed-{index}");
+        let value = format!("the-current-value-{index}");
+        let (_arn, current) = create_secret(&router, &name, &value, case).await;
+
+        // A rotation is STARTED, so a candidate is staked for the version its rotation
+        // function is to create.
+        let started = ok(
+            &router,
+            "RotateSecret",
+            json!({
+                "SecretId": name,
+                "RotationLambdaARN": LAMBDA_ARN,
+                "RotationRules": rules,
+                "RotateImmediately": true,
+            }),
+            case,
+        )
+        .await;
+        let candidate = text(&started, "VersionId", case);
+        let described = describe(&router, &name, case).await;
+        assert_eq!(
+            versions_with_stage(&described, "VersionIdsToStages", PENDING_STAGE),
+            vec![candidate.clone()],
+            "case {case:?}: expected the started rotation to stake {candidate} as \
+             {PENDING_STAGE}, got {described}"
+        );
+
+        // The cancel ends the rotation and the schedule, and leaves the candidate where
+        // that rotation left it.
+        let cancelled = ok(
+            &router,
+            "CancelRotateSecret",
+            json!({"SecretId": name}),
+            case,
+        )
+        .await;
+        assert_eq!(
+            cancelled.get("VersionId"),
+            Some(&json!(candidate)),
+            "case {case:?}: expected the cancel to report the candidate {candidate:?}, got \
+             {cancelled}"
+        );
+        let described = describe(&router, &name, case).await;
+        assert_eq!(
+            described.get("RotationEnabled"),
+            Some(&json!(false)),
+            "case {case:?}: expected RotationEnabled false after the cancel, got {described}"
+        );
+        assert_eq!(
+            described.get("NextRotationDate"),
+            None,
+            "case {case:?}: expected no NextRotationDate once rotation is off, got {described}"
+        );
+        assert_eq!(
+            versions_with_stage(&described, "VersionIdsToStages", PENDING_STAGE),
+            vec![candidate.clone()],
+            "case {case:?}: expected the cancelled rotation's candidate to stay \
+             {PENDING_STAGE}, got {described}"
+        );
+
+        // The next rotation takes that candidate up, whatever version it asked for.
+        let mut request = json!({"SecretId": name, "RotateImmediately": rotate_now});
+        let asked_for = match asks_for {
+            AsksFor::AFreshVersion => Some(crate::secret_client_request_token::fresh_token()),
+            AsksFor::WhateverTheServiceMints => None,
+            AsksFor::TheCancelledCandidate => Some(candidate.clone()),
+        };
+        if let Some(asked_for) = asked_for.as_ref() {
+            request["ClientRequestToken"] = json!(asked_for);
+        }
+        let resumed = ok(&router, "RotateSecret", request, case).await;
+        assert_eq!(
+            text(&resumed, "VersionId", case),
+            candidate,
+            "case {case:?}: expected the resumed rotation to report the cancelled candidate \
+             {candidate:?}, got {resumed}"
+        );
+
+        let described = describe(&router, &name, case).await;
+        assert_eq!(
+            versions_with_stage(&described, "VersionIdsToStages", PENDING_STAGE),
+            vec![candidate.clone()],
+            "case {case:?}: expected {PENDING_STAGE} still on {candidate} alone, got {described}"
+        );
+        assert_eq!(
+            versions_with_stage(&described, "VersionIdsToStages", CURRENT_STAGE),
+            vec![current.clone()],
+            "case {case:?}: expected the current version {current} left alone, got {described}"
+        );
+        if let Some(asked_for) = asked_for.as_ref().filter(|asked| **asked != candidate) {
+            assert!(
+                !version_ids(&described, "VersionIdsToStages").contains(asked_for),
+                "case {case:?}: expected the resumed rotation to mint nothing for \
+                 {asked_for:?}, got {described}"
+            );
+        }
+        assert_eq!(
+            described.get("RotationEnabled"),
+            Some(&json!(true)),
+            "case {case:?}: expected the resuming call to turn rotation back on, got {described}"
+        );
+        assert!(
+            described.get("NextRotationDate").is_some(),
+            "case {case:?}: expected the schedule to make a rotation due again, got {described}"
+        );
+        assert_eq!(
+            described.get("LastRotatedDate"),
+            None,
+            "case {case:?}: expected no LastRotatedDate while no rotation has completed, got \
+             {described}"
+        );
+
+        // What a FURTHER rotation beside the candidate earns: the in-progress refusal once
+        // the candidate is being driven again, and the candidate itself while the resuming
+        // call started no rotation of it.
+        let further = crate::secret_client_request_token::fresh_token();
+        let further_request = json!({"SecretId": name, "ClientRequestToken": further});
+        if *rotate_now {
+            let (code, message) = err(&router, "RotateSecret", further_request, case).await;
+            assert_eq!(
+                code, "InvalidRequestException",
+                "case {case:?}: expected InvalidRequestException for a further rotation, got \
+                 {code:?} with {message:?}"
+            );
+            assert_eq!(
+                message, ROTATION_IN_PROGRESS_MESSAGE,
+                "case {case:?}: expected {ROTATION_IN_PROGRESS_MESSAGE:?}, got {message:?}"
+            );
+        } else {
+            let again = ok(&router, "RotateSecret", further_request, case).await;
+            assert_eq!(
+                text(&again, "VersionId", case),
+                candidate,
+                "case {case:?}: expected the still-outstanding candidate {candidate:?} to be \
+                 resumed again, got {again}"
+            );
+        }
+        let described = describe(&router, &name, case).await;
+        assert!(
+            !version_ids(&described, "VersionIdsToStages").contains(&further),
+            "case {case:?}: expected the further rotation to mint nothing for {further:?}, got \
+             {described}"
+        );
+    }
+}
+
+/// A rotation that was CONFIGURED but never started stakes no candidate, so there is
+/// nothing for its cancel to report and nothing for the rotation after it to take up: that
+/// rotation is one of its own, on the version the call names.
+///
+/// The rows differ along how the schedule is expressed and along the form of the
+/// `SecretId` the cancel names.
+#[tokio::test]
+async fn a_rotation_that_never_started_leaves_no_candidate_to_resume() {
+    // (case, the RotationRules the deferred rotation configured, how the cancel names the
+    // secret)
+    let rows: &[(&str, Value, SecretIdForm)] = &[
+        (
+            "a days schedule, cancelled by name",
+            json!({"AutomaticallyAfterDays": 30}),
+            |name, _arn| name.to_string(),
+        ),
+        (
+            "a rate in days, cancelled by full ARN",
+            json!({"ScheduleExpression": "rate(10 days)"}),
+            |_name, arn| arn.to_string(),
+        ),
+        (
+            "a cron schedule, cancelled by partial ARN",
+            json!({"ScheduleExpression": "cron(0 8 1 * ? *)"}),
+            |_name, arn| partial_arn(arn),
+        ),
+    ];
+
+    for (index, (case, rules, secret_id_of)) in rows.iter().enumerate() {
+        let router = emulator();
+        let name = format!("unfired-{index}");
+        let (arn, current) = create_secret(&router, &name, "the-current-value", case).await;
+
+        // "The default for RotateImmediately is true. If you don't specify this value,
+        // Secrets Manager rotates the secret immediately"
+        // (`RotateSecretRequest$RotateImmediately`, this service's Smithy model): a call
+        // that asks not to rotate now configures the schedule and starts no rotation.
+        ok(
+            &router,
+            "RotateSecret",
+            json!({
+                "SecretId": name,
+                "RotationLambdaARN": LAMBDA_ARN,
+                "RotationRules": rules,
+                "RotateImmediately": false,
+            }),
+            case,
+        )
+        .await;
+        let described = describe(&router, &name, case).await;
+        assert_eq!(
+            described.get("RotationEnabled"),
+            Some(&json!(true)),
+            "case {case:?}: expected rotation on once the schedule is configured, got {described}"
+        );
+        assert!(
+            described.get("NextRotationDate").is_some(),
+            "case {case:?}: expected the schedule to make a rotation due, got {described}"
+        );
+        assert_eq!(
+            versions_with_stage(&described, "VersionIdsToStages", PENDING_STAGE),
+            Vec::<String>::new(),
+            "case {case:?}: expected no {PENDING_STAGE} candidate for a rotation that never \
+             started, got {described}"
+        );
+
+        let secret_id = secret_id_of(&name, &arn);
+        let cancelled = ok(
+            &router,
+            "CancelRotateSecret",
+            json!({"SecretId": secret_id}),
+            case,
+        )
+        .await;
+        assert_eq!(
+            cancelled.get("VersionId"),
+            None,
+            "case {case:?}: expected no VersionId where no rotation was in progress, got \
+             {cancelled}"
+        );
+        let described = describe(&router, &secret_id, case).await;
+        assert_eq!(
+            described.get("RotationEnabled"),
+            Some(&json!(false)),
+            "case {case:?}: expected RotationEnabled false after the cancel, got {described}"
+        );
+        assert_eq!(
+            described.get("NextRotationDate"),
+            None,
+            "case {case:?}: expected the cancel to clear the next due instant, got {described}"
+        );
+        assert_eq!(
+            versions_with_stage(&described, "VersionIdsToStages", PENDING_STAGE),
+            Vec::<String>::new(),
+            "case {case:?}: expected the cancel to stake nothing, got {described}"
+        );
+
+        // With no candidate outstanding, the rotation after the cancel is a rotation of
+        // its own: it works on the version its own token names.
+        let token = crate::secret_client_request_token::fresh_token();
+        let started = ok(
+            &router,
+            "RotateSecret",
+            json!({"SecretId": secret_id, "ClientRequestToken": token}),
+            case,
+        )
+        .await;
+        assert_eq!(
+            text(&started, "VersionId", case),
+            token,
+            "case {case:?}: expected the rotation to work on the version it named {token:?}, \
+             got {started}"
+        );
+        let described = describe(&router, &secret_id, case).await;
+        assert_eq!(
+            versions_with_stage(&described, "VersionIdsToStages", PENDING_STAGE),
+            vec![token.clone()],
+            "case {case:?}: expected {PENDING_STAGE} staked on {token}, got {described}"
+        );
+        assert_eq!(
+            versions_with_stage(&described, "VersionIdsToStages", CURRENT_STAGE),
+            vec![current.clone()],
+            "case {case:?}: expected the current version {current} left alone, got {described}"
+        );
+    }
 }
