@@ -247,7 +247,8 @@ async fn a_created_repository_is_described_from_what_was_stored() {
         created_names.push(name);
     }
 
-    // And a describe naming no repository reports every one of them, in name order.
+    // And a describe naming no repository reports every one of them, in the order they
+    // were created.
     let all = ok(&router, "all repositories", "DescribeRepositories", &json!({})).await;
     let reported: Vec<String> = all["repositories"]
         .as_array()
@@ -255,10 +256,9 @@ async fn a_created_repository_is_described_from_what_was_stored() {
         .iter()
         .map(|repo| repo["repositoryName"].as_str().unwrap_or_default().to_string())
         .collect();
-    created_names.sort();
     assert_eq!(
         reported, created_names,
-        "a describe naming no repository reports every stored one in name order"
+        "a describe naming no repository reports every stored one in creation order"
     );
 }
 
@@ -472,10 +472,12 @@ async fn a_pushed_manifest_is_stored_and_reported_under_its_own_digest() {
             Some("v1"),
             None,
             Some("application/vnd.docker.distribution.manifest.v2+json"),
-            // The manifest references one blob, its configuration, and declares 7023
-            // bytes for it; it names no `layers`, so that is the whole of the image's
-            // content (and nothing to do with the manifest document's own length).
-            Some(7023),
+            // The manifest references one blob, its configuration, and names no `layers`,
+            // so that blob is the whole of the image's content. Its size is the byte
+            // count the registry recorded for the blob it holds — the 18 bytes the layer
+            // upload above carried — and not the 7023 bytes the descriptor claims for it,
+            // nor the manifest document's own length.
+            Some(18),
         ),
         (
             "an OCI manifest, tagged, media type sent explicitly",

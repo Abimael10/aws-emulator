@@ -832,16 +832,9 @@ impl ImageRecord {
     /// them in: ascending push instant, and the digest where two images were pushed in
     /// the same instant, so the order is total and the same on every call.
     ///
-    /// Rendered as a key [`paginate`] can compare: the push instant as a fixed-width
-    /// count of nanoseconds since the epoch, so comparing the rendered keys as text
-    /// orders them the same way comparing the instants does, followed by the digest.
+    /// Rendered as a key [`paginate`] can compare ([`chronological_key`]).
     pub fn push_order_key(&self) -> String {
-        let since_epoch = self
-            .pushed_at
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        format!("{since_epoch:039}\u{1}{}", self.digest)
+        chronological_key(self.pushed_at, &self.digest)
     }
 
     /// The byte length of the stored manifest document — `imageManifestSize`, the size of
@@ -2292,6 +2285,15 @@ impl Repo {
         }
     }
 
+    /// This repository's place in the order a paginated read of the registry reports its
+    /// repositories in: ascending creation instant, and the name where two were created in
+    /// the same instant, so the order is total and the same on every call.
+    ///
+    /// Rendered as a key [`paginate`] can compare ([`chronological_key`]).
+    pub fn creation_order_key(&self) -> String {
+        chronological_key(self.created_at, &self.name)
+    }
+
     /// Whether `tag` may be moved from the image it points at to another one.
     ///
     /// The repository's `imageTagMutability` decides it, and the two
@@ -2618,11 +2620,15 @@ impl Repo {
     /// holds. An image manifest with an EMPTY `layers` array and no configuration blob is
     /// a statement, not a gap: it references no content, so its total is `0`.
     ///
-    /// What a blob's size is read from: the size its descriptor declares, else the byte
-    /// count this repository recorded when the layer upload was completed
-    /// ([`Self::layer_blobs`]) — a manifest form that states no size (a V2 schema 1
-    /// `fsLayers` entry, a descriptor without `size`) still references content the
-    /// registry has counted.
+    /// What a blob's size is read from: the byte count this repository recorded when the
+    /// layer upload was completed ([`Self::layer_blobs`]) — the registry's own count of
+    /// the content it holds — and only where it holds no record of that blob, the size the
+    /// manifest's descriptor declares for it. A descriptor's `size` is a statement by the
+    /// client that pushed the manifest, so where the registry has counted the bytes
+    /// itself, two manifests that declare different sizes for the one blob still report
+    /// the size of the blob in the repository; a manifest form that states no size at all
+    /// (a V2 schema 1 `fsLayers` entry, a descriptor without `size`) still references
+    /// content the registry has counted.
     pub fn refresh_image_sizes(&mut self) {
         // An image manifest's total rests on its own descriptors and on the blobs this
         // repository holds for them.
@@ -2632,9 +2638,11 @@ impl Repo {
             .map(|(digest, image)| {
                 let own = match &image.references {
                     ManifestContent::Blobs(blobs) => blobs.iter().try_fold(0i64, |total, blob| {
-                        let size = blob.size.or_else(|| {
-                            self.layer_blobs.get(&blob.digest).and_then(|held| held.size)
-                        })?;
+                        let size = self
+                            .layer_blobs
+                            .get(&blob.digest)
+                            .and_then(|held| held.size)
+                            .or(blob.size)?;
                         total.checked_add(size)
                     }),
                     ManifestContent::List(_) | ManifestContent::Opaque => None,
@@ -4381,6 +4389,24 @@ pub fn wildcard_matches(filter: &str, tag: &str) -> bool {
 /// against live state on the next call rather than against a snapshot.
 pub fn encode_token(key: &str) -> String {
     hex::encode(key.as_bytes())
+}
+
+/// The key that puts a record in the order the registry came to hold it: `at` as a
+/// fixed-width count of nanoseconds since the epoch — so comparing two rendered keys as
+/// text orders them the way comparing the two instants does — followed by `discriminator`,
+/// the record's own identifier, which makes the order total where two records carry the
+/// same instant.
+///
+/// What a paginated read of a registry's records both ORDERS and pages by
+/// ([`paginate`]): the repositories a registry holds, by the instant each was created
+/// ([`Repo::creation_order_key`]), and a repository's images, by the instant each was
+/// pushed ([`ImageRecord::push_order_key`]).
+pub fn chronological_key(at: SystemTime, discriminator: &str) -> String {
+    let since_epoch = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{since_epoch:039}\u{1}{discriminator}")
 }
 
 /// The key a pagination token was built from, or [`Fault::InvalidParameter`].

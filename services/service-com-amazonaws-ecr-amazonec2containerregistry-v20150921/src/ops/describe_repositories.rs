@@ -4,8 +4,9 @@
 //! Reports the stored repositories: each `Repository` is exactly what
 //! `CreateRepository` persisted. A read that names the repositories to report answers
 //! one entry per element of `repositoryNames`, in the order the request listed them; a
-//! read that names none walks the registry's own repositories in name order, one page at
-//! a time. A name in `repositoryNames` that no repository carries is refused.
+//! read that names none walks the registry's own repositories in ascending order of the
+//! instant each was created, one page at a time. A name in `repositoryNames` that no
+//! repository carries is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -252,20 +253,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        // A read that enumerates nothing reports the registry's own repositories, keyed by
-        // name, which is the order the store holds one Region's repositories in, so a page
-        // boundary means the same thing on the next call.
-        let candidates: Vec<(String, Repository)> = store
+        // A read that enumerates nothing reports the registry's own repositories, keyed —
+        // and so ordered and paged — by ascending creation instant
+        // ([`crate::state::Repo::creation_order_key`]): the repository created first is
+        // reported first, and a page boundary is a point in that one total order the next
+        // call resolves against the live store.
+        let mut candidates: Vec<(String, Repository)> = store
             .repositories_in(&region)
-            .map(|repo| (repo.name.clone(), repo.to_repository(&published_endpoint)))
+            .map(|repo| {
+                (
+                    repo.creation_order_key(),
+                    repo.to_repository(&published_endpoint),
+                )
+            })
             .collect();
+        // No two keys compare equal — each embeds its repository's own name — so the sort
+        // has nothing to keep stable.
+        candidates.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
 
-        let (repositories, next_token) = crate::state::paginate(
-            candidates,
-            input.next_token.as_ref(),
-            input.max_results,
-        )
-        .map_err(fault_error)?;
+        let (repositories, next_token) =
+            crate::state::paginate(candidates, input.next_token.as_ref(), input.max_results)
+                .map_err(fault_error)?;
 
         Ok(DescribeRepositoriesOutput {
             repositories: Some(repositories),
