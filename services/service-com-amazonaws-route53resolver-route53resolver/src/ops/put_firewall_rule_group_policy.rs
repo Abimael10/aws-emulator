@@ -163,21 +163,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the service will not attach leaves the rule group with whatever
         // policy it already carried. The refusal names the document it was
         // handed rather than the element the document misses, so the fault the
-        // check reports is not carried into it. Only the GRAMMAR can be checked
-        // here: whether the document shares the group with another account is
-        // decided against the group's own `OwnerId`, which is not known until
-        // the `Arn` has been resolved against the store below.
-        if crate::state::policy_document_fault(&input.firewall_rule_group_policy).is_some() {
+        // check reports is not carried into it.
+        //
+        // A rule group's resource policy is the share of that group, so the
+        // service attaches it only when the document asks for the share the
+        // service can make: an IAM resource-based policy document that delegates
+        // the rule-group operations a share grants and no other
+        // (`crate::state::attachable_sharing_policy` over
+        // `crate::state::FIREWALL_RULE_GROUP_SHARED_ACTIONS`). Whom it names as
+        // principal is not part of the check: the document states the account
+        // the group is shared with, and the service attaches whichever account
+        // that is.
+        if !crate::state::attachable_sharing_policy(
+            &input.firewall_rule_group_policy,
+            crate::state::FIREWALL_RULE_GROUP_SHARED_ACTIONS,
+        ) {
             return Err(PutFirewallRuleGroupPolicyErrorModeled::ValidationException(
-                crate::state::invalid_iam_policy(&input.firewall_rule_group_policy),
+                crate::state::invalid_iam_policy(&input.firewall_rule_group_policy, &trace_root),
             )
             .into());
         }
 
         // "Attaches an Identity and Access Management (Amazon Web Services IAM)
         // policy for sharing the rule group": the document is attached to the
-        // group the `Arn` names, so a read of that group's policy reports
-        // exactly this document, and a second write replaces it.
+        // group the `Arn` names, so a read of that group's policy reports it.
         // As for the read, the refusal for an `Arn` no group is stored under
         // names the group by the id that ARN carries
         // (`crate::state::resource_not_found_message`).
@@ -191,25 +200,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // A resource policy on a rule group is what shares it with ANOTHER
-        // account, so a document that grants only to the account that already
-        // owns the group — or that states no statement — asks for a share the
-        // service cannot make, and is refused rather than attached. The
-        // Resolver RULE policy write answers the same class of document
-        // differently (it succeeds and leaves the rule with no policy, see
-        // `crate::ops::put_resolver_rule_policy`), so the two are not to be
-        // unified: each follows what its own operation answers.
-        if !crate::state::policy_shares_with_other_account(
+        // A resource policy on a rule group is held as the PARSED policy, so a
+        // read of the group's policy reports the service's own serialization of
+        // the document that was attached
+        // (`crate::state::stored_policy_document`), and a second write replaces
+        // it.
+        record.firewall_rule_group_policy = Some(crate::state::stored_policy_document(
             &input.firewall_rule_group_policy,
-            &record.owner_id,
-        ) {
-            return Err(PutFirewallRuleGroupPolicyErrorModeled::ValidationException(
-                crate::state::invalid_iam_policy(&input.firewall_rule_group_policy),
-            )
-            .into());
-        }
-
-        record.firewall_rule_group_policy = Some(input.firewall_rule_group_policy.clone());
+        ));
 
         // `ReturnValue`: the document has been applied to the rule group, so
         // the request was successful.

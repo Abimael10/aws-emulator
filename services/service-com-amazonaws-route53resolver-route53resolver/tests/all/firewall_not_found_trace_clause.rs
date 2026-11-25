@@ -199,7 +199,10 @@ const REFUSALS: &[Refusal] = &[
                     "Statement": [{
                         "Effect": "Allow",
                         "Principal": { "AWS": "123456789012" },
-                        "Action": "route53resolver:GetFirewallRuleGroup",
+                        "Action": [
+                            "route53resolver:GetFirewallRuleGroup",
+                            "route53resolver:ListFirewallRuleGroups",
+                        ],
                         "Resource": arn,
                     }],
                 })

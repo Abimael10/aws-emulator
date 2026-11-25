@@ -48,16 +48,20 @@ fn expected_message(resource_id: &str) -> String {
     format!("[{RSLVR_CODE_RESOURCE_NOT_FOUND}] Can’t find the resource with ID \"{resource_id}\".")
 }
 
-/// A grammatically valid document that shares `arn` with another account, so a
-/// policy write reaches the identifier resolution instead of being refused for
-/// the document it carries.
+/// A grammatically valid document that shares `arn` with another account and
+/// delegates the rule-group operations a share grants, so a policy write reaches
+/// the identifier resolution instead of being refused for the document it
+/// carries.
 fn sharing_document(arn: &str) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
             "Effect": "Allow",
             "Principal": { "AWS": OTHER_ACCOUNT },
-            "Action": "route53resolver:GetFirewallRuleGroup",
+            "Action": [
+                "route53resolver:GetFirewallRuleGroup",
+                "route53resolver:ListFirewallRuleGroups",
+            ],
             "Resource": arn,
         }],
     })

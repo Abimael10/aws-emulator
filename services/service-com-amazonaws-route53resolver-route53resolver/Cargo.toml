@@ -62,5 +62,10 @@ ipnet = "2"
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
+[dev-dependencies]
+# Declares one module per `tests/all/<name>.rs` from `tests/all/main.rs`, so a suite is
+# picked up by adding its file.
+automod = { workspace = true }
+
 [lints]
 workspace = true

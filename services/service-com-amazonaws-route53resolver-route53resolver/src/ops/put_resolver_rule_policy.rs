@@ -164,11 +164,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The policy document is checked before the store is touched, so a
-        // document outside the policy grammar leaves the rule with whatever
+        // document the service will not attach leaves the rule with whatever
         // policy it already carried.
-        if let Some(fault) = crate::state::policy_document_fault(&input.resolver_rule_policy) {
+        //
+        // A rule's resource policy is the share of that rule, so the service
+        // attaches it only when the document asks for the share the service can
+        // make: an IAM resource-based policy document that delegates the rule
+        // operations the model lists for this member and no other
+        // (`crate::state::attachable_sharing_policy` over
+        // `crate::state::RESOLVER_RULE_SHARED_ACTIONS`). Whom it names as
+        // principal is not part of the check: the document states the account
+        // the rule is shared with, and the service attaches whichever account
+        // that is.
+        if !crate::state::attachable_sharing_policy(
+            &input.resolver_rule_policy,
+            crate::state::RESOLVER_RULE_SHARED_ACTIONS,
+        ) {
             return Err(PutResolverRulePolicyErrorModeled::InvalidPolicyDocument(
-                crate::state::invalid_policy_document(&fault),
+                crate::state::invalid_resolver_rule_policy(),
             )
             .into());
         }
@@ -177,8 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // another account, the account that you want to share the rule with,
         // and the operations that you want the account to be able to perform on
         // the rule": the document is attached to the rule the `Arn` names, so a
-        // read of that rule's policy reports exactly this document, and a
-        // second write replaces it.
+        // read of that rule's policy reports it.
         let mut store = state.lock();
         let Some(record) = store.rule_by_arn_mut(&input.arn) else {
             return Err(PutResolverRulePolicyErrorModeled::UnknownResourceException(
@@ -187,18 +199,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A resource policy is what shares the rule with ANOTHER account, so a
-        // document that grants only to the account that already owns the rule —
-        // or that states no statement — shares it with nobody and leaves it with
-        // no policy at all. The DNS Firewall rule-group policy write REFUSES the
-        // same class of document instead (see
-        // `crate::ops::put_firewall_rule_group_policy`), so the two are not to
-        // be unified: each follows what its own operation answers.
-        let shares = crate::state::policy_shares_with_other_account(
-            &input.resolver_rule_policy,
-            &record.owner_id,
-        );
-        record.resolver_rule_policy = shares.then(|| input.resolver_rule_policy.clone());
+        // A resource policy is held on the rule as the PARSED policy, so a read
+        // of that rule's policy reports the service's own serialization of the
+        // document that was attached (`crate::state::stored_policy_document`),
+        // and a second write replaces it.
+        record.resolver_rule_policy =
+            Some(crate::state::stored_policy_document(&input.resolver_rule_policy));
 
         // "Whether the PutResolverRulePolicy request was successful": the
         // document has been applied to the rule, so it was.

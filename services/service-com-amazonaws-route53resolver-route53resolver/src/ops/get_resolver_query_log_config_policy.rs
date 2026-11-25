@@ -143,7 +143,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // What this operation takes from `ctx` is the trace its refusal is
+        // reported under.
+        let trace_root = crate::state::request_trace_root(&ctx.parts().headers);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 GetResolverQueryLogConfigPolicyErrorModeled::InternalServiceErrorException(
@@ -158,25 +160,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Gets information about a query logging policy": a pure read of the
         // policy held on that configuration's record, so nothing about it
         // changes for the next caller.
-        let store = state.lock();
-        let Some(record) = store.query_log_config_by_arn(&input.arn) else {
-            return Err(
-                GetResolverQueryLogConfigPolicyErrorModeled::UnknownResourceException(
-                    crate::state::unknown_resolver_query_log_config_arn(&input.arn),
-                )
-                .into(),
-            );
-        };
-
+        //
         // A query logging policy "specifies the Resolver query logging
         // operations and resources that you want to allow another Amazon Web
-        // Services account to be able to use": a configuration shared with
-        // nobody carries no such policy, and a read of a policy that is not
-        // there is refused rather than answered with a document.
-        let Some(policy) = record.resolver_query_log_config_policy.clone() else {
+        // Services account to be able to use", so the read answers a document
+        // only where the caller is granted one to read: a configuration this
+        // account holds no record of, and one it holds that nobody has written
+        // a policy for, both leave the caller granted nothing, which the
+        // modelled `AccessDeniedException` ("the current account doesn't have
+        // the IAM permissions required to perform the specified Resolver
+        // operation") is the answer for. The one refusal for both is also what
+        // keeps the read from disclosing whether a configuration whose policy
+        // the caller cannot read exists at all.
+        let store = state.lock();
+        let attached = store
+            .query_log_config_by_arn(&input.arn)
+            .and_then(|record| record.resolver_query_log_config_policy.clone());
+        let Some(policy) = attached else {
             return Err(
                 GetResolverQueryLogConfigPolicyErrorModeled::AccessDeniedException(
-                    crate::state::query_log_config_policy_access_denied(),
+                    crate::state::query_log_config_policy_access_denied(&trace_root),
                 )
                 .into(),
             );

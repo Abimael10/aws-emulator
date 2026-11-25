@@ -311,8 +311,10 @@ pub const RSLVR_CODE_QUERY_LOG_DESTINATION_TYPE_ALREADY_ASSOCIATED: &str = "RSLV
 /// Carried for the same reason as
 /// [`RSLVR_CODE_QUERY_LOG_CONFIG_VPC_ALREADY_ASSOCIATED`]: the code comes from
 /// the recorded response of the query-logging policy write that refuses a
-/// document it cannot attach. See [`invalid_query_log_config_policy`].
-pub const RSLVR_CODE_QUERY_LOG_CONFIG_POLICY_INVALID: &str = "RSLVR-00312";
+/// document it cannot attach. See [`invalid_query_log_config_policy`]. It is the
+/// service's one code for a resource-policy document it will not attach
+/// ([`RSLVR_CODE_INVALID_POLICY`]), which is where the digits are written.
+pub const RSLVR_CODE_QUERY_LOG_CONFIG_POLICY_INVALID: &str = RSLVR_CODE_INVALID_POLICY;
 
 /// The `InvalidRequestException` `AssociateResolverQueryLogConfig` answers for a
 /// VPC the configuration it names is already associated with.
@@ -400,10 +402,11 @@ pub fn query_log_destination_type_already_associated() -> InvalidRequestExceptio
 /// ([`RSLVR_CODE_QUERY_LOG_CONFIG_POLICY_INVALID`]) and is fixed text: it echoes
 /// no part of the document it refused, so WHY the document was refused is not
 /// part of the body and one sentence covers every document outside the policy
-/// grammar ([`policy_document_fault`]). The rule-policy write of this service
-/// answers its own modelled `InvalidPolicyDocument` for the same class of
-/// document ([`invalid_policy_document`]), which is the shape that operation
-/// models for it.
+/// grammar (`service_common::iam_policy::resource_policy_defect`, the tree's one
+/// reading of what a resource-based policy document is). The rule-policy write of
+/// this service answers its own modelled `InvalidPolicyDocument` for the same
+/// class of document ([`invalid_resolver_rule_policy`]), which is the shape that
+/// operation models for it.
 ///
 /// The recorded refusal of this fault closes with no trace clause either, for
 /// the same reason as [`query_log_destination_type_already_associated`].

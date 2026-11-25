@@ -77,6 +77,10 @@
 //! * `InvalidPolicyDocument` (HTTP 400) — The specified Resolver rule policy is invalid.
 //! * `InvalidRequestException` (HTTP 400) — The request is invalid.
 //! * `UnknownResourceException` (HTTP 400) — The specified resource doesn't exist.
+//! * `ResourceNotFoundException` (HTTP 400) — widened in through `extra_errors` (see
+//!   below): the specified resource doesn't exist. The model's `errors` list for this
+//!   operation omits the shape, but it is the not-found class this service answers for an
+//!   `Arn` naming a query logging configuration that does not exist.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -92,7 +96,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-route53resolver-route53
 // here — hence the `PutResolverQueryLogConfigPolicyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.route53resolver#PutResolverQueryLogConfigPolicy")]
+//
+// `ResourceNotFoundException` is widened in through `extra_errors`: this SERVICE
+// models that shape (it is the not-found class the rest of the query-logging
+// plane answers with) and this operation's own `errors` list does not repeat it,
+// but the recorded refusal for an `Arn` naming a configuration that does not
+// exist is that generic not-found class rather than the operation-specific
+// `UnknownResourceException` — so the shape a client catches has to be
+// constructible here.
+#[smithy_macros::operation_error(
+    "com.amazonaws.route53resolver#PutResolverQueryLogConfigPolicy",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum PutResolverQueryLogConfigPolicyErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -100,6 +115,7 @@ pub enum PutResolverQueryLogConfigPolicyErrorModeled {
     InvalidParameterException(InvalidParameterException),
     InvalidPolicyDocument(InvalidPolicyDocument),
     InvalidRequestException(InvalidRequestException),
+    ResourceNotFoundException(ResourceNotFoundException),
     UnknownResourceException(UnknownResourceException),
 }
 
@@ -154,7 +170,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // What this operation takes from `ctx` is the trace its refusals are
+        // reported under.
+        let trace_root = crate::state::request_trace_root(&ctx.parts().headers);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 PutResolverQueryLogConfigPolicyErrorModeled::InternalServiceErrorException(
@@ -168,10 +186,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The policy document is checked before the store is touched, so a
         // document outside the policy grammar leaves the configuration with
-        // whatever policy it already carried. The document itself is echoed
-        // nowhere: this slice words the fault with its own coded sentence
-        // (`crate::state::invalid_query_log_config_policy`).
-        if crate::state::policy_document_fault(&input.resolver_query_log_config_policy).is_some() {
+        // whatever policy it already carried. Whether the text is an IAM
+        // resource-based policy document at all is the tree's one grammar
+        // (`service_common::iam_policy::resource_policy_defect`), and the
+        // document itself is echoed nowhere: this slice words the fault with its
+        // own coded sentence (`crate::state::invalid_query_log_config_policy`).
+        if ::service_common::iam_policy::resource_policy_defect(
+            &input.resolver_query_log_config_policy,
+        )
+        .is_some()
+        {
             return Err(
                 PutResolverQueryLogConfigPolicyErrorModeled::InvalidRequestException(
                     crate::state::invalid_query_log_config_policy(),
@@ -187,21 +211,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // to the configuration the `Arn` names, so a read of that
         // configuration's policy reports exactly this document, and a second
         // write replaces it.
+        //
+        // An `Arn` the store holds no configuration under is refused as the
+        // configuration that does not exist, in the generic not-found class the
+        // rest of the query-logging plane answers with and with that plane's own
+        // coded sentence (`crate::state::resolver_query_log_config_not_found`):
+        // a client catches ONE shape for a Resolver resource that is not there,
+        // whichever operation it asked.
         let mut store = state.lock();
         let Some(record) = store.query_log_config_by_arn_mut(&input.arn) else {
             return Err(
-                PutResolverQueryLogConfigPolicyErrorModeled::UnknownResourceException(
-                    crate::state::unknown_resolver_query_log_config_arn(&input.arn),
+                PutResolverQueryLogConfigPolicyErrorModeled::ResourceNotFoundException(
+                    crate::state::resolver_query_log_config_not_found(&trace_root),
                 )
                 .into(),
             );
         };
 
-        // A resource policy is held on the configuration exactly as written, so
-        // a read reports the document that was put; a configuration has no
-        // policy only while no write has attached one.
-        record.resolver_query_log_config_policy =
-            Some(input.resolver_query_log_config_policy.clone());
+        // A resource policy is held on the configuration as the PARSED policy,
+        // so a read reports the service's own serialization of the document
+        // that was put (`crate::state::stored_policy_document`); a configuration
+        // has no policy only while no write has attached one.
+        record.resolver_query_log_config_policy = Some(crate::state::stored_policy_document(
+            &input.resolver_query_log_config_policy,
+        ));
 
         // "Whether the PutResolverQueryLogConfigPolicy request was successful":
         // the document has been applied to the configuration, so it was.

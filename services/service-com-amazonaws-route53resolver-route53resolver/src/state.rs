@@ -61,6 +61,7 @@ mod query_log_delivery;
 mod query_log_destinations;
 mod relayed_ec2;
 mod resolver_rules;
+mod resource_policies;
 mod tags;
 mod vpc_configs;
 /// The DNS DATA PLANE a query asked from inside a VPC reaches: which addresses of the VPC
@@ -84,6 +85,7 @@ pub use query_log::*;
 pub use query_log_destinations::*;
 pub use relayed_ec2::*;
 pub use resolver_rules::*;
+pub use resource_policies::*;
 pub use tags::*;
 pub use vpc_configs::*;
 pub use vpc_dns::*;
@@ -2047,34 +2049,30 @@ pub fn unknown_resolver_rule_arn(arn: &str) -> UnknownResourceException {
     }
 }
 
-/// The `UnknownResourceException` the query-logging policy operations answer
-/// for an `Arn` the store holds no query logging configuration under.
-///
-/// Both operations address the configuration by its ARN rather than by its id,
-/// so — as for [`unknown_resolver_rule_arn`] — the sentence names what the
-/// request asked for: the ARN it was handed.
-pub fn unknown_resolver_query_log_config_arn(arn: &str) -> UnknownResourceException {
-    UnknownResourceException {
-        message: Some(format!(
-            r#"Resolver query log config with ARN "{arn}" does not exist."#
-        )),
-    }
-}
-
 /// The `AccessDeniedException` a read of a query logging configuration's
-/// resource policy answers while the configuration carries no policy.
+/// resource policy answers for a policy the caller is granted nothing of: a
+/// configuration this account holds no record of, and one it holds that nobody
+/// has written a policy for.
 ///
 /// A query logging configuration's resource policy is readable only while one is
-/// attached: with nothing attached the caller is granted nothing to read, which
-/// the model's `AccessDeniedException` ("the current account doesn't have the
-/// IAM permissions required to perform the specified Resolver operation") is the
-/// modelled answer for. The message is the one the query-logging slice words
-/// every denial with ([`query_log_access_denied_message`]), and this read
-/// carries it alone: the recorded response of the policy read closes with no
-/// trace clause.
-pub fn query_log_config_policy_access_denied() -> AccessDeniedException {
+/// attached, and only by an account the configuration belongs to: with either
+/// missing the caller is granted nothing to read, which the model's
+/// `AccessDeniedException` ("the current account doesn't have the IAM
+/// permissions required to perform the specified Resolver operation") is the
+/// modelled answer for — and ONE body for both is what keeps the refusal from
+/// disclosing which of the two it was.
+///
+/// The sentence is the one the query-logging slice words every denial with
+/// ([`query_log_access_denied_message`]), closed with the trace clause of the
+/// request ([`traced_message`]) exactly as that slice's other denial is
+/// ([`query_log_destination_access_denied`]), so the two cannot drift apart; the
+/// trace id is the only part of the body that is not fixed text.
+pub fn query_log_config_policy_access_denied(trace_root: &str) -> AccessDeniedException {
     AccessDeniedException {
-        message: Some(query_log_access_denied_message()),
+        message: Some(traced_message(
+            query_log_access_denied_message(),
+            trace_root,
+        )),
     }
 }
 
@@ -2164,173 +2162,6 @@ pub fn resolver_access_denied(trace_root: &str) -> AccessDeniedException {
             trace_root,
         )),
     }
-}
-
-/// The `InvalidPolicyDocument` a resource-policy write answers for a document
-/// outside the policy grammar, with `fault` stating which part of the grammar it
-/// misses (from [`policy_document_fault`]).
-///
-/// The opening sentence is the fault the model states for the shape ("The
-/// specified Resolver rule policy is invalid"); what follows names the element
-/// the document is missing, so the caller can fix the document from the message
-/// alone.
-pub fn invalid_policy_document(fault: &str) -> InvalidPolicyDocument {
-    InvalidPolicyDocument {
-        message: Some(format!(
-            "The specified Resolver rule policy is invalid: {fault}."
-        )),
-    }
-}
-
-/// The `ValidationException` a DNS Firewall rule-group policy write answers for
-/// an IAM policy document the service will not attach.
-///
-/// `PutFirewallRuleGroupPolicy` models no `InvalidPolicyDocument`
-/// (`smithy_query(query="operation",operation="PutFirewallRuleGroupPolicy")`
-/// lists `ValidationException` instead), so the faults the Resolver rule policy
-/// reports through that shape are reported here through the exception this
-/// operation does model.
-///
-/// The body carries the service's code for an invalid IAM policy
-/// ([`RSLVR_CODE_INVALID_IAM_POLICY`]) and echoes the document it was handed, so
-/// the caller sees exactly which document was refused, and then the remediation
-/// sentence that states what a document the service WOULD attach has to do
-/// ([`FIREWALL_RULE_GROUP_POLICY_REMEDIATION`]). WHY the document was refused is
-/// not part of it, so the one body covers a document outside the policy grammar
-/// and one that shares the resource with nobody but its owner.
-pub fn invalid_iam_policy(policy: &str) -> ValidationException {
-    ValidationException {
-        message: Some(rslvr_message_sentences(
-            RSLVR_CODE_INVALID_IAM_POLICY,
-            &[
-                &format!("The specified IAM policy isn't valid: \"{policy}\""),
-                FIREWALL_RULE_GROUP_POLICY_REMEDIATION,
-            ],
-        )),
-    }
-}
-
-/// The remediation sentence a DNS Firewall rule-group policy refusal closes
-/// with: what a document the service would attach has to do.
-///
-/// It is the only part of the refusal that says what to send instead, and it is
-/// fixed text — it echoes nothing from the request or the store. Carried as a
-/// constant, WITHOUT its final period (as every sentence handed to
-/// [`rslvr_message_sentences`] is), so the refusals of both classes of document
-/// the rule-group policy write rejects cannot word it differently. The model
-/// states no message text for `ValidationException`
-/// (`smithy_query(query="shape",shape="ValidationException")` carries `Message`
-/// alone), so this wording is the recorded behaviour of the operation.
-pub const FIREWALL_RULE_GROUP_POLICY_REMEDIATION: &str =
-    "Provide a valid policy that allows a DNS Firewall rule group to be shared with another AWS \
-     account";
-
-/// The policy document a resource with no stored resource policy reports: the
-/// empty JSON object, a document that states no statement and so shares the
-/// resource with nobody. Inside the modelled length of both members that report
-/// one — `ResolverRulePolicy` and `FirewallRuleGroupPolicy`, each 0..30000
-/// (`smithy_query(query="shape",shape="ResolverRulePolicy,FirewallRuleGroupPolicy")`).
-pub const EMPTY_POLICY_DOCUMENT: &str = "{}";
-
-/// Why `policy` is not a policy document, or `None` when it is one.
-///
-/// A JSON policy document is an object, and each statement of its `Statement`
-/// element — one statement or an array of them — is an object that states an
-/// `Effect` and an `Action` (the elements the IAM JSON policy grammar requires
-/// of every statement). A document that states no statement at all is still a
-/// document: it grants nothing, which is what [`EMPTY_POLICY_DOCUMENT`] is.
-///
-/// The modelled `ResolverRulePolicy` length (0..30000) admits the empty string
-/// and any other text, so the grammar is what a policy write checks here,
-/// before it touches the store: a document outside it is refused with
-/// `InvalidPolicyDocument` and the resource keeps the policy it had.
-pub fn policy_document_fault(policy: &str) -> Option<String> {
-    let Ok(document) = serde_json::from_str::<serde_json::Value>(policy) else {
-        return Some("a policy document is JSON".to_string());
-    };
-    if !document.is_object() {
-        return Some("a policy document is a JSON object".to_string());
-    }
-    for (index, statement) in policy_statements(&document).iter().enumerate() {
-        let Some(members) = statement.as_object() else {
-            return Some(format!("statement {index} is not a JSON object"));
-        };
-        for element in ["Effect", "Action"] {
-            if !members.contains_key(element) {
-                return Some(format!("statement {index} states no {element} element"));
-            }
-        }
-    }
-    None
-}
-
-/// The statements of a policy document: the elements of its `Statement` array,
-/// or the single statement when the element is one statement rather than an
-/// array, or none when the document states no `Statement` at all.
-fn policy_statements(document: &serde_json::Value) -> Vec<&serde_json::Value> {
-    match document.get("Statement") {
-        Some(serde_json::Value::Array(items)) => items.iter().collect(),
-        Some(single) => vec![single],
-        None => Vec::new(),
-    }
-}
-
-/// Every principal one statement's `Principal` element names, in the forms the
-/// policy grammar writes them: the element is either one string (`*`) or a map
-/// from principal type to one value or a list of values.
-fn policy_principals(principal: &serde_json::Value) -> Vec<&str> {
-    match principal {
-        serde_json::Value::String(value) => vec![value.as_str()],
-        serde_json::Value::Object(by_type) => by_type
-            .values()
-            .flat_map(|value| match value {
-                serde_json::Value::Array(items) => {
-                    items.iter().filter_map(serde_json::Value::as_str).collect()
-                }
-                single => single.as_str().into_iter().collect::<Vec<&str>>(),
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// The account one principal value names: the account field of an ARN
-/// (`arn:<partition>:<service>:<region>:<account>:<resource>`), or the value
-/// itself when it is a bare account id.
-///
-/// `None` for anything that names no single account — `*`, or a principal of
-/// another kind such as a service — and none of those is the owning account.
-fn principal_account(value: &str) -> Option<&str> {
-    if let Some(rest) = value.strip_prefix("arn:") {
-        return rest.split(':').nth(3).filter(|account| !account.is_empty());
-    }
-    if !value.is_empty() && value.chars().all(|character| character.is_ascii_digit()) {
-        return Some(value);
-    }
-    None
-}
-
-/// Whether `policy` grants anything to a principal other than `owner_account`,
-/// the account that owns the resource the policy would be attached to.
-///
-/// A resource policy on a Resolver resource is how it is shared with ANOTHER
-/// account, so a document whose principals are all the owning account — or that
-/// names no principal at all — shares the resource with nobody and leaves it
-/// with no policy. Read with [`policy_principals`] and [`principal_account`], so
-/// an account named by its id and the same account named by an ARN carrying it
-/// count as the one account.
-pub fn policy_shares_with_other_account(policy: &str, owner_account: &str) -> bool {
-    let Ok(document) = serde_json::from_str::<serde_json::Value>(policy) else {
-        return false;
-    };
-    policy_statements(&document).iter().any(|statement| {
-        statement
-            .get("Principal")
-            .map(policy_principals)
-            .unwrap_or_default()
-            .iter()
-            .any(|value| principal_account(value) != Some(owner_account))
-    })
 }
 
 /// Canonicalise the domain name a Resolver rule selects on to a fully-qualified

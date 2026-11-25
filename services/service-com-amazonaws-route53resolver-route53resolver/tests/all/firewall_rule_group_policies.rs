@@ -3,15 +3,17 @@
 //! End-to-end tests for the DNS Firewall rule-group policy slice:
 //! `PutFirewallRuleGroupPolicy` and `GetFirewallRuleGroupPolicy`.
 //!
-//! The rule under test: a resource policy is the grant that shares a DNS
-//! Firewall rule group with ANOTHER account, so a document that names such an
-//! account is attached to the group its `Arn` names and is reported back
-//! verbatim by a read of that group's policy, while a document that shares the
-//! group with nobody — one whose principals are all the owning account, or that
-//! names no principal at all — and a document outside the policy grammar are
-//! refused and change nothing. A group nobody has written a policy for reports
-//! the document that grants nothing, and an `Arn` the store holds no group
-//! under is refused by both operations.
+//! The rule under test: a rule group's resource policy is the share of that
+//! group, so the write attaches a document that asks for the share the service
+//! can make — a policy document whose every statement delegates the rule-group
+//! operations a share grants and no other — whoever the document names as
+//! principal, and refuses every other document, leaving the policy the group
+//! already carried in place. What a read reports is the service's own
+//! serialization of the document that was attached: the elements in the order
+//! they were written, with each account named as a principal in the form IAM
+//! converts an account id to. A group nobody has written a policy for reports
+//! the document that grants nothing, and an `Arn` the store holds no group under
+//! is refused by both operations.
 //!
 //! Each suite drives a TABLE of documents spanning the forms the policy grammar
 //! admits, so no case is tied to one document.
@@ -34,7 +36,7 @@ use super::harness::{
 };
 
 /// An account that is not the one this emulator's resources belong to, so a
-/// policy naming it really does share the rule group.
+/// policy naming it really does share the rule group with somebody else.
 const OTHER_ACCOUNT: &str = "123456789012";
 
 /// Create a DNS Firewall rule group and return `(Id, Arn)`. A group is created
@@ -98,16 +100,33 @@ async fn refused_policy(
     string_member(&refusal, "Message")
 }
 
+/// The ARN of the root user of the account `account` names — the form IAM
+/// converts an account id named as a principal to.
+fn account_root(account: &str) -> String {
+    format!("arn:aws:iam::{account}:root")
+}
+
+/// The `Action` section of a rule-group sharing statement: the operations a
+/// share of a rule group delegates.
+///
+/// Source: AWS's sharing policy for a DNS Firewall rule group names the read of
+/// the group and the listing, and nothing that changes it; the same two
+/// operations the crate carries as the delegated set.
+fn shared_actions() -> Value {
+    json!([
+        "route53resolver:GetFirewallRuleGroup",
+        "route53resolver:ListFirewallRuleGroups",
+    ])
+}
+
 /// One statement sharing `arn` with `principal`, in the grammar's statement
-/// form: an `Effect`, an `Action` list and the `Resource` the share is for.
+/// form: an `Effect`, the delegated `Action` set and the `Resource` the share is
+/// for.
 fn share_statement(principal: Value, arn: &str) -> Value {
     json!({
         "Effect": "Allow",
         "Principal": principal,
-        "Action": [
-            "route53resolver:GetFirewallRuleGroup",
-            "route53resolver:AssociateFirewallRuleGroup",
-        ],
+        "Action": shared_actions(),
         "Resource": arn,
     })
 }
@@ -117,46 +136,52 @@ fn policy_document(statements: Value) -> String {
     json!({ "Version": "2012-10-17", "Statement": statements }).to_string()
 }
 
-/// A document that shares the rule group with an account other than its owner
-/// is attached as written, and the read reports exactly that document —
-/// whatever form the grammar lets the document take.
+/// A document that delegates the operations a share of a rule group grants is
+/// attached, and the read reports the service's serialization of it — whatever
+/// form the grammar lets the document take.
 #[tokio::test]
-async fn a_shared_policy_is_reported_back_as_written() {
+async fn a_delegating_policy_is_reported_back_as_attached() {
     let router = emulator();
     let (_, arn) = rule_group(&router, "policy-shared").await;
 
-    // Each row is a different shape of sharing document: how the principal is
-    // written, how many statements the document carries, and which optional
-    // elements it states.
-    let cases: Vec<(&str, String)> = vec![
+    // One statement for `principal`, as the request writes it.
+    let shared = |principal: Value| policy_document(json!([share_statement(principal, &arn)]));
+
+    // Each row is a different shape of sharing document — how the principal is
+    // written, how many statements the document carries, which optional
+    // elements it states — paired with the document a read of it reports.
+    let cases: Vec<(&str, String, String)> = vec![
         (
             "principal by account id",
-            policy_document(json!([share_statement(json!({ "AWS": OTHER_ACCOUNT }), &arn)])),
+            shared(json!({ "AWS": OTHER_ACCOUNT })),
+            shared(json!({ "AWS": account_root(OTHER_ACCOUNT) })),
         ),
         (
             "principal by account root ARN",
-            policy_document(json!([share_statement(
-                json!({ "AWS": format!("arn:aws:iam::{OTHER_ACCOUNT}:root") }),
-                &arn,
-            )])),
+            shared(json!({ "AWS": account_root(OTHER_ACCOUNT) })),
+            shared(json!({ "AWS": account_root(OTHER_ACCOUNT) })),
         ),
         (
             "principal list naming the owner and another account",
-            policy_document(json!([share_statement(
-                json!({ "AWS": [ACCOUNT, OTHER_ACCOUNT] }),
-                &arn,
-            )])),
+            shared(json!({ "AWS": [ACCOUNT, OTHER_ACCOUNT] })),
+            shared(json!({ "AWS": [account_root(ACCOUNT), account_root(OTHER_ACCOUNT)] })),
         ),
         (
             "wildcard principal",
-            policy_document(json!([share_statement(json!("*"), &arn)])),
+            shared(json!("*")),
+            shared(json!("*")),
         ),
         (
             "service principal",
-            policy_document(json!([share_statement(
-                json!({ "Service": "ram.amazonaws.com" }),
-                &arn,
-            )])),
+            shared(json!({ "Service": "ram.amazonaws.com" })),
+            shared(json!({ "Service": "ram.amazonaws.com" })),
+        ),
+        // The emulator serves one account, so a caller sharing a group has its
+        // own account to name: that document asks for a share like any other.
+        (
+            "principal by the owning account's id",
+            shared(json!({ "AWS": ACCOUNT })),
+            shared(json!({ "AWS": account_root(ACCOUNT) })),
         ),
         (
             "two statements",
@@ -164,19 +189,38 @@ async fn a_shared_policy_is_reported_back_as_written() {
                 share_statement(json!({ "AWS": OTHER_ACCOUNT }), &arn),
                 share_statement(json!({ "AWS": "210987654321" }), &arn),
             ])),
+            policy_document(json!([
+                share_statement(json!({ "AWS": account_root(OTHER_ACCOUNT) }), &arn),
+                share_statement(json!({ "AWS": account_root("210987654321") }), &arn),
+            ])),
         ),
         (
             "one statement, not a list",
             policy_document(share_statement(json!({ "AWS": OTHER_ACCOUNT }), &arn)),
+            policy_document(share_statement(
+                json!({ "AWS": account_root(OTHER_ACCOUNT) }),
+                &arn,
+            )),
         ),
         (
-            "statement with a Sid and a Condition, and a single Action",
+            "statement with a Sid and a Condition",
             json!({
                 "Statement": [{
                     "Sid": "ShareOneRuleGroup",
                     "Effect": "Allow",
                     "Principal": { "AWS": OTHER_ACCOUNT },
-                    "Action": "route53resolver:GetFirewallRuleGroup",
+                    "Action": shared_actions(),
+                    "Resource": arn,
+                    "Condition": { "StringEquals": { "aws:PrincipalOrgID": "o-example" } },
+                }],
+            })
+            .to_string(),
+            json!({
+                "Statement": [{
+                    "Sid": "ShareOneRuleGroup",
+                    "Effect": "Allow",
+                    "Principal": { "AWS": account_root(OTHER_ACCOUNT) },
+                    "Action": shared_actions(),
                     "Resource": arn,
                     "Condition": { "StringEquals": { "aws:PrincipalOrgID": "o-example" } },
                 }],
@@ -187,6 +231,13 @@ async fn a_shared_policy_is_reported_back_as_written() {
             "no Version element",
             json!({ "Statement": [share_statement(json!({ "AWS": OTHER_ACCOUNT }), &arn)] })
                 .to_string(),
+            json!({
+                "Statement": [share_statement(
+                    json!({ "AWS": account_root(OTHER_ACCOUNT) }),
+                    &arn,
+                )],
+            })
+            .to_string(),
         ),
         (
             "a long document: one statement per shared account",
@@ -198,32 +249,40 @@ async fn a_shared_policy_is_reported_back_as_written() {
                     })
                     .collect(),
             )),
+            policy_document(Value::Array(
+                (0..40)
+                    .map(|index| {
+                        let account = format!("{:012}", 100_000_000_000u64 + index);
+                        share_statement(json!({ "AWS": account_root(&account) }), &arn)
+                    })
+                    .collect(),
+            )),
         ),
     ];
 
-    for (case, policy) in cases {
-        put_policy(&router, case, &arn, &policy).await;
+    for (case, submitted, attached) in cases {
+        put_policy(&router, case, &arn, &submitted).await;
         let read = stored_policy(&router, &arn).await;
         assert_eq!(
-            read, policy,
-            "case {case:?}: GetFirewallRuleGroupPolicy must report the document that was written, got {read:?}"
+            read, attached,
+            "case {case:?}: GetFirewallRuleGroupPolicy must report the attached document, got {read:?}"
         );
         // A read reports the policy without changing it: a second read of the
         // same group answers the same document.
         let reread = stored_policy(&router, &arn).await;
         assert_eq!(
-            reread, policy,
+            reread, attached,
             "case {case:?}: a second GetFirewallRuleGroupPolicy must report the same document, got {reread:?}"
         );
     }
 }
 
-/// A document that shares the rule group with no account other than its owner
-/// is refused, and the policy the group already carried stays.
+/// A document that does not delegate the operations a share of a rule group
+/// grants is refused, and the policy the group already carried stays.
 #[tokio::test]
-async fn a_policy_that_shares_with_nobody_is_refused() {
+async fn a_policy_that_delegates_something_else_is_refused() {
     let router = emulator();
-    let (_, arn) = rule_group(&router, "policy-self").await;
+    let (_, arn) = rule_group(&router, "policy-undelegated").await;
 
     // The policy every row has to leave alone.
     let shared = policy_document(json!([share_statement(
@@ -231,51 +290,57 @@ async fn a_policy_that_shares_with_nobody_is_refused() {
         &arn,
     )]));
     put_policy(&router, "the policy to preserve", &arn, &shared).await;
+    let preserved = stored_policy(&router, &arn).await;
 
-    // Rows differ in HOW the document fails to share: the owner named by id, by
-    // its root ARN, by a list of both forms, and a document with no statement
-    // to grant anything at all.
+    // One statement delegating `action`, so the rows differ in the `Action`
+    // section alone.
+    let delegating = |action: Value| {
+        policy_document(json!([{
+            "Effect": "Allow",
+            "Principal": { "AWS": OTHER_ACCOUNT },
+            "Action": action,
+            "Resource": arn,
+        }]))
+    };
+
+    // Rows differ in HOW the document misses the delegated set: one operation
+    // of it, the other, one too many, an operation of another resource's share,
+    // the wildcard, none at all — and a document with no statement to delegate
+    // anything.
     let cases: Vec<(&str, String)> = vec![
         (
-            "owner by account id",
-            policy_document(json!([share_statement(json!({ "AWS": ACCOUNT }), &arn)])),
+            "the read of the group alone",
+            delegating(json!(["route53resolver:GetFirewallRuleGroup"])),
         ),
         (
-            "owner by account root ARN",
-            policy_document(json!([share_statement(
-                json!({ "AWS": format!("arn:aws:iam::{ACCOUNT}:root") }),
-                &arn,
-            )])),
+            "the listing alone",
+            delegating(json!(["route53resolver:ListFirewallRuleGroups"])),
         ),
         (
-            "owner as a one-element principal list",
-            policy_document(json!([share_statement(json!({ "AWS": [ACCOUNT] }), &arn)])),
+            "the read of the group alone, as a single Action string",
+            delegating(json!("route53resolver:GetFirewallRuleGroup")),
         ),
         (
-            "owner twice, by id and by ARN",
-            policy_document(json!([share_statement(
-                json!({ "AWS": [ACCOUNT, format!("arn:aws:iam::{ACCOUNT}:root")] }),
-                &arn,
-            )])),
-        ),
-        (
-            "two statements, both for the owner",
-            policy_document(json!([
-                share_statement(json!({ "AWS": ACCOUNT }), &arn),
-                share_statement(
-                    json!({ "AWS": format!("arn:aws:iam::{ACCOUNT}:user/analyst") }),
-                    &arn,
-                ),
+            "the delegated set and the association operations beside it",
+            delegating(json!([
+                "route53resolver:GetFirewallRuleGroup",
+                "route53resolver:AssociateFirewallRuleGroup",
+                "route53resolver:DisassociateFirewallRuleGroup",
+                "route53resolver:ListFirewallRuleGroups",
             ])),
         ),
         (
-            "a statement with no Principal",
-            policy_document(json!([{
-                "Effect": "Allow",
-                "Action": ["route53resolver:GetFirewallRuleGroup"],
-                "Resource": arn,
-            }])),
+            "the operations a Resolver rule's share delegates",
+            delegating(json!([
+                "route53resolver:GetResolverRule",
+                "route53resolver:ListResolverRules",
+            ])),
         ),
+        (
+            "every operation of the service, by wildcard",
+            delegating(json!("route53resolver:*")),
+        ),
+        ("no operation at all", delegating(json!([]))),
         ("an empty statement list", policy_document(json!([]))),
         ("no Statement element", EMPTY_POLICY_DOCUMENT.to_string()),
     ];
@@ -283,15 +348,19 @@ async fn a_policy_that_shares_with_nobody_is_refused() {
     for (case, policy) in cases {
         let message = refused_policy(&router, case, &arn, &policy).await;
         // The refusal states the service's code for a policy it will not
-        // attach, and echoes the document it was handed, so the caller sees
-        // which document was refused.
+        // attach, echoes the document it was handed so the caller sees which
+        // document was refused, and closes with the trace clause of the
+        // request.
+        let (stated, _) = traced_message(&message).unwrap_or_else(|| {
+            panic!("case {case:?}: the refusal must close with its trace clause, got {message:?}")
+        });
         assert!(
-            message.contains(RSLVR_CODE_INVALID_IAM_POLICY) && message.contains(&policy),
+            stated.contains(RSLVR_CODE_INVALID_IAM_POLICY) && stated.contains(&policy),
             "case {case:?}: the refusal must state {RSLVR_CODE_INVALID_IAM_POLICY} and echo the document, got {message:?}"
         );
         let read = stored_policy(&router, &arn).await;
         assert_eq!(
-            read, shared,
+            read, preserved,
             "case {case:?}: a refused document must leave the stored policy alone, got {read:?}"
         );
     }
@@ -329,10 +398,13 @@ async fn an_invalid_document_is_refused_and_stores_nothing() {
         &arn,
     )]));
     put_policy(&router, "the policy to preserve", &arn, &shared).await;
+    let preserved = stored_policy(&router, &arn).await;
 
-    // Rows differ in which part of the grammar the document misses: it is not
-    // JSON at all, it is JSON but not an object, or one of its statements is
-    // not a statement.
+    // Rows differ in which clause of the policy grammar the document breaks —
+    // the one reading of it every service of this tree shares
+    // (`service_common::iam_policy::resource_policy_defect`): it is not JSON at
+    // all, it is JSON but not an object, or one of its statements is not a
+    // statement or states no effect, no action or no principal.
     let cases: Vec<(&str, String)> = vec![
         ("the empty string", String::new()),
         ("not JSON", "this is not a policy".to_string()),
@@ -351,7 +423,7 @@ async fn an_invalid_document_is_refused_and_stores_nothing() {
             "a statement with no Effect",
             policy_document(json!([{
                 "Principal": { "AWS": OTHER_ACCOUNT },
-                "Action": ["route53resolver:GetFirewallRuleGroup"],
+                "Action": shared_actions(),
                 "Resource": arn,
             }])),
         ),
@@ -364,23 +436,34 @@ async fn an_invalid_document_is_refused_and_stores_nothing() {
             }])),
         ),
         (
+            "a statement with no Principal",
+            policy_document(json!([{
+                "Effect": "Allow",
+                "Action": shared_actions(),
+                "Resource": arn,
+            }])),
+        ),
+        (
             "a second statement with no Effect",
             policy_document(json!([
                 share_statement(json!({ "AWS": OTHER_ACCOUNT }), &arn),
-                { "Action": ["route53resolver:GetFirewallRuleGroup"], "Resource": arn },
+                { "Action": shared_actions(), "Resource": arn },
             ])),
         ),
     ];
 
     for (case, policy) in cases {
         let message = refused_policy(&router, case, &arn, &policy).await;
+        let (stated, _) = traced_message(&message).unwrap_or_else(|| {
+            panic!("case {case:?}: the refusal must close with its trace clause, got {message:?}")
+        });
         assert!(
-            message.contains(RSLVR_CODE_INVALID_IAM_POLICY) && message.contains(&policy),
+            stated.contains(RSLVR_CODE_INVALID_IAM_POLICY) && stated.contains(&policy),
             "case {case:?}: the refusal must state {RSLVR_CODE_INVALID_IAM_POLICY} and echo the document, got {message:?}"
         );
         let read = stored_policy(&router, &arn).await;
         assert_eq!(
-            read, shared,
+            read, preserved,
             "case {case:?}: a refused document must leave the stored policy alone, got {read:?}"
         );
     }
