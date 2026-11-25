@@ -80,7 +80,10 @@ type ClientSocket = tokio_tungstenite::WebSocketStream<TcpStream>;
 
 /// A client of one session's data channel: the socket, and the sequence its own messages stand
 /// in — a Session Manager client numbers what it sends.
-struct Channel {
+///
+/// Reachable from the suites beside this one, so a case about the sessions of another task
+/// shape drives the channel through this one client rather than a second copy of it.
+pub(crate) struct Channel {
     socket: ClientSocket,
     written: i64,
 }
@@ -110,7 +113,7 @@ impl Channel {
 
     /// Type one command LINE into the session, as a client types it: the characters and the
     /// return that ends the line.
-    async fn type_line(&mut self, case: &str, line: &str) {
+    pub(crate) async fn type_line(&mut self, case: &str, line: &str) {
         self.send(
             case,
             agent_message::PAYLOAD_TYPE_OUTPUT,
@@ -120,7 +123,7 @@ impl Channel {
     }
 
     /// State the size of the client's terminal, as a client does when its window changes.
-    async fn resize(&mut self, case: &str, rows: u32, columns: u32) {
+    pub(crate) async fn resize(&mut self, case: &str, rows: u32, columns: u32) {
         self.send(
             case,
             agent_message::PAYLOAD_TYPE_SIZE,
@@ -131,7 +134,7 @@ impl Channel {
 
     /// The next agent message the channel delivers, or `None` when none arrives within
     /// [`FRAME_DEADLINE`].
-    async fn next_message(&mut self, case: &str) -> Option<AgentMessage> {
+    pub(crate) async fn next_message(&mut self, case: &str) -> Option<AgentMessage> {
         match tokio::time::timeout(FRAME_DEADLINE, self.socket.next()).await {
             Ok(Some(Ok(Message::Binary(bytes)))) => Some(
                 AgentMessage::decode(&bytes)
@@ -147,7 +150,7 @@ impl Channel {
     /// Read the stream until everything it has delivered so far CONTAINS `wanted`, and answer
     /// what was read. The output of a line is written as the line runs, so a case reads until
     /// what it is waiting for is there rather than assuming one message carries it.
-    async fn read_until(&mut self, case: &str, wanted: &str) -> String {
+    pub(crate) async fn read_until(&mut self, case: &str, wanted: &str) -> String {
         let mut read = String::new();
         while !read.contains(wanted) {
             let Some(message) = self.next_message(case).await else {
@@ -166,10 +169,11 @@ impl Channel {
     }
 }
 
-/// A container definition of [`FAMILY`]: the harness's minimal definition plus a program that
-/// runs for longer than this suite takes, so the task stays RUNNING while its sessions are
-/// carried.
-fn long_running_container(name: &str) -> Value {
+/// A container definition of a family whose task stays RUNNING while its sessions are carried:
+/// the harness's minimal definition plus a program that runs for longer than a suite takes.
+///
+/// Reachable from the suites beside this one, which launch tasks of the same shape.
+pub(crate) fn long_running_container(name: &str) -> Value {
     let mut definition = container(name, "public.ecr.aws/nginx/nginx:latest");
     definition["command"] = json!(["sleep", "600"]);
     definition
@@ -249,7 +253,7 @@ async fn describe_task(router: &MultiServiceRouter, task_arn: &str, case: &str) 
 }
 
 /// The `lastStatus` the execute-command agent of `container_name` reports in a described task.
-fn agent_status(task: &Value, container_name: &str, case: &str) -> Option<String> {
+pub(crate) fn agent_status(task: &Value, container_name: &str, case: &str) -> Option<String> {
     let container = list(task, "containers", case)
         .into_iter()
         .find(|container| container["name"].as_str() == Some(container_name))?;
@@ -305,7 +309,7 @@ fn dialled(case: &str, stream_url: &str) -> (u16, String) {
 /// Open the data channel `stream_url` names and present `token` on it, as a Session Manager
 /// client does: the established channel, or `None` when the channel closed instead of
 /// carrying the session.
-async fn dial(case: &str, stream_url: &str, token: &str) -> Option<Channel> {
+pub(crate) async fn dial(case: &str, stream_url: &str, token: &str) -> Option<Channel> {
     let (port, path) = dialled(case, stream_url);
     // The emulator's own loopback port, named as a literal: a case dials this address and
     // nothing else ([`dialled`] has already held the announced host to it).
@@ -376,7 +380,7 @@ async fn dial(case: &str, stream_url: &str, token: &str) -> Option<Channel> {
 
 /// The session members of an `ExecuteCommand` response: its id, the channel it is carried on
 /// and the token that channel admits.
-fn session_of(answer: &Value, case: &str) -> (String, String, String) {
+pub(crate) fn session_of(answer: &Value, case: &str) -> (String, String, String) {
     let session = &answer["session"];
     (
         string(session, "sessionId", case),
