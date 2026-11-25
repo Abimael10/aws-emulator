@@ -10,6 +10,12 @@
 //! reporting them, and the source instance's automated backup stops reporting the replication
 //! ([`crate::state::ReplicatedInstanceBackupRecord`]).
 //!
+//! The one thing this call resolves is that replication, from the `SourceDBInstanceArn` alone:
+//! the source instance is never looked up, so every call that names no replication into this
+//! Region — one never enabled, one already stopped, one made in another Region, and one whose
+//! ARN names an instance that does not exist — is refused the SAME modelled
+//! `InvalidDBInstanceStateFault`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -171,58 +177,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
         };
         let mut store = state.lock();
-        // The transitions the clock already made due in both Regions this call reads, for the
-        // reason the start settles both: the state this stop is judged against is the current
-        // one.
+        // The transitions the clock already made due in the Region this call reads \u2014 the
+        // DESTINATION, whose replicated backups are the whole of the state this stop is judged
+        // against: the state it is judged against is the current one.
         store.settle_due_transitions(&destination);
-        if source.region != destination {
-            store.settle_due_transitions(&source.region);
-        }
 
-        // The source instance is resolved FIRST, in the Region its own ARN names: a resource
-        // that does not exist has no replication to stop, and the operation models
-        // `DBInstanceNotFoundFault` for exactly this.
-        let Some(instance) = store
-            .db_instances
-            .get(&(source.region.clone(), source.identifier.clone()))
-        else {
+        // What this operation RESOLVES is the replication into the Region of the call, read
+        // from the ARN alone: the destination's own record carries the source instance's
+        // Region and identifier, so a Region that holds no replication from that instance has
+        // none to stop. The source instance itself is never looked up, which is why an ARN
+        // naming an instance that does not exist is answered the same way as one naming an
+        // instance that is simply not replicating here, and why a stop of a replication
+        // already stopped \u2014 or issued in the wrong destination Region \u2014 reads as "nothing to
+        // stop" rather than as a bad ARN.
+        let replicating = store
+            .replicated_instance_backup_from(&destination, &source)
+            .filter(|backup| backup.is_replicating())
+            .map(|backup| backup.source.dbi_resource_id.clone());
+        let Some(resource_id) = replicating else {
             return Err(
-                StopDBInstanceAutomatedBackupsReplicationErrorModeled::DBInstanceNotFoundFault(
-                    DBInstanceNotFoundFault {
-                        // The source is addressed by an ARN that carries its own Region, as
-                        // the start's own refusal reads it: one Region-qualified sentence for
-                        // both, naming the identifier the ARN carries and the Region it
-                        // points at.
-                        message: Some(crate::state::source_db_instance_not_found_message(
+                StopDBInstanceAutomatedBackupsReplicationErrorModeled::InvalidDBInstanceStateFault(
+                    InvalidDBInstanceStateFault {
+                        message: Some(crate::state::backup_replication_not_to_this_region_message(
                             &input.source_db_instance_arn,
-                            &source.region,
                         )),
                     },
                 )
                 .into(),
             );
         };
-        let identifier = instance.identifier.clone();
-        let resource_id = instance.dbi_resource_id.clone();
-
-        // A source whose backups are not being replicated into this Region has no replication
-        // to stop — one that was never enabled, and one that has already been stopped alike —
-        // which is the state the modelled `InvalidDBInstanceStateFault` reports.
-        let replicating = store
-            .replicated_instance_backup_of(&destination, &resource_id)
-            .is_some_and(crate::state::ReplicatedInstanceBackupRecord::is_replicating);
-        if !replicating {
-            return Err(
-                StopDBInstanceAutomatedBackupsReplicationErrorModeled::InvalidDBInstanceStateFault(
-                    InvalidDBInstanceStateFault {
-                        message: Some(crate::state::backup_replication_not_enabled_message(
-                            &identifier,
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
 
         // The replication is stopped and the backups it had taken are REPORTED BACK as they
         // now stand: this Region retains them, so the record stays and reads `retained` from

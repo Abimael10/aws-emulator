@@ -1,15 +1,36 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: rds.automated-backups-replication-nonexistent-source-instance-rejected rds.deep-rds-sql-truth-mysql-replica-write-rejected-read-only
+Issue-Trace-Ids: rds.automated-backups-replication-nonexistent-source-instance-rejected
 Issue-Shape-Id: com.amazonaws.rds#AmazonRDSv19
 Issue-Key: rds.automated-backups-replication-nonexistent-source-instance-rejected|run#11|AssertionError|assert err_stop.get("Code") == _ERR_STOP_NOT_REPLICATING, (
-Issue-Key: rds.deep-rds-sql-truth-mysql-replica-write-rejected-read-only|run#22|AssertionError|assert rep_host != src_host, f"replica and source must be distinct endpoints; both {rep_host!r}"
 Issue-Commit: b38efef85af881a9c357f09f754c4d7783936268
 
 # rds: 2 net-new causes — StopDBInstanceAutomatedBackupsReplication resolves the source instance before the replication and answers DBInstanceNotFound where AWS answers InvalidDBInstanceState, and a mysql read replica publishes the source instance's endpoint address
 
 > _Note: this issue was identified against the code base at commit `b38efef85af881a9c357f09f754c4d7783936268`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+> _RESOLUTION. Cause 1 is FIXED: `StopDBInstanceAutomatedBackupsReplication` now resolves the
+> replication into the Region of the call from the `SourceDBInstanceArn` alone — it looks no
+> source DB instance up — and refuses `InvalidDBInstanceStateFault` (HTTP 400,
+> `InvalidDBInstanceState`) worded `DB Instance <SourceDBInstanceArn> is not replicating to the
+> current region.` for every call that names no replication in force here: one never enabled,
+> one already stopped, one running into another Region, and an ARN naming no instance alike
+> (`src/ops/stop_db_instance_automated_backups_replication.rs`,
+> `crate::state::backup_replication_not_to_this_region_message`,
+> `tests/all/stop_db_instance_automated_backups_replication_region.rs`)._
+>
+> _Cause 2 is NOT fixed and is NOT this report's any more: a per-instance `Endpoint.Address`
+> for a served engine is blocked on the read-only core — `vendor/server/src/listeners.rs` binds
+> every resource listener on the ONE operator-chosen interface (`bind_std`/`bind_tokio`) and
+> `ResourceListener::host()` is the only address a service may publish — so its replay key
+> (`rds.deep-rds-sql-truth-mysql-replica-write-rejected-read-only|run#22`) and trace id were
+> RE-FILED onto the open report that owns that cause and names the required core change,
+> `issues/things-that-do-not-work/20261118T181500Z-rds-the-published-endpoint-of-a-served-engine-is-the-core-listeners.md`,
+> and removed from the header above so nothing here reads as working. Everything else that
+> check needs is already implemented: the replica has a listener and a port of its own, and the
+> MySQL read-only refusal (`ER_OPTION_PREVENTS_STATEMENT`, 1290) is served by
+> `src/state/data_plane/read_only.rs`._
 
 ## Operation
 StopDBInstanceAutomatedBackupsReplication

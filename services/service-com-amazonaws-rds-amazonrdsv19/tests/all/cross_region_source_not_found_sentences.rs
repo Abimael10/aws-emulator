@@ -10,15 +10,18 @@
 //! answer. An ARN carrying no Region names no Region other than the one the request was
 //! signed for, which is then the Region the source was looked for in.
 //!
-//! The operations the rule covers are the ones that address their source by ARN:
-//! `StartDBInstanceAutomatedBackupsReplication` and
-//! `StopDBInstanceAutomatedBackupsReplication` (the source DB instance), and `CopyDBSnapshot`
+//! The operations the rule covers are the ones that look their source up BY ARN:
+//! `StartDBInstanceAutomatedBackupsReplication` (the source DB instance), and `CopyDBSnapshot`
 //! and `CopyDBClusterSnapshot` (the source snapshot), which word it through the same
-//! template.
+//! template. `StopDBInstanceAutomatedBackupsReplication` looks NO source instance up — it
+//! resolves the replication into the Region of the call, which is the only thing it acts on —
+//! so the same ARN the start answers this Region-qualified 404 for the stop answers its own
+//! `InvalidDBInstanceState` for; the rows below assert that contrast, and
+//! `stop_db_instance_automated_backups_replication_region` pins the stop's own rule.
 //!
 //! The table below spans what the rule generalises over: the Region the source ARN points at,
-//! the Region the call itself was made to, the identifier the ARN carries, an ARN with no
-//! Region segment at all, and both operations of the replication pair. One case proves the
+//! the Region the call itself was made to, the identifier the ARN carries, and an ARN with no
+//! Region segment at all. One case proves the
 //! Region in the sentence is the ARN's rather than any Region the identifier does exist in: an
 //! instance is created in one Region and then addressed by an ARN naming another. A separate
 //! test pins the other half of the Region-less rule — such an ARN is RESOLVED in the Region of
@@ -110,9 +113,10 @@ async fn stop_replication(
     .await
 }
 
-/// Both operations of the automated-backups-replication pair word a source DB instance they
-/// cannot find with the Region-qualified sentence, naming the identifier and the Region the
-/// request's own `SourceDBInstanceArn` carries.
+/// The START of the automated-backups-replication pair words a source DB instance it cannot
+/// find with the Region-qualified sentence, naming the identifier and the Region the request's
+/// own `SourceDBInstanceArn` carries. The STOP of the same pair looks no source instance up,
+/// so the same ARN is refused its own state sentence instead.
 #[tokio::test]
 async fn a_missing_replication_source_is_refused_with_its_arn_region() {
     let router = emulator_with_an_instance_in("us-west-2", "emu-xr-exists-west").await;
@@ -174,24 +178,38 @@ async fn a_missing_replication_source_is_refused_with_its_arn_region() {
             "Requested DB Instance {} not found in source region {}",
             row.identifier, row.source_region
         );
-        for (action, response) in [
-            (
-                "StartDBInstanceAutomatedBackupsReplication",
-                start_replication(&router, row.request_region, &row.source_arn).await,
-            ),
-            (
-                "StopDBInstanceAutomatedBackupsReplication",
-                stop_replication(&router, row.request_region, &row.source_arn).await,
-            ),
-        ] {
-            let case = format!("{action}: {}", row.case);
-            let refused = expect_error(&case, response, 404, NOT_FOUND);
-            assert_eq!(
-                text(&refused, "Message"),
-                expected,
-                "case {case:?}: expected {expected:?}, got {refused}"
-            );
-        }
+        let case = format!("StartDBInstanceAutomatedBackupsReplication: {}", row.case);
+        let refused = expect_error(
+            &case,
+            start_replication(&router, row.request_region, &row.source_arn).await,
+            404,
+            NOT_FOUND,
+        );
+        assert_eq!(
+            text(&refused, "Message"),
+            expected,
+            "case {case:?}: expected {expected:?}, got {refused}"
+        );
+
+        // The stop resolves the replication into the Region of the call and nothing else, so
+        // the ARN the start could not resolve is refused the state fault here, worded from the
+        // ARN itself.
+        let case = format!("StopDBInstanceAutomatedBackupsReplication: {}", row.case);
+        let refused = expect_error(
+            &case,
+            stop_replication(&router, row.request_region, &row.source_arn).await,
+            400,
+            INVALID_STATE,
+        );
+        let expected = format!(
+            "DB Instance {} is not replicating to the current region.",
+            row.source_arn
+        );
+        assert_eq!(
+            text(&refused, "Message"),
+            expected,
+            "case {case:?}: expected {expected:?}, got {refused}"
+        );
     }
 }
 
@@ -224,7 +242,9 @@ async fn a_region_less_source_arn_resolves_in_the_region_of_the_call() {
         "case {case:?}: expected {expected:?}, got {refused}"
     );
 
-    // The stop finds it too, and there is no replication into this Region to stop.
+    // The stop resolves no source instance at all: what it looks for is a replication into
+    // the Region of the call, and there is none, so its own sentence names the ARN the request
+    // carried.
     let case = "a stop whose Region-less ARN names an instance in the Region of the call";
     let refused = expect_error(
         case,
@@ -232,8 +252,7 @@ async fn a_region_less_source_arn_resolves_in_the_region_of_the_call() {
         400,
         INVALID_STATE,
     );
-    let expected =
-        format!("Automated backup replication is not enabled for the DB instance {identifier}");
+    let expected = format!("DB Instance {source_arn} is not replicating to the current region.");
     assert_eq!(
         text(&refused, "Message"),
         expected,

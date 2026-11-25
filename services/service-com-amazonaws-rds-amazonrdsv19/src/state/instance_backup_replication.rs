@@ -107,15 +107,19 @@ pub fn same_region_backup_replication_message(source_arn: &str) -> String {
     )
 }
 
-/// What `StopDBInstanceAutomatedBackupsReplication` refuses a source DB instance whose
-/// automated backups are not being replicated into the Region of the call with.
+/// What `StopDBInstanceAutomatedBackupsReplication` refuses a call that names no replication
+/// INTO the Region the call was made to with.
 ///
-/// There is no replication to stop, which is the state the modelled
-/// `InvalidDBInstanceStateFault` ("the DB instance isn't in a valid state") reports. Worded as
-/// the statement this front door makes about a DB instance whose automated backups a call
-/// needs and does not find, with the source instance's identifier as its one variable part.
-pub fn backup_replication_not_enabled_message(identifier: &str) -> String {
-    format!("Automated backup replication is not enabled for the DB instance {identifier}")
+/// The question that operation asks is about the Region of the call — is the instance the ARN
+/// names replicating its automated backups into THIS Region? — so the one state it can refuse
+/// is "nothing is replicating here", which is the modelled `InvalidDBInstanceStateFault` ("the
+/// DB instance isn't in a valid state"). It is the answer whether the replication was never
+/// enabled, has already been stopped, or the instance the ARN names does not exist at all:
+/// none of them is a replication into this Region. The sentence's one variable part is the
+/// request's `SourceDBInstanceArn`, reproduced whole, because the ARN is all this call
+/// resolves.
+pub fn backup_replication_not_to_this_region_message(source_arn: &str) -> String {
+    format!("DB Instance {source_arn} is not replicating to the current region.")
 }
 
 /// A REPLICATED automated backup: the automated backups of one DB instance, replicated into
@@ -327,6 +331,32 @@ impl ComAmazonawsRdsAmazonrdsv19State {
     ) -> Option<&ReplicatedInstanceBackupRecord> {
         self.db_instance_automated_backup_replications
             .get(&(region.to_string(), dbi_resource_id.to_string()))
+    }
+
+    /// The automated backups replicated into `region` FROM the source DB instance a
+    /// `SourceDBInstanceArn` names, resolved from the ARN alone: the record's own copy of the
+    /// source carries that instance's Region and identifier
+    /// ([`RetainedInstanceBackupRecord`]), so a replication into this Region is found without
+    /// the source instance being looked up — which is what lets a Region answer "nothing is
+    /// replicating here" for an ARN naming an instance this store holds no record of at all.
+    ///
+    /// Both halves of what the ARN names — the Region segment and the identifier — are matched
+    /// without regard to case, as every name this service resolves against stored state is, so
+    /// a replication in force is found by the ARN however the request spells it.
+    pub fn replicated_instance_backup_from(
+        &self,
+        region: &str,
+        source: &SourceDbInstance,
+    ) -> Option<&ReplicatedInstanceBackupRecord> {
+        self.replicated_instance_backups_in(region)
+            .into_iter()
+            .find(|backup| {
+                backup.source.region.eq_ignore_ascii_case(&source.region)
+                    && backup
+                        .source
+                        .db_instance_identifier
+                        .eq_ignore_ascii_case(&source.identifier)
+            })
     }
 
     /// Whether this store has ROOM to replicate the backups of the instance whose resource id

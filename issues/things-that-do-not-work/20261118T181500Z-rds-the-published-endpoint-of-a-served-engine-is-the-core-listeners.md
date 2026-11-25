@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: rds.aurora-writer-reader-endpoint-query-routing rds.deep-rds-sql-truth-force-ssl-plaintext-login-rejected rds.snaprestore-final-snapshot-on-delete-restores-rows rds.rds-sql-connectivity-postgres-mysql rds.create-shard-group-wrong-cluster-state-rejected rds.read-replica-promote-lifecycle rds.read-replica-replication-query-and-promote rds.replica-uncommitted-primary-write-absent-until-commit rds.deploy-rds-2-cfn-mysql-sql-then-dbname-change-replaces-instance
+Issue-Trace-Ids: rds.aurora-writer-reader-endpoint-query-routing rds.deep-rds-sql-truth-force-ssl-plaintext-login-rejected rds.snaprestore-final-snapshot-on-delete-restores-rows rds.rds-sql-connectivity-postgres-mysql rds.create-shard-group-wrong-cluster-state-rejected rds.read-replica-promote-lifecycle rds.read-replica-replication-query-and-promote rds.replica-uncommitted-primary-write-absent-until-commit rds.deploy-rds-2-cfn-mysql-sql-then-dbname-change-replaces-instance rds.deep-rds-sql-truth-mysql-replica-write-rejected-read-only
 Issue-Key: rds.aurora-writer-reader-endpoint-query-routing|run#30|AssertionError|assert port == 5432, f"aurora-postgresql must listen on 5432, got {port!r}"
 Issue-Key: rds.aurora-writer-reader-endpoint-query-routing|run#23|AssertionError|assert writer_ep != reader_ep, (
 Issue-Key: rds.deep-rds-sql-truth-force-ssl-plaintext-login-rejected|run#21|AssertionError|assert port == _PORT, f"postgres must listen on {_PORT}; DescribeDBInstances says {port!r}"
@@ -14,6 +14,7 @@ Issue-Key: rds.read-replica-promote-lifecycle|_wait_until#12|Timeout|last = prob
 Issue-Key: rds.read-replica-replication-query-and-promote|run#24|AssertionError|assert rep_addr != src_addr, (
 Issue-Key: rds.replica-uncommitted-primary-write-absent-until-commit|run#14|AssertionError|assert rep_addr != src_addr, (
 Issue-Key: rds.deploy-rds-2-cfn-mysql-sql-then-dbname-change-replaces-instance|run#55|AssertionError|assert host_b != host_a, f"replacement kept the same Endpoint.Address {host_a!r}"
+Issue-Key: rds.deep-rds-sql-truth-mysql-replica-write-rejected-read-only|run#22|AssertionError|assert rep_host != src_host, f"replica and source must be distinct endpoints; both {rep_host!r}"
 Issue-Commit: 8b0f35809934c567f1bf7b94b8ce8845151fefb8
 
 # rds: the endpoint a served engine publishes cannot be both AWS's (engine port, per-resource DNS address) and dialable, and three checks die in a wait this fixer could not place
@@ -73,13 +74,27 @@ rds.replica-uncommitted-primary-write-absent-until-commit (a read replica advert
 `127.0.0.1`, the same host as the source it was made from, so a reader cannot be pointed at
 it), rds.deploy-rds-2-cfn-mysql-sql-then-dbname-change-replaces-instance (the instance
 CloudFormation provisions for a `DBName` replacement publishes the replaced instance's
-address).
+address), rds.deep-rds-sql-truth-mysql-replica-write-rejected-read-only (a mysql read
+replica advertises the same `127.0.0.1` as its source, so the session that would be refused
+read-only is never opened).
 
 > _Those last three keys were re-filed here from
 > `issues/things-that-now-work/20261115T181413Z-rds-3-net-new-behavioral-causes-every-db.md`,
 > whose causes 2 and 3 are fixed and whose cause 1 is this same cause: two live DB instances
 > of a SERVED engine share the one address the core binds. They are kept on this report so
 > they are not recorded as working while the core change above is outstanding._
+
+> _`rds.deep-rds-sql-truth-mysql-replica-write-rejected-read-only` was re-filed here from
+> `issues/things-that-now-work/20261122T085622Z-rds-2-net-new-causes-stopdbinstanceautomatedbackupsreplication-resolves-the.md`,
+> whose cause 1 (the Stop leg's refusal) is fixed and whose cause 2 is this same cause: a
+> mysql read replica and the source it replicates publish the one address the core binds
+> (`127.0.0.1`), so that check cannot open a session against the replica and never reaches
+> the read-only refusal it was written for. The replica's own read-only enforcement IS
+> implemented (`src/state/data_plane/read_only.rs`, `src/state/data_plane/replication.rs`,
+> exercised by `tests/all/read_only_engine_endpoints.rs`) and the replica already has a
+> listener and a port of its own; what is missing is the per-resource ADDRESS the core change
+> above is required for. The key is kept here so it is not recorded as working until that
+> change lands._
 
 === Cause 2 of 4: the Limitless shard-group check never gets past its cluster wait ===
 AWS: `CreateDBShardGroup` against a cluster that is not available is refused

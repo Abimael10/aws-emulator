@@ -116,7 +116,10 @@ impl ReplicationCase {
 
 /// `CreateDBInstance` in `region`, waiting until the instance is `available`, and the
 /// `DbiResourceId` and `DBInstanceArn` it reports.
-async fn available_instance(
+///
+/// `pub(crate)` so the sibling suite that drives the STOP leg's own refusal reaches a source
+/// instance through this one setup rather than growing a second copy of it.
+pub(crate) async fn available_instance(
     router: &MultiServiceRouter,
     case: &str,
     region: &str,
@@ -183,7 +186,7 @@ async fn describe_instance(
 
 /// `StartDBInstanceAutomatedBackupsReplication` in `destination`, for the source instance
 /// `source_arn` names.
-async fn start_replication(
+pub(crate) async fn start_replication(
     router: &MultiServiceRouter,
     destination: &str,
     source_arn: &str,
@@ -202,7 +205,7 @@ async fn start_replication(
 }
 
 /// `StopDBInstanceAutomatedBackupsReplication` in `destination`.
-async fn stop_replication(
+pub(crate) async fn stop_replication(
     router: &MultiServiceRouter,
     destination: &str,
     source_arn: &str,
@@ -218,7 +221,7 @@ async fn stop_replication(
 
 /// `DescribeDBInstanceAutomatedBackups` in `region`, narrowed to the backups of the source
 /// instance whose resource id is `resource_id`.
-async fn describe_backups_of(
+pub(crate) async fn describe_backups_of(
     router: &MultiServiceRouter,
     region: &str,
     resource_id: &str,
@@ -249,7 +252,7 @@ async fn delete_backups(
 }
 
 /// The one `<DBInstanceAutomatedBackup>` subtree a report carries.
-fn the_backup(case: &str, body: &str) -> String {
+pub(crate) fn the_backup(case: &str, body: &str) -> String {
     let reported = subtrees(body, "DBInstanceAutomatedBackup");
     assert_eq!(
         reported.len(),
@@ -687,7 +690,8 @@ async fn stop_retains_the_replicated_backups_and_can_be_started_again() {
          {at_source}"
     );
 
-    // A second stop has no replication to stop.
+    // A second stop has no replication to stop: the Region of the call no longer has one from
+    // this source, which is the one state this operation refuses.
     let refused = expect_error(
         case,
         stop_replication(&router, destination, &source_arn).await,
@@ -696,8 +700,8 @@ async fn stop_retains_the_replicated_backups_and_can_be_started_again() {
     );
     assert_eq!(
         text(&refused, "Message"),
-        format!("Automated backup replication is not enabled for the DB instance {identifier}"),
-        "case {case:?}: the refusal must name the source instance, got {refused}"
+        format!("DB Instance {source_arn} is not replicating to the current region."),
+        "case {case:?}: the refusal must name the ARN the request carried, got {refused}"
     );
 
     // Starting again begins a new replication into the same Region, of the source as it
@@ -907,24 +911,34 @@ async fn a_source_that_cannot_be_replicated_is_refused() {
     // A well-formed DB instance ARN naming an instance that was never created.
     let missing_identifier = "emu-abr-never-created";
     let missing = format!("arn:aws:rds:{region}:{ACCOUNT}:db:{missing_identifier}");
-    for (case, response) in [
-        (
-            "a start on a source instance that does not exist",
-            start_replication(&router, destination, &missing, &[]).await,
-        ),
-        (
-            "a stop on a source instance that does not exist",
-            stop_replication(&router, destination, &missing).await,
-        ),
-    ] {
-        let refused = expect_error(case, response, 404, NOT_FOUND);
-        assert_eq!(
-            text(&refused, "Message"),
-            format!("Requested DB Instance {missing_identifier} not found in source region {region}"),
-            "case {case:?}: the refusal must name the instance the source ARN carries and the \
-             Region that ARN points at, got {refused}"
-        );
-    }
+    // The START resolves that source instance, so it is refused the modelled not-found fault.
+    let case = "a start on a source instance that does not exist";
+    let refused = expect_error(
+        case,
+        start_replication(&router, destination, &missing, &[]).await,
+        404,
+        NOT_FOUND,
+    );
+    assert_eq!(
+        text(&refused, "Message"),
+        format!("Requested DB Instance {missing_identifier} not found in source region {region}"),
+        "case {case:?}: the refusal must name the instance the source ARN carries and the \
+         Region that ARN points at, got {refused}"
+    );
+    // The STOP resolves the replication into the Region of the call instead, and there is
+    // none — the same answer as for an instance that exists and is not replicating here.
+    let case = "a stop on a source instance that does not exist";
+    let refused = expect_error(
+        case,
+        stop_replication(&router, destination, &missing).await,
+        400,
+        INVALID_STATE,
+    );
+    assert_eq!(
+        text(&refused, "Message"),
+        format!("DB Instance {missing} is not replicating to the current region."),
+        "case {case:?}: the refusal must name the ARN the request carried, got {refused}"
+    );
 
     // A value that is not the ARN of a DB instance at all: a bare identifier, an ARN of
     // another resource type of this service, and an ARN of another service.
@@ -1045,7 +1059,7 @@ async fn a_source_that_cannot_be_replicated_is_refused() {
     );
     assert_eq!(
         text(&refused, "Message"),
-        "Automated backup replication is not enabled for the DB instance emu-abr-never-started",
-        "case {case:?}: the refusal must name the source instance, got {refused}"
+        format!("DB Instance {arn} is not replicating to the current region."),
+        "case {case:?}: the refusal must name the ARN the request carried, got {refused}"
     );
 }
