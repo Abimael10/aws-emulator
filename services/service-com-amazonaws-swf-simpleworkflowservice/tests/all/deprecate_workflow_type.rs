@@ -38,6 +38,14 @@ const MAX_TYPE_VERSION_LEN: usize = 64;
 const TASK_LIST: &str = "primary";
 const CHILD_POLICY: &str = "TERMINATE";
 
+/// `ListWorkflowTypes`, the per-domain listing that selects on the very
+/// `RegistrationStatus` this suite's calls move, which is why it is a child of this suite
+/// rather than a second suite beside it. The `#[path]` is what keeps it one: this crate's
+/// `tests/all.rs` declares the suites directly under `tests/all/`, and a module of a
+/// `#[path]`-declared file resolves next to that file unless it says otherwise.
+#[path = "deprecate_workflow_type/workflow_type_listing.rs"]
+mod workflow_type_listing;
+
 /// The `workflowType` member of a request addressing one type.
 fn type_ref(name: &str, version: &str) -> Value {
     json!({ "name": name, "version": version })
