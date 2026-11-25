@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEndpointConfigs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEndpointConfigs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEndpointConfigs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: filters, sorts and pages the endpoint configurations stored in
+//! `crate::state`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -146,20 +139,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEndpointConfigs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEndpointConfigsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEndpointConfigs"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let sort_by = input
+            .sort_by
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SORT_BY);
+        if !ENDPOINT_CONFIG_SORT_KEY_VALUES.contains(&sort_by) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortBy must be one of {}; got \"{sort_by}\".",
+                ENDPOINT_CONFIG_SORT_KEY_VALUES.join(", ")
+            )));
+        }
+        let sort_order = input
+            .sort_order
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SORT_ORDER);
+        if !ORDER_KEY_VALUES.contains(&sort_order) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortOrder must be one of {}; got \"{sort_order}\".",
+                ORDER_KEY_VALUES.join(", ")
+            )));
+        }
+        let descending = sort_order == crate::state::ORDER_DESCENDING;
+
+        let after = input.creation_time_after.map(crate::state::timestamp_key);
+        let before = input.creation_time_before.map(crate::state::timestamp_key);
+
+        // A pure READ: an endpoint configuration carries no status the clock moves, so
+        // this listing reports exactly what `CreateEndpointConfig` stored and what
+        // `DescribeEndpointConfig` replays, and writes nothing.
+        let store = state.lock();
+        let mut matching: Vec<&crate::state::EndpointConfig> = store
+            .endpoint_configs
+            .values()
+            .filter(|config| {
+                // `NameContains` selects on a SUBSTRING of the name ("returns only
+                // endpoint configurations whose name contains the specified string"), so a
+                // needle equal to a whole name selects that one configuration alone.
+                input
+                    .name_contains
+                    .as_deref()
+                    .is_none_or(|needle| config.name.contains(needle))
+            })
+            .filter(|config| {
+                // Both bounds are inclusive — `CreationTimeAfter` selects a creation time
+                // "greater than or equal to the specified time" — so an instant copied
+                // straight out of a prior response's `CreationTime` still selects the
+                // configuration carrying it.
+                let created =
+                    crate::state::timestamp_key(crate::state::timestamp(config.creation_time));
+                after.is_none_or(|bound| created >= bound)
+                    && before.is_none_or(|bound| created <= bound)
+            })
+            .collect();
+        // `SortOrder` reverses the SORT KEY only. The tie-break stays `EndpointConfigName`
+        // ascending in both directions, so two configurations created in the same instant
+        // keep one order whichever way the page is sorted — and a `NextToken` resolved
+        // against a freshly computed result set lands on the same boundary.
+        matching.sort_by(|left, right| {
+            let by_key = if sort_by == "Name" {
+                left.name.cmp(&right.name)
+            } else {
+                crate::state::timestamp_key(crate::state::timestamp(left.creation_time)).cmp(
+                    &crate::state::timestamp_key(crate::state::timestamp(right.creation_time)),
+                )
+            };
+            let by_key = if descending { by_key.reverse() } else { by_key };
+            by_key.then_with(|| left.name.cmp(&right.name))
+        });
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resumed_after = crate::state::decode_page_token(token)
+                    .and_then(|name| matching.iter().position(|config| config.name == name))
+                    .ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::validation(crate::state::STALE_PAGE_TOKEN)
+                    })?;
+                resumed_after + 1
+            }
+        };
+
+        // This operation documents no `MaxResults` default, so an absent one takes the
+        // service's own ceiling and an explicit one is capped by it: no single call can
+        // serialise the whole store. The token below is emitted whenever anything is left,
+        // so a paginating client walks the full result set exactly once either way.
+        let start = start.min(matching.len());
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_PAGE_SIZE, |max| {
+                max.clamp(1, crate::state::MAX_PAGE_SIZE)
+            })
+            .unsigned_abs() as usize;
+        let end = start.saturating_add(page_size).min(matching.len());
+        let page = &matching[start..end];
+
+        let next_token = match page.last() {
+            // A token only where a further page exists, so a paginating client stops.
+            Some(last) if end < matching.len() => Some(crate::state::encode_page_token(&last.name)),
+            _ => None,
+        };
+
+        Ok(ListEndpointConfigsOutput {
+            endpoint_configs: page
+                .iter()
+                .map(|config| EndpointConfigSummary {
+                    endpoint_config_name: config.name.clone(),
+                    endpoint_config_arn: config.arn.clone(),
+                    creation_time: crate::state::timestamp(config.creation_time),
+                })
+                .collect(),
+            next_token,
+        })
     }
 }
+
