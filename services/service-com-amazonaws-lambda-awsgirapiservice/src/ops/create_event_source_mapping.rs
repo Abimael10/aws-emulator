@@ -118,7 +118,9 @@
 //! ([`crate::state::drive_sqs_pollers`]) that takes each batch out of the queue and hands
 //! it to the mapping's function. A mapping on an Amazon MQ broker is armed the same way
 //! ([`crate::state::drive_mq_pollers`]), consuming the one `Queues` entry it names on that
-//! broker. Nothing waits for a poll here — each mapping's poller runs
+//! broker, and a mapping on an Amazon MSK cluster the same way again
+//! ([`crate::state::drive_kafka_pollers`]), consuming each partition of each topic its
+//! `Topics` names. Nothing waits for a poll here — each mapping's poller runs
 //! on its own clock, so a mapping's deliveries wait on no other mapping — and what one poll
 //! does, including why an unprocessed batch is left on the queue, is documented in
 //! [`crate::state::sqs_poller`] and [`crate::state::mq_poller`].
@@ -1078,6 +1080,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         drop(store);
         crate::state::drive_sqs_pollers(ctx, &self.engine);
         crate::state::drive_mq_pollers(ctx, &self.engine);
+        crate::state::drive_kafka_pollers(ctx, &self.engine);
         crate::state::event_source_poller::drive_mapping(ctx, &self.engine, &uuid);
 
         Ok(reported)

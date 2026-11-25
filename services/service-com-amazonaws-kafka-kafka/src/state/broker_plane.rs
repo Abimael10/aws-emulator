@@ -1001,6 +1001,25 @@ pub struct DataPlaneTopic {
     pub replication_factor: i32,
 }
 
+/// Where an in-process CONSUMER of this cluster has got to in one partition, as it commits
+/// that position ([`ComAmazonawsKafkaKafkaState::data_plane_commit_offset`]): the group it
+/// consumes as and the member it is of that group, the partition it read, and the offset it
+/// reads FROM next — which is what a committed offset is.
+#[derive(Debug, Clone, Copy)]
+pub struct CommittedPosition<'a> {
+    /// The group the position belongs to: `GroupId` as a client of that group names it.
+    pub group_id: &'a str,
+    /// The member of that group the commit speaks for, and `""` for a client that stores
+    /// offsets in the group without joining it.
+    pub member_id: &'a str,
+    /// The topic and partition the position is in.
+    pub topic: &'a str,
+    /// See [`Self::topic`].
+    pub partition: i32,
+    /// The offset the group reads from next.
+    pub next_offset: i64,
+}
+
 /// What an accepted produce of one partition answers: where the records landed, and the
 /// instant the BROKER stamped them at for a topic that stamps its records itself.
 #[derive(Debug, Clone, Copy)]
@@ -1234,5 +1253,104 @@ impl ComAmazonawsKafkaKafkaState {
     ) -> Result<(i64, i64), PartitionRefusal> {
         let fetched = self.data_plane_fetch(cluster_arn, topic, partition, 0, 0, now)?;
         Ok((fetched.log_start_offset, fetched.high_watermark))
+    }
+
+    /// Store the position `at` states as the one the consumer group it names on the cluster
+    /// `cluster_arn` has committed in one partition, answering whether the group took it.
+    ///
+    /// The commit an in-process CONSUMER of this cluster makes — a Lambda event source
+    /// mapping reading this cluster's topic — into the same group state a client's own
+    /// `OffsetCommit` writes and `OffsetFetch` reads, so what such a consumer has handled
+    /// is what every reader of that group is told.
+    ///
+    /// Refused — answering `false`, storing nothing — for a group id past
+    /// [`groups::MAX_GROUP_ID_BYTES`], for a cluster already holding
+    /// [`groups::MAX_GROUPS_PER_CLUSTER`] groups when the id names none of them, and for a
+    /// commit the group's own membership fences out: one speaking for a member it does not
+    /// hold, and one quoting no member at all while members hold the group
+    /// ([`groups::ConsumerGroup::commit_offset`]) — the bounds and the fencing the wire's own
+    /// commit is held to.
+    pub fn data_plane_commit_offset(
+        &mut self,
+        cluster_arn: &str,
+        at: &CommittedPosition<'_>,
+        now: SystemTime,
+    ) -> bool {
+        self.consumer_group_in(cluster_arn, at.group_id)
+            .is_some_and(|group| {
+                group.commit_offset(at.member_id, at.topic, at.partition, at.next_offset, now)
+            })
+    }
+
+    /// Admit an in-process CONSUMER of this cluster into the group `group_id` names, holding
+    /// the partitions `assigned` names of the topics it subscribed to, and answer the member
+    /// id the coordinator gave it.
+    ///
+    /// The join an event source mapping of the Lambda emulator makes to consume this
+    /// cluster's topic: such a consumer is a member of the group it reads as, so every reader
+    /// of that group — `DescribeGroups`, `ListGroups`, `OffsetFetch` — is told about it
+    /// exactly as it is told about a member that joined over the wire
+    /// ([`groups::ConsumerGroup::admit_consumer`]). Repeating the call renews that member's
+    /// session, which is what each pass of the consumer does.
+    ///
+    /// `None` — joining nothing — for a group id past [`groups::MAX_GROUP_ID_BYTES`], for a
+    /// cluster already holding [`groups::MAX_GROUPS_PER_CLUSTER`] groups when the id names
+    /// none of them, and for a group another member already holds.
+    pub fn data_plane_join_group(
+        &mut self,
+        cluster_arn: &str,
+        group_id: &str,
+        client_id: &str,
+        topics: &[String],
+        assigned: &[(String, Vec<i32>)],
+        now: SystemTime,
+    ) -> Option<String> {
+        self.consumer_group_in(cluster_arn, group_id)?
+            .admit_consumer(client_id, topics, assigned, now)
+    }
+
+    /// Take the in-process consumer `member_id` names out of the group `group_id` names, as a
+    /// consumer that stands down does ([`groups::ConsumerGroup::release_consumer`]).
+    pub fn data_plane_leave_group(
+        &mut self,
+        cluster_arn: &str,
+        group_id: &str,
+        member_id: &str,
+        now: SystemTime,
+    ) {
+        let key = (cluster_arn.to_string(), group_id.to_string());
+        if let Some(group) = self.consumer_groups.get_mut(&key) {
+            group.release_consumer(member_id, now);
+        }
+    }
+
+    /// The group `group_id` names on the cluster `cluster_arn`, registering it when this
+    /// endpoint holds none of that name — the same lookup the wire's own group calls make,
+    /// held to the same two bounds: a group id past [`groups::MAX_GROUP_ID_BYTES`], and a
+    /// cluster already coordinating [`groups::MAX_GROUPS_PER_CLUSTER`] groups, register
+    /// nothing.
+    fn consumer_group_in(
+        &mut self,
+        cluster_arn: &str,
+        group_id: &str,
+    ) -> Option<&mut groups::ConsumerGroup> {
+        if group_id.is_empty() || group_id.len() > groups::MAX_GROUP_ID_BYTES {
+            return None;
+        }
+        let key = (cluster_arn.to_string(), group_id.to_string());
+        if !self.consumer_groups.contains_key(&key) {
+            // The ceiling is THIS cluster's: the store is keyed by (cluster, group), so the
+            // groups of one cluster are the ones counted against it.
+            let held_here = self
+                .consumer_groups
+                .keys()
+                .filter(|(cluster, _)| cluster == cluster_arn)
+                .count();
+            if held_here >= groups::MAX_GROUPS_PER_CLUSTER {
+                return None;
+            }
+            self.consumer_groups.insert(key.clone(), Default::default());
+        }
+        self.consumer_groups.get_mut(&key)
     }
 }

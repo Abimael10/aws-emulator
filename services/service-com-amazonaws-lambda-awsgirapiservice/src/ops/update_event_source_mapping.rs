@@ -96,9 +96,12 @@
 //!
 //! An update is also what RESUMES polling, or re-targets it onto another queue, so it arms
 //! the mapping's own poller exactly as the create does
-//! ([`crate::state::drive_sqs_pollers`]); a poller reads only while its mapping reports
+//! ([`crate::state::drive_sqs_pollers`], [`crate::state::drive_mq_pollers`],
+//! [`crate::state::drive_kafka_pollers`]); a poller reads only while its mapping reports
 //! `Enabled` at the instant of each pass, so a mapping this call paused stops being polled
-//! when the clock settles it into `Disabled`, and its poller stands down.
+//! when the clock settles it into `Disabled`, and its poller stands down — and, for a mapping
+//! on an Amazon MSK cluster, leaves the consumer group it was reading as, keeping the offsets
+//! it committed so the resumed poller reads on from them.
 //!
 //! ## Shape of an operation
 //!
@@ -814,6 +817,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         drop(store);
         crate::state::drive_sqs_pollers(ctx, &self.engine);
         crate::state::drive_mq_pollers(ctx, &self.engine);
+        crate::state::drive_kafka_pollers(ctx, &self.engine);
         crate::state::event_source_poller::drive_mapping(ctx, &self.engine, &input.uuid);
 
         Ok(reported)

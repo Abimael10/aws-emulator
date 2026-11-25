@@ -41,6 +41,12 @@ service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 # owning service's state TYPE. The same store holds the QUEUES of each broker's own data
 # plane, which the mapping's poller consumes (`state::mq_poller`).
 service-com-amazonaws-mq-mq = { workspace = true }
+# An event source mapping on an Amazon MSK cluster CONSUMES the topics it names, and a
+# cluster's topics and their partition logs live in the Amazon MSK emulator's own store
+# (`state::kafka_poller`): the records are read through the same data-plane reading that
+# cluster's Apache Kafka wire protocol serves a fetch from, reached through the shared engine,
+# which needs the owning service's state TYPE.
+service-com-amazonaws-kafka-kafka = { workspace = true }
 # The AMQP 0-9-1 basic properties a message of such a broker carries, which is how the
 # message is stored and what the event a RabbitMQ mapping hands its function reports for it
 # (`state::mq_poller`): the same codec the broker's own wire is served with, so one process
@@ -597,6 +603,14 @@ service-com-amazonaws-scheduler-awschronosservice = { workspace = true }
 # hands the same sentence over already unescaped, so the two are held against each other
 # through this maintained unescaper rather than a hand-written one.
 quick-xml = "0.41"
+# The Apache Kafka wire protocol, CLIENT side: the records an MSK event source mapping consumes
+# are produced over the bootstrap address the cluster published, so the suite over that mapping
+# frames a real `Produce` on a socket of that address with the same implementation the cluster's
+# own broker endpoint is served with — one reading of the protocol in this process.
+kafka-protocol = { version = "0.18", default-features = false, features = [
+    "broker",
+    "client",
+] }
 
 [lints]
 workspace = true

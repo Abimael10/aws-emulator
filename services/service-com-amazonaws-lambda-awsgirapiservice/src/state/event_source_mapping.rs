@@ -750,8 +750,10 @@ pub struct EventSourceMappingRecord {
     /// at; see [`ShardCursor::AtTimestamp`].
     pub created_at: SystemTime,
     /// Where this mapping reads next in each shard it has already read from, keyed by
-    /// shard id; a shard absent from the map has not been read yet and is read from
-    /// [`Self::initial_shard_cursor`]. Written by the poller
+    /// shard id — and, for a mapping on a Kafka source, in each PARTITION it has already
+    /// read from, keyed by the topic and partition that source identifies one by
+    /// ([`crate::state::kafka_poller`]); a position absent from the map has not been read
+    /// yet and is read from [`Self::initial_shard_cursor`]. Written by the poller
     /// ([`crate::state::event_source_poller`]) as it checkpoints past each delivered
     /// batch.
     pub shard_cursors: BTreeMap<String, ShardCursor>,

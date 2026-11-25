@@ -56,6 +56,10 @@ use ::kafka_protocol::ResponseError;
 /// (Apache Kafka's `OffsetFetch`: a partition with no committed offset answers `-1`).
 pub const NO_COMMITTED_OFFSET: i64 = -1;
 
+/// The generation a call that quotes none carries — a client acting on a group it has not
+/// joined (Apache Kafka's `OffsetCommit`: such a request states `-1`).
+const NO_GENERATION: i32 = -1;
+
 /// The most members one group holds, and the most offsets it keeps. CHOSEN as
 /// process-safety bounds, not Apache Kafka settings: both come from clients, so without
 /// a ceiling one client would size the store.
@@ -806,6 +810,213 @@ impl ConsumerGroup {
             .collect();
         OffsetFetchResponse::default().with_topics(topics)
     }
+
+    /// Store the offset `offset` as the group's committed position in one partition at `now`,
+    /// answering whether the group took it.
+    ///
+    /// The same `offsets` an `OffsetCommit` writes and an `OffsetFetch` reads, held to the
+    /// same ceiling ([`MAX_COMMITTED_PARTITIONS_PER_GROUP`]) and fenced by the same reading of
+    /// the group's membership ([`Self::commit_refusal`], over the members the clock still
+    /// leaves it), for the commit a consumer running INSIDE this process makes as the member
+    /// `member_id` names ([`Self::admit_consumer`]) — an event source mapping of the Lambda
+    /// emulator consuming this cluster's topic. Such a consumer commits at the generation it
+    /// is a member of, so what the fencing decides here is WHO the commit speaks for: a member
+    /// the group no longer holds — one whose session ran out, or that a rebalance evicted —
+    /// writes nothing. An empty `member_id` is a client storing offsets in a group without
+    /// joining it, admitted only while no member holds the group.
+    pub fn commit_offset(
+        &mut self,
+        member_id: &str,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+        now: SystemTime,
+    ) -> bool {
+        self.expire_members(now);
+        let generation = match member_id.is_empty() {
+            true => NO_GENERATION,
+            false => self.generation,
+        };
+        if self.commit_refusal(member_id, generation).is_some() {
+            return false;
+        }
+        let key = (topic.to_string(), partition);
+        if !self.offsets.contains_key(&key)
+            && self.offsets.len() >= MAX_COMMITTED_PARTITIONS_PER_GROUP
+        {
+            return false;
+        }
+        self.offsets.insert(key, offset);
+        true
+    }
+
+    /// Admit the consumer `client_id` names as a MEMBER of this group, holding the
+    /// partitions `assigned` names of the topics it subscribed to, and answer the member id
+    /// the coordinator gave it — or `None` for a group this consumer may not be admitted
+    /// to.
+    ///
+    /// What it is for: a consumer running INSIDE this process — an event source mapping of
+    /// the Lambda emulator consuming this cluster's topic — is a consumer of the group it
+    /// reads as, so a reader of that group is told what every reader of a group is told
+    /// about a member: the client it goes by, the subscription it joined with and the
+    /// assignment it holds, at the generation the group is on and with a session this call
+    /// renews. A consumer that stops reading stops renewing it and is dropped exactly as
+    /// any other member that stops heartbeating is ([`Self::expire_members`]), and one that
+    /// stands down takes itself out ([`Self::release_consumer`]).
+    ///
+    /// What it does is one JOIN and the SYNC that follows it, for a consumer that is the
+    /// group's only member: the member is admitted as having rejoined, the generation is
+    /// FORMED through the same step every join forms one through ([`Self::form_generation`],
+    /// which advances it once and makes the member that rejoined first its leader), and the
+    /// assignment this consumer holds is in force at once — there is no other member's
+    /// `SyncGroup` to wait for, which is what [`Self::begin_sync`] waits on. A group another
+    /// member already holds is NOT joined this way: the partitions of such a group are
+    /// being handed out by a rebalance those members drive, so the consumer is refused
+    /// rather than assigned beside them without one.
+    ///
+    /// Repeating the call for a consumer the group already holds renews its session and
+    /// restates its assignment, which is what its next pass does; nothing else moves, so
+    /// the group stays at the generation its join formed.
+    pub fn admit_consumer(
+        &mut self,
+        client_id: &str,
+        topics: &[String],
+        assigned: &[(String, Vec<i32>)],
+        now: SystemTime,
+    ) -> Option<String> {
+        self.expire_members(now);
+        let session_window = session_window(0);
+        if let Some(member) = self
+            .members
+            .iter_mut()
+            .find(|member| member.client_id == client_id)
+        {
+            member.session_deadline = now + session_window;
+            member.metadata = subscription_of(topics);
+            member.assignment = Some(assignment_of(assigned));
+            return Some(member.id.clone());
+        }
+        if !self.members.is_empty() {
+            return None;
+        }
+        self.minted += 1;
+        let member_id = format!("{client_id}-{}", self.minted);
+        self.rejoins = self.rejoins.saturating_add(1);
+        self.members.push(GroupMember {
+            id: member_id.clone(),
+            client_id: client_id.to_string(),
+            metadata: subscription_of(topics),
+            rejoined: Some(self.rejoins),
+            assignment: None,
+            session_deadline: now + session_window,
+            session_window,
+        });
+        // The generation this join forms, elected and stamped exactly as every other join's
+        // is; what follows is the SYNC, which for the group's only member is the assignment it
+        // computed for itself going into force.
+        self.form_generation(now);
+        if let Some(member) = self
+            .members
+            .iter_mut()
+            .find(|member| member.id == member_id)
+        {
+            member.assignment = Some(assignment_of(assigned));
+        }
+        self.protocol_type = Some(CONSUMER_PROTOCOL_TYPE.to_string());
+        self.protocol_name = Some(CONSUMER_ASSIGNOR_NAME.to_string());
+        self.state = GroupState::Stable;
+        self.rebalance_deadline = None;
+        Some(member_id)
+    }
+
+    /// Take the in-process consumer `member_id` names out of the group, as a consumer that
+    /// stands down does: the same removal a `LeaveGroup` makes ([`Self::leave`]), so the
+    /// group it leaves empty reports itself empty and the offsets it committed stay the
+    /// group's.
+    pub fn release_consumer(&mut self, member_id: &str, now: SystemTime) {
+        let before = self.members.len();
+        self.members.retain(|member| member.id != member_id);
+        if self.members.len() == before {
+            return;
+        }
+        match self.members.is_empty() {
+            true => {
+                self.state = GroupState::Empty;
+                self.leader = String::new();
+                self.rebalance_deadline = None;
+            }
+            false => self.begin_rebalance(now, MAX_REBALANCE_BARRIER),
+        }
+    }
+}
+
+/// The `protocol_type` a CONSUMING client's group runs under, which is what tells a group of
+/// consumers from a group of any other kind of client (Apache Kafka's own
+/// `ConsumerProtocol.PROTOCOL_TYPE`).
+const CONSUMER_PROTOCOL_TYPE: &str = "consumer";
+
+/// The assignor an in-process consumer's group names: Apache Kafka's RangeAssignor, whose
+/// protocol name is `range` — the name a group reports as the protocol its members agreed on.
+const CONSUMER_ASSIGNOR_NAME: &str = "range";
+
+/// The version the subscription and the assignment of a consuming member are written at: the
+/// first version of Apache Kafka's consumer embedded protocol, whose two documents every
+/// consumer client reads.
+const CONSUMER_PROTOCOL_VERSION: i16 = 0;
+
+/// The SUBSCRIPTION a member joined with, as the consumer embedded protocol carries one: the
+/// version, then the topics the consumer subscribed to.
+///
+/// A reader of the group hands these bytes to its own reader of that protocol, so they are
+/// written by the one implementation of it in this process rather than by hand.
+fn subscription_of(topics: &[String]) -> Bytes {
+    use ::kafka_protocol::messages::consumer_protocol_subscription::ConsumerProtocolSubscription;
+
+    let subscribed = ConsumerProtocolSubscription::default().with_topics(
+        topics
+            .iter()
+            .map(|topic| StrBytes::from_string(topic.clone()))
+            .collect(),
+    );
+    embedded_protocol(&subscribed)
+}
+
+/// The ASSIGNMENT a member holds, as that same protocol carries one: the version, then the
+/// partitions of each topic the member was given.
+fn assignment_of(assigned: &[(String, Vec<i32>)]) -> Bytes {
+    use ::kafka_protocol::messages::consumer_protocol_assignment::{
+        ConsumerProtocolAssignment, TopicPartition,
+    };
+
+    let held = ConsumerProtocolAssignment::default().with_assigned_partitions(
+        assigned
+            .iter()
+            .map(|(topic, partitions)| {
+                TopicPartition::default()
+                    .with_topic(TopicName(StrBytes::from_string(topic.clone())))
+                    .with_partitions(partitions.clone())
+            })
+            .collect(),
+    );
+    embedded_protocol(&held)
+}
+
+/// One document of the consumer embedded protocol, written as a client reads it: the two-byte
+/// version first, then the document itself at that version.
+fn embedded_protocol<Document: ::kafka_protocol::protocol::Encodable>(
+    document: &Document,
+) -> Bytes {
+    use ::bytes::BufMut as _;
+
+    let mut written = ::bytes::BytesMut::new();
+    written.put_i16(CONSUMER_PROTOCOL_VERSION);
+    if document
+        .encode(&mut written, CONSUMER_PROTOCOL_VERSION)
+        .is_err()
+    {
+        return Bytes::new();
+    }
+    written.freeze()
 }
 
 /// The window a member's session lives for, from the timeout it named: read within
@@ -824,5 +1035,181 @@ fn rebalance_barrier(rebalance_timeout_ms: i32) -> Duration {
             .min(MAX_REBALANCE_BARRIER),
         // A version of the join that states no rebalance timeout at all.
         _ => MAX_REBALANCE_BARRIER,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, SystemTime};
+
+    use super::{ConsumerGroup, GroupState, MAX_COMMITTED_PARTITIONS_PER_GROUP};
+
+    /// The topic the consumer below subscribes to, and the client it goes by.
+    const TOPIC: &str = "orders";
+    /// See [`TOPIC`].
+    const CLIENT: &str = "lambda-event-source-mapping-0e6b8f41";
+
+    /// The partitions that consumer holds of that topic.
+    fn assigned() -> Vec<(String, Vec<i32>)> {
+        vec![(TOPIC.to_string(), vec![0, 1])]
+    }
+
+    /// RULE: a consumer admitted into a group IS a member of it — the group reports it under
+    /// the client it goes by, with the subscription it joined with and the assignment it
+    /// holds, at a generation the join advanced and running the consumer protocol — and the
+    /// same call repeated renews that one member rather than adding another.
+    #[test]
+    fn an_admitted_consumer_is_a_member_of_the_group_it_reads_as() {
+        let now = SystemTime::now();
+        let mut group = ConsumerGroup::default();
+        let topics = vec![TOPIC.to_string()];
+        let member = group
+            .admit_consumer(CLIENT, &topics, &assigned(), now)
+            .expect("an empty group admits a consumer");
+        // (case, what the group reports, what it must report)
+        let reported = group.described_members();
+        assert_eq!(
+            reported.len(),
+            1,
+            "case \"one consumer\": expected one member, got {reported:?}"
+        );
+        let held = &reported[0];
+        assert_eq!(
+            (held.id.as_str(), held.client_id.as_str()),
+            (member.as_str(), CLIENT),
+            "case \"one consumer\": expected the member the join minted under {CLIENT:?}, got \
+             {held:?}"
+        );
+        assert!(
+            !held.metadata.is_empty() && !held.assignment.is_empty(),
+            "case \"one consumer\": expected the subscription and the assignment to be \
+             reported, got {held:?}"
+        );
+        assert_eq!(
+            (group.state(), group.protocol_type(), group.protocol_name()),
+            (GroupState::Stable, Some("consumer"), Some("range")),
+            "case \"one consumer\": expected a stable consumer group, got {:?}",
+            (group.state(), group.protocol_type(), group.protocol_name())
+        );
+        // The same consumer again is the same member, renewed: a pass of a consumer that
+        // keeps reading is a heartbeat, not a second member.
+        let again = group
+            .admit_consumer(CLIENT, &topics, &assigned(), now + Duration::from_secs(1))
+            .expect("the group holds this consumer already");
+        assert_eq!(
+            (again.as_str(), group.described_members().len()),
+            (member.as_str(), 1),
+            "case \"the same consumer again\": expected the one member renewed, got {:?}",
+            group.described_members()
+        );
+        // And a consumer of ANOTHER client is refused while this one holds the group: those
+        // partitions are being read by a member already.
+        let other = group.admit_consumer("another-consumer", &topics, &assigned(), now);
+        assert!(
+            other.is_none(),
+            "case \"a second consumer\": a group a member holds admits no in-process consumer, \
+             got {other:?}"
+        );
+    }
+
+    /// RULE: the position a member commits is the group's — read back by every reader of that
+    /// group — a commit from a member the group does not hold stores nothing, and a group no
+    /// member holds takes a commit that quotes none; releasing the member empties the group
+    /// and keeps what it committed.
+    #[test]
+    fn the_position_a_member_commits_is_the_groups() {
+        let now = SystemTime::now();
+        let mut group = ConsumerGroup::default();
+        let topics = vec![TOPIC.to_string()];
+        let member = group
+            .admit_consumer(CLIENT, &topics, &assigned(), now)
+            .expect("an empty group admits a consumer");
+        // (case, the member the commit speaks for, whether the group takes it)
+        let rows: Vec<(&str, String, bool)> = vec![
+            ("the member the group holds", member.clone(), true),
+            (
+                "a member the group does not hold",
+                "no-such-member".to_string(),
+                false,
+            ),
+            (
+                "no member at all, while a member holds the group",
+                String::new(),
+                false,
+            ),
+        ];
+        for (case, speaks_for, expected) in rows {
+            let took = group.commit_offset(&speaks_for, TOPIC, 0, 7, now);
+            assert_eq!(
+                took, expected,
+                "case {case:?}: expected the group to take the commit: {expected}, got {took}"
+            );
+        }
+        group.release_consumer(&member, now);
+        assert_eq!(
+            (group.state(), group.has_members()),
+            (GroupState::Empty, false),
+            "case \"the consumer stands down\": expected an empty group, got {:?}",
+            group.state()
+        );
+        // The offsets it committed are the GROUP's, so they outlive the member — and a group
+        // no member holds takes a commit that quotes none, as a client storing offsets in it
+        // does.
+        assert!(
+            group.commit_offset("", TOPIC, 1, 3, now),
+            "case \"a group no member holds\": expected a commit quoting no member to be taken"
+        );
+        // A fetch that names no topic at all is the one that asks for every position the
+        // group holds.
+        let request = ::kafka_protocol::messages::OffsetFetchRequest::default().with_topics(None);
+        let answered = group.fetch_offsets(&request);
+        let committed: Vec<(String, i32, i64)> = answered
+            .topics
+            .iter()
+            .flat_map(|topic| {
+                topic.partitions.iter().map(move |partition| {
+                    (
+                        topic.name.0.to_string(),
+                        partition.partition_index,
+                        partition.committed_offset,
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            committed,
+            vec![
+                (TOPIC.to_string(), 0, 7),
+                (TOPIC.to_string(), 1, 3),
+            ],
+            "case \"every committed position\": expected the two positions the group holds, got \
+             {committed:?}"
+        );
+    }
+
+    /// RULE: a group keeps at most [`MAX_COMMITTED_PARTITIONS_PER_GROUP`] committed positions,
+    /// and a commit past that ceiling stores nothing while one of a partition it already holds
+    /// still lands.
+    #[test]
+    fn a_group_keeps_a_bounded_number_of_committed_positions() {
+        let now = SystemTime::now();
+        let mut group = ConsumerGroup::default();
+        for partition in 0..MAX_COMMITTED_PARTITIONS_PER_GROUP {
+            let partition = i32::try_from(partition).expect("the ceiling fits in an i32");
+            assert!(
+                group.commit_offset("", TOPIC, partition, 1, now),
+                "case \"inside the ceiling\": expected partition {partition} to be committed"
+            );
+        }
+        let past = i32::try_from(MAX_COMMITTED_PARTITIONS_PER_GROUP)
+            .expect("the ceiling fits in an i32");
+        assert!(
+            !group.commit_offset("", TOPIC, past, 1, now),
+            "case \"past the ceiling\": expected a further partition to be refused"
+        );
+        assert!(
+            group.commit_offset("", TOPIC, 0, 9, now),
+            "case \"a partition already held\": expected its position to be moved"
+        );
     }
 }

@@ -255,6 +255,13 @@ pub use sqs_poller::{
 pub mod mq_poller;
 pub use mq_poller::drive_mq_pollers;
 
+/// And [`kafka_poller`] for a mapping on an Amazon MSK cluster's topics, whose records sit in
+/// PARTITIONS and are handed out from an offset the consumer carries, with nothing removed by
+/// being read — which is neither how a queue's messages are held nor how a broker's are. It is
+/// re-exported here for the same reason as the three above.
+pub mod kafka_poller;
+pub use kafka_poller::drive_kafka_pollers;
+
 /// The instants this crate publishes as CALENDAR TEXT rather than as an epoch count — a
 /// function URL's Common Log Format instant and an Amazon MQ record's `basicProperties`
 /// timestamp — live in [`calendar_fields`], each one `chrono` format of the instant, so
