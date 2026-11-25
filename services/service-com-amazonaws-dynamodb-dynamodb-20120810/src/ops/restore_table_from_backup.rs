@@ -824,6 +824,9 @@ fn restored_vector_indexes(
                 distance_function: recorded.distance_function.clone().unwrap_or_default(),
                 transient_status: crate::state::IndexStatus::Creating,
                 active_at: now + crate::state::STATUS_TRANSITION,
+                // An index the restore brings into being is new, so nothing is owed its
+                // removal ([`crate::state::VectorIndex::begin_deletion`]).
+                deleting_at: None,
                 reported_counters: crate::state::MeteredCounters::new(now),
                 // Restored WITH the table, like every index a restore brings into being,
                 // so it reports no `Backfilling` ([`crate::state::IndexBackfill`]).

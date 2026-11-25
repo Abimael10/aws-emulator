@@ -1063,6 +1063,7 @@ impl TableStatus {
 pub enum IndexStatus {
     Creating,
     Updating,
+    Deleting,
     Active,
 }
 
@@ -1072,6 +1073,7 @@ impl IndexStatus {
         match self {
             Self::Creating => "CREATING",
             Self::Updating => "UPDATING",
+            Self::Deleting => "DELETING",
             Self::Active => "ACTIVE",
         }
     }
@@ -1317,6 +1319,10 @@ pub struct VectorIndex {
     pub transient_status: IndexStatus,
     /// When the clock owes this index its transient -> `ACTIVE` transition.
     pub active_at: SystemTime,
+    /// When the clock owes this index's REMOVAL from the table, set by the call that
+    /// accepted its delete and `None` for an index nobody has asked to remove
+    /// ([`Self::begin_deletion`]).
+    pub deleting_at: Option<SystemTime>,
     /// The metered figures this index's `ItemCount` and `IndexSizeBytes` report,
     /// refreshed with the table's on the documented schedule.
     pub reported_counters: MeteredCounters,
@@ -1328,12 +1334,48 @@ pub struct VectorIndex {
 impl VectorIndex {
     /// The status at `now`, derived from the stored instants, by the same rule a
     /// secondary index follows.
+    ///
+    /// An index whose delete has been accepted reports `DELETING` — "the index is being
+    /// deleted" (`VectorIndexDescription$IndexStatus`) — for as long as the table still
+    /// carries it, whichever status it was in when the delete arrived: the removal is the
+    /// last thing that happens to it, so no build it had in flight can take it back to
+    /// `ACTIVE` ([`Self::begin_deletion`]).
     pub fn status(&self, now: SystemTime) -> IndexStatus {
-        if now >= self.active_at {
+        if self.being_deleted() {
+            IndexStatus::Deleting
+        } else if now >= self.active_at {
             IndexStatus::Active
         } else {
             self.transient_status
         }
+    }
+
+    /// Accept this index's DELETE, owing its removal at `due_at`.
+    ///
+    /// Removing an index is asynchronous work on the table: the call that asks for it
+    /// answers a description that still carries the index, in the `DELETING` status that
+    /// says what is happening to it, and the entry disappears only once the clock makes
+    /// the removal due ([`Table::apply_due_index_removals`]). A caller polling the index
+    /// therefore sees `DELETING` and then its absence, which is what tells "delete
+    /// requested" apart from "delete finished".
+    pub fn begin_deletion(&mut self, due_at: SystemTime) {
+        self.deleting_at = Some(due_at);
+    }
+
+    /// Whether this index's delete has been accepted, so the table is only still carrying
+    /// it until the removal falls due.
+    ///
+    /// An index on its way out is no longer one of the indexes the TABLE is held to — it
+    /// takes no slot of the per-table quota, spends no projection budget and keeps no
+    /// attribute definition alive — and it is not addressable either: only an `ACTIVE`
+    /// index serves a search.
+    pub fn being_deleted(&self) -> bool {
+        self.deleting_at.is_some()
+    }
+
+    /// Whether the clock has already made this index's removal due at `now`.
+    pub fn removal_due(&self, now: SystemTime) -> bool {
+        self.deleting_at.is_some_and(|due_at| now >= due_at)
     }
 
     /// Every attribute of the TABLE this index consumes: the vector attribute, and each
@@ -3365,7 +3407,8 @@ pub fn unknown_index_named(index_name: &str) -> RequestError {
 
 impl ComAmazonawsDynamodbDynamodb20120810State {
     /// Materialise the changes the clock has already made due: a table whose
-    /// `DeleteTable` span has elapsed is gone, an item whose TTL expiry has fallen due
+    /// `DeleteTable` span has elapsed is gone, an index whose removal an accepted delete
+    /// owed is dropped from its table, an item whose TTL expiry has fallen due
     /// is deleted, a table whose metering interval has elapsed reports freshly counted
     /// `ItemCount`/`TableSizeBytes` figures, a tag write whose propagation span has
     /// elapsed becomes visible to the tag reader, and a `ClientRequestToken` whose
@@ -3404,6 +3447,7 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
                         });
                     }
                 }
+                table.apply_due_index_removals(now);
                 table.refresh_due_counters(now);
                 table.tags.apply_due_propagation(now);
             }

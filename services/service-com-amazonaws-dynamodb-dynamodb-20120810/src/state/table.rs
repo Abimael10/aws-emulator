@@ -1162,6 +1162,18 @@ impl Table {
         self.meter_counters(now);
     }
 
+    /// Drop every index of this table whose REMOVAL the clock has already made due.
+    ///
+    /// Deleting an index is asynchronous work: the call that accepts it leaves the index
+    /// in place, reported `DELETING` ([`VectorIndex::begin_deletion`]), and the removal
+    /// that call owed falls due at the instant the table's own update settles — owed then
+    /// whether or not anybody called, so a reporting operation may finish it. From that
+    /// instant the table carries no such index at all, which is what tells a caller
+    /// polling the index that the delete is finished rather than requested.
+    pub fn apply_due_index_removals(&mut self, now: SystemTime) {
+        self.vector_indexes.retain(|index| !index.removal_due(now));
+    }
+
     /// Remove every item of this table whose TTL deletion the clock has already made
     /// due, returning the items removed so their tables' streams can carry the change.
     ///
@@ -2295,10 +2307,14 @@ impl Table {
                 })
                 .collect(),
             // The vector indexes the table carried, recorded with the backup so a restore
-            // from it rebuilds them and `DescribeBackup` reports them.
+            // from it rebuilds them and `DescribeBackup` reports them. An index whose
+            // delete has been accepted is on its way out
+            // ([`VectorIndex::being_deleted`]), so the backup records the index set the
+            // table is left with rather than one it no longer keeps.
             vector_indexes: self
                 .vector_indexes
                 .iter()
+                .filter(|index| !index.being_deleted())
                 .map(|index| VectorIndexInfo {
                     index_name: Some(index.name.clone()),
                     vector_attribute: Some(index.vector_attribute.clone()),

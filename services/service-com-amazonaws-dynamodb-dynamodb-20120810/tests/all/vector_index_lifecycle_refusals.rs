@@ -244,12 +244,12 @@ async fn deleting_the_index_being_built_is_served_once_it_is_reading_the_table()
 
     let answered = ok(&router, "UpdateTable", remove_vector_index(table, "vidx-a")).await;
     assert_eq!(
-        vector_index_status(&answered["TableDescription"], "vidx-a"),
-        None,
-        "the cancelled build must leave the table carrying no such index, got {answered}"
+        vector_index_status(&answered["TableDescription"], "vidx-a").as_deref(),
+        Some("DELETING"),
+        "the cancelled build must be reported as the deletion it now is, got {answered}"
     );
-    // And the index is gone for good: a search through the name it was created under is
-    // answered as a name no index of the table has.
+    // And the index serves nothing from that moment on: a search through the name it was
+    // created under is answered as a name no index of the table has.
     let (status, body) = call(
         &router,
         "SearchVectors",
@@ -397,9 +397,10 @@ async fn a_settled_vector_index_is_deletable() {
     );
     let answered = ok(&router, "UpdateTable", remove_vector_index(table, "vidx-a")).await;
     assert_eq!(
-        vector_index_status(&answered["TableDescription"], "vidx-a"),
-        None,
-        "a settled index is deletable, got {answered}"
+        vector_index_status(&answered["TableDescription"], "vidx-a").as_deref(),
+        Some("DELETING"),
+        "a settled index is deletable, and the accepted delete is reported on it, got \
+         {answered}"
     );
 }
 
@@ -521,9 +522,9 @@ async fn an_update_that_removes_the_last_vector_index_may_switch_the_mode() {
     )
     .await;
     assert_eq!(
-        vector_index_status(&answered["TableDescription"], "vidx"),
-        None,
-        "the removed index must be gone, got {answered}"
+        vector_index_status(&answered["TableDescription"], "vidx").as_deref(),
+        Some("DELETING"),
+        "the removed index must be reported on its way out, got {answered}"
     );
     assert_eq!(
         answered["TableDescription"]["BillingModeSummary"]["BillingMode"],

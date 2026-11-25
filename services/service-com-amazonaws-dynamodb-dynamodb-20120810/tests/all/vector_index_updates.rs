@@ -10,11 +10,11 @@
 //!    `ResourceNotFoundException` at HTTP 400 naming the index and the table — and the
 //!    refusal writes nothing: the table stays `ACTIVE` and every vector index it holds stays
 //!    present and `ACTIVE`;
-//! 2. a `Delete` naming a vector index the table does carry removes exactly that index —
-//!    the update is index lifecycle work, so the table is `UPDATING` until the clock
-//!    settles it `ACTIVE`, and the siblings are left searchable while a `SearchVectors`
-//!    through the removed name gets the `ValidationException` an `IndexName` member no
-//!    index of the table answers;
+//! 2. a `Delete` naming a vector index the table does carry starts the removal of exactly
+//!    that index — the update is index lifecycle work, so the table is `UPDATING` and the
+//!    index is reported `DELETING` until the clock settles both, and the siblings are left
+//!    searchable while a `SearchVectors` through the removed name gets the
+//!    `ValidationException` an `IndexName` member no index of the table answers;
 //! 3. a removed index takes its schema's `AttributeDefinitions` with it, exactly as a
 //!    removed secondary index takes its key attributes;
 //! 4. an entry that does not ask for exactly one of the two actions the model gives it,
@@ -106,14 +106,6 @@ fn reported_indexes(description: &Value) -> Vec<(String, String)> {
         .collect();
     reported.sort();
     reported
-}
-
-/// The names of the vector indexes a description reports, in name order.
-fn reported_index_names(description: &Value) -> Vec<String> {
-    reported_indexes(description)
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect()
 }
 
 /// Those names paired with `ACTIVE`, which is what a settled table reports them in.
@@ -318,14 +310,14 @@ async fn a_delete_removes_exactly_the_vector_index_it_names() {
             "UPDATING",
             "case {case:?}: removing an index is work that outlives the call, got {described}"
         );
-        let mut expected_survivors: Vec<String> =
-            survivors.iter().map(|name| (*name).to_string()).collect();
-        expected_survivors.sort();
+        let mut expected_during: Vec<(String, String)> = active(survivors);
+        expected_during.push((removed.to_string(), "DELETING".to_string()));
+        expected_during.sort();
         assert_eq!(
-            reported_index_names(described),
-            expected_survivors,
-            "case {case:?}: the accepted update reports the table without {removed}, got \
-             {described}"
+            reported_indexes(described),
+            expected_during,
+            "case {case:?}: the accepted update reports {removed} DELETING beside its \
+             surviving siblings, got {described}"
         );
 
         // The table settles back to ACTIVE with exactly that index gone and its siblings

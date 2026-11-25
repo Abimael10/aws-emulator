@@ -660,6 +660,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .chain(
                     vector_indexes
                         .iter()
+                        .filter(|index| !index.being_deleted())
                         .map(crate::state::vector_projected_non_key_attributes),
                 ),
         )
@@ -1743,7 +1744,10 @@ fn merged_definitions(
 /// the new index" (`UpdateTable$AttributeDefinitions`) — a declaration beyond that asks
 /// for nothing, so the update carries on and the stored list tracks the live keys. A
 /// definition that was stored and whose index this same request deleted is dropped by
-/// the same rule, since removing an index removes its keys.
+/// the same rule, since removing an index removes its keys — and that holds from the
+/// instant the delete is ACCEPTED, so an index on its way out
+/// ([`crate::state::VectorIndex::being_deleted`]) keeps no definition alive even while the
+/// table still reports it `DELETING`.
 ///
 /// The used attributes are collected ONCE into a set, so the filter costs one hash per
 /// definition rather than a walk over every schema.
@@ -1767,6 +1771,7 @@ fn retained_definitions(
         .chain(
             vector_indexes
                 .iter()
+                .filter(|index| !index.being_deleted())
                 .flat_map(crate::state::VectorIndex::consumed_attributes),
         )
         .collect();
@@ -2056,9 +2061,9 @@ fn resolve_indexes(
     Ok(indexes)
 }
 
-/// The table's vector indexes after the update: every one a `Delete` names is gone, and
-/// every one a `Create` names is added, `CREATING` until the clock settles it `ACTIVE` and
-/// backfilling the items the table already holds for that span
+/// The table's vector indexes after the update: every one a `Delete` names is on its way
+/// out, and every one a `Create` names is added, `CREATING` until the clock settles it
+/// `ACTIVE` and backfilling the items the table already holds for that span
 /// ([`crate::state::IndexBackfill`]).
 ///
 /// A `Delete` naming a vector index the table does not carry names a resource that is not
@@ -2066,10 +2071,19 @@ fn resolve_indexes(
 /// ([`crate::state::lifecycle_index_not_found`]), and because this resolves the whole list
 /// before `handle` writes anything, the stored indexes are left exactly as they were.
 ///
-/// An index removed from a table is removed outright, by the same rule a secondary index
-/// delete follows ([`resolve_indexes`]): the model's `IndexStatus` has no terminal
-/// `DELETING` for a description to report it in, and nothing can be searched through it
-/// again.
+/// An index a `Delete` names is KEPT in the list and marked as being removed
+/// ([`crate::state::VectorIndex::begin_deletion`]): removing it is asynchronous work on the
+/// table, so every description taken before that work falls due still reports the index,
+/// with "`DELETING` - The index is being deleted" (`VectorIndexDescription$IndexStatus`),
+/// and the entry disappears when the clock makes the removal due
+/// ([`crate::state::Table::apply_due_index_removals`]). A caller reading the response to
+/// learn the new index state can therefore tell a delete it requested from one that has
+/// finished, and from a name the table never carried.
+///
+/// Which is also why the rules about what the TABLE may carry are asked of the indexes this
+/// update leaves it KEEPING rather than of the whole list: an index on its way out takes no
+/// slot of the per-table quota, holds no dimension count against a future create and does
+/// not hold the table in the capacity mode a vector index needs.
 ///
 /// A `Create` is held to what the table can carry, exactly as `CreateTable` holds a vector
 /// index declared WITH the table: the table's capacity mode is the on-demand one
@@ -2092,14 +2106,20 @@ fn resolve_vector_indexes(
 ) -> Result<Vec<crate::state::VectorIndex>, crate::state::RequestError> {
     let mut indexes = table.vector_indexes.clone();
     for delete in updates.iter().filter_map(|update| update.delete.as_ref()) {
-        let before = indexes.len();
-        indexes.retain(|index| index.name != delete.index_name);
-        if indexes.len() == before {
+        let Some(index) = indexes
+            .iter_mut()
+            .find(|index| index.name == delete.index_name && !index.being_deleted())
+        else {
             return Err(crate::state::lifecycle_index_not_found(
                 &table.name,
                 &delete.index_name,
             ));
-        }
+        };
+        // The removal falls due when the table's own update settles, which is the span
+        // this very call reports the table `UPDATING` for: a caller that waits for the
+        // table and then describes it sees the index gone, and one that acts straight
+        // after the call sees it `DELETING`.
+        index.begin_deletion(now + crate::state::STATUS_TRANSITION);
     }
     for create in updates.iter().filter_map(|update| update.create.as_ref()) {
         let taken = indexes.iter().any(|stored| stored.name == create.index_name)
@@ -2148,12 +2168,18 @@ fn resolve_vector_indexes(
         );
     }
     // The per-table vector-index quota and the one dimension count each vector attribute
-    // may have are the TABLE's rules, so both are asked of the list this update leaves the
-    // table carrying ([`crate::state::check_vector_index_count`],
+    // may have are the TABLE's rules, so both are asked of the indexes this update leaves
+    // the table KEEPING ([`crate::state::check_vector_index_count`],
     // [`crate::state::check_vector_dimensions_agree`]): an index added here is held to
-    // exactly what one declared with the table is.
-    crate::state::check_vector_index_count(indexes.len())?;
-    crate::state::check_vector_dimensions_agree(&indexes)?;
+    // exactly what one declared with the table is, and one on its way out is held against
+    // nothing.
+    let kept: Vec<crate::state::VectorIndex> = indexes
+        .iter()
+        .filter(|index| !index.being_deleted())
+        .cloned()
+        .collect();
+    crate::state::check_vector_index_count(kept.len())?;
+    crate::state::check_vector_dimensions_agree(&kept)?;
     // A vector index exists only on an ON-DEMAND table, so the mode this very update
     // leaves the table in is what every index it will still CARRY has to hold on
     // ([`crate::state::check_vector_index_capacity_mode`]): an update that adds one to a
@@ -2162,6 +2188,6 @@ fn resolve_vector_indexes(
     // same call may switch it, because the table is left carrying none. Asked of the
     // resolved list, after the deletes and the creates above, so one rule answers all
     // three.
-    crate::state::check_vector_index_capacity_mode(billing_mode, indexes.len())?;
+    crate::state::check_vector_index_capacity_mode(billing_mode, kept.len())?;
     Ok(indexes)
 }

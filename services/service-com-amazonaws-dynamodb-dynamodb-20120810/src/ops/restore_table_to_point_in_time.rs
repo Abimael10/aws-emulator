@@ -1023,10 +1023,15 @@ fn restored_vector_indexes(
     source
         .vector_indexes
         .iter()
+        // An index whose delete the source table has accepted is on its way out
+        // ([`crate::state::VectorIndex::being_deleted`]), so the restored table is given
+        // the index set the source is left with.
+        .filter(|index| !index.being_deleted())
         .map(|index| crate::state::VectorIndex {
             arn: crate::state::index_arn(region, table, &index.name),
             transient_status: crate::state::IndexStatus::Creating,
             active_at: now + crate::state::STATUS_TRANSITION,
+            deleting_at: None,
             reported_counters: crate::state::MeteredCounters::new(now),
             // Restored WITH the table, whatever the SOURCE index was reporting, so it
             // reports no `Backfilling` ([`crate::state::IndexBackfill`]).

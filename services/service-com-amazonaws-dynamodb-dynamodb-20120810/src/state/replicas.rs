@@ -1063,11 +1063,16 @@ impl Table {
             vector_indexes: self
                 .vector_indexes
                 .iter()
+                // An index whose delete this table has accepted is on its way out
+                // ([`super::VectorIndex::being_deleted`]), so a replica created now is
+                // given the index set the source table is left with.
+                .filter(|index| !index.being_deleted())
                 .map(|index| super::VectorIndex {
                     arn: index_arn(&region, &self.name, &index.name),
                     reported_counters: MeteredCounters::new(now),
                     transient_status: IndexStatus::Creating,
                     active_at: now + STATUS_TRANSITION,
+                    deleting_at: None,
                     // Created WITH the replica's own table, by the same rule its secondary
                     // indexes follow ([`super::IndexBackfill`]).
                     backfill: super::IndexBackfill::WithTable,
