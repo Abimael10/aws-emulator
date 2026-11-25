@@ -5,11 +5,14 @@
 //!
 //! The rule under test: the `serviceDeploymentArn` is checked against the FORM Amazon ECS
 //! mints it in before any state is consulted, and a value outside that form is refused
-//! `InvalidParameterException` with the fixed sentence that states the form. The rollout
-//! that ARN names is then resolved — a `hookId` names a hook OF one service deployment, so
-//! a well-formed ARN that names no stored rollout is reported as that (`ClientException`)
-//! whatever the `hookId` beside it spells — and only then is the `hookId` read, for its own
-//! form first and then against the hooks that rollout is waiting at.
+//! `InvalidParameterException` with the fixed sentence the KIND of identifier the value
+//! claims to be earns — a malformed rollout ARN for a value claiming to be one, and the
+//! unusable-service-identifier sentence for a value claiming no kind of this service's
+//! resources at all ([`crate::service_owned_arn_reference_kinds`] spans that rule). The
+//! rollout that ARN names is then resolved — a `hookId` names a hook OF one service
+//! deployment, so a well-formed ARN that names no stored rollout is reported as that
+//! (`ClientException`) whatever the `hookId` beside it spells — and only then is the `hookId`
+//! read, for its own form first and then against the hooks that rollout is waiting at.
 //!
 //! The same two readings of the ARN are asserted here for the SIBLING operations that
 //! address a service deployment by ARN (`DescribeServiceDeployments` and
@@ -71,9 +74,15 @@ const MISSING: &str = "MISSING";
 const INVALID_HOOK_ID_MESSAGE: &str = "Invalid hookId: hookId must follow the format: \
                                        ecs-{hookType}-{id}";
 
-/// The whole message a `serviceDeploymentArn` outside the minted form is refused with, and
-/// fixed text for the same reason.
+/// The whole message a value CLAIMING to be a service-deployment ARN of this service, and
+/// outside the form it mints, is refused with. Fixed text: it names the parameter whose
+/// syntax is wrong and echoes nothing the request carried.
 const INVALID_ARN_MESSAGE: &str = "The ServiceDeployment ARN is invalid.";
+
+/// The whole message a value claiming NO kind of this service's resources is refused with:
+/// there is no rollout ARN to call malformed, so the value is read as the service identifier
+/// a rollout hangs off ([`crate::service_owned_arn_reference_kinds`] spans that rule).
+const SERVICE_ARN_INVALID_MESSAGE: &str = "The Service ARN provided is invalid.";
 
 /// The `DeploymentLifecycleHookStatus` of a `PAUSE` hook the rollout is waiting at.
 const AWAITING_ACTION: &str = "AWAITING_ACTION";
@@ -433,10 +442,21 @@ async fn a_service_deployment_arn_outside_the_minted_form_is_refused_by_shape() 
     // The rows differ along WHAT about the ARN's shape is wrong: the ARN frame itself, the
     // namespace, the resource type, the number of resource segments, the names those
     // segments carry, and the width and alphabet of the deployment-id token — the token's
-    // width is a bound, so it is tested one digit either side of the minted width too.
+    // width is a bound, so it is tested one digit either side of the minted width too. Each
+    // row carries the sentence the KIND of identifier it claims to be earns: a value claiming
+    // to be a rollout ARN of this service is refused as a malformed one, and one claiming no
+    // kind at all is read as the service identifier a rollout hangs off.
     let malformed = [
-        ("not an ARN at all", arn.replace("arn:aws:", "")),
-        ("a plain string", "not-an-arn".to_string()),
+        (
+            "not an ARN at all",
+            arn.replace("arn:aws:", ""),
+            SERVICE_ARN_INVALID_MESSAGE,
+        ),
+        (
+            "a plain string",
+            "not-an-arn".to_string(),
+            SERVICE_ARN_INVALID_MESSAGE,
+        ),
         (
             "another service's namespace",
             deployment_arn(&format!(
@@ -444,6 +464,7 @@ async fn a_service_deployment_arn_outside_the_minted_form_is_refused_by_shape() 
                 deployment_id(minted_width)
             ))
             .replace(":ecs:", ":ec2:"),
+            SERVICE_ARN_INVALID_MESSAGE,
         ),
         (
             "another resource type",
@@ -451,6 +472,7 @@ async fn a_service_deployment_arn_outside_the_minted_form_is_refused_by_shape() 
                 "service-revision/{CLUSTER}/arn-shapes/{}",
                 deployment_id(minted_width)
             )),
+            SERVICE_ARN_INVALID_MESSAGE,
         ),
         (
             "a resource type the segment only starts with",
@@ -458,10 +480,12 @@ async fn a_service_deployment_arn_outside_the_minted_form_is_refused_by_shape() 
                 "service-deployments/{CLUSTER}/arn-shapes/{}",
                 deployment_id(minted_width)
             )),
+            SERVICE_ARN_INVALID_MESSAGE,
         ),
         (
             "no deployment-id segment",
             deployment_arn(&format!("service-deployment/{CLUSTER}/arn-shapes")),
+            INVALID_ARN_MESSAGE,
         ),
         (
             "a segment too many",
@@ -469,6 +493,7 @@ async fn a_service_deployment_arn_outside_the_minted_form_is_refused_by_shape() 
                 "service-deployment/{CLUSTER}/arn-shapes/{}/extra",
                 deployment_id(minted_width)
             )),
+            INVALID_ARN_MESSAGE,
         ),
         (
             "an empty service segment",
@@ -476,6 +501,7 @@ async fn a_service_deployment_arn_outside_the_minted_form_is_refused_by_shape() 
                 "service-deployment/{CLUSTER}//{}",
                 deployment_id(minted_width)
             )),
+            INVALID_ARN_MESSAGE,
         ),
         (
             "a cluster name no cluster may carry",
@@ -483,6 +509,7 @@ async fn a_service_deployment_arn_outside_the_minted_form_is_refused_by_shape() 
                 "service-deployment/not a cluster/arn-shapes/{}",
                 deployment_id(minted_width)
             )),
+            INVALID_ARN_MESSAGE,
         ),
         (
             "a deployment-id token one digit short",
@@ -490,6 +517,7 @@ async fn a_service_deployment_arn_outside_the_minted_form_is_refused_by_shape() 
                 "service-deployment/{CLUSTER}/arn-shapes/{}",
                 deployment_id(minted_width - 1)
             )),
+            INVALID_ARN_MESSAGE,
         ),
         (
             "a deployment-id token one digit long",
@@ -497,6 +525,7 @@ async fn a_service_deployment_arn_outside_the_minted_form_is_refused_by_shape() 
                 "service-deployment/{CLUSTER}/arn-shapes/{}",
                 deployment_id(minted_width + 1)
             )),
+            INVALID_ARN_MESSAGE,
         ),
         (
             "a deployment-id token twice the width",
@@ -504,10 +533,12 @@ async fn a_service_deployment_arn_outside_the_minted_form_is_refused_by_shape() 
                 "service-deployment/{CLUSTER}/arn-shapes/{}",
                 deployment_id(minted_width * 2)
             )),
+            INVALID_ARN_MESSAGE,
         ),
         (
             "a deployment-id token that is not a token",
             format!("{arn}-absent"),
+            INVALID_ARN_MESSAGE,
         ),
         (
             "a deployment-id token with a character outside the alphabet",
@@ -515,9 +546,10 @@ async fn a_service_deployment_arn_outside_the_minted_form_is_refused_by_shape() 
                 "service-deployment/{CLUSTER}/arn-shapes/-{}",
                 deployment_id(minted_width - 1)
             )),
+            INVALID_ARN_MESSAGE,
         ),
     ];
-    for (case, bad_arn) in &malformed {
+    for (case, bad_arn, expected) in &malformed {
         let (code, message) = refused_continue(&router, bad_arn, &waiting_hook_id, case).await;
         assert_eq!(
             code, INVALID_PARAMETER,
@@ -525,8 +557,8 @@ async fn a_service_deployment_arn_outside_the_minted_form_is_refused_by_shape() 
              {message:?}"
         );
         assert_eq!(
-            message, INVALID_ARN_MESSAGE,
-            "case {case:?}: expected the ARN format refusal for {bad_arn}, got {message:?}"
+            &message, expected,
+            "case {case:?}: expected the refusal {expected:?} for {bad_arn}, got {message:?}"
         );
     }
 
@@ -636,24 +668,35 @@ async fn every_operation_that_takes_a_service_deployment_arn_reads_the_same_form
     // the resource type, the number of resource segments, the names those segments carry,
     // and the width and the alphabet of the deployment-id token — the token's width is a
     // bound, so it is tested one digit either side of the minted width as well as far from
-    // it.
-    let malformed: Vec<(&str, String)> = vec![
-        ("not an ARN at all", "not-an-arn".to_string()),
-        ("an empty value", String::new()),
+    // it. Each row carries the sentence the KIND of identifier it claims to be earns, which
+    // all three operations answer alike.
+    let malformed: Vec<(&str, String, &str)> = vec![
+        (
+            "not an ARN at all",
+            "not-an-arn".to_string(),
+            SERVICE_ARN_INVALID_MESSAGE,
+        ),
+        ("an empty value", String::new(), SERVICE_ARN_INVALID_MESSAGE),
         (
             "the resource field with no ARN frame",
             format!(
                 "service-deployment/{CLUSTER}/arn-forms/{}",
                 deployment_id(minted_width)
             ),
+            SERVICE_ARN_INVALID_MESSAGE,
         ),
-        ("another vendor's namespace", stored.replace(":ecs:", ":ec2:")),
+        (
+            "another vendor's namespace",
+            stored.replace(":ecs:", ":ec2:"),
+            SERVICE_ARN_INVALID_MESSAGE,
+        ),
         (
             "another resource type",
             deployment_arn(&format!(
                 "service-revision/{CLUSTER}/arn-forms/{}",
                 deployment_id(minted_width)
             )),
+            SERVICE_ARN_INVALID_MESSAGE,
         ),
         (
             "a resource type the segment only starts with",
@@ -661,22 +704,30 @@ async fn every_operation_that_takes_a_service_deployment_arn_reads_the_same_form
                 "service-deployments/{CLUSTER}/arn-forms/{}",
                 deployment_id(minted_width)
             )),
+            SERVICE_ARN_INVALID_MESSAGE,
         ),
         (
             "no deployment-id segment",
             deployment_arn(&format!("service-deployment/{CLUSTER}/arn-forms")),
+            INVALID_ARN_MESSAGE,
         ),
         (
             "the cluster segment alone",
             deployment_arn(&format!("service-deployment/{CLUSTER}")),
+            INVALID_ARN_MESSAGE,
         ),
-        ("a segment too many", format!("{stored}/extra")),
+        (
+            "a segment too many",
+            format!("{stored}/extra"),
+            INVALID_ARN_MESSAGE,
+        ),
         (
             "an empty service segment",
             deployment_arn(&format!(
                 "service-deployment/{CLUSTER}//{}",
                 deployment_id(minted_width)
             )),
+            INVALID_ARN_MESSAGE,
         ),
         (
             "a cluster name no cluster may carry",
@@ -684,6 +735,7 @@ async fn every_operation_that_takes_a_service_deployment_arn_reads_the_same_form
                 "service-deployment/not a cluster/arn-forms/{}",
                 deployment_id(minted_width)
             )),
+            INVALID_ARN_MESSAGE,
         ),
         (
             "a deployment-id token one digit short",
@@ -691,6 +743,7 @@ async fn every_operation_that_takes_a_service_deployment_arn_reads_the_same_form
                 "service-deployment/{CLUSTER}/arn-forms/{}",
                 deployment_id(minted_width - 1)
             )),
+            INVALID_ARN_MESSAGE,
         ),
         (
             "a deployment-id token one digit long",
@@ -698,12 +751,14 @@ async fn every_operation_that_takes_a_service_deployment_arn_reads_the_same_form
                 "service-deployment/{CLUSTER}/arn-forms/{}",
                 deployment_id(minted_width + 1)
             )),
+            INVALID_ARN_MESSAGE,
         ),
         (
             "a deployment-id token spelled as a UUID",
             deployment_arn(&format!(
                 "service-deployment/{CLUSTER}/arn-forms/11111111-2222-3333-4444-555555555555"
             )),
+            INVALID_ARN_MESSAGE,
         ),
         (
             "a deployment-id token with a character outside the alphabet",
@@ -711,17 +766,18 @@ async fn every_operation_that_takes_a_service_deployment_arn_reads_the_same_form
                 "service-deployment/{CLUSTER}/arn-forms/-{}",
                 deployment_id(minted_width - 1)
             )),
+            INVALID_ARN_MESSAGE,
         ),
     ];
 
-    for (row, bad_arn) in &malformed {
+    for (row, bad_arn, expected) in &malformed {
         for operation in DEPLOYMENT_OPERATIONS {
             let case = format!("{operation}: {row}");
             let (code, message) =
                 refusal(&router, operation, deployment_request(operation, bad_arn), &case).await;
             assert_eq!(
                 (code.as_str(), message.as_str()),
-                (INVALID_PARAMETER, INVALID_ARN_MESSAGE),
+                (INVALID_PARAMETER, *expected),
                 "case {case:?}: expected the shape refusal for {bad_arn:?}, got {code} with \
                  {message:?}"
             );

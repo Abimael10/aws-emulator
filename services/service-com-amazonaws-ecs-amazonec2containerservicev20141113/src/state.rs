@@ -1381,6 +1381,30 @@ pub fn page_size_range_violation(max_results: i32, min: i32, max: i32) -> Option
     (max_results < min || max_results > max).then(|| page_size_range_message(min, max))
 }
 
+/// The sentence a page size outside its documented range is refused with where the
+/// operation states the whole range as ONE span — the page-size member as its refusal names
+/// it and both ends of the range, echoing nothing the request carried: `Max results must be
+/// between <min> and <max>`, with no trailing period.
+///
+/// RECORDED for the SERVICE-DEPLOYMENT surface, which words this refusal neither as the
+/// long-standing listings do (naming the one bound the value crossed,
+/// [`page_size_bound_violation`]) nor as the daemon plane does ([`page_size_range_message`]):
+/// which sentence a page-size refusal carries is a property of the OPERATION, so each family
+/// states its own.
+pub fn page_size_span_message(min: i32, max: i32) -> String {
+    format!("{} must be between {min} and {max}", member_subject("maxResults"))
+}
+
+/// The refusal a `maxResults` of a SERVICE-DEPLOYMENT listing earns when it falls outside
+/// the inclusive page-size range `min..=max` its own doc states ("This value can be between
+/// 1 and 100"), or `None` when it is inside it.
+///
+/// Both ends are the same violation of one rule here, so both earn the one sentence that
+/// states the range ([`page_size_span_message`]).
+pub fn page_size_span_violation(max_results: i32, min: i32, max: i32) -> Option<String> {
+    (max_results < min || max_results > max).then(|| page_size_span_message(min, max))
+}
+
 /// The refusal a `maxResults` of one of this API's LONG-STANDING list operations earns when
 /// it falls outside the inclusive page-size range `min..=max` its own doc states, or `None`
 /// when it is inside it.
@@ -1392,7 +1416,8 @@ pub fn page_size_range_violation(max_results: i32, min: i32, max: i32) -> Option
 /// <min>" below the range and "Max results can not be greater than <max>" above it: a page
 /// size outside a documented range is refused by NAMING the bound it crossed, as RECORDED
 /// for these listings. The operations added with the daemon plane state the whole range at
-/// either end instead, so they reach for [`page_size_range_violation`].
+/// either end instead, so they reach for [`page_size_range_violation`], and the
+/// service-deployment surface states its own span ([`page_size_span_violation`]).
 pub fn page_size_bound_violation(max_results: i32, min: i32, max: i32) -> Option<String> {
     let subject = member_subject("maxResults");
     if max_results < min {

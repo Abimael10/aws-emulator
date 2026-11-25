@@ -572,11 +572,11 @@ async fn a_status_filter_entry_outside_the_set_is_reported_against_the_list_it_c
 
     // The clause names the LIST — the whole list as the value, under the name the API prints
     // for it — and nests the element's own requirement inside the list's, with the value set
-    // in the ascending order this service states its value sets in. The rows differ in how
-    // many entries are outside the set and where they sit, because one list is ONE violation
-    // however many of its entries are at fault.
-    let accepted = "IN_PROGRESS, PENDING, ROLLBACK_FAILED, ROLLBACK_IN_PROGRESS, \
-                    ROLLBACK_REQUESTED, ROLLBACK_SUCCESSFUL, STOPPED, STOP_REQUESTED, \
+    // the LISTING publishes for the member, in the order it publishes it. The rows differ in
+    // how many entries are outside the set and where they sit, because one list is ONE
+    // violation however many of its entries are at fault.
+    let accepted = "IN_PROGRESS, CREATED, ROLLBACK_IN_PROGRESS, STOPPED, STOP_REQUESTED, \
+                    ROLLBACK_REQUESTED, ROLLBACK_SUCCESSFUL, PENDING, ROLLBACK_FAILED, \
                     SUCCESSFUL";
     let rows: [(&str, Vec<&str>); 4] = [
         ("one entry in the wrong case", vec!["successful"]),

@@ -600,7 +600,10 @@ async fn an_arn_that_names_no_stored_deployment_is_a_missing_failure() {    let 
 
     // A value outside the FORM this service mints is no identity to look up at all, so it
     // is refused for its SYNTAX rather than reported as a failure of its own entry — before
-    // the cluster an ARN of that form would name is resolved.
+    // the cluster an ARN of that form would name is resolved. A value that does not even
+    // claim to be a rollout ARN is read as the service identifier it would have to be
+    // instead, so it earns that sentence ([`crate::service_owned_arn_reference_kinds`] spans
+    // both).
     let case = "a value that is not an ARN at all";
     let (code, message) = refusal(
         &router,
@@ -613,7 +616,7 @@ async fn an_arn_that_names_no_stored_deployment_is_a_missing_failure() {    let 
         (code.as_str(), message.as_str()),
         (
             "InvalidParameterException",
-            "The ServiceDeployment ARN is invalid."
+            "The Service ARN provided is invalid."
         ),
         "case {case:?}: unexpected refusal {code} / {message}"
     );

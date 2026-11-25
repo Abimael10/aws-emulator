@@ -903,8 +903,10 @@ pub fn invalid_parameter_member_message(member: &str) -> String {
 /// nested inside the list's — rather than against the position of the first entry at fault.
 ///
 /// One list is ONE violation however many of its entries are outside the set, so the
-/// envelope counts one. `accepted` is stated in the ascending order the modelled value sets
-/// of this crate are held in, which is the order Amazon ECS prints a value set in.
+/// envelope counts one. `accepted` is printed in the order the CALLER passes it, which is the
+/// order the operation publishes its set in: the message is the only place the API states
+/// which values a member takes, so the set it prints is the one that member accepts, in that
+/// order, whether or not the modelled enum spells it the same way.
 ///
 /// Every fixed part of the sentence comes from the tree's one speller of it: the clause
 /// itself is the FRAMEWORK's rendering of a violation ([`::smithy_server_runtime::Violation`]'s
@@ -1966,6 +1968,54 @@ pub fn is_service_deployment_arn(arn: &str) -> bool {
 /// parameter whose syntax is wrong and echoing nothing the request carried.
 pub fn invalid_service_deployment_arn_message() -> String {
     "The ServiceDeployment ARN is invalid.".to_string()
+}
+
+/// `InvalidParameterException$message` for a value Amazon ECS read as a SERVICE identifier
+/// where the member takes no service: the whole sentence is fixed text naming the KIND of
+/// identifier the value was read as, and echoes nothing the request carried.
+///
+/// Spelled once for every member that earns it, so the readings cannot drift: the identifier
+/// `ListServiceDeployments` requires and names no service in, and a value handed to an
+/// operation addressing what a service OWNS — a rollout of it, a revision of it — that does
+/// not even claim to be an ARN of that kind ([`claims_resource_type`]), so the only identity
+/// left to read it as is the service's own.
+pub const SERVICE_ARN_INVALID_MESSAGE: &str = "The Service ARN provided is invalid.";
+
+/// The sentence a `serviceDeploymentArn` outside the form this service mints earns
+/// ([`is_service_deployment_arn`] is that question), decided by the KIND of identifier the
+/// value claims to be.
+///
+/// Spelled once for every operation that addresses a rollout by its ARN — the batch read and
+/// the two calls that act on one — so a value cannot be read as one kind of identifier by one
+/// of them and another kind by another:
+///
+/// * a value claiming to be a service-deployment ARN of this service was meant to be one, so
+///   it is refused as the malformed rollout ARN it is
+///   ([`invalid_service_deployment_arn_message`]) whatever else about its form is wrong;
+/// * a value claiming no kind at all leaves only the identity a rollout hangs off — the
+///   service's — so it is refused as the unusable service identifier it is
+///   ([`SERVICE_ARN_INVALID_MESSAGE`]).
+pub fn unusable_service_deployment_arn_message(reference: &str) -> String {
+    if claims_resource_type(reference, SERVICE_DEPLOYMENT_RESOURCE_TYPE) {
+        invalid_service_deployment_arn_message()
+    } else {
+        SERVICE_ARN_INVALID_MESSAGE.to_string()
+    }
+}
+
+/// Whether `value` is an ARN of THIS service whose resource type is `resource_type` — the
+/// KIND of resource the value itself claims to name.
+///
+/// Read from the value alone, and deliberately WITHOUT the rest of that resource's form
+/// (`is_service_deployment_arn` is that question): what this decides is which identifier a
+/// caller was spelling, which is what a refusal about an unusable identifier has to name. A
+/// value that claims no kind at all — a bare name, text that is no ARN, an ARN of another
+/// vendor or another resource — claims none of this service's resources, and is left to be
+/// read as the identifier the member's own resource hangs off
+/// ([`SERVICE_ARN_INVALID_MESSAGE`]).
+pub fn claims_resource_type(value: &str, resource_type: &str) -> bool {
+    ::service_common::arn::parse(value.trim())
+        .is_some_and(|arn| arn.vendor == ARN_NAMESPACE && arn.resource_type() == resource_type)
 }
 
 /// Why a rollout is in the state it is in, for the deployment that rolls it out.

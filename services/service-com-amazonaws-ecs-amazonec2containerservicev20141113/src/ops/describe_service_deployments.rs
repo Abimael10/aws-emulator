@@ -7,8 +7,8 @@
 //! configuration turned on — and a `MISSING` failure for every WELL-FORMED ARN that names
 //! no stored deployment, rather than refusing the batch; an ARN outside the form this
 //! service mints names nothing at all and is refused for its syntax before any of them is
-//! resolved. A REPORTING operation (`@readonly`): nothing here changes what a later caller
-//! sees.
+//! resolved, in the words of the kind of ARN the value itself is. A REPORTING operation
+//! (`@readonly`): nothing here changes what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -189,15 +189,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // store happens not to hold, which is the order every operation that takes one of
         // these ARNs reads it in. A WELL-FORMED ARN that names nothing stored is the
         // `MISSING` failure below.
-        if input
+        //
+        // WHICH sentence that refusal carries is decided by the kind of identifier the VALUE
+        // claims to be, the one reading every operation addressing a rollout by its ARN
+        // shares ([`crate::state::unusable_service_deployment_arn_message`]).
+        if let Some(reference) = input
             .service_deployment_arns
             .iter()
-            .any(|reference| !crate::state::is_service_deployment_arn(reference.trim()))
+            .find(|reference| !crate::state::is_service_deployment_arn(reference.trim()))
         {
+            let message = crate::state::unusable_service_deployment_arn_message(reference);
             return Err(
                 DescribeServiceDeploymentsErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(crate::state::invalid_service_deployment_arn_message()),
+                        message: Some(message),
                     },
                 )
                 .into(),

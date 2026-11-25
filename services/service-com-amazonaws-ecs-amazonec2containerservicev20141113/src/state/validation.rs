@@ -174,7 +174,9 @@ pub fn service_registry_refusal(
 /// * A pair the entry does name has to be one the revision declares — the container one of
 ///   its `containerDefinitions` and the port one that container publishes — which is the
 ///   same "from the task definition" rule a load-balancer binding is held to
-///   ([`load_balancer_binding_violation`]).
+///   ([`load_balancer_binding_violation`]), refused here in the words a REGISTRY entry earns:
+///   the member whose value has to come from the revision and the registry the entry names,
+///   rather than the sentence a load-balancer binding carries.
 ///
 /// `dns_records` is what [`cloud_map_service_dns_records`] read for
 /// [`requested_registry_ids`] of the same list: an entry whose registry it has no record
@@ -267,9 +269,15 @@ pub fn service_registry_binding_violation(
             .flatten()
             .any(|mapping| port_mapping_covers(mapping, container_port));
         if !declared {
+            // The port half of "from the task definition", worded as the entry's own
+            // refusal: the container and the port the entry named, the member whose value
+            // has to come from the revision, and the registry the entry sits in — the same
+            // frame the `containerName` half above carries, since both are one entry's
+            // reference to something the revision does not declare.
             return Some(format!(
-                "The container {container_name} did not have a container port \
-                 {container_port} defined."
+                "The container {container_name} with port {container_port} is not valid. The \
+                 value specified for 'containerPort' must already be specified in the task \
+                 definition. Registry: {registry_arn}"
             ));
         }
     }

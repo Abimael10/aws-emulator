@@ -38,7 +38,9 @@
 //!   value the request carried instead of listing the kinds the member takes.
 //! * **A status filter whose entries are outside the set**, reported against the LIST — the
 //!   whole list as the value, the list under the name the API prints for it, and the
-//!   element's own requirement nested inside the list's ([`crate::state::list_member_constraint_message`]).
+//!   element's own requirement nested inside the list's ([`crate::state::list_member_constraint_message`]),
+//!   listing the statuses THAT operation publishes in its order
+//!   ([`FILTER_SERVICE_DEPLOYMENT_STATUSES`]).
 //! * **A required identifier the request leaves out, or names nothing at all in**, refused
 //!   with the one sentence that operation publishes for it — naming no member path, no value
 //!   and no count, which is what the framework's clause would state.
@@ -105,10 +107,38 @@ const LISTED_SCHEDULING_STRATEGY_MEMBER: &str = "Scheduling strategy";
 /// member is spelled with.
 const STATUS_FILTER_MEMBER: &str = "statusFilter";
 
+/// The service-deployment statuses a LISTING publishes for `ListServiceDeployments$status`,
+/// in the order it publishes them. RECORDED behaviour of the operation, as with
+/// [`FILTER_LAUNCH_TYPES`]: the message is the only place the API states which statuses it
+/// filters on, so it prints the set the SERVICE accepts there, which is neither the order nor
+/// the membership of the modelled enum
+/// (`smithy_query(query="shape",shape="ServiceDeploymentStatus")`: PENDING, SUCCESSFUL,
+/// STOPPED, STOP_REQUESTED, IN_PROGRESS, ROLLBACK_REQUESTED, ROLLBACK_IN_PROGRESS,
+/// ROLLBACK_SUCCESSFUL, ROLLBACK_FAILED).
+///
+/// `CREATED` is published by this operation and is NOT a member of that modelled enum, so the
+/// generated input schema this service is built from cannot carry it: a listing asked to
+/// filter on it is refused rather than served, with this operation's own sentence listing it.
+/// Serving it would need the model to declare it.
+const FILTER_SERVICE_DEPLOYMENT_STATUSES: [&str; 10] = [
+    "IN_PROGRESS",
+    "CREATED",
+    "ROLLBACK_IN_PROGRESS",
+    "STOPPED",
+    "STOP_REQUESTED",
+    "ROLLBACK_REQUESTED",
+    "ROLLBACK_SUCCESSFUL",
+    "PENDING",
+    "ROLLBACK_FAILED",
+    "SUCCESSFUL",
+];
+
 /// `ListServiceDeployments$service` is "The ARN or name of the service", and a request that
 /// carries none names no service to report the deployments of: the whole sentence is fixed
-/// text about the identifier.
-const SERVICE_ARN_INVALID_MESSAGE: &str = "The Service ARN provided is invalid.";
+/// text about the identifier — the one this service spells once
+/// ([`crate::state::SERVICE_ARN_INVALID_MESSAGE`]), so this refusal and the reads that answer
+/// a SERVICE ARN handed to a member taking no service cannot drift apart.
+const SERVICE_ARN_INVALID_MESSAGE: &str = crate::state::SERVICE_ARN_INVALID_MESSAGE;
 
 /// The member that identifies WHICH service's deployments a listing reports.
 const SERVICE_MEMBER: &str = "service";
@@ -465,6 +495,11 @@ fn duplicate_services_refusal(requested: &[String]) -> Option<String> {
 /// The clause a `status` filter holding an entry outside the status set earns, reported
 /// against the LIST the entries came in, or `None` when every entry names a status (and for
 /// a request that carries no filter).
+///
+/// As with [`launch_type_refusal`], the set a value is CHECKED against is the member's
+/// modelled one ([`SERVICE_DEPLOYMENT_STATUS_VALUES`]), so no request's outcome changes with
+/// the set the sentence LISTS — the statuses this operation publishes
+/// ([`FILTER_SERVICE_DEPLOYMENT_STATUSES`]).
 fn status_filter_refusal(requested: Option<&[String]>) -> Option<String> {
     let requested = requested?;
     let outside = requested
@@ -474,7 +509,7 @@ fn status_filter_refusal(requested: Option<&[String]>) -> Option<String> {
         crate::state::list_member_constraint_message(
             STATUS_FILTER_MEMBER,
             requested,
-            SERVICE_DEPLOYMENT_STATUS_VALUES,
+            &FILTER_SERVICE_DEPLOYMENT_STATUSES,
         )
     })
 }

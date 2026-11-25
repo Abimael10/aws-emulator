@@ -177,12 +177,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the form this service mints ([`crate::state::is_service_deployment_arn`]) names
         // no rollout at all, so it is refused for its syntax — the same reading its sibling
         // calls make, so one ARN cannot be malformed for one of them and merely absent for
-        // another.
+        // another, and in the sentence the KIND of identifier the value claims to be earns
+        // ([`crate::state::unusable_service_deployment_arn_message`]).
         if !crate::state::is_service_deployment_arn(&deployment_arn) {
             return Err(
                 StopServiceDeploymentErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(crate::state::invalid_service_deployment_arn_message()),
+                        message: Some(
+                            crate::state::unusable_service_deployment_arn_message(&deployment_arn),
+                        ),
                     },
                 )
                 .into(),

@@ -181,6 +181,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // A `serviceRevisionArn` names a revision OF a service, so a value that does not even
+        // claim to be a service-revision ARN of this service
+        // ([`crate::state::claims_resource_type`]) — a bare name, text that is no ARN, an ARN
+        // of another resource, the SERVICE's own among them — hands this read no revision at
+        // all: the only identity left to read it as is the service's own, so it is refused as
+        // the unusable service identifier it is, before anything is resolved and in the same
+        // words its sibling `DescribeServiceDeployments` answers such a value with
+        // ([`crate::state::SERVICE_ARN_INVALID_MESSAGE`]).
+        if input.service_revision_arns.iter().any(|reference| {
+            !crate::state::claims_resource_type(
+                reference,
+                crate::state::SERVICE_REVISION_RESOURCE_TYPE,
+            )
+        }) {
+            return Err(
+                DescribeServiceRevisionsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::SERVICE_ARN_INVALID_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
 

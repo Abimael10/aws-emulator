@@ -13,6 +13,9 @@
 //! number between <min>-<max>."). A `maxResults` inside the range, each published bound
 //! included, is accepted and paged with.
 //!
+//! The service-deployment listing words its own span sentence instead, pinned beside its
+//! other published statements in [`crate::service_deployment_listing_refusal_wording`].
+//!
 //! The refusal is a property of the RANGE and of the sentence that operation words, not of
 //! how far past a bound the value is, so the tables below vary the END crossed (below the
 //! minimum, above the maximum), the DISTANCE past it (one step, far), the RANGE (the
@@ -25,6 +28,7 @@
 //!   `ListTaskDefinitions`, `ListTaskDefinitionFamilies`, `ListContainerInstances`,
 //!   `ListAttributes`, `ListServiceDeployments`, `ListDaemons`,
 //!   `ListDaemonTaskDefinitions` — "This value can be between 1 and 100."
+//!   (`ListServiceDeployments` documents that range and states it in its own sentence.)
 //! * `ListAccountSettings` — "This value can be between 1 and 10."
 //!
 //! `DescribeCapacityProviders` documents the same 1..=10 at its own `maxResults`, but that
@@ -315,12 +319,6 @@ async fn a_long_standing_page_size_names_the_bound_it_crossed_at_either_end() {
                 "ListAttributes",
                 json!({ "targetType": "container-instance", "maxResults": 0 }),
                 below_minimum_sentence(1),
-            ),
-            (
-                "a service-deployment page one above the range",
-                "ListServiceDeployments",
-                json!({ "service": "pagedservice", "maxResults": 101 }),
-                above_maximum_sentence(100),
             ),
             (
                 "an account-setting page below its narrower range",

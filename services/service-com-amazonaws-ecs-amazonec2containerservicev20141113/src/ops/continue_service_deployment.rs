@@ -183,12 +183,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let hook_id = input.hook_id.trim().to_string();
         // The SHAPE of the ARN is settled before any state is consulted: it is what says
         // which rollout a hook would belong to, so a value outside the form this service
-        // mints names no rollout at all and is refused for what it IS.
+        // mints names no rollout at all and is refused for what it IS — in the sentence the
+        // KIND of identifier the value claims to be earns, the one reading every operation
+        // addressing a rollout shares
+        // ([`crate::state::unusable_service_deployment_arn_message`]).
         if !crate::state::is_service_deployment_arn(&deployment_arn) {
             return Err(
                 ContinueServiceDeploymentErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(crate::state::invalid_service_deployment_arn_message()),
+                        message: Some(
+                            crate::state::unusable_service_deployment_arn_message(&deployment_arn),
+                        ),
                     },
                 )
                 .into(),
