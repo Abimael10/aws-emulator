@@ -917,6 +917,10 @@ pub mod xray_segments;
 /// takes one as a caller-supplied string — so X-Ray and a service that merely carries a
 /// trace header cannot disagree about what counts as one.
 pub mod xray_trace;
+/// The ONE reading of an XML document a service is handed by something other than its own
+/// wire — the answer of a REST-XML or QUERY service it called, and the error document a
+/// refused call carries — as a tree of elements and as the JSON document that tree carries.
+pub mod xml_document;
 /// The ONE bound on how deeply a caller-supplied YAML document nests, taken before that
 /// document is handed to a parser — so how deeply a caller's text may nest is decided in
 /// one place rather than per service.

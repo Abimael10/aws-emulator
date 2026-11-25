@@ -23028,6 +23028,7 @@ dependencies = [
  "pkcs1",
  "pkcs8 0.10.2",
  "png 0.18.1",
+ "quick-xml",
  "rand 0.9.5",
  "rcgen",
  "regex",

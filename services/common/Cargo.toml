@@ -318,6 +318,11 @@ fancy-regex = "0.16"
 # `deflate` alone — no other compression method is linked in — and never extracted to a host
 # path.
 zip = { version = "9", default-features = false, features = ["deflate"] }
+# `xml_document`: the maintained XML pull parser the ONE reading of an XML document a
+# service was handed by another service's wire is built on — so the format itself is read
+# by that parser rather than by a reader written per service. The same version every other
+# crate in this workspace reads and writes XML with.
+quick-xml = "0.41"
 # `record_identicon`: the PNG encoder the image a service serves for a record whose own image
 # bytes it does not hold is written with — the maintained codec this workspace already encodes
 # PNGs with, so the one renderer every such service shares writes a real image rather than

@@ -185,7 +185,7 @@ const MAX_RENDERED_BYTES: usize = 8 * crate::ops::put_integration::MAX_TEMPLATE_
 /// bytes it READS.
 ///
 /// The one piece of work a reference can make large is a query of the PAYLOAD
-/// (`$input.json`, `$input.path`): the payload is read as a JSON document once per
+/// (`$input.json`, `$input.path`): the payload is read as a document once per
 /// rendering ([`Render::document`]) and each query looks through it, so without a budget the
 /// cost would be the product of two caller-chosen factors — how many such references the
 /// stored template carries and how large the payload the request sent is. Charging each
@@ -373,9 +373,9 @@ fn emitting(branches: &[Branch]) -> bool {
 /// what is left of the reads [`MAX_RENDER_WORK`] allows.
 struct Render<'i> {
     inputs: &'i TemplateInputs,
-    /// The payload as a JSON document: `None` until a reference needs it, `Some(None)` once
-    /// it has been read and is not a JSON document (or there is no payload to read), so
-    /// neither the parse nor the refusal happens twice.
+    /// The payload as the document its bytes carry ([`Render::document`]): `None` until a
+    /// reference needs it, `Some(None)` once it has been read and is no document at all (or
+    /// there is no payload to read), so neither the parse nor the refusal happens twice.
     document: Option<Option<::serde_json::Value>>,
     /// What the `#set` directives seen so far have bound, by name.
     bindings: BTreeMap<String, ::serde_json::Value>,
@@ -661,7 +661,17 @@ impl Render<'_> {
 
     /// The payload as the JSON document a `$input.json`/`$input.path` query is applied to,
     /// read on the first reference that needs it and kept for the rest of this rendering;
-    /// `None` when there is no payload to read or it is not a JSON document.
+    /// `None` when there is no payload to read or it is no document at all.
+    ///
+    /// The payload is read as the document ITS OWN BYTES carry, which is the whole point of
+    /// `$input.path` — "takes a JSONPath expression string (x) and returns a JSON object
+    /// representation of the result". A JSON payload is that document already; an XML one —
+    /// what every AWS QUERY and REST-XML service answers, so what an `AWS` integration to one
+    /// of them hands its response template — carries the same object model in its elements,
+    /// and is read by the tree's ONE reading of an XML document
+    /// ([`::service_common::xml_document::rooted_document`]): a nested element is a member of
+    /// its parent, repeated siblings are a list, a text-only element is its text, and the
+    /// result is named both through the root element and as the document's own members.
     fn document(&mut self) -> Result<Option<&::serde_json::Value>, Unrendered> {
         if self.document.is_none() {
             let read = match self.inputs.payload.as_deref() {
@@ -670,7 +680,9 @@ impl Render<'_> {
                     // once — and the queries below are charged again per query, which is
                     // what bounds the product this module could otherwise cost.
                     self.spend(payload.len())?;
-                    ::serde_json::from_slice::<::serde_json::Value>(payload).ok()
+                    ::serde_json::from_slice::<::serde_json::Value>(payload)
+                        .ok()
+                        .or_else(|| ::service_common::xml_document::rooted_document(payload))
                 }
                 None => None,
             };
