@@ -954,8 +954,11 @@ async fn a_request_the_model_cannot_bound_is_refused_as_invalid() {
                 "infrastructureConfigurationArn": configuration.clone(),
                 "clientToken": "both-recipes",
             }),
-            "InvalidRequestException",
-            "The request must specify exactly one of imageRecipeArn and containerRecipeArn.",
+            // A request that named BOTH carries a parameter COMBINATION that cannot hold:
+            // neither ARN is wrong on its own, so the refusal names both members.
+            "InvalidParameterCombinationException",
+            "The value supplied for parameter 'imageRecipeArn' and 'containerRecipeArn' is \
+             not valid. You must specify either imageRecipeArn or containerRecipeArn.",
         ),
         (
             "workflows without the role they run under",

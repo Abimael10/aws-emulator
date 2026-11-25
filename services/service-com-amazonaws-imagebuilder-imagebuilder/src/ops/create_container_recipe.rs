@@ -212,9 +212,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-imagebuilder-imagebuild
 // service refuses a parameter of a request with, which is what a `semanticVersion` outside
 // the bound its nodes are assignable in, a `platformOverride` a container recipe cannot
 // build for, and a `dockerfileTemplateUri` naming no readable object each are.
+//
+// `InvalidParameterCombinationException` is widened in for a third reason: the request can
+// carry a COMBINATION of parameters no one value of which is wrong —
+// `dockerfileTemplateData` and `dockerfileTemplateUri` exclude each other — and this SERVICE
+// models that shape for "a combination of parameters that isn't valid" (HTTP 400, declared
+// in `types/shared_types.rs` and listed by `CreateComponent` for the same kind of pair),
+// while this operation's own `errors` list omits it.
 #[smithy_macros::operation_error(
     "com.amazonaws.imagebuilder#CreateContainerRecipe",
-    extra_errors = ["ResourceNotFoundException", "InvalidParameterValueException"]
+    extra_errors = [
+        "ResourceNotFoundException",
+        "InvalidParameterValueException",
+        "InvalidParameterCombinationException",
+    ]
 )]
 #[derive(Debug)]
 pub enum CreateContainerRecipeErrorModeled {
@@ -223,6 +234,7 @@ pub enum CreateContainerRecipeErrorModeled {
     DryRunOperationException(DryRunOperationException),
     ForbiddenException(ForbiddenException),
     IdempotentParameterMismatchException(IdempotentParameterMismatchException),
+    InvalidParameterCombinationException(InvalidParameterCombinationException),
     InvalidParameterValueException(InvalidParameterValueException),
     InvalidRequestException(InvalidRequestException),
     InvalidVersionNumberException(InvalidVersionNumberException),
@@ -299,15 +311,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You must specify exactly one of the dockerfileTemplateData or
         // dockerfileTemplateUri properties" — a requirement over the two members together,
-        // so it is refused as this service refuses every parameter whose value it cannot
-        // accept, naming both.
+        // so the sentence names both. The two halves of it are DIFFERENT failures: a request
+        // naming BOTH carries a combination of parameters that cannot hold together, which
+        // is the parameter-combination class (`InvalidParameterCombinationException`), while
+        // one naming NEITHER is refused as the parameter this service could not read a
+        // template from.
         let template_source = match (
             input.dockerfile_template_data.as_deref(),
             input.dockerfile_template_uri.as_deref(),
         ) {
             (Some(data), None) => TemplateSource::Inline(data),
             (None, Some(uri)) => TemplateSource::Uri(uri),
-            _ => return Err(refused(crate::state::dockerfile_template_data_or_uri_message())),
+            (Some(_), Some(_)) => {
+                return Err(
+                    CreateContainerRecipeErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(crate::state::dockerfile_template_data_or_uri_message()),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            (None, None) => {
+                return Err(refused(
+                    crate::state::dockerfile_template_data_or_uri_message(),
+                ))
+            }
         };
 
         // The modelled `WildcardVersionNumber` admits an `x` node, which is a FILTERING

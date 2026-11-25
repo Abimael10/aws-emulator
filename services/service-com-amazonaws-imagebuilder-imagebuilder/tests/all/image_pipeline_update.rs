@@ -1136,8 +1136,9 @@ async fn a_refused_update_leaves_the_pipeline_as_it_was() {
                 "containerRecipeArn": fixture.container_recipe,
             }),
             400,
-            "InvalidRequestException",
-            "The request must specify exactly one of imageRecipeArn and containerRecipeArn."
+            "InvalidParameterCombinationException",
+            "The value supplied for parameter 'imageRecipeArn' and 'containerRecipeArn' is \
+             not valid. You must specify either imageRecipeArn or containerRecipeArn."
                 .to_string(),
         ),
         (

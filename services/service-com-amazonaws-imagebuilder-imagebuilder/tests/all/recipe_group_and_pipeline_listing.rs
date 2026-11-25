@@ -14,8 +14,9 @@
 //! sentence "Required parameters are missing from the request: '<member>' or '<member>'.
 //! Verify that you have entered all of the required parameters in your request and try
 //! again.", quoting the members in the order the input shape declares them. That is a
-//! different failure from naming BOTH, which is a combination that cannot hold together and
-//! keeps the modelled `InvalidRequestException`, and from naming one that resolves to
+//! different failure from naming BOTH, which is a combination of parameters that cannot hold
+//! together and is refused as that combination (`InvalidParameterCombinationException`), and
+//! from naming one that resolves to
 //! nothing, which reports the resource missing. Nothing is stored by any of the three, which
 //! the listing of the resource the create would have made is what shows.
 //!
@@ -307,9 +308,10 @@ async fn a_create_naming_none_of_the_recipe_group_reports_the_group_missing() {
                 ],
                 Some((
                     400,
-                    "InvalidRequestException",
-                    "The request must specify exactly one of imageRecipeArn and \
-                     containerRecipeArn."
+                    "InvalidParameterCombinationException",
+                    "The value supplied for parameter 'imageRecipeArn' and \
+                     'containerRecipeArn' is not valid. You must specify either \
+                     imageRecipeArn or containerRecipeArn."
                         .to_string(),
                 )),
             ),

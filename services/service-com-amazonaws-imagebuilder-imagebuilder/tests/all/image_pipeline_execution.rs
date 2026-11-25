@@ -1007,8 +1007,9 @@ async fn a_create_refuses_what_it_cannot_resolve() {
             json!({ "imageRecipeArn": recipe, "containerRecipeArn": absent_container }),
             Err((
                 400,
-                "InvalidRequestException",
-                "The request must specify exactly one of imageRecipeArn and containerRecipeArn."
+                "InvalidParameterCombinationException",
+                "The value supplied for parameter 'imageRecipeArn' and 'containerRecipeArn' \
+                 is not valid. You must specify either imageRecipeArn or containerRecipeArn."
                     .to_string(),
             )),
         ),

@@ -183,9 +183,23 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-imagebuilder-imagebuild
 // `types/shared_types.rs`), and this operation's own `errors` list omits it. So an expression
 // that is not a schedule is refused as that parameter's value, in the one sentence this
 // service states every parameter refusal in.
+//
+// `InvalidParameterCombinationException` is widened in because the request can carry a
+// COMBINATION of parameters no one value of which is wrong: `imageRecipeArn` and
+// `containerRecipeArn` exclude each other, and this SERVICE models that shape for "a
+// combination of parameters that isn't valid" (`com.amazonaws.imagebuilder#
+// InvalidParameterCombinationException`, HTTP 400, declared in `types/shared_types.rs` and
+// listed by `CreateComponent` for the same kind of pair), while this operation's own
+// `errors` list omits it. So a pair that cannot hold together is reported as the parameter
+// combination it is rather than as a malformed request, which is a different claim a client
+// branches on.
 #[smithy_macros::operation_error(
     "com.amazonaws.imagebuilder#CreateImagePipeline",
-    extra_errors = ["ResourceNotFoundException", "InvalidParameterValueException"]
+    extra_errors = [
+        "ResourceNotFoundException",
+        "InvalidParameterValueException",
+        "InvalidParameterCombinationException",
+    ]
 )]
 #[derive(Debug)]
 pub enum CreateImagePipelineErrorModeled {
@@ -194,6 +208,7 @@ pub enum CreateImagePipelineErrorModeled {
     DryRunOperationException(DryRunOperationException),
     ForbiddenException(ForbiddenException),
     IdempotentParameterMismatchException(IdempotentParameterMismatchException),
+    InvalidParameterCombinationException(InvalidParameterCombinationException),
     InvalidParameterValueException(InvalidParameterValueException),
     InvalidRequestException(InvalidRequestException),
     ResourceAlreadyExistsException(ResourceAlreadyExistsException),
@@ -274,8 +289,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that named NONE of the group is missing a required parameter — the class a
         // parameter group the model cannot require is reported under
         // (`crate::state::MISSING_PARAMETERS_CODE`), naming the members it could have
-        // carried — while a request that named BOTH carries a combination that cannot hold
-        // together, which is the modelled invalid-request class.
+        // carried — while a request that named BOTH carries a combination of parameters that
+        // cannot hold together, which is the parameter-combination class
+        // (`InvalidParameterCombinationException`) over the sentence naming both members.
         if input.image_recipe_arn.is_none() && input.container_recipe_arn.is_none() {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::MISSING_PARAMETERS_CODE,
@@ -284,12 +300,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
         if input.image_recipe_arn.is_some() && input.container_recipe_arn.is_some() {
-            return Err(CreateImagePipelineErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(crate::state::exactly_one_recipe_message()),
-                },
-            )
-            .into());
+            return Err(
+                CreateImagePipelineErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(crate::state::exactly_one_recipe_message()),
+                    },
+                )
+                .into(),
+            );
         }
 
         // "You must also specify executionRole when you provide workflows."

@@ -4577,15 +4577,28 @@ pub fn duplicate_recipe_component_message(name: &str) -> String {
 }
 
 
-/// Why a create naming neither recipe, or both, is refused.
+/// Why a call naming BOTH recipes is refused.
 ///
 /// The rule is the one `CreateImagePipeline` and `CreateImage` each state for themselves:
 /// "You must specify exactly one recipe" "using either a containerRecipeArn or an
 /// imageRecipeArn", which each of the two members repeats as "You must specify either this
 /// property or … but not both".
+///
+/// A requirement over the two members TOGETHER rather than a constraint on either value —
+/// each ARN is well formed and names a recipe, and it is the PAIR that cannot hold — so it
+/// is stated in the sentence this service states a refused parameter COMBINATION in
+/// (`service_common::validation_message::parameters_value_mismatch`), naming both members in
+/// the order the input shapes declare them ([`PIPELINE_RECIPE_MEMBERS`]) and closing on the
+/// one the caller has to choose between them. The two member names are the only parts of the
+/// sentence that vary, and both halves read them off the same constant so the parameters the
+/// sentence names and the ones its requirement states cannot drift apart.
 #[must_use]
 pub fn exactly_one_recipe_message() -> String {
-    "The request must specify exactly one of imageRecipeArn and containerRecipeArn.".to_string()
+    let [image_recipe, container_recipe] = PIPELINE_RECIPE_MEMBERS;
+    ::service_common::validation_message::parameters_value_mismatch(
+        &PIPELINE_RECIPE_MEMBERS,
+        &format!("You must specify either {image_recipe} or {container_recipe}."),
+    )
 }
 
 /// Why a create naming workflows but no execution role is refused.

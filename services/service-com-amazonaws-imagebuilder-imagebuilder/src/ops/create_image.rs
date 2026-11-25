@@ -158,9 +158,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-imagebuilder-imagebuild
 // this operation's own `errors` list omits. So a reference that resolves to nothing is
 // reported MISSING rather than dressed up as an invalid request, which is a different
 // claim a client branches on.
+//
+// `InvalidParameterCombinationException` is widened in for the same kind of reason: the
+// request can carry a COMBINATION of parameters no one value of which is wrong —
+// `imageRecipeArn` and `containerRecipeArn` exclude each other — and this SERVICE models
+// that shape for "a combination of parameters that isn't valid"
+// (`com.amazonaws.imagebuilder#InvalidParameterCombinationException`, HTTP 400, declared in
+// `types/shared_types.rs` and listed by `CreateComponent` for the same kind of pair), while
+// this operation's own `errors` list omits it.
 #[smithy_macros::operation_error(
     "com.amazonaws.imagebuilder#CreateImage",
-    extra_errors = ["ResourceNotFoundException"]
+    extra_errors = ["ResourceNotFoundException", "InvalidParameterCombinationException"]
 )]
 #[derive(Debug)]
 pub enum CreateImageErrorModeled {
@@ -168,6 +176,7 @@ pub enum CreateImageErrorModeled {
     ClientException(ClientException),
     ForbiddenException(ForbiddenException),
     IdempotentParameterMismatchException(IdempotentParameterMismatchException),
+    InvalidParameterCombinationException(InvalidParameterCombinationException),
     InvalidRequestException(InvalidRequestException),
     ResourceInUseException(ResourceInUseException),
     ResourceNotFoundException(ResourceNotFoundException),
@@ -563,8 +572,9 @@ fn answer(request_id: String, client_token: String, arn: String) -> CreateImageO
 /// this property or … but not both" — and the model can say neither that one of them is
 /// required nor that they exclude each other. The two halves are different failures: a
 /// request naming NONE of the group is missing a required parameter
-/// ([`crate::state::MISSING_PARAMETERS_CODE`]), and one naming BOTH carries a combination
-/// that cannot hold together.
+/// ([`crate::state::MISSING_PARAMETERS_CODE`]), and one naming BOTH carries a combination of
+/// parameters that cannot hold together, which is the parameter-combination class
+/// (`InvalidParameterCombinationException`) over the sentence naming both members.
 ///
 /// WHICH kind of recipe the one reference names is the ARN's own to say, so the reference
 /// alone is handed back: each member's modelled pattern pins the resource kind its value may
@@ -579,12 +589,14 @@ fn named_recipe(input: &CreateImageInput) -> Result<&str, CreateImageError> {
             crate::state::MISSING_PARAMETERS_STATUS,
             crate::state::missing_parameters_message(&crate::state::PIPELINE_RECIPE_MEMBERS),
         )),
-        (Some(_), Some(_)) => Err(CreateImageErrorModeled::InvalidRequestException(
-            InvalidRequestException {
-                message: Some(crate::state::exactly_one_recipe_message()),
-            },
-        )
-        .into()),
+        (Some(_), Some(_)) => Err(
+            CreateImageErrorModeled::InvalidParameterCombinationException(
+                InvalidParameterCombinationException {
+                    message: Some(crate::state::exactly_one_recipe_message()),
+                },
+            )
+            .into(),
+        ),
     }
 }
 

@@ -731,7 +731,9 @@ async fn a_create_refuses_what_it_cannot_accept() {
                 "dockerfileTemplateUri": "s3://imagebuilder-templates/Dockerfile",
             }),
             400,
-            "InvalidParameterValueException",
+            // Naming BOTH is a parameter COMBINATION that cannot hold: neither value is
+            // wrong on its own, so the refusal is the combination class.
+            "InvalidParameterCombinationException",
         ),
         (
             "a platform a container recipe cannot build for",
