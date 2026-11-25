@@ -662,8 +662,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let deployment_group_id =
                 crate::state::mint_uuid_from(&mut state.next_id, "deployment-group");
             let compute_platform = application.compute_platform.clone();
+            // A request that named no configuration runs under the one its
+            // platform and its style default to, stored so every read of the
+            // group reports the configuration its deployments are paced by
+            // (`crate::state::deployment_group_default_config`).
             let deployment_config_name = named_config.unwrap_or_else(|| {
-                crate::state::default_deployment_config_for(&compute_platform).to_string()
+                crate::state::default_deployment_config_for(
+                    &compute_platform,
+                    deployment_style.as_ref(),
+                )
+                .to_string()
             });
             let group = crate::state::DeploymentGroup {
                 deployment_group_id: deployment_group_id.clone(),

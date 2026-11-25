@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetDeploymentGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetDeploymentGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers the stored record of each deployment group the request names under one
+//! application — the same record the single reader `GetDeploymentGroup` answers.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetDeploymentGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +155,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetDeploymentGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetDeploymentGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetDeploymentGroups"))
+        let _ = ctx;
+        // `applicationName` is @required and carries the modelled length and
+        // pattern, and so does every entry of `deploymentGroupNames`, so the
+        // boundary already refused an absent, empty or malformed one (`service.rs`
+        // words those as this service's `ApplicationNameRequiredException` /
+        // `InvalidApplicationNameException` and
+        // `DeploymentGroupNameRequiredException` /
+        // `InvalidDeploymentGroupNameException`).
+        let application_name = input.application_name;
+        let names = input.deployment_group_names;
+
+        // The batch precondition comes FIRST: a batch past the request-size quota
+        // is refused whatever it carries, and nothing about the store is read for
+        // it. That quota is the one `BatchLimitExceededException` states for every
+        // batch reader of this service (`crate::state::MAX_BATCH_SIZE`), which is
+        // also the figure this operation's own prose carries.
+        if names.len() > crate::state::MAX_BATCH_SIZE {
+            return Err(
+                BatchGetDeploymentGroupsErrorModeled::BatchLimitExceededException(
+                    BatchLimitExceededException {
+                        message: Some(crate::state::batch_limit_exceeded_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+        // A batch has to name at least one deployment group: an empty list
+        // identifies nothing to look up, which is the same refusal as an absent
+        // `deploymentGroupNames`.
+        if names.is_empty() {
+            return Err(
+                BatchGetDeploymentGroupsErrorModeled::DeploymentGroupNameRequiredException(
+                    DeploymentGroupNameRequiredException {
+                        message: Some(crate::state::DEPLOYMENT_GROUP_NAME_MISSING.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let outcome = crate::state::with_state(&*self.engine, |state| {
+            // The application OWNS its deployment groups, so a batch under an
+            // application this account does not hold is refused for the
+            // application rather than answered as a batch that found nothing.
+            let Some(application) = state.applications.get(&application_name) else {
+                return Err(
+                    BatchGetDeploymentGroupsErrorModeled::ApplicationDoesNotExistException(
+                        ApplicationDoesNotExistException {
+                            message: Some(crate::state::application_not_found(
+                                &application_name,
+                            )),
+                        },
+                    ),
+                );
+            };
+            // One record per name the application holds a group under, in the
+            // order the request named them — so a caller can line the answer up
+            // with its input, and a repeated name is answered at each position it
+            // appears at. Each record is built by the one projection the single
+            // reader `GetDeploymentGroup` answers with
+            // (`crate::state::deployment_group_info`), so the two views of one
+            // group cannot disagree. A name the application holds no group under
+            // is simply absent from the answer: this operation models no
+            // "deployment group does not exist" error, so an unknown name cannot
+            // be reported as one and does not refuse the batch, exactly as the
+            // other batch readers of this service do.
+            let groups: Vec<&crate::state::DeploymentGroup> = names
+                .iter()
+                .filter_map(|name| application.deployment_groups.get(name))
+                .collect();
+            Ok(groups
+                .into_iter()
+                .map(|group| crate::state::deployment_group_info(state, group))
+                .collect::<Vec<_>>())
+        })
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        Ok(BatchGetDeploymentGroupsOutput {
+            // `errorMessage` reports "errors that might have occurred during the
+            // API call": this batch either reports the groups the application
+            // holds or is refused outright with the modelled error for why, so
+            // there is no partial failure left to describe here. The member is
+            // still ANSWERED — as the empty string, the no-error text — exactly as
+            // the other batch readers of this service answer it.
+            error_message: Some(String::new()),
+            deployment_groups_info: Some(outcome?),
+        })
     }
 }

@@ -142,6 +142,10 @@ pub mod deployment_config_namespace;
 /// whether it determines one.
 pub mod tag_set;
 
+/// The configuration a deployment group whose request named none runs by: the one
+/// place that default is chosen.
+pub mod deployment_group_default_config;
+
 use crate::ops::types::{
     AlarmConfiguration, AutoRollbackConfiguration, BlueGreenDeploymentConfiguration,
     DeploymentStyle, EC2DeploymentOptions, EC2TagFilter, EC2TagSet, ECSService, LoadBalancerInfo,
@@ -3095,14 +3099,10 @@ pub fn timestamp_millis(value: &::aws_smithy_types::DateTime) -> Option<i64> {
 }
 
 /// The deployment configuration CodeDeploy applies when neither the request nor
-/// the deployment group names one: the default built-in for the compute platform.
-pub fn default_deployment_config_for(compute_platform: &str) -> &'static str {
-    match compute_platform {
-        "Lambda" => "CodeDeployDefault.LambdaAllAtOnce",
-        "ECS" => "CodeDeployDefault.ECSAllAtOnce",
-        _ => "CodeDeployDefault.OneAtATime",
-    }
-}
+/// the deployment group names one: see
+/// [`deployment_group_default_config::default_deployment_config_for`], which is
+/// the one place that choice is made.
+pub use deployment_group_default_config::default_deployment_config_for;
 
 /// Whether `id` is shaped like a deployment id at all.
 ///

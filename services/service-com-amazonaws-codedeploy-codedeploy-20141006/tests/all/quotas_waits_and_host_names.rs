@@ -227,6 +227,15 @@ async fn every_batch_reader_enforces_the_shared_request_size_quota() {
                 })
             }),
         },
+        Reader {
+            operation: "BatchGetDeploymentGroups",
+            request: Box::new(|size| {
+                json!({
+                    "applicationName": application,
+                    "deploymentGroupNames": vec![group.clone(); size],
+                })
+            }),
+        },
     ];
 
     // Sizes differ along the quota: one entry, the smaller figure an operation's

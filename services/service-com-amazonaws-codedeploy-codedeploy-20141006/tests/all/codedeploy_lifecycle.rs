@@ -694,6 +694,24 @@ pub(crate) async fn seeded_group(
     group
 }
 
+/// The predefined deployment configuration that shifts ALL of a deployment's
+/// traffic in ONE step on `platform`, or `None` for a platform whose
+/// configurations shift no traffic at all (the EC2/on-premises one).
+///
+/// A group whose style has the service move the production traffic defaults to its
+/// platform's TIME-BASED configuration, which holds the deployment open for that
+/// configuration's interval. A fixture whose case is not about that pacing names
+/// this configuration instead, so its deployment cuts over in one step; the suites
+/// that ARE about the default (`deployment_group_default_config`) and about the
+/// shift itself (`lambda_traffic_shifting`) name nothing here.
+pub(crate) fn all_at_once_config(platform: &str) -> Option<&'static str> {
+    match platform {
+        "Lambda" => Some("CodeDeployDefault.LambdaAllAtOnce"),
+        "ECS" => Some("CodeDeployDefault.ECSAllAtOnce"),
+        _ => None,
+    }
+}
+
 /// How long a suite waits for a transition the clock owes, and how often it
 /// looks: the emulator owes a deployment its terminal status well inside this.
 ///

@@ -61,6 +61,11 @@ fn blue_green_style() -> Value {
 
 /// Create an application and one deployment group on it, carrying `style` when it
 /// is not null, and answer the group name.
+///
+/// No case here is about the PACING a deployment configuration gives a
+/// deployment, so the group names the one that cuts over in a single step
+/// ([`crate::codedeploy_lifecycle::all_at_once_config`]) rather than the
+/// time-based configuration a traffic-controlled group would default to.
 async fn seeded_group(
     emulator: &Emulator,
     application: &str,
@@ -79,6 +84,9 @@ async fn seeded_group(
         "deploymentGroupName": group,
         "serviceRoleArn": SERVICE_ROLE,
     });
+    if let Some(config) = crate::codedeploy_lifecycle::all_at_once_config(platform) {
+        request["deploymentConfigName"] = json!(config);
+    }
     if !style.is_null() {
         request["deploymentStyle"] = style.clone();
     }
