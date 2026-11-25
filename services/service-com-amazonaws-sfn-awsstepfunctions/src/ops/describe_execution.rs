@@ -379,7 +379,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let reported = DescribeExecutionOutput {
             execution_arn: execution.arn.clone(),
-            state_machine_arn: execution.state_machine_arn.clone(),
+            // "The Amazon Resource Name (ARN) of the executed stated machine": a CHILD
+            // workflow execution of a Distributed Map state was executed by that Map
+            // state's own child state machine, which its labeled ARN names
+            // ([`crate::state::map_run_identity`]); every other execution was executed
+            // by the state machine itself.
+            state_machine_arn: crate::state::map_run_identity::executed_state_machine_arn(
+                &execution.state_machine_arn,
+                execution.map_run_arn.as_deref(),
+            ),
             name: Some(execution.name.clone()),
             status: execution.status.clone(),
             start_date: crate::state::to_date_time(execution.start_date),

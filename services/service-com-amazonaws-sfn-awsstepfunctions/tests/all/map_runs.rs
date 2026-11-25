@@ -8,11 +8,14 @@
 //! 1. `ListMapRuns` reports, for the execution its `executionArn` names, one Map Run
 //!    per Distributed Map state that execution's run entered — each with its own
 //!    `mapRun` ARN built from the state machine's name and the state's label, the
-//!    execution and state machine it belongs to, the instant its state was entered,
+//!    execution it belongs to, the LABELED ARN of the child state machine it executed
+//!    (the parent's ARN carrying that same label), the instant its state was entered,
 //!    and a `stopDate` only once its items are no longer owed to the clock — paged by
 //!    `maxResults`/`nextToken`; an inline `Map` starts no Map Run, and a request
 //!    naming no execution of this endpoint's region is refused with this operation's
-//!    own modelled error rather than an empty page;
+//!    own modelled error rather than an empty page. A state that declares a `Label` is
+//!    identified by it; one that declares none is identified by a generated
+//!    identifier, the same one at every entry into that state;
 //! 2. `DescribeMapRun` answers from that same record, resolved by the Map Run's own
 //!    ARN: the configuration the `Map` state declared and the counts its items
 //!    produced.
@@ -25,8 +28,8 @@
 use serde_json::{json, Value};
 
 use crate::state_machine_lifecycle::{
-    create_machine, error_code, start_execution, string, Emulator, ACCOUNT,
-    PAST_THE_EXECUTION_DELAY, REGION,
+    create_machine, describe_execution, error_code, is_generated_label, start_execution, string,
+    Emulator, ACCOUNT, PAST_THE_EXECUTION_DELAY, REGION,
 };
 
 /// Two items for every definition below to iterate.
@@ -64,12 +67,24 @@ fn machine_definition(start_at: &str, states: Value) -> String {
     json!({ "StartAt": start_at, "States": states }).to_string()
 }
 
+/// What a row expects of ONE Map Run's label: the `Label` its `Map` state declared, or
+/// the identifier the service generated for a state that declared none.
+///
+/// A generated label is the service's own, so no row names its value: what a row names
+/// is the STATE it identifies, and the rule checked for it is that the label is one
+/// generated identifier and the SAME one at every entry into that state.
+#[derive(Debug)]
+enum ExpectedLabel {
+    Declared(&'static str),
+    GeneratedFor(&'static str),
+}
+
 /// One row of the Map Run table: a definition, and the labels of the Map Runs the
 /// execution that runs it must report, in order.
 struct MapRunCase {
     case: &'static str,
     definition: String,
-    labels: &'static [&'static str],
+    labels: &'static [ExpectedLabel],
 }
 
 fn cases() -> Vec<MapRunCase> {
@@ -101,9 +116,9 @@ fn cases() -> Vec<MapRunCase> {
             labels: &[],
         },
         MapRunCase {
-            case: "one Distributed Map, labelled by its own state name",
+            case: "one Distributed Map that declares no Label of its own",
             definition: machine_definition("M", json!({ "M": distributed_map(None, None) })),
-            labels: &["M"],
+            labels: &[ExpectedLabel::GeneratedFor("M")],
         },
         MapRunCase {
             case: "a Distributed Map whose items come from the execution input",
@@ -122,7 +137,7 @@ fn cases() -> Vec<MapRunCase> {
                     },
                 }),
             ),
-            labels: &["FromInput"],
+            labels: &[ExpectedLabel::GeneratedFor("FromInput")],
         },
         MapRunCase {
             case: "one Distributed Map that declares a Label of its own",
@@ -130,7 +145,7 @@ fn cases() -> Vec<MapRunCase> {
                 "M",
                 json!({ "M": distributed_map(Some("mapStateLabel"), None) }),
             ),
-            labels: &["mapStateLabel"],
+            labels: &[ExpectedLabel::Declared("mapStateLabel")],
         },
         MapRunCase {
             case: "two Distributed Maps in sequence, in the order they were entered",
@@ -141,7 +156,10 @@ fn cases() -> Vec<MapRunCase> {
                     "Second": distributed_map(None, None),
                 }),
             ),
-            labels: &["First", "Second"],
+            labels: &[
+                ExpectedLabel::GeneratedFor("First"),
+                ExpectedLabel::GeneratedFor("Second"),
+            ],
         },
         MapRunCase {
             case: "a Distributed Map nested inside a Distributed Map, outermost first",
@@ -171,7 +189,11 @@ fn cases() -> Vec<MapRunCase> {
                     },
                 }),
             ),
-            labels: &["Outer", "Inner", "Inner"],
+            labels: &[
+                ExpectedLabel::GeneratedFor("Outer"),
+                ExpectedLabel::GeneratedFor("Inner"),
+                ExpectedLabel::GeneratedFor("Inner"),
+            ],
         },
         MapRunCase {
             case: "a Distributed Map inside a Parallel branch",
@@ -188,7 +210,7 @@ fn cases() -> Vec<MapRunCase> {
                     },
                 }),
             ),
-            labels: &["InBranch"],
+            labels: &[ExpectedLabel::GeneratedFor("InBranch")],
         },
         MapRunCase {
             case: "a Distributed Map whose items failed past what it tolerates",
@@ -207,7 +229,7 @@ fn cases() -> Vec<MapRunCase> {
                     },
                 }),
             ),
-            labels: &["Broken"],
+            labels: &[ExpectedLabel::GeneratedFor("Broken")],
         },
     ]
 }
@@ -227,6 +249,48 @@ async fn list_map_runs(emulator: &Emulator, execution_arn: &str) -> Vec<Value> {
         .cloned()
         .unwrap_or_else(|| panic!("expected a mapRuns array in {listed:?}"))
 }
+
+/// The Map Runs of one execution once the clock owes nothing more about them: the run
+/// has left `RUNNING` and each of the `wanted` Map Runs it started reports the `stopDate`
+/// its own items came due at.
+///
+/// Looked for again until that holds or [`PATIENCE`] passes, so what a case waits for is
+/// the CONDITION rather than a span of the host's clock.
+async fn map_runs_once_settled(
+    emulator: &Emulator,
+    case: &str,
+    execution_arn: &str,
+    wanted: usize,
+) -> Vec<Value> {
+    let began = std::time::Instant::now();
+    loop {
+        let described = describe_execution(emulator, execution_arn).await;
+        let listed = list_map_runs(emulator, execution_arn).await;
+        let settled = described.get("status").and_then(Value::as_str) != Some("RUNNING")
+            && listed.len() == wanted
+            && listed
+                .iter()
+                .all(|map_run| map_run.get("stopDate").is_some_and(|date| !date.is_null()));
+        if settled {
+            return listed;
+        }
+        assert!(
+            began.elapsed() < PATIENCE,
+            "case {case:?}: expected the run to settle with {wanted} stopped Map Run(s) \
+             within {PATIENCE:?}, got {described:?} and {listed:?}"
+        );
+        ::tokio::time::sleep(LOOK_AGAIN).await;
+    }
+}
+
+/// How long the wait above gives a run to leave `RUNNING` and its Map Runs to stop.
+///
+/// Generous: what the case asserts is what the Map Runs RECORD, never how fast the host
+/// got there, so the bound only makes a run that never settles fail instead of hang.
+const PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How often that wait looks again.
+const LOOK_AGAIN: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// The `member` of the `group` counts structure of a `DescribeMapRun` body.
 fn integer(body: &Value, group: &str, member: &str) -> i64 {
@@ -248,8 +312,8 @@ async fn list_map_runs_reports_the_map_runs_the_execution_started() {
     let emulator = Emulator::new();
     let rows = cases();
 
-    // Every row is started first and read afterwards, so one wait covers the outcomes
-    // the clock owed all of them.
+    // Every row is started first and read afterwards, so each row's own wait finds the
+    // outcomes the clock owed all of them.
     let mut started = Vec::with_capacity(rows.len());
     for (index, row) in rows.iter().enumerate() {
         let name = format!("maprun-{index}");
@@ -257,11 +321,10 @@ async fn list_map_runs_reports_the_map_runs_the_execution_started() {
         let execution = start_execution(&emulator, &machine, "only", TWO_ITEMS).await;
         started.push((name, machine, execution));
     }
-    std::thread::sleep(PAST_THE_EXECUTION_DELAY);
 
     for (row, (name, machine, execution)) in rows.iter().zip(&started) {
         let case = row.case;
-        let listed = list_map_runs(&emulator, execution).await;
+        let listed = map_runs_once_settled(&emulator, case, execution, row.labels.len()).await;
         let labels: Vec<String> = listed
             .iter()
             .map(|map_run| {
@@ -284,9 +347,9 @@ async fn list_map_runs_reports_the_map_runs_the_execution_started() {
                 );
                 assert_eq!(
                     string(map_run, "stateMachineArn"),
-                    *machine,
-                    "case {case:?}: a Map Run names the state machine that was executed, got \
-                     {map_run:?}"
+                    format!("{machine}/{label}"),
+                    "case {case:?}: a Map Run names the state machine that was executed \
+                     — the labeled child machine of its own Map state — got {map_run:?}"
                 );
                 assert!(
                     map_run.get("startDate").is_some_and(|date| !date.is_null()),
@@ -301,10 +364,41 @@ async fn list_map_runs_reports_the_map_runs_the_execution_started() {
             })
             .collect();
         assert_eq!(
-            labels, row.labels,
-            "case {case:?}: expected the Map Run labels {:?}, got {labels:?}",
-            row.labels
+            labels.len(),
+            row.labels.len(),
+            "case {case:?}: expected {} Map Run(s), got the labels {labels:?}",
+            row.labels.len()
         );
+        // A declared label is the one reported; a generated one is checked against the
+        // rule it is minted under, because its value is the service's own.
+        let mut minted: std::collections::BTreeMap<&str, String> =
+            std::collections::BTreeMap::new();
+        for (expected, actual) in row.labels.iter().zip(&labels) {
+            match expected {
+                ExpectedLabel::Declared(declared) => assert_eq!(
+                    actual, declared,
+                    "case {case:?}: expected the declared label {declared:?}, got {actual:?}"
+                ),
+                ExpectedLabel::GeneratedFor(state) => {
+                    assert!(
+                        is_generated_label(actual),
+                        "case {case:?}: expected a generated label for the Map state \
+                         {state:?}, got {actual:?}"
+                    );
+                    match minted.get(*state) {
+                        Some(first) => assert_eq!(
+                            actual, first,
+                            "case {case:?}: every entry into the Map state {state:?} \
+                             reports the one label generated for it, got {actual:?} after \
+                             {first:?}"
+                        ),
+                        None => {
+                            minted.insert(state, actual.clone());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Each Map Run has an ARN of its own: no two of the records above collide, which

@@ -3232,13 +3232,15 @@ impl Interpreter<'_> {
             states_of(processor, &format!("the 'ItemProcessor' of state '{name}'"))
                 .map_err(|failure| failure.at(at))?;
         // "A user-defined or an auto-generated string that identifies a Map state":
-        // the field the Map Run's own ARN carries, and the field the ARN of every
-        // child execution it starts carries too, so one reading serves both.
-        let label = state
-            .get("Label")
-            .and_then(Value::as_str)
-            .unwrap_or(name)
-            .to_string();
+        // the field the Map Run's own ARN carries, the field the ARN of the CHILD state
+        // machine the Map Run runs carries, and the field the ARN of every child
+        // execution it starts carries too — so one reading
+        // ([`super::super::map_run_identity::map_state_label`]) serves them all.
+        let label = super::super::map_run_identity::map_state_label(
+            &self.machine_name,
+            name,
+            state.get("Label").and_then(Value::as_str),
+        );
         // Which DISTRIBUTED Map state of this walk this one is, in ENTRY order: the Map
         // Run it starts is recorded once its items are done, and the list it goes in is
         // read in this order rather than that one. An inline `Map` starts no Map Run, so

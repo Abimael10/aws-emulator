@@ -317,6 +317,35 @@ pub(crate) async fn describe_execution(emulator: &Emulator, execution_arn: &str)
         .await
 }
 
+/// The label a Map Run's ARN carries: the `<label>` of
+/// `mapRun:<state machine name>/<label>:<id>`, which is the field the ARN of the child
+/// state machine that Map Run executed carries too.
+///
+/// `pub(crate)`, not private: `tests/all/main.rs` is this binary's crate root, and the
+/// suites that assert the label rule — `map_runs`, `distributed_map_children` and
+/// `map_run_child_state_machine` — read it out of an ARN through this one helper.
+pub(crate) fn map_run_label(case: &str, map_run_arn: &str) -> String {
+    map_run_arn
+        .rsplit_once(':')
+        .and_then(|(resource, _id)| resource.rsplit_once('/'))
+        .map(|(_machine, label)| label.to_string())
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: expected a labeled Map Run ARN, got {map_run_arn:?}")
+        })
+}
+
+/// Whether `label` is one of the identifiers the service generates for a `Map` state
+/// that declares no `Label`: the 36-character hyphenated form, in groups of 8-4-4-4-12
+/// hexadecimal digits.
+pub(crate) fn is_generated_label(label: &str) -> bool {
+    let groups: Vec<&str> = label.split('-').collect();
+    groups.len() == 5
+        && groups.iter().map(|group| group.len()).eq([8, 4, 4, 4, 12])
+        && groups
+            .iter()
+            .all(|group| group.chars().all(|digit| digit.is_ascii_hexdigit()))
+}
+
 // ---------------------------------------------------------------------------
 // Create -> Describe: the record, not the request
 // ---------------------------------------------------------------------------

@@ -318,9 +318,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(DescribeStateMachineForExecutionOutput {
             // `stateMachineArn` is "the state machine associated with the execution" —
-            // the UNQUALIFIED ARN the execution record carries, which is what
-            // `DescribeExecution` reports for the same execution and what every other
-            // read of this service means by that member.
+            // the UNQUALIFIED ARN the execution record carries, which is what the
+            // configuration reported below belongs to. This operation reports the
+            // `label` of the `Map` state beside it, so the two members together name
+            // the child state machine a Map Run's execution ran on; the member that
+            // reports that child on its own is `DescribeExecution`'s "executed stated
+            // machine" ([`crate::state::map_run_identity`]).
             state_machine_arn: execution.state_machine_arn.clone(),
             // "The name of the state machine associated with the execution": a name
             // is fixed at creation, so the state machine's own record carries it for

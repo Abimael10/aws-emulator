@@ -263,12 +263,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // no grant ("you can call DescribeStateMachine API with includedData =
         // METADATA_ONLY to get a successful response without the encrypted
         // definition"). The decision is made with no store of this service locked.
+        //
+        // A map-run LABELED ARN names the CHILD state machine of a Distributed Map
+        // state written in another state machine — "the following qualified state
+        // machine ARN refers to a Distributed Map state with a label `mapStateLabel` in
+        // a state machine named `myStateMachine`" — and the definition it reports is
+        // part of that PARENT's definition, so the key the parent's data is sealed under
+        // is the one this read is judged against.
+        let read_arn = match parsed.label() {
+            Some(label) => input
+                .state_machine_arn
+                .strip_suffix(&format!("/{label}"))
+                .unwrap_or(&input.state_machine_arn)
+                .to_string(),
+            None => input.state_machine_arn.clone(),
+        };
         if !included_data.is_metadata_only() {
             if let Some(refusal) = crate::state::encryption::state_machine_read_denied(
                 &*self.engine,
                 ctx,
                 &endpoint_region,
-                &input.state_machine_arn,
+                &read_arn,
             ) {
                 return Err(
                     crate::kms_key_refusal!(DescribeStateMachineErrorModeled, refusal).into(),
@@ -336,6 +351,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 description: version.description.clone(),
                 encryption_configuration: Some(crate::state::reported_encryption_configuration(
                     version.encryption_configuration.as_ref(),
+                )),
+                variable_references,
+            });
+        }
+
+        // A map-run LABELED ARN names the child state machine of a Distributed Map
+        // state rather than the state machine it is written in: "this parameter
+        // [`label`] is present only if the stateMachineArn specified in input is a
+        // qualified state machine ARN". What that child state machine IS, is the
+        // `ItemProcessor` of the `Map` state the label identifies — its own state list,
+        // run as the `ExecutionType` that processor's `ProcessorConfig` names — so the
+        // report is built from the processor rather than from the whole definition the
+        // processor is written in ([`crate::state::map_run_identity`]).
+        if let Some(label) = parsed.label() {
+            let Some(parent) = store.state_machines.get(&read_arn) else {
+                return Err(not_found().into());
+            };
+            let Some(child) = crate::state::map_run_identity::child_state_machine(
+                &parent.definition,
+                &parent.name,
+                label,
+            ) else {
+                return Err(not_found().into());
+            };
+            // Read OUT OF the definition this read reports, which is the child's.
+            let variable_references =
+                crate::state::reported_variable_references(&child.definition, included_data);
+            return Ok(DescribeStateMachineOutput {
+                // The ARN the request named, as every other form of it is reported.
+                state_machine_arn: input.state_machine_arn.clone(),
+                // A child state machine has no name of its own: the label identifies
+                // it, and the name is the state machine the `Map` state is written in.
+                name: parent.name.clone(),
+                status: Some(parent.status.clone()),
+                definition: crate::state::reported_definition(&child.definition, included_data),
+                role_arn: parent.role_arn.clone(),
+                // "ExecutionType — the execution type [...] its child workflow
+                // executions run as": the type of the state machine the Map Run
+                // executes. A processor that names none runs them as the type of the
+                // state machine it is written in.
+                r#type: child
+                    .execution_type
+                    .unwrap_or_else(|| parent.sm_type.clone()),
+                creation_date: crate::state::to_date_time(parent.creation_date),
+                logging_configuration: Some(crate::state::reported_logging_configuration(
+                    parent.logging_configuration.as_ref(),
+                )),
+                tracing_configuration: Some(crate::state::reported_tracing_configuration(
+                    parent.tracing_configuration.as_ref(),
+                )),
+                // The label the ARN carried, which is what makes the child state
+                // machine tell apart from the one it is written in.
+                label: Some(label.to_string()),
+                revision_id: parent.revision_id.clone(),
+                description: None,
+                encryption_configuration: Some(crate::state::reported_encryption_configuration(
+                    parent.encryption_configuration.as_ref(),
                 )),
                 variable_references,
             });

@@ -486,7 +486,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn list_item(execution: &crate::state::Execution, map_run: Option<&str>) -> ExecutionListItem {
     ExecutionListItem {
         execution_arn: execution.arn.clone(),
-        state_machine_arn: execution.state_machine_arn.clone(),
+        // "The Amazon Resource Name (ARN) of the state machine that ran the execution":
+        // a CHILD workflow execution of a Distributed Map state ran on that Map state's
+        // own child state machine, which its labeled ARN names
+        // ([`crate::state::map_run_identity`]); every other execution ran on the state
+        // machine itself. Read off the execution's OWN record, so the answer does not
+        // depend on which member the request scoped the listing by.
+        state_machine_arn: crate::state::map_run_identity::executed_state_machine_arn(
+            &execution.state_machine_arn,
+            execution.map_run_arn.as_deref(),
+        ),
         name: execution.name.clone(),
         status: execution.status.clone(),
         start_date: crate::state::to_date_time(execution.start_date),

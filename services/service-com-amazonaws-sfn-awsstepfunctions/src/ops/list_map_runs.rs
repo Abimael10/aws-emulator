@@ -218,7 +218,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|map_run| MapRunListItem {
                 execution_arn: map_run.execution_arn.clone(),
                 map_run_arn: map_run.arn.clone(),
-                state_machine_arn: map_run.state_machine_arn.clone(),
+                // "The Amazon Resource Name (ARN) of the executed state machine": the
+                // state machine a Distributed Map state's Map Run executed is the Map
+                // state's own CHILD state machine, whose ARN is the parent's with this
+                // Map Run's label after a `/` — the same label its `mapRunArn` carries
+                // ([`crate::state::map_run_identity`]).
+                state_machine_arn: crate::state::map_run_identity::child_state_machine_arn(
+                    &map_run.state_machine_arn,
+                    &map_run.label,
+                ),
                 start_date: crate::state::to_date_time(map_run.start_date),
                 // "The date on which the Map Run stopped": absent while its items
                 // are still owed to the clock.

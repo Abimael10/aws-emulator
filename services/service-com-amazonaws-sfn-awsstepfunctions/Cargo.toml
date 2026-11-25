@@ -118,8 +118,11 @@ service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = t
 service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # The opaque name of the session this service assumes a state machine's execution role
 # under (`state::task_authorization::new_session_name`): a fresh version-4 UUID from the
-# maintained crate, rendered as its 32 hexadecimal digits.
-uuid = { version = "1", features = ["v4"] }
+# maintained crate, rendered as its 32 hexadecimal digits. `v3` mints the generated
+# LABEL of a Distributed Map state that declares none
+# (`state::map_run_identity::map_state_label`): a name-based UUID, so the same state is
+# always identified by the same label.
+uuid = { version = "1", features = ["v3", "v4"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

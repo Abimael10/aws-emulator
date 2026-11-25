@@ -39,7 +39,7 @@
 use serde_json::{json, Map, Value};
 
 use crate::state_machine_lifecycle::{
-    create_machine, describe_execution, start_execution, string, Emulator,
+    create_machine, describe_execution, map_run_label, start_execution, string, Emulator,
     PAST_THE_EXECUTION_DELAY,
 };
 
@@ -63,9 +63,10 @@ struct ChildrenCase {
     case: &'static str,
     state: Value,
     input: String,
-    /// The `Label` of the Map state, which is its own name unless it declares one:
-    /// what the Map Run and its children are reported under.
-    label: &'static str,
+    /// The `Label` the Map state declares, or `None` for a state that declares none,
+    /// which the service identifies by a label it generates: what the Map Run and its
+    /// children are reported under.
+    label: Option<&'static str>,
     children: Vec<ExpectedChild>,
 }
 
@@ -185,7 +186,7 @@ fn cases() -> Vec<ChildrenCase> {
                 json!({ "ItemSelector": item_selector(), "MaxConcurrency": 8 }),
             ),
             input: numbered_items("eight", 8),
-            label: "M",
+            label: None,
             children: doubled_children("eight", 8),
         },
         ChildrenCase {
@@ -196,7 +197,7 @@ fn cases() -> Vec<ChildrenCase> {
                 json!({ "ItemSelector": item_selector(), "MaxConcurrency": 2 }),
             ),
             input: numbered_items("batched", 5),
-            label: "M",
+            label: None,
             children: doubled_children("batched", 5),
         },
         ChildrenCase {
@@ -207,7 +208,7 @@ fn cases() -> Vec<ChildrenCase> {
                 json!({ "ItemSelector": item_selector(), "Label": "mapStateLabel" }),
             ),
             input: numbered_items("single", 1),
-            label: "mapStateLabel",
+            label: Some("mapStateLabel"),
             children: doubled_children("single", 1),
         },
         ChildrenCase {
@@ -218,7 +219,7 @@ fn cases() -> Vec<ChildrenCase> {
                 json!({ "ItemSelector": item_selector() }),
             ),
             input: numbered_items("express", 3),
-            label: "M",
+            label: None,
             children: doubled_children("express", 3),
         },
         ChildrenCase {
@@ -229,7 +230,7 @@ fn cases() -> Vec<ChildrenCase> {
                 json!({ "ItemSelector": item_selector() }),
             ),
             input: numbered_items("empty", 0),
-            label: "M",
+            label: None,
             children: Vec::new(),
         },
         ChildrenCase {
@@ -240,7 +241,7 @@ fn cases() -> Vec<ChildrenCase> {
                 json!({}),
             ),
             input: r#"{"run":"literal"}"#.to_string(),
-            label: "M",
+            label: None,
             children: (1..=3)
                 .map(|n| ExpectedChild {
                     input: json!({ "n": n }),
@@ -263,7 +264,7 @@ fn cases() -> Vec<ChildrenCase> {
                 json!({ "ToleratedFailureCount": 2 }),
             ),
             input: r#"{"run":"mixed"}"#.to_string(),
-            label: "M",
+            label: None,
             children: (0..4)
                 .map(|id| {
                     if id % 2 == 0 {
@@ -335,6 +336,44 @@ async fn list_executions(emulator: &Emulator, selector: Value, max_results: Opti
     }
 }
 
+/// Wait until `execution_arn` has left `RUNNING` and the `wanted` child workflow
+/// executions its Map Run dispatched have too.
+///
+/// Looked for again until that holds or [`PATIENCE`] passes, so what a case waits for is
+/// the CONDITION rather than a span of the host's clock.
+async fn until_children_settled(
+    emulator: &Emulator,
+    case: &str,
+    execution_arn: &str,
+    wanted: usize,
+) {
+    let began = std::time::Instant::now();
+    loop {
+        settled(emulator, execution_arn, case).await;
+        let runs = map_runs(emulator, execution_arn).await;
+        let listed = match runs.first() {
+            Some(run) => {
+                list_executions(emulator, json!({ "mapRunArn": string(run, "mapRunArn") }), None)
+                    .await
+            }
+            None => Vec::new(),
+        };
+        if listed.len() == wanted
+            && listed
+                .iter()
+                .all(|child| child.get("status").and_then(Value::as_str) != Some("RUNNING"))
+        {
+            return;
+        }
+        assert!(
+            began.elapsed() < PATIENCE,
+            "case {case:?}: expected the Map Run's {wanted} child execution(s) to settle \
+             within {PATIENCE:?}, got {runs:?} and {listed:?}"
+        );
+        ::tokio::time::sleep(LOOK_AGAIN).await;
+    }
+}
+
 /// `document` parsed, which must be the JSON text an execution member carries.
 fn parsed(document: &str) -> Value {
     serde_json::from_str(document)
@@ -367,8 +406,8 @@ async fn a_distributed_map_starts_one_child_execution_per_item() {
     let emulator = Emulator::new();
     let rows = cases();
 
-    // Every row is started first and read afterwards, so one wait covers the outcomes
-    // the clock owed all of them.
+    // Every row is started first and read afterwards, so each row's own wait finds the
+    // outcomes the clock owed all of them.
     let mut started = Vec::with_capacity(rows.len());
     for (index, row) in rows.iter().enumerate() {
         let name = format!("children-{index}");
@@ -378,10 +417,10 @@ async fn a_distributed_map_starts_one_child_execution_per_item() {
         let execution = start_execution(&emulator, &machine, "only", &row.input).await;
         started.push((machine, execution));
     }
-    std::thread::sleep(PAST_THE_EXECUTION_DELAY);
 
     for (row, (machine, execution)) in rows.iter().zip(started) {
         let case = row.case;
+        until_children_settled(&emulator, case, &execution, row.children.len()).await;
         let runs = map_runs(&emulator, &execution).await;
         assert_eq!(
             runs.len(),
@@ -446,7 +485,10 @@ async fn a_distributed_map_starts_one_child_execution_per_item() {
             );
             // The other read of a child's record agrees with it: `mapRunArn` and
             // `label` are "returned only if the executionArn is a child workflow
-            // execution that was started by a Distributed Map state".
+            // execution that was started by a Distributed Map state". The label is the
+            // one the Map Run's own ARN carries — the `Label` the state declared, where
+            // it declared one, and the generated identifier otherwise.
+            let labeled = map_run_label(case, &map_run_arn);
             let for_execution = emulator
                 .ok(
                     "DescribeStateMachineForExecution",
@@ -458,10 +500,17 @@ async fn a_distributed_map_starts_one_child_execution_per_item() {
                     for_execution.get("mapRunArn").and_then(Value::as_str),
                     for_execution.get("label").and_then(Value::as_str),
                 ),
-                (Some(map_run_arn.as_str()), Some(row.label)),
+                (Some(map_run_arn.as_str()), Some(labeled.as_str())),
                 "case {case:?}: DescribeStateMachineForExecution names the Map Run \
                  and the Map state's label, got {for_execution:?}"
             );
+            if let Some(declared) = row.label {
+                assert_eq!(
+                    labeled, declared,
+                    "case {case:?}: the label of a state that declares one is that \
+                     Label, got {labeled:?}"
+                );
+            }
             assert_eq!(
                 described.get("status"),
                 child.get("status"),

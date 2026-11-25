@@ -2532,8 +2532,8 @@ pub struct MapRun {
     pub execution_arn: String,
     /// The state machine that execution ran.
     pub state_machine_arn: String,
-    /// The `Label` the Map state declares, else that state's own name: the field of
-    /// the ARN that tells two Map Runs of one execution apart.
+    /// The label that identifies the Map state ([`map_run_identity::map_state_label`]):
+    /// the field of the ARN that tells two Map Runs of one execution apart.
     pub label: String,
     pub status: String,
     pub start_date: SystemTime,
@@ -4962,6 +4962,7 @@ pub mod item_batcher;
 pub mod item_reader;
 mod json_diagnostic;
 pub mod jsonata;
+pub mod map_run_identity;
 pub mod map_runs;
 pub mod observability;
 pub mod payload_size;
