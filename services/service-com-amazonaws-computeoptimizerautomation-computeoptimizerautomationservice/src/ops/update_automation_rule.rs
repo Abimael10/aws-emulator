@@ -221,51 +221,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `priority` is a plain `String` in the model but documents a decimal
-        // between 0 and 1, so its form is judged where the create judges it
-        // (`crate::state::priority_violation`).
-        if let Some(report) = input
-            .priority
-            .as_deref()
-            .and_then(crate::state::priority_violation)
-        {
-            return Err(invalid_parameter(report));
-        }
-        // "Must be 1-128 characters long", of which the floor is the service's
-        // own and is judged where the create judges it
-        // (`crate::state::rule_name_violation`).
-        if let Some(report) = input
-            .name
-            .as_deref()
-            .and_then(crate::state::rule_name_violation)
-        {
-            return Err(invalid_parameter(report));
-        }
         // A member an update REPLACES must satisfy the rules a create holds it
         // to, or the update would turn a valid rule into one this service could
-        // not have created. Each is judged on its own, because an absent member
-        // leaves the stored (already valid) value alone. Checked BEFORE the
-        // store is touched, so a refused update neither applies, consumes the
-        // client token nor bumps the revision.
-        if let Some(report) = input
-            .recommended_action_types
-            .as_deref()
-            .and_then(crate::state::recommended_action_types_violation)
-        {
-            return Err(invalid_parameter(report));
-        }
-        if let Some(report) = input
-            .schedule
-            .as_ref()
-            .and_then(crate::state::schedule_violation)
-        {
-            return Err(invalid_parameter(report));
-        }
-        if let Some(report) = input
-            .criteria
-            .as_ref()
-            .and_then(crate::state::criteria_violation)
-        {
+        // not have created. The members a rule's own form is made of are judged
+        // as a whole, by the same helper and therefore in the same ORDER as on
+        // the create path (`crate::state::rule_form_violation`), so a request
+        // breaking more than one of them is refused with one and the same
+        // report whichever write path received it. An absent member is left
+        // unjudged, because it leaves the stored (already valid) value alone.
+        // Checked BEFORE the store is touched, so a refused update neither
+        // applies, consumes the client token nor bumps the revision.
+        if let Some(report) = crate::state::rule_form_violation(&crate::state::RuleFormMembers {
+            name: input.name.as_deref(),
+            priority: input.priority.as_deref(),
+            recommended_action_types: input.recommended_action_types.as_deref(),
+            schedule: input.schedule.as_ref(),
+            criteria: input.criteria.as_ref(),
+        }) {
             return Err(invalid_parameter(report));
         }
 

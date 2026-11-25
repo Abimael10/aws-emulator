@@ -27,10 +27,17 @@
 //! Every row is driven through BOTH write paths and their answers compared, so a
 //! requirement that moved on one path and not on the other fails here.
 //!
+//! The same holds of a request that breaks MORE than one of the members a rule
+//! is made of: the two write paths judge those members in one and the same
+//! ORDER, so such a request is refused with one and the same report whichever of
+//! them received it — see
+//! [`one_request_breaking_several_members_is_refused_the_same_way_on_both_write_paths`].
+//!
 //! Every case drives the service over the wire through the shared awsJson1_0
 //! harness in [`crate::automation_rule_lifecycle`].
 
 use serde_json::{json, Value};
+use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomationservice::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::automation_rule_lifecycle::{
@@ -314,5 +321,197 @@ async fn the_priority_form_is_one_rule_over_the_create_and_the_update() {
             case,
         )
         .await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// One request breaking several members at once
+// ---------------------------------------------------------------------------
+
+/// The members a rule a request writes is judged by, in the ONE order both write
+/// paths judge them in: the rule's own form first — its `name`, its `priority`,
+/// its `recommendedActionTypes`, its `schedule` and its `criteria` — and last the
+/// `ruleType`/`organizationConfiguration` pair, whose judgement needs the merged
+/// rule and so cannot be made before the stored one has been read.
+///
+/// Every row of [`one_request_breaking_several_members_is_refused_the_same_way_on_both_write_paths`]
+/// takes its expected report from this list, so the order is stated once and each
+/// row's expectation follows from it rather than being written out beside it.
+const JUDGEMENT_ORDER: [&str; 6] = [
+    "name",
+    "priority",
+    "recommendedActionTypes",
+    "schedule",
+    "criteria",
+    "organizationConfiguration",
+];
+
+/// For one member of [`JUDGEMENT_ORDER`]: the request members that break its
+/// requirement, and the report the service refuses that break with.
+///
+/// The reports are built through the service's own single home for the wording
+/// ([`state::constraint_report`]), so a row names the member and the requirement
+/// rather than a sentence copied beside the implementation. The break for the
+/// `organizationConfiguration` pair is the rule type that REQUIRES a
+/// configuration sent without one, which is a break of the pair whether the
+/// request carries the other half or leaves it stored.
+fn broken_member(member_name: &str) -> (Value, String) {
+    match member_name {
+        "name" => (json!({"name": ""}), NAME_FLOOR_REPORT.to_string()),
+        "priority" => (json!({"priority": "7"}), PRIORITY_FORM_REPORT.to_string()),
+        "recommendedActionTypes" => (
+            json!({"recommendedActionTypes": []}),
+            state::constraint_report(
+                "recommendedActionTypes",
+                "Member must have length greater than or equal to 1",
+            ),
+        ),
+        "schedule" => (
+            json!({"schedule": {"scheduleExpression": "* 12 * * ? *"}}),
+            state::constraint_report(
+                "schedule.scheduleExpression",
+                "Member must use a single specific value from 0 to 59 for the minutes field, not \
+                 a wildcard, list, range or step",
+            ),
+        ),
+        "criteria" => (
+            json!({"criteria": {"region": [{"values": ["us-east-1"]}]}}),
+            state::constraint_report("criteria.region.member.comparison", "Member is required"),
+        ),
+        "organizationConfiguration" => (
+            json!({"ruleType": "OrganizationRule"}),
+            state::constraint_report(
+                "organizationConfiguration",
+                "Member is required for the OrganizationRule rule type",
+            ),
+        ),
+        other => panic!("no break is written for the member {other:?}"),
+    }
+}
+
+/// Splice every member of `overlay` (a JSON object) into `request`.
+fn splice(request: &mut Value, overlay: &Value) {
+    for (name, value) in overlay
+        .as_object()
+        .expect("a break is written as a JSON object of request members")
+    {
+        request[name] = value.clone();
+    }
+}
+
+/// Drive a request breaking every member of `members` at once through both write
+/// paths, and assert the two refuse it with one and the same report: the one
+/// [`JUDGEMENT_ORDER`] picks.
+///
+/// A refused row must leave the store exactly as it was on both paths, as a
+/// single-member refusal does: the create stores no rule and the update neither
+/// applies a member nor advances the subject's revision.
+async fn assert_both_write_paths_word_one_refusal(
+    router: &MultiServiceRouter,
+    subject: &Subject,
+    members: &[&str],
+    case: &str,
+) {
+    let expected = JUDGEMENT_ORDER
+        .iter()
+        .find(|member_name| members.contains(*member_name))
+        .map(|member_name| broken_member(member_name).1)
+        .unwrap_or_else(|| panic!("case {case:?}: the row breaks no judged member"));
+
+    let mut create_request = minimal_rule(&format!("subject-{case}"));
+    let mut update_request = json!({"ruleArn": &subject.arn, "ruleRevision": subject.revision});
+    for member_name in members {
+        let (overlay, _) = broken_member(member_name);
+        splice(&mut create_request, &overlay);
+        splice(&mut update_request, &overlay);
+    }
+    let created_name = string_member(&create_request, "name");
+
+    let (create_status, create_body) = call(router, "CreateAutomationRule", &create_request).await;
+    let (update_status, update_body) = call(router, "UpdateAutomationRule", &update_request).await;
+
+    assert_refused(
+        (create_status, create_body.clone()),
+        400,
+        "InvalidParameterValueException",
+        case,
+    );
+    assert_refused(
+        (update_status, update_body.clone()),
+        400,
+        "InvalidParameterValueException",
+        case,
+    );
+    let from_create = string_member(&create_body, "message");
+    let from_update = string_member(&update_body, "message");
+    assert_eq!(
+        from_create, expected,
+        "case {case:?}: expected the create to report {expected:?}, got {from_create:?}"
+    );
+    assert_eq!(
+        from_update, expected,
+        "case {case:?}: expected the update to report {expected:?}, got {from_update:?}"
+    );
+    assert_eq!(
+        from_create, from_update,
+        "case {case:?}: both write paths must word one refusal alike, got {from_create:?} from \
+         the create and {from_update:?} from the update"
+    );
+
+    let listed = call_ok(router, "ListAutomationRules", &json!({}), case).await;
+    let stored: Vec<String> = member(&listed, "automationRules")
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|rule| string_member(rule, "name"))
+        .collect();
+    assert!(
+        !stored.contains(&created_name),
+        "case {case:?}: a refused create must store nothing, got {listed}"
+    );
+    let after = read_rule(router, &subject.arn, case).await;
+    assert_eq!(
+        after, subject.snapshot,
+        "case {case:?}: a refused update must leave the rule, its revision and its update time \
+         alone, got {after}"
+    );
+}
+
+/// A request breaking several of a rule's members at once is refused with one and
+/// the same report whichever write path received it.
+///
+/// The rows span the pairs of members that can break together, each member of
+/// [`JUDGEMENT_ORDER`] paired with one before and one after it, the pair
+/// including the member judged last (the `ruleType`/`organizationConfiguration`
+/// pair, whose judgement is the only one an update makes after reading the stored
+/// rule), and the row that breaks every member of a rule's own form at once.
+#[tokio::test]
+async fn one_request_breaking_several_members_is_refused_the_same_way_on_both_write_paths() {
+    let router = emulator();
+    let subject = Subject::create(&router, "refusal-order-subject").await;
+
+    let rows: Vec<Vec<&str>> = vec![
+        vec!["name", "priority"],
+        vec!["name", "recommendedActionTypes"],
+        vec!["name", "criteria"],
+        vec!["priority", "recommendedActionTypes"],
+        vec!["priority", "schedule"],
+        vec!["recommendedActionTypes", "schedule"],
+        vec!["schedule", "criteria"],
+        vec!["name", "organizationConfiguration"],
+        vec!["priority", "organizationConfiguration"],
+        vec!["criteria", "organizationConfiguration"],
+        vec![
+            "name",
+            "priority",
+            "recommendedActionTypes",
+            "schedule",
+            "criteria",
+        ],
+    ];
+
+    for row in &rows {
+        let case = row.join("-and-");
+        assert_both_write_paths_word_one_refusal(&router, &subject, row, &case).await;
     }
 }

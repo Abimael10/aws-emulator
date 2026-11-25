@@ -3093,6 +3093,60 @@ pub fn rule_name_violation(name: &str) -> Option<String> {
         .then(|| constraint_report("name", MIN_LENGTH_REQUIREMENT))
 }
 
+/// The members of a rule's own form a write path supplies, as that request
+/// carries them: `None` is a member the request does not write, which leaves the
+/// stored (already judged) value alone and so is not judged.
+///
+/// A create fills in the members its input requires (`name`,
+/// `recommendedActionTypes`, `schedule`) and leaves the rest as sent; an update
+/// fills in only what it replaces.
+#[derive(Debug, Default)]
+pub struct RuleFormMembers<'a> {
+    pub name: Option<&'a str>,
+    pub priority: Option<&'a str>,
+    pub recommended_action_types: Option<&'a [String]>,
+    pub schedule: Option<&'a Schedule>,
+    pub criteria: Option<&'a Criteria>,
+}
+
+/// Why the rule a request would write cannot stand as sent, if it cannot — the
+/// WHOLE judgement of the members a rule's own form is made of, for every
+/// operation that writes one.
+///
+/// The members are judged in ONE order, fixed HERE rather than in each handler:
+/// the name ([`rule_name_violation`]), the precedence ([`priority_violation`]),
+/// the action types ([`recommended_action_types_violation`]), the schedule
+/// ([`schedule_violation`]) and the criteria ([`criteria_violation`]). A request
+/// that breaks more than one of them is therefore refused with one and the same
+/// report whichever operation received it, exactly as a `tags` list is
+/// ([`tag_list_violation`]): two handlers applying the same rules in different
+/// orders word the same refusal differently, which is what homing both the
+/// wording and the order in this module prevents.
+///
+/// A rule's `ruleType` and its `organizationConfiguration` are judged separately
+/// ([`organization_configuration_violation`]), because the pair an update must
+/// judge is the MERGED one and so is not known until the stored rule has been
+/// read; both write paths judge that pair AFTER these members, so the two agree
+/// over it as well.
+pub fn rule_form_violation(members: &RuleFormMembers<'_>) -> Option<String> {
+    if let Some(report) = members.name.and_then(rule_name_violation) {
+        return Some(report);
+    }
+    if let Some(report) = members.priority.and_then(priority_violation) {
+        return Some(report);
+    }
+    if let Some(report) = members
+        .recommended_action_types
+        .and_then(recommended_action_types_violation)
+    {
+        return Some(report);
+    }
+    if let Some(report) = members.schedule.and_then(schedule_violation) {
+        return Some(report);
+    }
+    members.criteria.and_then(criteria_violation)
+}
+
 /// Why this rule's `ruleType` and `organizationConfiguration` do not go
 /// together, if they do not, as the service's own validation report
 /// ([`constraint_report`], which echoes no request value).

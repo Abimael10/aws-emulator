@@ -418,65 +418,43 @@ fn access_denied() -> CreateAutomationRuleError {
 
 /// Why this request's parameter values are not valid, if they are not.
 ///
-/// Each clause is a documented rule the Smithy constraints cannot carry:
+/// Each clause is a documented rule the Smithy constraints cannot carry, and
+/// each is judged where the update that REPLACES the same member judges it, so
+/// neither which values the two write paths refuse nor how they word the refusal
+/// can drift apart:
 ///
-/// * `name` — "Must be 1-128 characters long", of which the floor is the
-///   service's own ([`crate::state::rule_name_violation`]), which the update
-///   holds a replacement name to as well.
+/// * the members a rule's own form is made of — its `name`, its `priority`, its
+///   `recommendedActionTypes`, its `schedule` and its `criteria` — are judged as
+///   a whole by [`crate::state::rule_form_violation`], which also fixes the ONE
+///   order they are judged in, so a request breaking more than one of them is
+///   refused with the same report whichever write path received it.
 /// * `organizationConfiguration` — the member and the `OrganizationRule` rule
 ///   type stand and fall together, in both directions
-///   ([`crate::state::organization_configuration_violation`]).
-/// * `priority` — "a decimal number between 0 and 1 (having up to 30 digits
-///   after the decimal point)" ([`crate::state::priority_violation`]), which the
-///   update holds a replacement precedence to as well.
-/// * `recommendedActionTypes` — the action types the rule executes, so an empty
-///   list automates nothing ([`crate::state::recommended_action_types_violation`]).
-/// * `schedule` — "The expression that defines when the schedule runs", with
-///   specific (non-wildcard) minutes and hours
-///   ([`crate::state::schedule_violation`]).
-/// * `criteria` — a condition the service could not evaluate, or one past the
-///   published 20-conditions/20-values size
-///   ([`crate::state::criteria_violation`]), which is what the preview
-///   operations refuse the same value set with: a rule whose criteria can never
-///   be previewed or evaluated is not a rule this service could run.
+///   ([`crate::state::organization_configuration_violation`]). Judged after the
+///   members above, which is where the update (whose pair is the merged one, and
+///   so is not known until the stored rule has been read) judges it too.
 /// * `tags` — the whole judgement of a caller-supplied tag list
 ///   ([`crate::state::tag_list_violation`]): one request may not name the same
 ///   tag key twice, and no key may be one a caller may not supply. The rules
 ///   are ordered THERE, not here, so the tagging operations refuse the same
-///   list with the same report.
+///   list with the same report. The update carries no `tags` member.
 ///
 /// Every clause runs BEFORE the store is touched, so a refused create leaves
 /// the store exactly as it was.
 fn invalid_parameter(input: &CreateAutomationRuleInput) -> Option<String> {
-    if let Some(report) = crate::state::rule_name_violation(&input.name) {
+    if let Some(report) = crate::state::rule_form_violation(&crate::state::RuleFormMembers {
+        name: Some(input.name.as_str()),
+        priority: input.priority.as_deref(),
+        recommended_action_types: Some(input.recommended_action_types.as_slice()),
+        schedule: Some(&input.schedule),
+        criteria: input.criteria.as_ref(),
+    }) {
         return Some(report);
     }
     if let Some(report) = crate::state::organization_configuration_violation(
         &input.rule_type,
         input.organization_configuration.as_ref(),
     ) {
-        return Some(report);
-    }
-    if let Some(report) = input
-        .priority
-        .as_deref()
-        .and_then(crate::state::priority_violation)
-    {
-        return Some(report);
-    }
-    if let Some(report) =
-        crate::state::recommended_action_types_violation(&input.recommended_action_types)
-    {
-        return Some(report);
-    }
-    if let Some(report) = crate::state::schedule_violation(&input.schedule) {
-        return Some(report);
-    }
-    if let Some(report) = input
-        .criteria
-        .as_ref()
-        .and_then(crate::state::criteria_violation)
-    {
         return Some(report);
     }
     input
