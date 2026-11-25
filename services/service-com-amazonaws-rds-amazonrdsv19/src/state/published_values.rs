@@ -1303,7 +1303,8 @@ pub const AURORA_DEFAULT_STORAGE_TYPE: &str = "aurora";
 /// The engine modes a DB cluster may be created in, as
 /// `CreateDBClusterMessage$EngineMode` publishes them: "The DB engine mode of the DB
 /// cluster, either `provisioned` or `serverless`."
-pub const DB_CLUSTER_ENGINE_MODES: [&str; 2] = [DEFAULT_DB_CLUSTER_ENGINE_MODE, "serverless"];
+pub const DB_CLUSTER_ENGINE_MODES: [&str; 2] =
+    [DEFAULT_DB_CLUSTER_ENGINE_MODE, SERVERLESS_V1_ENGINE_MODE];
 
 /// The engine mode a DB cluster created without one runs in.
 ///

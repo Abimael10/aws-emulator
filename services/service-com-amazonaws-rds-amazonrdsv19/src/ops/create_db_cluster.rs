@@ -1297,6 +1297,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     seconds_before_timeout: asked.seconds_before_timeout,
                 }
             }),
+            // No `ModifyCurrentDBClusterCapacity` has set this cluster's Aurora Serverless v1
+            // capacity yet, so it runs on the floor its own configuration gives it
+            // (`crate::state::DbClusterRecord::reported_capacity`).
+            serverless_v1_capacity: None,
             // "A list of Amazon Web Services Identity and Access Management (IAM) roles to
             // associate with the DB cluster": each is in place from the create onwards, so
             // each reports the `ACTIVE` status of an association that holds.

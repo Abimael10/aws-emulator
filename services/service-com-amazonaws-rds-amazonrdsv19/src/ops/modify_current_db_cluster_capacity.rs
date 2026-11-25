@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyCurrentDBClusterCapacity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyCurrentDBClusterCapacity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyCurrentDBClusterCapacity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets the capacity of an Aurora Serverless v1 DB cluster: the ACUs the cluster runs on,
+//! held on the cluster's own record ([`crate::state::ServerlessV1Capacity`]) and reported by
+//! `DBCluster$Capacity`.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +169,145 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyCurrentDBClusterCapacity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyCurrentDBClusterCapacityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyCurrentDBClusterCapacity"))
+        let region = crate::state::request_region(ctx)
+            .map_err(ModifyCurrentDBClusterCapacityError::validation)?;
+        // `DBClusterIdentifier`: "This parameter isn't case-sensitive", and every member that
+        // names a DB cluster also accepts its ARN, so the reference is reduced to the
+        // identifier it names — which is what the fault below reports — and a reference no DB
+        // cluster identifier could be is refused before any record is read
+        // (`crate::state::db_cluster_lookup_identifier`).
+        let named = crate::state::db_cluster_lookup_identifier(&input.db_cluster_identifier)
+            .map_err(ModifyCurrentDBClusterCapacityError::invalid_parameter_value)?;
+        let identifier = named.to_ascii_lowercase();
+
+        // The two members that describe THIS call rather than the cluster, each held to its
+        // own published domain: "The default is 300. Specify a value between 10 and 600
+        // seconds", and "either ForceApplyCapacityChange or RollbackCapacityChange". Both are
+        // facts about the request alone, so they are answered before anything is looked up.
+        let seconds_before_timeout = input
+            .seconds_before_timeout
+            .unwrap_or(crate::state::DEFAULT_SECONDS_BEFORE_TIMEOUT);
+        crate::state::check_seconds_before_timeout(seconds_before_timeout)
+            .map_err(ModifyCurrentDBClusterCapacityError::invalid_parameter_value)?;
+        let timeout_action = input
+            .timeout_action
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_TIMEOUT_ACTION.to_string());
+        crate::state::check_timeout_action(&timeout_action)
+            .map_err(ModifyCurrentDBClusterCapacityError::invalid_parameter_value)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a capacity nothing holds.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // The transitions the clock already made due — owed at this instant whether or not
+        // anybody called — so the capacity this call is judged against, and the status it is
+        // judged against, are the current ones.
+        store.settle_due_transitions(&region);
+
+        // The cluster this call addresses is resolved FIRST: the operation models
+        // `DBClusterNotFoundFault` for exactly this ("DBClusterIdentifier doesn't refer to an
+        // existing DB cluster"), and a cluster that does not exist runs on no capacity. RDS
+        // is regional, so only the region the request was signed for is in scope.
+        let key = (region.clone(), identifier.clone());
+        let Some(cluster) = store.db_clusters.get(&key) else {
+            return Err(
+                ModifyCurrentDBClusterCapacityErrorModeled::DBClusterNotFoundFault(
+                    DBClusterNotFoundFault {
+                        message: Some(crate::state::db_cluster_not_found_message(named)),
+                    },
+                )
+                .into(),
+            );
+        };
+        // "This operation only applies to Aurora Serverless v1 DB clusters": a cluster in any
+        // other engine mode has no such capacity to set, which is a VALUE the identifier
+        // carries rather than a state the cluster is in — the `InvalidParameterValue` Query
+        // API error — and it is answered BEFORE the cluster's status, because no amount of
+        // waiting makes a provisioned cluster into a Serverless v1 one.
+        if !cluster.is_serverless_v1() {
+            return Err(ModifyCurrentDBClusterCapacityError::invalid_parameter_value(
+                crate::state::SERVERLESS_V1_ONLY_MESSAGE,
+            ));
+        }
+        // `Capacity` is held to the values the cluster's ENGINE publishes, which is the
+        // modelled `InvalidDBClusterCapacityFault` — the fault declared for exactly this
+        // ("Capacity isn't a valid Aurora Serverless DB cluster capacity").
+        if let Some(capacity) = input.capacity {
+            let engine = cluster.engine.clone();
+            crate::state::check_serverless_v1_capacity(&engine, capacity).map_err(|message| {
+                ModifyCurrentDBClusterCapacityError::from(
+                    ModifyCurrentDBClusterCapacityErrorModeled::InvalidDBClusterCapacityFault(
+                        InvalidDBClusterCapacityFault {
+                            message: Some(message),
+                        },
+                    ),
+                )
+            })?;
+        }
+        // A capacity change is a change to the cluster, so it needs the same available
+        // cluster every other modification of one does: a cluster still coming up, rebooting,
+        // failing over or on its way out is not in a state this operation can be performed in
+        // — the modelled cluster state fault. The status the clock has yet to settle is real,
+        // so a call issued immediately after the create sees `creating` and is refused.
+        if cluster.status != crate::state::DB_CLUSTER_STATUS_AVAILABLE {
+            let status = cluster.status.clone();
+            return Err(
+                ModifyCurrentDBClusterCapacityErrorModeled::InvalidDBClusterStateFault(
+                    InvalidDBClusterStateFault {
+                        message: Some(crate::state::cluster_state_message(
+                            &identifier,
+                            &status,
+                            crate::state::DB_CLUSTER_STATUS_AVAILABLE,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The call is accepted. A key this handler resolved and a lookup under it can only
+        // disagree if the record is not where the resolve said it was, which answers the same
+        // modelled 404 as a cluster that was never there.
+        let Some(record) = store.db_clusters.get_mut(&key) else {
+            return Err(
+                ModifyCurrentDBClusterCapacityErrorModeled::DBClusterNotFoundFault(
+                    DBClusterNotFoundFault {
+                        message: Some(crate::state::db_cluster_not_found_message(named)),
+                    },
+                )
+                .into(),
+            );
+        };
+        // `Capacity` is optional, so a call that names none asks for no scaling at all: it
+        // reports where the cluster's capacity stands rather than moving it. A call that names
+        // one records the scaling the clock owes, and the two capacities the response carries
+        // are the one the cluster is ON and "the capacity that the DB cluster scales to next"
+        // (`crate::state::DbClusterRecord::scale_serverless_v1_capacity`).
+        let (current_capacity, pending_capacity) = match input.capacity {
+            Some(capacity) => record.scale_serverless_v1_capacity(capacity),
+            None => (
+                record.reported_capacity().unwrap_or_default(),
+                record.pending_capacity().unwrap_or_default(),
+            ),
+        };
+
+        Ok(ModifyCurrentDBClusterCapacityOutput {
+            // The cluster's own stored identifier — "a user-supplied DB cluster identifier …
+            // the unique key that identifies a DB cluster" — rather than the spelling or the
+            // ARN the request carried.
+            db_cluster_identifier: Some(record.identifier.clone()),
+            current_capacity: Some(current_capacity),
+            pending_capacity: Some(pending_capacity),
+            // The two members that report THIS call's timeout settings back: "the number of
+            // seconds before a call to ModifyCurrentDBClusterCapacity times out" and "the
+            // timeout action of a call to ModifyCurrentDBClusterCapacity", which are the
+            // values the request named or the documented defaults for the ones it left out.
+            seconds_before_timeout: Some(seconds_before_timeout),
+            timeout_action: Some(timeout_action),
+        })
     }
 }

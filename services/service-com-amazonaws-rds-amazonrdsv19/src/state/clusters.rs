@@ -190,6 +190,14 @@ pub struct DbClusterRecord {
     /// `ScalingConfigurationInfo`: the Aurora Serverless v1 scaling configuration the
     /// request named, for a cluster in the `serverless` engine mode.
     pub scaling_configuration: Option<ScalingConfigurationInfo>,
+    /// The Aurora Serverless v1 CAPACITY this cluster is running on, and the scaling the
+    /// clock still owes it ([`ServerlessV1Capacity`]).
+    ///
+    /// `None` for a cluster no `ModifyCurrentDBClusterCapacity` has set the capacity of,
+    /// which runs on the floor its own configuration gives it
+    /// ([`Self::reported_capacity`]), and for every cluster that is not a Serverless v1 one,
+    /// which has no such capacity at all.
+    pub serverless_v1_capacity: Option<ServerlessV1Capacity>,
     /// `AssociatedRoles`: the IAM roles the request associated with the cluster.
     pub associated_roles: Vec<DBClusterRole>,
     /// `Domain` and `DomainIAMRoleName`, reported as the cluster's one domain membership.
@@ -377,6 +385,12 @@ impl DbClusterRecord {
     /// step before it was due, so a read that comes after the whole progression reports where
     /// the clock has taken it rather than one step per read.
     pub(super) fn settle(&mut self, now: Instant) -> bool {
+        // The Aurora Serverless v1 scaling a capacity call set in motion settles on its own
+        // clock, whatever the cluster's status is doing: the capacity a cluster runs on is
+        // not its status ([`ServerlessV1Capacity`]).
+        if let Some(capacity) = self.serverless_v1_capacity.as_mut() {
+            capacity.settle(now);
+        }
         // The start or stop of the cluster's database activity stream settles on its own
         // clock, whatever the cluster's status is doing: a stream is not the cluster's status
         // ([`ActivityStream`]). A stop that has run its course leaves no stream behind.
@@ -1138,6 +1152,10 @@ impl DbClusterRecord {
             // credential pending until it is up, masked because the member is
             // `@sensitive` — the same reading the DB instance envelope follows
             // ([`DbInstanceRecord::pending_modified_values`]).
+            // `Capacity`: "the current capacity of an Aurora Serverless v1 DB cluster" — the
+            // ACUs such a cluster is running on, and nothing at all for a cluster of any
+            // other kind, which has no such capacity ([`Self::reported_capacity`]).
+            capacity: self.reported_capacity(),
             pending_modified_values: (self.status == DB_CLUSTER_STATUS_CREATING
                 && self.master_user_password.is_some())
             .then(|| ClusterPendingModifiedValues {

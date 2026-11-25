@@ -362,6 +362,10 @@ pub use automated_snapshots::*;
 // idle one is owed, and the CloudWatch series both are published as.
 pub mod serverless_capacity;
 pub use serverless_capacity::ServerlessCapacityPublisher;
+// The Aurora Serverless v1 CAPACITY a DB cluster in the `serverless` engine mode runs on: the
+// ACUs it holds, the scaling a call owes it, and the values each Aurora engine publishes.
+mod serverless_v1_capacity;
+pub use serverless_v1_capacity::*;
 // STORAGE AUTOSCALING of a DB instance: the raise of its `AllocatedStorage` toward
 // `MaxAllocatedStorage` the storage its engine is using makes due.
 pub mod storage_autoscaling;

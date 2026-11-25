@@ -1089,6 +1089,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     seconds_before_timeout: asked.seconds_before_timeout,
                 }
             }),
+            // A restored cluster has had no `ModifyCurrentDBClusterCapacity` of its own, so
+            // its Aurora Serverless v1 capacity is the floor its configuration gives it
+            // (`crate::state::DbClusterRecord::reported_capacity`).
+            serverless_v1_capacity: None,
             // "A list of Amazon Web Services Identity and Access Management (IAM) roles to
             // associate with the DB cluster when it's restored from a snapshot": each is in
             // place from the restore onwards, so each reports the `ACTIVE` status of an
