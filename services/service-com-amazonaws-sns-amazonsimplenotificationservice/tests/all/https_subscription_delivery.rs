@@ -26,7 +26,11 @@
 //! notification, the retry budget the subscription was written (none at all, zero, one, two),
 //! whether it asks for a redrive, and whether it asks for raw delivery. The attempts are
 //! counted on the REQUESTS the endpoint recorded, so no row can pass without the POSTs really
-//! being made.
+//! being made — and those records are CONSUMED as they are read ([`consumed`]), so one POST is
+//! counted exactly once however long a case runs. Nothing here is decided by a span of host
+//! seconds: a case that waits for an absence waits for a whole schedule the emulator itself
+//! runs ([`recorded_while_a_whole_schedule_runs`]), and every other wait looks again until the
+//! condition it is about holds.
 //!
 //! The `http` protocol's own half of the rule is the same path with the other scheme; what
 //! differs is only the scheme an endpoint is read under, which the delivery module's own unit
@@ -129,40 +133,70 @@ impl Recorded {
     }
 }
 
-/// Every request the endpoint has recorded on the capture queue so far, drained: the queue is
-/// read until a read reports nothing, so one call collects the whole batch.
-async fn drain_recorded(emulator: &Emulator, capture_url: &str) -> Vec<Recorded> {
-    let mut recorded = Vec::new();
+/// Every message waiting on the queue at `url`, CONSUMED: each one is received and then
+/// DELETED, so one message is observed exactly once however long a case runs.
+///
+/// A message that is only received is still ON the queue: it is hidden for the queue's
+/// visibility timeout and handed out again once that lapses. A reader that counts what it saw
+/// would then count the same record a second time as soon as the case outlasted that timeout —
+/// an outcome decided by how fast the host served the requests rather than by what the
+/// emulator did — so every read of a queue this suite observes through deletes what it read.
+async fn consumed(emulator: &Emulator, url: &str) -> Vec<Value> {
+    let mut taken = Vec::new();
     loop {
         let received = sqs(
             emulator,
             "ReceiveMessage",
-            &json!({"QueueUrl": capture_url, "MaxNumberOfMessages": 10}),
+            &json!({"QueueUrl": url, "MaxNumberOfMessages": 10}),
         )
         .await;
         let messages = received["Messages"].as_array().cloned().unwrap_or_default();
         if messages.is_empty() {
-            return recorded;
+            return taken;
         }
         for message in messages {
+            sqs(
+                emulator,
+                "DeleteMessage",
+                &json!({
+                    "QueueUrl": url,
+                    "ReceiptHandle": message["ReceiptHandle"].as_str().unwrap_or_default(),
+                }),
+            )
+            .await;
+            taken.push(message);
+        }
+    }
+}
+
+/// Every request the endpoint has recorded on the capture queue so far, drained: the queue is
+/// consumed until a read reports nothing, so one call collects the whole batch and no request
+/// is ever collected twice ([`consumed`]).
+async fn drain_recorded(emulator: &Emulator, capture_url: &str) -> Vec<Recorded> {
+    consumed(emulator, capture_url)
+        .await
+        .into_iter()
+        .map(|message| {
             let body = message["Body"].as_str().unwrap_or_default();
             let captured: Value = serde_json::from_str(body).unwrap_or_else(|error| {
                 panic!("the capture queue must hold JSON records, got {error} for {body:?}")
             });
-            recorded.push(Recorded {
+            Recorded {
                 path: captured["path"].as_str().unwrap_or_default().to_string(),
                 headers: captured["headers"].clone(),
                 body: captured["body"].as_str().unwrap_or_default().to_string(),
-            });
-        }
-    }
+            }
+        })
+        .collect()
 }
 
 /// The requests recorded for `path`, waiting until there are at least `expected` of them — or
 /// until the deadline, which is how a case that expects a COUNT fails with what it did see.
 ///
-/// Every POST this suite asserts on has already been made by the time the call that owed it
-/// answered, so this waits only for the capture queue to have them all.
+/// It LOOKS until the count holds rather than waiting any span out, so it answers the moment the
+/// endpoint has been POSTed to that many times — whether the POSTs were made inside the call
+/// that owed them or on the schedule that outlived it — and the deadline only bounds the case
+/// where they never come.
 ///
 /// `pub(crate)` for the reason [`SINK_HANDLER`] is.
 pub(crate) async fn recorded_for(
@@ -1348,10 +1382,97 @@ const OPENING_ATTEMPTS: usize = 6;
 /// retries the subscription's own policy states.
 const SCHEDULED_ATTEMPTS: usize = OPENING_ATTEMPTS + UNREADY_RETRY_POLICY_RETRIES;
 
-/// How long a case waits to be sure NOTHING further is POSTed once the schedule is exhausted:
-/// several times the delay between two attempts of it, so an attempt the emulator would still
-/// make is seen rather than missed.
-const QUIET_BUDGET: Duration = Duration::from_secs(4 * UNREADY_RETRY_POLICY_DELAY_SECONDS);
+/// Everything `path` records over the span of a WHOLE schedule of the same policy, run from
+/// now: how a case concludes that a schedule is EXHAUSTED without waiting out a span of host
+/// seconds.
+///
+/// An absence has no condition of its own to look for, so this waits for one the EMULATOR
+/// states: a WITNESS subscription over the same topic policy, to an endpoint refused until the
+/// last retry that policy allows, so its confirmation costs the whole schedule
+/// ([`SCHEDULED_ATTEMPTS`] POSTs) — and the wait looks until the witness has been POSTed to that
+/// many times. The witness is subscribed after the row's last POST, so the whole span its own
+/// schedule spends lies after that POST, and a further attempt of the row — due one retry delay
+/// after its last, which is the shortest step the policy states — falls inside that span and is
+/// collected here rather than missed. Under load the witness's attempts stretch exactly as the
+/// row's would, which no number of seconds written here does.
+///
+/// `index` tells this witness's topic and path from another row's. The witness is owed exactly
+/// the refusals its own schedule's last retry is reached by, on a queue emptied first, so what it
+/// is handed does not depend on what the calling row left there; the deadline bounds only the
+/// case where the witness itself was never POSTed to as the policy states, which this reports as
+/// the failure it is rather than as an absence.
+async fn recorded_while_a_whole_schedule_runs(
+    emulator: &Emulator,
+    capture_url: &str,
+    refusals_url: &str,
+    sink: &str,
+    index: usize,
+    path: &str,
+) -> Vec<Recorded> {
+    let witness_path = format!("/unready/witness-{index}");
+    consumed(emulator, refusals_url).await;
+    for owed in 0..SCHEDULED_ATTEMPTS - 1 {
+        sqs(
+            emulator,
+            "SendMessage",
+            &json!({
+                "QueueUrl": refusals_url,
+                "MessageBody": format!("witness-{index}:{owed}"),
+            }),
+        )
+        .await;
+    }
+    let topic = element(
+        &sns(
+            emulator,
+            "CreateTopic",
+            &[("Name", &format!("https-unready-witness-{index}"))],
+        )
+        .await,
+        "TopicArn",
+    );
+    sns(
+        emulator,
+        "SetTopicAttributes",
+        &[
+            ("TopicArn", &topic),
+            ("AttributeName", "DeliveryPolicy"),
+            ("AttributeValue", &unready_topic_policy()),
+        ],
+    )
+    .await;
+    subscribe(
+        emulator,
+        &topic,
+        HTTPS_PROTOCOL,
+        &format!("{sink}{witness_path}"),
+    )
+    .await;
+
+    let deadline = Instant::now() + DEADLINE;
+    let mut collected: Vec<Recorded> = Vec::new();
+    let mut witnessed = 0;
+    loop {
+        for recorded in drain_recorded(emulator, capture_url).await {
+            if recorded.path == witness_path {
+                witnessed += 1;
+            } else if recorded.path == path {
+                collected.push(recorded);
+            }
+        }
+        if witnessed >= SCHEDULED_ATTEMPTS {
+            return collected;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {witness_path:?}: expected the witness subscription to be POSTed to \
+             {SCHEDULED_ATTEMPTS} times, so that a whole schedule is known to have run, it was \
+             POSTed to {witnessed} times while {path:?} recorded {} further POST(s)",
+            collected.len()
+        );
+        tokio::time::sleep(LOOK_INTERVAL).await;
+    }
+}
 
 /// The topic-level delivery policy the case writes.
 fn unready_topic_policy() -> String {
@@ -1467,29 +1588,7 @@ async fn a_confirmation_is_retried_on_the_clock_until_the_endpoint_takes_it() {
         let case = row.case;
         // What the endpoint owes in refusals, written before anything is POSTed to it — on a
         // queue emptied first, so a row is handed exactly what it asked for.
-        loop {
-            let received = sqs(
-                &emulator,
-                "ReceiveMessage",
-                &json!({"QueueUrl": refusals_url, "MaxNumberOfMessages": 10}),
-            )
-            .await;
-            let left = received["Messages"].as_array().cloned().unwrap_or_default();
-            if left.is_empty() {
-                break;
-            }
-            for message in left {
-                sqs(
-                    &emulator,
-                    "DeleteMessage",
-                    &json!({
-                        "QueueUrl": refusals_url,
-                        "ReceiptHandle": message["ReceiptHandle"].as_str().unwrap_or_default(),
-                    }),
-                )
-                .await;
-            }
-        }
+        consumed(&emulator, &refusals_url).await;
         for owed in 0..row.refusals {
             sqs(
                 &emulator,
@@ -1560,17 +1659,19 @@ async fn a_confirmation_is_retried_on_the_clock_until_the_endpoint_takes_it() {
                  {confirmed}"
             );
         } else {
-            let deadline = Instant::now() + QUIET_BUDGET;
-            let mut further: Vec<Recorded> = Vec::new();
-            while Instant::now() < deadline {
-                further.extend(
-                    drain_recorded(&emulator, &capture_url)
-                        .await
-                        .into_iter()
-                        .filter(|recorded| recorded.path == row.path),
-                );
-                tokio::time::sleep(LOOK_INTERVAL).await;
-            }
+            // Nothing further may be POSTed, and an absence is concluded from the EMULATOR's
+            // clock rather than from this host's: a witness subscription runs a whole schedule
+            // of the same policy from here, and everything this row's endpoint recorded while
+            // it did is what a schedule that was not exhausted would have POSTed.
+            let further = recorded_while_a_whole_schedule_runs(
+                &emulator,
+                &capture_url,
+                &refusals_url,
+                &sink,
+                index,
+                row.path,
+            )
+            .await;
             assert!(
                 further.is_empty(),
                 "case {case:?}: expected the schedule to be exhausted after {} POSTs, the \
@@ -1579,5 +1680,102 @@ async fn a_confirmation_is_retried_on_the_clock_until_the_endpoint_takes_it() {
                 further.len()
             );
         }
+    }
+}
+
+/// RULE: a read of the capture queue CONSUMES what it collected ([`consumed`]), so one recorded
+/// request is handed to a case exactly once — however long the case runs and however often it
+/// looks again. A read that only RECEIVED would leave the record on the queue, in flight, to be
+/// handed out again once its visibility timeout lapsed; a case counting its POSTs would then
+/// count one of them twice because the host was slow rather than because the emulator POSTed
+/// again.
+///
+/// The rows differ along what the rule generalises over: how many records are waiting — none,
+/// one, a few, and more than one read of the queue carries (`MaxNumberOfMessages` admits at most
+/// ten, `ReceiveMessageRequest$MaxNumberOfMessages`).
+///
+/// What the rule is asserted on is the QUEUE's own account of what is left — the messages waiting
+/// and the messages in flight it reports (`GetQueueAttributesResult$Attributes`) — because that
+/// is what tells a record that was consumed from one that is merely invisible for now, and it
+/// says so without waiting any visibility timeout out.
+#[tokio::test]
+async fn a_read_of_the_capture_queue_consumes_what_it_collected() {
+    let emulator = emulator();
+    // (case, how many records are waiting)
+    let rows: &[(&str, usize)] = &[
+        ("no record at all", 0),
+        ("one record", 1),
+        ("a few records", 3),
+        ("more records than one read of the queue carries", 12),
+    ];
+    for (index, (case, waiting)) in rows.iter().enumerate() {
+        let (url, _arn) = given_queue(&emulator, &format!("https-consumed-{index}")).await;
+        for record in 0..*waiting {
+            sqs(
+                &emulator,
+                "SendMessage",
+                &json!({
+                    "QueueUrl": url,
+                    "MessageBody": json!({
+                        "path": format!("/consumed/{record}"),
+                        "headers": {},
+                        "body": "",
+                    })
+                    .to_string(),
+                }),
+            )
+            .await;
+        }
+
+        let collected = drain_recorded(&emulator, &url).await;
+        let mut paths: Vec<String> = collected
+            .iter()
+            .map(|recorded| recorded.path.clone())
+            .collect();
+        paths.sort();
+        let mut expected: Vec<String> = (0..*waiting)
+            .map(|record| format!("/consumed/{record}"))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            paths, expected,
+            "case {case:?}: expected the read to collect {expected:?}, got {paths:?}"
+        );
+
+        let left = sqs(
+            &emulator,
+            "GetQueueAttributes",
+            &json!({
+                "QueueUrl": url,
+                "AttributeNames": [
+                    "ApproximateNumberOfMessages",
+                    "ApproximateNumberOfMessagesNotVisible",
+                ],
+            }),
+        )
+        .await;
+        for name in [
+            "ApproximateNumberOfMessages",
+            "ApproximateNumberOfMessagesNotVisible",
+        ] {
+            let reported = left["Attributes"][name].as_str().unwrap_or_default();
+            assert_eq!(
+                reported, "0",
+                "case {case:?}: expected the queue to hold nothing once its records were \
+                 collected, it reports {name} as {reported:?} in {left}"
+            );
+        }
+
+        let again = drain_recorded(&emulator, &url).await;
+        assert!(
+            again.is_empty(),
+            "case {case:?}: expected a record collected once to be gone from the queue, a second \
+             read collected {} of them: {:?}",
+            again.len(),
+            again
+                .iter()
+                .map(|recorded| recorded.path.clone())
+                .collect::<Vec<String>>()
+        );
     }
 }
