@@ -9,7 +9,11 @@
 //!
 //! * `Issuer` — "The base domain of the identity provider that issues JSON Web Tokens.
 //!   For example, an Amazon Cognito user pool has the following format:
-//!   https://cognito-idp.{region}.amazonaws.com/{userPoolId}";
+//!   https://cognito-idp.{region}.amazonaws.com/{userPoolId}". It names a PROVIDER, so every
+//!   name of that one provider meets the clause: a provider this emulator itself serves
+//!   answers at each address this emulator is reached at while minting its tokens under one
+//!   `iss`, and that issuer reaches this module as [`Expectations::minted_issuer`]
+//!   (resolved from the provider's own record by `crate::service::invoke::token_issuer`);
 //! * `Audience` — "A list of the intended recipients of the JWT. A valid JWT must provide
 //!   an aud that matches at least one entry in this list. See RFC 7519".
 //!
@@ -143,6 +147,14 @@ pub struct Expectations<'c> {
     /// `JWTConfiguration$Issuer`, the one member a JWT authorizer cannot be created
     /// without (`crate::state::validate_authorizer_config`).
     pub issuer: &'c str,
+    /// The issuer the provider [`Expectations::issuer`] names MINTS its tokens under, when
+    /// that provider is one THIS EMULATOR serves and so answers at more than one address —
+    /// the other name of the one provider the authorizer recorded
+    /// (`crate::service::invoke::token_issuer`).
+    ///
+    /// `None` for a provider nothing here serves, where the recorded value is the only name
+    /// of it there is.
+    pub minted_issuer: Option<&'c str>,
     /// `JWTConfiguration$Audience`. Empty when the configuration names none, which is a
     /// configuration the create accepts — then no audience clause applies, because the api
     /// recorded no recipient to require.
@@ -236,7 +248,15 @@ impl Claims {
         let Some(issuer) = self.string(ISSUER_CLAIM) else {
             return Some(Unauthorized::Issuer);
         };
-        if trimmed_issuer(issuer) != trimmed_issuer(expected.issuer) {
+        // The recorded value names a PROVIDER, so every name of that one provider meets the
+        // clause: a provider this emulator serves answers at each address this emulator is
+        // reached at while minting its tokens under one `iss`, and that issuer is what
+        // `Expectations::minted_issuer` carries.
+        let names_the_provider = [Some(expected.issuer), expected.minted_issuer]
+            .into_iter()
+            .flatten()
+            .any(|name| trimmed_issuer(name) == trimmed_issuer(issuer));
+        if !names_the_provider {
             return Some(Unauthorized::Issuer);
         }
         // "A valid JWT must provide an aud that matches at least one entry in this list"
@@ -496,6 +516,11 @@ mod tests {
     /// The issuer of a Cognito user pool, the form `JWTConfiguration$Issuer` documents.
     const ISSUER: &str = "https://cognito-idp.eu-west-1.amazonaws.com/eu-west-1_abc123";
 
+    /// The SAME pool's issuer as this emulator publishes it — the address a client on this
+    /// machine reaches that provider at, which is the issuer such a pool mints its tokens
+    /// under.
+    const MINTED_ISSUER: &str = "https://cognito-idp.eu-west-1.localhost:9297/eu-west-1_abc123";
+
     /// Noon of a day, as the `now` every case is evaluated at.
     const NOW: i64 = 1_767_225_600;
 
@@ -506,6 +531,23 @@ mod tests {
     ) -> Expectations<'c> {
         Expectations {
             issuer,
+            minted_issuer: None,
+            audience,
+            scopes,
+        }
+    }
+
+    /// [`expectations`] for a configuration whose provider this emulator serves, which mints
+    /// its tokens under `minted`.
+    fn expectations_of_served_provider<'c>(
+        issuer: &'c str,
+        minted: &'c str,
+        audience: &'c [String],
+        scopes: &'c [String],
+    ) -> Expectations<'c> {
+        Expectations {
+            issuer,
+            minted_issuer: Some(minted),
             audience,
             scopes,
         }
@@ -570,6 +612,37 @@ mod tests {
                 }))),
                 expectations(ISSUER, &no_audience, &no_scopes),
                 Decision::Allow,
+            ),
+            (
+                "the issuer the configured provider MINTS under, which this emulator serves \
+                 it at",
+                Some(token(::serde_json::json!({
+                    "iss": MINTED_ISSUER,
+                    "aud": audience[0],
+                    "exp": NOW + 60
+                }))),
+                expectations_of_served_provider(ISSUER, MINTED_ISSUER, &audience, &no_scopes),
+                Decision::Allow,
+            ),
+            (
+                "the configured name of that same provider, which it also answers at",
+                Some(token(::serde_json::json!({
+                    "iss": ISSUER,
+                    "aud": audience[0],
+                    "exp": NOW + 60
+                }))),
+                expectations_of_served_provider(ISSUER, MINTED_ISSUER, &audience, &no_scopes),
+                Decision::Allow,
+            ),
+            (
+                "a third issuer, which is neither name of the configured provider",
+                Some(token(::serde_json::json!({
+                    "iss": "https://cognito-idp.eu-west-1.localhost:9297/eu-west-1_other9",
+                    "aud": audience[0],
+                    "exp": NOW + 60
+                }))),
+                expectations_of_served_provider(ISSUER, MINTED_ISSUER, &audience, &no_scopes),
+                Decision::Unauthorized(Unauthorized::Issuer),
             ),
             (
                 "a foreign issuer",

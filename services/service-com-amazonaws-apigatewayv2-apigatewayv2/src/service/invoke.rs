@@ -209,6 +209,10 @@ pub(crate) mod request_authorizer;
 /// answered, before the client reads it.
 mod response_parameters;
 mod service_action;
+/// WHICH identity provider a JWT authorizer's `Issuer` names, for a provider this emulator
+/// itself serves — the issuer such a provider mints its tokens under, which is the other name
+/// of the one provider the authorizer recorded.
+mod token_issuer;
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -1213,7 +1217,14 @@ fn resolved<Eng: Send + Sync + 'static>(
     // below, so it is computed once, from the api and the request alone, before the stage
     // and the route are resolved; see [`cors_decoration`].
     let decoration = cors_decoration(resolved.api, req);
-    let answer = resolve_answer(&resolved, &addressed, req, request_id, decoration.preflight);
+    let answer = resolve_answer(
+        engine,
+        &resolved,
+        &addressed,
+        req,
+        request_id,
+        decoration.preflight,
+    );
     Ok((decoration, answer))
 }
 
@@ -1238,7 +1249,13 @@ enum Answer {
 /// [`PREFLIGHT_STATUS`] are the whole answer, in place of the `404` such a request is
 /// otherwise answered with. A preflight a route DOES match takes that route like any other
 /// request, authorization and integration included.
-fn resolve_answer(
+///
+/// `engine` is the shared engine, which the route's authorization is decided with: a JWT
+/// authorizer's `Issuer` may name an identity provider this emulator itself serves, and that
+/// provider's own record says which issuer it mints its tokens under
+/// ([`token_issuer::minted_issuer`]).
+fn resolve_answer<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     resolved: &Resolved<'_, '_>,
     addressed: &Addressed<'_>,
     req: &RtRequest,
@@ -1323,7 +1340,7 @@ fn resolve_answer(
     // refused here never reaches the integration below, which is what makes an authorizer's
     // gate observable. A Lambda authorizer's own decision is the one part of it that needs
     // the backend, so it travels with the dispatch below.
-    let (authorizer, admitted_jwt) = match authorization(api, stage, route_record, req) {
+    let (authorizer, admitted_jwt) = match authorization(engine, api, stage, route_record, req) {
         Authorization::Refused(refusal) => return Answer::Now(Box::new(refusal)),
         Authorization::Admitted(admitted_jwt) => (None, admitted_jwt),
         Authorization::DecidedByFunction(authorizer, identity) => {
@@ -1956,7 +1973,10 @@ enum Authorization {
 /// `AuthorizationScopes` ([`super::jwt::evaluate`]). A token the gate cannot accept is
 /// `401` `{"message":"Unauthorized"}` and the integration is NOT reached; a token it
 /// accepts whose scopes do not meet the route's is `403` — "otherwise, the invocation is
-/// not authorized" (`Route$AuthorizationScopes`).
+/// not authorized" (`Route$AuthorizationScopes`). The `Issuer` that configuration records
+/// names an identity provider, not a string: where the provider is one THIS EMULATOR serves,
+/// the issuer it mints its tokens under is the same provider under another address
+/// ([`token_issuer::minted_issuer`]), so the clause is met by either name of it.
 ///
 /// `CUSTOM` names a Lambda authorizer, whose decision is that function's answer. The part
 /// that is settled BEFORE the function is called is applied here: every identity source must
@@ -1972,7 +1992,8 @@ enum Authorization {
 /// `500`. The writers of a route refuse that association
 /// ([`crate::state::UNRESOLVED_AUTHORIZER_MESSAGE`]), so this is a store that lost the
 /// authorizer some other way and not a route a caller can create.
-fn authorization(
+fn authorization<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     api: &Api,
     stage: &Stage,
     route: &Route,
@@ -2084,10 +2105,17 @@ fn authorization(
         .find(|source| !source.trim().is_empty())
         .unwrap_or(DEFAULT_JWT_IDENTITY_SOURCE);
     let presented = identity_source_value(identity_source, header, &query_parameters);
+    let configured_issuer = configuration.issuer.as_deref().unwrap_or_default();
+    // The other name of the SAME provider, for a provider this emulator itself serves: a user
+    // pool answers at every address this emulator is reached at while minting its tokens under
+    // one `iss`, so an authorizer configured from the documented form, or from the address its
+    // client dialled the pool at, records that one provider too.
+    let minted_issuer = token_issuer::minted_issuer(engine, configured_issuer);
     let decision = jwt::evaluate(
         presented.as_deref(),
         jwt::Expectations {
-            issuer: configuration.issuer.as_deref().unwrap_or_default(),
+            issuer: configured_issuer,
+            minted_issuer: minted_issuer.as_deref(),
             audience,
             scopes: &route.authorization_scopes,
         },
