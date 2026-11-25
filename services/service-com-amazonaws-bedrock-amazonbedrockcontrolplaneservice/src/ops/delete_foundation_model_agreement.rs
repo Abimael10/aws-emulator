@@ -20,6 +20,13 @@
 //! agreement-bearing model, which is the INPUT fault this service states once
 //! ([`crate::state::INVALID_MODEL_IDENTIFIER_MESSAGE`]): 400 `ValidationException`.
 //!
+//! Withdrawing is a call on the AGREEMENT API, like the acceptance it undoes, and that
+//! surface is one the account has to be allowed to call at all
+//! ([`crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::may_call_agreement_api`]):
+//! an account that is not allowed to call it is refused 403 `AccessDeniedException` naming
+//! that surface ([`crate::state::AGREEMENT_API_NOT_ALLOWED_MESSAGE`]) and nothing is
+//! deleted, while the READS of the surface stay open.
+//!
 //! What the 404 class reports here is the AGREEMENT, which — unlike the terms a model is
 //! published under — is a resource the account either holds or does not: an
 //! agreement-bearing model whose agreement this account never accepted has none for this
@@ -204,6 +211,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // Withdrawing an agreement is a call on the Agreement API, and that surface is one
+        // the account has to be allowed to call at all
+        // ([`crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::may_call_agreement_api`]).
+        // An account that is not allowed to call it is told which surface is closed to it,
+        // the same way the acceptance beside this call answers it, and nothing is deleted.
+        if !store.may_call_agreement_api() {
+            return Err(
+                DeleteFoundationModelAgreementErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(
+                            crate::state::AGREEMENT_API_NOT_ALLOWED_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
 
         // The withdrawal itself, taken against the PUBLISHED model the id resolved to, so a
         // `:`-qualified variant withdraws the agreement of the model it is a variant of. An

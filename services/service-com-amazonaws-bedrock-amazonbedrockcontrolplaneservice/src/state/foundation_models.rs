@@ -2838,17 +2838,27 @@ pub fn names_offer_of_model(model: &FoundationModel, offer_token: &str) -> bool 
 /// [`INVALID_MODEL_IDENTIFIER_MESSAGE`] is stated once: one sentence for one class.
 pub const INVALID_OFFER_TOKEN_MESSAGE: &str = "The provided offer token is invalid.";
 
-/// What this control plane answers a request to accept a model's agreement while the
-/// account has submitted no use case for model access.
+/// What this control plane answers a call on the foundation-model AGREEMENT API — the
+/// mutating calls that accept (`CreateFoundationModelAgreement`) and withdraw
+/// (`DeleteFoundationModelAgreement`) a model's agreement — made by an account that is not
+/// allowed to call that API.
 ///
-/// The use case is the acknowledgement Amazon Bedrock takes before it acts on a request for
-/// access to a model: `PutUseCaseForModelAccess` submits it and `GetUseCaseForModelAccess`
-/// reports it back, and neither names a model
-/// (`smithy_query(query="operation",operation="PutUseCaseForModelAccess")`), so the one
-/// account-level form governs every model the account asks for access to. A FIXED sentence:
-/// the account has submitted nothing, so there is no value of the request in it.
-pub const MODEL_ACCESS_USE_CASE_REQUIRED_MESSAGE: &str =
-    "You must submit your use case details before you can request access to a model.";
+/// RECORDED behaviour: Amazon Bedrock names the restricted SURFACE, the Agreement APIs, in
+/// this denial, rather than any remediation for model access. That is what distinguishes it
+/// from the refusals of the use-case surface itself
+/// ([`USE_CASE_FOR_MODEL_ACCESS_NOT_SUBMITTED`], which `GetUseCaseForModelAccess` answers):
+/// an account that may not call the Agreement APIs is told which surface is closed to it,
+/// because the two have different fixes.
+///
+/// The only part of the sentence that is not fixed is the CLASS of account the caller is
+/// in, which is a fact about the account the call was made for — so this names the account
+/// this emulator serves and never the account class any one recorded call was made from.
+///
+/// The READ side of the same surface is not restricted: the offers of a model's agreement
+/// are still listed ([`model_agreement_offers`]) and the model's standing is still reported
+/// ([`ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::foundation_model_agreement_outstanding`]).
+pub const AGREEMENT_API_NOT_ALLOWED_MESSAGE: &str =
+    "This account is not allowed to call Agreement APIs";
 
 /// How a request to accept the agreement of a model whose agreement this account already
 /// holds is refused: the agreement exists, so there is nothing left for this request to

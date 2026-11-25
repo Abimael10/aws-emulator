@@ -33,12 +33,12 @@
 //!
 //! Two further conditions decide whether the acceptance is made:
 //!
-//! * the account's USE CASE for model access is the acknowledgement Amazon Bedrock takes
-//!   before it acts on a request for access to a model (`PutUseCaseForModelAccess` submits
-//!   it, `GetUseCaseForModelAccess` reports it back, and neither names a model, so the one
-//!   account-level form governs every such request). While the account has submitted none,
-//!   this request is refused 403 `AccessDeniedException` carrying
-//!   [`crate::state::MODEL_ACCESS_USE_CASE_REQUIRED_MESSAGE`], and nothing is recorded;
+//! * this is a call on the AGREEMENT API, which is a surface the account has to be allowed
+//!   to call at all ([`crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::may_call_agreement_api`]).
+//!   An account that is not allowed to call it is refused 403 `AccessDeniedException`
+//!   naming that surface ([`crate::state::AGREEMENT_API_NOT_ALLOWED_MESSAGE`]) — the same
+//!   refusal the withdrawal beside it answers — and nothing is recorded, while the READS of
+//!   the surface stay open;
 //! * a model whose agreement the account already holds has nothing left to accept: 400
 //!   `ConflictException`
 //!   ([`crate::state::foundation_model_agreement_conflict_message`]). The terms of one model
@@ -246,16 +246,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The account's acknowledged use case for model access is what Amazon Bedrock takes
-        // before it acts on a request for access to a model, and it is account-level: the
-        // operations that submit and report it name no model at all. An account that has
-        // submitted none has not reached the point of asking for a model.
-        if store.use_case_for_model_access.is_none() {
+        // Accepting an agreement is a call on the Agreement API, and that surface is one the
+        // account has to be allowed to call at all
+        // ([`crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::may_call_agreement_api`]).
+        // An account that is not allowed to call it is told which surface is closed to it,
+        // the same way the withdrawal beside this call answers it, and nothing is recorded.
+        if !store.may_call_agreement_api() {
             return Err(
                 CreateFoundationModelAgreementErrorModeled::AccessDeniedException(
                     AccessDeniedException {
                         message: Some(
-                            crate::state::MODEL_ACCESS_USE_CASE_REQUIRED_MESSAGE.to_string(),
+                            crate::state::AGREEMENT_API_NOT_ALLOWED_MESSAGE.to_string(),
                         ),
                     },
                 )

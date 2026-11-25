@@ -1528,6 +1528,27 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
         model_agreement_outstanding(model) && !self.holds_foundation_model_agreement(model.model_id)
     }
 
+    /// Whether this account is allowed to call the foundation-model AGREEMENT API — the
+    /// mutating calls that accept (`CreateFoundationModelAgreement`) and withdraw
+    /// (`DeleteFoundationModelAgreement`) a model's agreement.
+    ///
+    /// Amazon Bedrock admits an account to that surface once it holds the account's use case
+    /// for model access ([`Self::use_case_for_model_access`]): the one account-level
+    /// acknowledgement it takes before acting on a request for access to a model, which
+    /// names no model at all
+    /// (`smithy_query(query="operation",operation="PutUseCaseForModelAccess")`), so the one
+    /// form governs the whole surface. Every mutating call of an account it holds none for is
+    /// refused 403 `AccessDeniedException` naming that surface
+    /// ([`AGREEMENT_API_NOT_ALLOWED_MESSAGE`]) and records nothing, while the READS of the
+    /// same surface — the offers of a model's agreement and the model's standing — stay open.
+    ///
+    /// Asked here, beside the acceptances the surface writes, because both of its mutating
+    /// calls ask it: two spellings of the one admission could drift apart.
+    #[must_use]
+    pub fn may_call_agreement_api(&self) -> bool {
+        self.use_case_for_model_access.is_some()
+    }
+
     /// Whether this account holds the agreement of the published model `model_id` — the
     /// acceptance `CreateFoundationModelAgreement` recorded for that catalog row.
     #[must_use]

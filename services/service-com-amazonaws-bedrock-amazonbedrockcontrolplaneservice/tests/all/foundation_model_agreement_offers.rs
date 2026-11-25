@@ -72,7 +72,7 @@ const OFFER_TYPES: [Option<&str>; 3] = [
 
 /// `GET /list-foundation-model-agreement-offers/{modelId}`, with the `offerType` the row
 /// names.
-async fn offers(emulator: &Emulator, model_id: &str, offer_type: Option<&str>) -> Reply {
+pub(crate) async fn offers(emulator: &Emulator, model_id: &str, offer_type: Option<&str>) -> Reply {
     let path = match offer_type {
         Some(offer_type) => format!(
             "/list-foundation-model-agreement-offers/{}?offerType={offer_type}",
@@ -87,17 +87,17 @@ async fn offers(emulator: &Emulator, model_id: &str, offer_type: Option<&str>) -
 }
 
 /// The offers a reply reports.
-fn reported(reply: &Reply) -> Vec<Value> {
+pub(crate) fn reported(reply: &Reply) -> Vec<Value> {
     reply.get("offers").as_array().cloned().unwrap_or_default()
 }
 
 /// The wire error code a refusal carries.
-fn code(reply: &Reply) -> &str {
+pub(crate) fn code(reply: &Reply) -> &str {
     reply.error.as_deref().map(error_code).unwrap_or("none")
 }
 
 /// The `message` a refusal carries.
-fn message(case: &str, reply: &Reply) -> String {
+pub(crate) fn message(case: &str, reply: &Reply) -> String {
     reply
         .body
         .get("message")
@@ -422,14 +422,14 @@ const USE_CASE_FORM: &[u8] = br#"{"companyName":"Acme","useCase":"document summa
 
 /// The standing a model whose provider's terms this account has NOT accepted is reported
 /// in: no agreement, no entitlement, no authorization.
-const OUTSTANDING: (&str, &str, &str) = (
+pub(crate) const OUTSTANDING: (&str, &str, &str) = (
     bedrock::state::AGREEMENT_STATUS_NOT_AVAILABLE,
     bedrock::state::AVAILABILITY_NOT_AVAILABLE,
     bedrock::state::AUTHORIZATION_STATUS_NOT_AUTHORIZED,
 );
 
 /// The standing a model whose agreement this account holds is reported in.
-const ENTITLED: (&str, &str, &str) = (
+pub(crate) const ENTITLED: (&str, &str, &str) = (
     bedrock::state::AGREEMENT_STATUS_AVAILABLE,
     bedrock::state::AVAILABILITY_AVAILABLE,
     bedrock::state::AUTHORIZATION_STATUS_AUTHORIZED,
@@ -437,7 +437,7 @@ const ENTITLED: (&str, &str, &str) = (
 
 /// Every catalogued model offered under a provider's own agreement: the rows that have an
 /// agreement to accept at all.
-fn agreement_models() -> Vec<&'static bedrock::state::FoundationModel> {
+pub(crate) fn agreement_models() -> Vec<&'static bedrock::state::FoundationModel> {
     CATALOG
         .iter()
         .filter(|model| bedrock::state::model_offered_under_agreement(model))
@@ -446,7 +446,7 @@ fn agreement_models() -> Vec<&'static bedrock::state::FoundationModel> {
 
 /// `POST /use-case-for-model-access`: the one account-level acknowledgement
 /// `PutUseCaseForModelAccess` submits. A blob member travels as base64 on restJson1.
-async fn submit_use_case(emulator: &Emulator) -> Reply {
+pub(crate) async fn submit_use_case(emulator: &Emulator) -> Reply {
     let reply = emulator
         .call(
             "POST",
@@ -464,7 +464,7 @@ async fn submit_use_case(emulator: &Emulator) -> Reply {
 
 /// `POST /create-foundation-model-agreement` with the `modelId` and `offerToken` a row
 /// names.
-async fn accept(emulator: &Emulator, model_id: &str, offer_token: &str) -> Reply {
+pub(crate) async fn accept(emulator: &Emulator, model_id: &str, offer_token: &str) -> Reply {
     emulator
         .call(
             "POST",
@@ -480,14 +480,14 @@ async fn accept(emulator: &Emulator, model_id: &str, offer_token: &str) -> Reply
 const WITHDRAW_URI: &str = "/delete-foundation-model-agreement";
 
 /// `POST /delete-foundation-model-agreement` with the `modelId` a row names.
-async fn withdraw(emulator: &Emulator, model_id: &str) -> Reply {
+pub(crate) async fn withdraw(emulator: &Emulator, model_id: &str) -> Reply {
     emulator
         .call("POST", WITHDRAW_URI, Some(json!({ "modelId": model_id })))
         .await
 }
 
 /// `GET /foundation-model-availability/{modelId}`: the read an acceptance shows up in.
-async fn availability(emulator: &Emulator, model_id: &str) -> Reply {
+pub(crate) async fn availability(emulator: &Emulator, model_id: &str) -> Reply {
     emulator
         .call(
             "GET",
@@ -499,7 +499,7 @@ async fn availability(emulator: &Emulator, model_id: &str) -> Reply {
 
 /// The `offerToken` the listing of `model_id`'s offers hands out — the token that accepts
 /// that model's agreement.
-async fn offer_token_of(emulator: &Emulator, model_id: &str) -> String {
+pub(crate) async fn offer_token_of(emulator: &Emulator, model_id: &str) -> String {
     let listed = reported(&offers(emulator, model_id, None).await);
     let offer = listed
         .first()
@@ -512,7 +512,7 @@ async fn offer_token_of(emulator: &Emulator, model_id: &str) -> String {
 
 /// Assert the standing `GET /foundation-model-availability/{model_id}` reports is
 /// `expected` — the one read that answers whether this account may use the model.
-async fn assert_standing(
+pub(crate) async fn assert_standing(
     emulator: &Emulator,
     case: &str,
     model_id: &str,
@@ -772,11 +772,11 @@ async fn a_request_naming_no_offer_of_an_agreement_bearing_model_accepts_nothing
     }
 }
 
-/// RULE: Amazon Bedrock acts on a request for access to a model only once the account's use
+/// RULE: Amazon Bedrock admits an account to the Agreement API only once the account's use
 /// case for model access is on record — the one account-level acknowledgement
 /// `PutUseCaseForModelAccess` submits — so until then an acceptance is refused 403
-/// `AccessDeniedException` and accepts nothing, and the very same request is served once the
-/// form has been submitted.
+/// `AccessDeniedException` naming that surface and accepts nothing, and the very same request
+/// is served once the form has been submitted.
 #[tokio::test]
 async fn an_acceptance_waits_on_the_accounts_use_case_for_model_access() {
     let emulator = emulator();
@@ -816,8 +816,8 @@ async fn an_acceptance_waits_on_the_accounts_use_case_for_model_access() {
             );
             assert_eq!(
                 message(&case, &reply),
-                bedrock::state::MODEL_ACCESS_USE_CASE_REQUIRED_MESSAGE,
-                "case {case}: the refusal must state the acknowledgement it waits on, got {:?}",
+                bedrock::state::AGREEMENT_API_NOT_ALLOWED_MESSAGE,
+                "case {case}: the refusal must name the surface closed to the account, got {:?}",
                 reply.body
             );
             assert_standing(&emulator, &case, model.model_id, OUTSTANDING).await;
