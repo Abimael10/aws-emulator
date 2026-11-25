@@ -49,7 +49,11 @@ mod rtmp_wire;
 /// The service that opened the socket, as the register of the planes this emulator serves
 /// in process names it: this service's own SigV4 signing name, because the contribute plane
 /// is the IVS data plane.
-const SIGNING_NAME: &str = "ivs";
+///
+/// Read by the playback plane too ([`super::publish_playback_addresses`]), which records the
+/// name a channel's playlists are fetched at under the same service: one deployment, one
+/// signing name, whichever of its planes a client was handed an address for.
+pub(super) const SIGNING_NAME: &str = "ivs";
 
 /// The socket the contribute plane answers on, as the control plane publishes it.
 ///

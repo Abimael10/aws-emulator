@@ -4,16 +4,17 @@
 //! CONTRIBUTES to and the one a player FETCHES from — built here and nowhere else, so
 //! every operation that projects a channel announces the same pair.
 //!
-//! RULE: a member this API fills with an address is announced in the FORM that member
-//! carries, and the form is read off what the member is FOR. A member that carries a HOST
-//! the client composes an authority from — appending the port its own protocol dials — is
-//! announced as a DNS hostname: a minted label under the labels this service publishes that
-//! plane in, in the zone this emulator may announce a name of its own in, carrying no scheme
-//! and NO PORT, because a value that already carried one would compose into a doubly-ported
-//! address no client can dial. A member that carries a URL the client FETCHES exactly as it
-//! stands keeps the scheme and the path layout the resource is laid out at and is rooted on
-//! the whole `host[:port]` this request reached this emulator at, port included, which is the
-//! one half of an address a name alone cannot carry.
+//! RULE: a member this API fills with an address announces a HOST of ONE class, whatever the
+//! member's own form: a DNS hostname made of a minted label and the labels this service
+//! publishes that plane under, in the zone this emulator may announce a name of its own in,
+//! carrying no port. A member that carries the host ALONE is that name and nothing else — no
+//! scheme, no path and no port, because the client composes the authority itself, appending
+//! the port its own protocol dials, and a value that already carried one would compose into a
+//! doubly-ported address no client can dial. A member that carries a URL the client FETCHES
+//! exactly as it stands keeps the scheme and the path layout the resource is laid out at, and
+//! its HOST is a name of that SAME class: the scheme already names the port such a URL is
+//! fetched on, so a port in the value is a half of the address the member does not carry —
+//! which is what the recording holds for all three of this service's address members.
 //!
 //! Neither member is modelled with a form (`Channel$ingestEndpoint`, `Channel$playbackUrl`
 //! and `Srt$endpoint` are plain strings with no `@length` and no `@pattern`,
@@ -46,16 +47,16 @@
 //! * `playbackUrl` is a URL a player FETCHES ("URL of the master playlist, required by the
 //!   video player to play the HLS stream", `Stream$playbackUrl`), so it keeps the `https`
 //!   scheme and the playlist path a channel's manifest is laid out at ([`playback_path`]:
-//!   the Region, the account and the channel id, all three read off the channel's own ARN)
-//!   on the address this caller reached this emulator at ([`playback_host`]) — the front
-//!   door that really answers that path ([`super::playback_plane`], claimed by the path the
-//!   URL carries, whatever host it was fetched at), with a loopback address written as the
-//!   NAME that resolves to it so the host of the URL is a hostname rather than a literal.
-//!   It is NOT announced as a name of this service's own the way the contribute host is: a
-//!   name carries no port, and the playlist is served by the front door on the port the
-//!   OPERATOR chose for this emulator rather than on 443 — so a name would be fetched where
-//!   nothing answers, and no register can fix that for a player, which dials the URL as it
-//!   stands rather than resolving a plane in this process.
+//!   the Region, the account and the channel id, all three read off the channel's own ARN) —
+//!   and its HOST is a name of the same class as the contribute host beside it
+//!   ([`announced_playback_url`], composed by [`playback_host_in`]): a minted label, the
+//!   Region the channel is in, the label this service publishes its playback edge under and
+//!   this service's own domain, in the zone this emulator may announce in, with no port.
+//!   What ANSWERS that URL is this deployment's own playback plane
+//!   ([`super::playback_plane`]), claimed by the PATH the URL carries whatever host it was
+//!   fetched at — the whole identity of the channel is in that path — and the announced name
+//!   resolves to this service for a client inside this emulator that dials it
+//!   ([`super::publish_playback_addresses`], the register every such client reads).
 //!
 //! The ZONE a name sits in is the one this emulator may announce a name of its own in
 //! ([`::service_common::data_plane_addressing::announced_zone_of_authority`], the
@@ -74,8 +75,7 @@
 //!
 //! Nothing here is ever CONNECTED to. This module formats strings into a response and
 //! holds no outbound client, socket or resolver; every value it composes is a name in this
-//! process's own zone or one of this process's own inbound addresses, so no value it reports
-//! leads off this machine.
+//! process's own zone, so no value it reports leads off this machine.
 
 use super::*;
 
@@ -97,6 +97,25 @@ const HOST_LABEL_BYTES: usize = 6;
 /// purpose, so a label minted for one plane can never collide with a label minted for
 /// another from the same subject.
 const CONTRIBUTE_LABEL_PURPOSE: &str = "ivs-contribute";
+
+/// The domain label the IVS PLAYBACK edge is published under, between the Region label and
+/// this service's own domain: a channel's playlists are served in the Region that channel
+/// lives in, which is what the Region label in front of this one says.
+const PLAYBACK_DOMAIN_LABEL: &str = "playback";
+
+/// What the ACCOUNT's playback label is minted from, beside the account itself, by the same
+/// rule as [`CONTRIBUTE_LABEL_PURPOSE`]: the playback edge is the account's, so the label is
+/// the account's, and WHICH channel a playlist belongs to is carried by the path
+/// ([`playback_path`]) exactly as the recorded URLs carry it.
+const PLAYBACK_LABEL_PURPOSE: &str = "ivs-playback";
+
+/// The port a playback URL is DIALED on, which is the port its `https` scheme names and
+/// therefore the half of the authority the member itself does not carry.
+///
+/// Read by the record that resolves the announced playback name for a client inside this
+/// emulator ([`super::publish_playback_addresses`]), so the name a player was handed and the
+/// address that register answers for are one address.
+pub(crate) const PLAYBACK_PORT: u16 = 443;
 
 /// The ports a contribution to the announced contribute host is DIALED on — the port a
 /// client appends to the host this service announces, which is the half of the authority
@@ -218,9 +237,10 @@ pub fn announced_stream(
 /// that ARN names no channel — in which case there is no channel to compose a URL for and
 /// the member is reported as absent rather than as a URL to nowhere.
 ///
-/// AWS's own scheme and path layout, on the address this caller can fetch the playlist
-/// from: the whole identity of the channel is in the path ([`playback_path`]), which is
-/// what survives moving the value off AWS's hostname and onto this emulator's address.
+/// AWS's own scheme and path layout, on a playback host of this emulator's own: the whole
+/// identity of the channel is in the path ([`playback_path`]), which is what survives moving
+/// the value off AWS's hostname and onto a name this emulator may announce
+/// ([`playback_host_in`]).
 #[must_use]
 pub fn announced_playback_url(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
@@ -229,38 +249,61 @@ pub fn announced_playback_url(
     let (region, account, channel_id) = channel_of_arn(channel_arn)?;
     Some(format!(
         "https://{}{}",
-        playback_host(ctx),
+        playback_host_in(&announced_zone(ctx), region, account),
         playback_path(region, account, channel_id)
     ))
 }
 
-/// The host a channel's playlists are fetched at: the `host[:port]` the caller reached this
-/// emulator at ([`reached_authority`]), with a host that names the LOOPBACK interface
-/// written as the name of the zone that interface resolves in
-/// (`service_common::data_plane_addressing::LOOPBACK_ZONE`), port kept.
+/// The host a channel of `region` in `account` has its playlists fetched at, in `zone`: a
+/// hostname of the SAME class as the contribute host beside it — a minted label, the
+/// channel's Region, the label this service publishes its playback edge under and this
+/// service's own domain — carrying no port.
 ///
-/// A URL is dialed exactly as it stands — unlike a bare HOST member, where the client
-/// composes the authority and appends the port its protocol dials — so this value has to
-/// carry both halves of the address the player fetches the playlist from, the port included,
-/// which is the one thing a name alone cannot carry. Spelling a loopback address as the
-/// loopback NAME changes nothing about where it leads (RFC 6761 reserves that name for this
-/// interface) and makes the host of the URL a hostname rather than an address literal, which
-/// is what a player that parses the host, or asserts TLS by hostname, expects. Any other
-/// host is answered as it stands: a request that reached this emulator at a routable address
-/// or at a name of its own is told that address, because a client off this machine cannot
-/// resolve one of this machine's own interfaces.
-fn playback_host(ctx: &::smithy_server_runtime::OperationContext<'_>) -> String {
-    let reached = reached_authority(ctx);
-    if !::service_common::data_plane_addressing::names_the_loopback_interface(&reached) {
-        return reached;
-    }
-    let zone = ::service_common::data_plane_addressing::LOOPBACK_ZONE;
-    match ::service_common::data_plane_addressing::addressed_port(Some(&reached))
-        .and_then(|port| u16::try_from(port).ok())
-    {
-        Some(port) => ::service_common::data_plane_addressing::host_port_authority(zone, port),
-        None => zone.to_string(),
-    }
+/// A playback URL is fetched exactly as it stands, so the port it is dialed on is the one its
+/// `https` scheme names ([`PLAYBACK_PORT`]) and not one written into the value: the recording
+/// holds one hostname class for every address member of this API, and a host carrying an
+/// explicit port is not of it — a player that parses the host to pick an edge, or asserts TLS
+/// by hostname, is handed a name either way. What ANSWERS the URL is this deployment's own
+/// playback plane, which claims the PATH the URL carries whatever host it was fetched at
+/// ([`super::playback_plane`]), and the name itself resolves to this service for a client
+/// inside this emulator that dials it ([`super::publish_playback_addresses`]).
+///
+/// The Region is the channel's own, read off its ARN like every other part of the value, and
+/// drawn into the alphabet of a DNS label by the workspace's one reading of that question
+/// (`::service_common::data_plane_addressing::dns_label`) — a label it empties is left out
+/// altogether rather than announced as an empty one, so the host is a well-formed name for
+/// every ARN this store can hold.
+fn playback_host_in(zone: &str, region: &str, account: &str) -> String {
+    let regional = match ::service_common::data_plane_addressing::dns_label(region) {
+        label if label.is_empty() => String::new(),
+        label => format!("{label}."),
+    };
+    format!(
+        "{}.{regional}{PLAYBACK_DOMAIN_LABEL}.{SERVICE_DOMAIN_LABEL}.{zone}",
+        minted_host_label(PLAYBACK_LABEL_PURPOSE, account)
+    )
+}
+
+/// The playback host of a channel of `region` as a client ON THIS MACHINE resolves it: the
+/// same name, in the zone a resolver answers with the interface the core binds its listeners
+/// on.
+///
+/// The spelling the announced name is RECORDED under for an in-process client
+/// ([`super::publish_playback_addresses`]), and the only one it can be: the records follow
+/// the channels this store holds, written before any later request's zone is known, and an
+/// in-process client is on this machine by construction. A caller whose own addressing puts this
+/// emulator in another zone ([`announced_zone`]) is announced that zone and resolves it
+/// itself.
+///
+/// The account is this deployment's own, as the label the contribute host carries is
+/// ([`contribute_host_on_this_machine`]): every channel this emulator holds is minted in it.
+#[must_use]
+pub(crate) fn playback_host_on_this_machine(region: &str) -> String {
+    playback_host_in(
+        ::service_common::data_plane_addressing::LOOPBACK_ZONE,
+        region,
+        ::emulator_server::emulator_account_id(),
+    )
 }
 
 /// One label of an announced name, minted for `purpose` from `seed`: the twelve
@@ -268,8 +311,8 @@ fn playback_host(ctx: &::smithy_server_runtime::OperationContext<'_>) -> String 
 ///
 /// Derived rather than drawn from the store's mint counter, because the label has to be the
 /// one value for its subject on every request that announces it while nothing about it is
-/// persisted: the account's contribute label is the account's for the life of the
-/// deployment. A separator the purpose and the subject cannot carry joins the two, so two
+/// persisted: the account's contribute and playback labels are the account's for the life of
+/// the deployment. A separator the purpose and the subject cannot carry joins the two, so two
 /// subjects cannot run together into one preimage.
 fn minted_host_label(purpose: &str, seed: &str) -> String {
     let digest = Sha256::digest(format!("{purpose}:{seed}").as_bytes());
@@ -289,8 +332,8 @@ fn announced_zone(ctx: &::smithy_server_runtime::OperationContext<'_>) -> String
 }
 
 /// The `host[:port]` this request reached this emulator at, which is the address the zone
-/// every announced name sits in is read off, and the address a URL this service announces is
-/// rooted on ([`playback_host`]).
+/// every announced name sits in is read off ([`announced_zone`]) — every name this module
+/// composes, the host of the playback URL included.
 ///
 /// In the order the other data planes of this tree read it:
 ///

@@ -15,13 +15,13 @@
 //!    carrying no scheme, no path and NO PORT, and never an address literal.
 //! 2. A member that carries a URL the client FETCHES exactly as it stands keeps the `https`
 //!    scheme and the playlist path `/api/video/v1/<region>.<account>.channel.<id>.m3u8`,
-//!    with the Region, the account and the channel id read off the channel's own ARN, and is
-//!    rooted on the whole `host[:port]` the caller reached this emulator at — a loopback
-//!    address written as the name that resolves to that interface, so the host is a hostname
-//!    and the URL is still fetched where the caller reached it.
-//! 3. The ZONE every announced name sits in, and the address every announced URL is rooted
-//!    on, come from the CALLER's own addressing: the loopback zone for a caller that reached
-//!    an address, the reached name for a caller that reached one of this emulator's own names
+//!    with the Region, the account and the channel id read off the channel's own ARN, and its
+//!    HOST is a hostname of the SAME class as rule 1's: a minted label under the labels this
+//!    service publishes its playback edge in, in the zone this emulator may announce in,
+//!    carrying NO PORT — the port such a URL is dialed on is the one its scheme names.
+//! 3. The ZONE every announced name sits in — the host of an announced URL included — comes
+//!    from the CALLER's own addressing: the loopback zone for a caller that reached an
+//!    address, the reached name for a caller that reached one of this emulator's own names
 //!    — never a zone AWS serves its own names in.
 //! 4. Every projection of one channel agrees: the create, the single read, the batch read,
 //!    the update and the live stream read off that channel all announce the same addresses
@@ -35,6 +35,10 @@
 //!    contribute plane: a connection opened to it is answered by a server that speaks RTMP.
 //!    A port this emulator opened nothing on is served by nothing, the port an SRT ingest URL
 //!    names included, because this emulator answers no SRT.
+//! 7. The announced playback NAME is one a client INSIDE this emulator resolves: the register
+//!    every such client reads answers this service for it, on the bare name and on the port
+//!    its scheme names, and the URL as announced is answered by this service's own playback
+//!    plane.
 
 use std::collections::BTreeSet;
 
@@ -59,6 +63,11 @@ const PLAYBACK_PATH_SUFFIX: &str = ".m3u8";
 /// Region.
 const CONTRIBUTE_DOMAIN_LABEL: &str = "global-contribute";
 
+/// The domain label a channel's PLAYBACK host carries between the channel's Region and this
+/// service's own domain: the playlists of a Region's channels are served by that Region's
+/// edge.
+const PLAYBACK_DOMAIN_LABEL: &str = "playback";
+
 /// The label this service's own names sit under, inside the zone the caller's addressing
 /// puts this emulator in.
 const SERVICE_DOMAIN_LABEL: &str = "ivs";
@@ -78,6 +87,10 @@ const CONTRIBUTE_PORTS: [u16; 2] = [443, 1935];
 /// emulator answers SRT, so no plane may be found there: a reachability this deployment does
 /// not provide must not be claimed.
 const SRT_PORT: u16 = 9000;
+
+/// The port a playback URL is DIALED on, which is the port its `https` scheme names: the
+/// half of the authority the member itself does not carry, exactly as a contribute port is.
+const PLAYBACK_PORT: u16 = 443;
 
 /// Hosts no address this emulator announces may name: a value on one of these leaves the
 /// sandbox, because nothing here answers on an Amazon production host.
@@ -183,6 +196,12 @@ fn contribute_suffix(zone: &str) -> String {
     format!("{CONTRIBUTE_DOMAIN_LABEL}.{SERVICE_DOMAIN_LABEL}.{zone}")
 }
 
+/// The labels the host of a playback URL carries after its minted label, for a channel of
+/// `region` announced to a caller whose addressing puts this emulator in `zone`.
+fn playback_suffix(region: &str, zone: &str) -> String {
+    format!("{region}.{PLAYBACK_DOMAIN_LABEL}.{SERVICE_DOMAIN_LABEL}.{zone}")
+}
+
 /// Rules 1 and 5 on a channel's INGEST host: the account's contribute server, with the
 /// `srt.endpoint` beside it the same value — one host serves both protocols. Answers the
 /// value, so a caller can compare it across projections.
@@ -208,55 +227,41 @@ pub(crate) fn assert_announced_ingest(
     ingest
 }
 
-/// Rules 2 and 3 on one announced playback URL: the `https` scheme, the playlist path with
-/// the channel's own identity in it, and the `host[:port]` this caller reached the emulator
-/// at — written as a hostname, never as an address literal.
-fn assert_announced_playback(case: &str, member: &str, url: &str, authority: &str, arn: &str) {
+/// Rules 2 and 3 on one announced playback URL: the `https` scheme, a HOST of the same class
+/// as the ingest host beside it — a minted label over this service's playback labels in the
+/// zone this caller's addressing puts the emulator in, with no port — and the playlist path
+/// with the channel's own identity in it. Answers the host, so a caller can compare it across
+/// projections.
+fn assert_announced_playback(case: &str, member: &str, url: &str, zone: &str, arn: &str) -> String {
     let (region, account, id) = channel_of_arn(arn);
+    let (host, path) = split_url(url);
+    assert!(
+        url.starts_with("https://"),
+        "case {case:?}: {member} must be fetched over https, got {url:?}"
+    );
+    assert_announced_hostname(
+        case,
+        &format!("{member}'s host"),
+        &host,
+        &playback_suffix(&region, zone),
+    );
+    assert_eq!(
+        path,
+        format!("{PLAYBACK_PATH_PREFIX}/{region}.{account}.channel.{id}{PLAYBACK_PATH_SUFFIX}"),
+        "case {case:?}: {member} must carry the playlist path AWS lays out for this channel, \
+         got {url:?}"
+    );
     assert_eq!(
         url,
-        format!(
-            "https://{authority}{PLAYBACK_PATH_PREFIX}/{region}.{account}.channel.{id}\
-             {PLAYBACK_PATH_SUFFIX}"
-        ),
-        "case {case:?}: {member} must be the playlist URL on the address this caller \
-         reached the emulator at ({authority:?}), got {url:?}"
+        format!("https://{host}{path}"),
+        "case {case:?}: {member} must be the host and the path and nothing else, got {url:?}"
     );
-    let (host, path) = split_url(url);
-    let named = match host.find(':') {
-        Some(end) => host[..end].to_string(),
-        None => host.clone(),
-    };
-    assert!(
-        named.parse::<std::net::IpAddr>().is_err() && !named.starts_with('['),
-        "case {case:?}: {member} must name the host, not an address literal, got {host:?} \
-         in {url:?}"
-    );
-    for label in named.split('.') {
-        assert!(
-            !label.is_empty()
-                && label
-                    .chars()
-                    .all(|character| character.is_ascii_alphanumeric() || character == '-'),
-            "case {case:?}: every label of {member}'s host must be a DNS label, got \
-             {label:?} in {url:?}"
-        );
-    }
-    for domain in FOREIGN_DOMAINS {
-        assert!(
-            !named.ends_with(domain),
-            "case {case:?}: {member} must not send a player to a {domain} host, got {url:?}"
-        );
-    }
-    assert!(
-        path.starts_with(PLAYBACK_PATH_PREFIX) && path.ends_with(PLAYBACK_PATH_SUFFIX),
-        "case {case:?}: {member} must carry the playlist path AWS lays out, got {path:?}"
-    );
+    host
 }
 
 /// One addressing a client reaches this emulator through: the base the emulator is served
-/// at, the `Host` the client sent, the zone every name announced to it sits in, and the
-/// `host[:port]` every URL announced to it is rooted on.
+/// at, the `Host` the client sent, and the zone every name announced to it sits in — the host
+/// of an announced URL included.
 struct Addressing {
     case: &'static str,
     /// The base `OperationContext::endpoint` reports, or `None` for an emulator served on
@@ -268,9 +273,6 @@ struct Addressing {
     /// The zone every name announced to that client must sit in — the zone that client's
     /// own addressing puts this emulator in.
     zone: &'static str,
-    /// The `host[:port]` every URL announced to that client must be rooted on: the address
-    /// it reached this emulator at, a loopback host written as the loopback name.
-    authority: &'static str,
 }
 
 /// The addressings this suite spans: rows differ along what rules 1-3 generalise over — how
@@ -287,52 +289,44 @@ fn addressings() -> Vec<Addressing> {
             // served on no port reports, a name RFC 6761 reserves so that nothing resolves
             // it — which is the honest zone for a deployment reachable nowhere.
             zone: "emulator.invalid",
-            authority: "emulator.invalid",
         },
         Addressing {
             case: "a client on the loopback address",
             served_at: None,
             host: Some("127.0.0.1:9297"),
             // An ADDRESS names no zone, and the zone a resolver answers with the
-            // interface it names is the loopback zone RFC 6761 reserves — which is also how
-            // that address is spelled inside a URL.
+            // interface it names is the loopback zone RFC 6761 reserves.
             zone: "localhost",
-            authority: "localhost:9297",
         },
         Addressing {
             case: "a client naming the loopback by name, on another port",
             served_at: None,
             host: Some("localhost:40305"),
             zone: "localhost",
-            authority: "localhost:40305",
         },
         Addressing {
             case: "a client on an IPv6 literal",
             served_at: None,
             host: Some("[::1]:9297"),
             zone: "localhost",
-            authority: "localhost:9297",
         },
         Addressing {
             case: "a client that resolves AWS's own hosts, on an emulator served on a port",
             served_at: Some("https://127.0.0.1:40305"),
             host: Some("ivs.us-east-1.amazonaws.com"),
             zone: "localhost",
-            authority: "localhost:40305",
         },
         Addressing {
             case: "an SDK client on an emulator served at a name",
             served_at: Some("https://emulator.test:8443"),
             host: None,
             zone: "emulator.test",
-            authority: "emulator.test:8443",
         },
         Addressing {
             case: "a client on the loopback address of an emulator served elsewhere",
             served_at: Some("https://127.0.0.1:40305"),
             host: Some("localhost:9297"),
             zone: "localhost",
-            authority: "localhost:9297",
         },
     ]
 }
@@ -369,7 +363,6 @@ async fn every_channel_projection_announces_both_addresses_for_its_own_caller() 
             served_at,
             host,
             zone,
-            authority,
         } = addressing;
         let ivs = match served_at {
             Some(base) => Ivs::served_at(base),
@@ -392,11 +385,11 @@ async fn every_channel_projection_announces_both_addresses_for_its_own_caller() 
         let created = call("CreateChannel", json!({ "name": "announced" })).await;
         let channel = &created["channel"];
         let arn = text(channel, "arn");
-        assert_announced_playback(
+        let playback = assert_announced_playback(
             case,
             "CreateChannel $.channel.playbackUrl",
             &text(channel, "playbackUrl"),
-            authority,
+            zone,
             &arn,
         );
         let ingest = assert_announced_ingest(case, "CreateChannel $.channel", channel, zone);
@@ -407,7 +400,7 @@ async fn every_channel_projection_announces_both_addresses_for_its_own_caller() 
             case,
             "GetChannel $.channel.playbackUrl",
             &text(&read["channel"], "playbackUrl"),
-            authority,
+            zone,
             &arn,
         );
         assert_announced_ingest(case, "GetChannel $.channel", &read["channel"], zone);
@@ -416,7 +409,7 @@ async fn every_channel_projection_announces_both_addresses_for_its_own_caller() 
             case,
             "UpdateChannel $.channel.playbackUrl",
             &text(&updated["channel"], "playbackUrl"),
-            authority,
+            zone,
             &arn,
         );
         assert_announced_ingest(case, "UpdateChannel $.channel", &updated["channel"], zone);
@@ -426,7 +419,7 @@ async fn every_channel_projection_announces_both_addresses_for_its_own_caller() 
             case,
             "BatchGetChannel $.channels[0].playbackUrl",
             &text(batched, "playbackUrl"),
-            authority,
+            zone,
             &arn,
         );
         assert_announced_ingest(case, "BatchGetChannel $.channels[0]", batched, zone);
@@ -439,8 +432,28 @@ async fn every_channel_projection_announces_both_addresses_for_its_own_caller() 
             case,
             "GetStream $.stream.playbackUrl",
             &text(&stream["stream"], "playbackUrl"),
-            authority,
+            zone,
             &arn,
+        );
+
+        // Rules 1 and 2 together: the two hosts are of ONE class — both end in this
+        // service's own domain inside the zone this caller's addressing names, and neither
+        // carries a port — while each names the plane it serves, which is the plane label it
+        // carries ahead of that domain.
+        let suffix = format!("{SERVICE_DOMAIN_LABEL}.{zone}");
+        for (member, announced) in [("ingestEndpoint", &ingest), ("playbackUrl's host", &playback)]
+        {
+            assert!(
+                announced.ends_with(&suffix) && !announced.contains(':'),
+                "case {case:?}: {member} must be a port-less name under {suffix:?}, got \
+                 {announced:?}"
+            );
+        }
+        assert!(
+            ingest.contains(&format!(".{CONTRIBUTE_DOMAIN_LABEL}."))
+                && playback.contains(&format!(".{PLAYBACK_DOMAIN_LABEL}.")),
+            "case {case:?}: each host must carry the label of the plane it names, got \
+             {ingest:?} and {playback:?}"
         );
 
         // Rule 5: the contribute server is the account's, so nothing of this channel is in
@@ -466,7 +479,7 @@ async fn every_channel_projection_announces_both_addresses_for_its_own_caller() 
             case,
             "CreateChannel $.channel.playbackUrl (second)",
             &text(&second["channel"], "playbackUrl"),
-            authority,
+            zone,
             &second_arn,
         );
         assert_eq!(
@@ -494,12 +507,12 @@ async fn a_read_through_one_address_does_not_change_what_another_caller_is_told(
     // `every_channel_projection_announces_both_addresses_for_its_own_caller`, which varies
     // the base the emulator is served at as well as the host the client addressed.
     let addresses = [
-        ("127.0.0.1:9297", "localhost", "localhost:9297"),
-        ("localhost:40305", "localhost", "localhost:40305"),
-        ("[::1]:8443", "localhost", "localhost:8443"),
+        ("127.0.0.1:9297", "localhost"),
+        ("localhost:40305", "localhost"),
+        ("[::1]:8443", "localhost"),
     ];
     for round in 1..=2 {
-        for (host, zone, authority) in addresses {
+        for (host, zone) in addresses {
             let case = format!("round {round} at {host}");
             let read = ivs
                 .call_as("GetChannel", &json!({ "arn": arn }), Some(host), AUTHORIZATION)
@@ -513,7 +526,7 @@ async fn a_read_through_one_address_does_not_change_what_another_caller_is_told(
                 &case,
                 "GetChannel $.channel.playbackUrl",
                 &text(&read.body["channel"], "playbackUrl"),
-                authority,
+                zone,
                 &arn,
             );
             assert_announced_ingest(&case, "GetChannel $.channel", &read.body["channel"], zone);
@@ -561,9 +574,9 @@ async fn the_ingest_endpoint_is_the_accounts_and_not_a_channels() {
                 channel,
                 "emulator.invalid",
             );
-            // The channel's own Region is in its ARN and therefore in the playlist PATH of
-            // its playback URL, and the create minted the channel in the Region its caller
-            // signed for.
+            // The channel's own Region is in its ARN, and therefore both in the Region label
+            // of its playback host and in the playlist PATH of its playback URL; the create
+            // minted the channel in the Region its caller signed for.
             assert_announced_playback(
                 &case,
                 "CreateChannel $.channel.playbackUrl",
@@ -751,6 +764,201 @@ async fn the_address_a_client_composes_from_the_announced_ingest_host_is_served(
         assert!(
             nothing.is_none(),
             "case {case:?}: {host}:{asked} must be served by nothing, got {nothing:?}"
+        );
+    }
+}
+
+/// Rule 7: the playback NAME a channel announces is one a client INSIDE this emulator
+/// resolves — the register every such client reads answers this service for it, on the bare
+/// name and on the port its scheme names — and the URL as announced is answered by this
+/// service's own playback plane rather than by whoever answers an address nobody published.
+///
+/// Rows differ along the Region the caller's credential scope names, because the playback edge
+/// is the channel's own Region's: each Region announces a name of its own, and each has to
+/// resolve. The closing rows are the names nothing announced, which must resolve to nothing —
+/// a Region only a REFUSED create named, and the Region of a channel that was DELETED, because
+/// the records are a projection of the channels this store holds rather than a log of the calls
+/// it was sent.
+#[tokio::test]
+async fn the_announced_playback_name_resolves_to_this_service_and_serves_its_path() {
+    let ivs = Ivs::new();
+    let published = ivs.published_planes();
+    // The Regions a caller's credential scope can name, including the label shapes around an
+    // ordinary Region code — the same set the contribute rule is driven over.
+    let regions = ["us-east-1", "us-west-2", "ap-southeast-2", "a", "x1-2-3"];
+    let mut announced: BTreeSet<String> = BTreeSet::new();
+    // Each channel beside the playback host it announced, so the rows below can delete one and
+    // ask what its Region's name resolves to afterwards.
+    let mut created_channels: Vec<(String, String)> = Vec::new();
+
+    for region in regions {
+        let case = format!("a channel in {region}");
+        let created = ivs
+            .call_as(
+                "CreateChannel",
+                &json!({ "name": "resolved" }),
+                Some("127.0.0.1:9297"),
+                &authorization_in(region),
+            )
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: CreateChannel must answer HTTP 200, got {} {}",
+            created.status, created.body
+        );
+        let channel = &created.body["channel"];
+        let arn = text(channel, "arn");
+        let url = text(channel, "playbackUrl");
+        let host = assert_announced_playback(
+            &case,
+            "CreateChannel $.channel.playbackUrl",
+            &url,
+            "localhost",
+            &arn,
+        );
+
+        // The name itself resolves to THIS service, both as the URL spells it and with the
+        // port its scheme names written out, which is the authority a client that normalises
+        // the URL dials.
+        for (spelling, authority) in [
+            ("the announced name", host.clone()),
+            (
+                "the name on the port its scheme names",
+                format!("{host}:{PLAYBACK_PORT}"),
+            ),
+        ] {
+            let answering = published.answering_service(&authority);
+            assert_eq!(
+                answering.as_deref(),
+                Some("ivs"),
+                "case {case:?}: {spelling} ({authority}) must resolve to this service, got \
+                 {answering:?}"
+            );
+        }
+
+        // And the URL as announced is this emulator's to answer: the plane claims the path
+        // the URL carries and reports that nothing is packaged for a channel no publisher has
+        // reached yet, with no body of its own.
+        let fetched = ivs.fetch(&url).await;
+        assert_eq!(
+            fetched.status, 404,
+            "case {case:?}: the announced URL {url} must be answered by this service's \
+             playback plane, got {} {:?}",
+            fetched.status, fetched.body
+        );
+        assert!(
+            fetched.body.is_empty(),
+            "case {case:?}: a channel nothing publishes to serves no playlist, got {:?}",
+            fetched.body
+        );
+        announced.insert(host.clone());
+        created_channels.push((arn, host));
+    }
+
+    assert_eq!(
+        announced.len(),
+        regions.len(),
+        "each Region's channels are played back from that Region's own edge, got {announced:?}"
+    );
+
+    // A create that is REFUSED announces no channel, so it publishes no name either: the
+    // records follow the channels this store persisted, not the calls it was sent. The
+    // authority a successful create in this Region WOULD have published is composed from the
+    // label a successful create in another Region announced, because the label is the
+    // account's and the Region is a label of its own.
+    let refused_region = "eu-west-1";
+    let minted_label = announced
+        .iter()
+        .next()
+        .and_then(|host| host.split_once('.'))
+        .map(|(label, _)| label.to_string())
+        .expect("a created channel announced a playback host");
+    let refused = ivs
+        .call_as(
+            "CreateChannel",
+            // `containerFormat` must be FRAGMENTED_MP4 when multitrack input is enabled
+            // (`Channel$containerFormat`, `smithy_query(query="shape",shape="Channel")`), so
+            // this request is refused before anything is persisted.
+            &json!({ "name": "refused", "containerFormat": "TS",
+                     "multitrackInputConfiguration": { "enabled": true } }),
+            Some("127.0.0.1:9297"),
+            &authorization_in(refused_region),
+        )
+        .await;
+    assert_eq!(
+        refused.status, 400,
+        "case \"a refused create\": CreateChannel must refuse that pair, got {} {}",
+        refused.status, refused.body
+    );
+
+    // A name of the right FORM that this emulator announced for nothing resolves to nothing:
+    // the register answers for the addresses this deployment really published and not for
+    // every name under its own zone.
+    for (case, authority) in [
+        (
+            "the name a refused create would have published",
+            format!(
+                "{minted_label}.{refused_region}.{PLAYBACK_DOMAIN_LABEL}.\
+                 {SERVICE_DOMAIN_LABEL}.localhost"
+            ),
+        ),
+        (
+            "a playback name of a Region no channel was created in",
+            format!("ffffffffffff.eu-central-1.{PLAYBACK_DOMAIN_LABEL}.{SERVICE_DOMAIN_LABEL}.localhost"),
+        ),
+        (
+            "a label nothing was minted for",
+            format!("000000000000.us-east-1.{PLAYBACK_DOMAIN_LABEL}.{SERVICE_DOMAIN_LABEL}.localhost"),
+        ),
+    ] {
+        let answering = published.answering_service(&authority);
+        assert!(
+            answering.is_none(),
+            "case {case:?}: {authority} must resolve to nothing, got {answering:?}"
+        );
+    }
+
+    // And the records follow the channels the store HOLDS, not the ones it once held: the
+    // Region of a deleted channel announces nothing for the next caller, while every Region
+    // that still holds one keeps resolving.
+    let (deleted_arn, deleted_host) = created_channels
+        .first()
+        .cloned()
+        .expect("a created channel announced a playback host");
+    let deleted = ivs
+        .call_as(
+            "DeleteChannel",
+            &json!({ "arn": deleted_arn }),
+            Some("127.0.0.1:9297"),
+            AUTHORIZATION,
+        )
+        .await;
+    assert_eq!(
+        deleted.status, 204,
+        "case \"a deleted channel\": DeleteChannel must answer HTTP 204, got {} {}",
+        deleted.status, deleted.body
+    );
+    for (case, authority) in [
+        ("the deleted channel's Region", deleted_host.clone()),
+        (
+            "the same name on the port its scheme names",
+            format!("{deleted_host}:{PLAYBACK_PORT}"),
+        ),
+    ] {
+        let answering = published.answering_service(&authority);
+        assert!(
+            answering.is_none(),
+            "case {case:?}: {authority} must resolve to nothing once no channel lives there, \
+             got {answering:?}"
+        );
+    }
+    for (arn, host) in created_channels.iter().skip(1) {
+        let answering = published.answering_service(host);
+        assert_eq!(
+            answering.as_deref(),
+            Some("ivs"),
+            "case {arn:?}: a Region that still holds a channel keeps resolving {host}, got \
+             {answering:?}"
         );
     }
 }

@@ -152,6 +152,17 @@ impl Ivs {
             .expect("the shared engine vends the register of its open planes")
     }
 
+    /// The register of WHICH service answers at an address this emulator published, as an
+    /// in-process client that was handed a URL reads it: nothing can be read off the host of
+    /// a name a service minted, so a client resolves the answering service here before its
+    /// request is carried to it.
+    pub(crate) fn published_planes(
+        &self,
+    ) -> ::service_common::published_data_planes::PublishedPlanes {
+        ::service_common::published_data_planes::PublishedPlanes::of(&*self.engine)
+            .expect("the shared engine vends the register of the addresses it published")
+    }
+
     pub(crate) async fn call(&self, operation: &str, body: &Value) -> Reply {
         self.call_as(operation, body, None, AUTHORIZATION).await
     }

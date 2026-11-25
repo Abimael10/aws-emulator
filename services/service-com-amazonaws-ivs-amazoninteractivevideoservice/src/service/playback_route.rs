@@ -3,14 +3,19 @@
 //! The front-door route a channel's PLAYBACK URL is fetched on: how this service claims a
 //! request that followed the `playbackUrl` it announced, and how it answers one.
 //!
-//! The announced value is an `https://` URL on the address the caller reached this emulator
-//! at ([`crate::state::announced_playback_url`]), so a player fetches it at this emulator's
-//! own endpoint — unsigned, because a viewer holds no credentials, and on a path the model
-//! binds no operation to. Such a request resolves no modelled operation, which is exactly
-//! the seam [`::smithy_server_runtime::Service::override_routing_error`] is reached at, and
-//! so is where the playlist is served; [`::smithy_server_runtime::Service::can_handle`]
-//! claims it first so the router does not answer `404 UnknownService` for an address this
-//! service itself published.
+//! The announced value is an `https://` URL on a name of this service's own
+//! ([`crate::state::announced_playback_url`]: a minted label over this service's regional
+//! playback labels, in the zone the caller's addressing puts this emulator in, carrying no
+//! port), so what is claimed here is the PATH that URL carries, whatever host it was fetched
+//! at — this emulator's own endpoint for a player configured with it, and the announced name
+//! for one that resolves it ([`crate::state::publish_playback_addresses`] is where an
+//! in-process client reads which service answers at that name). The request is unsigned,
+//! because a viewer holds no credentials, and on a path the model binds no operation to.
+//! Such a request resolves no modelled operation, which is exactly the seam
+//! [`::smithy_server_runtime::Service::override_routing_error`] is reached at, and so is where
+//! the playlist is served; [`::smithy_server_runtime::Service::can_handle`] claims it first so
+//! the router does not answer `404 UnknownService` for an address this service itself
+//! published.
 //!
 //! Only a path naming a channel THIS store holds is claimed, so nothing modelled is
 //! diverted here and an address this emulator never announced is answered the way the

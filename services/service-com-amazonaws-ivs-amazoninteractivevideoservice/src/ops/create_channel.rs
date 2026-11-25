@@ -293,6 +293,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::secret_unavailable(CreateChannelErrorModeled::InternalServerException)
         })?;
         store.channels.insert(arn.clone(), channel.clone());
+        drop(store);
+
+        // The other half of the ingest plane's question, for the PLAYBACK name this channel
+        // is about to be announced: a client inside this emulator that is handed the URL
+        // resolves which service answers at that name, and this is the record it reads
+        // (`crate::state::publish_playback_addresses`). The path the URL carries is answered
+        // by this service's own playback plane.
+        //
+        // Reconciled only once the channel is PERSISTED, and with the store guard released:
+        // the records are a projection of the channels this store holds, so a call that was
+        // refused the quota above — or that could not mint its secrets — records nothing.
+        crate::state::publish_playback_addresses(&*self.engine, &state);
 
         Ok(CreateChannelOutput {
             // What the create answers is the channel it persisted, announced to THIS

@@ -7,7 +7,7 @@
 //! rules the model documents, how this service WORDS the failures it answers, and
 //! the modelled constraints it enforces in its own handlers).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime};
 
@@ -19,11 +19,10 @@ use regex::Regex;
 use sha2::{Digest, Sha256};
 use smithy_server_runtime::{Violation, ViolationKind};
 
-/// The two addresses a channel announces — the ingest server a client contributes to, a
-/// name in this emulator's own zone, and the playback URL a player fetches, rooted on the
-/// address that player reached this emulator at — kept in one module beside the state they
-/// are built from, and re-exported here so a handler reaches them where it reaches the rest
-/// of this service's rules.
+/// The two addresses a channel announces — the ingest server a client contributes to and the
+/// playback URL a player fetches, both names in this emulator's own zone — kept in one module
+/// beside the state they are built from, and re-exported here so a handler reaches them where
+/// it reaches the rest of this service's rules.
 mod channel_endpoints;
 
 /// The ad marker a broadcasting channel's playlist carries, and the rule
@@ -138,6 +137,13 @@ pub struct ComAmazonawsIvsAmazoninteractivevideoserviceState {
     /// [`end_stream`] drops it with the stream — because there is no playlist for a
     /// stream that is not live.
     pub playlists: BTreeMap<String, ChannelPlaylist>,
+    /// The Regions this deployment currently has PLAYBACK-NAME records for, where a client
+    /// inside this emulator resolves which service answers at an announced address — see
+    /// [`publish_playback_addresses`], which keeps this set equal to the Regions the channels
+    /// of [`Self::channels`] live in. Held beside those channels so the records are a
+    /// projection of them: bounded by the live channels ([`MAX_CHANNELS`]) rather than by how
+    /// many calls a caller makes, and reconciled by the create and the delete.
+    pub published_playback_regions: BTreeSet<String>,
 }
 
 /// A persisted recording configuration together with the instant at which the

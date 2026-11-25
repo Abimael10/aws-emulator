@@ -199,6 +199,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // report a session of, and a session read answers the way it does for an ARN this
         // store never held.
         store.stream_sessions.remove(&input.arn);
+        drop(store);
+
+        // The channel is gone, so the playback name of its Region is announced for nothing
+        // unless another channel still lives there: the records that resolve an announced
+        // name for a client inside this emulator are a projection of the channels this store
+        // holds, reconciled here as well as by the create
+        // (`crate::state::publish_playback_addresses`).
+        crate::state::publish_playback_addresses(&*self.engine, &state);
 
         Ok(DeleteChannelOutput)
     }

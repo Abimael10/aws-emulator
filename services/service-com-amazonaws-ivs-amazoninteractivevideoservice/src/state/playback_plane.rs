@@ -34,6 +34,7 @@
 use std::collections::VecDeque;
 
 use super::channel_endpoints::{channel_of_arn, PLAYBACK_PATH_PREFIX};
+use super::ingest_plane::SIGNING_NAME;
 use super::*;
 
 /// The media type an HLS playlist is served as (RFC 8216 §4).
@@ -412,6 +413,88 @@ pub enum PlaybackAnswer {
 
 /// The methods the playback plane serves: a viewer reads, it does not write.
 pub const PLAYBACK_METHODS: &str = "GET, HEAD";
+
+/// Reconcile the records that say WHICH service answers at the playback hosts this deployment
+/// announces with the channels this store HOLDS, where a client INSIDE this emulator resolves
+/// that question ([`::service_common::published_data_planes`], the tree's one register of it).
+///
+/// The announced `playbackUrl` carries a NAME ([`super::announced_playback_url`]), and
+/// nothing can be read off the host of a name this service minted: a client of this emulator
+/// that was handed the URL — a function reading a channel out of the control plane and
+/// fetching its playlist — resolves the service that answers there here, and is then carried
+/// to this service in process, where the playback plane claims the path the URL carries
+/// ([`crate::service`]). Both spellings of the one authority are recorded, the bare name and
+/// the name on the port its `https` scheme names ([`super::PLAYBACK_PORT`]), so a client that
+/// wrote the default port for the scheme resolves the same plane as one that left it out.
+///
+/// It is a PROJECTION of the store and not a log of calls: the Regions it records are the
+/// Regions the channels this store holds live in, read off their own ARNs, and a Region the
+/// store no longer holds a channel in has its records WITHDRAWN. So the records a deployment
+/// holds are at most one pair per live channel — a count the channel cap
+/// ([`super::MAX_CHANNELS`]) dominates, whatever Region a caller signs for and however many
+/// calls it makes — and a channel that is deleted takes its Region's records with it unless
+/// another channel still lives there. Which Regions are currently recorded is held beside the
+/// channels themselves
+/// ([`ComAmazonawsIvsAmazoninteractivevideoserviceState::published_playback_regions`]), so a
+/// reconcile writes only the difference.
+///
+/// Called by the create once the channel is PERSISTED — a channel is announced a playback URL
+/// from the moment it exists, so that is when its name has to resolve, and a call refused the
+/// channel quota records nothing — and by the delete once the channel is gone. Nothing is
+/// recorded on an engine that vends no such register, which leaves the name resolving to
+/// nothing for an in-process client, exactly as it did before any channel existed.
+pub fn publish_playback_addresses<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    state: &::engine::ServiceState<ComAmazonawsIvsAmazoninteractivevideoserviceState>,
+) {
+    let Some(published) = ::service_common::published_data_planes::PublishedPlanes::of(engine)
+    else {
+        return;
+    };
+    // The difference between what the store holds and what is recorded, computed under one
+    // hold of this store's guard and applied with none: the register's own lock is taken last
+    // (`::service_common::published_data_planes`), so nothing of it is held while this store
+    // is.
+    let (announce, withdraw) = {
+        let mut store = state.lock();
+        let live: ::std::collections::BTreeSet<String> = store
+            .channels
+            .keys()
+            .filter_map(|arn| super::arn_region(arn).map(str::to_string))
+            .collect();
+        let announce: Vec<String> = live
+            .difference(&store.published_playback_regions)
+            .cloned()
+            .collect();
+        let withdraw: Vec<String> = store
+            .published_playback_regions
+            .difference(&live)
+            .cloned()
+            .collect();
+        store.published_playback_regions = live;
+        (announce, withdraw)
+    };
+    for region in withdraw {
+        for authority in playback_authorities(&region) {
+            published.withdraw(&authority);
+        }
+    }
+    for region in announce {
+        for authority in playback_authorities(&region) {
+            published.publish(&authority, SIGNING_NAME);
+        }
+    }
+}
+
+/// Every address a client composes from the playback name a channel of `region` announces:
+/// the name as the URL spells it, and the name on the port that URL's scheme names
+/// ([`super::PLAYBACK_PORT`]).
+fn playback_authorities(region: &str) -> [String; 2] {
+    let host = super::playback_host_on_this_machine(region);
+    let ported =
+        ::service_common::data_plane_addressing::host_port_authority(&host, super::PLAYBACK_PORT);
+    [host, ported]
+}
 
 /// Serve one request on the playback path, out of what the contribute plane has packaged.
 ///
