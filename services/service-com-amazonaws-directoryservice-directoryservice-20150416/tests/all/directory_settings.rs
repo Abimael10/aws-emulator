@@ -23,6 +23,10 @@
 //! * `Status` narrows the entries: the status every fresh setting is in reports them all,
 //!   and every other value of the modelled `DirectoryConfigurationStatus` enum reports
 //!   none;
+//! * `Status` reports exactly the settings whose own request status is the one asked for,
+//!   so the filters over that enum PARTITION the directory's settings — asserted on a
+//!   directory whose settings are in DIFFERENT statuses, and as an invariant of every
+//!   filtered answer while the transition an update owes has not fallen due yet;
 //! * this operation issues no `NextToken`, so every token a request can carry is one it
 //!   did not issue and is refused with `InvalidNextTokenException`.
 
@@ -31,8 +35,9 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 
 use crate::directory_lifecycle::{
-    call, create_directory, minimal_create, ok, refused, service, PAST_ONE_SPAN,
+    await_in_service, call, create_directory, minimal_create, ok, refused, service, PAST_ONE_SPAN,
 };
+use crate::harness::{poll_until_reported, POLL_DEADLINE};
 use crate::microsoft_ad::{create_microsoft_ad, minimal_microsoft_ad};
 
 /// Well-formed `DirectoryId`s no directory is ever created under, as `(id, class)`.
@@ -56,6 +61,10 @@ const STATUS_CATALOG: [&str; 5] = ["Requested", "Updating", "Updated", "Failed",
 /// The status a setting nothing has changed is in: the one value of that catalog a freshly
 /// created directory's settings carry.
 const STATUS_DEFAULT: &str = "Default";
+
+/// The status a carried-out request ends on: the value of that catalog a setting rests at
+/// once the transition its update owes has fallen due.
+const STATUS_UPDATED: &str = "Updated";
 
 /// The `SettingEntries` of an answer.
 fn entries(body: &Value, case: &str) -> Vec<Value> {
@@ -697,4 +706,264 @@ async fn an_update_this_service_cannot_carry_out_is_refused_and_persists_nothing
         )
         .await;
     }
+}
+
+/// The `RequestStatus` the unfiltered catalogue reports for the setting named `name`.
+async fn status_of(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    directory_id: &str,
+    name: &str,
+    case: &str,
+) -> Value {
+    let found = entries(&settings_of(router, directory_id, case).await, case);
+    entry_named(&found, name, case)["RequestStatus"].clone()
+}
+
+/// The entries of `directory_id` narrowed to `status`.
+///
+/// Every filtered answer is held to what the operation answers for an unfiltered one too:
+/// it names the directory read, and it carries no page token, since the whole catalogue
+/// fits in one page however it is narrowed.
+async fn settings_in_status(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    directory_id: &str,
+    status: &str,
+    case: &str,
+) -> Vec<Value> {
+    let answer = ok(
+        router,
+        "DescribeSettings",
+        json!({ "DirectoryId": directory_id, "Status": status }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        answer["DirectoryId"],
+        json!(directory_id),
+        "case {case:?}: expected the answer to name the directory read, got {answer}"
+    );
+    assert_eq!(
+        answer["NextToken"],
+        json!(null),
+        "case {case:?}: expected no NextToken, got {answer}"
+    );
+    entries(&answer, case)
+}
+
+/// `(the setting's name, a value it admits and does not carry)`, read out of the entry the
+/// catalogue reports — so the pair an update is driven with comes from the store rather
+/// than from a literal this suite spells.
+fn another_admitted_value(entry: &Value, case: &str) -> (String, String) {
+    let name = entry["Name"].as_str().unwrap_or_default().to_string();
+    let applied = entry["AppliedValue"].as_str().unwrap_or_default().to_string();
+    let allowed: Vec<String> =
+        serde_json::from_str(entry["AllowedValues"].as_str().unwrap_or_default())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "case {case:?}: expected AllowedValues to decode as a JSON array of \
+                     strings, got {entry} ({error})"
+                )
+            });
+    let other = allowed
+        .into_iter()
+        .find(|value| *value != applied)
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected {name} to admit a value besides {applied}, got {entry}"
+            )
+        });
+    (name, other)
+}
+
+/// Assert the invariant of a narrowed read, over every value of the modelled catalog: an
+/// entry is reported under a status only if that is the status the stored setting is in,
+/// and only for a setting the unfiltered catalogue publishes.
+///
+/// It is a property of each individual answer, so it holds whatever status each setting
+/// happens to be in when the read lands — no case built on it depends on how fast the host
+/// runs.
+async fn assert_each_filter_reports_only_its_own_status(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    directory_id: &str,
+    case: &str,
+) {
+    let published: BTreeSet<String> = entries(&settings_of(router, directory_id, case).await, case)
+        .iter()
+        .map(|entry| entry["Name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    for status in STATUS_CATALOG {
+        let case = format!("{case}: Status={status}");
+        for entry in settings_in_status(router, directory_id, status, &case).await {
+            assert_eq!(
+                entry["RequestStatus"],
+                json!(status),
+                "case {case:?}: expected every entry the filter reports to be in that \
+                 status, got {entry}"
+            );
+            let name = entry["Name"].as_str().unwrap_or_default().to_string();
+            assert!(
+                published.contains(&name),
+                "case {case:?}: expected {name} to be one of the settings the catalogue \
+                 publishes {published:?}, got {entry}"
+            );
+        }
+    }
+}
+
+/// RULE: `Status` reports exactly the stored settings whose own request status is the one
+/// asked for, so the filters over the modelled catalog PARTITION the directory's settings —
+/// which has to hold when the settings are in DIFFERENT statuses, not only when a fresh
+/// directory has them all in one.
+#[tokio::test]
+async fn the_status_filter_partitions_a_catalogue_whose_settings_are_in_different_statuses() {
+    let router = service();
+    let case = "settings in different statuses";
+    let managed =
+        create_microsoft_ad(&router, minimal_microsoft_ad("narrowed.example.com"), case).await;
+    await_in_service(&router, &managed, case).await;
+
+    let fresh = entries(&settings_of(&router, &managed, case).await, case);
+    assert!(
+        fresh.len() > 1,
+        "case {case:?}: expected more than one setting, so one of them can be in another \
+         status than its neighbours, got {fresh:?}"
+    );
+    let (subject, value) = another_admitted_value(&fresh[0], case);
+
+    ok(
+        &router,
+        "UpdateSettings",
+        json!({
+            "DirectoryId": &managed,
+            "Settings": [{ "Name": &subject, "Value": &value }],
+        }),
+        case,
+    )
+    .await;
+
+    // The CONDITION is what is waited for, not a span of time: once the subject reports the
+    // status a carried-out request ends on, it and its neighbours rest on statuses no clock
+    // moves them off, so the configuration the filters are read against cannot change under
+    // them.
+    poll_until_reported(
+        case,
+        &format!("{subject} to report the update carried out"),
+        POLL_DEADLINE,
+        || status_of(&router, &managed, &subject, case),
+        |status: &Value| status == &json!(STATUS_UPDATED),
+    )
+    .await;
+
+    let base = entries(&settings_of(&router, &managed, case).await, case);
+    let statuses: BTreeSet<&str> = base
+        .iter()
+        .map(|entry| entry["RequestStatus"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        statuses.len() > 1,
+        "case {case:?}: expected the settings to be in more than one status, got {base:?}"
+    );
+
+    // Every value of the modelled catalog, the ones the settings are in among them: the
+    // filter reports the entries in that status and nothing else, each exactly as the
+    // unfiltered catalogue reports it.
+    let mut reported = 0usize;
+    for status in STATUS_CATALOG {
+        let case = format!("{case}: Status={status}");
+        let found = settings_in_status(&router, &managed, status, &case).await;
+        let expected: Vec<Value> = base
+            .iter()
+            .filter(|entry| entry["RequestStatus"] == json!(status))
+            .cloned()
+            .collect();
+        assert_eq!(
+            found, expected,
+            "case {case:?}: expected the settings in that status, got {found:?}"
+        );
+        reported += found.len();
+    }
+    // A partition: each setting is reported by exactly one of the filters, so none is
+    // dropped and none is reported under two statuses.
+    assert_eq!(
+        reported,
+        base.len(),
+        "case {case:?}: expected the filters to report each of the {expected} settings \
+         exactly once, got {reported}",
+        expected = base.len()
+    );
+
+    // Narrowing is reading: the filtered reads left what a later caller sees untouched.
+    let after = entries(&settings_of(&router, &managed, case).await, case);
+    assert_eq!(
+        after, base,
+        "case {case:?}: expected the narrowed reads to change nothing, got {after:?}"
+    );
+}
+
+/// RULE: a narrowed read reports a setting only under the status that setting is in at the
+/// instant the read lands — the transition an update owes included, which a directory with
+/// an update in flight is in the middle of — and a setting an update has been requested for
+/// has left the status an unchanged one carries.
+#[tokio::test]
+async fn a_narrowed_read_reports_a_setting_only_under_the_status_it_is_in() {
+    let router = service();
+    let case = "a narrowed read while updates are in flight";
+    let managed =
+        create_microsoft_ad(&router, minimal_microsoft_ad("in-flight.example.com"), case).await;
+    await_in_service(&router, &managed, case).await;
+
+    let fresh = entries(&settings_of(&router, &managed, case).await, case);
+    let subjects: Vec<(String, String)> = fresh
+        .iter()
+        .map(|entry| another_admitted_value(entry, case))
+        .collect();
+
+    // An update is requested for EVERY setting the catalogue publishes, so none of them is
+    // left in the status an unchanged setting carries.
+    for (name, value) in &subjects {
+        ok(
+            &router,
+            "UpdateSettings",
+            json!({
+                "DirectoryId": &managed,
+                "Settings": [{ "Name": name, "Value": value }],
+            }),
+            case,
+        )
+        .await;
+    }
+
+    // In flight: the requests have been accepted and the transitions they owe have not all
+    // fallen due.
+    let in_flight = format!("{case}, in flight");
+    assert_each_filter_reports_only_its_own_status(&router, &managed, &in_flight).await;
+    let unchanged = settings_in_status(&router, &managed, STATUS_DEFAULT, &in_flight).await;
+    assert!(
+        unchanged.is_empty(),
+        "case {in_flight:?}: expected no setting to be reported as unchanged once an update \
+         has been requested for every one of them, got {unchanged:?}"
+    );
+
+    // And once the transitions have fallen due — waited for as the condition it is — the
+    // same holds of the settled catalogue, which the filter for that status now reports
+    // whole.
+    let settled = poll_until_reported(
+        case,
+        "every setting to report its update carried out",
+        POLL_DEADLINE,
+        || settings_in_status(&router, &managed, STATUS_UPDATED, case),
+        |found: &Vec<Value>| found.len() == subjects.len(),
+    )
+    .await;
+    for (name, value) in &subjects {
+        let entry = entry_named(&settled, name, case);
+        assert_eq!(
+            entry["AppliedValue"],
+            json!(value),
+            "case {case:?}: expected the value requested for {name} to be the one applied, \
+             got {entry}"
+        );
+    }
+    assert_each_filter_reports_only_its_own_status(&router, &managed, &format!("{case}, settled"))
+        .await;
 }
