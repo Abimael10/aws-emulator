@@ -2493,7 +2493,13 @@ impl AutoScalingState {
         }
 
         let terminated_ids = self.scale_in_selection(group_name, surplus_units, now);
-        self.terminate_group_instances(engine, group_name, &terminated_ids, now, due);
+        // A warm pool whose own reuse policy asks for it takes those instances BACK rather
+        // than letting them be terminated — "whether instances in the Auto Scaling group can
+        // be returned to the warm pool on scale in" (`InstanceReusePolicy$ReuseOnScaleIn`) —
+        // as far as the pool has room for them ([`Self::reuse_scaled_in_instances`]); the
+        // rest leave the group as every other scale-in's do.
+        let reuse = self.reuse_scaled_in_instances(group_name, &terminated_ids, now);
+        self.terminate_group_instances(engine, group_name, &reuse.terminated, now, due);
 
         for instance_id in promoted.into_iter().chain(launched_ids) {
             // The activity of an instance the CONVERGENCE brought into service states both
@@ -2520,7 +2526,7 @@ impl AutoScalingState {
                 },
             );
         }
-        for instance_id in terminated_ids {
+        for instance_id in reuse.terminated {
             let cause = Self::convergence_cause(
                 cause,
                 InstanceLifecycle::Terminated,
@@ -2538,6 +2544,33 @@ impl AutoScalingState {
                     cause: &cause,
                     start_time: now,
                     due,
+                },
+            );
+        }
+        for instance_id in &reuse.returned {
+            // An instance the group's warm pool took back was taken out of service by this
+            // same convergence, so its activity states that step — and its description states
+            // what the group did with it, which is a return rather than a termination
+            // ([`warm_pools::warm_pool_return_description`]).
+            let cause = Self::convergence_cause(
+                cause,
+                InstanceLifecycle::Terminated,
+                now,
+                met_capacity,
+                desired_capacity,
+            );
+            self.record_activity(
+                engine,
+                &ActivityRecord {
+                    group_name,
+                    group_arn: &arn,
+                    description: warm_pools::warm_pool_return_description(instance_id),
+                    cause,
+                    group_state: GROUP_STATE_IN_SERVICE,
+                    start_time: now,
+                    completes_at: Some(due),
+                    milestone: ActivityMilestone::InProgress,
+                    instance_id: Some(instance_id),
                 },
             );
         }

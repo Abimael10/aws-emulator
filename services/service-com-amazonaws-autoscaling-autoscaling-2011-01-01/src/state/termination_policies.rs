@@ -9,18 +9,30 @@
 //! with the policies a group may name listed by that same documentation
 //! ([`super::TERMINATION_POLICIES`]).
 //!
-//! So selection here is ONE ordered pass: the candidates — the group's instances that
-//! are not already on their way out and not protected from scale-in — are ordered by
-//! the FIRST policy the group lists, instances the first policy cannot tell apart are
-//! ordered by the second, and so on; the scale-in then takes as many from the front of
-//! that order as it has surplus. This is the one place that order is computed, so every
-//! capacity decrease — `UpdateAutoScalingGroup`, `SetDesiredCapacity`, a policy a
-//! caller executed, a scheduled action, a change the clock made due — selects its
-//! victims the same way.
+//! The group's policies are not the FIRST thing that narrows the choice, though:
+//! Availability Zone balance comes before them. Amazon EC2 Auto Scaling keeps a group's
+//! instances spread across the zones it is configured for, so each instance a scale-in
+//! takes is chosen from the zone(s) HOLDING THE MOST of the group's instances — of the
+//! zones that still offer an instance the scale-in may take — and the group's
+//! `TerminationPolicies` then order the candidates WITHIN that zone. The group's spread is
+//! re-read between one victim and the next, so a scale-in of several instances takes them
+//! from the zone that is fullest at that point and leaves the group as balanced as it
+//! found it.
+//!
+//! So selection here is ONE ordered pass narrowed per victim by that spread: the
+//! candidates — the group's instances that are not already on their way out and not
+//! protected from scale-in — are ordered by the FIRST policy the group lists, instances
+//! the first policy cannot tell apart are ordered by the second, and so on; the scale-in
+//! then takes, from the fullest zone that offers one, as many from the front of that order
+//! as it has surplus. This is the one place that order is computed, so every capacity
+//! decrease — `UpdateAutoScalingGroup`, `SetDesiredCapacity`, a policy a caller executed, a
+//! scheduled action, a change the clock made due — selects its victims the same way.
 //!
 //! An instance protected from scale-in is never a candidate, whatever the policies say:
-//! that is what the protection means. A termination a caller asked for BY INSTANCE ID
-//! does not come through here at all — it names what it terminates.
+//! that is what the protection means, and a zone that holds nothing but protected
+//! instances is not the zone a scale-in is taken from however many it holds. A termination
+//! a caller asked for BY INSTANCE ID does not come through here at all — it names what it
+//! terminates.
 //!
 //! # What each policy orders by
 //!
@@ -64,7 +76,7 @@
 //! of the group tied on reaches this fallback.
 
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use super::{StoredGroup, StoredInstance, StoredLaunchConfiguration};
@@ -105,6 +117,12 @@ const BILLING_HOUR: Duration = Duration::from_secs(60 * 60);
 /// The instances a scale-in of `surplus_units` capacity units takes out of `group`, in the
 /// order it takes them.
 ///
+/// Each of them is chosen from the Availability Zone(s) holding the most of the group's
+/// instances, among those that still offer an instance this scale-in may take, and the
+/// group's own `TerminationPolicies` order the candidates within it ([`next_victim`]): the
+/// zone step comes first, so a group spread unevenly over its zones is scaled in from its
+/// fullest zone even where a policy prefers an instance standing in a thinner one.
+///
 /// `surplus_units` is a capacity in the group's own units
 /// ([`StoredGroup::surplus_capacity_units`]), so each candidate covers the units ITS
 /// instance type is weighted at and a scale-in of a weighted group takes fewer instances
@@ -142,21 +160,88 @@ pub fn scale_in_selection(
     {
         order_by(&mut ordered, policy, launch_configurations, now);
     }
+    // How the group is SPREAD over its Availability Zones, which is what narrows the
+    // candidates before the policies order them — and which this selection keeps up to date
+    // as it takes instances, so each victim is chosen from the zone that is fullest at that
+    // point rather than from the zone that was fullest at the start.
+    let mut populations = zone_populations(group);
     // Each instance pays for the units its own type is weighted at, so the surplus is
     // spent down the selection order rather than counted in instances.
     let mut remaining = surplus_units;
     let mut taken: Vec<String> = Vec::new();
-    for instance in ordered {
-        if remaining <= 0 {
+    // What is already spoken for: one instance is never taken twice, and this is also what
+    // bounds the loop — every pass either takes a candidate or finds none left to take.
+    let mut chosen: BTreeSet<&str> = BTreeSet::new();
+    while remaining > 0 {
+        let Some(instance) = next_victim(&ordered, &chosen, &populations, group, remaining)
+        else {
             break;
+        };
+        remaining -= group.instance_capacity_units(instance);
+        if let Some(population) = populations.get_mut(instance.availability_zone.as_str()) {
+            *population = population.saturating_sub(1);
         }
-        let units = group.instance_capacity_units(instance);
-        if units <= remaining {
-            remaining -= units;
-            taken.push(instance.instance_id.clone());
-        }
+        chosen.insert(instance.instance_id.as_str());
+        taken.push(instance.instance_id.clone());
     }
     taken
+}
+
+/// The next instance a scale-in with `remaining` capacity units left to spend takes: the
+/// first in the policies' own order, among the candidates standing in the zone(s) that hold
+/// the most of the group's instances.
+///
+/// The zone step comes FIRST and the policies decide only within it, which is what keeps a
+/// group spread over its zones: the globally preferred instance is passed over while it
+/// stands in a thinner zone than another candidate's. `None` when nothing is left that the
+/// surplus can pay for — an instance worth more units than the surplus has left is passed
+/// over, since a scale-in never takes the group's capacity below what it must fulfil, and a
+/// zone whose only candidates are such instances is not the zone this takes from.
+fn next_victim<'a>(
+    ordered: &[&'a StoredInstance],
+    chosen: &BTreeSet<&str>,
+    populations: &BTreeMap<&str, usize>,
+    group: &StoredGroup,
+    remaining: i32,
+) -> Option<&'a StoredInstance> {
+    let takeable = |instance: &&'a StoredInstance| {
+        !chosen.contains(instance.instance_id.as_str())
+            && group.instance_capacity_units(instance) <= remaining
+    };
+    let fullest = ordered
+        .iter()
+        .copied()
+        .filter(takeable)
+        .map(|instance| population_of(populations, instance))
+        .max()?;
+    ordered
+        .iter()
+        .copied()
+        .find(|instance| takeable(instance) && population_of(populations, instance) == fullest)
+}
+
+/// How many of `group`'s instances stand in each of its Availability Zones.
+///
+/// An instance already on its way out is not one of them — it is leaving the zone — so the
+/// spread this reads is the one the group will HOLD, which is what a scale-in balances.
+fn zone_populations(group: &StoredGroup) -> BTreeMap<&str, usize> {
+    let mut populations: BTreeMap<&str, usize> = BTreeMap::new();
+    for instance in &group.instances {
+        if !instance.is_leaving_group() {
+            *populations
+                .entry(instance.availability_zone.as_str())
+                .or_default() += 1;
+        }
+    }
+    populations
+}
+
+/// How many instances stand in the zone `instance` is in, as the selection has it now.
+fn population_of(populations: &BTreeMap<&str, usize>, instance: &StoredInstance) -> usize {
+    populations
+        .get(instance.availability_zone.as_str())
+        .copied()
+        .unwrap_or_default()
 }
 
 /// The policies of `policies` a selection has to apply, in the order they are listed.

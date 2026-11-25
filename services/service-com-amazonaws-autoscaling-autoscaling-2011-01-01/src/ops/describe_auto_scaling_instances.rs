@@ -3,8 +3,9 @@
 //! @op DescribeAutoScalingInstances
 //!
 //! Reports the Auto Scaling instances of the account and Region: every instance each of
-//! the account's Auto Scaling groups holds, as that group's own view of it, filtered by
-//! the ids the request names and paged with the operation's own `NextToken`.
+//! the account's Auto Scaling groups holds — its own members and the ones its warm pool
+//! holds alike — as that group's own view of it, filtered by the ids the request names and
+//! paged with the operation's own `NextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -234,11 +235,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.materialize_due(&*self.engine, ::std::time::SystemTime::now());
 
-        // Every instance of every group of the account, in group-name order and inside a
-        // group in the order the group reports its own members, so one page of this read
-        // follows the previous one. Iterated LAZILY from the page's own first entry: only
-        // what is served is projected, and one entry past it is looked at to decide
-        // whether a further page exists.
+        // Every Auto Scaling instance of every group of the account, in group-name order and
+        // inside a group its own members first and then the ones its warm pool holds, so one
+        // page of this read follows the previous one. A pooled instance is one of the
+        // account's Auto Scaling instances like any other — the `Warmed:` states this read
+        // publishes for it are in the same value set as `InService`
+        // (`AutoScalingInstanceDetails$LifecycleState`) — so this read is where a client
+        // observes it beside the group's own members. Iterated LAZILY from the page's own
+        // first entry: only what is served is projected, and one entry past it is looked at
+        // to decide whether a further page exists.
         let mut matching = state
             .groups
             .values()
@@ -246,6 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 group
                     .instances
                     .iter()
+                    .chain(group.warm_pool_instances())
                     .map(move |instance| (group, instance))
             })
             .filter(|(_, instance)| {

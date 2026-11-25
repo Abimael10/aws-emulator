@@ -55,6 +55,13 @@
 //! own `InstanceId` instead of a cold launch taking its place — and the pool is left short of
 //! it, so that consumption owes the preparation of its replacement like every other change
 //! that leaves the pool short.
+//!
+//! The move back is the pool's own policy: `InstanceReusePolicy$ReuseOnScaleIn` "specifies
+//! whether instances in the Auto Scaling group can be returned to the warm pool on scale
+//! in", so a pool that carries it takes the instances a scale-in picks BACK instead of
+//! letting them be terminated ([`super::AutoScalingState::reuse_scaled_in_instances`]),
+//! up to what the pool maintains — the rest are terminated, as they are for a pool that
+//! carries no such policy.
 
 use std::time::SystemTime;
 
@@ -62,7 +69,7 @@ use crate::ops::types::{InstanceReusePolicy, WarmPoolConfiguration};
 
 use super::{
     AutoScalingState, GroupLaunch, HeldTransition, LaunchDestination, StoredGroup, StoredInstance,
-    GROUP_STATE_IN_SERVICE, LIFECYCLE_PENDING, LIFECYCLE_TRANSITION,
+    GROUP_STATE_IN_SERVICE, LIFECYCLE_IN_SERVICE, LIFECYCLE_PENDING, LIFECYCLE_TRANSITION,
 };
 
 /// `MinSize` when a request that CREATES a warm pool omits it.
@@ -200,6 +207,13 @@ pub fn warm_pool_launch_description(instance_id: &str) -> String {
 /// The `Activity$Description` a warm-pool termination records, in the same shape.
 pub fn warm_pool_termination_description(instance_id: &str) -> String {
     format!("Terminating EC2 instance in warm pool: {instance_id}")
+}
+
+/// The `Activity$Description` of an instance a scale-in handed back to the pool instead of
+/// terminating it, in that same shape: the step the group took, and the instance it took it
+/// with.
+pub fn warm_pool_return_description(instance_id: &str) -> String {
+    format!("Returning EC2 instance to warm pool: {instance_id}")
 }
 
 /// The `Activity$Description` of a warm-pool launch that FAILED: what the launch set out
@@ -342,6 +356,27 @@ impl StoredWarmPool {
     }
 }
 
+/// Whether an instance of a group is one its warm pool may take BACK on a scale-in: the
+/// pool takes over an instance that is IN SERVICE, so one still coming into service, one a
+/// lifecycle hook is holding mid-transition and one already on its way out are left to be
+/// terminated.
+fn reusable(instance: &StoredInstance) -> bool {
+    instance.lifecycle_state == LIFECYCLE_IN_SERVICE
+        && instance.pending_lifecycle_actions.is_empty()
+        && instance.held_step.is_none()
+}
+
+/// What a scale-in's chosen instances were split into by the group's warm pool: the ones the
+/// pool took back, and the ones that are still to be terminated
+/// ([`AutoScalingState::reuse_scaled_in_instances`]).
+#[derive(Debug, Clone, Default)]
+pub struct ScaleInReuse {
+    /// The instances that moved into the pool, in the order the scale-in picked them.
+    pub returned: Vec<String>,
+    /// The instances the scale-in still takes out of service.
+    pub terminated: Vec<String>,
+}
+
 /// The warm pool members ONE request carries, each `Some` only where the request named
 /// it.
 ///
@@ -400,6 +435,30 @@ impl StoredGroup {
         self.warm_pool
             .as_ref()
             .map_or(0, |pool| pool.target_size(self.desired_capacity, self.max_size))
+    }
+
+    /// Whether this group's warm pool takes the instances a scale-in picks BACK rather than
+    /// letting them be terminated: `InstanceReusePolicy$ReuseOnScaleIn` "specifies whether
+    /// instances in the Auto Scaling group can be returned to the warm pool on scale in".
+    ///
+    /// `false` for a group with no warm pool and for a pool whose policy does not ask for
+    /// it, which is the behaviour of a pool that carries no reuse policy at all.
+    pub fn warm_pool_reuses_on_scale_in(&self) -> bool {
+        self.warm_pool.as_ref().is_some_and(|pool| {
+            pool.instance_reuse_policy
+                .as_ref()
+                .and_then(|policy| policy.reuse_on_scale_in)
+                .unwrap_or(false)
+        })
+    }
+
+    /// How many more instances this group's warm pool can take before it holds everything it
+    /// maintains ([`Self::warm_pool_target_size`]), counted over the instances it holds that
+    /// are not on their way out; 0 for a group with no warm pool and for a pool already at
+    /// its size.
+    pub fn warm_pool_room(&self) -> usize {
+        let held = self.warm_pool.as_ref().map_or(0, StoredWarmPool::live_size);
+        usize::try_from(self.warm_pool_target_size() - held).unwrap_or(0)
     }
 
     /// The instant this group's warm pool owes the preparation of its shortfall at
@@ -638,6 +697,89 @@ impl AutoScalingState {
         super::ec2_instances::set_running(engine, &ids, true, now);
         self.hold_lifecycle_transition(engine, group_name, HeldTransition::Launching, &ids, now);
         ids
+    }
+
+    /// Hand the instances a scale-in picked BACK to `group_name`'s warm pool where that
+    /// pool's own reuse policy asks for it, and answer which of them moved and which are
+    /// still the caller's to terminate.
+    ///
+    /// `InstanceReusePolicy$ReuseOnScaleIn` "specifies whether instances in the Auto Scaling
+    /// group can be returned to the warm pool on scale in", so this is the move a scale-in
+    /// makes INSTEAD of a termination: the instance keeps its own `InstanceId`, leaves the
+    /// group's own members for the pool's, and is reported [`WARMED_PENDING`] until
+    /// [`LIFECYCLE_TRANSITION`] takes it to the pool's own state — the reverse of the move a
+    /// scale-out makes ([`Self::consume_warm_pool`]), and the same span. The pool stops the
+    /// instance where it lives once it settles there, exactly as it does for one it prepared
+    /// itself ([`Self::settle_warm_pool`]).
+    ///
+    /// A pool takes back only what it has ROOM for ([`StoredGroup::warm_pool_room`]): it
+    /// maintains the size the documented rule gives it and no more, so a scale-in of more
+    /// instances than that leaves the rest to be terminated, in the order the scale-in picked
+    /// them. Everything is left to be terminated for a group with no warm pool, for a pool
+    /// whose policy does not ask for the reuse, and for an instance that is not in service —
+    /// one still coming into service, one a lifecycle hook is holding and one already on its
+    /// way out are none of them in the pool's hands.
+    pub(crate) fn reuse_scaled_in_instances(
+        &mut self,
+        group_name: &str,
+        instance_ids: &[String],
+        now: SystemTime,
+    ) -> ScaleInReuse {
+        let terminate_every = || ScaleInReuse {
+            returned: Vec::new(),
+            terminated: instance_ids.to_vec(),
+        };
+        let Some(group) = self.groups.get_mut(group_name) else {
+            return terminate_every();
+        };
+        let room = group.warm_pool_room();
+        if room == 0 || !group.warm_pool_reuses_on_scale_in() {
+            return terminate_every();
+        }
+        // What the pool takes, in the order the scale-in picked them, bounded by the room it
+        // has: the instances beyond that are terminated like every other scale-in's.
+        let returned: Vec<String> = instance_ids
+            .iter()
+            .filter(|instance_id| {
+                group
+                    .instances
+                    .iter()
+                    .any(|instance| instance.instance_id == **instance_id && reusable(instance))
+            })
+            .take(room)
+            .cloned()
+            .collect();
+        let due = now + LIFECYCLE_TRANSITION;
+        let mut moving: Vec<StoredInstance> = Vec::new();
+        let mut kept: Vec<StoredInstance> = Vec::with_capacity(group.instances.len());
+        for mut instance in group.instances.drain(..) {
+            if returned.contains(&instance.instance_id) {
+                instance.lifecycle_state = WARMED_PENDING.to_string();
+                instance.transition_due = Some(due);
+                // An instance out of service owes its group's health check nothing: the
+                // replacement a failed check had coming for it is not owed by a pool.
+                instance.health_check_due = None;
+                moving.push(instance);
+            } else {
+                kept.push(instance);
+            }
+        }
+        group.instances = kept;
+        match group.warm_pool.as_mut() {
+            Some(pool) => pool.instances.extend(moving),
+            // A group with no pool took nothing back above, so there is nothing here to
+            // move; the instances stay the group's rather than being dropped.
+            None => group.instances.extend(moving),
+        }
+        let terminated = instance_ids
+            .iter()
+            .filter(|instance_id| !returned.contains(instance_id))
+            .cloned()
+            .collect();
+        ScaleInReuse {
+            returned,
+            terminated,
+        }
     }
 
     /// Bring every group's warm pool to the size it maintains, and settle the warm-pool
