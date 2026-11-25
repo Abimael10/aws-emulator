@@ -3,27 +3,63 @@
 //! The ROUTE that answers at a domain's announced endpoint.
 //!
 //! A domain reports `domainEndpointUrl` and `customEndpointUrls` for a caller to OPEN, and
-//! this emulator publishes both on its own endpoint
-//! ([`crate::state::domain_endpoint_url`], [`crate::state::custom_endpoint_urls`]). This
-//! module is the other half of those addresses: the claim that says a fetch of one is this
-//! service's to answer, and the answer itself — the page of the stored domain the path names
-//! ([`crate::state::domain_endpoint_page`]), and a not-found page for a path naming a domain
-//! this emulator does not hold.
+//! this emulator announces both as hosts whose leftmost label is the domain's own identity,
+//! under a suffix of its own ([`crate::state::domain_endpoint_url`],
+//! [`crate::state::custom_endpoint_urls`]). This module is the other half of those
+//! addresses: the claim that says a fetch of one is this service's to answer, and the answer
+//! itself — the page of the stored domain the address names
+//! ([`crate::state::domain_endpoint_page`]), and a not-found page for a local path naming a
+//! domain this emulator does not hold.
 //!
 //! The fetch carries no credential and names no modelled operation: a domain endpoint is
 //! opened by whatever browser, probe or test holds the URL, exactly as AWS serves its own
-//! domain host. So the claim is on the PATH this service itself minted, and the answer is a
-//! web page rather than a modelled API envelope.
+//! domain host. So the claim is on the ADDRESS this service itself minted, and the answer is
+//! a web page rather than a modelled API envelope.
+//!
+//! The two addressings are claimed differently, because they say different things. The LOCAL
+//! PATH form is this service's alone — the reserved data-plane namespace and this service's
+//! own plane segment — so a fetch of it is claimed whatever host the client addressed, and a
+//! path naming a domain this emulator does not hold is answered by this service too. An
+//! announced HOST, by contrast, names no service at all: its first label is a resource
+//! identity, and other planes of this emulator announce hosts of the same shape. A fetch of
+//! one is therefore claimed only when THIS emulator holds the domain that label names, so a
+//! host belonging to another plane's resource is left to that plane.
 
 use smithy_server_runtime::http;
 
 /// Whether `parts` addresses a domain endpoint this service publishes, for a request that
 /// resolved no routing key of its own: a `GET` (or the `HEAD` that asks only what is there)
-/// of exactly the path [`crate::state::domain_endpoint_path`] or
-/// [`crate::state::domain_name_endpoint_path`] mints.
-pub fn claimed(parts: &http::request::Parts) -> bool {
-    (parts.method == http::Method::GET || parts.method == http::Method::HEAD)
-        && crate::state::domain_endpoint_route(&parts.uri.to_string()).is_some()
+/// of an address [`crate::state::addressed_domain_endpoint`] reads back — with an announced
+/// HOST claimed only when `engine` holds the domain its first label names (see the module
+/// docs).
+pub fn claimed<Eng: Send + Sync + 'static>(engine: &Eng, parts: &http::request::Parts) -> bool {
+    if parts.method != http::Method::GET && parts.method != http::Method::HEAD {
+        return false;
+    }
+    let uri = parts.uri.to_string();
+    let host = parts
+        .headers
+        .get(http::header::HOST)
+        .and_then(|value| value.to_str().ok());
+    match crate::state::addressed_domain_endpoint(&uri, host) {
+        Some(crate::state::DomainEndpointRoute::ByHostLabel(label)) => holds_domain(
+            engine,
+            crate::state::DomainEndpointRoute::ByHostLabel(label),
+        ),
+        Some(_) => true,
+        None => false,
+    }
+}
+
+/// Whether this emulator holds the domain `route` addresses.
+fn holds_domain<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    route: crate::state::DomainEndpointRoute<'_>,
+) -> bool {
+    crate::state::service_state(engine).is_some_and(|state| {
+        let store = state.lock();
+        store.domain_at_endpoint(route).is_some()
+    })
 }
 
 /// The page a fetch of `req` renders, or `None` when `req` addresses no domain endpoint of
@@ -40,7 +76,7 @@ pub fn answer<Eng: Send + Sync + 'static>(
         "HEAD" => false,
         _ => return None,
     };
-    let route = crate::state::domain_endpoint_route(req.uri())?;
+    let route = crate::state::addressed_domain_endpoint(req.uri(), req.headers().get("host"))?;
     let state = crate::state::service_state(engine)?;
     let page = {
         let store = state.lock();
@@ -49,8 +85,12 @@ pub fn answer<Eng: Send + Sync + 'static>(
             .map(crate::state::domain_endpoint_page)
     };
     // The endpoint of a domain this emulator holds, and a page saying there is none for every
-    // other address of this shape: nothing is invented for a domain that was never created or
-    // whose deletion has completed.
+    // other LOCAL PATH of this shape: nothing is invented for a domain that was never created
+    // or whose deletion has completed. An announced HOST this emulator holds no domain for is
+    // not this service's address at all, so it keeps the answer it would otherwise get.
+    if page.is_none() && matches!(route, crate::state::DomainEndpointRoute::ByHostLabel(_)) {
+        return None;
+    }
     let status = if page.is_some() { 200u16 } else { 404 };
     let document = page.unwrap_or_else(crate::state::domain_endpoint_not_found_page);
     let body = if body_wanted {

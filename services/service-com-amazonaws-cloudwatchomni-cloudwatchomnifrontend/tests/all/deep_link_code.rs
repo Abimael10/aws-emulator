@@ -396,18 +396,26 @@ async fn a_redirect_is_admitted_only_at_the_domains_own_callback() {
     let domain = omni.domain("omni-redirects").await;
     let endpoint = domain.domain_endpoint_url.clone();
     // The address the endpoint is published at, split into the authority a client dials and
-    // the path this emulator serves the domain under: a row that moves the host, the port or
-    // the path builds on these.
+    // the path within that host the endpoint is served at (the host's ROOT, so nothing): a row
+    // that moves the host, the port or the path builds on these.
     let (authority, path) = endpoint
         .strip_prefix("https://")
-        .and_then(|rest| rest.split_once('/'))
-        .map(|(authority, path)| (authority.to_string(), format!("/{path}")))
-        .expect("a domain endpoint is an https URL carrying the domain's own path");
+        .map(|rest| match rest.split_once('/') {
+            Some((authority, within)) => (authority.to_string(), format!("/{within}")),
+            None => (rest.to_string(), String::new()),
+        })
+        .expect("a domain endpoint is an https URL");
     let host = authority
         .split(':')
         .next()
         .expect("an authority names a host")
         .to_string();
+    // The same authority WITHOUT the label that names the domain: this emulator's own address,
+    // which labels no domain at all.
+    let suffix = authority
+        .split_once('.')
+        .map(|(_label, suffix)| suffix.to_string())
+        .expect("an announced authority carries a label in front of its suffix");
     let name_endpoint = domain
         .custom_endpoint_urls
         .clone()
@@ -466,9 +474,9 @@ async fn a_redirect_is_admitted_only_at_the_domains_own_callback() {
             "path must be /auth/callback",
         ),
         (
-            "the callback path outside the domain's own endpoint",
-            format!("https://{authority}{CALLBACK_PATH}"),
-            "path must be /auth/callback",
+            "the callback path at this emulator's own address, which labels no domain",
+            format!("https://{suffix}{CALLBACK_PATH}"),
+            "unrecognized domain",
         ),
         (
             "the callback path with a query string",

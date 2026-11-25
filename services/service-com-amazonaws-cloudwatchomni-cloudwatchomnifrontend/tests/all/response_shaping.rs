@@ -882,15 +882,20 @@ async fn a_resources_own_aggregate_members_are_reported_empty_rather_than_omitte
             "case {case:?}: the reported configuration is {reported:?}"
         );
 
-        // The endpoint URLs a domain publishes are addresses on THIS emulator: the id
-        // addresses one and the name the other, both under the path this emulator serves the
-        // domain at, and neither carrying a region.
+        // The endpoint URLs a domain publishes are addresses on THIS emulator: the id labels
+        // the host of one and the name the host of the other, both under the one suffix this
+        // emulator announces its own names in, and neither carrying a region.
+        let unserved_authority = smithy_server_runtime::UNSERVED_URL_BASE
+            .split_once("://")
+            .map_or(smithy_server_runtime::UNSERVED_URL_BASE, |(_, rest)| rest);
         assert_eq!(
             fetched.domain_endpoint_url,
             format!(
-                "{}{}",
-                smithy_server_runtime::UNSERVED_URL_BASE,
-                omni::state::domain_endpoint_path(&fetched.domain_id)
+                "https://{}",
+                omni::state::announced_endpoint_authority(
+                    unserved_authority,
+                    &fetched.domain_id
+                )
             ),
             "case {case:?}: domainEndpointUrl is {:?}",
             fetched.domain_endpoint_url
@@ -899,9 +904,8 @@ async fn a_resources_own_aggregate_members_are_reported_empty_rather_than_omitte
             fetched.custom_endpoint_urls.as_deref(),
             Some(
                 [format!(
-                    "{}{}",
-                    smithy_server_runtime::UNSERVED_URL_BASE,
-                    omni::state::domain_name_endpoint_path(&name)
+                    "https://{}",
+                    omni::state::announced_endpoint_authority(unserved_authority, &name)
                 )]
                 .as_slice()
             ),

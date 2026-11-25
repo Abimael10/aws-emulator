@@ -5,9 +5,9 @@
 //! `Domain.customEndpointUrls` entry ("Additional endpoint URLs derived from the domain
 //! name").
 //!
-//! The RULE this suite asserts: a URL this service hands a caller to OPEN is rooted on the
-//! `host[:port]` THIS emulator was reached at for the request being answered, with the
-//! identity AWS's own host carries in its leftmost label moved into the path — never a host
+//! The RULE this suite asserts: a URL this service hands a caller to OPEN carries the
+//! resource's identity as its host's LEFTMOST LABEL, under a suffix read off the
+//! `host[:port]` THIS emulator was reached at for the request being answered — never a host
 //! in a zone AWS publishes its own endpoints in, which resolves nowhere near this process.
 //! It follows that
 //!
@@ -48,7 +48,7 @@ use omni::ops::types::{
 use omni::ops::update_domain::UpdateDomain;
 
 /// The region the suite signs for.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The suffix AWS publishes its own CloudWatch Omni domain hosts under, which no value this
 /// emulator announces may name: a client on this machine resolves nothing there, and a
@@ -58,7 +58,7 @@ const AWS_DOMAIN_HOST_SUFFIX: &str = "cloudwatch-omni.global.app.aws";
 /// The request parts a row drives its calls with: a SigV4 credential scope naming this
 /// service and the Region the handlers record, the request target `uri`, and the `Host`
 /// header the client stated, when it stated one.
-fn signed_parts(host: Option<&str>, uri: &str) -> http::request::Parts {
+pub(crate) fn signed_parts(host: Option<&str>, uri: &str) -> http::request::Parts {
     let mut builder = http::Request::builder()
         .method("POST")
         .uri(uri)
@@ -80,18 +80,21 @@ fn signed_parts(host: Option<&str>, uri: &str) -> http::request::Parts {
 }
 
 /// The modelled request target this service's operations are addressed at.
-const MODELLED_TARGET: &str = "/service/CloudWatchOmniFrontend/operation/Unused";
+pub(crate) const MODELLED_TARGET: &str = "/service/CloudWatchOmniFrontend/operation/Unused";
 
 /// One emulator: one shared engine and the service mounted on a router, driven through
 /// whichever request parts a case hands it.
-struct Omni {
+///
+/// Shared with the sibling suites that drive the same addresses
+/// (`crate::domain_endpoint_identity_label`), so one harness stands up one emulator.
+pub(crate) struct Omni {
     engine: Arc<engine::InMemoryEngine>,
     service: omni::EmulatedService<engine::InMemoryEngine>,
     router: MultiServiceRouter,
 }
 
 impl Omni {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -115,7 +118,7 @@ impl Omni {
 
     /// The account's domain, created through the handler that persists it, for a request
     /// carrying `parts`.
-    async fn create_domain(&self, parts: &http::request::Parts, name: &str) -> Domain {
+    pub(crate) async fn create_domain(&self, parts: &http::request::Parts, name: &str) -> Domain {
         CreateDomain::new(Arc::clone(&self.engine))
             .handle(
                 CreateDomainInput {
@@ -131,7 +134,7 @@ impl Omni {
             .domain
     }
 
-    async fn get_domain(&self, parts: &http::request::Parts, domain_id: &str) -> Domain {
+    pub(crate) async fn get_domain(&self, parts: &http::request::Parts, domain_id: &str) -> Domain {
         GetDomain::new(Arc::clone(&self.engine))
             .handle(
                 GetDomainInput {
@@ -144,7 +147,7 @@ impl Omni {
             .domain
     }
 
-    async fn rename_domain(
+    pub(crate) async fn rename_domain(
         &self,
         parts: &http::request::Parts,
         domain_id: &str,
@@ -166,7 +169,7 @@ impl Omni {
 
     /// Dispatch one GET (or HEAD) over HTTP through the router, as a browser holding an
     /// announced endpoint URL would: no credential, and no header naming this service.
-    async fn fetch(&self, method: &str, url: &str) -> (u16, String, String) {
+    pub(crate) async fn fetch(&self, method: &str, url: &str) -> (u16, String, String) {
         let request = http::Request::builder()
             .method(method)
             .uri(url)
@@ -240,12 +243,12 @@ fn unserved_authority() -> String {
         .to_string()
 }
 
-/// Assert that `domain` announces both endpoint members on `authority`, with the domain's id
-/// addressing one and its name the other.
+/// Assert that `domain` announces both endpoint members under the suffix read off
+/// `authority`, with the domain's id labelling one host and its name the other.
 fn assert_announced_on(case: &str, domain: &Domain, authority: &str) {
     let expected_id_endpoint = format!(
-        "https://{authority}{}",
-        omni::state::domain_endpoint_path(&domain.domain_id)
+        "https://{}",
+        omni::state::announced_endpoint_authority(authority, &domain.domain_id)
     );
     assert_eq!(
         domain.domain_endpoint_url, expected_id_endpoint,
@@ -257,8 +260,8 @@ fn assert_announced_on(case: &str, domain: &Domain, authority: &str) {
         .clone()
         .unwrap_or_else(|| panic!("case {case:?}: the created domain reports its name"));
     let expected_custom = vec![format!(
-        "https://{authority}{}",
-        omni::state::domain_name_endpoint_path(&name)
+        "https://{}",
+        omni::state::announced_endpoint_authority(authority, &name)
     )];
     let custom = domain.custom_endpoint_urls.clone().unwrap_or_default();
     assert_eq!(
@@ -424,9 +427,10 @@ async fn a_fetch_of_an_announced_endpoint_reaches_the_stored_domain() {
         .cloned()
         .expect("the create reports an endpoint derived from its name");
 
-    // Rows differ along which announced endpoint is opened and how: the id-addressed URL as
-    // handed out, the name-derived one, the id-addressed path with the trailing slash a
-    // browser normalises a bare address to, and a HEAD that asks only what is there.
+    // Rows differ along which announced endpoint is opened and how: the id-labelled URL as
+    // handed out, the name-labelled one, the id-labelled host with the trailing slash a
+    // browser normalises a bare address to, a HEAD that asks only what is there, and the
+    // local path the same page is also served under for a client that resolves no name.
     for (case, method, url) in [
         (
             "the id-addressed endpoint",
@@ -443,6 +447,22 @@ async fn a_fetch_of_an_announced_endpoint_reaches_the_stored_domain() {
             "a HEAD of the id-addressed endpoint",
             "HEAD",
             created.domain_endpoint_url.clone(),
+        ),
+        (
+            "the local path of the id-addressed endpoint",
+            "GET",
+            format!(
+                "https://127.0.0.1:9297{}",
+                omni::state::domain_endpoint_path(&created.domain_id)
+            ),
+        ),
+        (
+            "the local path of the name-derived endpoint",
+            "GET",
+            format!(
+                "https://127.0.0.1:9297{}",
+                omni::state::domain_name_endpoint_path(&name)
+            ),
         ),
     ] {
         let (status, media_type, body) = omni.fetch(method, &url).await;
@@ -470,19 +490,33 @@ async fn a_fetch_of_an_announced_endpoint_reaches_the_stored_domain() {
     }
 
     // Rows differ along what the address of this shape names: a domain id this emulator holds
-    // nothing under, a domain name it holds nothing under, and the endpoint of a domain whose
-    // deletion has completed — none of which may render a domain.
+    // nothing under and a domain name it holds nothing under — neither of which may render a
+    // domain, at the announced host or at the local path the same page is served under.
     let announced_authority = "127.0.0.1:9297";
     for (case, url) in [
         (
-            "an id this emulator holds no domain under",
+            "an announced host whose label names no domain",
+            format!(
+                "https://{}",
+                omni::state::announced_endpoint_authority(announced_authority, "d-doesnotexist")
+            ),
+        ),
+        (
+            "an announced host whose label names no domain by name",
+            format!(
+                "https://{}",
+                omni::state::announced_endpoint_authority(announced_authority, "omni-nothing")
+            ),
+        ),
+        (
+            "a local path with an id this emulator holds no domain under",
             format!(
                 "https://{announced_authority}{}",
                 omni::state::domain_endpoint_path("d-doesnotexist")
             ),
         ),
         (
-            "a name this emulator holds no domain under",
+            "a local path with a name this emulator holds no domain under",
             format!(
                 "https://{announced_authority}{}",
                 omni::state::domain_name_endpoint_path("omni-nothing")
@@ -500,13 +534,17 @@ async fn a_fetch_of_an_announced_endpoint_reaches_the_stored_domain() {
         );
     }
 
-    // A path BELOW an announced endpoint is not that endpoint: the endpoint is one page
-    // rather than a path space, so nothing there reports the domain.
-    let (_status, _media_type, body) = omni
+    // A path BELOW an announced endpoint is not that endpoint: the endpoint is one page at the
+    // root of its host rather than a path space, so nothing there renders the domain's page.
+    let (status, _media_type, body) = omni
         .fetch("GET", &format!("{}/auth/code", created.domain_endpoint_url))
         .await;
+    assert_ne!(
+        status, 200,
+        "case \"a path below the endpoint\": expected no page, got {status}: {body:?}"
+    );
     assert!(
-        !body.contains(&created.domain_id),
+        !body.contains(REGION),
         "case \"a path below the endpoint\": expected no domain page, got {body:?}"
     );
 }

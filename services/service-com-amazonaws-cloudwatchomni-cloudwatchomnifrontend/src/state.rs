@@ -1630,10 +1630,12 @@ mod deep_link;
 mod domain_endpoint;
 
 pub use domain_endpoint::{
-    announced_authority, announced_domain, custom_endpoint_urls, domain_endpoint_not_found_page,
-    domain_endpoint_page, domain_endpoint_path, domain_endpoint_route, domain_endpoint_url,
-    domain_name_endpoint_path, DomainEndpointRoute, DOMAIN_BY_ID_SEGMENT, DOMAIN_BY_NAME_SEGMENT,
-    DOMAIN_ENDPOINT_MEDIA_TYPE, DOMAIN_PLANE,
+    addressed_domain_endpoint, announced_authority, announced_domain,
+    announced_endpoint_authority, announced_endpoint_url, custom_endpoint_urls,
+    domain_endpoint_host_label, domain_endpoint_not_found_page, domain_endpoint_page,
+    domain_endpoint_path, domain_endpoint_route, domain_endpoint_url, domain_name_endpoint_path,
+    DomainEndpointRoute, DOMAIN_BY_ID_SEGMENT, DOMAIN_BY_NAME_SEGMENT, DOMAIN_ENDPOINT_MEDIA_TYPE,
+    DOMAIN_ENDPOINT_SCHEME, DOMAIN_PLANE,
 };
 
 
