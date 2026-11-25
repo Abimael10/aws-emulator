@@ -1768,25 +1768,35 @@ async fn queue_job_counts_are_derived_from_the_stored_jobs() {
 /// cancelled.
 #[tokio::test]
 async fn a_submitted_job_leaves_submitted_once_the_clock_makes_it_due() {
-    // The span the service ships with is non-zero and inside the window this project
-    // allows for a clock-owed transition, so a caller acting straight after CreateJob
-    // always observes the transient status — and has a window to act inside it.
+    // The span the service ships with is the WHOLE run — from the submit to the status the
+    // run ends in — and it is non-zero and inside the window this project allows for a
+    // clock-owed transition, so a client that submits a job and then waits for its terminal
+    // status waits a deliberate value rather than a multiple of one.
     let shipped = engine::InMemoryEngine::new()
         .state::<service_com_amazonaws_mediaconvert_mediaconvert::ComAmazonawsMediaconvertMediaconvertState>()
         .lock()
         .job_settles_after;
     assert!(
         shipped >= Duration::from_secs(2) && shipped <= Duration::from_secs(5),
-        "the shipped settle span must be a non-zero 2-5s, got {shipped:?}"
+        "the shipped run must reach a terminal status in a non-zero 2-5s, got {shipped:?}"
     );
-    // And the WHOLE run a client waits out is two of those steps — out of `SUBMITTED`, then
-    // on to the status the run ends in — so the end-to-end wait is a deliberate value too
-    // and not a by-product of the per-step one.
-    let whole_run = shipped * 2;
+    // And each of the two steps that run is — out of `SUBMITTED`, then on to the status the
+    // run ends in — is half of it, so a caller acting straight after CreateJob observes
+    // `SUBMITTED` and one acting while the job runs observes `PROGRESSING`, each with a
+    // window to act inside.
+    let step = engine::InMemoryEngine::new()
+        .state::<service_com_amazonaws_mediaconvert_mediaconvert::ComAmazonawsMediaconvertMediaconvertState>()
+        .lock()
+        .job_run_step();
+    assert_eq!(
+        step * 2,
+        shipped,
+        "the two steps of a run must divide the shipped span between them, got {step:?} of \
+         {shipped:?}"
+    );
     assert!(
-        whole_run >= Duration::from_secs(4) && whole_run <= Duration::from_secs(10),
-        "the shipped run must reach a terminal status in 4-10s over its two steps, got \
-         {whole_run:?}"
+        step >= Duration::from_secs(1),
+        "each step of a run must leave a caller a window to act inside, got {step:?}"
     );
 
     let emulator = Emulator::with_settle_span(SHORT_SETTLE);

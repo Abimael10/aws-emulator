@@ -27,7 +27,7 @@
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_mediaconvert_mediaconvert::state::JobClock;
+use service_com_amazonaws_mediaconvert_mediaconvert::state::{JobClock, JobTiming};
 use service_com_amazonaws_mediaconvert_mediaconvert::ComAmazonawsMediaconvertMediaconvertState;
 
 use super::job_lifecycle::{queue_arn, settings as job_settings, Emulator, ROLE};
@@ -57,6 +57,20 @@ fn job_clock(emulator: &Emulator, id: &str) -> JobClock {
         .state::<ComAmazonawsMediaconvertMediaconvertState>()
         .lock()
         .job_clock(id)
+}
+
+/// When the job `id` was submitted, began and finished, as the store the handlers write to
+/// holds those instants — read here rather than off a response, because `Timing`'s projected
+/// members are whole seconds and the instants the clock decides are exact.
+fn timing(emulator: &Emulator, id: &str) -> JobTiming {
+    emulator
+        .engine
+        .state::<ComAmazonawsMediaconvertMediaconvertState>()
+        .lock()
+        .jobs
+        .get(id)
+        .map(|job| job.timing.clone())
+        .unwrap_or_default()
 }
 
 /// Assert that nothing at all is owed from the job `id`: no instant on its record, no entry
@@ -309,6 +323,148 @@ async fn a_job_that_stops_waiting_is_owed_nothing_further() {
     }
 }
 
+/// How the clock divides a job's run: the whole run is owed ONE span from the submit, and
+/// the two steps of that run divide the span between them — so a reader before the first
+/// step observes `SUBMITTED`, a reader between the steps observes `PROGRESSING`, and the run
+/// has ended one span after the submit.
+///
+/// The rule: `JobStatus` is "SUBMITTED, PROGRESSING, COMPLETE, CANCELED, or ERROR" and
+/// `Timing` reports a run's two instants separately ("the time ... that transcoding for the
+/// job began" and "the time ... that the transcoding job finished"), so a run is two steps;
+/// a job is ONE resource rather than a composite that waits for others to be ready, so the
+/// span the clock owes it covers the whole run rather than each step of it. Both halves stay
+/// non-zero, which is what leaves a caller a window to observe — and act inside — each
+/// non-terminal status.
+///
+/// The rows span what the rule generalises over: how long the span is, including one that is
+/// not a whole number of minutes. Nothing here waits on the real clock: no handler sleeps
+/// for a due instant — it is stored — so `advance` hands `settle` the instant a later reader
+/// would arrive at, and each row's assertions are about the stored instants themselves.
+#[tokio::test]
+async fn a_jobs_whole_run_is_owed_one_span_divided_between_its_two_steps() {
+    /// How far either side of a step's own instant a row reads, so a row is never deciding
+    /// on the microseconds between the submit and the clock pass that follows it.
+    const EITHER_SIDE: Duration = Duration::from_secs(1);
+
+    for (case, span) in [
+        ("a two-minute span", 2 * MINUTE),
+        ("a ten-minute span", 10 * MINUTE),
+        ("a span that is not whole minutes", 2 * MINUTE + Duration::from_secs(31)),
+        ("an hour-long span", 60 * MINUTE),
+    ] {
+        let step = span / 2;
+        assert_eq!(
+            step * 2,
+            span,
+            "case {case:?}: the row's own span must divide between the two steps, got \
+             {step:?} of {span:?}"
+        );
+        let emulator = Emulator::with_settle_span(span);
+        seed_queues(&emulator, &[(SOURCE, false)]).await;
+
+        let created = emulator
+            .create_job(json!({
+                "role": ROLE,
+                "queue": SOURCE,
+                "settings": job_settings("s3://example-bucket/in/divided.mp4", "_d"),
+            }))
+            .await;
+        assert_eq!(
+            created.status, 201,
+            "case {case:?}: expected HTTP 201, got {} with body {}",
+            created.status, created.body
+        );
+        let id = created.string("/job/id");
+        // The span is never zero, so the submit itself answers the status a caller acting
+        // straight after it observes.
+        assert_eq!(
+            created.string("/job/status"),
+            "SUBMITTED",
+            "case {case:?}: CreateJob must answer SUBMITTED, got {}",
+            created.body
+        );
+
+        // The submit arms the FIRST step of the run and nothing beyond it: half a span out.
+        let submitted_at = timing(&emulator, &id)
+            .submit_time
+            .unwrap_or_else(|| panic!("case {case:?}: the stored job must carry a submit time"));
+        assert_eq!(
+            job_clock(&emulator, &id).settles_at,
+            Some(submitted_at + step),
+            "case {case:?}: a job must be owed its exit from SUBMITTED half a span out, got \
+             {:?} against a submit at {submitted_at:?}",
+            job_clock(&emulator, &id)
+        );
+
+        // Before that step: still waiting in its queue, and still owed the same instant.
+        advance(&emulator, step - EITHER_SIDE);
+        let waiting = emulator.get_job(&id).await;
+        assert_eq!(
+            waiting.string("/job/status"),
+            "SUBMITTED",
+            "case {case:?}: before its first step the job must still be SUBMITTED, got {}",
+            waiting.body
+        );
+
+        // Past it: the job has BEGUN, at the instant the clock made that step due, and the
+        // end of its run is owed the same step again — one whole span from the submit.
+        advance(&emulator, step + EITHER_SIDE);
+        let begun = emulator.get_job(&id).await;
+        assert_eq!(
+            begun.string("/job/status"),
+            "PROGRESSING",
+            "case {case:?}: a step past the submit the job must be PROGRESSING, got {}",
+            begun.body
+        );
+        assert_eq!(
+            timing(&emulator, &id).start_time,
+            Some(submitted_at + step),
+            "case {case:?}: the run must have begun at the instant the step was due, got {:?}",
+            timing(&emulator, &id)
+        );
+        assert_eq!(
+            job_clock(&emulator, &id).settles_at,
+            Some(submitted_at + span),
+            "case {case:?}: the end of the run must be owed one span from the submit, got \
+             {:?}",
+            job_clock(&emulator, &id)
+        );
+
+        // Before the end of the run, the job is still running: the second step is a step of
+        // its own and not something the first one reached.
+        advance(&emulator, span - EITHER_SIDE);
+        let running = emulator.get_job(&id).await;
+        assert_eq!(
+            running.string("/job/status"),
+            "PROGRESSING",
+            "case {case:?}: before the span is out the job must still be PROGRESSING, got {}",
+            running.body
+        );
+
+        // One span from the submit, the run has ended — in one of the two statuses a run
+        // ends in — at that instant, and nothing further is owed.
+        advance(&emulator, span + EITHER_SIDE);
+        let ended = emulator.get_job(&id).await;
+        let status = ended.string("/job/status");
+        assert!(
+            ["COMPLETE", "ERROR"].contains(&status.as_str()),
+            "case {case:?}: one span from the submit the run must have ended, got {}",
+            ended.body
+        );
+        assert_eq!(
+            timing(&emulator, &id).finish_time,
+            Some(submitted_at + span),
+            "case {case:?}: the run must have ended one span from the submit, got {:?}",
+            timing(&emulator, &id)
+        );
+        assert_nothing_due(
+            case,
+            "once the whole span from its submit has passed",
+            job_clock(&emulator, &id),
+        );
+    }
+}
+
 /// One row of the "a held job is owed no exit from `SUBMITTED`" table.
 struct HeldCase {
     case: &'static str,
@@ -488,13 +644,16 @@ async fn a_job_in_a_paused_queue_is_owed_no_exit_from_submitted() {
 }
 
 /// The one response difference the rule makes: a job its queue was holding waits its WHOLE
-/// span from the moment it reaches a queue that lets it begin, because it was never owed
-/// that exit while it was held — the time its queue spent paused does not count towards it.
+/// run from the moment it reaches a queue that lets it begin, because it was never owed that
+/// exit while it was held — the time its queue spent paused does not count towards it.
 #[tokio::test]
 async fn a_held_job_waits_its_whole_span_from_the_moment_it_can_begin() {
-    // Ten minutes, so the hop (one minute) lands well inside the span and the span's end
-    // can be read on either side of the hop.
+    // Ten minutes, so the hop (one minute) lands well inside the first step of the run and
+    // each step's end can be read on either side of the hop.
     let span = 10 * MINUTE;
+    // What the job is owed its exit from `SUBMITTED` after, once it can begin: half the span
+    // the whole run is owed in, which is how the clock divides a run's two steps.
+    let step = span / 2;
     let emulator = Emulator::with_settle_span(span);
     seed_queues(&emulator, &[("span-paused", true), ("span-active", false)]).await;
 
@@ -531,21 +690,21 @@ async fn a_held_job_waits_its_whole_span_from_the_moment_it_can_begin() {
         hopped.body
     );
 
-    // Past the span counted from the SUBMIT, but not from the hop: the job has not begun,
+    // Past the step counted from the SUBMIT, but not from the hop: the job has not begun,
     // because nothing was ever due from it while its queue held it.
-    advance(&emulator, span + Duration::from_secs(30));
+    advance(&emulator, step + Duration::from_secs(30));
     let waiting = emulator.get_job(&id).await;
     assert_eq!(
         waiting.string("/job/status"),
         "SUBMITTED",
-        "case a job released by a hop: its span runs from the hop, not from the submit, \
+        "case a job released by a hop: its step runs from the hop, not from the submit, \
          got {}",
         waiting.body
     );
 
     // Past BOTH steps of the run counted from the hop — the exit from `SUBMITTED` and the
-    // end of the run, one span each: it has run, and then nothing is due from it.
-    advance(&emulator, MINUTE + span + span + Duration::from_secs(30));
+    // end of the run, half the span each: it has run, and then nothing is due from it.
+    advance(&emulator, MINUTE + span + Duration::from_secs(30));
     let begun = emulator.get_job(&id).await;
     assert_ne!(
         begun.string("/job/status"),

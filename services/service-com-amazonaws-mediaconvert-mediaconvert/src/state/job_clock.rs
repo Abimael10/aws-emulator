@@ -34,8 +34,13 @@
 //!
 //! At most one pump runs per store — the store carries the claim and its generation — it is
 //! bounded by [`MAX_CLOCK_WAKE_UPS`] wake-ups, and it stands down as soon as the store owes
-//! nothing and has nothing queued. With no async runtime to spawn onto there is no pump, and
-//! the transitions are materialised by the next reader instead.
+//! nothing and has nothing queued. The claim is held by a GUARD the pump task owns
+//! ([`PumpClaim`]), so a pump that ends abnormally — the work it drives panics, the task is
+//! aborted, the runtime it was spawned on is dropped — releases the claim exactly as one that
+//! stands down does, and the next door that owes a transition starts a pump of its own. A
+//! claim a vanished pump still held would otherwise stop this store's clock for good, and with
+//! it every event a later job's run would have published. With no async runtime to spawn onto
+//! there is no pump, and the transitions are materialised by the next reader instead.
 
 use ::std::time::{Duration, SystemTime};
 
@@ -147,6 +152,29 @@ impl ComAmazonawsMediaconvertMediaconvertState {
     }
 }
 
+/// The single pump claim of one store, held for as long as the pump task that took it lives.
+///
+/// A pump that stands down releases its claim inside the very critical section that observed
+/// the store owing nothing ([`ComAmazonawsMediaconvertMediaconvertState::next_due_or_release_pump`]),
+/// which is what makes the hand-over to the next door race-free. This guard is the OTHER half
+/// of that rule: it releases the claim however the task ends — including the ends no code path
+/// here reaches, a panic in the work the pump drives, an abort, a runtime dropped out from
+/// under it — so a pump that is gone cannot leave this store's clock claimed by nobody, which
+/// would stop every later job's run and every event that run would have published. Releasing
+/// twice is harmless: a release only clears the claim of its own generation
+/// ([`ComAmazonawsMediaconvertMediaconvertState::release_clock_pump`]), so a claim another door
+/// has taken since is left alone.
+struct PumpClaim {
+    state: ::engine::ServiceState<ComAmazonawsMediaconvertMediaconvertState>,
+    generation: u64,
+}
+
+impl Drop for PumpClaim {
+    fn drop(&mut self) {
+        self.state.lock().release_clock_pump(self.generation);
+    }
+}
+
 /// Start this store's clock pump, unless one is already running.
 ///
 /// Called by the doors that leave the store OWING a job transition — the submit that arms a
@@ -177,6 +205,11 @@ pub fn drive_job_clock<Eng: Send + Sync + 'static>(
     let region = region.to_string();
     let pumped = ::engine::ServiceState::clone(&state);
     let handle = runtime.spawn(async move {
+        // The claim this pump holds, released whenever this task ends ([`PumpClaim`]).
+        let _claim = PumpClaim {
+            state: ::engine::ServiceState::clone(&state),
+            generation,
+        };
         // `true` only if the wake-up cap below is what ended the loop; a pump that ran out
         // of work has already released its claim inside the one critical section that
         // observed it ([`ComAmazonawsMediaconvertMediaconvertState::next_due_or_release_pump`]).

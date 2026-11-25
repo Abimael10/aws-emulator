@@ -57,8 +57,8 @@ const POLL_PAUSE: Duration = Duration::from_millis(20);
 
 /// The span the one case that CANCELS a running job pins.
 ///
-/// Each step of a run is owed this span after the one before it, so a case that has to act
-/// while the job runs waits one span for it to begin and then has another one to act in —
+/// The two steps of a run divide the span between them, so a case that has to act while the
+/// job runs waits half of it for the job to begin and then has the other half to act in —
 /// which is what makes that case about the cancel rather than about how fast the machine
 /// is.
 const CANCELLABLE_SPAN: Duration = Duration::from_secs(5);
@@ -345,8 +345,8 @@ async fn a_due_transition_is_published_with_no_later_mediaconvert_call() {
 #[tokio::test]
 async fn a_cancel_of_a_running_job_publishes_the_status_it_moved_into() {
     let case = "a job cancelled while it was running";
-    // A span wide enough to act inside: the case waits for the job to BEGIN and then has
-    // the same span again before the clock would end the run on its own.
+    // A span wide enough to act inside: the case waits for the job to BEGIN — half the span
+    // out — and then has the other half before the clock would end the run on its own.
     let emulator = Emulator::with_settle_span(CANCELLABLE_SPAN)
         .mount(service_com_amazonaws_eventbridge_awsevents::EmulatedService::new)
         .mount(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new);
@@ -460,6 +460,71 @@ async fn the_clock_moves_a_job_in_the_store_with_no_later_mediaconvert_call() {
             stored_status(&emulator, &held)
         );
     }
+}
+
+/// The clock survives the DEATH of the pump that was driving it: a job submitted after a
+/// pump has gone without standing down still has its run materialised and announced, with no
+/// MediaConvert call after the submit.
+///
+/// The rule: a store's clock pump is a single claim, and the claim belongs to the pump that
+/// holds it — so a pump that ends without standing down must leave it released. A pump can
+/// end that way: the work it drives panics, its task is aborted, or the runtime it was
+/// spawned on goes away. A claim held by a pump that is gone would stop this store's clock
+/// for the life of the process, and with it every event a later job's run would publish —
+/// which is exactly what a client that submits a job and then only listens depends on.
+///
+/// The case takes a pump down the way those ends do, by driving the submit that STARTS it on
+/// a runtime it then drops, and then judges a SECOND job submitted from a fresh one. Nothing
+/// is asserted about the first job: its run may have been claimed by the pump that died, and
+/// what this case is about is the clock being left usable, not that job.
+#[test]
+fn a_pump_that_ended_without_standing_down_leaves_the_clock_usable() {
+    let case = "a pump taken down with the runtime it was spawned on";
+    let emulator = Emulator::with_settle_span(SHORT_SETTLE)
+        .mount(service_com_amazonaws_eventbridge_awsevents::EmulatedService::new)
+        .mount(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new);
+
+    let first = tokio::runtime::Runtime::new().expect("a runtime to drive the first submit on");
+    let url = first.block_on(async {
+        let (url, queue_arn) = given_queue(&emulator, case, "mediaconvert-events").await;
+        let rule = given_rule(
+            &emulator,
+            case,
+            MATCHING_RULE,
+            json!({ "source": [EVENT_SOURCE], "detail-type": [JOB_STATE_CHANGE] }),
+            &queue_arn,
+        )
+        .await;
+        grant_delivery(&emulator, case, &url, &queue_arn, &rule).await;
+        given_job_queue(&emulator, case, SUBJECT_QUEUE, "ACTIVE").await;
+        // The submit that starts this store's pump, on the runtime that is about to go.
+        submit(&emulator, case, SUBJECT_QUEUE, 0).await;
+        url
+    });
+    // And the pump goes with it, without ever standing down.
+    drop(first);
+
+    let second = tokio::runtime::Runtime::new().expect("a runtime to drive the second submit on");
+    second.block_on(async {
+        let subject = submit(&emulator, case, SUBJECT_QUEUE, 1).await;
+        let started = Instant::now();
+        let mut collected: Vec<Value> = Vec::new();
+        loop {
+            // SQS only: not one MediaConvert request is made while waiting, so nothing here
+            // can be what materialised the run.
+            collected.extend(drain(&emulator, case, &url).await);
+            let own = events_for(&collected, &subject);
+            if statuses_of(&own) == RUN {
+                return;
+            }
+            assert!(
+                started.elapsed() < DEADLINE,
+                "case {case:?}: expected the statuses {RUN:?} published for the job {subject} \
+                 submitted after the pump was gone, got {own:?}"
+            );
+            tokio::time::sleep(POLL_PAUSE).await;
+        }
+    });
 }
 
 /// The status the STORE holds for the job `id`.

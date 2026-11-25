@@ -16,6 +16,16 @@
 use super::*;
 
 impl ComAmazonawsMediaconvertMediaconvertState {
+    /// How long ONE step of a job's run is owed after the step before it.
+    ///
+    /// A job's run is two steps ([`Self::settle_job`]) and the clock owes the job the WHOLE
+    /// run one span after the submit ([`Self::job_settles_after`]), so the two steps divide
+    /// that span between them: the job begins halfway through it and the run ends at its
+    /// end. Both halves are non-zero, which is what leaves a caller a window to observe —
+    /// and to act inside — each of the two non-terminal statuses a job passes through.
+    pub fn job_run_step(&self) -> Duration {
+        self.job_settles_after / 2
+    }
     /// Materialise every status change the clock had already made due at `now` — a step of
     /// a job's run (its exit from `SUBMITTED`, or the end of a run already `PROGRESSING`),
     /// a jobs query's completion, a job's share attempt reaching `SHARED` and a job's hop
@@ -112,15 +122,15 @@ impl ComAmazonawsMediaconvertMediaconvertState {
     /// `SUBMITTED`.
     ///
     /// `QueueStatus`: a paused queue's jobs "won't begin". So a job held while its queue
-    /// was paused begins only once the queue is `ACTIVE` again, and the span it then waits
-    /// is the same one every other job waits — the time the queue spent paused does not
-    /// count towards it. Called by `UpdateQueue` when it sets a queue's status to
-    /// `ACTIVE`. Every still-`SUBMITTED` job in the queue is re-armed, including one
-    /// whose own due instant elapsed unobserved during the pause (nothing drained
-    /// `pending` while it was paused), so no job transitions on the first read after the
-    /// unpause on the strength of an instant that passed while it was held.
+    /// was paused begins only once the queue is `ACTIVE` again, and the step it then waits
+    /// is the same one every other job waits ([`Self::job_run_step`]) — the time the queue
+    /// spent paused does not count towards it. Called by `UpdateQueue` when it sets a
+    /// queue's status to `ACTIVE`. Every still-`SUBMITTED` job in the queue is re-armed,
+    /// including one whose own due instant elapsed unobserved during the pause (nothing
+    /// drained `pending` while it was paused), so no job transitions on the first read after
+    /// the unpause on the strength of an instant that passed while it was held.
     pub fn rearm_queue(&mut self, queue_name: &str, now: SystemTime) {
-        let due = now + self.job_settles_after;
+        let due = now + self.job_run_step();
         let waiting: Vec<(String, Option<SystemTime>)> = self
             .jobs
             .values()
@@ -153,9 +163,11 @@ impl ComAmazonawsMediaconvertMediaconvertState {
     /// 2. it ENDS — the run reaches a status nothing further is due from, and that is the
     ///    instant `Timing$FinishTime` carries.
     ///
-    /// Each step is owed the same span after the one before it, so a caller reading between
-    /// them observes the job PROGRESSING, exactly as a caller reading before the first
-    /// observes it `SUBMITTED`. WHICH status the second step reaches is decided by the
+    /// Each step is owed the same step span after the one before it ([`Self::job_run_step`],
+    /// half of the span the whole run is owed in), so a caller reading between them observes
+    /// the job PROGRESSING, exactly as a caller reading before the first observes it
+    /// `SUBMITTED` — and the run as a whole has ended one span after the submit. WHICH
+    /// status the second step reaches is decided by the
     /// job's RUN ([`JobRunRecord`], made while the job is `PROGRESSING`): a run that
     /// produced the outputs the job's settings describe ends it in `COMPLETE`, and a run
     /// that failed, or a job nothing ran at all, ends it in `ERROR` with the reason.
@@ -182,9 +194,9 @@ impl ComAmazonawsMediaconvertMediaconvertState {
         let held = self.jobs.get(id).is_some_and(|job| {
             job.status == JOB_STATUS_SUBMITTED && self.queue_is_paused(&job.queue)
         });
-        // Read before the record is borrowed for writing: the span the finish is owed after
+        // Read before the record is borrowed for writing: the step the finish is owed after
         // is the same one the start was owed after.
-        let settles_after = self.job_settles_after;
+        let settles_after = self.job_run_step();
         let Some(job) = self.jobs.get_mut(id) else {
             return;
         };
@@ -436,7 +448,7 @@ impl ComAmazonawsMediaconvertMediaconvertState {
         let destination_paused = destination
             .as_deref()
             .is_some_and(|name| self.queue_is_paused(name));
-        let settles_after = self.job_settles_after;
+        let settles_after = self.job_run_step();
 
         if !waiting {
             // The job is no longer waiting in a queue, so none of its hop destinations is
@@ -464,7 +476,7 @@ impl ComAmazonawsMediaconvertMediaconvertState {
             }
             // A job held back by a PAUSED queue carries no due instant for its exit from
             // `SUBMITTED`; once it has hopped to a queue that lets it begin, the clock owes
-            // it that exit again, over the same span [`Self::rearm_queue`] gives it.
+            // it that exit again, over the same step [`Self::rearm_queue`] gives it.
             if job.settles_at.is_none() && !destination_paused {
                 let settles_at = due.checked_add(settles_after);
                 job.settles_at = settles_at;

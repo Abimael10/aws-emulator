@@ -524,15 +524,18 @@ pub const MAX_CERTIFICATES: usize = 100;
 /// (an unsigned request to an emulator with authentication switched off).
 const FALLBACK_REGION: &str = "us-east-1";
 
-/// How long after `CreateJob` a job leaves the non-terminal `SUBMITTED` status — and, from
-/// there, how long its run then takes to end.
+/// How long after `CreateJob` a job's RUN has ended — the one span the clock owes a
+/// submitted job, from the submit to the status its run ends in.
 ///
 /// A chosen span, not a documented one: real MediaConvert takes as long as the transcode
-/// takes. It is deliberately non-zero, and long enough to act inside, so a caller acting
-/// immediately after `CreateJob` still observes `SUBMITTED` and the state errors that go
-/// with it, and one acting while the job runs still observes `PROGRESSING`. A job's run is
-/// two steps ([`ComAmazonawsMediaconvertMediaconvertState::settle_job`]), each owed this
-/// span after the one before it.
+/// takes. A job is ONE resource rather than a composite waiting on others to be ready, so
+/// it reaches its terminal status one span after the call that submitted it, and the two
+/// steps of its run ([`ComAmazonawsMediaconvertMediaconvertState::settle_job`]) divide that
+/// span between them ([`ComAmazonawsMediaconvertMediaconvertState::job_run_step`]) rather
+/// than each taking one of its own. It is deliberately non-zero, and so is each of its two
+/// steps, so a caller acting immediately after `CreateJob` still observes `SUBMITTED` and
+/// the state errors that go with it, and one acting while the job runs still observes
+/// `PROGRESSING`.
 const JOB_SETTLES_AFTER: Duration = Duration::from_secs(3);
 
 /// How long after `StartJobsQuery` a jobs query leaves the non-terminal `SUBMITTED`
@@ -3887,12 +3890,14 @@ pub struct ComAmazonawsMediaconvertMediaconvertState {
     job_sequence: u64,
     /// Monotonic suffix source for a minted jobs query id. See `job_sequence`.
     jobs_query_sequence: u64,
-    /// How long after `CreateJob` a job is due to leave `SUBMITTED`.
+    /// How long after `CreateJob` a job's whole run is due to have ended.
     ///
     /// Defaults to [`JOB_SETTLES_AFTER`]. It is a field rather than a constant so a test
     /// can pin the span it needs — a long one to hold a job in `SUBMITTED` for the whole
-    /// case, a short one to observe the transition — instead of racing the real clock.
-    /// Nothing on a request path writes it.
+    /// case, a short one to observe the run — instead of racing the real clock. Each of the
+    /// two steps of a run is owed half of it
+    /// ([`ComAmazonawsMediaconvertMediaconvertState::job_run_step`]). Nothing on a request
+    /// path writes it.
     pub job_settles_after: Duration,
     /// How long after `StartJobsQuery` a jobs query is due to leave `SUBMITTED`.
     ///
@@ -4149,7 +4154,7 @@ impl ComAmazonawsMediaconvertMediaconvertState {
         record.settles_at = if self.queue_is_paused(&record.queue) {
             None
         } else {
-            now.checked_add(self.job_settles_after)
+            now.checked_add(self.job_run_step())
         };
         if let Some(due) = record.settles_at {
             self.pending.insert((due, id.clone()));
