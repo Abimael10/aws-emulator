@@ -98,7 +98,9 @@ async fn an_unmodelled_permission_is_refused_with_the_services_invalid_permissio
     // lower-cased modelled value, a modelled value with trailing whitespace, the empty
     // string), how many of them one request names, which list they sit in, and whether a
     // modelled value sits beside them — the refusal names the rejected values and only
-    // those. The last row is the control: every value it names IS a member of the enum
+    // those. Every modelled value a row names is one the DATABASE the rows address holds,
+    // so no row is refused for anything but its unmodelled values. The last row is the
+    // control: every value it names IS a member of the enum
     // (`smithy_query(query="shape",shape="Permission")`), so it is accepted.
     let cases: Vec<PermissionCase> = vec![
         (
@@ -109,7 +111,7 @@ async fn an_unmodelled_permission_is_refused_with_the_services_invalid_permissio
         ),
         (
             "an invented value beside a modelled one",
-            vec!["SELECT", "SUPER"],
+            vec!["DESCRIBE", "SUPER"],
             vec![],
             Some(vec!["SUPER"]),
         ),
@@ -142,8 +144,8 @@ async fn an_unmodelled_permission_is_refused_with_the_services_invalid_permissio
         ("the empty string", vec![""], vec![], Some(vec![""])),
         (
             "an invented value only in PermissionsWithGrantOption",
-            vec!["SELECT"],
-            vec!["SELECT", "NOSUCHPERMISSION"],
+            vec!["DESCRIBE"],
+            vec!["DESCRIBE", "NOSUCHPERMISSION"],
             Some(vec!["NOSUCHPERMISSION"]),
         ),
         (
@@ -155,8 +157,8 @@ async fn an_unmodelled_permission_is_refused_with_the_services_invalid_permissio
         // The control: only values the enum carries, so nothing is rejected.
         (
             "only modelled values",
-            vec!["SELECT"],
-            vec!["SELECT"],
+            vec!["DESCRIBE"],
+            vec!["DESCRIBE"],
             None,
         ),
     ];

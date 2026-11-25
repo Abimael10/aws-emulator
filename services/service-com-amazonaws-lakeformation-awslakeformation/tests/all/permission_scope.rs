@@ -165,27 +165,33 @@ async fn a_grant_on_an_entity_the_catalog_does_not_hold_is_refused() {
     revoke_default_database_grant(&router, "sales").await;
     revoke_table_default_grants(&router, "sales", "orders").await;
 
-    // The third field is the entity kind the refusal must name: whichever of the two the
-    // catalog could not resolve, the database first.
-    let refused: Vec<(&str, Value, &str)> = vec![
+    // The third field is what the row grants — a permission the kind of resource it names
+    // HOLDS, so each row is refused for the entity it could not resolve and not for the
+    // permission set it asked for — and the fourth the entity kind the refusal must name:
+    // whichever of the two the catalog could not resolve, the database first.
+    let refused: Vec<(&str, Value, Vec<&str>, &str)> = vec![
         (
             "a missing database",
             json!({"Database": {"Name": "absent"}}),
+            vec!["DESCRIBE"],
             "Database",
         ),
         (
             "a missing table in a database that exists",
             json!({"Table": {"DatabaseName": "sales", "Name": "absent"}}),
+            vec!["SELECT"],
             "Table",
         ),
         (
             "a table under a missing database",
             json!({"Table": {"DatabaseName": "absent", "Name": "orders"}}),
+            vec!["SELECT"],
             "Database",
         ),
         (
             "every table of a missing database",
             json!({"Table": {"DatabaseName": "absent", "TableWildcard": {}}}),
+            vec!["SELECT"],
             "Database",
         ),
         (
@@ -197,16 +203,18 @@ async fn a_grant_on_an_entity_the_catalog_does_not_hold_is_refused() {
                     "ColumnWildcard": {}
                 }
             }),
+            vec!["SELECT"],
             "Table",
         ),
         (
             "a missing table with the catalog id named explicitly",
             json!({"Table": {"CatalogId": account(), "DatabaseName": "sales", "Name": "absent"}}),
+            vec!["SELECT"],
             "Table",
         ),
     ];
-    for (case, resource, kind) in refused {
-        let (status, body) = grant(&router, principal, &resource, &["SELECT"]).await;
+    for (case, resource, permissions, kind) in refused {
+        let (status, body) = grant(&router, principal, &resource, &permissions).await;
         assert_eq!(
             status, 400,
             "case {case:?}: expected HTTP 400, got {status} {body}"

@@ -32,6 +32,9 @@ mod creator_table_grants;
 /// `GrantPermissions` and `BatchGrantPermissions` share.
 mod grant_requests;
 mod implicit_table_grants;
+/// WHICH permissions each kind of Lake Formation resource can hold, and the refusal a
+/// grant naming one it cannot draws.
+mod permission_scopes;
 /// What identifies a Lake Formation principal, and the refusal a value that identifies
 /// none draws.
 mod principals;
@@ -47,6 +50,7 @@ mod revoke_requests;
 pub use creator_table_grants::*;
 pub use grant_requests::*;
 pub use implicit_table_grants::*;
+pub use permission_scopes::*;
 pub use principals::*;
 pub use refusals::*;
 pub use reported_grants::*;
@@ -1922,7 +1926,7 @@ pub fn validate_listed_table(table: &TableResource) -> Result<(), String> {
 /// recorded evidence — if `ALL` is ever observed reported at column scope too.
 pub const COLUMN_SCOPED_TABLE_PERMISSIONS: [&str; 1] = ["SELECT"];
 
-/// The permission a grant made DIRECTLY on `TableWithColumns` names that cannot be granted
+/// The permission a REVOKE made DIRECTLY on `TableWithColumns` names that cannot be held
 /// at column scope, as the message for `InvalidInputException` — `None` when every
 /// permission it names can.
 ///
@@ -1930,15 +1934,16 @@ pub const COLUMN_SCOPED_TABLE_PERMISSIONS: [&str; 1] = ["SELECT"];
 /// (`smithy_query(query="doc",shape="TableWithColumnsResource")`), so a request that
 /// addresses columns and asks for a permission that is not column-scoped
 /// ([`COLUMN_SCOPED_TABLE_PERMISSIONS`]) names a scope that permission has no meaning at
-/// and is refused rather than recorded there. This bites only a request that NAMES
-/// `TableWithColumns`: a grant on the table itself is split by
+/// and is refused rather than applied there. This bites only a request that NAMES
+/// `TableWithColumns`: a revoke on the table itself is split by
 /// [`scoped_grant_records`], which is what puts the table-scoped permissions on the table.
 ///
-/// `RevokePermissions` applies it too, so the two write paths agree on what a
-/// column-scoped request may say. The model's sentence is about GRANTING, so the revoke
-/// side is an extension of it rather than a quotation — one that changes no error class:
-/// before it, such a revoke was refused as a permission "the grantee does not have",
-/// which is the same modelled `InvalidInputException`.
+/// The GRANT paths hold a column-scoped request to the same set, as the one instance the
+/// model states of the general rule [`inapplicable_permissions`] carries, and answer the
+/// service's own sentence for an invalid modification. The model's sentence is about
+/// GRANTING, so the revoke side is an extension of it rather than a quotation — one that
+/// changes no error class: before it, such a revoke was refused as a permission "the
+/// grantee does not have", which is the same modelled `InvalidInputException`.
 pub fn column_scope_violation(
     resource: &Resource,
     permissions: &[String],

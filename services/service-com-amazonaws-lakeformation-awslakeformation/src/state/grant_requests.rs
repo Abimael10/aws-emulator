@@ -13,9 +13,11 @@
 //!
 //! 1. every value named is a `Permission` the model carries;
 //! 2. the grantee identifies a Lake Formation principal ([`malformed_principal`]);
-//! 3. at least one permission is named;
+//! 3. at least one permission is named, and the grant option is asked for only on a
+//!    permission the grant grants ([`grant_option_outside_permissions`]);
 //! 4. (the caller's own step, because it is asynchronous) the grantee resolves in IAM;
-//! 5. the `Resource` names exactly one resource, at a scope its permissions apply at;
+//! 5. the `Resource` names exactly one resource, whose kind holds every permission named
+//!    ([`inapplicable_permissions`]);
 //! 6. the Data Catalog holds the entity it names.
 
 use super::*;
@@ -151,6 +153,16 @@ pub fn read_grant_request(
         return Err(NO_PERMISSION_TO_GRANT.to_string());
     }
 
+    // The grant option may only be handed out for a permission the grant itself grants:
+    // `PermissionsWithGrantOption` "may only be a subset of the permissions granted in the
+    // Privileges", so a grant that passes on what it does not grant is not a modification
+    // Lake Formation can make ([`grant_option_outside_permissions`]).
+    if let Some(refusal) =
+        grant_option_outside_permissions(&permissions, &permissions_with_grant_option)
+    {
+        return Err(refusal);
+    }
+
     Ok(GrantRequest {
         principal: identifier.to_string(),
         permissions,
@@ -180,10 +192,13 @@ pub fn plan_grant<Eng: Send + Sync + 'static>(
     };
     validate_resource(resource)?;
 
-    // `TableWithColumnsResource` "is only used when granting a SELECT permission", so a
-    // request that addresses COLUMNS and asks for a permission that is not column-scoped
-    // names a scope that permission has no meaning at.
-    if let Some(violation) = column_scope_violation(
+    // Each member of `Resource` names a different KIND of resource, and only the
+    // privileges that kind has mean anything on it — `TableWithColumnsResource` "is only
+    // used when granting a SELECT permission" is the one the model states outright — so a
+    // grant naming a permission the named kind cannot hold is not a modification Lake
+    // Formation can make and is refused rather than recorded at a scope no read could
+    // honour ([`inapplicable_permissions`]).
+    if let Some(violation) = inapplicable_permissions(
         resource,
         &request.permissions,
         &request.permissions_with_grant_option,

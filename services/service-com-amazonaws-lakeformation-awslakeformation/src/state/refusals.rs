@@ -112,6 +112,13 @@ pub fn permissions_not_held(named: &[String]) -> String {
     )
 }
 
+/// What a grant whose permission set is not one this service can record on the resource it
+/// names answers.
+///
+/// Wholly fixed text: it names neither the grantee, nor the resource, nor the permission
+/// that does not belong there, so the same sentence answers every such grant.
+pub const PERMISSIONS_MODIFICATION_INVALID: &str = "Permissions modification is invalid.";
+
 /// What a create of an LF-tag whose key the Data Catalog already holds answers.
 ///
 /// Wholly fixed text: neither the key nor the catalog is named.

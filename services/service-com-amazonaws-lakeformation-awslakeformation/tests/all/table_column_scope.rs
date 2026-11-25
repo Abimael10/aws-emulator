@@ -188,12 +188,12 @@ fn grant_option_cases() -> Vec<GrantOptionCase> {
             // A database has no column scope, so both lists stay on its one record.
             case: "a database, which has no column scope",
             resource: json!({ "Database": { "Name": "sales" } }),
-            permissions: vec!["SELECT", "DESCRIBE"],
-            with_grant_option: vec!["SELECT"],
+            permissions: vec!["CREATE_TABLE", "DESCRIBE"],
+            with_grant_option: vec!["CREATE_TABLE"],
             expected: vec![(
                 json!({ "Database": { "CatalogId": account_catalog(), "Name": "sales" } }),
-                vec!["SELECT", "DESCRIBE"],
-                vec!["SELECT"],
+                vec!["CREATE_TABLE", "DESCRIBE"],
+                vec!["CREATE_TABLE"],
             )],
         },
     ]

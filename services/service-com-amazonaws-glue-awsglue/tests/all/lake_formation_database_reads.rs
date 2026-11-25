@@ -449,11 +449,11 @@ async fn a_database_read_is_answered_only_where_lake_formation_grants_it() {
             200,
         ),
         (
-            "SELECT on the database, a permission other than DESCRIBE",
+            "CREATE_TABLE on the database, a permission other than DESCRIBE",
             Held::Granted {
                 principal: reader_arn,
                 resource: on_database,
-                permissions: &["SELECT"],
+                permissions: &["CREATE_TABLE"],
             },
             200,
         ),

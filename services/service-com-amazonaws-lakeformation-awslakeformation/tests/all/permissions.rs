@@ -532,21 +532,23 @@ async fn revoking_what_was_never_granted_is_refused_and_changes_nothing() {
 #[tokio::test]
 async fn a_revoke_takes_away_only_what_it_names() {
     // Rows differ along how much of the grant the revoke names: a part, every part (which
-    // drops the record), and the grant-option set alone.
+    // drops the record), and the grant-option set alone. Every row names a permission a
+    // DATABASE holds, so each is about the revoke rather than about what may be granted
+    // there at all.
     let resource = json!({ "Database": { "Name": "sales" } });
     let cases: Vec<PartialRevokeCase> = vec![
         (
             "one of two",
-            vec!["SELECT", "ALTER"],
+            vec!["DESCRIBE", "ALTER"],
             vec![],
-            vec!["SELECT"],
+            vec!["DESCRIBE"],
             Some(vec!["ALTER"]),
         ),
         (
             "both of two",
-            vec!["SELECT", "ALTER"],
+            vec!["DESCRIBE", "ALTER"],
             vec![],
-            vec!["SELECT", "ALTER"],
+            vec!["DESCRIBE", "ALTER"],
             None,
         ),
         (
@@ -558,9 +560,9 @@ async fn a_revoke_takes_away_only_what_it_names() {
         ),
         (
             "leaving the grant option",
-            vec!["SELECT"],
-            vec!["SELECT"],
-            vec!["SELECT"],
+            vec!["DESCRIBE"],
+            vec!["DESCRIBE"],
+            vec!["DESCRIBE"],
             Some(vec![]),
         ),
     ];
@@ -1049,9 +1051,11 @@ async fn a_resource_that_names_no_single_target_is_refused() {
 async fn a_permission_the_model_does_not_carry_is_refused_on_both_write_paths() {
     // One row per class of unmodelled value, plus the accepted control. `Permissions`,
     // `PermissionsWithGrantOption`, and whether the request is expected to be accepted.
+    // Every modelled value a row names is one the DATABASE the rows grant on holds, so a
+    // refused row is refused for the unmodelled value and nothing else.
     let cases: Vec<(&str, Vec<&str>, Vec<&str>, bool)> = vec![
         ("an invented value alone", vec!["NOT_A_PERMISSION"], vec![], false),
-        ("an invented value beside a modelled one", vec!["SELECT", "SUPER"], vec![], false),
+        ("an invented value beside a modelled one", vec!["DESCRIBE", "SUPER"], vec![], false),
         // `Permission`'s values are upper-case (`PERMISSION_VALUES`), so a lower-cased
         // spelling is a different string and not a member of the enum.
         ("a lower-cased modelled value", vec!["select"], vec![], false),
@@ -1059,12 +1063,12 @@ async fn a_permission_the_model_does_not_carry_is_refused_on_both_write_paths() 
         ("the empty string", vec![""], vec![], false),
         (
             "an invented value in PermissionsWithGrantOption",
-            vec!["SELECT"],
-            vec!["SELECT", "NOT_A_PERMISSION"],
+            vec!["DESCRIBE"],
+            vec!["DESCRIBE", "NOT_A_PERMISSION"],
             false,
         ),
         // The control: every value here IS a member of the enum, so this one is recorded.
-        ("only modelled values", vec!["SELECT"], vec!["SELECT"], true),
+        ("only modelled values", vec!["DESCRIBE"], vec!["DESCRIBE"], true),
     ];
 
     let router = emulator_with_catalog().await;
@@ -1121,7 +1125,7 @@ async fn a_permission_the_model_does_not_carry_is_refused_on_both_write_paths() 
         .await;
         let stored: Vec<String> = entries.iter().flat_map(permissions_of).collect();
         let expected: Vec<String> = if accepted {
-            vec!["SELECT".to_string()]
+            vec!["DESCRIBE".to_string()]
         } else {
             Vec::new()
         };
@@ -1132,10 +1136,10 @@ async fn a_permission_the_model_does_not_carry_is_refused_on_both_write_paths() 
     }
 }
 
-/// One grant may name every `Permission` the model admits, and what it records is the SET
-/// of the values it named — so the ceiling on how many DISTINCT permissions one grant can
-/// push into a record is the `Permission` enum's own size, which a request naming only
-/// modelled values can reach but never pass.
+/// One grant may name every permission the resource it addresses can hold, and what it
+/// records is the SET of the values it named — so the ceiling on how many DISTINCT
+/// permissions one grant can push into a record is at most the `Permission` enum's own
+/// size, which no request naming only modelled values can pass.
 ///
 /// `PermissionList` carries no length constraint of its own, so the bound is inherent
 /// rather than enforced: the boundary validator admits only values the `Permission` enum
@@ -1169,8 +1173,16 @@ async fn a_grant_records_the_set_of_the_permissions_it_names_up_to_the_modelled_
         "SUPER_USER",
     ];
 
-    // The ceiling IS the enum's size, so naming every modelled permission at once is
-    // exactly at the bound and no request of modelled values can exceed it.
+    /// Every permission a DATABASE holds — Lake Formation's database-level privileges:
+    /// creating a table in it, altering, dropping and describing the database, and the
+    /// "Super" permission over the whole of it. The other values of `Permission` name a
+    /// privilege a database does not have, and a grant asking for one of those on a
+    /// database is refused (`invalid_permissions_modification.rs`).
+    const ON_A_DATABASE: [&str; 5] = ["ALL", "ALTER", "CREATE_TABLE", "DESCRIBE", "DROP"];
+
+    // The ceiling is the enum's size, which bounds every kind's own set: naming every
+    // permission a database holds is at or under the bound, and no request of modelled
+    // values can pass it.
     assert_eq!(
         MODELLED.len(),
         MAX_PERMISSIONS_PER_GRANT,
@@ -1178,24 +1190,34 @@ async fn a_grant_records_the_set_of_the_permissions_it_names_up_to_the_modelled_
          Permission ({}), got {MAX_PERMISSIONS_PER_GRANT}",
         MODELLED.len()
     );
+    assert!(
+        ON_A_DATABASE.len() <= MAX_PERMISSIONS_PER_GRANT,
+        "case \"the ceiling\": a database holds {} permissions, which must not pass the \
+         ceiling {MAX_PERMISSIONS_PER_GRANT}",
+        ON_A_DATABASE.len()
+    );
 
-    let every_twice: Vec<&str> = MODELLED.iter().chain(MODELLED.iter()).copied().collect();
-    let repeated: Vec<&str> = std::iter::repeat_n("SELECT", 64).collect();
+    let every_twice: Vec<&str> = ON_A_DATABASE
+        .iter()
+        .chain(ON_A_DATABASE.iter())
+        .copied()
+        .collect();
+    let repeated: Vec<&str> = std::iter::repeat_n("DESCRIBE", 64).collect();
     let cases: Vec<(&str, Vec<&str>, Vec<&str>)> = vec![
         (
-            "every modelled permission once",
-            MODELLED.to_vec(),
-            MODELLED.to_vec(),
+            "every permission the resource holds, once",
+            ON_A_DATABASE.to_vec(),
+            ON_A_DATABASE.to_vec(),
         ),
         (
             "one permission named 64 times",
             repeated,
-            vec!["SELECT"],
+            vec!["DESCRIBE"],
         ),
         (
-            "every modelled permission twice",
+            "every permission the resource holds, twice",
             every_twice,
-            MODELLED.to_vec(),
+            ON_A_DATABASE.to_vec(),
         ),
     ];
 

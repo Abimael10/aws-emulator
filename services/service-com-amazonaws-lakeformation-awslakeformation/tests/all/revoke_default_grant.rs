@@ -274,12 +274,12 @@ async fn the_default_grant_and_an_explicit_grant_are_revoked_independently() {
     let grant = json!({
         "Principal": { "DataLakePrincipalIdentifier": IAM_ALLOWED_PRINCIPALS },
         "Resource": resource,
-        "Permissions": ["SELECT"],
+        "Permissions": ["DESCRIBE"],
     });
     let (status, payload) = call(&router, "GrantPermissions", &grant).await;
     assert_eq!(
         status, 200,
-        "case \"grant SELECT explicitly\": expected 200, got {status} {payload:?}"
+        "case \"grant DESCRIBE explicitly\": expected 200, got {status} {payload:?}"
     );
 
     // The default is still there to revoke, and revoking it leaves the explicit grant.
@@ -299,13 +299,13 @@ async fn the_default_grant_and_an_explicit_grant_are_revoked_independently() {
     );
     assert_eq!(
         entries[0].get("Permissions"),
-        Some(&json!(["SELECT"])),
-        "case \"revoke the default, keep the explicit grant\": expected SELECT, got \
+        Some(&json!(["DESCRIBE"])),
+        "case \"revoke the default, keep the explicit grant\": expected DESCRIBE, got \
          {entries:?}"
     );
 
     // And the explicit grant is revoked as usual, which empties the store.
-    let body = revoke_body(IAM_ALLOWED_PRINCIPALS, &resource, &["SELECT"], &[], None);
+    let body = revoke_body(IAM_ALLOWED_PRINCIPALS, &resource, &["DESCRIBE"], &[], None);
     let (status, payload) = call(&router, "RevokePermissions", &body).await;
     assert_eq!(
         status, 200,
@@ -320,7 +320,7 @@ async fn the_default_grant_and_an_explicit_grant_are_revoked_independently() {
     // Neither is revocable twice: the default is remembered as gone, the record is gone.
     for (label, permissions) in [
         ("the default again", vec!["ALL"]),
-        ("the explicit grant again", vec!["SELECT"]),
+        ("the explicit grant again", vec!["DESCRIBE"]),
     ] {
         let body = revoke_body(IAM_ALLOWED_PRINCIPALS, &resource, &permissions, &[], None);
         let (status, payload) = call(&router, "RevokePermissions", &body).await;

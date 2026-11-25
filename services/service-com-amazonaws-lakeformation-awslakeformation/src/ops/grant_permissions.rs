@@ -28,6 +28,14 @@
 //!   so one grant on a table can write two records — the "table and the table w columns"
 //!   pair `ListPermissions$Resource` documents (see
 //!   [`crate::state::scoped_grant_records`]).
+//! * The permissions asked for must be a modification Lake Formation can MAKE. Each member
+//!   of `Resource` names a different kind of resource and `Permission` is one vocabulary
+//!   shared across them all, so a grant naming a permission the named kind does not hold,
+//!   or handing out the grant option for a permission it does not grant, is refused with
+//!   HTTP 400 and the modelled `InvalidInputException` carrying
+//!   [`crate::state::PERMISSIONS_MODIFICATION_INVALID`], with nothing persisted (see
+//!   [`crate::state::inapplicable_permissions`] and
+//!   [`crate::state::grant_option_outside_permissions`]).
 //!
 //! What this handler does NOT model: who may grant. Real Lake Formation requires the
 //! caller to be a data lake administrator, the resource owner, or a holder of the

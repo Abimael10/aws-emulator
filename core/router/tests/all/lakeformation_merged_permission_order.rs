@@ -186,9 +186,9 @@ const ROWS: &[Row] = &[
     Row {
         case: "three permissions written by three calls",
         database: "order_three_calls",
-        granted: &[&["DROP"], &["SELECT"], &["ALTER"]],
-        held: &["DROP", "SELECT", "ALTER"],
-        effective: &["ALL", "SELECT", "ALTER", "DROP"],
+        granted: &[&["DROP"], &["CREATE_TABLE"], &["ALTER"]],
+        held: &["DROP", "CREATE_TABLE", "ALTER"],
+        effective: &["ALL", "ALTER", "DROP", "CREATE_TABLE"],
     },
     Row {
         case: "the permission the group itself holds",

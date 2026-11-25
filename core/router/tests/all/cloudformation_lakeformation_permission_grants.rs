@@ -360,11 +360,11 @@ const ROWS: &[Row] = &[
         permissions: &["CREATE_TABLE", "DESCRIBE"],
         with_grant_option: &["DESCRIBE"],
         // Narrowed AND widened at once, and the grant option withdrawn: `CREATE_TABLE` goes,
-        // `SELECT` arrives, `DESCRIBE` stays and stops being passable onward.
+        // `DROP` arrives, `DESCRIBE` stays and stops being passable onward.
         changed: Some(Changed {
-            permissions: &["DESCRIBE", "SELECT"],
+            permissions: &["DESCRIBE", "DROP"],
             with_grant_option: &[],
-            held: &["DESCRIBE", "SELECT"],
+            held: &["DESCRIBE", "DROP"],
             held_with_grant_option: &[],
         }),
     },
