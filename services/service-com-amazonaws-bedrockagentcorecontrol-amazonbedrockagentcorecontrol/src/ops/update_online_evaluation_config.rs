@@ -198,6 +198,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // A configuration whose accepted deletion the clock has already made due is gone
+        // before this call looks for it, so a change asked of it is the modelled 404.
+        store.expire_deleted_online_evaluation_configs(now);
 
         // Whether this request replays one this token already applied to the configuration the
         // path names: "If this token matches a previous request, the service ignores the
@@ -214,9 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&input.online_evaluation_config_id)
             .ok_or_else(|| {
                 UpdateOnlineEvaluationConfigErrorModeled::ResourceNotFoundException(
-                    crate::state::online_evaluation_config_not_found(
-                        &input.online_evaluation_config_id,
-                    ),
+                    crate::state::online_evaluation_config_not_found(),
                 )
             })?;
 

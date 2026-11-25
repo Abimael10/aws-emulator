@@ -206,6 +206,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // A configuration whose accepted deletion the clock has already made due is gone
+        // before this create looks at the names this account holds, so the name it reserved is
+        // free again.
+        store.expire_deleted_online_evaluation_configs(now);
 
         // A replayed request carrying the same `clientToken` answers with the configuration
         // that token first produced, rather than minting a second one: "If this token matches

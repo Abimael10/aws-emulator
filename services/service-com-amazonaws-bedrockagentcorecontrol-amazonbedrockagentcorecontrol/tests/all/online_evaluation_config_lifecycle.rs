@@ -524,7 +524,7 @@ async fn an_id_naming_no_config_is_not_found() {
         );
         assert_eq!(
             text(&refused, "message"),
-            format!("Online evaluation configuration with ID {id} does not exist"),
+            "Online evaluation configuration not found",
             "case {case:?}: got {refused}"
         );
     }

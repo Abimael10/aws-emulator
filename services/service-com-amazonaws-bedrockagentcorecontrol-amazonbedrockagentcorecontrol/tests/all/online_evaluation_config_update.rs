@@ -600,7 +600,7 @@ async fn an_update_of_an_id_naming_no_config_is_not_found() {
             (
                 404,
                 "ResourceNotFoundException".to_string(),
-                format!("Online evaluation configuration with ID {id} does not exist")
+                "Online evaluation configuration not found".to_string()
             ),
             "case {case:?} ({id}): expected the modelled 404 naming the id, got {status} \
              ({refused})"

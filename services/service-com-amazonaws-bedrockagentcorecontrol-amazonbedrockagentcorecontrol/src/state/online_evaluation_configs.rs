@@ -18,8 +18,9 @@ use super::*;
 
 use crate::ops::types::{
     ClusteringConfig, CreateOnlineEvaluationConfigInput, CreateOnlineEvaluationConfigOutput,
-    DataSourceConfig, EvaluatorReference, GetOnlineEvaluationConfigOutput, Insight, OutputConfig,
-    Rule, UpdateOnlineEvaluationConfigInput, UpdateOnlineEvaluationConfigOutput,
+    DataSourceConfig, DeleteOnlineEvaluationConfigOutput, EvaluatorReference,
+    GetOnlineEvaluationConfigOutput, Insight, OutputConfig, Rule,
+    UpdateOnlineEvaluationConfigInput, UpdateOnlineEvaluationConfigOutput,
 };
 
 /// The ARN resource type an online evaluation configuration carries:
@@ -44,6 +45,7 @@ pub fn online_evaluation_config_arn(region: &str, online_evaluation_config_id: &
 pub const ONLINE_EVALUATION_CONFIG_STATUS_CREATING: &str = "CREATING";
 pub const ONLINE_EVALUATION_CONFIG_STATUS_ACTIVE: &str = "ACTIVE";
 pub const ONLINE_EVALUATION_CONFIG_STATUS_UPDATING: &str = "UPDATING";
+pub const ONLINE_EVALUATION_CONFIG_STATUS_DELETING: &str = "DELETING";
 
 /// `OnlineEvaluationExecutionStatus`'s two values — whether the evaluation this
 /// configuration describes is running (`smithy_query shape=OnlineEvaluationExecutionStatus`).
@@ -51,13 +53,14 @@ pub const ONLINE_EVALUATION_EXECUTION_ENABLED: &str = "ENABLED";
 pub const ONLINE_EVALUATION_EXECUTION_DISABLED: &str = "DISABLED";
 
 /// How long a freshly created online evaluation configuration stays `CREATING` before the
-/// clock owes it `ACTIVE`.
+/// clock owes it `ACTIVE`, and how long one whose deletion was accepted stays readable in
+/// `DELETING` before the clock owes its removal.
 ///
-/// The create is accepted with HTTP 202 and reports a transient status
-/// (`smithy_query operation=CreateOnlineEvaluationConfig`), and AWS documents no duration for
-/// the transition, so the span is chosen: the same one the sibling resources' transitions
-/// take ([`super::REGISTRY_SETTLE_DELAY`]), long enough that a caller acting straight after
-/// the create still observes the transient status.
+/// The create and the delete are each accepted with HTTP 202 and report a transient status
+/// (`smithy_query operation=CreateOnlineEvaluationConfig,DeleteOnlineEvaluationConfig`), and
+/// AWS documents no duration for either transition, so the span is chosen: the same one the
+/// sibling resources' transitions take ([`super::REGISTRY_SETTLE_DELAY`]), long enough that a
+/// caller acting straight after the call still observes the transient status.
 pub const ONLINE_EVALUATION_CONFIG_SETTLE_DELAY: Duration = super::REGISTRY_SETTLE_DELAY;
 
 /// How many online evaluation configurations this emulator will hold.
@@ -92,19 +95,14 @@ pub fn online_evaluation_config_name_conflict() -> ConflictException {
 }
 
 /// The modelled not-found error for an online evaluation configuration this account does not
-/// hold: the identifier the request carried, in the sentence this plane words a missing
-/// configuration with.
+/// hold: the one fixed sentence this family words a missing configuration with.
 ///
-/// The text around the identifier is fixed and the identifier is the caller's own value, so
-/// every operation that resolves a configuration reports a missing one identically.
-pub fn online_evaluation_config_not_found(
-    online_evaluation_config_id: &str,
-) -> ResourceNotFoundException {
+/// The identifier the request named is NOT echoed — it is the caller's own value, and the
+/// remedy does not depend on it — so every operation that resolves a configuration reports a
+/// missing one in exactly these words.
+pub fn online_evaluation_config_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!(
-            "{ONLINE_EVALUATION_CONFIG_LABEL} with ID {online_evaluation_config_id} does not \
-             exist"
-        )),
+        message: Some(format!("{ONLINE_EVALUATION_CONFIG_LABEL} not found")),
     }
 }
 
@@ -168,6 +166,12 @@ pub struct OnlineEvaluationConfigRecord {
     /// The instant the transient status is owed its transition. Stored, never slept on: a
     /// read materialises the transition the clock already made due.
     pub settles_at: SystemTime,
+    /// The instant an accepted deletion removes this record, once
+    /// `DeleteOnlineEvaluationConfig` has accepted one; `None` for a configuration nobody has
+    /// deleted. Stored, never slept on: the removal is the clock's, materialised by
+    /// [`expire_deleted_online_evaluation_configs`](ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState::expire_deleted_online_evaluation_configs)
+    /// on the next call that reads this store.
+    pub removal_due_at: Option<SystemTime>,
 }
 
 impl OnlineEvaluationConfigRecord {
@@ -211,6 +215,7 @@ impl OnlineEvaluationConfigRecord {
             transient_status: ONLINE_EVALUATION_CONFIG_STATUS_CREATING.to_string(),
             settled_status: ONLINE_EVALUATION_CONFIG_STATUS_ACTIVE.to_string(),
             settles_at: now + ONLINE_EVALUATION_CONFIG_SETTLE_DELAY,
+            removal_due_at: None,
         }
     }
 
@@ -222,6 +227,47 @@ impl OnlineEvaluationConfigRecord {
             &self.transient_status
         } else {
             &self.settled_status
+        }
+    }
+
+    /// Whether a deletion has been accepted for this configuration: it reports `DELETING` and
+    /// the clock owes its removal.
+    pub fn is_deleting(&self) -> bool {
+        self.removal_due_at.is_some()
+    }
+
+    /// Accept a deletion at `now`: the configuration reports `DELETING` from this instant on,
+    /// the evaluation it describes is stopped, and the clock owes its removal one settle span
+    /// later.
+    ///
+    /// The deletion "stops any ongoing evaluation processes associated with it"
+    /// (`smithy_query doc shape=DeleteOnlineEvaluationConfig`), so the execution status the
+    /// configuration reports from here on is the stopped one, and an evaluator this
+    /// configuration was evaluating with is no longer in use by it.
+    ///
+    /// Idempotent, as `DeleteOnlineEvaluationConfig` is (`@idempotent`): a repeat while the
+    /// deletion is still under way leaves the record and the instant it is owed alone rather
+    /// than re-arming the clock.
+    pub fn accept_deletion(&mut self, now: SystemTime) {
+        if self.is_deleting() {
+            return;
+        }
+        self.execution_status = ONLINE_EVALUATION_EXECUTION_DISABLED.to_string();
+        self.transient_status = ONLINE_EVALUATION_CONFIG_STATUS_DELETING.to_string();
+        self.settled_status = ONLINE_EVALUATION_CONFIG_STATUS_DELETING.to_string();
+        self.settles_at = now;
+        self.removal_due_at = Some(now + ONLINE_EVALUATION_CONFIG_SETTLE_DELAY);
+        self.updated_at = now;
+    }
+
+    /// This configuration as `DeleteOnlineEvaluationConfig`'s response envelope: the
+    /// configuration the deletion was accepted for and the status it reports from that
+    /// acceptance on.
+    pub fn delete_output(&self, now: SystemTime) -> DeleteOnlineEvaluationConfigOutput {
+        DeleteOnlineEvaluationConfigOutput {
+            online_evaluation_config_arn: self.online_evaluation_config_arn.clone(),
+            online_evaluation_config_id: self.online_evaluation_config_id.clone(),
+            status: self.status_at(now).to_string(),
         }
     }
 
@@ -400,5 +446,28 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
             token_key(operation, &token),
             online_evaluation_config_id.to_string(),
         );
+    }
+
+    /// Remove every online evaluation configuration whose deletion the clock has already made
+    /// due, with the name it reserved.
+    ///
+    /// `DeleteOnlineEvaluationConfig` ACCEPTS the deletion (202) and the configuration reports
+    /// `DELETING` until then; the record itself goes when the span it owes passes, so a caller
+    /// polling it sees `DELETING` and then the modelled 404, and the name it held is free
+    /// again. The removal is owed by the CLOCK — it was due at this instant whether or not
+    /// anybody called — so every operation that reads this store materialises it first, and
+    /// nothing ever sleeps for it.
+    pub fn expire_deleted_online_evaluation_configs(&mut self, now: SystemTime) {
+        let expired: Vec<String> = self
+            .online_evaluation_configs
+            .iter()
+            .filter(|(_, record)| record.removal_due_at.is_some_and(|at| now >= at))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for config_id in expired {
+            if let Some(record) = self.online_evaluation_configs.remove(&config_id) {
+                self.online_evaluation_config_names.remove(&record.name);
+            }
+        }
     }
 }

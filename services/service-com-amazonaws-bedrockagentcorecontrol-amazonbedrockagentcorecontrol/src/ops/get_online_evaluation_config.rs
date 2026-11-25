@@ -186,7 +186,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let now = ::std::time::SystemTime::now();
-        let store = state.lock();
+        let mut store = state.lock();
+        // A configuration whose accepted deletion the clock has already made due is gone
+        // before this read looks for it: the removal was owed at this instant whether or not
+        // anybody called, so the read materialises it rather than reporting a record that
+        // should no longer exist.
+        store.expire_deleted_online_evaluation_configs(now);
 
         // The store is keyed by the `onlineEvaluationConfigId` the create minted; an id
         // naming no stored configuration is the modelled 404 rather than an empty envelope.
@@ -195,9 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.online_evaluation_config_id)
             .ok_or_else(|| {
                 GetOnlineEvaluationConfigErrorModeled::ResourceNotFoundException(
-                    crate::state::online_evaluation_config_not_found(
-                        &input.online_evaluation_config_id,
-                    ),
+                    crate::state::online_evaluation_config_not_found(),
                 )
             })?;
 
