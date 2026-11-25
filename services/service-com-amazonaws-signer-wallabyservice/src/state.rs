@@ -102,6 +102,21 @@ pub const JOB_STATUS_SUCCEEDED: &str = "Succeeded";
 /// [`code_signing::JobOutcome::Failed`]).
 pub const JOB_STATUS_FAILED: &str = "Failed";
 
+/// The `statusReason` a signing job that signed reports.
+///
+/// `statusReason` is "String value that contains the status reason"
+/// (`smithy_query(query="doc", shape="DescribeSigningJobResponse",
+/// member="statusReason")`): a job that reached a TERMINAL status reports why it
+/// is in it, so the member is the explanation of the status and not of a failure
+/// alone — a job that failed reports what stopped it
+/// ([`code_signing::JobOutcome::Failed`]) and a job that signed reports that the
+/// signing finished. The text is recorded behaviour and carries no variable
+/// part: a successful signing has nothing to report about it but the fact.
+///
+/// A job still `InProgress` has reached no status to explain, so it reports no
+/// reason at all.
+pub const JOB_STATUS_REASON_COMPLETED: &str = "Completed signing.";
+
 /// The most signing jobs this store keeps.
 ///
 /// NOT an AWS limit — AWS Signer publishes none — and not a rule a client can
@@ -617,6 +632,9 @@ impl SigningJobRecord {
         {
             code_signing::JobOutcome::Signed(signed_object) => {
                 self.status = JOB_STATUS_SUCCEEDED.to_string();
+                // A terminal job reports the reason for the status it reached,
+                // and a job that signed reports that the signing finished.
+                self.status_reason = Some(JOB_STATUS_REASON_COMPLETED.to_string());
                 self.signed_object = Some(signed_object);
             }
             code_signing::JobOutcome::Failed(reason) => {

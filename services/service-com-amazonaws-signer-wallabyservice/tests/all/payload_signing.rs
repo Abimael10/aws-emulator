@@ -86,6 +86,27 @@ const STATUS_CANCELED: &str = "Canceled";
 /// The status a profile `RevokeSigningProfile` has moved reports.
 const STATUS_REVOKED: &str = "Revoked";
 
+/// The metadata key a payload signature reports its signing job under, spelled
+/// out here rather than imported so the exact key a container-image client reads
+/// is pinned independently of the service's own constant.
+const METADATA_KEY_SIGNING_JOB: &str = "com.amazonaws.signer.signingJob";
+
+/// The metadata key a payload signature reports the signing profile version it
+/// was made under (see [`METADATA_KEY_SIGNING_JOB`]).
+const METADATA_KEY_SIGNING_PROFILE_VERSION: &str = "com.amazonaws.signer.signingProfileVersion";
+
+/// The `statusReason` a signing job that signed reports: AWS's fixed text for a
+/// successfully completed signing job, which carries no variable part.
+const COMPLETED_STATUS_REASON: &str = "Completed signing.";
+
+/// The ARN of the signing job `job_id` names, as this region's endpoint reports
+/// it: a Signer job ARN carries the leading `/` in its resource portion. Built
+/// here rather than read off the service, so an ARN assembled wrongly in the
+/// handler fails this suite.
+fn job_arn(job_id: &str) -> String {
+    format!("arn:aws:signer:{REGION}:{ACCOUNT_ID}:/signing-jobs/{job_id}")
+}
+
 /// Whether `platform_id` names a platform of the payload workflow.
 fn is_payload_platform(platform_id: &str) -> bool {
     platform_id.starts_with(&format!("{PAYLOAD_WORKFLOW_PARTNER}-"))
@@ -502,14 +523,20 @@ async fn an_active_profile_signs_the_payload_it_is_handed() {
             "case {case:?}: expected jobOwner {ACCOUNT_ID}, got {:?}",
             answer.body["jobOwner"]
         );
+        // The metadata a container-image client builds its signature envelope
+        // from: the profile version the signature was made under and the job that
+        // made it, each named by the ARN the revocation read takes it as
+        // (`GetRevocationStatus` takes `profileVersionArn` and `jobArn`).
         assert_eq!(
-            answer.body["metadata"]["jobId"].as_str().unwrap_or_default(),
-            job_id,
+            answer.body["metadata"][METADATA_KEY_SIGNING_JOB]
+                .as_str()
+                .unwrap_or_default(),
+            job_arn(&job_id),
             "case {case:?}: expected the metadata to name the signing job, got {:?}",
             answer.body["metadata"]
         );
         assert_eq!(
-            answer.body["metadata"]["profileVersionArn"]
+            answer.body["metadata"][METADATA_KEY_SIGNING_PROFILE_VERSION]
                 .as_str()
                 .unwrap_or_default(),
             version_arn,
@@ -561,6 +588,18 @@ async fn an_active_profile_signs_the_payload_it_is_handed() {
             platform_id,
             "case {case:?}: expected the job to carry its profile's platform, got {:?}",
             described.body["platformId"]
+        );
+        assert_eq!(
+            described.str_member("platform"),
+            platform_id,
+            "case {case:?}: expected the legacy platform spelling to carry the same id, got {:?}",
+            described.body["platform"]
+        );
+        assert_eq!(
+            described.str_member("statusReason"),
+            COMPLETED_STATUS_REASON,
+            "case {case:?}: expected the terminal job to report why it is Succeeded, got {:?}",
+            described.body["statusReason"]
         );
         assert_eq!(
             described.str_member("profileVersion"),
@@ -832,4 +871,139 @@ async fn the_job_store_keeps_at_most_the_jobs_it_retains() {
         store.jobs.contains_key(&format!("filler-{:08}", MAX_RETAINED_JOBS - 1)),
         "expected the job stored last to be held"
     );
+}
+
+/// A `RevokeSignature` for one job, carrying the owner and a reason.
+async fn revoke_signature(router: &MultiServiceRouter, job_id: &str, reason: &str) -> Answer {
+    call(
+        router,
+        "PUT",
+        &format!("/signing-jobs/{job_id}/revoke"),
+        Some(json!({ "jobOwner": ACCOUNT_ID, "reason": reason })),
+    )
+    .await
+}
+
+/// A read of a payload-signed job reports the platform it ran on — under the
+/// modelled `platformId` and under the legacy `platform` spelling AWS answers
+/// beside it — and the reason for the terminal status it reached, whatever the
+/// read is asked about the signature afterwards.
+///
+/// Rows differ along what the rule generalises over: which profile (so which
+/// profile version) signed, the payload that was signed, and whether the
+/// signature had been revoked before the read — a revocation is a fact about the
+/// signature, so it changes neither the platform the job ran on nor the reason it
+/// completed. Every row reads the job TWICE, so a value that is only computed
+/// once would show up as a second answer that differs from the first.
+#[tokio::test]
+async fn a_payload_signed_job_reports_its_platform_and_its_completion_reason() {
+    let (router, _engine) = emulator();
+    let platform_id = payload_platform();
+
+    // (case, profile name, payload, whether the signature is revoked first)
+    let cases: Vec<(&str, &str, Vec<u8>, bool)> = vec![
+        ("one profile, a trusted signature", "Notation_Job_One", payload_of(32), false),
+        ("another profile, a trusted signature", "Notation_Job_Two", payload_of(4096), false),
+        ("the signature revoked first", "Notation_Job_Three", payload_of(1), true),
+        (
+            "another profile, the signature revoked first",
+            "Notation_Job_Four",
+            payload_of(777),
+            true,
+        ),
+    ];
+
+    for (case, name, payload, revoked) in cases {
+        let put = put_profile(&router, name, platform_id).await;
+        assert_eq!(
+            put.status, 200,
+            "case {case:?}: seeding the profile, got {} {:?}",
+            put.status, put.body
+        );
+        let version_arn = put.str_member("profileVersionArn");
+
+        let signed = sign_payload(&router, sign_request(name, &payload, PAYLOAD_FORMAT)).await;
+        assert_eq!(
+            signed.status, 200,
+            "case {case:?}: expected the payload signed, got {} {:?}",
+            signed.status, signed.body
+        );
+        let job_id = signed.str_member("jobId");
+        // The job the metadata named is the job this reads, named by its ARN.
+        assert_eq!(
+            signed.body["metadata"][METADATA_KEY_SIGNING_JOB]
+                .as_str()
+                .unwrap_or_default(),
+            job_arn(&job_id),
+            "case {case:?}: expected the metadata to name the job by ARN, got {:?}",
+            signed.body["metadata"]
+        );
+        assert_eq!(
+            signed.body["metadata"][METADATA_KEY_SIGNING_PROFILE_VERSION]
+                .as_str()
+                .unwrap_or_default(),
+            version_arn,
+            "case {case:?}: expected the metadata to name this profile's version, got {:?}",
+            signed.body["metadata"]
+        );
+
+        if revoked {
+            let revocation = revoke_signature(&router, &job_id, "the payload was superseded").await;
+            assert!(
+                revocation.status < 300,
+                "case {case:?}: expected the revocation served, got {} {:?}",
+                revocation.status,
+                revocation.body
+            );
+        }
+
+        for ordinal in ["first", "second"] {
+            let read = describe_job(&router, &job_id).await;
+            assert_eq!(
+                read.status, 200,
+                "case {case:?} ({ordinal} read): expected 200, got {} {:?}",
+                read.status, read.body
+            );
+            assert_eq!(
+                read.str_member("platform"),
+                platform_id,
+                "case {case:?} ({ordinal} read): expected the job's platform id, got {:?}",
+                read.body["platform"]
+            );
+            assert_eq!(
+                read.str_member("platform"),
+                read.str_member("platformId"),
+                "case {case:?} ({ordinal} read): expected both spellings to carry one id, got {:?}",
+                read.body
+            );
+            assert_eq!(
+                read.str_member("status"),
+                "Succeeded",
+                "case {case:?} ({ordinal} read): expected Succeeded, got {:?}",
+                read.body["status"]
+            );
+            assert_eq!(
+                read.str_member("statusReason"),
+                COMPLETED_STATUS_REASON,
+                "case {case:?} ({ordinal} read): expected the completion reason, got {:?}",
+                read.body["statusReason"]
+            );
+            assert_eq!(
+                read.body["revocationRecord"].is_null(),
+                !revoked,
+                "case {case:?} ({ordinal} read): expected a revocation record only once revoked, \
+                 got {:?}",
+                read.body["revocationRecord"]
+            );
+            // The profile version the metadata named is this job's own version,
+            // the last segment of that ARN.
+            assert_eq!(
+                version_arn.rsplit('/').next().unwrap_or_default(),
+                read.str_member("profileVersion"),
+                "case {case:?} ({ordinal} read): expected the metadata's profile version to be \
+                 the job's, got {:?}",
+                read.body["profileVersion"]
+            );
+        }
+    }
 }

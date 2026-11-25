@@ -12,10 +12,11 @@
 //!
 //! * A job whose source object Amazon S3 serves as a readable zip archive writes
 //!   the signed artifact at the destination — the destination bucket, under the
-//!   destination prefix, named for the job — and reports `Succeeded` with the
-//!   `signedObject` naming it. An independent `HeadObject` of exactly that
-//!   bucket and key answers 200, and the artifact opens as an archive carrying
-//!   the source's own entries plus the signature envelope.
+//!   destination prefix, named for the job — and reports `Succeeded`, the reason
+//!   for that status, and the `signedObject` naming it. An independent
+//!   `HeadObject` of exactly that bucket and key answers 200, and the artifact
+//!   opens as an archive carrying the source's own entries plus the signature
+//!   envelope.
 //! * A job whose source signs nothing — an object that is not a zip archive, a
 //!   key the bucket holds nothing under, a bucket that does not exist — reports
 //!   `Failed` with a non-empty `statusReason`, reports no `signedObject`, and
@@ -47,6 +48,12 @@ const ACCESS_KEY_ID: &str = "AKIDEXAMPLE";
 
 /// An ACM certificate ARN for `signingMaterial`.
 const CERTIFICATE_ARN: &str = "arn:aws:acm:us-west-2:000000000000:certificate/abc";
+
+/// The `statusReason` a signing job that signed reports: AWS's fixed text for a
+/// successfully completed signing job, which carries no variable part. Spelled
+/// out here rather than imported, so a reason reworded in the service fails this
+/// suite.
+const COMPLETED_STATUS_REASON: &str = "Completed signing.";
 
 /// A published platform of the S3 code-signing-job workflow — the workflow
 /// `StartSigningJob` serves.
@@ -306,6 +313,13 @@ async fn a_signed_job_reports_an_object_that_is_really_at_the_destination() {
             "case {:?}: expected the job to have Succeeded, got {:?}",
             job.case,
             done.body
+        );
+        assert_eq!(
+            done.str_member("statusReason"),
+            COMPLETED_STATUS_REASON,
+            "case {:?}: expected the job to report why it is Succeeded, got {:?}",
+            job.case,
+            done.body["statusReason"]
         );
         let expected_key = format!("{}{job_id}", job.prefix.unwrap_or_default());
         assert_eq!(

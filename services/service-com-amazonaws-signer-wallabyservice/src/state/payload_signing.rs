@@ -72,31 +72,42 @@ pub fn signing_refused_message(profile_name: &str, status: &str) -> String {
     format!("Signing profile with name: {profile_name} is in state {status}")
 }
 
-/// The key the signature's `metadata` reports the signing profile version the
+/// The key the signature's `metadata` reports the signing profile VERSION the
 /// signature was made under.
 ///
 /// `Metadata` is a bare `map<String, String>` the model names no keys of
 /// (`smithy_query(query="shape", shape="Metadata")`) and the member is documented
 /// as "Information including the signing profile ARN and the signing job ID"
 /// (`smithy_query(query="doc", shape="SignPayloadResponse", member="metadata")`),
-/// so each key is spelled the way this service's own members spell the value it
-/// carries.
-pub const METADATA_KEY_PROFILE_VERSION_ARN: &str = "profileVersionArn";
+/// so WHICH keys it carries is recorded behaviour: the entries are the ones the
+/// container-image client this workflow serves copies into the signature envelope
+/// it builds, under the keys that name this service and the member whose value
+/// each one carries.
+///
+/// The ARN is what the key carries, not the bare version: the entries are what a
+/// holder of the signature later asks the revocation read about, and
+/// `GetRevocationStatus` takes the two resources as `profileVersionArn` and
+/// `jobArn`, both targeting `Arn` (`smithy_query(query="operation",
+/// operation="GetRevocationStatus")`). So each entry names its resource the way
+/// the call that consumes it does.
+pub const METADATA_KEY_SIGNING_PROFILE_VERSION: &str =
+    "com.amazonaws.signer.signingProfileVersion";
 
-/// The key the signature's `metadata` reports the signing job under — the `jobId`
-/// the answer carries as a member too, so a client that kept only the metadata map
-/// still has it (see [`METADATA_KEY_PROFILE_VERSION_ARN`]).
-pub const METADATA_KEY_JOB_ID: &str = "jobId";
+/// The key the signature's `metadata` reports the signing job that made it under
+/// — the job the answer also carries as `jobId`, named here by its ARN (see
+/// [`METADATA_KEY_SIGNING_PROFILE_VERSION`]).
+pub const METADATA_KEY_SIGNING_JOB: &str = "com.amazonaws.signer.signingJob";
 
 /// The `metadata` a payload signature is reported with: the profile version it was
-/// made under and the signing job it was made by, both read off the stored job.
-pub fn signature_metadata(profile_version_arn: &str, job_id: &str) -> HashMap<String, String> {
+/// made under and the signing job it was made by, both named by the ARN of the
+/// stored record and read off that record.
+pub fn signature_metadata(profile_version_arn: &str, job_arn: &str) -> HashMap<String, String> {
     HashMap::from([
         (
-            METADATA_KEY_PROFILE_VERSION_ARN.to_string(),
+            METADATA_KEY_SIGNING_PROFILE_VERSION.to_string(),
             profile_version_arn.to_string(),
         ),
-        (METADATA_KEY_JOB_ID.to_string(), job_id.to_string()),
+        (METADATA_KEY_SIGNING_JOB.to_string(), job_arn.to_string()),
     ])
 }
 

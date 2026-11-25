@@ -325,7 +325,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             destination: None,
             signed_object: None,
             status: crate::state::JOB_STATUS_SUCCEEDED.to_string(),
-            status_reason: None,
+            // Terminal and successful by the time this answers, so the job
+            // reports the reason for the status it reached
+            // ([`crate::state::JOB_STATUS_REASON_COMPLETED`]) — the same reason
+            // a code-signing job reports once its own signing finished.
+            status_reason: Some(crate::state::JOB_STATUS_REASON_COMPLETED.to_string()),
             created_at: now,
             completed_at: Some(now),
             completion_due: None,
@@ -354,9 +358,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(SignPayloadOutput {
             job_id: Some(stored.job_id.clone()),
             job_owner: Some(stored.job_owner.clone()),
+            // The profile version the signature was made under and the job that
+            // made it, each named by the ARN the revocation read takes it as
+            // ([`crate::state::payload_signing::signature_metadata`]).
             metadata: Some(crate::state::payload_signing::signature_metadata(
                 &profile_version_arn,
-                &stored.job_id,
+                &stored.arn(),
             )),
             signature: Some(signature),
         })

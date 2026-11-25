@@ -6,6 +6,10 @@
 //! completion the clock owes it — the only write a reporting call makes here, and
 //! one that was due at the same instant whether or not anybody asked.
 //!
+//! Beside the modelled members the answer carries `platform`, which AWS returns
+//! and the model does not declare — see [`DescribeSigningJobOutput`] for why it is
+//! declared by hand.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -234,6 +238,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             signed_object: job.signed_object.clone(),
             signing_material: job.signing_material.clone(),
             platform_id: Some(job.platform_id.clone()),
+            // The legacy spelling of the same id, which AWS answers beside
+            // `platformId` (see [`DescribeSigningJobOutput::platform`]): one
+            // value, read off the job once, so the two members of an answer can
+            // never disagree about the platform the job ran on.
+            platform: Some(job.platform_id.clone()),
             platform_display_name: job.platform_display_name.clone(),
             profile_name: Some(job.profile_name.clone()),
             profile_version: Some(job.profile_version.clone()),
