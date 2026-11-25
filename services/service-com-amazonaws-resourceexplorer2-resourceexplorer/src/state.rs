@@ -905,9 +905,11 @@ impl ComAmazonawsResourceexplorer2ResourceexplorerState {
             owning_account_id: account.clone(),
             region: index.region.clone(),
             service: SERVICE_NAMESPACE.to_string(),
-            resource_type: format!("{SERVICE_NAMESPACE}:index"),
-            // The CloudFormation registry names for this service's resources.
-            cfn_resource_type: Some("AWS::ResourceExplorer2::Index".to_string()),
+            // This service's own two types, read from the one catalogue
+            // (`owners::SUPPORTED_TYPES`) that `ListSupportedResourceTypes` reports, so a
+            // type a query can find is a type the catalogue names.
+            resource_type: owners::OWN_INDEX.resource_type.to_string(),
+            cfn_resource_type: Some(owners::OWN_INDEX.cfn_resource_type.to_string()),
             last_reported_at: index.last_updated_at,
             tags: index.tags.clone(),
         }];
@@ -917,8 +919,8 @@ impl ComAmazonawsResourceexplorer2ResourceexplorerState {
                 owning_account_id: account.clone(),
                 region: view.region.clone(),
                 service: SERVICE_NAMESPACE.to_string(),
-                resource_type: format!("{SERVICE_NAMESPACE}:view"),
-                cfn_resource_type: Some("AWS::ResourceExplorer2::View".to_string()),
+                resource_type: owners::OWN_VIEW.resource_type.to_string(),
+                cfn_resource_type: Some(owners::OWN_VIEW.cfn_resource_type.to_string()),
                 last_reported_at: view.last_updated_at,
                 tags: view.tags.clone(),
             });

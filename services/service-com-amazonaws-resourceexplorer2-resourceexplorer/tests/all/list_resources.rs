@@ -1453,6 +1453,134 @@ async fn list_resources_and_search_report_the_same_index() {
     }
 }
 
+/// RULE: `ListSupportedResourceTypes` publishes the resource types a Region's index can
+/// hold — every type a query can report, each with the owning service and the
+/// CloudFormation type name of that kind — and nothing a query could never report; the
+/// catalogue is a published list, so it is the same whatever the account holds, and it pages
+/// like every other paginated listing of this service.
+///
+/// The rows the catalogue is checked against are the fixture's own indexed resources, read
+/// back through `ListResources`: the two sides are what must agree, so neither is asserted
+/// against a literal list. They span every owning service the index reads — this service's
+/// own index and views, an SQS queue, an SNS topic — and the page sizes span one entry at a
+/// time up to the whole catalogue at once.
+#[tokio::test]
+async fn the_supported_resource_types_are_the_types_a_query_can_report() {
+    let fixture = Fixture::new().await;
+
+    // The catalogue, read one whole page at a time.
+    let whole = fixture
+        .emulator
+        .explorer(REGION, "ListSupportedResourceTypes", json!({}))
+        .await;
+    let case = "the whole catalogue";
+    let published = whole.ok(case)["ResourceTypes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a ResourceTypes list, got {}", whole.body))
+        .clone();
+    assert_eq!(
+        whole.body.get("NextToken"),
+        None,
+        "case {case:?}: a page that carries the whole catalogue resumes nothing, got {}",
+        whole.body
+    );
+
+    // What a query actually reports for each resource the fixture created, which is the
+    // projection the catalogue has to describe.
+    let queried = fixture.emulator.list(REGION, "").await;
+    let reported = queried.resources("every indexed resource");
+    let mut covered = 0usize;
+    for resource in &fixture.indexed() {
+        let case = resource.case;
+        let found = reported
+            .iter()
+            .find(|candidate| candidate["Arn"] == json!(resource.arn))
+            .unwrap_or_else(|| panic!("case {case:?}: {} is not indexed", resource.arn));
+        let entry = published
+            .iter()
+            .find(|candidate| candidate["ResourceType"] == found["ResourceType"])
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: the index reports {} but the catalogue does not publish \
+                     it, got {published:?}",
+                    found["ResourceType"]
+                )
+            });
+        assert_eq!(
+            (&entry["Service"], &entry["CFNResourceTypes"]),
+            (
+                &json!(resource.service),
+                &json!([resource.cfn_resource_type])
+            ),
+            "case {case:?}: expected the owning service and CloudFormation type of this \
+             kind, got {entry}"
+        );
+        covered += 1;
+    }
+    assert_eq!(
+        covered,
+        fixture.indexed().len(),
+        "every indexed resource's type is published"
+    );
+    assert_eq!(
+        published.len(),
+        reported
+            .iter()
+            .map(|resource| resource["ResourceType"].clone().to_string())
+            .collect::<BTreeSet<String>>()
+            .len(),
+        "the catalogue publishes exactly the types a query can report, got {published:?} \
+         against {reported:?}"
+    );
+
+    // The page size cuts the catalogue and the token resumes it, for every size from one
+    // entry to more than the catalogue holds.
+    for size in [1, 2, published.len(), published.len() + 1] {
+        let case = format!("pages of {size}");
+        let mut walked: Vec<Value> = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut request = json!({ "MaxResults": size });
+            if let Some(resume) = &token {
+                request["NextToken"] = json!(resume);
+            }
+            let answer = fixture
+                .emulator
+                .explorer(REGION, "ListSupportedResourceTypes", request)
+                .await;
+            let page = answer.ok(&case)["ResourceTypes"]
+                .as_array()
+                .unwrap_or_else(|| panic!("case {case:?}: expected a ResourceTypes list"))
+                .clone();
+            assert!(
+                page.len() <= size,
+                "case {case:?}: a page holds at most the size asked for, got {}",
+                page.len()
+            );
+            walked.extend(page);
+            token = answer.body["NextToken"].as_str().map(str::to_string);
+            if token.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            walked, published,
+            "case {case:?}: the pages walk the whole catalogue in one order, got {walked:?}"
+        );
+    }
+
+    // A token this listing never issued is refused, not answered with a slice of it.
+    let answer = fixture
+        .emulator
+        .explorer(
+            REGION,
+            "ListSupportedResourceTypes",
+            json!({ "NextToken": "not-a-token-this-listing-issued" }),
+        )
+        .await;
+    answer.failed("a token this listing never issued", 400, "ValidationException");
+}
+
 /// The `Resources` list is a `BTreeMap`-free projection of persisted state, so two reads
 /// of an unchanged index answer identically — a query writes nothing.
 #[tokio::test]

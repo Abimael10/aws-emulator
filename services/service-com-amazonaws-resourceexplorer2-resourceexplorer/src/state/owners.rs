@@ -20,6 +20,12 @@
 //! boundary rather than an AWS rule (AWS indexes the types its "Supported resource
 //! types" list names). Adding a service here is a dependency in `Cargo.toml`, an
 //! [`OwnedType`] per resource type it owns and one block of [`indexed_resources`].
+//!
+//! [`SUPPORTED_TYPES`] is the other side of that boundary: the resource types an index here
+//! can hold at all — the ones below plus this service's own index and view — which is what
+//! `ListSupportedResourceTypes` reports and what a query's `resourcetype:` filter can match.
+//! Both readings come from the same rows, so the catalogue a caller is told about and the
+//! types it can actually find cannot disagree.
 
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -32,18 +38,29 @@ use service_com_amazonaws_sqs_amazonsqs as owner_sqs;
 
 use super::IndexedResource;
 
-/// One resource type an owning service holds, as Resource Explorer names it.
+/// One resource type an index here holds, as Resource Explorer names it.
 #[derive(Debug, Clone, Copy)]
-struct OwnedType {
+pub struct OwnedType {
     /// The `<service>:<type>` key this type is reported and filtered by
     /// (`Resource$ResourceType`), from the Resource Explorer "Supported resource types"
     /// list. Its first segment is the ARN's own service namespace, which is what
     /// `Resource$Service` carries.
-    resource_type: &'static str,
+    pub resource_type: &'static str,
     /// "The CloudFormation resource type identifier for the resource, such as
     /// `AWS::EC2::Instance` or `AWS::S3::Bucket`" (`Resource$CfnResourceType`): the
     /// name this type is registered under in the CloudFormation registry.
-    cfn_resource_type: &'static str,
+    pub cfn_resource_type: &'static str,
+}
+
+impl OwnedType {
+    /// "The Amazon Web Services service that is associated with the resource type"
+    /// (`SupportedResourceType$Service`): the first segment of the `<service>:<type>` key,
+    /// which is the ARN service namespace resources of this type carry.
+    pub fn service(&self) -> &'static str {
+        self.resource_type
+            .split_once(':')
+            .map_or(self.resource_type, |(service, _)| service)
+    }
 }
 
 /// An Amazon SQS queue.
@@ -57,6 +74,27 @@ const SNS_TOPIC: OwnedType = OwnedType {
     resource_type: "sns:topic",
     cfn_resource_type: "AWS::SNS::Topic",
 };
+
+/// A Resource Explorer index — a resource of this service's own namespace, which its own
+/// index holds like any other.
+pub const OWN_INDEX: OwnedType = OwnedType {
+    resource_type: "resource-explorer-2:index",
+    cfn_resource_type: "AWS::ResourceExplorer2::Index",
+};
+
+/// A Resource Explorer view, likewise.
+pub const OWN_VIEW: OwnedType = OwnedType {
+    resource_type: "resource-explorer-2:view",
+    cfn_resource_type: "AWS::ResourceExplorer2::View",
+};
+
+/// Every resource type an index here can hold, which is every type this emulator's
+/// Resource Explorer supports: this service's own two, and one row per type of each owning
+/// service above.
+///
+/// Ordered by the `<service>:<type>` key, so the catalogue a caller pages through is in a
+/// stable order that does not depend on which resources happen to exist.
+pub const SUPPORTED_TYPES: [OwnedType; 4] = [OWN_INDEX, OWN_VIEW, SNS_TOPIC, SQS_QUEUE];
 
 /// Every resource an owning service holds in `region`, in the form the index reports
 /// it.

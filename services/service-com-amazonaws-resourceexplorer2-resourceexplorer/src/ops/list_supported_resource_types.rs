@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSupportedResourceTypes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSupportedResourceTypes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSupportedResourceTypes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the resource types a Region's index can hold — the one catalogue in
+//! [`crate::state::owners::SUPPORTED_TYPES`] that the index itself is built from — one page
+//! at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -161,20 +155,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSupportedResourceTypes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSupportedResourceTypesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSupportedResourceTypes"))
+        // The catalogue is this SERVICE's own constant data, so this handler needs no store:
+        // the engine is bound here only to keep the constructor seam honest.
+        let _ = &self.engine;
+
+        // "The list of resource types supported by Resource Explorer" is a CATALOGUE, not an
+        // inventory: it names the types an index can hold whether or not the account holds a
+        // resource of one. The catalogue read here is the same one
+        // `crate::state::indexed_resources` builds a Region's index from, so a type this
+        // operation publishes is a type a query can actually report.
+        let supported: Vec<SupportedResourceType> = crate::state::owners::SUPPORTED_TYPES
+            .iter()
+            .map(|kind| SupportedResourceType {
+                service: Some(kind.service().to_string()),
+                resource_type: Some(kind.resource_type.to_string()),
+                // "The CloudFormation resource type identifiers for this resource type":
+                // each type here is registered under exactly one.
+                cfn_resource_types: Some(vec![kind.cfn_resource_type.to_string()]),
+            })
+            .collect();
+
+        let (page, next_token) = crate::state::paginate(
+            &supported,
+            Self::NAME,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(|message| {
+            ListSupportedResourceTypesErrorModeled::ValidationException(ValidationException {
+                message,
+                field_list: None,
+            })
+        })?;
+        Ok(ListSupportedResourceTypesOutput {
+            resource_types: Some(page),
+            next_token,
+        })
     }
 }

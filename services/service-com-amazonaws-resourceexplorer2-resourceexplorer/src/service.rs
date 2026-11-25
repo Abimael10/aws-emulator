@@ -63,7 +63,15 @@
 //! (the protocol's deserializer and `constraints::validate`, through
 //! `service_common::validation`), and the envelope and the 400 stay the framework's.
 //!
-//! A rule the model states only in prose is NOT this answer: it is refused by the
+//! ONE class of body refusal is NOT that sentence, and the recorded refusals are what say
+//! so: an operation that validates its own page size refuses one outside the range its
+//! member declares by naming that member, in the modelled `ValidationException`'s `Message`
+//! and in its `FieldList`. Neither a per-operation sentence nor a field list can be stated
+//! through the wording channel below — one is handed the violations alone and the other
+//! carries a code and a message — so [`page_size_refusal`] owns that answer, at the
+//! definition seam where the rendered refusal and the request meet.
+//!
+//! A rule the model states only in prose is NOT this answer either: it is refused by the
 //! operation that owns it, as the modelled `ValidationException` naming what failed (a
 //! filter string carrying free-form text, an index in a state that forbids the call).
 //!
@@ -72,12 +80,15 @@
 //! carries — the `date-time` timestamp form this model declares, and the body member a
 //! failure reports its detail text in.
 
+pub mod page_size_refusal;
 pub mod wire;
 
+use page_size_refusal::PageSizeRefusalDefinition;
 use service_common::front_door::{FrontDoorTable, INVALID_REQUEST_BODY};
 use service_common::validation::SubmittedEcho;
 use smithy_server_runtime::{
-    http, ErasedOperation, OperationRoutingTable, Refusal, Refused, Service, Violation,
+    http, ErasedOperation, ErasedServiceDefinition, OperationRoutingTable, Refusal, Refused,
+    Service, Violation,
 };
 use std::sync::Arc;
 
@@ -92,7 +103,9 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// request.
 ///
 /// The violations are not read: the answer is the same whichever member broke whichever
-/// rule, which is exactly what makes the sentence value-free.
+/// rule, which is exactly what makes the sentence value-free. The one class answered
+/// otherwise is stated where the request is in hand ([`page_size_refusal`]), over the body
+/// this wording renders.
 fn body_wording(_refused: &[(Violation, SubmittedEcho)]) -> Option<Refused> {
     Some(Refused {
         code: VALIDATION_EXCEPTION.to_string(),
@@ -106,7 +119,11 @@ fn body_wording(_refused: &[(Violation, SubmittedEcho)]) -> Option<Refused> {
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    /// The generated definition, wrapped so a refused page size carries the members its
+    /// modelled `ValidationException` declares (see [`page_size_refusal`]). Everything else
+    /// about the entry — identity, the routing table, the protocol, every other rendering —
+    /// is the generated one's, reached through the wrapper.
+    entry: PageSizeRefusalDefinition<crate::ServiceDefinition<Eng>>,
     /// The same modelled operations the generated table holds, each served behind this
     /// service's front door so a request BODY that breaks a modelled rule is refused the
     /// way this service refuses one (see "How a refusal of a request BODY is worded").
@@ -181,7 +198,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             .serve(crate::ops::update_index_type::UpdateIndexType::new(Arc::clone(&engine)))
             .serve(crate::ops::update_view::UpdateView::new(Arc::clone(&engine)));
         Self {
-            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            entry: PageSizeRefusalDefinition::new(crate::ServiceDefinition::new(Arc::clone(
+                &engine,
+            ))),
             front_door: front_door.finish(),
             protocol: wire::ResourceExplorerRestJson::new(),
         }

@@ -20,6 +20,11 @@
 //! one member or one value — while a rule the model states only in prose, and a value the
 //! request carries outside its body, keep the wording that names what failed.
 //!
+//! ONE operation's page size is not that sentence, and the recorded answers are what say so:
+//! an operation that validates its own page size refuses one outside the range its member
+//! declares by naming the member and the bound, in the modelled `ValidationException`'s
+//! `Message` and in its `FieldList`. The last suite below spans both halves of that split.
+//!
 //! Every assertion goes over the wire: the suite mounts this service on a
 //! [`MultiServiceRouter`] over one shared engine and dispatches restJson1 requests at
 //! it, so the status, the `x-amzn-errortype` code and the serialized `Message` member
@@ -519,7 +524,10 @@ fn bad_bodies() -> Vec<BadBody> {
 
     // A page size, for each operation that takes one and each published maximum the model
     // declares — the refused side of both ends of the range, and each end of the member's
-    // own `integer` range, which is as far past the bound as a value can be sent.
+    // own `integer` range, which is as far past the bound as a value can be sent. Every
+    // operation here is one whose page size this service refuses with the fixed sentence;
+    // the operations that validate their own are the subject of
+    // `a_refused_page_size_of_an_operation_that_validates_its_own_names_the_member` below.
     let page_sizes: [(&'static str, Value, i64); 5] = [
         ("ListResources", json!({}), QUERY_MAX_RESULTS_MAX),
         ("Search", json!({ "QueryString": "" }), QUERY_MAX_RESULTS_MAX),
@@ -724,6 +732,174 @@ async fn a_body_outside_the_models_own_rules_is_refused_with_one_fixed_sentence(
     ];
     for (case, operation, body) in served {
         emulator.call(region, operation, body).await.ok(&case);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A page size an operation validates itself names the member and the bound
+// ---------------------------------------------------------------------------
+
+/// The member a page size travels in, spelled the way the model names it — which is the
+/// spelling `ValidationExceptionField$Name` reports
+/// (`smithy_query(query="shape",shape="ListSupportedResourceTypesInput")` -> `MaxResults`).
+const PAGE_SIZE_MEMBER: &str = "MaxResults";
+
+/// The published maximum of `ListSupportedResourceTypesInput$MaxResults`, from the same
+/// query (`range {min: 1, max: 1000}`). Spelled out independently of the crate's own
+/// constants, so a wrong bound in `src/` fails here rather than agreeing with itself.
+const SUPPORTED_TYPES_MAX_RESULTS_MAX: i64 = 1000;
+
+/// One refused page size and the whole answer its operation gives it: the sentence, and the
+/// `ValidationIssue` of the one `FieldList` entry where the operation validates its own page
+/// size — `None` where this service answers its one fixed body sentence instead, which
+/// carries no field list at all.
+struct RefusedPageSize {
+    case: String,
+    operation: &'static str,
+    body: Value,
+    value: i64,
+    message: String,
+    issue: Option<String>,
+}
+
+/// Every refused page size, spanning both halves of the split: the operation whose own
+/// validation refuses it, at both ends of its declared range and at several distances past
+/// each bound, and the operations whose page size this service refuses with its one fixed
+/// sentence, at the same two ends of their own ranges.
+fn refused_page_sizes() -> Vec<RefusedPageSize> {
+    let mut rows = Vec::new();
+    let own = "ListSupportedResourceTypes";
+    for value in [
+        MAX_RESULTS_MIN - 1,
+        -MAX_RESULTS_MIN,
+        -1000,
+        i64::from(i32::MIN),
+    ] {
+        rows.push(RefusedPageSize {
+            case: format!("{own} MaxResults {value}, below its minimum of {MAX_RESULTS_MIN}"),
+            operation: own,
+            body: json!({}),
+            value,
+            message: format!(
+                "{PAGE_SIZE_MEMBER} must be greater than {}.",
+                MAX_RESULTS_MIN - 1
+            ),
+            issue: Some(format!("< {MAX_RESULTS_MIN}")),
+        });
+    }
+    for value in [
+        SUPPORTED_TYPES_MAX_RESULTS_MAX + 1,
+        SUPPORTED_TYPES_MAX_RESULTS_MAX + 1000,
+        i64::from(i32::MAX),
+    ] {
+        rows.push(RefusedPageSize {
+            case: format!(
+                "{own} MaxResults {value}, above its maximum of \
+                 {SUPPORTED_TYPES_MAX_RESULTS_MAX}"
+            ),
+            operation: own,
+            body: json!({}),
+            value,
+            message: format!("{PAGE_SIZE_MEMBER} cannot exceed {SUPPORTED_TYPES_MAX_RESULTS_MAX}."),
+            issue: Some(format!("> {SUPPORTED_TYPES_MAX_RESULTS_MAX}")),
+        });
+    }
+    let fixed_sentence: [(&'static str, Value, i64); 3] = [
+        ("ListResources", json!({}), QUERY_MAX_RESULTS_MAX),
+        ("ListViews", json!({}), VIEWS_MAX_RESULTS_MAX),
+        ("ListIndexes", json!({}), INDEX_MAX_RESULTS_MAX),
+    ];
+    for (operation, base, max) in fixed_sentence {
+        for value in [MAX_RESULTS_MIN - 1, max + 1] {
+            rows.push(RefusedPageSize {
+                case: format!("{operation} MaxResults {value}, outside {MAX_RESULTS_MIN}..={max}"),
+                operation,
+                body: base.clone(),
+                value,
+                message: INVALID_REQUEST_BODY.to_string(),
+                issue: None,
+            });
+        }
+    }
+    rows
+}
+
+/// An operation that validates its own page size refuses one outside the range its member
+/// declares with HTTP 400 and the modelled `ValidationException`, whose `Message` names the
+/// member and the bound the value broke and whose `FieldList` carries one entry naming that
+/// member and that bound — while an operation whose page size this service refuses ahead of
+/// it keeps the one fixed body sentence, and both ends of every declared range are served.
+///
+/// The rows span the two answers, both ends of each declared range, and values at several
+/// distances past each bound down to the ends of the member's own `integer` range, so each
+/// answer is shown to belong to the operation and the bound rather than to one submitted
+/// value. The recorded cases — `ListSupportedResourceTypes` with a page size of 0, and with
+/// one past its maximum — are two rows.
+#[tokio::test]
+async fn a_refused_page_size_of_an_operation_that_validates_its_own_names_the_member() {
+    let emulator = Emulator::new();
+    let region = "us-east-1";
+    // Turning the Region on leaves it an index and a default view, so a row that is NOT
+    // refused for its page size is served rather than refused for want of a view.
+    create_index(&emulator, region, "page-size-bounds").await;
+
+    for row in refused_page_sizes() {
+        let case = &row.case;
+        let mut body = row.body.clone();
+        body["MaxResults"] = json!(row.value);
+        let answer = emulator.call(region, row.operation, body).await;
+        answer.failed(case, 400, "ValidationException");
+        assert_eq!(
+            answer.error_message(),
+            row.message,
+            "case {case:?}: expected the sentence this class fixes, got {}",
+            answer.body
+        );
+        match &row.issue {
+            Some(issue) => assert_eq!(
+                answer.body["FieldList"],
+                json!([{ "Name": PAGE_SIZE_MEMBER, "ValidationIssue": issue }]),
+                "case {case:?}: expected the member at fault and the bound it broke, got {}",
+                answer.body
+            ),
+            None => assert_eq!(
+                answer.body.get("FieldList"),
+                None,
+                "case {case:?}: the fixed sentence names no field at all, got {}",
+                answer.body
+            ),
+        }
+        // A sentence states the bound, never the value submitted — so a value the answer
+        // does carry is one that happens to equal the bound the sentence states.
+        let rendered = answer.body.to_string();
+        let submitted = row.value.to_string();
+        assert!(
+            !rendered.contains(&submitted) || row.message.contains(&submitted),
+            "case {case:?}: the refusal states the bound, never the value submitted, got \
+             {rendered}"
+        );
+    }
+
+    // Both ends of every declared range are INCLUSIVE, so each published bound itself is
+    // served — by the operations whose answer does not depend on state this fixture does not
+    // set up.
+    let served: [(&'static str, Value, i64); 4] = [
+        (
+            "ListSupportedResourceTypes",
+            json!({}),
+            SUPPORTED_TYPES_MAX_RESULTS_MAX,
+        ),
+        ("ListResources", json!({}), QUERY_MAX_RESULTS_MAX),
+        ("ListIndexes", json!({}), INDEX_MAX_RESULTS_MAX),
+        ("ListViews", json!({}), VIEWS_MAX_RESULTS_MAX),
+    ];
+    for (operation, base, max) in served {
+        for value in [MAX_RESULTS_MIN, max] {
+            let case = format!("{operation} MaxResults {value}, inside {MAX_RESULTS_MIN}..={max}");
+            let mut body = base.clone();
+            body["MaxResults"] = json!(value);
+            emulator.call(region, operation, body).await.ok(&case);
+        }
     }
 }
 
