@@ -117,7 +117,9 @@ pub(crate) const AMI: &str = "ami-0123456789abcdef0";
 /// The directory a backend launched by [`serving_user_data`] serves, and the body each
 /// document it holds carries.
 const SERVED_ROOT: &str = "/srv/site";
-const SERVED_BODY: &str = "ok";
+/// The document body a backend launched by [`serving_user_data`] serves, which is what a
+/// client reaches that backend through a load balancer receives.
+pub(crate) const SERVED_BODY: &str = "ok";
 
 /// The user data a launch carries to leave its instance SERVING HTTP on `port`, with a
 /// document at each path of `paths`.
@@ -434,6 +436,121 @@ pub(crate) async fn call_at_version(
             .to_string(),
         body: String::from_utf8(response.body().to_vec()).expect("a UTF-8 XML body"),
     }
+}
+
+/// The emulator with Amazon EC2 beside it, SERVED at `endpoint` — the base URL
+/// `OperationContext::endpoint` reports, which is what a running emulator's data port records
+/// through `EmulatorService::serving_at`.
+///
+/// The address this emulator is reached at is what the zone of every name it announces is read
+/// off (`…::state::announced_zone`), so a suite that varies that address builds its emulator
+/// here. [`emulator_with_ec2`] is the same emulator served on no port at all, which is the
+/// position a host that embeds it in its own process is in.
+pub(crate) fn emulator_with_ec2_served_at(
+    endpoint: &str,
+) -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let (mut router, engine) = emulator_with_ec2();
+    router.set_url_base(
+        smithy_server_runtime::EndpointUrl::parse(endpoint)
+            .unwrap_or_else(|| panic!("{endpoint:?} is an endpoint base URL")),
+    );
+    (router, engine)
+}
+
+/// The `host:port` a client of an UNSERVED emulator dials one load balancer at, read off this
+/// service's own store.
+///
+/// A load balancer publishes a host NAME, served at the endpoint this emulator is reached on;
+/// an emulator served on no endpoint at all gives each load balancer a socket of its own
+/// instead, and this is the address that socket answers at — which only the store knows,
+/// because no response carries a port.
+pub(crate) fn dialled_authority(
+    engine: &Arc<engine::InMemoryEngine>,
+    region: &str,
+    load_balancer_name: &str,
+) -> String {
+    let state = engine.state::<ElbState>();
+    let guard = state.lock();
+    guard
+        .endpoints
+        .get(&(region.to_string(), load_balancer_name.to_string()))
+        .and_then(|endpoint| endpoint.dialled_authority())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            panic!("case {load_balancer_name:?} in {region}: no socket of its own was opened")
+        })
+}
+
+/// RULE: a load balancer publishes its `DNSName` as a HOST NAME — no port and no scheme — in
+/// the shape Elastic Load Balancing's own names carry,
+/// `[internal-]<name>-<10 digits>.<region>.elb.<zone>`, where `zone` is the DNS zone this
+/// emulator may announce a name of its own in: never one AWS serves, and one that resolves to
+/// the interface this emulator is reached on.
+///
+/// Asserted here, once, because every suite that reads a published address reads the same
+/// value: `DNSName` on the create, on every `DescribeLoadBalancers`, and
+/// `CanonicalHostedZoneName` beside it.
+pub(crate) fn assert_published_dns_name(
+    case: &str,
+    dns: &str,
+    region: &str,
+    load_balancer_name: &str,
+    scheme: Option<&str>,
+    zone: &str,
+) {
+    assert!(
+        dns.parse::<std::net::SocketAddr>().is_err() && !dns.contains(':'),
+        "case {case:?}: the published DNSName is a host name a client RESOLVES, so it carries \
+         no port, got {dns:?}"
+    );
+    assert!(
+        !dns.contains('/') && !dns.contains("://"),
+        "case {case:?}: the published DNSName is a host name, not a URL, got {dns:?}"
+    );
+    assert!(
+        dns.bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'.'),
+        "case {case:?}: a DNS name is written in lower-case letters, digits, hyphens and dots, \
+         got {dns:?}"
+    );
+    for suffix in service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES {
+        assert!(
+            !dns.ends_with(suffix),
+            "case {case:?}: the published DNSName must not sit in a zone AWS serves, got \
+             {dns:?}"
+        );
+    }
+    let expected_suffix = format!(".{region}.elb.{zone}");
+    assert!(
+        dns.ends_with(&expected_suffix),
+        "case {case:?}: expected a name under {expected_suffix:?}, got {dns:?}"
+    );
+    let minted = dns
+        .strip_suffix(&expected_suffix)
+        .unwrap_or_else(|| panic!("case {case:?}: {dns:?} has no {expected_suffix:?} suffix"));
+    let internal = scheme == Some("internal");
+    assert_eq!(
+        minted.starts_with("internal-"),
+        internal,
+        "case {case:?}: only an internal load balancer's name carries the internal- prefix, \
+         got {dns:?}"
+    );
+    let minted = match internal {
+        true => minted.strip_prefix("internal-").unwrap_or(minted),
+        false => minted,
+    };
+    let (name, id) = minted
+        .rsplit_once('-')
+        .unwrap_or_else(|| panic!("case {case:?}: {dns:?} carries no generated id"));
+    assert_eq!(
+        name,
+        load_balancer_name.to_ascii_lowercase(),
+        "case {case:?}: the published name carries the load balancer's own name, got {dns:?}"
+    );
+    assert!(
+        id.len() == 10 && id.bytes().all(|byte| byte.is_ascii_digit()),
+        "case {case:?}: the generated id is 10 digits, got {id:?} in {dns:?}"
+    );
 }
 
 /// One form field.

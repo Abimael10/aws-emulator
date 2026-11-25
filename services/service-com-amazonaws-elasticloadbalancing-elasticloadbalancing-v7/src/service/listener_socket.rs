@@ -1,23 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The SOCKET a Classic load balancer's listeners are reached on: the address the load
-//! balancer publishes as its `DNSName`, and the hand-off of every request it accepts to the
-//! data plane ([`super::data_plane`]).
+//! The SOCKET a Classic load balancer of an UNSERVED emulator is dialled at, and the hand-off
+//! of every request it accepts to the data plane ([`super::data_plane`]).
 //!
-//! `CreateAccessPointOutput$DNSName` is "the DNS name of the load balancer" — the address a
-//! CLIENT then dials — so it has to be an address something answers on. A name under
-//! Elastic Load Balancing's own zone resolves to nothing on the machine this emulator runs
-//! on, so a load balancer that published one published an address no client could reach. So
-//! each load balancer gets a socket of the EMULATOR's own, opened through the core
+//! `CreateAccessPointOutput$DNSName` is "the DNS name of the load balancer" — the name a
+//! CLIENT resolves and then sends its traffic to — and what is published is a name served at
+//! the endpoint this emulator is reached on ([`crate::state::LoadBalancerEndpoint`]), not an
+//! address of this emulator's own choosing. An emulator embedded in a host's process is served
+//! on NO endpoint at all, though, and then there is no endpoint for that name to be served at:
+//! such a load balancer is given a socket of its own, opened through the core
 //! (`engine.listeners().tcp_plaintext(..)`, which owns the socket, the bind interface, the
-//! port range and the connection caps), and publishes the `host:port` that socket answers
-//! on ([`crate::state::LoadBalancerEndpoint`]).
+//! port range and the connection caps), which is the one address a client of that emulator can
+//! dial.
 //!
 //! ONE address serves both schemes a Classic load balancer's listeners carry: the first
 //! byte of a connection says whether the client opened with a TLS record or with a request
 //! in the clear ([`::service_common::in_band_tls`]), so an `https://` client of an HTTPS or
-//! SSL listener and an `http://` client of an HTTP or TCP listener dial the same published
-//! address. A TLS connection is handed to the core's own TLS server, which is the only
+//! SSL listener and an `http://` client of an HTTP or TCP listener dial the same address. A
+//! TLS connection is handed to the core's own TLS server, which is the only
 //! thing in this emulator that holds a key: this module touches no certificate and no key
 //! material.
 //!

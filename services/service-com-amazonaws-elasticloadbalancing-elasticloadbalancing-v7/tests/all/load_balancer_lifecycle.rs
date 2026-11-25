@@ -10,15 +10,19 @@
 //! request:
 //!
 //! * `CreateLoadBalancer` persists a record keyed by `LoadBalancerName` and answers a
-//!   `DNSName` — the address this emulator answers that load balancer's traffic on — that
+//!   `DNSName` — the host NAME this emulator serves that load balancer's traffic at — that
 //!   the record keeps for its lifetime, and `CanonicalHostedZoneName`, the Route 53 alias
-//!   target, carries that same address wherever it is reported at all (an `internal` load
+//!   target, carries that same name wherever it is reported at all (an `internal` load
 //!   balancer reports no alias target).
 //! * every later operation computes its answer from that stored record: the describes
 //!   project it, register/deregister mutate it and answer the resulting set, and delete
 //!   removes it.
 
-use super::wire::{call, emulator, kid, kid_text, member_texts, members, param, parse, Element};
+use super::wire::{
+    assert_published_dns_name, call, emulator, kid, kid_text, member_texts, members, param, parse,
+    Element,
+};
+use service_common::data_plane_addressing::LOOPBACK_ZONE;
 
 /// The `InstanceId` of each member of an `Instances` list.
 fn instance_ids(node: &Element) -> Vec<String> {
@@ -153,23 +157,21 @@ const PUBLISHED_HOSTED_ZONE_IDS: &[(&str, &str)] = &[
     ("ap-southeast-2", "Z1GM3OXH4ZPM65"),
 ];
 
-/// The published `DNSName` is the address a CLIENT dials, and the name Elastic Load
-/// Balancing's own zone would give a load balancer resolves to nothing on the machine this
-/// emulator runs on — so what is published is the `host:port` of the socket this emulator
-/// answers that load balancer's traffic on. The alias target reported beside it is the same
-/// address ([`assert_hosted_zone_name`]), and the whole published form is pinned in
-/// `classic_data_plane.rs`.
+/// The published `DNSName` is the host name a CLIENT resolves and then sends its traffic to:
+/// a name in Elastic Load Balancing's own zone resolves to nothing on the machine this
+/// emulator runs on, and an address of this emulator's own choosing is no name at all — so
+/// what is published is a name in the zone of the address this emulator is reached at, served
+/// at that endpoint. The alias target reported beside it is the same name
+/// ([`assert_hosted_zone_name`]), and the whole published form — including how the zone
+/// follows the address this emulator is reached at — is pinned in `classic_data_plane.rs`.
 fn assert_dns_name(case: &Case, dns_name: &str) {
-    assert!(
-        dns_name.parse::<std::net::SocketAddr>().is_ok(),
-        "case {:?}: expected an address a client can dial, got {dns_name:?}",
-        case.name
-    );
-    assert!(
-        !dns_name.contains("elb.amazonaws.com"),
-        "case {:?}: the published address must not be a host in AWS's own zone, got \
-         {dns_name:?}",
-        case.name
+    assert_published_dns_name(
+        case.name,
+        dns_name,
+        case.region,
+        case.name,
+        case.scheme,
+        LOOPBACK_ZONE,
     );
 }
 
@@ -1201,10 +1203,15 @@ async fn a_scope_region_that_names_no_region_is_attributed_to_the_default_region
         );
         let doc = parse(&created.body);
         let dns_name = kid_text(created.result(&doc), "DNSName").unwrap_or_default();
-        assert!(
-            dns_name.parse::<std::net::SocketAddr>().is_ok(),
-            "case {bogus:?}: the published DNSName is the address the emulator answers this \
-             load balancer on, got {dns_name:?}"
+        // The published name is this emulator's own, under the default region a credential
+        // scope naming no region falls back to.
+        assert_published_dns_name(
+            bogus,
+            &dns_name,
+            "us-east-1",
+            "defaulted-elb",
+            None,
+            LOOPBACK_ZONE,
         );
 
         // It landed in the default region's partition, and nowhere else.
@@ -1643,15 +1650,15 @@ impl PublishedAddressCase {
     }
 
     /// The `CanonicalHostedZoneName` this load balancer reports beside a `DNSName` of
-    /// `published`: the same address, and nothing at all for an `internal` load balancer,
+    /// `published`: the same name, and nothing at all for an `internal` load balancer,
     /// which has no alias target to point a Route 53 record at.
     fn expected_alias_target(&self, published: &str) -> Option<String> {
         (self.scheme != Some("internal")).then(|| published.to_string())
     }
 }
 
-/// Both members that report "the DNS name of the load balancer" report the address this
-/// emulator ANSWERS that load balancer's traffic on, and `CanonicalHostedZoneName` — the
+/// Both members that report "the DNS name of the load balancer" report the host NAME this
+/// emulator SERVES that load balancer's traffic at, and `CanonicalHostedZoneName` — the
 /// alias target a Route 53 record points at — is reported only for a load balancer that has
 /// one.
 ///
@@ -1714,16 +1721,13 @@ async fn published_dns_names_are_served_addresses_and_carry_an_alias_target_only
         );
         let created_doc = parse(&created.body);
         let published = kid_text(created.result(&created_doc), "DNSName").unwrap_or_default();
-        assert!(
-            published.parse::<std::net::SocketAddr>().is_ok(),
-            "case {:?}: expected an address a client can dial, got {published:?}",
-            case.what
-        );
-        assert!(
-            !published.contains("elb.amazonaws.com"),
-            "case {:?}: the published address must not be a host in AWS's own zone, got \
-             {published:?}",
-            case.what
+        assert_published_dns_name(
+            case.what,
+            &published,
+            case.region,
+            case.name,
+            case.scheme,
+            LOOPBACK_ZONE,
         );
 
         let reads: [(&str, Vec<(String, String)>); 2] = [

@@ -5,12 +5,12 @@
 //!
 //! A load balancer publishes the address a client sends traffic to —
 //! `CreateAccessPointOutput$DNSName`, "the DNS name of the load balancer", reported again on
-//! every `LoadBalancerDescription` — and that address is NOT this API's endpoint: its first
-//! label names no service, so the emulator's front door can resolve no target service from
-//! such a request and answered `404 UnknownService` for the one address this service told
-//! the caller to use. So the address a load balancer publishes is a socket of this
-//! emulator's own ([`crate::state::LoadBalancerEndpoint`]) and this module is what answers
-//! on it: the claim ([`claims_parts`], read by `Service::can_handle`) and the serving
+//! every `LoadBalancerDescription` — and that name's first label names no service, so the
+//! emulator's front door can resolve no target service from a request addressed to it and
+//! answered `404 UnknownService` for the one address this service told the caller to use. So
+//! the name a load balancer publishes ([`crate::state::LoadBalancerEndpoint`]) is SERVED at
+//! the endpoint this emulator is reached on, and this module is what answers there: the claim
+//! ([`claims_parts`], read by `Service::can_handle`) and the serving
 //! ([`DataPlane`], handed back by `Service::override_operation`, which the router reaches
 //! before authentication — which is what lets a load balancer's own traffic, carrying no
 //! AWS credential, be answered at all).
@@ -31,8 +31,8 @@
 //!   load balancer of another region. The segment begins with `_`, which no modelled path
 //!   segment of any service does, so the prefix collides with no control-plane route, and a
 //!   path under that namespace naming ANOTHER plane is that plane's, never this one's. It is
-//!   how the socket a load balancer's own address is served on hands the request it accepted
-//!   to this plane ([`super::listener_socket`]).
+//!   how the socket a load balancer of an UNSERVED emulator is dialled at hands the request
+//!   it accepted to this plane ([`super::listener_socket`]).
 //!
 //! A request presenting what an AWS API call presents (a SigV4 `Authorization` header) is a
 //! control-plane call and is never taken by the host-style addressing: a client of a
@@ -100,7 +100,7 @@ pub const DATA_PLANE_SEGMENT: &str = "elasticloadbalancing-classic";
 /// `/_aws/elasticloadbalancing-classic/{region}/{name}`, which a request path follows.
 ///
 /// The one place that addressing is WRITTEN, beside [`prefixed_addressing`], which is the
-/// one place it is read: the socket a load balancer's own address is served on
+/// one place it is read: the socket a load balancer of an unserved emulator is dialled at
 /// ([`super::listener_socket`]) hands the request it accepts to this plane under it, so the
 /// two cannot drift on how a plane is named.
 pub fn data_plane_path(region: &str, load_balancer_name: &str) -> String {

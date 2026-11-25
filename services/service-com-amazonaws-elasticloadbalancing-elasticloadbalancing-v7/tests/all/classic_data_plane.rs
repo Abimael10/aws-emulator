@@ -5,13 +5,14 @@
 //!
 //! The rules under test:
 //!
-//! 1. **the address a load balancer publishes as its `DNSName` is an address this emulator
-//!    answers on, and the load balancer answers there.** `DNSName` is the address a client
-//!    dials, so a host in Elastic Load Balancing's own DNS zone — which resolves to nothing
-//!    on the machine this emulator runs on — is no address at all; what is published is the
-//!    `host:port` of the socket this emulator serves that load balancer's traffic on, which
-//!    is the address `CanonicalHostedZoneName` reports too wherever that member is reported
-//!    at all.
+//! 1. **the address a load balancer publishes as its `DNSName` is a host NAME served at the
+//!    endpoint this emulator is reached on, and the load balancer answers there.** `DNSName`
+//!    is the address a client RESOLVES and then sends its traffic to, so a host in Elastic
+//!    Load Balancing's own DNS zone — which resolves to nothing on the machine this emulator
+//!    runs on — is no address at all, and neither is a `host:port` of this emulator's own
+//!    choosing: what is published is a name in the zone of the address this emulator is
+//!    reached at, which is the name `CanonicalHostedZoneName` reports too wherever that
+//!    member is reported at all.
 //! 2. **a request is answered only by a registered instance the load balancer may send it
 //!    to**: one its own health checks report `InService` and — while
 //!    `CrossZoneLoadBalancing` is off — one in the zone of the node that took the request.
@@ -42,10 +43,10 @@
 //! `AWSELB` cookie the answer hands back, whose token names one instance of one load
 //! balancer ([`instance_token`]).
 //!
-//! Most cases drive the plane through the router, which is the path the socket's own
-//! forwarded leg takes; the last one DIALS the published `host:port` over TCP and speaks
-//! HTTP/1.1 on it, which is what a client handed that address does, so the transport and the
-//! region-exact addressing behind it are exercised too.
+//! Most cases drive the plane through the router, which is the path a published name is
+//! addressed on; two of them DIAL the socket an emulator served on no endpoint of its own
+//! gives each load balancer and speak HTTP/1.1 on it, so the transport and the region-exact
+//! addressing behind it are exercised too.
 //!
 //! The health checks the clock owes a registration are placed in the past rather than slept
 //! for ([`age_registrations`]), exactly as this crate's health suites place them.
@@ -61,9 +62,11 @@ use service_com_amazonaws_elasticloadbalancing_elasticloadbalancing_v7::state::H
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::wire::{
-    age_registrations, call, emulator_with_ec2, kid_text, launch_backend, members, move_instance,
-    param, parse, serving_user_data, settle_ec2_transition,
+    age_registrations, assert_published_dns_name, call, dialled_authority, emulator_with_ec2,
+    emulator_with_ec2_served_at, kid_text, launch_backend, members, move_instance, param, parse,
+    serving_user_data, settle_ec2_transition, SERVED_BODY,
 };
+use service_common::data_plane_addressing::LOOPBACK_ZONE;
 
 /// The region every call below is signed for, unless a row names another.
 const REGION: &str = "us-east-1";
@@ -115,10 +118,11 @@ async fn launch_serving_backend(
 const HEALTHY_THRESHOLD: i32 = 2;
 const UNHEALTHY_THRESHOLD: i32 = 2;
 
-/// One answered data-plane request: the status, and the stickiness cookie the answer
-/// carried.
+/// One answered data-plane request: the status, the document it carried, and the stickiness
+/// cookie the answer carried.
 struct Answered {
     status: u16,
+    body: String,
     set_cookie: Option<String>,
 }
 
@@ -156,6 +160,7 @@ async fn send(
     let response = router.dispatch(request).await;
     Answered {
         status: response.status().as_u16(),
+        body: String::from_utf8_lossy(response.body()).into_owned(),
         set_cookie: response
             .headers()
             .get("set-cookie")
@@ -173,6 +178,22 @@ async fn create_load_balancer(
     protocol: &str,
     zones: &[&str],
 ) -> String {
+    create_load_balancer_forwarding_to(router, region, name, scheme, protocol, zones, INSTANCE_PORT)
+        .await
+}
+
+/// The same create, with the listener forwarding traffic to `instance_port` — the port of a
+/// registered instance the load balancer opens a connection to, which is what decides whether
+/// a request reaches a server the instance really runs.
+async fn create_load_balancer_forwarding_to(
+    router: &MultiServiceRouter,
+    region: &str,
+    name: &str,
+    scheme: Option<&str>,
+    protocol: &str,
+    zones: &[&str],
+    instance_port: i32,
+) -> String {
     let mut params = vec![
         param("LoadBalancerName", name),
         param("Listeners.member.1.Protocol", protocol),
@@ -182,7 +203,7 @@ async fn create_load_balancer(
         ),
         param(
             "Listeners.member.1.InstancePort",
-            &INSTANCE_PORT.to_string(),
+            &instance_port.to_string(),
         ),
     ];
     if let Some(scheme) = scheme {
@@ -451,9 +472,9 @@ async fn fixture(name: &'static str, cross_zone: bool) -> (Fixture, Arc<engine::
     )
 }
 
-/// RULE 1: the address a load balancer publishes is one this emulator answers on, the load
-/// balancer answers there, and `CanonicalHostedZoneName` — where it is reported — carries
-/// that same address.
+/// RULE 1: the address a load balancer publishes is a host NAME served at the endpoint this
+/// emulator is reached on, the load balancer answers there, and `CanonicalHostedZoneName` —
+/// where it is reported — carries that same name.
 #[tokio::test]
 async fn the_published_address_is_one_the_emulator_answers_on() {
     let (router, _engine) = emulator_with_ec2();
@@ -481,17 +502,7 @@ async fn the_published_address_is_one_the_emulator_answers_on() {
     for (case, region, name, scheme, protocol) in cases {
         let zone = format!("{region}a");
         let dns = create_load_balancer(&router, region, name, *scheme, protocol, &[&zone]).await;
-        let address = dns.parse::<SocketAddr>();
-        assert!(
-            address.is_ok(),
-            "case {case:?}: the published DNSName must be an address a client dials, got \
-             {dns:?}"
-        );
-        assert!(
-            !dns.contains("elb.amazonaws.com"),
-            "case {case:?}: the published DNSName must not be a host in AWS's own zone, got \
-             {dns:?}"
-        );
+        assert_published_dns_name(case, &dns, region, name, *scheme, LOOPBACK_ZONE);
 
         let described = call(
             &router,
@@ -562,6 +573,70 @@ async fn the_published_address_is_one_the_emulator_answers_on() {
             wrong_region.status != NO_INSTANCE && wrong_region.status != INSTANCE_UNREACHABLE,
             "case {case:?}: no load balancer may answer for another region, got {}",
             wrong_region.status
+        );
+    }
+}
+
+/// RULE 1, the ADDRESSING half: the name a load balancer publishes carries no port and sits
+/// in the DNS zone of the address this emulator is REACHED at, and that name is served by
+/// that load balancer at the endpoint it reached.
+///
+/// `DNSName` is the one address a Classic client is given, and what a client does with it is
+/// RESOLVE it and then send its traffic to what it resolved — so the published value is a host
+/// name, and the zone it sits in has to be one that resolves to the interface this emulator is
+/// reached on. A name in a zone AWS serves is never announced: it resolves nowhere near this
+/// process or, worse, at genuine AWS infrastructure.
+///
+/// The rows span what the rule generalises over: the address this emulator is SERVED at — an
+/// IPv4 loopback address, an IPv6 one, a name of this emulator's own, and no endpoint at all
+/// (the position a host that embeds the emulator in its own process is in) — because that
+/// address is what the announced zone is read off.
+#[tokio::test]
+async fn the_published_name_sits_in_the_zone_of_the_address_this_emulator_is_reached_at() {
+    const NAME: &str = "zoned-elb";
+    let cases: &[(&str, Option<&str>, &str)] = &[
+        (
+            "served on an IPv4 loopback address",
+            Some("https://127.0.0.1:9297"),
+            LOOPBACK_ZONE,
+        ),
+        (
+            "served on an IPv6 loopback address",
+            Some("https://[::1]:8443"),
+            LOOPBACK_ZONE,
+        ),
+        (
+            "served on a name of its own",
+            Some("https://emulator.example:9297"),
+            "emulator.example",
+        ),
+        ("served on no endpoint at all", None, LOOPBACK_ZONE),
+    ];
+    for (case, endpoint, zone) in cases {
+        let (router, _engine) = match endpoint {
+            Some(endpoint) => emulator_with_ec2_served_at(endpoint),
+            None => emulator_with_ec2(),
+        };
+        let dns =
+            create_load_balancer(&router, REGION, NAME, None, "HTTP", &[NODE_ZONE]).await;
+        assert_published_dns_name(case, &dns, REGION, NAME, None, zone);
+        // The name is SERVED at the endpoint this emulator is reached on: a request carrying
+        // it as its host is answered out of that load balancer's own state — nothing is
+        // registered yet, so what it answers is its own "no instance to send this to".
+        let answered = send(&router, &dns, "/", None).await;
+        assert_eq!(
+            answered.status, NO_INSTANCE,
+            "case {case:?}: the published name {dns:?} must be served by the load balancer, \
+             got {}",
+            answered.status
+        );
+        // And a client that did not keep the create's answer reads the same name back.
+        let reported = described_dns_name(&router, REGION, NAME).await;
+        assert_eq!(
+            reported.as_deref(),
+            Some(dns.as_str()),
+            "case {case:?}: a describe must report the name the create published, got \
+             {reported:?}"
         );
     }
 }
@@ -711,6 +786,110 @@ async fn cross_zone_load_balancing_decides_which_zones_a_node_reaches() {
         BTreeSet::from([node_token, other_token]),
         "case cross-zone on: both zones' instances must take requests, got {spread:?}"
     );
+}
+
+/// RULE 2, end to end at the PUBLISHED NAME: with cross-zone load balancing on, the one node
+/// this emulator publishes spreads requests to the registered `InService` instances of EVERY
+/// enabled zone, and what the client receives is the BACKEND's own answer — the status, the
+/// media type and the bytes of the server that instance runs on the port the listener
+/// forwards traffic to.
+///
+/// This is the whole path a client of `DNSName` drives: it resolves the published name, sends
+/// an HTTP request to it, and is answered 200 out of a backend in one zone or the other. The
+/// rows span what the rule generalises over: the path asked for (each of the two documents the
+/// backends hold) — and over the requests of one run, because WHICH backend answers is drawn
+/// per request.
+#[tokio::test]
+async fn a_cross_zone_node_relays_the_backends_of_both_zones_at_the_published_name() {
+    const NAME: &str = "spreading-elb";
+    /// The second document each backend holds, so the client's own path is what the backend
+    /// is asked for rather than one path this test could hard-code.
+    const SECOND_PATH: &str = "/health";
+
+    let (router, engine) = emulator_with_ec2();
+    // The listener forwards to the very port each backend's own server listens on, so what
+    // the client receives is that server's answer rather than a status the load balancer
+    // words for a backend it could not reach.
+    let dns = create_load_balancer_forwarding_to(
+        &router,
+        REGION,
+        NAME,
+        None,
+        "HTTP",
+        &[NODE_ZONE, OTHER_ZONE],
+        SERVED_PORT,
+    )
+    .await;
+    configure_health_check(&router, REGION, NAME).await;
+    set_cross_zone(&router, REGION, NAME, true).await;
+    // The pin is what names the instance each answer came from.
+    attach_lb_cookie_policy(&router, REGION, NAME, "spread-pin", Some("300")).await;
+
+    let mut backends: Vec<String> = Vec::new();
+    for (zone, label) in [(NODE_ZONE, "node zone"), (OTHER_ZONE, "other zone")] {
+        backends.push(
+            launch_backend(
+                &router,
+                REGION,
+                Some(zone),
+                label,
+                Some(&serving_user_data(SERVED_PORT, &[CHECK_PATH, SECOND_PATH])),
+            )
+            .await,
+        );
+    }
+    settle_ec2_transition().await;
+    register(
+        &router,
+        REGION,
+        NAME,
+        &backends.iter().map(String::as_str).collect::<Vec<&str>>(),
+    )
+    .await;
+    age_registrations(
+        &engine,
+        REGION,
+        NAME,
+        HEALTH_CHECK_SPAN.saturating_mul(u32::try_from(HEALTHY_THRESHOLD).expect("a threshold")),
+    );
+
+    let expected_tokens: BTreeSet<String> = backends
+        .iter()
+        .map(|instance| instance_token(NAME, instance))
+        .collect();
+    for path in [CHECK_PATH, SECOND_PATH] {
+        let mut answered_by: BTreeSet<String> = BTreeSet::new();
+        // Which backend answers is DRAWN per request, so the node is asked until it has
+        // answered out of both zones — bounded, so a node that only ever reaches one zone
+        // fails rather than loops.
+        for attempt in 0..64 {
+            let answered = send(&router, &dns, path, None).await;
+            assert_eq!(
+                answered.status, 200,
+                "case {path:?}, request {attempt}: the published name must be answered by a \
+                 backend, got {} with {:?}",
+                answered.status, answered.body
+            );
+            assert_eq!(
+                answered.body.trim(),
+                SERVED_BODY,
+                "case {path:?}, request {attempt}: the client receives the backend's own \
+                 document, got {:?}",
+                answered.body
+            );
+            if let Some(token) = answered.minted_token() {
+                answered_by.insert(token);
+            }
+            if answered_by == expected_tokens {
+                break;
+            }
+        }
+        assert_eq!(
+            answered_by, expected_tokens,
+            "case {path:?}: with cross-zone load balancing on, the node must answer out of \
+             the backends of BOTH zones, got {answered_by:?}"
+        );
+    }
 }
 
 /// RULE 2, the placement half again: with cross-zone load balancing off, a load balancer
@@ -1008,9 +1187,9 @@ async fn a_listener_refuses_a_policy_set_its_protocol_cannot_carry() {
     );
 }
 
-/// RULE 1, end to end over a REAL connection: a client that DIALS the published `host:port`
-/// — as a client handed that address does, over TCP, speaking HTTP/1.1, carrying no AWS
-/// credential — is answered by the load balancer that published it.
+/// RULE 1, end to end over a REAL connection: an emulator served on no endpoint of its own
+/// gives each load balancer a SOCKET of its own, and a client that dials it — over TCP,
+/// speaking HTTP/1.1, carrying no AWS credential — is answered by that load balancer.
 ///
 /// Two load balancers of the SAME NAME in different regions are deployed, each with its own
 /// registered backend: a Classic load balancer's name is unique within one region only, so
@@ -1048,7 +1227,8 @@ async fn a_client_that_dials_the_published_address_reaches_that_load_balancer() 
     );
 
     for (region, dns, backend) in &published {
-        let dialled = dial(dns, "/", None).await;
+        let authority = dialled_authority(&engine, region, NAME);
+        let dialled = dial(&authority, dns, "/", None).await;
         assert_eq!(
             dialled.status, INSTANCE_UNREACHABLE,
             "case dialling {region}'s published address: expected {INSTANCE_UNREACHABLE}, got \
@@ -1066,7 +1246,13 @@ async fn a_client_that_dials_the_published_address_reaches_that_load_balancer() 
         );
         // And a client that carries the pin back over its own connection is served by the
         // instance it names, with no new cookie minted.
-        let pinned = dial(dns, "/", Some(&format!("{STICKINESS_COOKIE}={token}"))).await;
+        let pinned = dial(
+            &authority,
+            dns,
+            "/",
+            Some(&format!("{STICKINESS_COOKIE}={token}")),
+        )
+        .await;
         assert_eq!(
             (pinned.status, pinned.set_cookie.clone()),
             (INSTANCE_UNREACHABLE, None),
@@ -1076,26 +1262,26 @@ async fn a_client_that_dials_the_published_address_reaches_that_load_balancer() 
     }
 }
 
-/// Dial the published `host:port` over TCP and speak one HTTP/1.1 request on it, exactly as
-/// a client handed that address does. The connection is closed by the answer
+/// Dial one load balancer's own socket over TCP and speak one HTTP/1.1 request on it,
+/// carrying `host` — the name that load balancer published — as the request's `Host`, exactly
+/// as a client of an unserved emulator does. The connection is closed by the answer
 /// (`Connection: close`), so the response is read to end of stream rather than framed here.
 ///
-/// The address dialled is this machine's own: the port is read off the address the load
-/// balancer published and the host is the loopback literal, which is the only interface a
-/// core-owned listener binds.
-async fn dial(published: &str, target: &str, cookie: Option<&str>) -> Answered {
+/// The address dialled is this machine's own: the port is read off the `authority` the socket
+/// answers at and the host is the loopback literal, which is the only interface a core-owned
+/// listener binds.
+async fn dial(authority: &str, host: &str, target: &str, cookie: Option<&str>) -> Answered {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-    let port = published
+    let port = authority
         .parse::<SocketAddr>()
-        .unwrap_or_else(|error| panic!("case dial {published:?}: not an address: {error}"))
+        .unwrap_or_else(|error| panic!("case dial {authority:?}: not an address: {error}"))
         .port();
     let mut stream = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
         .await
-        .unwrap_or_else(|error| panic!("case dial {published:?}: cannot connect: {error}"));
-    let mut request = format!(
-        "GET {target} HTTP/1.1\r\nHost: {published}\r\nConnection: close\r\n"
-    );
+        .unwrap_or_else(|error| panic!("case dial {authority:?}: cannot connect: {error}"));
+    let mut request =
+        format!("GET {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
     if let Some(cookie) = cookie {
         request.push_str(&format!("Cookie: {cookie}\r\n"));
     }
@@ -1103,25 +1289,30 @@ async fn dial(published: &str, target: &str, cookie: Option<&str>) -> Answered {
     stream
         .write_all(request.as_bytes())
         .await
-        .unwrap_or_else(|error| panic!("case dial {published:?}: cannot write: {error}"));
+        .unwrap_or_else(|error| panic!("case dial {authority:?}: cannot write: {error}"));
     let mut answered = Vec::new();
     stream
         .read_to_end(&mut answered)
         .await
-        .unwrap_or_else(|error| panic!("case dial {published:?}: cannot read: {error}"));
+        .unwrap_or_else(|error| panic!("case dial {authority:?}: cannot read: {error}"));
     let text = String::from_utf8_lossy(&answered).into_owned();
-    let (head, _body) = text.split_once("\r\n\r\n").unwrap_or((text.as_str(), ""));
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_str(), ""));
+    let body = body.to_string();
     let mut lines = head.split("\r\n");
     let status = lines
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse::<u16>().ok())
-        .unwrap_or_else(|| panic!("case dial {published:?}: no status line in {text:?}"));
+        .unwrap_or_else(|| panic!("case dial {authority:?}: no status line in {text:?}"));
     let set_cookie = lines
         .filter_map(|line| line.split_once(':'))
         .find(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
         .map(|(_, value)| value.trim().to_string());
-    Answered { status, set_cookie }
+    Answered {
+        status,
+        body,
+        set_cookie,
+    }
 }
 
 /// A second listener port the updates below add, so the load balancer a client holds an
@@ -1160,11 +1351,11 @@ struct PublishedCase {
 /// The rows span what the rule generalises over: the scheme (the default and `internal`,
 /// whose client is inside this emulator too), the listener protocol a connection in the
 /// clear reaches, and how many Availability Zones the load balancer is placed in. Every
-/// address is DIALLED over TCP, as a client handed it does, rather than only addressed
-/// through the emulator's own endpoint.
+/// published name is addressed through the emulator's own endpoint, and the socket this
+/// unserved emulator opened beside it is DIALLED over TCP as well.
 #[tokio::test]
 async fn a_published_address_stays_the_address_its_load_balancer_answers_on() {
-    let (router, _engine) = emulator_with_ec2();
+    let (router, engine) = emulator_with_ec2();
     let rows: &[PublishedCase] = &[
         PublishedCase {
             case: "the default scheme in one zone",
@@ -1202,22 +1393,23 @@ async fn a_published_address_stays_the_address_its_load_balancer_answers_on() {
             row.zones,
         )
         .await;
-        assert!(
-            dns.parse::<SocketAddr>().is_ok(),
-            "case {case:?}: the published DNSName must be an address a client dials, got {dns:?}"
+        assert_published_dns_name(case, &dns, REGION, row.name, row.scheme, LOOPBACK_ZONE);
+        // A client ADDRESSES the published name at the endpoint this emulator is reached on,
+        // carrying no AWS credential: nothing is registered yet, so what answers there is
+        // this load balancer's own "no instance to send this to" — a name nothing served
+        // would not answer at all.
+        let answered = send(&router, &dns, "/", None).await;
+        assert_eq!(
+            answered.status, NO_INSTANCE,
+            "case {case:?}: the published name must be served by the load balancer, got {}",
+            answered.status
         );
-        assert!(
-            !dns.contains("elb.amazonaws.com"),
-            "case {case:?}: the published DNSName must not be a host in AWS's own zone, got \
-             {dns:?}"
-        );
-        // A client DIALS it, over TCP, carrying no AWS credential: nothing is registered
-        // yet, so what answers there is this load balancer's own "no instance to send this
-        // to" — an address nothing served would not answer at all.
-        let dialled = dial(&dns, "/", None).await;
+        // And the socket this unserved emulator gave it answers the same request over a real
+        // connection.
+        let dialled = dial(&dialled_authority(&engine, REGION, row.name), &dns, "/", None).await;
         assert_eq!(
             dialled.status, NO_INSTANCE,
-            "case {case:?}: the published address must be served by the load balancer, got {}",
+            "case {case:?}: the load balancer's own socket must be served by it, got {}",
             dialled.status
         );
         published.push(dns);
@@ -1241,7 +1433,7 @@ async fn a_published_address_stays_the_address_its_load_balancer_answers_on() {
             "case {case:?}: a describe after every update must report the address the create \
              published, got {reported:?}"
         );
-        let dialled = dial(dns, "/", None).await;
+        let dialled = dial(&dialled_authority(&engine, REGION, row.name), dns, "/", None).await;
         assert_eq!(
             dialled.status, NO_INSTANCE,
             "case {case:?}: the published address must still be served after every update, got \
@@ -1275,7 +1467,13 @@ async fn a_published_address_stays_the_address_its_load_balancer_answers_on() {
     );
     for index in [0_usize, 2] {
         let case = rows[index].case;
-        let dialled = dial(&published[index], "/", None).await;
+        let dialled = dial(
+            &dialled_authority(&engine, REGION, rows[index].name),
+            &published[index],
+            "/",
+            None,
+        )
+        .await;
         assert_eq!(
             dialled.status, NO_INSTANCE,
             "case {case:?}: another load balancer's delete must leave this address answering, \

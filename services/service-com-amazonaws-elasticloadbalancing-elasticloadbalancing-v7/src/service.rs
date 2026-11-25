@@ -59,7 +59,8 @@ pub mod data_plane;
 /// The connection [`data_plane`] makes to the registered instance it selected, and what the
 /// server behind that instance answers.
 pub mod instance_connection;
-/// The SOCKET that address is answered on — the transport under [`data_plane`].
+/// The SOCKET a load balancer of an UNSERVED emulator is dialled at — the transport under
+/// [`data_plane`] for an emulator that is served on no endpoint of its own.
 pub mod listener_socket;
 /// The session stickiness a listener's policies give a client: the `AWSELB` cookie.
 pub mod stickiness;

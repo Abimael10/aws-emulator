@@ -36,9 +36,9 @@
 //! to (its own no-capacity status).
 //!
 //! Every row's answer is taken BOTH over the request this emulator carries in process to the
-//! published name and over a TCP connection DIALLED to the `host:port` that name is — which is
-//! what a client handed that address does, and the only way the socket a load balancer's
-//! listeners are served on is exercised. The two sibling suites below read the same answer for
+//! published name and over a TCP connection DIALLED to the socket that load balancer's
+//! listeners are served on — the address an emulator served on no endpoint of its own gives it,
+//! which is the only way that socket is exercised. The two sibling suites below read the same answer for
 //! the two rules that decide WHICH registered instance a request is sent to and are only
 //! observable once the instance's own body comes back: the `AWSELB` pin a duration-based policy
 //! mints, and the zone a node serves while `CrossZoneLoadBalancing` is off. Every clock-owed move
@@ -53,7 +53,7 @@ use std::time::{Duration, Instant};
 
 use aws_emulator_router::{build_router, InMemoryEngine};
 use service_com_amazonaws_elasticloadbalancing_elasticloadbalancing_v7::state::{
-    InstanceHealth, HEALTH_FAILED_HEALTH_CHECKS, HEALTH_IN_SERVICE,
+    service_state, InstanceHealth, HEALTH_FAILED_HEALTH_CHECKS, HEALTH_IN_SERVICE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -379,14 +379,17 @@ fn carried(
     }
 }
 
-/// DIAL the address the load balancer published and exchange one request on it, as a client
-/// handed that address does: a TCP connection in the clear, HTTP/1.1, closed after the answer.
+/// DIAL the socket one load balancer's listeners are served on and exchange one request on it,
+/// as a client handed an address does: a TCP connection in the clear, HTTP/1.1, closed after
+/// the answer. The request carries `dns_name` — the name the load balancer PUBLISHED — as its
+/// `Host`, exactly as a client that resolved that name does.
 ///
-/// Only the PORT is taken from the published authority: the core binds its listeners on
-/// loopback, so the dial is to this machine.
+/// Only the PORT is taken from `authority`: the core binds its listeners on loopback, so the
+/// dial is to this machine.
 fn dialled(
     runtime: &tokio::runtime::Runtime,
     case: &str,
+    authority: &str,
     dns_name: &str,
     method: &str,
     path: &str,
@@ -394,12 +397,12 @@ fn dialled(
 ) -> Answered {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-    let port = dns_name
+    let port = authority
         .rsplit(':')
         .next()
         .and_then(|port| port.parse::<u16>().ok())
         .unwrap_or_else(|| {
-            panic!("case {case:?}: the published address {dns_name:?} carries no port to dial")
+            panic!("case {case:?}: the socket address {authority:?} carries no port to dial")
         });
     runtime.block_on(async move {
         let mut stream = tokio::time::timeout(
@@ -448,6 +451,24 @@ fn dialled(
             set_cookie: field("set-cookie"),
         }
     })
+}
+
+/// The `host:port` the socket of the load balancer `name` answers at, read off the Classic
+/// service's own store.
+///
+/// What a load balancer PUBLISHES is a host NAME served at the endpoint this emulator is
+/// reached on; an emulator served on no endpoint of its own — which a suite driving the router
+/// in process is — gives each load balancer a socket of its own as well, and only the store
+/// knows the port it landed on, because no response carries one.
+fn socket_authority(engine: &Arc<InMemoryEngine>, region: &str, name: &str) -> String {
+    let state = service_state(&**engine).expect("the Classic service's own store");
+    let guard = state.lock();
+    guard
+        .endpoints
+        .get(&(region.to_string(), name.to_string()))
+        .and_then(|endpoint| endpoint.dialled_authority())
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("case {name:?}: no socket of its own was opened in {region}"))
 }
 
 /// Look again until `holds` answers `Some`, or the deadline passes — what a client waiting for
@@ -718,7 +739,7 @@ fn a_classic_load_balancer_answers_with_its_registered_instances_own_response() 
         .stack_size(BOOT_STACK_SIZE)
         .spawn(|| {
             let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
-            let mut router = build_router(engine);
+            let mut router = build_router(Arc::clone(&engine));
             router.set_request_authentication(false);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -793,6 +814,7 @@ fn a_classic_load_balancer_answers_with_its_registered_instances_own_response() 
 
             for row in ROWS {
                 let dns_name = &published[row.backend];
+                let authority = socket_authority(&engine, REGION, &names[row.backend]);
                 for (how, answered) in [
                     (
                         "carried in process",
@@ -800,7 +822,15 @@ fn a_classic_load_balancer_answers_with_its_registered_instances_own_response() 
                     ),
                     (
                         "dialled over TCP",
-                        dialled(&runtime, row.case, dns_name, row.method, row.path, None),
+                        dialled(
+                            &runtime,
+                            row.case,
+                            &authority,
+                            dns_name,
+                            row.method,
+                            row.path,
+                            None,
+                        ),
                     ),
                 ] {
                     assert_eq!(
@@ -844,7 +874,7 @@ fn a_duration_policy_pins_a_client_to_the_instance_that_served_it() {
         .stack_size(BOOT_STACK_SIZE)
         .spawn(|| {
             let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
-            let mut router = build_router(engine);
+            let mut router = build_router(Arc::clone(&engine));
             router.set_request_authentication(false);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -968,6 +998,7 @@ fn a_duration_policy_pins_a_client_to_the_instance_that_served_it() {
             // every time, with no new cookie minted — over both ways it can reach the address.
             let (pin, body) = drawn.first().cloned().expect("a drawn request minted a pin");
             let cookie = format!("AWSELB={pin}");
+            let authority = socket_authority(&engine, REGION, NAME);
             for attempt in 0..DRAWS {
                 for (how, answered) in [
                     (
@@ -976,7 +1007,15 @@ fn a_duration_policy_pins_a_client_to_the_instance_that_served_it() {
                     ),
                     (
                         "dialled over TCP",
-                        dialled(&runtime, case, &dns_name, "GET", "/", Some(&cookie)),
+                        dialled(
+                            &runtime,
+                            case,
+                            &authority,
+                            &dns_name,
+                            "GET",
+                            "/",
+                            Some(&cookie),
+                        ),
                     ),
                 ] {
                     assert_eq!(
@@ -1015,7 +1054,7 @@ fn cross_zone_load_balancing_decides_whose_body_the_published_address_answers_wi
         .stack_size(BOOT_STACK_SIZE)
         .spawn(|| {
             let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
-            let mut router = build_router(engine);
+            let mut router = build_router(Arc::clone(&engine));
             router.set_request_authentication(false);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

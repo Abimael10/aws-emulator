@@ -206,8 +206,8 @@ pub use instance_health::*;
 mod vpc_placement;
 pub use vpc_placement::*;
 
-/// The ADDRESS one load balancer publishes as its `DNSName`, and the socket of this
-/// emulator's own that answers there.
+/// The NAME one load balancer publishes as its `DNSName`, and where a client that holds
+/// that name reaches it.
 mod load_balancer_endpoint;
 pub use load_balancer_endpoint::*;
 
@@ -771,8 +771,8 @@ impl Default for AttributeConfig {
 pub struct LoadBalancer {
     pub name: String,
     /// The address this load balancer PUBLISHES, generated once at create and kept for the
-    /// record's lifetime: the `host:port` of the socket this emulator answers that load
-    /// balancer's traffic on ([`LoadBalancerEndpoint`]).
+    /// record's lifetime: the host NAME a client resolves and then sends its traffic to,
+    /// served at the endpoint this emulator is reached on ([`LoadBalancerEndpoint`]).
     pub dns_name: String,
     pub canonical_hosted_zone_name_id: String,
     pub scheme: String,
@@ -1035,13 +1035,13 @@ pub struct ComAmazonawsElasticloadbalancingElasticloadbalancingV7State {
     /// Region -> (`LoadBalancerName` -> record). `BTreeMap`s throughout, so
     /// `DescribeLoadBalancers` paginates one stable order.
     pub regions: BTreeMap<String, BTreeMap<String, LoadBalancer>>,
-    /// The socket each load balancer's own address is served on, keyed by the region and
-    /// the name of the load balancer it belongs to ([`LoadBalancerEndpoint`]).
+    /// The published address of each load balancer, keyed by the region and the name of the
+    /// load balancer it belongs to ([`LoadBalancerEndpoint`]).
     ///
-    /// Held here rather than on [`LoadBalancer`] because it is a LIVE socket: the record is
-    /// cloned by every read, and a socket is not a value that may be copied — dropping a
-    /// handle closes the port. The record keeps the ADDRESS the socket answers on, as its
-    /// `dns_name`, which is what every reader reports.
+    /// Held here rather than on [`LoadBalancer`] because it may hold a LIVE socket: the
+    /// record is cloned by every read, and a socket is not a value that may be copied —
+    /// dropping a handle closes the port. The load balancer's own record keeps the published
+    /// NAME, as its `dns_name`, which is what every reader reports.
     pub endpoints: BTreeMap<(String, String), LoadBalancerEndpoint>,
 }
 
@@ -1078,12 +1078,12 @@ impl ComAmazonawsElasticloadbalancingElasticloadbalancingV7State {
         Some(self.regions.entry(region.to_string()).or_default())
     }
 
-    /// Remember the socket one load balancer's own address is served on, answering the
-    /// `host:port` the load balancer then publishes as its `DNSName`.
+    /// Remember one load balancer's published address, answering the host NAME the load
+    /// balancer then publishes as its `DNSName`.
     ///
-    /// A load balancer that already holds an address keeps it: the socket already open is
-    /// the one every published name points at, and the one handed here is dropped with its
-    /// port.
+    /// A load balancer that already holds an address keeps it: the record already held is
+    /// the one every published name comes from, and the one handed here is dropped — with
+    /// any port it kept open.
     pub fn remember_endpoint(
         &mut self,
         region: &str,
@@ -1093,13 +1093,13 @@ impl ComAmazonawsElasticloadbalancingElasticloadbalancingV7State {
         self.endpoints
             .entry((region.to_string(), load_balancer_name.to_string()))
             .or_insert(endpoint)
-            .authority()
+            .published_name()
             .to_string()
     }
 
-    /// Close the socket one load balancer's address was served on, if it had one: dropping
-    /// the handle closes the port and severs every connection in flight on it, which is
-    /// what a deleted load balancer's address does.
+    /// Forget one load balancer's published address: dropping the record closes any port it
+    /// kept open, severing every connection in flight on it, which is what a deleted load
+    /// balancer's address does.
     pub fn forget_endpoint(&mut self, region: &str, load_balancer_name: &str) {
         self.endpoints
             .remove(&(region.to_string(), load_balancer_name.to_string()));
@@ -1361,31 +1361,14 @@ fn region_digest(region: &str, label: &str) -> u128 {
 
 /// A stable 10-digit id for a load balancer's DNS name, derived from the region and
 /// name so the same record in the same region always resolves to the same host.
+///
+/// The id the published name carries ([`published_dns_name`]), which is why it is stable:
+/// every read of one record reports the one name, and two load balancers of a region never
+/// share it.
 fn dns_suffix(region: &str, name: &str) -> u64 {
     // A 10-digit value, the shape Elastic Load Balancing's own DNS names carry.
     let value = (region_digest(region, name) % 9_000_000_000) as u64;
     1_000_000_000 + value
-}
-
-/// The name Elastic Load Balancing's OWN zone would give a load balancer:
-/// `<name>-<id>.<region>.elb.amazonaws.com`, prefixed `internal-` for the `internal`
-/// scheme (whose name resolves to private addresses).
-///
-/// NOT what a load balancer publishes as its `DNSName`: that name is the address a client
-/// DIALS, and a host in AWS's own zone resolves to nothing on the machine this emulator
-/// runs on, so what is published is the `host:port` of the socket this emulator answers
-/// the load balancer's traffic on ([`LoadBalancerEndpoint`]). This is the fallback behind
-/// it, for an engine that vends no listener at all: the only address such an emulator has
-/// to give. Every member that reports "the DNS name of the load balancer" — `DNSName` and
-/// `CanonicalHostedZoneName` alike ([`LoadBalancer::canonical_hosted_zone_name`]) —
-/// reports the published address, never a second name beside it.
-pub fn dns_name(region: &str, name: &str, scheme: &str) -> String {
-    let suffix = dns_suffix(region, name);
-    if scheme == SCHEME_INTERNAL {
-        format!("internal-{name}-{suffix}.{region}.elb.amazonaws.com")
-    } else {
-        format!("{name}-{suffix}.{region}.elb.amazonaws.com")
-    }
 }
 
 /// The published Route 53 hosted zone id of the Elastic Load Balancing (Classic)

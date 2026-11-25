@@ -309,17 +309,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let tags = collect_tags(input.tags.as_deref())?;
 
-        // The ADDRESS this load balancer answers on, opened BEFORE the store is locked
-        // because opening a socket is asynchronous. `DNSName` is the address a CLIENT
-        // dials, so what is published is the `host:port` of this socket rather than a host
-        // in Elastic Load Balancing's own zone, which resolves to nothing on the machine
-        // this emulator runs on ([`crate::state::LoadBalancerEndpoint`]). A create this
-        // request goes on to refuse drops the handle, which closes the port again.
+        // The ADDRESS this load balancer answers at, composed BEFORE the store is locked
+        // because an emulator with no endpoint of its own opens a socket here, which is
+        // asynchronous. `DNSName` is the host NAME a client resolves and then sends its
+        // traffic to, served at the endpoint this emulator is reached on
+        // ([`crate::state::LoadBalancerEndpoint`]): a name in Elastic Load Balancing's own
+        // zone resolves to nothing on the machine this emulator runs on, and an extra
+        // loopback port of this emulator's own choosing is no address a client handed a NAME
+        // can reach. A create this request goes on to refuse drops the record again.
         let endpoint = crate::state::open_load_balancer_endpoint(
             &*self.engine,
+            ctx,
             &region,
             &input.load_balancer_name,
-            ctx.callback().clone(),
+            &scheme,
         )
         .await;
 
@@ -355,19 +358,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // What this load balancer PUBLISHES as its `DNSName`: the address of the socket
-        // this create opened, so a client that dials what this load balancer published
-        // reaches this load balancer. What is published is the authority the store KEPT —
-        // the socket already open under this (region, name) is the one every published name
-        // points at — so a caller is never told a port that was closed again. An engine
-        // that vends no listener at all publishes the name Elastic Load Balancing's own
-        // zone would carry, which is the only address such an emulator has to give.
-        let dns_name = match endpoint {
-            Some(endpoint) => {
-                guard.remember_endpoint(&region, &input.load_balancer_name, endpoint)
-            }
-            None => crate::state::dns_name(&region, &input.load_balancer_name, &scheme),
-        };
+        // What this load balancer PUBLISHES as its `DNSName`: the host name composed above,
+        // so a client that resolves what this load balancer published and sends traffic to
+        // the endpoint it resolved reaches this load balancer. What is published is the name
+        // the store KEPT — the record already held under this (region, name) is the one
+        // every published name comes from — so a caller is never told an address that was
+        // withdrawn again.
+        let dns_name = guard.remember_endpoint(&region, &input.load_balancer_name, endpoint);
         // The default health check targets the instance port of the first listener.
         let health_check = crate::state::HealthCheckConfig::default_for_instance_port(
             listeners
@@ -408,8 +405,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The region's map is created only now, on the success path, and only while the
         // store holds fewer regions than it will keep records for.
         let Some(records) = guard.region_entry(&region) else {
-            // Nothing is left behind by a create this refuses, the socket included:
-            // dropping the handle closes the port again.
+            // Nothing is left behind by a create this refuses, the published address
+            // included: dropping the record closes any port it kept open.
             guard.forget_endpoint(&region, &input.load_balancer_name);
             return Err(crate::scaffolded::Scaffolded::validation(format!(
                 "this emulator holds load balancers for at most {} regions",
