@@ -13,9 +13,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    BatchPutLimitEntry, CreateGatewayRateLimitOutput, DeleteGatewayRateLimitOutput,
-    GatewayRateLimitDetail, GetGatewayRateLimitOutput, LimitEntry, ResourceNotFoundException,
-    UpdateGatewayRateLimitOutput, ValidationException,
+    BatchPutLimitEntry, ConflictException, CreateGatewayRateLimitOutput,
+    DeleteGatewayRateLimitOutput, GatewayRateLimitDetail, GetGatewayRateLimitOutput, LimitEntry,
+    ResourceNotFoundException, UpdateGatewayRateLimitOutput, ValidationException,
 };
 
 use super::{
@@ -63,10 +63,11 @@ pub fn gateway_rate_limit_not_found(rate_limit_id: &str) -> ResourceNotFoundExce
 
 /// How many rate limits one gateway will hold.
 ///
-/// `BatchPutLimitEntries` is `@length 1..50` and the batch write REPLACES the
-/// gateway's whole set, so a submitted set cannot exceed this on its own; the
-/// ceiling is named here so every writer of the set is bounded by one number
-/// rather than by the shape of its own request.
+/// The ceiling is on the set the gateway ENDS UP with, not on the list any one
+/// request carries: the batch write upserts its entries onto the set already
+/// held, so a batch inside `BatchPutLimitEntries`' own `@length 1..50` can still
+/// take the gateway past this. Named here so every writer of the set is bounded
+/// by one number rather than by the shape of its own request.
 pub const MAX_RATE_LIMITS_PER_GATEWAY: usize = 50;
 
 /// The request member a refused batch names.
@@ -435,6 +436,83 @@ pub fn rate_limit_sharing_dimension_keys<'a>(
             .collect::<BTreeSet<&str>>()
             == submitted
     })
+}
+
+/// The id a submitted batch entry is written under when the gateway already
+/// holds the limit it names, or `None` when it names none of them and has to be
+/// minted one.
+///
+/// The matching rule the operation's own doc states — "the operation updates
+/// existing limits with matching keys and creates new limits for new keys"
+/// (`smithy_query doc shape=BatchPutGatewayRateLimits`) — stated once here so
+/// every entry of a batch is matched the same way: the `rateLimitId` the entry
+/// carries, which the model says the service "uses … for upsert matching against
+/// existing rate limits" (`smithy_query shape=BatchPutLimitEntry`), and
+/// otherwise the dimension keys, the only other thing that identifies one rate
+/// limit of a gateway, since "no two rate limits can share the same dimension
+/// keys".
+pub fn upsert_match(
+    rate_limits: &BTreeMap<String, GatewayRateLimitRecord>,
+    entry: &BatchPutLimitEntry,
+) -> Option<String> {
+    entry.rate_limit_id.clone().or_else(|| {
+        rate_limit_sharing_dimension_keys(rate_limits, &entry.dimension_keys)
+            .map(|held| held.rate_limit_id.clone())
+    })
+}
+
+/// Two limits of one resulting set that would share a dimension-key set: the id
+/// of the one the gateway ALREADY holds (the limit the collision is with) and
+/// the keys the pair share, or `None` when every limit of the set is scoped by
+/// its own keys.
+///
+/// "Must be unique per gateway—no two rate limits can share the same dimension
+/// keys" (`smithy_query doc shape=CreateGatewayRateLimitRequest
+/// member=dimensionKeys`) is a rule about the set the gateway HOLDS, so a write
+/// that adds to that set checks what it would leave behind rather than only the
+/// entries it carries. `written` names the ids the write is about to store, so
+/// the refusal can name the limit that was there first; the keys are compared as
+/// a SET, for the reason [`rate_limit_sharing_dimension_keys`] compares them that
+/// way.
+pub fn colliding_dimension_keys(
+    resulting: &BTreeMap<String, GatewayRateLimitRecord>,
+    written: &BTreeSet<String>,
+) -> Option<(String, Vec<String>)> {
+    let mut by_keys: BTreeMap<BTreeSet<&str>, Vec<&GatewayRateLimitRecord>> = BTreeMap::new();
+    for record in resulting.values() {
+        by_keys
+            .entry(record.dimension_keys.iter().map(String::as_str).collect())
+            .or_default()
+            .push(record);
+    }
+    by_keys.into_values().find(|sharing| sharing.len() > 1).map(|sharing| {
+        let held = sharing
+            .iter()
+            .find(|record| !written.contains(&record.rate_limit_id))
+            .unwrap_or(&sharing[0]);
+        (held.rate_limit_id.clone(), held.dimension_keys.clone())
+    })
+}
+
+/// The modelled conflict a write of a rate limit owes when the gateway already
+/// holds one scoped by the same dimension keys: the gateway, the limit that holds
+/// that scope and the keys themselves.
+///
+/// One sentence for one rule — "no two rate limits can share the same dimension
+/// keys" — so the single create and the batch write cannot report the same
+/// collision in two wordings.
+pub fn dimension_keys_conflict(
+    gateway_id: &str,
+    held_rate_limit_id: &str,
+    dimension_keys: &[String],
+) -> ConflictException {
+    ConflictException {
+        message: Some(format!(
+            "gateway {gateway_id} already holds the rate limit {held_rate_limit_id} with the \
+             dimension keys {}; no two rate limits of a gateway can share the same dimension keys",
+            dimension_keys.join(", ")
+        )),
+    }
 }
 
 /// The refusal a write of one gateway's configuration owes when the gateway it

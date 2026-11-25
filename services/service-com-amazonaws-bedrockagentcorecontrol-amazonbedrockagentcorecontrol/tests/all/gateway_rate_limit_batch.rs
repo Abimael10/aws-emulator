@@ -9,14 +9,14 @@
 //!
 //! The rule under test, read off the Smithy model rather than off any one recorded request
 //! (`smithy_query(query="operation",operation="BatchPutGatewayRateLimits,\
-//! GetGatewayRateLimit")`): the batch write REPLACES a gateway's whole rate-limit set with
-//! the list it submits — "the complete set of rate limits for this gateway. This operation
-//! replaces all existing rate limits in a single request" — upserting an entry whose
-//! `rateLimitId` an existing limit already holds, minting an id for an entry that carries
-//! none, and dropping every limit the submitted list leaves out, so the stored set is
-//! always exactly one submitted list and never a merge of two. The write is atomic, so each
-//! limit of the resulting set is reported in the terminal `ACTIVE` at once, and reads back
-//! through `GetGatewayRateLimit` exactly as it was submitted.
+//! GetGatewayRateLimit")`): the batch write UPSERTS the entries it submits onto the
+//! gateway's rate-limit set — "the operation updates existing limits with matching keys and
+//! creates new limits for new keys" — matching an entry against the limit whose
+//! `rateLimitId` it carries, and otherwise against the limit scoped by the same dimension
+//! keys, minting an id for an entry that matches nothing, and REMOVING nothing: a limit the
+//! submitted list does not name stays where it is and stays addressable. The write is
+//! atomic, so each limit of the resulting set is reported in the terminal `ACTIVE` at once,
+//! and reads back through `GetGatewayRateLimit` exactly as it was submitted.
 //!
 //! The rows differ along what the rule generalises over: how many entries one batch
 //! carries, whether each entry names its own `rateLimitId` or is minted one, which
@@ -328,9 +328,9 @@ fn well_formed_id(rate_limit_id: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(*character))
 }
 
-/// A batch write stores exactly the submitted list: every entry reads back as submitted,
-/// under the id the caller named or one the service minted, and the response reports the
-/// resulting set.
+/// A batch write stores exactly the submitted list on a gateway that held nothing: every
+/// entry reads back as submitted, under the id the caller named or one the service minted,
+/// and the response reports what the request submitted.
 #[tokio::test]
 async fn a_batch_write_stores_exactly_the_submitted_set() {
     for row in rows() {
@@ -357,7 +357,7 @@ async fn a_batch_write_stores_exactly_the_submitted_set() {
         assert_eq!(
             reported.len(),
             submitted.len(),
-            "case {case:?}: the response reports the whole resulting set, got {}",
+            "case {case:?}: the response reports the entries the request submitted, got {}",
             written.body
         );
 
@@ -439,13 +439,13 @@ async fn a_batch_write_stores_exactly_the_submitted_set() {
     }
 }
 
-/// A second batch REPLACES the set: the entry it keeps is upserted onto the limit that id
-/// already named — same creation instant, reported `ACTIVE` by the atomic write — and every
-/// limit the second list leaves out is gone.
+/// A second batch UPSERTS onto the set: the entry it names is written onto the limit that
+/// id already named — same creation instant, reported `ACTIVE` by the atomic write — and
+/// every limit the second list leaves out is still there, and still deletable.
 #[tokio::test]
-async fn a_second_batch_replaces_the_set_rather_than_merging_into_it() {
+async fn a_second_batch_upserts_onto_the_set_rather_than_replacing_it() {
     let router = router();
-    let gateway_id = settled_gateway(&router, "ratelimitreplace").await;
+    let gateway_id = settled_gateway(&router, "ratelimitupsert").await;
 
     let first = vec![
         Submitted {
@@ -458,7 +458,7 @@ async fn a_second_batch_replaces_the_set_rather_than_merging_into_it() {
             })],
         },
         Submitted {
-            rate_limit_id: Some("dropped"),
+            rate_limit_id: Some("left-out"),
             description: Some("left out of the second batch"),
             dimension_keys: vec!["toolName"],
             entries: vec![json!({
@@ -506,7 +506,7 @@ async fn a_second_batch_replaces_the_set_rather_than_merging_into_it() {
             .and_then(Value::as_array)
             .map(Vec::len),
         Some(1),
-        "the resulting set is exactly the second submitted list, got {}",
+        "the answer reports the one entry the second batch submitted, got {}",
         replaced.body
     );
 
@@ -538,21 +538,49 @@ async fn a_second_batch_replaces_the_set_rather_than_merging_into_it() {
         upserted.body
     );
 
-    let gone = get_rate_limit(&router, &gateway_id, "dropped").await;
+    let standing = get_rate_limit(&router, &gateway_id, "left-out").await;
     assert_eq!(
-        (gone.status, error_code(&gone.body).as_str()),
-        (404, "ResourceNotFoundException"),
-        "a limit the second list leaves out is gone, got {} {} ({})",
-        gone.status,
-        error_code(&gone.body),
-        gone.body
+        (standing.status, text(&standing.body, "status").as_str()),
+        (200, "ACTIVE"),
+        "a limit the second list leaves out is left where it is, got {} {} ({})",
+        standing.status,
+        text(&standing.body, "status"),
+        standing.body
+    );
+    assert_eq!(
+        text(&standing.body, "description"),
+        "left out of the second batch",
+        "the limit the batch never named keeps its own configuration, got {}",
+        standing.body
+    );
+
+    // Still addressable for deletion, which is what a teardown or an IaC destroy does
+    // with the ids it created.
+    let deleted = send(
+        &router,
+        "DELETE",
+        &format!("/gateways/{gateway_id}/rate-limits/left-out"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        (
+            deleted.status,
+            text(&deleted.body, "rateLimitId"),
+            text(&deleted.body, "status")
+        ),
+        (200, "left-out".to_string(), "DELETING".to_string()),
+        "the limit the batch left standing is deletable, got {} ({})",
+        deleted.status,
+        deleted.body
     );
 }
 
-/// Two writers racing on the same `rateLimitId`: at least one is served, and the set the
-/// gateway ends up with is exactly one of the two submitted lists — never a merge.
+/// Two writers racing on the same `rateLimitId`: at least one is served, that id ends up
+/// holding exactly one of the two submitted configurations — never a merge of the two — and
+/// neither writer's own entries are taken away by the other.
 #[tokio::test]
-async fn concurrent_writers_leave_exactly_one_submitted_set() {
+async fn concurrent_writers_leave_one_configuration_per_contended_id() {
     let router = router();
     let gateway_id = settled_gateway(&router, "ratelimitrace").await;
 
@@ -610,25 +638,44 @@ async fn concurrent_writers_leave_exactly_one_submitted_set() {
     let contended = get_rate_limit(&router, &gateway_id, "contended").await;
     assert_eq!(
         contended.status, 200,
-        "the contended limit is stored by whichever writer won, got {} ({})",
+        "the contended limit is stored by whichever writer wrote it last, got {} ({})",
         contended.status, contended.body
     );
     let winner = text(&contended.body, "description");
-    let right_only = get_rate_limit(&router, &gateway_id, "right-only").await;
+    let entries = contended.body.get("entries").cloned().unwrap_or(Value::Null);
     match winner.as_str() {
         "left" => assert_eq!(
-            (right_only.status, error_code(&right_only.body).as_str()),
-            (404, "ResourceNotFoundException"),
-            "the left list has one entry, so nothing else is stored, got {} ({})",
-            right_only.status,
-            right_only.body
+            entries,
+            json!(left[0].entries),
+            "one id holds one configuration, never a merge of the two, got {}",
+            contended.body
         ),
         "right" => assert_eq!(
-            right_only.status, 200,
-            "the right list has two entries, so both are stored, got {} ({})",
-            right_only.status, right_only.body
+            entries,
+            json!(right[0].entries),
+            "one id holds one configuration, never a merge of the two, got {}",
+            contended.body
         ),
-        other => panic!("the stored set must be one submitted list, got description {other:?}"),
+        other => panic!("the contended id holds one submitted entry, got description {other:?}"),
+    }
+
+    // The entry only the right writer submitted: there whenever that writer was served,
+    // since a batch upserts its entries and takes nothing away.
+    let right_only = get_rate_limit(&router, &gateway_id, "right-only").await;
+    if second.status == 200 {
+        assert_eq!(
+            right_only.status, 200,
+            "the served right list keeps both of its entries, got {} ({})",
+            right_only.status, right_only.body
+        );
+    } else {
+        assert_eq!(
+            (right_only.status, error_code(&right_only.body).as_str()),
+            (404, "ResourceNotFoundException"),
+            "a refused writer writes nothing at all, got {} ({})",
+            right_only.status,
+            right_only.body
+        );
     }
 }
 

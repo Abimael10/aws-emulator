@@ -252,8 +252,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let gateway_id = gateway.gateway_id.clone();
         // An id the caller supplies names a rate limit to CREATE, so an id the
         // gateway already holds is a conflict with that limit rather than a second
-        // limit under one id (the batch write, which REPLACES the whole set, is
-        // where a known id is an upsert instead).
+        // limit under one id (the batch write, which UPSERTS its entries onto the
+        // set, is where a known id is an update instead).
         if let Some(rate_limit_id) = input
             .rate_limit_id
             .as_ref()
@@ -272,21 +272,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Must be unique per gateway—no two rate limits can share the same
         // dimension keys": a second limit over the same scope would leave which of
         // the two throttles a request undecidable, so it is refused as a conflict
-        // with the limit that already holds that scope.
+        // with the limit that already holds that scope — in the one sentence
+        // `crate::state` words that collision in, shared with the batch write.
         if let Some(held) = crate::state::rate_limit_sharing_dimension_keys(
             &gateway.rate_limits,
             &input.dimension_keys,
         ) {
             return Err(CreateGatewayRateLimitErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(format!(
-                        "gateway {gateway_id} already holds the rate limit {} with the dimension \
-                         keys {}; no two rate limits of a gateway can share the same dimension \
-                         keys",
-                        held.rate_limit_id,
-                        input.dimension_keys.join(", ")
-                    )),
-                },
+                crate::state::dimension_keys_conflict(
+                    &gateway_id,
+                    &held.rate_limit_id,
+                    &input.dimension_keys,
+                ),
             )
             .into());
         }

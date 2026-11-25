@@ -2,13 +2,14 @@
 
 //! @op BatchPutGatewayRateLimits
 //!
-//! Replaces the whole rate-limit set of the gateway the path names with the set the
-//! request submits, in [`crate::state`]: an entry carrying a `rateLimitId` an existing
-//! limit holds is upserted onto it (its creation instant kept, its status `UPDATING`),
-//! an entry carrying none is created under a minted id, and a limit the submitted set
-//! leaves out is gone — so the stored set is always exactly one submitted list and never
-//! a merge of two. The whole set is written under one guard, so a batch that is refused
-//! writes nothing.
+//! Upserts the submitted entries onto the rate-limit set of the gateway the path names,
+//! in [`crate::state`]: an entry the gateway already holds a limit for — matched by the
+//! `rateLimitId` the entry carries, and otherwise by the dimension keys that scope it —
+//! is updated in place, keeping its creation instant, and an entry matching nothing is
+//! created under the id the caller named or one minted here. A limit the submitted list
+//! does not name is LEFT WHERE IT IS, so it stays addressable by every later read,
+//! update and delete of it. The whole set is written under one guard, so a batch that
+//! is refused writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -230,33 +231,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 BatchPutGatewayRateLimitsErrorModeled::ValidationException(refusal).into(),
             );
         }
-        // The set one gateway holds is bounded, so a caller cannot grow this
-        // process's memory without bound. `BatchPutLimitEntries` is itself
-        // `@length 1..50`, so the boundary walk has already refused a longer
-        // list: this keeps the ceiling the store's own rather than the request
-        // shape's.
-        if input.rate_limits.len() > crate::state::MAX_RATE_LIMITS_PER_GATEWAY {
-            return Err(
-                BatchPutGatewayRateLimitsErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        message: Some(format!(
-                            "a gateway holds at most {} rate limits",
-                            crate::state::MAX_RATE_LIMITS_PER_GATEWAY
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
         let gateway_id = gateway.gateway_id.clone();
-        // The set this write replaces, read before the ids are minted: an upsert
-        // keeps the creation instant of the limit its id already names.
-        let replaced = gateway.rate_limits.clone();
+        // The set this write upserts ONTO, read before the ids are resolved: it
+        // decides which submitted entry updates a limit the gateway already
+        // holds — keeping that limit's creation instant — and which one creates a
+        // limit beside them.
+        let held = gateway.rate_limits.clone();
 
-        // Each submitted entry under the id it is stored by: the caller's
-        // `rateLimitId` where they supplied one — "If provided, the service uses
-        // it for upsert matching against existing rate limits" — and otherwise
-        // one minted here, distinct from every id this same batch is taking.
+        // Each submitted entry under the id it is stored by: the id the gateway
+        // already holds the matching limit under, decided by the one matching
+        // rule `crate::state` states for a batch entry, and otherwise one minted
+        // here, distinct from every id this same batch is taking.
         let mut taken: ::std::collections::BTreeSet<String> = input
             .rate_limits
             .iter()
@@ -264,7 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         let mut submitted = Vec::with_capacity(input.rate_limits.len());
         for entry in input.rate_limits {
-            let rate_limit_id = match entry.rate_limit_id.clone() {
+            let rate_limit_id = match crate::state::upsert_match(&held, &entry) {
                 Some(rate_limit_id) => rate_limit_id,
                 None => {
                     let minted = store.mint_gateway_rate_limit_id(
@@ -280,25 +265,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             submitted.push((rate_limit_id, entry));
         }
 
-        let written: ::std::collections::BTreeMap<String, crate::state::GatewayRateLimitRecord> =
-            submitted
-                .iter()
-                .map(|(rate_limit_id, entry)| {
-                    (
-                        rate_limit_id.clone(),
-                        crate::state::GatewayRateLimitRecord::stored(
-                            rate_limit_id.clone(),
-                            entry.clone(),
-                            replaced.get(rate_limit_id),
-                            now,
-                        ),
-                    )
-                })
-                .collect();
+        // A rate limit whose deletion has been accepted is on its way out on the
+        // clock and takes no further configuration, so a batch naming it is
+        // refused rather than cancelling the removal the clock already owes it —
+        // the precondition every write of ONE stored limit shares with the
+        // update, decided in `crate::state` so the two cannot drift.
+        if let Some(refusal) = submitted.iter().find_map(|(rate_limit_id, _)| {
+            held.get(rate_limit_id)
+                .and_then(|record| crate::state::refusal_for_rate_limit(Self::NAME, record, now))
+        }) {
+            return Err(
+                BatchPutGatewayRateLimitsErrorModeled::ValidationException(refusal).into(),
+            );
+        }
+
+        // The ids this write stores, held and new alike: what tells a limit the
+        // batch wrote from one it only leaves standing.
+        let stored_by: ::std::collections::BTreeSet<String> = submitted
+            .iter()
+            .map(|(rate_limit_id, _)| rate_limit_id.clone())
+            .collect();
+
+        // The set the gateway ends up with: every limit it already held, with the
+        // submitted entries created or updated onto it. "The operation updates
+        // existing limits with matching keys and creates new limits for new keys"
+        // — an upsert that removes nothing, so a limit this batch never names
+        // stays exactly where it was and stays addressable by its id.
+        let mut written = held.clone();
+        for (rate_limit_id, entry) in &submitted {
+            written.insert(
+                rate_limit_id.clone(),
+                crate::state::GatewayRateLimitRecord::stored(
+                    rate_limit_id.clone(),
+                    entry.clone(),
+                    held.get(rate_limit_id),
+                    now,
+                ),
+            );
+        }
+
+        // The rate limits one gateway holds are bounded, so a caller looping on
+        // this write meets the modelled quota instead of this process's memory
+        // limit. The ceiling is on the RESULTING set: the batch adds to the set
+        // it does not name, so `BatchPutLimitEntries`' own `@length 1..50` does
+        // not bound what the gateway ends up holding.
+        if written.len() > crate::state::MAX_RATE_LIMITS_PER_GATEWAY {
+            return Err(
+                BatchPutGatewayRateLimitsErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "a gateway holds at most {} rate limits",
+                            crate::state::MAX_RATE_LIMITS_PER_GATEWAY
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "No two rate limits can share the same dimension keys" is a rule about
+        // the set the GATEWAY holds, so an entry that would scope a second limit
+        // over a scope another limit of this gateway already holds is refused as a
+        // conflict with that limit — in the one sentence the single create refuses
+        // the same collision in.
+        if let Some((rate_limit_id, dimension_keys)) =
+            crate::state::colliding_dimension_keys(&written, &stored_by)
+        {
+            return Err(BatchPutGatewayRateLimitsErrorModeled::ConflictException(
+                crate::state::dimension_keys_conflict(
+                    &gateway_id,
+                    &rate_limit_id,
+                    &dimension_keys,
+                ),
+            )
+            .into());
+        }
 
         // One assignment, under the one guard: the gateway's set becomes the
-        // submitted set, so no caller can observe a half-applied batch or a merge
-        // of two.
+        // resulting set, so no caller can observe a half-applied batch.
         let gateway = store.gateways.get_mut(&gateway_id).ok_or_else(|| {
             BatchPutGatewayRateLimitsErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
@@ -306,8 +349,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         gateway.rate_limits = written;
         gateway.updated_at = now;
-        // Reported in the order the request submitted them, so the caller reads
-        // the resulting set against the list it sent.
+        // The entries this request submitted, in the order it submitted them and
+        // as they now stand, so the caller reads the result of its own write
+        // against the list it sent — the limits it left standing are read through
+        // the listing, which is what reports a gateway's whole set.
         let rate_limits = submitted
             .iter()
             .filter_map(|(rate_limit_id, _)| gateway.rate_limits.get(rate_limit_id))
