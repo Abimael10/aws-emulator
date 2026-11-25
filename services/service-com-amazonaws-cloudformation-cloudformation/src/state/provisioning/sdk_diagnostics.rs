@@ -234,6 +234,24 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
         "Efs",
         SdkDiagnostic::Attempts,
     ),
+    // AWS Elastic Beanstalk's SDK names it `ElasticBeanstalk` — that model's own
+    // `awsService.cloudFormationName`, which is its `sdkId` (`Elastic Beanstalk`,
+    // `smithy_query(query="service_info")` on that service's model) with the space closed up,
+    // as the name its SDK client carries. The shape is the ATTEMPT-counting one, as the
+    // recorded `ResourceStatusReason` of an `AWS::ElasticBeanstalk::Environment` naming a
+    // solution stack that service does not publish carries it (in the behavioral corpus
+    // `simparity-behavioral-aws-v1`, check `cloudformation__elasticbeanstalk.deploy-\
+    // elasticbeanstalk-environment-invalid-solution-stack-rejected-and-rolled-back`, whose
+    // reason reads `Resource handler returned message: "<the service's sentence> (Service:
+    // ElasticBeanstalk, Status Code: 400, Request ID: …) (SDK Attempt Count: …)"
+    // (RequestToken: …, HandlerErrorCode: InvalidRequest)`). The four resource types this
+    // emulator provisions over this signing name are all that service's
+    // ([`create_eb_application`] and the arms beside it).
+    (
+        crate::state::provisioner::ELASTIC_BEANSTALK_SIGNING_NAME,
+        "ElasticBeanstalk",
+        SdkDiagnostic::Attempts,
+    ),
     // Elastic Load Balancing v2's SDK names it `ElasticLoadBalancingV2` — that model's own
     // `awsService.cloudFormationName`, which is also the name its SDK client carries
     // (`smithy_query(query="service_info")`: `sdkId: "Elastic Load Balancing v2"`,

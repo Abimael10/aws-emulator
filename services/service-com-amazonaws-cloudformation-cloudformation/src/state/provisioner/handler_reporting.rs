@@ -67,6 +67,16 @@ impl Provisioner {
         ) {
             return format!("[{MSK_HANDLER_REQUEST_TOKEN_LABEL}: {token}] {message}");
         }
+        // The `AWS::ElasticBeanstalk::ConfigurationTemplate` provider reports the call it made
+        // as an OPERATION that failed, quoting the exception its SDK raised inside its own
+        // sentence ([`elastic_beanstalk_operation_failure`]) — whatever class the refusal falls
+        // in, since that is how this provider words a refusal rather than something it says
+        // about one kind of refusal. The ENVIRONMENT's provider is not one of these: its
+        // recorded reason carries the service's message alone, which is what makes this
+        // per-type rather than per-service.
+        if matches!(self, Self::ElasticBeanstalkConfigurationTemplate) {
+            return elastic_beanstalk_operation_failure(message);
+        }
         message.to_string()
     }
 
@@ -172,6 +182,22 @@ impl Provisioner {
         ) && code == AMPLIFYUIBUILDER_REFUSED_REQUEST
         {
             return super::provisioning::HANDLER_ERROR_INTERNAL_FAILURE;
+        }
+        // The `AWS::ElasticBeanstalk::ConfigurationTemplate` provider maps none of Elastic
+        // Beanstalk's parameter-value refusals — a solution stack name that service does not
+        // publish is one — so the plugin reports it under the same class for a service that
+        // failed. Recorded behaviour, read from the reason of the failed resource of a stack
+        // declaring such a configuration (in the behavioral corpus
+        // `simparity-behavioral-aws-v1`, check `cloudformation__elasticbeanstalk.deploy-\
+        // elasticbeanstalk-configurationtemplate-invalid-solutionstack-rejected-and-rolled-\
+        // back`, whose reason closes `HandlerErrorCode: GeneralServiceException`), and decided
+        // — as everywhere here — by the CODE that service answered rather than by its message.
+        // The ENVIRONMENT's provider maps that same code to the invalid-request class, which
+        // is what makes this per-type rather than per-service.
+        if matches!(self, Self::ElasticBeanstalkConfigurationTemplate)
+            && code == ELASTIC_BEANSTALK_INVALID_PARAMETER_VALUE
+        {
+            return super::provisioning::HANDLER_ERROR_SERVICE_FAILED;
         }
         // The `AWS::CertificateManager::Certificate` provider maps none of Amazon Route 53's
         // refusals of the change batch it publishes the certificate's DNS validation record

@@ -2012,28 +2012,30 @@ pub(super) const COGNITO_IDP_ARN_NAMESPACE: &str = "cognito-idp";
 /// is the type `super::provisioning` creates in Amazon ECS itself.
 pub const ECS_CLUSTER: &str = "AWS::ECS::Cluster";
 
-/// The three AWS Elastic Beanstalk resource types `super::provisioning` creates in
+/// The four AWS Elastic Beanstalk resource types `super::provisioning` creates in
 /// Elastic Beanstalk itself (that model: `cloudFormationName: ElasticBeanstalk`).
 ///
 /// Each deliberately carries NO [`return_values`] arm, so the default applies and the
 /// physical resource id is the resource's NAME — which is what each type's published
 /// return value is ("Ref returns the Elastic Beanstalk application name", "Ref returns
 /// the Elastic Beanstalk environment name", "Ref returns the auto-generated version
-/// label") and what every Elastic Beanstalk operation addresses the resource by. The
-/// environment's one published attribute, `EndpointURL`, is not computed here either: it
-/// is the endpoint Elastic Beanstalk itself answered the create with, which the
-/// provisioner records on the resource.
-///
-/// `AWS::ElasticBeanstalk::ConfigurationTemplate` is NOT among them: this emulator's
-/// `DeleteConfigurationTemplate` is still a stub, so a stack that created one could never
-/// delete it, and the type is left declared-only (which `super::provisioning` documents)
-/// rather than provisioned into a resource no stack deletion could remove.
+/// label", "Ref returns the name of the configuration template") and what every Elastic
+/// Beanstalk operation addresses the resource by. The attribute each of the two types that
+/// publishes one carries — the environment's `EndpointURL` and the configuration
+/// template's `TemplateName` — is not computed here either: it is the value Elastic
+/// Beanstalk itself answered the create with, which the provisioner records on the
+/// resource.
 pub const ELASTIC_BEANSTALK_APPLICATION: &str = "AWS::ElasticBeanstalk::Application";
 /// See [`ELASTIC_BEANSTALK_APPLICATION`].
 pub const ELASTIC_BEANSTALK_APPLICATION_VERSION: &str =
     "AWS::ElasticBeanstalk::ApplicationVersion";
 /// See [`ELASTIC_BEANSTALK_APPLICATION`].
 pub const ELASTIC_BEANSTALK_ENVIRONMENT: &str = "AWS::ElasticBeanstalk::Environment";
+/// See [`ELASTIC_BEANSTALK_APPLICATION`]. The SAVED CONFIGURATION a stack creates on an
+/// application, which `DescribeApplications` then reports among that application's
+/// `ConfigurationTemplates` and `DescribeConfigurationSettings` reports the settings of.
+pub const ELASTIC_BEANSTALK_CONFIGURATION_TEMPLATE: &str =
+    "AWS::ElasticBeanstalk::ConfigurationTemplate";
 
 /// An Amazon ECS task definition's resource type.
 pub const ECS_TASK_DEFINITION: &str = "AWS::ECS::TaskDefinition";

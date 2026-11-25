@@ -551,6 +551,11 @@ impl Provisioner {
             Self::ElasticBeanstalkApplicationVersion => {
                 describe_eb_application_version(ctx, region, resource).await
             }
+            // And the saved configuration's settings by the template name AND the
+            // application that holds it, which only the resource's own record carries.
+            Self::ElasticBeanstalkConfigurationTemplate => {
+                describe_eb_configuration_template(ctx, region, resource).await
+            }
             Self::ElasticBeanstalkEnvironment => {
                 describe_eb_environment(ctx, region, physical_resource_id).await
             }

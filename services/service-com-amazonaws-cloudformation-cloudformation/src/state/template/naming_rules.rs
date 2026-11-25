@@ -478,12 +478,13 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // inside — every character one is built from is printable and is neither a quotation
         // mark nor a backslash — but may be longer than.
         COGNITO_USER_POOL_RESOURCE_SERVER => rules(256, Characters::AsGenerated),
-        // Elastic Beanstalk `CreateApplication.ApplicationName` (`ApplicationName`) and
-        // `CreateApplicationVersion.VersionLabel` (`VersionLabel`): each
+        // Elastic Beanstalk `CreateApplication.ApplicationName` (`ApplicationName`),
+        // `CreateApplicationVersion.VersionLabel` (`VersionLabel`) and
+        // `CreateConfigurationTemplate.TemplateName` (`ConfigurationTemplateName`): each
         // `@length(min: 1, max: 100)` in that service's own Smithy model.
-        ELASTIC_BEANSTALK_APPLICATION | ELASTIC_BEANSTALK_APPLICATION_VERSION => {
-            rules(100, Characters::AsGenerated)
-        }
+        ELASTIC_BEANSTALK_APPLICATION
+        | ELASTIC_BEANSTALK_APPLICATION_VERSION
+        | ELASTIC_BEANSTALK_CONFIGURATION_TEMPLATE => rules(100, Characters::AsGenerated),
         // CodeDeploy `CreateApplication.applicationName` (`ApplicationName`),
         // `CreateDeploymentGroup.deploymentGroupName` (`DeploymentGroupName`) and
         // `CreateDeploymentConfig.deploymentConfigName` (`DeploymentConfigName`): each

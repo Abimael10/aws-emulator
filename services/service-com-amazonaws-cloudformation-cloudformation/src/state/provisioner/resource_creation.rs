@@ -724,6 +724,13 @@ impl Provisioner {
             Self::ElasticBeanstalkApplicationVersion => {
                 create_eb_application_version(ctx, region, resource).await
             }
+            // `AWS::ElasticBeanstalk::ConfigurationTemplate` publishes no `Tags` property
+            // either: its properties are the application it belongs to, the platform version
+            // its settings are for, the settings themselves and the configuration they are
+            // copied from.
+            Self::ElasticBeanstalkConfigurationTemplate => {
+                create_eb_configuration_template(ctx, region, resource).await
+            }
             Self::ElasticBeanstalkEnvironment => {
                 create_eb_environment(ctx, region, resource, propagated).await
             }

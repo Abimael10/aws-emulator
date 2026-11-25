@@ -2036,6 +2036,164 @@ pub(crate) async fn eb_reported_entry(
     Ok(Some(Value::Object(xml_scalar_children(&answered, "member"))))
 }
 
+/// The members `CreateConfigurationTemplate` takes, from Elastic Beanstalk's own model
+/// (`smithy_query(query="operation", operation="CreateConfigurationTemplate")`), with each
+/// list's element name the Smithy default for a list member that fixes none (`member`).
+///
+/// `AWS::ElasticBeanstalk::ConfigurationTemplate` publishes `ApplicationName`,
+/// `Description`, `EnvironmentId`, `OptionSettings`, `PlatformArn`, `SolutionStackName` and
+/// `SourceConfiguration` — every one of them a member of the create under the same name.
+/// The `TemplateName` is not a property of the type at all ("Ref returns the name of the
+/// configuration template"), so it is the physical id CloudFormation's naming rules computed
+/// and the arm pushes it. The type publishes no `Tags` property, so it is not taggable and
+/// no stack tag is propagated to it.
+pub(crate) const CREATE_CONFIGURATION_TEMPLATE_MEMBERS: &[(&str, QueryMember)] = &[
+    ("ApplicationName", QueryMember::Scalar),
+    ("Description", QueryMember::Scalar),
+    ("EnvironmentId", QueryMember::Scalar),
+    ("OptionSettings", QueryMember::List("member")),
+    ("PlatformArn", QueryMember::Scalar),
+    ("SolutionStackName", QueryMember::Scalar),
+    ("SourceConfiguration", QueryMember::Structure),
+];
+
+/// The member that carries the saved configuration's name — the one `Fn::GetAtt` attribute
+/// the type publishes ("the name of the configuration template"), which is also what the
+/// create answers for the configuration it made and the half of the pair every call of that
+/// service on one addresses it by.
+pub(crate) const CONFIGURATION_TEMPLATE_NAME_MEMBER: &str = "TemplateName";
+
+/// The error code Elastic Beanstalk refuses a value one of its parameters does not take with
+/// (`InvalidParameterValue`, the awsQuery code its own refusals carry — a solution stack name
+/// it does not publish is one), which the configuration template's provider maps to a class
+/// of its own ([`Provisioner::handler_error_class`]).
+pub(crate) const ELASTIC_BEANSTALK_INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
+
+/// How the `AWS::ElasticBeanstalk::ConfigurationTemplate` provider words a refusal of the
+/// call it made: the OPERATION it was carrying out failed, with the exception its SDK raised
+/// quoted inside the sentence.
+///
+/// Recorded behaviour, read from the `ResourceStatusReason` of the failed resource of a stack
+/// declaring a configuration on a solution stack that service does not publish (in the
+/// behavioral corpus `simparity-behavioral-aws-v1`, check
+/// `cloudformation__elasticbeanstalk.deploy-elasticbeanstalk-configurationtemplate-invalid-\
+/// solutionstack-rejected-and-rolled-back`, whose reason reads `Resource handler returned
+/// message: "Error occurred during operation '<the service's sentence> (Service:
+/// ElasticBeanstalk, Status Code: 400, Request ID: …) (SDK Attempt Count: …)'."
+/// (RequestToken: …, HandlerErrorCode: GeneralServiceException)`), where that service's own
+/// API answers the sentence alone.
+pub(crate) fn elastic_beanstalk_operation_failure(message: &str) -> String {
+    format!("Error occurred during operation '{message}'.")
+}
+
+/// Create the saved configuration an `AWS::ElasticBeanstalk::ConfigurationTemplate`
+/// declares, through Elastic Beanstalk's own `CreateConfigurationTemplate`.
+///
+/// The template is created under the name CloudFormation decided — this resource's physical
+/// id, which is what "Ref returns the name of the configuration template" resolves to — on
+/// the application its declaration names, so `DescribeApplications` reports it among that
+/// application's `ConfigurationTemplates` and `DescribeConfigurationSettings` reports the
+/// settings it holds. `TemplateName` is the one attribute the type publishes, so it is
+/// recorded from what Elastic Beanstalk answered rather than computed.
+pub(crate) async fn create_eb_configuration_template(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let mut parameters = query_members(
+        &resource.properties,
+        CREATE_CONFIGURATION_TEMPLATE_MEMBERS,
+        &[],
+        &[CONFIGURATION_TEMPLATE_NAME_MEMBER],
+        ELASTIC_BEANSTALK_CONFIGURATION_TEMPLATE,
+    )?;
+    parameters.push((
+        CONFIGURATION_TEMPLATE_NAME_MEMBER.to_string(),
+        resource.physical_resource_id.clone(),
+    ));
+    let answered = call_query(
+        ctx,
+        ELASTIC_BEANSTALK_SIGNING_NAME,
+        region,
+        ELASTIC_BEANSTALK_API_VERSION,
+        "CreateConfigurationTemplate",
+        &parameters,
+    )
+    .await?;
+    let mut attributes = BTreeMap::new();
+    if let Some(name) =
+        xml_element(&answered, CONFIGURATION_TEMPLATE_NAME_MEMBER).filter(|name| !name.is_empty())
+    {
+        attributes.insert(CONFIGURATION_TEMPLATE_NAME_MEMBER.to_string(), name);
+    }
+    Ok(Created::attributes(attributes))
+}
+
+/// Delete the saved configuration a stack created: its name is this resource's physical id,
+/// and the application that holds it is on the resource's own declaration.
+///
+/// `DeleteConfigurationTemplate` models no not-found error (its one modelled error is
+/// `OperationInProgressException`), so "already gone" is decided by READING the template
+/// back, exactly as the application's and the application version's deletes do.
+pub(crate) async fn delete_eb_configuration_template(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let parameters = vec![
+        ("ApplicationName".to_string(), eb_application_of(resource)),
+        (
+            CONFIGURATION_TEMPLATE_NAME_MEMBER.to_string(),
+            resource.physical_resource_id.clone(),
+        ),
+    ];
+    let refusal = match call_query(
+        ctx,
+        ELASTIC_BEANSTALK_SIGNING_NAME,
+        region,
+        ELASTIC_BEANSTALK_API_VERSION,
+        "DeleteConfigurationTemplate",
+        &parameters,
+    )
+    .await
+    {
+        Ok(_) => return Ok(()),
+        Err(refusal) => refusal,
+    };
+    match describe_eb_configuration_template(ctx, region, resource).await {
+        Ok(None) => Ok(()),
+        _ => Err(refusal),
+    }
+}
+
+/// The saved configuration's settings as Elastic Beanstalk reports them, for drift
+/// detection. Addressed by the PAIR that identifies it: the template name (this resource's
+/// physical id) and the application its declaration names.
+///
+/// `DescribeConfigurationSettings` models no not-found error, and REFUSES a pair that names
+/// no configuration set rather than answering an empty list: the two names are this read's
+/// only parameters, so that service's parameter-value refusal of it says the application does
+/// not hold this saved configuration — which is `None` here, the `DELETED` drift status and
+/// the state a stack's deletion asked for. Any other refusal is a read that did not happen and
+/// says nothing about the configuration, so it stands.
+pub(crate) async fn describe_eb_configuration_template(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let parameters = vec![
+        ("ApplicationName".to_string(), eb_application_of(resource)),
+        (
+            CONFIGURATION_TEMPLATE_NAME_MEMBER.to_string(),
+            resource.physical_resource_id.clone(),
+        ),
+    ];
+    match eb_reported_entry(ctx, region, "DescribeConfigurationSettings", &parameters).await {
+        Err(refusal) if refusal.code == ELASTIC_BEANSTALK_INVALID_PARAMETER_VALUE => Ok(None),
+        reported => reported,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CodeDeploy: AWS::CodeDeploy::Application / ::DeploymentGroup / ::DeploymentConfig
 // ---------------------------------------------------------------------------

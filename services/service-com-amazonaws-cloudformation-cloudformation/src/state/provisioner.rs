@@ -521,6 +521,7 @@ use super::template::{
     EMR_CLUSTER, EVENTS_EVENT_BUS, EVENTS_EVENT_BUS_POLICY, EVENTS_RULE,
     FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
     ELASTIC_BEANSTALK_APPLICATION, ELASTIC_BEANSTALK_APPLICATION_VERSION,
+    ELASTIC_BEANSTALK_CONFIGURATION_TEMPLATE,
     ELASTIC_BEANSTALK_ENVIRONMENT, GLUE_CRAWLER, GLUE_DATABASE, GLUE_TABLE,
     GLUE_TABLE_OPTIMIZER, GRAFANA_WORKSPACE,
     GUARDDUTY_DETECTOR, GUARDDUTY_IP_SET,
@@ -1234,6 +1235,11 @@ pub(super) enum Provisioner {
     Route53TrafficPolicy,
     ElasticBeanstalkApplication,
     ElasticBeanstalkApplicationVersion,
+    /// `AWS::ElasticBeanstalk::ConfigurationTemplate`: the SAVED CONFIGURATION
+    /// `CreateConfigurationTemplate` makes on an application and
+    /// `DeleteConfigurationTemplate` removes, each addressed by the application-and-template
+    /// pair every call of that service on one takes.
+    ElasticBeanstalkConfigurationTemplate,
     ElasticBeanstalkEnvironment,
     TransferServer,
     CodeDeployApplication,
@@ -1940,6 +1946,9 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         ELASTIC_BEANSTALK_APPLICATION => Some(Provisioner::ElasticBeanstalkApplication),
         ELASTIC_BEANSTALK_APPLICATION_VERSION => {
             Some(Provisioner::ElasticBeanstalkApplicationVersion)
+        }
+        ELASTIC_BEANSTALK_CONFIGURATION_TEMPLATE => {
+            Some(Provisioner::ElasticBeanstalkConfigurationTemplate)
         }
         ELASTIC_BEANSTALK_ENVIRONMENT => Some(Provisioner::ElasticBeanstalkEnvironment),
         TRANSFER_SERVER => Some(Provisioner::TransferServer),
@@ -2674,6 +2683,11 @@ impl Provisioner {
             // application half of that pair is on the resource's own declaration.
             Self::ElasticBeanstalkApplicationVersion => {
                 delete_eb_application_version(ctx, region, resource).await
+            }
+            // A saved configuration is keyed by the PAIR that identifies it, and the
+            // application half of that pair is on the resource's own declaration.
+            Self::ElasticBeanstalkConfigurationTemplate => {
+                delete_eb_configuration_template(ctx, region, resource).await
             }
             Self::ElasticBeanstalkEnvironment => {
                 terminate_eb_environment(ctx, region, physical_resource_id).await
