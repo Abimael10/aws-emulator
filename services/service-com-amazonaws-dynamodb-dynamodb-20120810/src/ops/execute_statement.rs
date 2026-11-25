@@ -229,6 +229,27 @@ impl From<ExecuteStatementErrorModeled> for ExecuteStatementError {
     }
 }
 
+/// How a read that asks for an ORDER and states no predicate at all is refused.
+///
+/// An order is served over ONE partition of the source — inside a partition the entries
+/// already stand in sort-key order, so the order asked for is that order or its reverse —
+/// and the predicate is what names the partition, so a statement with no `WHERE` clause
+/// asks for an order over the whole source. The sentence is fixed and names neither the
+/// attribute nor the source.
+const ORDER_BY_WITHOUT_WHERE_MESSAGE: &str =
+    "Must have WHERE clause in the statement when using ORDER BY clause.";
+
+/// How a read that asks to be ordered by an attribute that is no KEY of the source it
+/// reads is refused, naming the attribute the statement ordered by.
+///
+/// "ORDER BY clause can only be used on a key attribute" (the `ExecuteStatement` doc):
+/// the entries of a partition stand in the order of the key, so the only order a read can
+/// be served in is that one or its reverse — any other order would have to be computed
+/// over the whole source. The attribute named is the one the statement wrote.
+fn order_by_not_a_key_message(attribute: &str) -> String {
+    format!("Attribute {attribute} in ORDER BY clause must be part of the primary key")
+}
+
 /// The `ExecuteStatement` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -519,11 +540,20 @@ fn select_items(
     // pinning the partition key of the source it reads is refused instead of answered in
     // another order.
     if let Some((attribute, _)) = select.order_by.as_ref() {
+        // "Must have WHERE clause in the statement when using ORDER BY clause": the order
+        // is served over ONE partition of the source, and the predicate is what names that
+        // partition — so a statement stating no predicate at all is refused for the clause
+        // it does not state, before the attribute it orders by is judged.
+        if select.filter.is_none() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                ORDER_BY_WITHOUT_WHERE_MESSAGE,
+            ));
+        }
         if !crate::state::orderable_attributes(table, select.index.as_deref())
             .contains(attribute.as_str())
         {
             return Err(crate::scaffolded::Scaffolded::validation(
-                "ORDER BY is supported only on a key attribute of the source",
+                order_by_not_a_key_message(attribute),
             ));
         }
         if keyed.is_none() {

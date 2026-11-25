@@ -146,10 +146,12 @@ fn parse_rows() -> Vec<Row> {
             expected: parse_failure("Expected data manipulation"),
         },
         Row {
+            // A source that is no NAME is refused for the source the clause reads from,
+            // which is its own fixed sentence rather than a parse defect: the text parsed.
             case: "a single-quoted table name is a literal, not a name",
             statement: format!("SELECT * FROM '{TABLE}'"),
             parameters: Value::Null,
-            expected: parse_failure("Expected identifier for simple path"),
+            expected: "Unexpected from source".to_string(),
         },
         Row {
             case: "a single-quoted attribute name in a projection",
@@ -715,7 +717,7 @@ async fn a_transaction_states_the_slot_a_statement_was_sent_in() {
         (
             "a single-quoted table name",
             format!("SELECT * FROM '{TABLE}' WHERE pk = 'a'"),
-            parse_failure("Expected identifier for simple path"),
+            "Unexpected from source".to_string(),
         ),
         (
             "an unknown function",
@@ -868,7 +870,7 @@ fn cross_surface_rows() -> Vec<Row> {
             case: "a single-quoted table name",
             statement: format!("SELECT * FROM '{TABLE}'"),
             parameters: Value::Null,
-            expected: parse_failure("Expected identifier for simple path"),
+            expected: "Unexpected from source".to_string(),
         },
         Row {
             case: "an unknown function",

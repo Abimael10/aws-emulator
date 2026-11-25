@@ -94,11 +94,10 @@ async fn a_lexeme_the_scanner_cannot_read_is_refused_with_an_empty_tail() {
     let router = seeded().await;
 
     // The rows differ in the KIND of unreadable lexeme (an exponent marker with no
-    // exponent, in either case and with either sign; a second decimal point; a number run
-    // together with a word; a quoted run left open) and in WHERE the statement spells it
-    // (an INSERT's value, a projection, a predicate, a SET clause, inside a list, inside a
-    // bag, in the source path itself) — the tail is empty for every one of them, because
-    // no token was ever made.
+    // exponent, in either case and with either sign; a second decimal point; a quoted run
+    // left open) and in WHERE the statement spells it (an INSERT's value, a predicate, a
+    // SET clause, inside a list, in the source path itself) — the tail is empty for every
+    // one of them, because no token was ever made.
     for (case, statement) in [
         (
             "an exponent marker with no exponent, in an INSERT value",
@@ -125,14 +124,6 @@ async fn a_lexeme_the_scanner_cannot_read_is_refused_with_an_empty_tail() {
             format!("INSERT INTO \"{TABLE}\" VALUE {{'pk': 'py', 'l': [1.2.3]}}"),
         ),
         (
-            "a number run together with a word, inside a bag literal",
-            format!("INSERT INTO \"{TABLE}\" VALUE {{'pk': 'py', 's': <<5abc>>}}"),
-        ),
-        (
-            "a number run together with an underscore word, in a projection",
-            format!("SELECT 6_7 FROM \"{TABLE}\""),
-        ),
-        (
             "a string literal the statement never closes",
             format!("INSERT INTO \"{TABLE}\" VALUE {{'pk': 'open"),
         ),
@@ -152,8 +143,21 @@ async fn a_lexeme_the_scanner_cannot_read_is_refused_with_an_empty_tail() {
 
     // The contrast: a literal the scanner READ and the grammar then found unclosed stops
     // at a token position, so that class names the token it required. The two classes are
-    // therefore distinguishable, which is what the empty tail above is for.
+    // therefore distinguishable, which is what the empty tail above is for. A number and a
+    // word RUNNING TOGETHER belong to this second class: the lexeme ends where its digits
+    // do and the word after it is the next token, so the parse stops at a position of the
+    // grammar and the refusal names it.
     for (case, statement, phrase) in [
+        (
+            "a number run together with a word, inside a bag literal",
+            format!("INSERT INTO \"{TABLE}\" VALUE {{'pk': 'py', 's': <<5abc>>}}"),
+            "Expected RIGHT_DOUBLE_ANGLE_BRACKET",
+        ),
+        (
+            "a number run together with an underscore word, in a projection",
+            format!("SELECT 6_7 FROM \"{TABLE}\""),
+            "Expected identifier for simple path",
+        ),
         (
             "a tuple literal the statement never closes",
             format!("INSERT INTO \"{TABLE}\" VALUE {{'pk': 'py', 'n': 1"),

@@ -19,9 +19,10 @@
 //! 4. Text the scanner cannot read at all — a run it never closes, a numeric lexeme it
 //!    cannot finish, a character the language spells nothing with — never became tokens, so
 //!    there is no grammar position to name and the refusal states the fixed sentence with no
-//!    phrase behind it. A `.` that opens no number is a TOKEN of the language (the step
-//!    separator), so text that writes one where a value belongs stops at that token and is
-//!    refused as the term it is.
+//!    phrase behind it. Text the scanner CAN read stops at a token instead: a `.` that opens
+//!    no number is a TOKEN of the language (the step separator), so text that writes one
+//!    where a value belongs is refused as the term it is, and a number with a word run onto
+//!    it is two lexemes — the number, and the word standing past the expression it completed.
 //!
 //! The rows differ along what each rule generalises over: where the digits, the point and
 //! the exponent stand in a literal and how the exponent is signed; WHICH comment, where in
@@ -50,6 +51,10 @@ const NO_PHRASE: &str = "";
 
 /// The parser's phrase for a token the grammar has no place for where it stands.
 const UNEXPECTED_TERM: &str = "Unexpected term";
+
+/// The parser's phrase for a token standing past a complete expression — which is where a
+/// word run onto the end of a number stands, that word being its own lexeme.
+const TRAILING_TOKEN: &str = "Unexpected token after expression";
 
 /// One emulator holding one active table, keyed by a string partition key.
 async fn seeded() -> MultiServiceRouter {
@@ -447,14 +452,17 @@ async fn text_the_scanner_cannot_read_carries_no_phrase() {
             NO_PHRASE,
         ),
         (
+            // A number and a word RUNNING TOGETHER are two lexemes, not one the scanner
+            // cannot read: the number ends where its digits do, so the text became tokens
+            // and the parse stopped at the word standing past the complete expression.
             "a number run together with a word",
             format!("SELECT pk FROM \"{TABLE}\" WHERE n = 1abc"),
-            NO_PHRASE,
+            TRAILING_TOKEN,
         ),
         (
             "a number run together with an underscore",
             format!("SELECT pk FROM \"{TABLE}\" WHERE n = 1_0"),
-            NO_PHRASE,
+            TRAILING_TOKEN,
         ),
         (
             "a hash, which the language spells nothing with",

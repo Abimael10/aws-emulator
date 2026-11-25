@@ -53,6 +53,18 @@
 //! quoting mistake from an unknown function, and nothing but the request's own text
 //! appears in the message.
 //!
+//! What the GRAMMAR reads and what this surface SERVES are two different things, and the
+//! refusals say which is which: the grammar's `FROM` clause reads from an expression and
+//! may bind a name to it, while this surface reads from "data stored in DynamoDB" (the
+//! `ExecuteStatement` doc), so text that parses as the language and asks for something
+//! this surface does not serve is refused for THAT — the binding
+//! ([`aliasing_unsupported`]), the source that names no table
+//! ([`unexpected_from_source`]), a clause it does not read ([`unsupported_clause`],
+//! [`unsupported_clause_named`]), a token standing where it reads a projection
+//! ([`unsupported_token_in_expression`]) — and not as a defect of the text. Those
+//! requirements are therefore applied once the whole statement has READ, so text that is
+//! no statement of the language still reports its own parse defect.
+//!
 //! Every bound the walk uses is this module's own constant
 //! ([`MAX_STATEMENT_TOKENS`], [`MAX_STATEMENT_DEPTH`]), so neither the token vector
 //! nor the parser's stack is a function of what a caller sends.
@@ -165,10 +177,9 @@ enum ParseDefect {
     /// reports no phrase for it at all.
     Unterminated,
     /// A LEXEME the scanner cannot read at all: a numeric literal whose exponent marker
-    /// carries no exponent, a number run together with a word, a character the language
-    /// spells nothing with. The text never became tokens, so there is no grammar position
-    /// to name and the parser reports no phrase — the same empty tail an unterminated run
-    /// earns.
+    /// carries no exponent, a character the language spells nothing with. The text never
+    /// became tokens, so there is no grammar position to name and the parser reports no
+    /// phrase — the same empty tail an unterminated run earns.
     Lexeme,
     /// The `}` that closes a tuple literal is not there.
     ExpectedRightCurly,
@@ -348,6 +359,36 @@ fn invalid_returning_clause(clause: &str) -> RequestError {
     ))
 }
 
+/// The set quantifier a `SELECT` list may open with in the language that this surface
+/// does not run, as the language spells it.
+///
+/// `SELECT DISTINCT …` reports the distinct projections of the entries read, which is
+/// computed over the whole result rather than read from the store — this surface serves
+/// "reads and singleton writes on data stored in DynamoDB" (the `ExecuteStatement` doc) —
+/// so the quantifier is a token of the language standing where this dialect reads the
+/// paths a projection names, and the refusal names that token
+/// ([`unsupported_token_in_expression`]).
+const DISTINCT_QUANTIFIER: &str = "DISTINCT";
+
+/// How a token of the language standing where this dialect reads an EXPRESSION is
+/// refused: the token, in the LANGUAGE's own spelling of it rather than the statement's,
+/// the way a refusal about a clause this surface does not serve names the clause
+/// ([`unsupported_clause_named`]).
+fn unsupported_token_in_expression(token: &str) -> RequestError {
+    RequestError::Validation(format!("Unsupported token in expression: {token}"))
+}
+
+/// How a statement whose source is no table NAME is refused: the fixed sentence
+/// DynamoDB states about the source a clause reads from.
+///
+/// The language's `FROM` clause reads from an EXPRESSION, and this surface reads from
+/// "data stored in DynamoDB" (the `ExecuteStatement` doc) — one table, and for a read one
+/// index of it — so a source that is an expression rather than a name reads from nothing
+/// this store holds. The sentence is fixed and echoes no part of the statement.
+fn unexpected_from_source() -> RequestError {
+    RequestError::Validation("Unexpected from source".to_string())
+}
+
 /// How a statement that binds an ALIAS to the table it names is refused.
 ///
 /// PartiQL's grammar lets a source bind a name — `FROM table AS t`, or the same binding
@@ -510,6 +551,22 @@ pub fn check_single_attribute_source_key(
 /// ([`NON_DML_STATEMENT_OPERATIONS`]) — and the keyword a refusal states is the language's
 /// own spelling of it, not the statement's.
 const UNSUPPORTED_CLAUSES: [&str; 2] = ["LIMIT", "OFFSET"];
+
+/// The same, for the clauses of the language this surface does not serve that are spelled
+/// with TWO keywords, each stated as the pair the language spells it with.
+///
+/// A clause of this kind groups or orders the WHOLE result rather than carrying one
+/// expression of its own, so the refusal about it names the clause and nothing else
+/// ([`unsupported_clause_named`]), where a clause made of one keyword and the expression
+/// after it is refused at that expression's position ([`unsupported_clause`]).
+const UNSUPPORTED_CLAUSE_PAIRS: [(&str, &str); 1] = [("GROUP", "BY")];
+
+/// How a clause this surface does not serve that carries no expression of its own is
+/// refused: the clause, as the LANGUAGE spells it, and nothing of the statement's own
+/// text.
+fn unsupported_clause_named(clause: &str) -> RequestError {
+    RequestError::Validation(format!("Unsupported clause: {clause}"))
+}
 
 /// How a clause this surface does not serve is refused: the clause keyword, and where the
 /// statement spells the expression that clause carries.
@@ -1077,10 +1134,16 @@ fn quoted(
 /// it — is [`canonical_number_text`]'s business.
 ///
 /// A literal the scanner cannot finish reading is no lexeme at all: an exponent marker
-/// with no exponent after it (`1e`), or a number run together with a word (`1abc`),
-/// stops the scan where it stands rather than splitting into a number and a word the
-/// grammar would then refuse — a LEXICAL defect, which carries no phrase
-/// ([`ParseDefect::Lexeme`]).
+/// with no exponent after it (`1e`) stops the scan where it stands — a LEXICAL defect,
+/// which carries no phrase ([`ParseDefect::Lexeme`]).
+///
+/// A number and a word RUNNING TOGETHER are two lexemes, not one the scanner cannot
+/// read: the lexeme ends where its digits do, and the word after it is the next token,
+/// which is how the language's own scanner reads the same run. So a name a statement
+/// spells unquoted that may not stand unquoted — one opening with a digit — is read as
+/// the number and the name after it, and the statement is refused for the GRAMMAR that
+/// then describes it (a term with a name bound to it, which is a binding this surface
+/// does not serve) rather than for a character the scanner could not read.
 fn number(characters: &[char], at: usize) -> Result<(String, usize), RequestError> {
     let mut index = at;
     while index < characters.len() && characters[index].is_ascii_digit() {
@@ -1111,11 +1174,6 @@ fn number(characters: &[char], at: usize) -> Result<(String, usize), RequestErro
         while index < characters.len() && characters[index].is_ascii_digit() {
             index += 1;
         }
-    }
-    // A word character where the number ends means the two ran together, which is one
-    // lexeme the scanner cannot read rather than two tokens.
-    if characters.get(index).copied().is_some_and(is_word_char) {
-        return Err(statement_parse_error(ParseDefect::Lexeme));
     }
     Ok((characters[at..index].iter().collect(), index))
 }
@@ -1660,6 +1718,7 @@ pub fn parse_statement(
         used_parameters: 0,
         depth: 0,
         aliased: false,
+        source_defect: None,
     };
     let parsed = parser.statement()?;
     // "Only one query is allowed": a `;` ends the query, so text after it is a second
@@ -1682,6 +1741,11 @@ pub fn parse_statement(
     // text that never parsed still reports its own parse defect.
     if parser.aliased {
         return Err(aliasing_unsupported());
+    }
+    // A source that named no table at all is refused for the name it is not, once the
+    // text it stands in has parsed — the way a binding is.
+    if let Some(refusal) = parser.source_defect.take() {
+        return Err(refusal);
     }
     // "The parameters for the PartiQL statement, if any" (`Parameters`): a request
     // that sends more values than the statement has markers for has sent a statement
@@ -1708,6 +1772,9 @@ struct StatementParser<'t> {
     /// of the grammar, so it is READ here and refused once the whole statement has
     /// parsed ([`aliasing_unsupported`]).
     aliased: bool,
+    /// The refusal a source that NAMES no table earns, kept until the whole statement has
+    /// parsed for the same reason a binding is ([`Self::read_source`]).
+    source_defect: Option<RequestError>,
 }
 
 impl StatementParser<'_> {
@@ -1921,15 +1988,25 @@ impl StatementParser<'_> {
     }
 
     /// The refusal a clause this surface does not serve earns, when the token the parser
-    /// stands on opens one ([`UNSUPPORTED_CLAUSES`]), and `None` for every other token.
+    /// stands on opens one ([`UNSUPPORTED_CLAUSES`], [`UNSUPPORTED_CLAUSE_PAIRS`]), and
+    /// `None` for every other token.
     ///
     /// The keyword is CONSUMED, so the position the refusal reports is where the statement
     /// spells the expression the clause carries — and, for a clause stating none at all,
-    /// the empty position just past the text ([`Self::position`]).
+    /// the empty position just past the text ([`Self::position`]). A clause spelled with
+    /// TWO keywords carries no expression of its own, so its refusal names the clause
+    /// alone ([`unsupported_clause_named`]).
     fn unsupported_clause(&mut self) -> Option<RequestError> {
         let Some(Token::Word(word)) = self.peek() else {
             return None;
         };
+        if let Some((first, second)) = UNSUPPORTED_CLAUSE_PAIRS
+            .iter()
+            .find(|(first, second)| word.eq_ignore_ascii_case(first) && self.peek_word_at(1, second))
+        {
+            self.at += 2;
+            return Some(unsupported_clause_named(&format!("{first} {second}")));
+        }
         let clause = UNSUPPORTED_CLAUSES
             .iter()
             .find(|clause| word.eq_ignore_ascii_case(clause))?;
@@ -2118,6 +2195,13 @@ impl StatementParser<'_> {
     /// `SELECT (* | attribute, …) FROM source [WHERE predicate] [ORDER BY attribute
     /// [ASC | DESC]]`.
     fn select(&mut self) -> Result<SelectStatement, RequestError> {
+        // The quantifier a `SELECT` list may open with ([`DISTINCT_QUANTIFIER`]) stands
+        // where this dialect reads the paths the projection names: it is a token of the
+        // language this surface does not run, and that is what the statement is told,
+        // rather than being refused for the keyword standing where a name belongs.
+        if self.peek_word(DISTINCT_QUANTIFIER) {
+            return Err(unsupported_token_in_expression(DISTINCT_QUANTIFIER));
+        }
         let projection = if self.accept(&Token::Star) {
             None
         } else {
@@ -2334,8 +2418,36 @@ impl StatementParser<'_> {
 
     /// The source a `FROM` clause names — a `SELECT`'s and a `DELETE`'s: `table` or
     /// `table.index`, either part quoted or bare.
+    ///
+    /// The clause's source is one TERM of the language, and that it NAME a table is this
+    /// dialect's own requirement rather than the grammar's: a term that is no name — a
+    /// literal — is READ here, together with the binding that may follow it
+    /// ([`Self::read_table_alias`]), and the statement is refused once the whole text has
+    /// parsed: for the BINDING where it states one ([`aliasing_unsupported`]), and
+    /// otherwise for the name the term is not ([`Self::source_defect`]). So a statement
+    /// whose source is a literal with a name after it — which is how the language reads a
+    /// name spelled unquoted that may not stand unquoted — states a binding, and that is
+    /// what it is told.
     fn read_source(&mut self) -> Result<StatementSource, RequestError> {
-        let table = self.path_component()?;
+        let opens_at = self.at;
+        let table = match self.path_component() {
+            Ok(component) => component,
+            Err(refusal) => {
+                // The term is read from where the clause opens it, whatever of it the
+                // name that was required there read before failing.
+                self.at = opens_at;
+                if !matches!(self.peek(), Some(Token::Number(_) | Token::Text(_))) {
+                    return Err(refusal);
+                }
+                self.at += 1;
+                // The source names no table, so the name every later clause of the
+                // statement would be resolved against is the empty one: the statement is
+                // refused for the source it states (or for its binding) before anything
+                // is resolved.
+                self.source_defect = Some(unexpected_from_source());
+                String::new()
+            }
+        };
         let index = if self.accept(&Token::Dot) {
             Some(self.path_component()?)
         } else {
@@ -2348,7 +2460,29 @@ impl StatementParser<'_> {
                 FROM_PATH_ARITY_MESSAGE.to_string(),
             ));
         }
-        let source = StatementSource { table, index };
+        // The source of the clause is one EXPRESSION of the language, which carries on
+        // across its binary value operators ([`Self::at_value_operator`]): a source
+        // continued by one is that expression and names no table, whatever its first
+        // operand reads as. It is read whole here so the binding that may follow it is
+        // read as well, which is what text spelling a name no name may be spelled with —
+        // a name carrying one of those operators — reads as in the language.
+        let mut source = StatementSource { table, index };
+        while self.at_value_operator() {
+            let operator_at = self.at;
+            self.at += 1;
+            if !self.read_query_term() {
+                // The operand the operator introduces does not read, so the text is no
+                // expression: the operator belongs to nothing, and the statement is left
+                // to the defect its own text earns.
+                self.at = operator_at;
+                break;
+            }
+            self.source_defect = Some(unexpected_from_source());
+            source = StatementSource {
+                table: String::new(),
+                index: None,
+            };
+        }
         self.read_table_alias();
         Ok(source)
     }
