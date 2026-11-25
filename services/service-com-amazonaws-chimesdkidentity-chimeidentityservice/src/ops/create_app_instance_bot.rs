@@ -313,6 +313,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The `Tags` this create carries go in the family's shared, ARN-keyed directory,
+        // which REFUSES a write that would take the resource past the tag count the family's
+        // `TagList` bounds it by and stores NONE of the pairs when it does. That refusal is
+        // the resource-limit error this operation models, and the bot this create had just
+        // stored is taken back out, so a refused create leaves nothing behind. (A bot ARN
+        // carries a freshly minted uuid, so the directory holds no tags for it yet and the
+        // merge is refused only by a request bigger than the maximum itself; the outcome is
+        // read here because a create may not report stored tags the directory turned away,
+        // whichever way the ARN was formed.)
+        let mut tag_directory = tag_directory.lock();
+        if !tags.is_empty() {
+            if let ::service_common::chime_tags::Tagged::TooManyTags(requested) =
+                tag_directory.tag(&arn, tags)
+            {
+                // Nothing else has been written for this bot yet, so this is the whole of
+                // the create.
+                let _refused = state.remove_bot(&arn);
+                return Err(
+                    CreateAppInstanceBotErrorModeled::ResourceLimitExceededException(
+                        ResourceLimitExceededException {
+                            code: Some(crate::state::RESOURCE_LIMIT_EXCEEDED_CODE.to_string()),
+                            message: Some(crate::state::too_many_tags_message(requested, &arn)),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        drop(tag_directory);
+
         // The bot is stored either way; at the structural token ceiling the token is
         // simply not recorded, so the map cannot grow past it.
         let _recorded = state.record_idempotency(
@@ -325,9 +355,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // publish: the directory holds what was registered, never a placeholder.
         if let Some(name) = &input.name {
             name_directory.lock().register(&arn, name);
-        }
-        if !tags.is_empty() {
-            tag_directory.lock().tag(&arn, tags);
         }
 
         Ok(CreateAppInstanceBotOutput {

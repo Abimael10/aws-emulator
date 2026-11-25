@@ -258,8 +258,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         state.app_instances.insert(arn.clone(), record);
+        // The `Tags` this create carries go in the family's shared, ARN-keyed directory,
+        // which REFUSES a write that would take the resource past the tag count the family's
+        // `TagList` bounds it by and stores NONE of the pairs when it does. That refusal is
+        // the resource-limit error this operation models, and the instance this create had
+        // just stored is taken back out, so a refused create leaves nothing behind. (An
+        // instance ARN carries a freshly minted uuid, so the directory holds no tags for it
+        // yet and the merge is refused only by a request bigger than the maximum itself; the
+        // outcome is read here because a create may not report stored tags the directory
+        // turned away, whichever way the ARN was formed.)
         if !tags.is_empty() {
-            tag_directory.lock().tag(&arn, tags);
+            if let ::service_common::chime_tags::Tagged::TooManyTags(requested) =
+                tag_directory.lock().tag(&arn, tags)
+            {
+                // Nothing else has been written for this instance yet — the token below is
+                // recorded only once the create stands — so this is the whole of it. The
+                // removal is the raw one: an instance this create never handed out was
+                // never deleted, so nothing is withdrawn for its ARN.
+                let _refused = state.app_instances.remove(&arn);
+                return Err(
+                    CreateAppInstanceErrorModeled::ResourceLimitExceededException(
+                        ResourceLimitExceededException {
+                            code: Some(crate::state::RESOURCE_LIMIT_EXCEEDED_CODE.to_string()),
+                            message: Some(crate::state::too_many_tags_message(requested, &arn)),
+                        },
+                    )
+                    .into(),
+                );
+            }
         }
         // The instance is stored either way; at the structural token ceiling the token
         // is simply not recorded, so the map cannot grow past it.

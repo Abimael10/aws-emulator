@@ -20,6 +20,12 @@
 //!   withdrawn resource serves for a tagging call naming it, because this service serves the
 //!   tagging routes for every member's resource and cannot read a sibling's store.
 //!
+//! The wording of the other refusal a tag WRITE earns — the pairs would take the resource
+//! past the tag count the family's `TagList` bounds it by, so the shared directory stores
+//! none of them ([`too_many_tags_message`]) — is stated here for the same reason: `TagResource`
+//! and every create that carries `Tags` answer that one refusal, so they cannot word it
+//! differently either.
+//!
 //! The same rule read the other way round is what this service's own deletes PUBLISH:
 //! [`withdrawal_for`] answers, for an ARN this service has just stopped holding, the class
 //! and the wording a tagging call naming it earns here, and a delete records that pair in
@@ -45,6 +51,25 @@ const FORBIDDEN_CODE: &str = "Forbidden";
 /// The `Code` a refusal carries when the member owning the resource states a tagging call
 /// naming it as an invalid request.
 const BAD_REQUEST_CODE: &str = "BadRequest";
+
+/// The `Code` the modelled `ResourceLimitExceededException` (HTTP 400) carries.
+pub const RESOURCE_LIMIT_EXCEEDED_CODE: &str = "ResourceLimitExceeded";
+
+/// The sentence a refusal of a tag WRITE carries when the pairs it asks for would take the
+/// resource past the tag count the family's `TagList` bounds it by.
+///
+/// One function because the shared directory refuses such a write the same way wherever it
+/// is made — it stores nothing — and every route of this service that writes tags has to
+/// report that refusal: the tagging call itself and each create that carries `Tags`. The
+/// count is the one the refused merge would have reached, which is what tells a caller how
+/// far past the maximum its request was.
+pub fn too_many_tags_message(requested: usize, resource_arn: &str) -> String {
+    format!(
+        "{requested} tags were requested for {resource_arn}, which is more than the maximum \
+         of {} tags per resource",
+        ::service_common::chime_tags::MAX_TAGS_PER_RESOURCE
+    )
+}
 
 /// Which of the two client-error shapes every tagging operation of this model declares the
 /// refusal belongs to, with the `Code` and `Message` it carries.

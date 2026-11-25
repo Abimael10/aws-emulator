@@ -216,17 +216,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         match outcome {
             ::service_common::chime_tags::Tagged::Stored => Ok(TagResourceOutput),
             // Past the tag count every Chime `TagList` is bounded by, nothing is written
-            // and the modelled resource-limit refusal says so.
+            // and the modelled resource-limit refusal says so — worded by the one function
+            // every route of this service that writes tags answers that refusal with.
             ::service_common::chime_tags::Tagged::TooManyTags(requested) => Err(
                 TagResourceErrorModeled::ResourceLimitExceededException(
                     ResourceLimitExceededException {
-                        code: Some("ResourceLimitExceeded".to_string()),
-                        message: Some(format!(
-                            "{} tags were requested for {}, which is more than the maximum \
-                             of {} tags per resource",
+                        code: Some(crate::state::RESOURCE_LIMIT_EXCEEDED_CODE.to_string()),
+                        message: Some(crate::state::too_many_tags_message(
                             requested,
-                            input.resource_arn,
-                            ::service_common::chime_tags::MAX_TAGS_PER_RESOURCE
+                            &input.resource_arn,
                         )),
                     },
                 )

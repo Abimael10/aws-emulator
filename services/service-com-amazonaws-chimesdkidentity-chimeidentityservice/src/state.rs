@@ -50,7 +50,10 @@ use crate::ops::types::{
 /// generic tagging handlers resolve through rather than each stating it again.
 pub mod tagging_arn;
 
-pub use tagging_arn::{tagging_arn_refusal, withdrawal_for, TaggingArnRefusal};
+pub use tagging_arn::{
+    tagging_arn_refusal, too_many_tags_message, withdrawal_for, TaggingArnRefusal,
+    RESOURCE_LIMIT_EXCEEDED_CODE,
+};
 
 /// The region used for a minted ARN when the request carries no SigV4 credential
 /// scope to read one from (an unsigned or presigned request).

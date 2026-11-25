@@ -330,6 +330,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The `Tags` this create carries go in the family's shared, ARN-keyed directory,
+        // which REFUSES a write that would take the resource past the tag count the family's
+        // `TagList` bounds it by and stores NONE of the pairs when it does. A user ARN is
+        // fully determined by the request, so the directory can already hold tags for it —
+        // written through whichever member served an earlier tagging call — and the refused
+        // merge is reachable here. The refusal is the resource-limit error this operation
+        // models, and the user this create had just stored is taken back out, so a refused
+        // create leaves nothing behind: the id is free and no token was spent on it.
+        let mut tag_directory = tag_directory.lock();
+        if !tags.is_empty() {
+            if let ::service_common::chime_tags::Tagged::TooManyTags(requested) =
+                tag_directory.tag(&arn, tags)
+            {
+                // The user this create had just stored, taken back out: nothing else has
+                // been written for it yet, so this is the whole of the create.
+                let _refused = state.remove_user(&arn);
+                return Err(
+                    CreateAppInstanceUserErrorModeled::ResourceLimitExceededException(
+                        ResourceLimitExceededException {
+                            code: Some(crate::state::RESOURCE_LIMIT_EXCEEDED_CODE.to_string()),
+                            message: Some(crate::state::too_many_tags_message(requested, &arn)),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        // The user ARN carries the id the caller chose, so this create can mint an ARN a
+        // delete of the same id earlier WITHDREW in the shared directory. The resource that
+        // ARN names exists again, so the withdrawal is released here — without that, a
+        // sibling serving one of the family's shared tagging routes would keep refusing a
+        // tagging call for a live user.
+        tag_directory.readmit(&arn);
+        drop(tag_directory);
+
         // The user is stored either way; at the structural token ceiling the token is
         // simply not recorded, so the map cannot grow past it.
         let _recorded = state.record_idempotency(
@@ -339,18 +374,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &fingerprint,
         );
         name_directory.lock().register(&arn, &input.name);
-        // The user ARN carries the id the caller chose, so this create can mint an ARN a
-        // delete of the same id earlier WITHDREW in the shared directory. The resource that
-        // ARN names exists again, so the withdrawal is released here — without that, a
-        // sibling serving one of the family's shared tagging routes would keep refusing a
-        // tagging call for a live user.
-        {
-            let mut tag_directory = tag_directory.lock();
-            tag_directory.readmit(&arn);
-            if !tags.is_empty() {
-                tag_directory.tag(&arn, tags);
-            }
-        }
 
         Ok(CreateAppInstanceUserOutput {
             app_instance_user_arn: Some(arn),

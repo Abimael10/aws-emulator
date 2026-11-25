@@ -9,7 +9,9 @@
 //! list for a resource carrying none. A tagging call keyed by a resource of this service
 //! that does not exist is refused with the modelled client error carrying the `NotFound`
 //! code, and one that would take a resource past the modelled maximum number of tags with
-//! the modelled resource-limit error.
+//! the modelled resource-limit error. The tags a CREATE carries are the same state and the
+//! same write: they count against that one per-resource maximum, and the refusal of a write
+//! past it carries one sentence whichever route asked for it.
 //!
 //! The tables span what the rule generalises over: how many pairs one call carries (one,
 //! several, the modelled maximum, one past it), the form of a key and a value (short,
@@ -408,4 +410,156 @@ async fn a_tagging_call_this_service_cannot_serve_is_refused_and_writes_nothing(
         (200, Some("re-valued")),
         "case re-valuing a key at the maximum: expected the new value, got {listed:?}"
     );
+}
+
+/// Which create carries the `Tags` of a row below, and the collection it posts to.
+///
+/// The three creates of this service that take a `TagList`
+/// (`smithy_query(query="digest")`: `CreateAppInstance`, `CreateAppInstanceUser` and
+/// `CreateAppInstanceBot` each carry a `Tags` member).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaggedCreate {
+    Instance,
+    User,
+    Bot,
+}
+
+/// RULE: the tags a create carries are a write against the same per-resource tag maximum the
+/// tagging routes answer to — a create reports created only for pairs the store took, and the
+/// refusal of a write past that maximum is one answer, in one wording, whichever route asked
+/// for it.
+///
+/// The rows are the three creates that carry a `TagList`, each sending the largest set the
+/// model allows one request (`Tags` is `TagList, len 1..50`), which is also the per-resource
+/// maximum: the create leaves the resource exactly at it, so the next write over the same
+/// resource is the one the maximum turns away.
+#[tokio::test]
+async fn create_time_tags_answer_to_the_per_resource_maximum_the_tagging_routes_do() {
+    let emulator = Emulator::new();
+    let parent = emulator.app_instance("create-bound", "tok-bound").await;
+
+    // `TagList` is len 1..50 (`smithy_query(query="operation",operation="CreateAppInstance")`),
+    // so this is one request carrying the per-resource maximum.
+    let whole_tag_list: Vec<(String, String)> = (0..50)
+        .map(|index| (format!("c{index:02}"), "created".to_string()))
+        .collect();
+
+    for (index, kind) in [
+        TaggedCreate::Instance,
+        TaggedCreate::User,
+        TaggedCreate::Bot,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let case = format!("{kind:?} created with the whole TagList");
+        let tags: Vec<Value> = whole_tag_list
+            .iter()
+            .map(|(key, value)| json!({ "Key": key, "Value": value }))
+            .collect();
+        let token = format!("tok-create-bound-{index}");
+        let (path, request, arn_member) = match kind {
+            TaggedCreate::Instance => (
+                "/app-instances",
+                json!({
+                    "Name": "bounded",
+                    "ClientRequestToken": token,
+                    "Tags": tags,
+                }),
+                "AppInstanceArn",
+            ),
+            TaggedCreate::User => (
+                "/app-instance-users",
+                json!({
+                    "AppInstanceArn": parent,
+                    "AppInstanceUserId": format!("bounded-{index}"),
+                    "Name": "bounded",
+                    "ClientRequestToken": token,
+                    "Tags": tags,
+                }),
+                "AppInstanceUserArn",
+            ),
+            // `Configuration` is `@required` on a bot and its `LexBotAliasArn` is
+            // pattern-bound (`smithy_query(query="shape",shape="LexConfiguration")`).
+            TaggedCreate::Bot => (
+                "/app-instance-bots",
+                json!({
+                    "AppInstanceArn": parent,
+                    "Name": "bounded",
+                    "ClientRequestToken": token,
+                    "Tags": tags,
+                    "Configuration": {
+                        "Lex": {
+                            "LexBotAliasArn":
+                                "arn:aws:lex:us-west-2:123456789012:bot-alias/BOTIDAAAAA/ALIASAAAAA",
+                            "LocaleId": "en_US",
+                            "InvokedBy": {
+                                "StandardMessages": "ALL",
+                                "TargetedMessages": "ALL",
+                            },
+                        }
+                    },
+                }),
+                "AppInstanceBotArn",
+            ),
+        };
+
+        let (status, body) = emulator.call("POST", path, Some(request)).await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: expected the create to answer 201, got {status} {body:?}"
+        );
+        let arn = body[arn_member]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no {arn_member} in {body:?}"))
+            .to_string();
+
+        // Every pair the create carried is state the tagging routes read.
+        let (status, listed) = list(&emulator, &arn).await;
+        assert_eq!(
+            (status, &listed),
+            (200, &as_map(&whole_tag_list)),
+            "case {case:?}: expected the create-time tags to be the resource's tags"
+        );
+
+        // The resource is at the maximum, so one more KEY is the write the maximum turns
+        // away: the modelled resource-limit refusal, wording the count the merge would have
+        // reached, and nothing written.
+        let refusal = format!(
+            "51 tags were requested for {arn}, which is more than the maximum of 50 tags per \
+             resource"
+        );
+        let (status, body) = tag(&emulator, &arn, &owned(&[("one-too-many", "v")])).await;
+        assert_eq!(
+            (status, body["Code"].as_str(), body["Message"].as_str()),
+            (
+                400,
+                Some("ResourceLimitExceeded"),
+                Some(refusal.as_str()),
+            ),
+            "case {case:?}: expected the modelled resource-limit refusal for one key past the \
+             maximum, got {status} {body:?}"
+        );
+        let (status, listed) = list(&emulator, &arn).await;
+        assert_eq!(
+            (status, &listed),
+            (200, &as_map(&whole_tag_list)),
+            "case {case:?}: expected the refused write to leave the create-time tags alone"
+        );
+
+        // A key the resource already carries is RE-VALUED rather than added, so the merge
+        // stays at the maximum and the write is taken.
+        let (status, body) = tag(&emulator, &arn, &owned(&[("c00", "re-valued")])).await;
+        assert_eq!(
+            status, 204,
+            "case {case:?}: expected re-valuing a create-time key at the maximum to be \
+             accepted, got {status} {body:?}"
+        );
+        let (status, listed) = list(&emulator, &arn).await;
+        assert_eq!(
+            (status, listed.get("c00").map(String::as_str), listed.len()),
+            (200, Some("re-valued"), whole_tag_list.len()),
+            "case {case:?}: expected the re-valued key and no growth, got {listed:?}"
+        );
+    }
 }
