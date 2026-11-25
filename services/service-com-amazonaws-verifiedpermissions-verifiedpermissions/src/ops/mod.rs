@@ -512,6 +512,88 @@ pub enum OpenIdConnectTokenDescription<'a> {
     },
 }
 
+impl IdentityProviderDescription<'_> {
+    /// A canonical, UNAMBIGUOUS rendering of the provider a write DESCRIBES, as
+    /// one escaped value of an idempotency-parameters rendering
+    /// ([`crate::state::idempotency_parameters`]).
+    ///
+    /// It reads the request's own members — the union borrowed above — and
+    /// resolves nothing, so the parameters one `clientToken`'s two calls are
+    /// compared by can be rendered BEFORE the provider reference they name is
+    /// resolved. That is what lets `CreateIdentitySource` settle its replay
+    /// before it judges the request's own payload, as every other
+    /// `@idempotencyToken` create in this crate does.
+    ///
+    /// The rendering names the union's ACTIVE ARM and, inside it, that arm's own
+    /// members, each through the shared rendering, so every caller-supplied
+    /// value is quoted and escaped: a member carrying the `=` or `;` separators
+    /// cannot spell out its neighbours, a nested shape (the group configuration,
+    /// the token selection, a list) is itself one escaped value of the enclosing
+    /// rendering, and a member the request omitted renders as `None`, which no
+    /// present value can render as.
+    pub fn canonical_rendering(&self) -> String {
+        match *self {
+            Self::CognitoUserPool {
+                user_pool_arn,
+                client_ids,
+                group_entity_type,
+            } => {
+                let client_ids = client_ids.map(crate::state::idempotency_values::<String>);
+                crate::state::idempotency_parameters(&[
+                    ("provider", Some("cognito")),
+                    ("userPoolArn", Some(user_pool_arn)),
+                    ("clientIds", client_ids.as_deref()),
+                    ("groupEntityType", group_entity_type),
+                ])
+            }
+            Self::OpenIdConnect {
+                issuer,
+                entity_id_prefix,
+                group_configuration,
+                token_selection,
+            } => {
+                let groups = group_configuration.map(|groups| {
+                    crate::state::idempotency_parameters(&[
+                        ("groupClaim", Some(groups.group_claim)),
+                        ("groupEntityType", Some(groups.group_entity_type)),
+                    ])
+                });
+                let tokens = match token_selection {
+                    OpenIdConnectTokenDescription::AccessTokenOnly {
+                        principal_id_claim,
+                        audiences,
+                    } => {
+                        let audiences = audiences.map(crate::state::idempotency_values::<String>);
+                        crate::state::idempotency_parameters(&[
+                            ("tokens", Some("accessTokenOnly")),
+                            ("principalIdClaim", Some(principal_id_claim)),
+                            ("audiences", audiences.as_deref()),
+                        ])
+                    }
+                    OpenIdConnectTokenDescription::IdentityTokenOnly {
+                        principal_id_claim,
+                        client_ids,
+                    } => {
+                        let client_ids = client_ids.map(crate::state::idempotency_values::<String>);
+                        crate::state::idempotency_parameters(&[
+                            ("tokens", Some("identityTokenOnly")),
+                            ("principalIdClaim", Some(principal_id_claim)),
+                            ("clientIds", client_ids.as_deref()),
+                        ])
+                    }
+                };
+                crate::state::idempotency_parameters(&[
+                    ("provider", Some("oidc")),
+                    ("issuer", Some(issuer)),
+                    ("entityIdPrefix", entity_id_prefix),
+                    ("groups", groups.as_deref()),
+                    ("tokenSelection", Some(tokens.as_str())),
+                ])
+            }
+        }
+    }
+}
+
 /// A request union that describes the identity provider an identity source points
 /// at.
 ///

@@ -284,6 +284,21 @@ pub async fn user_pool_in(router: &MultiServiceRouter, region: &str, name: &str)
         .to_string()
 }
 
+/// Delete an Amazon Cognito user pool through the service that OWNS user pools,
+/// so a reference to it resolves to nothing afterwards: a suite about what a
+/// reference to a pool that stopped existing does drives the deletion through
+/// the same wire its creation went through.
+pub async fn delete_user_pool(router: &MultiServiceRouter, pool: &str) {
+    cognito(router, "DeleteUserPool", &json!({ "UserPoolId": pool })).await;
+}
+
+/// An identity-source `Configuration` naming the Amazon Cognito user pool `arn`,
+/// as `CreateIdentitySource` carries it — the union arm every suite that writes a
+/// user pool source needs, shaped once here.
+pub fn cognito_provider(arn: &str) -> Value {
+    json!({ "cognitoUserPoolConfiguration": { "userPoolArn": arn } })
+}
+
 /// The `(path, message)` pairs a fault's `fieldList` carries, in the order the
 /// response carries them. A fault that carries none maps to the empty list.
 pub fn field_list(body: &Value) -> Vec<(String, String)> {

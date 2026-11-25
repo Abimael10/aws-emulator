@@ -45,7 +45,12 @@
 //! * `clientToken` (IdempotencyToken, len 1..64, pattern ^[a-zA-Z0-9-]*$, @idempotencyToken)
 //!   — "Verified Permissions recognizes a ClientToken for eight hours"; a replay
 //!   answers with the identity source the first call created, and the same token
-//!   with different parameters is a `ConflictException`.
+//!   with different parameters is a `ConflictException`. Both outcomes are
+//!   settled BEFORE the request's own payload is judged — the parameters the two
+//!   calls are compared by are rendered from the request's members
+//!   ([`canonical_parameters`]), so none of them needs the provider reference
+//!   resolved — which is the order every `@idempotencyToken` create in this
+//!   crate follows.
 //! * `configuration` (Configuration) **required** — the Cognito user pool or the
 //!   OIDC provider this identity source points at. A Cognito user pool source
 //!   carrying no `groupConfiguration` is stored mapping its groups to
@@ -156,6 +161,35 @@ fn output_for(source: &crate::state::IdentitySource) -> CreateIdentitySourceOutp
     }
 }
 
+/// A canonical rendering of the parameters one `clientToken` was first used
+/// with, for this operation's idempotency ledger. A replay carrying the same
+/// token must carry the same parameters, or the model documents a
+/// `ConflictException`.
+///
+/// Rendered from the REQUEST — the store it resolved to, the
+/// `principalEntityType` member as the caller wrote it, and the `configuration`
+/// union through [`crate::ops::IdentityProviderDescription::canonical_rendering`]
+/// — so no part of it needs the provider reference resolved and the replay can be
+/// settled before the payload is judged, as it is in `CreatePolicyStore`,
+/// `CreatePolicy` and `CreatePolicyTemplate`. Every value goes through
+/// [`crate::state::idempotency_parameters`], the one canonical rendering every
+/// create in this crate uses, so each caller-supplied value is quoted and escaped
+/// and two different requests cannot render alike; a member the request omitted
+/// renders as `None`, which no value the caller passed can render as.
+fn canonical_parameters(store_id: &str, input: &CreateIdentitySourceInput) -> String {
+    let configuration =
+        crate::ops::DescribesIdentityProvider::provider_description(&input.configuration)
+            .canonical_rendering();
+    crate::state::idempotency_parameters(&[
+        ("store", Some(store_id)),
+        (
+            "principalEntityType",
+            input.principal_entity_type.as_deref(),
+        ),
+        ("configuration", Some(configuration.as_str())),
+    ])
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for CreateIdentitySource<Eng>
 {
@@ -212,6 +246,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .resolve_store_id(&region, &input.policy_store_id)
             .ok_or_else(not_found)?;
 
+        // `@idempotencyToken` replay: the same token answers with the identity
+        // source the first call created, and the same token with different
+        // parameters is the `ConflictException` the model documents. It is
+        // settled HERE — after the store the request references is resolved and
+        // before any of the request's own payload is judged — as it is in every
+        // other `@idempotencyToken` create in this crate, because the token
+        // speaks about the parameters the caller PASSED and not about what they
+        // resolve to: a token recorded against different parameters is the
+        // conflict, and a token recorded against these parameters answers with
+        // the first call's identity source, however the payload below would
+        // otherwise be refused.
+        let parameters = canonical_parameters(&store_id, &input);
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(record) = state.idempotency_replay("CreateIdentitySource", token) {
+                if record.parameters != parameters {
+                    // Fixed message; the identity source the token already
+                    // created is reported in `resources`.
+                    return Err(CreateIdentitySourceErrorModeled::ConflictException(
+                        crate::ops::conflict([crate::ops::resource_conflict(
+                            &record.resource_id,
+                            crate::state::RESOURCE_TYPE_IDENTITY_SOURCE,
+                        )]),
+                    )
+                    .into());
+                }
+                if let Some(source) = state
+                    .policy_stores
+                    .get(&store_id)
+                    .and_then(|store| store.identity_sources.get(&record.resource_id))
+                {
+                    return Ok(output_for(source));
+                }
+                // The token's identity source is no longer in the store (only a
+                // delete can do that), so the ledger record is STALE: there is
+                // nothing to answer the replay with. The call continues as a
+                // fresh create and `record_idempotency` below replaces the
+                // stale record, which is deliberate — answering a modelled
+                // error here would make a token unusable forever because the
+                // resource it once named was deleted.
+            }
+        }
+
         // The provider reference is resolved before any state is CHANGED: a
         // request this service cannot resolve must change nothing.
         let configuration = crate::ops::persisted_identity_source_configuration(
@@ -245,53 +321,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &configuration,
         )
         .map_err(invalid)?;
-
-        // `@idempotencyToken` replay: the same token answers with the identity
-        // source the first call created, and the same token with different
-        // parameters is the `ConflictException` the model documents. The
-        // rendering goes through `crate::state::idempotency_parameters`, the one
-        // canonical rendering every create in this crate uses, so each
-        // caller-supplied value — `principalEntityType` and every member of the
-        // configuration fingerprint — is quoted and escaped and two different
-        // requests cannot render alike.
-        let configuration_fingerprint = configuration.fingerprint();
-        let parameters = crate::state::idempotency_parameters(&[
-            ("store", Some(store_id.as_str())),
-            (
-                "principalEntityType",
-                Some(principal_entity_type.value.as_str()),
-            ),
-            ("configuration", Some(configuration_fingerprint.as_str())),
-        ]);
-        if let Some(token) = input.client_token.as_deref() {
-            if let Some(record) = state.idempotency_replay("CreateIdentitySource", token) {
-                if record.parameters != parameters {
-                    // Fixed message; the identity source the token already
-                    // created is reported in `resources`.
-                    return Err(CreateIdentitySourceErrorModeled::ConflictException(
-                        crate::ops::conflict([crate::ops::resource_conflict(
-                            &record.resource_id,
-                            crate::state::RESOURCE_TYPE_IDENTITY_SOURCE,
-                        )]),
-                    )
-                    .into());
-                }
-                if let Some(source) = state
-                    .policy_stores
-                    .get(&store_id)
-                    .and_then(|store| store.identity_sources.get(&record.resource_id))
-                {
-                    return Ok(output_for(source));
-                }
-                // The token's identity source is no longer in the store (only a
-                // delete can do that), so the ledger record is STALE: there is
-                // nothing to answer the replay with. The call continues as a
-                // fresh create and `record_idempotency` below replaces the
-                // stale record, which is deliberate — answering a modelled
-                // error here would make a token unusable forever because the
-                // resource it once named was deleted.
-            }
-        }
 
         let store = state.policy_stores.get_mut(&store_id).ok_or_else(not_found)?;
         // The identity-source map is the one structure this request grows, so the

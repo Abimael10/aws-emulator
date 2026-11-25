@@ -14,12 +14,16 @@
 //! collapse into one — answering the second request as a replay, so the resource
 //! it asked for was never created.
 //!
-//! The same token also decides WHEN that comparison happens: the replay is
-//! settled before any refusal of the request's own payload that is not needed to
-//! render the parameters being compared, so a token already recorded against
+//! The same token also decides WHEN that comparison happens: the parameters are
+//! rendered from the request's own members, so the replay is settled before ANY
+//! refusal of the request's own payload — a token already recorded against
 //! different parameters is the 409 however badly the rest of the request is
 //! formed
-//! ([`a_client_token_replay_outranks_a_refusal_of_the_requests_own_payload`]).
+//! ([`a_client_token_replay_outranks_a_refusal_of_the_requests_own_payload`],
+//! [`a_reused_identity_source_token_conflicts_however_its_payload_would_be_refused`]),
+//! and a token recorded against these parameters is the idempotent success even
+//! once the payload stopped resolving
+//! ([`an_identity_source_replay_answers_with_the_first_call_even_once_its_pool_is_gone`]).
 //!
 //! Every assertion goes over the wire through the shared [`super::harness`], so a
 //! resource is only visible if the create really reached state.
@@ -29,8 +33,8 @@ use service_com_amazonaws_verifiedpermissions_verifiedpermissions::state::cedar:
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::harness::{
-    call, error_code, field_list, ok, router, store_with_validation_off as store, user_pool_arn,
-    SIGNING_REGION,
+    call, cognito_provider, delete_user_pool, error_code, field_list, ok, router,
+    store_with_validation_off as store, user_pool, user_pool_arn, SIGNING_REGION,
 };
 
 /// A Cognito user pool this emulator can resolve: one freshly created in the
@@ -597,10 +601,12 @@ struct PayloadFault {
 /// read, a placeholder Cedar admits nowhere, and text past the size bound — so
 /// what they share is only that the request's own payload is unservable.
 ///
-/// `CreateIdentitySource` is deliberately absent: both of its payload refusals
-/// (the provider reference it resolves and the `principalEntityType` it must
-/// settle) produce members of the very parameters string the replay compares, so
-/// its replay cannot be decided before them, and it has no other payload check.
+/// `CreateIdentitySource` is absent from THIS table only because both of its
+/// payload refusals need a user pool seeded through another service, which a
+/// `const` row cannot do. The same rule is driven for it, over the same steps, by
+/// [`a_reused_identity_source_token_conflicts_however_its_payload_would_be_refused`]
+/// and
+/// [`an_identity_source_replay_answers_with_the_first_call_even_once_its_pool_is_gone`].
 const PAYLOAD_FAULTS: &[PayloadFault] = &[
     PayloadFault {
         case: "a create-time tag map one past the per-resource quota",
@@ -817,6 +823,335 @@ async fn a_client_token_replay_outranks_a_refusal_of_the_requests_own_payload() 
             after_conflict, after_create,
             "case {case:?}: expected {after_create} resources after the conflict, got \
              {after_conflict}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CreateIdentitySource, whose payload refusals read live state
+// ---------------------------------------------------------------------------
+
+/// The member `ValidationException$fieldList` names when the Cognito user pool a
+/// configuration references cannot be resolved, WITHIN
+/// `CreateIdentitySourceInput`'s own provider member.
+const POOL_ARN_FIELD: &str = "/configuration/cognitoUserPoolConfiguration/userPoolArn";
+
+/// The member `ValidationException$fieldList` names when there is no
+/// `principalEntityType` for the provider the request describes.
+const PRINCIPAL_ENTITY_TYPE_FIELD: &str = "/principalEntityType";
+
+/// The entity type the accepted identity-source requests below name.
+const SOURCE_ENTITY_TYPE: &str = "MyCorp::User";
+
+/// A `CreateIdentitySource` body: the row's members, plus the store and the
+/// token under test.
+fn source_request(store_id: &str, token: &str, members: &Value) -> Value {
+    let mut request = members.clone();
+    request["policyStoreId"] = json!(store_id);
+    request["clientToken"] = json!(token);
+    request
+}
+
+/// The `identitySourceId`s a store holds, and what one of them reads back as.
+async fn read_source(router: &MultiServiceRouter, store_id: &str, source_id: &str) -> Value {
+    ok(
+        router,
+        "GetIdentitySource",
+        &json!({ "policyStoreId": store_id, "identitySourceId": source_id }),
+    )
+    .await
+}
+
+/// One recorded `CreateIdentitySource` call whose payload stops resolving after
+/// it was served, because the user pool it references is deleted.
+struct VanishedPool {
+    case: &'static str,
+    /// The request members beside `policyStoreId` and `clientToken`, built from
+    /// the ARN of the pool the row creates.
+    members: fn(&str) -> Value,
+}
+
+/// RULE: a create that carries an `@idempotencyToken` settles the token replay
+/// before it judges the request's own payload, so a token replayed with the SAME
+/// parameters answers with the identity source the first call created even once
+/// that payload no longer resolves — the documented idempotent success, not the
+/// 400 the payload would now earn.
+///
+/// The rows differ along WHICH members the recorded call carried — none of the
+/// optional ones, an entity type of the caller's own, a client-id list and a
+/// group configuration — so what they share is only that a served request's
+/// payload stopped resolving after the service recorded its token.
+#[tokio::test]
+async fn an_identity_source_replay_answers_with_the_first_call_even_once_its_pool_is_gone() {
+    let rows: &[VanishedPool] = &[
+        VanishedPool {
+            // Every optional member omitted, so the entity type and the group
+            // entity type a read reports are the service's own defaults.
+            case: "a create that named only the pool",
+            members: |arn| json!({ "configuration": cognito_provider(arn) }),
+        },
+        VanishedPool {
+            case: "a create that named an entity type of its own",
+            members: |arn| {
+                json!({
+                    "configuration": cognito_provider(arn),
+                    "principalEntityType": SOURCE_ENTITY_TYPE,
+                })
+            },
+        },
+        VanishedPool {
+            case: "a create that named a client-id list and a group configuration",
+            members: |arn| {
+                json!({
+                    "configuration": {
+                        "cognitoUserPoolConfiguration": {
+                            "userPoolArn": arn,
+                            "clientIds": ["a1b2c3d4e5f6g7h8i9j0kalbmc", "zz1yy2xx3ww4vv5uu6tt7ss8rr"],
+                            "groupConfiguration": { "groupEntityType": "MyCorp::UserGroup" },
+                        }
+                    },
+                    "principalEntityType": SOURCE_ENTITY_TYPE,
+                })
+            },
+        },
+    ];
+
+    let router = router();
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        // One store per row, so what a row's store holds is only what that row
+        // created.
+        let store_id = store(&router).await;
+        let token = format!("vanished-{index}");
+        let pool = user_pool(&router, &format!("vanished-pool-{index}")).await;
+        let request = source_request(&store_id, &token, &(row.members)(&user_pool_arn(
+            SIGNING_REGION,
+            &pool,
+        )));
+
+        let created = ok(&router, "CreateIdentitySource", &request).await;
+        let created_id = created["identitySourceId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !created_id.is_empty(),
+            "case {case:?}: expected CreateIdentitySource to report an identitySourceId, \
+             got {created}"
+        );
+        let before = read_source(&router, &store_id, &created_id).await;
+
+        // The pool the recorded request references stops existing.
+        delete_user_pool(&router, &pool).await;
+
+        // The control: under a token the service has never seen, that same body
+        // is now refused on its payload, 400 naming the member at fault. What
+        // the row pins is therefore the PRECEDENCE of the replay, not that the
+        // payload became servable.
+        let mut unseen = request.clone();
+        unseen["clientToken"] = json!(format!("unseen-{index}"));
+        let (status, body) = call(&router, "CreateIdentitySource", &unseen).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400 under an unseen token once the pool is gone, \
+             got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: expected a ValidationException under an unseen token, got {body}"
+        );
+        let paths: Vec<String> = field_list(&body).into_iter().map(|(path, _)| path).collect();
+        assert!(
+            paths.iter().any(|path| path == POOL_ARN_FIELD),
+            "case {case:?}: expected fieldList to name {POOL_ARN_FIELD}, got {paths:?} in {body}"
+        );
+
+        // The recorded token with those same parameters: the replay is decided
+        // first, so the answer is the first call's output.
+        let replayed = ok(&router, "CreateIdentitySource", &request).await;
+        assert_eq!(
+            replayed, created,
+            "case {case:?}: expected the replay to answer with {created}, got {replayed}"
+        );
+
+        // The replay reported state rather than writing any: the identity source
+        // still reads back exactly as it did, and the store holds only it.
+        let after = read_source(&router, &store_id, &created_id).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: the replay must change nothing, expected {before}, got {after}"
+        );
+        assert_eq!(
+            listed_source_ids(&router, &store_id).await,
+            vec![created_id.clone()],
+            "case {case:?}: expected the store to hold only {created_id}, got {:?}",
+            listed_source_ids(&router, &store_id).await
+        );
+    }
+}
+
+/// One `CreateIdentitySource` payload this service refuses on its own checks,
+/// beside a body it serves under the same token.
+struct SourcePayloadFault {
+    case: &'static str,
+    /// The request members beside `policyStoreId` and `clientToken` whose
+    /// payload this service refuses.
+    refused: Value,
+    /// The member `ValidationException$fieldList` names for `refused`.
+    field: &'static str,
+}
+
+/// RULE (the other half): the same token replayed with DIFFERENT parameters is
+/// the modelled 409 `ConflictException` naming the resource that token created,
+/// whatever the replayed request's payload would otherwise be refused for, and
+/// that payload still earns its 400 `ValidationException` naming the member at
+/// fault under a token the service has never seen.
+///
+/// The rows differ along the KIND of payload fault: a pool reference that
+/// resolves to nothing for each of the reasons the service distinguishes — a pool
+/// nothing minted, one that was deleted, one in another Region, one in another
+/// account — and an OpenID Connect provider for which there is no
+/// `principalEntityType` to resolve, which is the other member this operation
+/// refuses on.
+#[tokio::test]
+async fn a_reused_identity_source_token_conflicts_however_its_payload_would_be_refused() {
+    let router = router();
+    // The pool the accepted body references: one the user-pool service really
+    // minted, in the region the harness signs for.
+    let live_arn = user_pool_arn(SIGNING_REGION, &user_pool(&router, "reused-live-pool").await);
+    // A pool that existed and then stopped existing.
+    let deleted = user_pool(&router, "reused-deleted-pool").await;
+    delete_user_pool(&router, &deleted).await;
+    // A pool minted in another Region: an identity source can only reference one
+    // in its policy store's Region.
+    let other_region = "us-west-2";
+    let elsewhere = super::harness::user_pool_in(&router, other_region, "reused-other-region").await;
+
+    let accepted = json!({
+        "configuration": cognito_provider(&live_arn),
+        "principalEntityType": SOURCE_ENTITY_TYPE,
+    });
+    let rows = [
+        SourcePayloadFault {
+            case: "a pool id nothing ever minted",
+            refused: json!({
+                "configuration": cognito_provider(&user_pool_arn(
+                    SIGNING_REGION,
+                    &format!("{SIGNING_REGION}_0a1b2c3d4"),
+                )),
+                "principalEntityType": SOURCE_ENTITY_TYPE,
+            }),
+            field: POOL_ARN_FIELD,
+        },
+        SourcePayloadFault {
+            case: "a pool that was minted and then deleted",
+            refused: json!({
+                "configuration": cognito_provider(&user_pool_arn(SIGNING_REGION, &deleted)),
+                "principalEntityType": SOURCE_ENTITY_TYPE,
+            }),
+            field: POOL_ARN_FIELD,
+        },
+        SourcePayloadFault {
+            case: "a live pool in another Region than the policy store",
+            refused: json!({
+                "configuration": cognito_provider(&user_pool_arn(other_region, &elsewhere)),
+                "principalEntityType": SOURCE_ENTITY_TYPE,
+            }),
+            field: POOL_ARN_FIELD,
+        },
+        SourcePayloadFault {
+            case: "a pool in another account",
+            refused: json!({
+                "configuration": cognito_provider(&format!(
+                    "arn:aws:cognito-idp:{SIGNING_REGION}:210987654321:userpool/{SIGNING_REGION}_1a2b3c4d5"
+                )),
+                "principalEntityType": SOURCE_ENTITY_TYPE,
+            }),
+            field: POOL_ARN_FIELD,
+        },
+        SourcePayloadFault {
+            // An OIDC source's principals are of a type only the caller can
+            // name, so a request that names none has nothing to resolve to.
+            case: "an OpenID Connect provider with no entity type to resolve",
+            refused: json!({
+                "configuration": {
+                    "openIdConnectConfiguration": {
+                        "issuer": "https://reused.example.com",
+                        "tokenSelection": { "accessTokenOnly": { "principalIdClaim": "sub" } },
+                    }
+                },
+            }),
+            field: PRINCIPAL_ENTITY_TYPE_FIELD,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let store_id = store(&router).await;
+        let token = format!("reused-{index}");
+
+        // The control: under a token the service has never seen, this payload is
+        // refused on its own merits, 400 naming the member at fault.
+        let unseen = source_request(&store_id, &format!("unseen-{index}"), &row.refused);
+        let (status, body) = call(&router, "CreateIdentitySource", &unseen).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400 under an unseen token, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: expected a ValidationException under an unseen token, got {body}"
+        );
+        let paths: Vec<String> = field_list(&body).into_iter().map(|(path, _)| path).collect();
+        assert!(
+            paths.iter().any(|path| path == row.field),
+            "case {case:?}: expected fieldList to name {}, got {paths:?} in {body}",
+            row.field
+        );
+
+        // The token is now recorded against a request the service served.
+        let served = source_request(&store_id, &token, &accepted);
+        let created = ok(&router, "CreateIdentitySource", &served).await;
+        let created_id = created["identitySourceId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+
+        // That same token, replayed with the unservable payload: the replay is
+        // decided first, so the answer is the conflict naming the identity
+        // source the token already created — not the payload's 400.
+        let replay = source_request(&store_id, &token, &row.refused);
+        let (status, body) = call(&router, "CreateIdentitySource", &replay).await;
+        assert_eq!(
+            status, 409,
+            "case {case:?}: expected HTTP 409 for the reused token, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ConflictException",
+            "case {case:?}: expected a ConflictException for the reused token, got {body}"
+        );
+        assert_eq!(
+            body["resources"],
+            json!([{ "resourceId": created_id, "resourceType": "IDENTITY_SOURCE" }]),
+            "case {case:?}: expected the conflict to name {created_id} as an IDENTITY_SOURCE, \
+             got {body}"
+        );
+
+        // Neither answer reached state: the token still replays the identity
+        // source it was recorded against, and nothing else was created.
+        let replayed = ok(&router, "CreateIdentitySource", &served).await;
+        assert_eq!(
+            replayed, created,
+            "case {case:?}: the token must still replay {created}, got {replayed}"
+        );
+        assert_eq!(
+            listed_source_ids(&router, &store_id).await,
+            vec![created_id.clone()],
+            "case {case:?}: expected the store to hold only {created_id}, got {:?}",
+            listed_source_ids(&router, &store_id).await
         );
     }
 }

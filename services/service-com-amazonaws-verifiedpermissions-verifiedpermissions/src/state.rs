@@ -612,75 +612,13 @@ pub enum IdentitySourceConfiguration {
     OpenIdConnect(OpenIdConnectSource),
 }
 
-impl IdentitySourceConfiguration {
-    /// A canonical rendering of this configuration, for the idempotency ledger:
-    /// two `CreateIdentitySource` calls carrying one `clientToken` are the same
-    /// call only when every member of their configurations agrees. Spelled out
-    /// member by member rather than taken from `#[derive(Debug)]`, so what
-    /// counts as "different parameters" is a stated contract that a later field
-    /// rename cannot silently change.
-    ///
-    /// Every member goes through [`idempotency_parameters`], so each
-    /// caller-supplied value is quoted and escaped and no two configurations
-    /// that differ can render alike — a member whose value carries the `=` or
-    /// `;` separators (the modelled patterns of `issuer` and the claim names
-    /// admit both) cannot spell out its neighbours. A nested rendering (the
-    /// group configuration, the token selection, a list) is itself one escaped
-    /// value of the enclosing one, so the nesting cannot be flattened away
-    /// either.
-    pub fn fingerprint(&self) -> String {
-        match self {
-            Self::CognitoUserPool(cognito) => {
-                let client_ids = idempotency_values(&cognito.client_ids);
-                idempotency_parameters(&[
-                    ("provider", Some("cognito")),
-                    ("userPoolArn", Some(cognito.user_pool_arn.as_str())),
-                    ("clientIds", Some(client_ids.as_str())),
-                    ("groupEntityType", Some(cognito.group_entity_type.as_str())),
-                ])
-            }
-            Self::OpenIdConnect(oidc) => {
-                let groups = oidc.group_configuration.as_ref().map(|groups| {
-                    idempotency_parameters(&[
-                        ("groupClaim", Some(groups.group_claim.as_str())),
-                        ("groupEntityType", Some(groups.group_entity_type.as_str())),
-                    ])
-                });
-                let tokens = match &oidc.token_selection {
-                    OpenIdConnectTokens::AccessToken {
-                        principal_id_claim,
-                        audiences,
-                    } => {
-                        let audiences = idempotency_values(audiences);
-                        idempotency_parameters(&[
-                            ("tokens", Some("accessTokenOnly")),
-                            ("principalIdClaim", Some(principal_id_claim.as_str())),
-                            ("audiences", Some(audiences.as_str())),
-                        ])
-                    }
-                    OpenIdConnectTokens::IdentityToken {
-                        principal_id_claim,
-                        client_ids,
-                    } => {
-                        let client_ids = idempotency_values(client_ids);
-                        idempotency_parameters(&[
-                            ("tokens", Some("identityTokenOnly")),
-                            ("principalIdClaim", Some(principal_id_claim.as_str())),
-                            ("clientIds", Some(client_ids.as_str())),
-                        ])
-                    }
-                };
-                idempotency_parameters(&[
-                    ("provider", Some("oidc")),
-                    ("issuer", Some(oidc.issuer.as_str())),
-                    ("entityIdPrefix", oidc.entity_id_prefix.as_deref()),
-                    ("groups", groups.as_deref()),
-                    ("tokenSelection", Some(tokens.as_str())),
-                ])
-            }
-        }
-    }
-}
+// A `clientToken` names the PARAMETERS a caller passed, not the state they
+// resolved to, so the rendering the idempotency ledger compares two calls by is
+// a rendering of the REQUEST — `crate::ops::IdentityProviderDescription`'s
+// `canonical_rendering`, beside the one translation of that request into the
+// stored configuration above — and not of this persisted shape. That is what
+// lets a create settle its replay before it resolves what the request's
+// configuration references.
 
 /// An Amazon Cognito user pool identity source. `region` and `user_pool_id` are
 /// the segments [`resolve_user_pool_arn`] read out of `user_pool_arn`, so the
