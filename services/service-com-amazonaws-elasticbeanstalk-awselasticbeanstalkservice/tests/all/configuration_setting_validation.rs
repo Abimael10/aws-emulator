@@ -101,12 +101,18 @@ const NO_INSTANCE_PROFILE: &str = "The environment does not have an IAM instance
 /// One `ValidationMessage` as the answer reports it, read member by member off
 /// ONE element so an answer that mixes up which message belongs to which option
 /// fails rather than matching independent flat lists.
+///
+/// `pub(crate)` along with [`reported_errors`], [`invalid_value`] and
+/// [`published`] below: the `batch_size_validation_message` suite in this same
+/// test target reads the very same `ValidationMessage`s off the wire and states
+/// its rows against the same published catalogue, so it drives them through
+/// these rather than keeping a second reader that could drift from this one.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ReportedMessage {
-    namespace: String,
-    option_name: String,
-    severity: String,
-    message: String,
+pub(crate) struct ReportedMessage {
+    pub(crate) namespace: String,
+    pub(crate) option_name: String,
+    pub(crate) severity: String,
+    pub(crate) message: String,
 }
 
 /// Every validation message in `answer`, in the order the document lists them.
@@ -133,7 +139,7 @@ fn reported_messages(answer: &Answer) -> Vec<ReportedMessage> {
 /// The error-severity messages in `answer`: the findings about a value the
 /// option does not take, read apart from the advisories the configuration
 /// carries, so a row about one class is asserted on that class alone.
-fn reported_errors(answer: &Answer) -> Vec<ReportedMessage> {
+pub(crate) fn reported_errors(answer: &Answer) -> Vec<ReportedMessage> {
     reported_messages(answer)
         .into_iter()
         .filter(|message| message.severity == "error")
@@ -156,7 +162,10 @@ fn instance_profile_advisory() -> ReportedMessage {
 /// version the fixtures below run, from the catalogue the service publishes —
 /// the one `DescribeConfigurationOptions` reports, so a row cannot state a
 /// restriction this service does not publish.
-fn published(namespace: &str, option_name: &str) -> &'static eb::state::ConfigurationOption {
+pub(crate) fn published(
+    namespace: &str,
+    option_name: &str,
+) -> &'static eb::state::ConfigurationOption {
     let stack = published_stack(0);
     eb::state::published_configuration_options(Some(stack), true)
         .into_iter()
@@ -166,7 +175,12 @@ fn published(namespace: &str, option_name: &str) -> &'static eb::state::Configur
 
 /// The sentence a message about `value` for `namespace` / `option_name` opens
 /// with: the value the request sent and the option it was sent for.
-fn invalid_value(namespace: &str, option_name: &str, value: &str, requirement: &str) -> String {
+pub(crate) fn invalid_value(
+    namespace: &str,
+    option_name: &str,
+    value: &str,
+    requirement: &str,
+) -> String {
     format!(
         "Invalid option value: '{value}' (Namespace: '{namespace}', OptionName: \
          '{option_name}'): {requirement}"

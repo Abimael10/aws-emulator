@@ -34,6 +34,13 @@
 //! that maximum below the minimum, neither of them a value outside the range the
 //! option's own published description states.
 //!
+//! A bound can also belong to a UNIT a second option chooses: `BatchSizeType`
+//! says "whether BatchSize is a fixed number of instances or a percentage of
+//! them", so the maximum a deployment batch size is held to is the maximum FOR
+//! the batch size type in force. A message naming that maximum therefore names
+//! the type it is the maximum of as well, which is what tells a caller whether
+//! to lower the value or to state it in the other type.
+//!
 //! Split out of [`super`] so the evaluation lives beside the option tables it
 //! reads, and so every operation that takes option settings has one place to
 //! reach it.
@@ -371,7 +378,9 @@ fn catalog_states_option_names(
 /// value, which is asked of the configuration `in_force` once the value is
 /// inside the option's own published range. They are checked in that order, and
 /// the FIRST one failed is reported: one setting earns one message, naming the
-/// requirement it did not meet.
+/// requirement it did not meet — and, where the published maximum is the maximum
+/// of a unit another option chooses, the unit it belongs to as well (see
+/// [`exceeds_maximum_requirement`]).
 fn unmet_requirement(
     option: &ConfigurationOption,
     value: &str,
@@ -414,7 +423,7 @@ fn unmet_requirement(
         }
         if let Some(maximum) = maximum {
             if number > maximum {
-                return Some(format!("Value exceeds maximum allowed value: {maximum}"));
+                return Some(exceeds_maximum_requirement(option, maximum, in_force));
             }
         }
         if let Some(requirement) = unmet_co_requirement(option, number, in_force) {
@@ -437,6 +446,58 @@ fn unmet_requirement(
         }
     }
     None
+}
+
+/// The requirement a number above `option`'s published maximum fails: the
+/// maximum itself, and — where that maximum is the maximum of a UNIT the
+/// configuration selects through another option — the unit it is the maximum
+/// of, so the caller is told WHICH limit was applied rather than its number
+/// alone.
+fn exceeds_maximum_requirement(
+    option: &ConfigurationOption,
+    maximum: i64,
+    in_force: &[ConfigurationOptionSetting],
+) -> String {
+    let exceeded = format!("Value exceeds maximum allowed value: {maximum}");
+    match enforced_maximum_unit(option, in_force) {
+        Some(unit) => format!("{exceeded} for {unit}"),
+        None => exceeded,
+    }
+}
+
+/// The clause naming the kind of number a deployment batch size is stated in,
+/// as the maximum one is held to is reported with. FIXED text; the kind itself
+/// is the value the configuration puts in force for it.
+const BATCH_SIZE_TYPE_CLAUSE: &str = "Batch Size Type.";
+
+/// The unit `option`'s published maximum is the maximum OF, where the option's
+/// value carries a unit another option chooses — `None` for an option whose
+/// value is a plain number, whose maximum is therefore reported by itself.
+///
+/// The one option of this catalog whose value has such a unit is the deployment
+/// batch size: `BatchSizeType` states "whether BatchSize is a fixed number of
+/// instances or a percentage of them", so the maximum a batch size is held to is
+/// the maximum for the batch size type the configuration `in_force` puts in
+/// force — the value the request sent for it, else the one the configuration set
+/// already carries, else that option's documented default, which is the same
+/// resolution a read of the configuration makes.
+///
+/// The maximum belongs to one of the types that option PUBLISHES, so a
+/// configuration whose value for it is not one of them (a value that option's
+/// own evaluation reports as an error of its own) leaves the published default
+/// the maximum in force belongs to.
+fn enforced_maximum_unit(
+    option: &ConfigurationOption,
+    in_force: &[ConfigurationOptionSetting],
+) -> Option<String> {
+    if option.namespace != NAMESPACE_COMMAND || option.name != OPTION_BATCH_SIZE {
+        return None;
+    }
+    let batch_size_type = option_value(in_force, NAMESPACE_COMMAND, OPTION_BATCH_SIZE_TYPE)
+        .map(str::trim)
+        .filter(|batch_size_type| BATCH_SIZE_TYPES.contains(batch_size_type))
+        .unwrap_or(BATCH_SIZE_TYPE_PERCENTAGE);
+    Some(format!("{batch_size_type} {BATCH_SIZE_TYPE_CLAUSE}"))
 }
 
 /// The compiled form of the published pattern `pattern`, from the expressions of

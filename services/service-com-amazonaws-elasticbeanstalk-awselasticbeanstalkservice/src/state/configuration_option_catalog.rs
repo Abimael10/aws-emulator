@@ -240,6 +240,38 @@ pub(super) const NAMESPACE_PROXY: &str = "aws:elasticbeanstalk:environment:proxy
 /// See [`NAMESPACE_PROXY`].
 pub(super) const OPTION_PROXY_SERVER: &str = "ProxyServer";
 
+/// The namespace holding the options that say how an application version is
+/// deployed to an environment's instances.
+pub(super) const NAMESPACE_COMMAND: &str = "aws:elasticbeanstalk:command";
+/// The option in that namespace giving the "percentage or fixed number of
+/// Amazon EC2 instances in the Auto Scaling group on which to simultaneously
+/// perform deployments".
+pub(super) const OPTION_BATCH_SIZE: &str = "BatchSize";
+/// The option in the same namespace that says which of those two
+/// [`OPTION_BATCH_SIZE`] is — "whether BatchSize is a fixed number of instances
+/// or a percentage of them" — so the published bound a batch size is held to is
+/// the bound for the type this option puts in force.
+pub(super) const OPTION_BATCH_SIZE_TYPE: &str = "BatchSizeType";
+
+/// The batch size type of a batch size stated as a share of the group, and
+/// [`OPTION_BATCH_SIZE_TYPE`]'s documented default.
+pub(super) const BATCH_SIZE_TYPE_PERCENTAGE: &str = "Percentage";
+/// The value set [`OPTION_BATCH_SIZE_TYPE`] publishes: a batch size is either a
+/// count of instances or a share of them.
+pub(super) const BATCH_SIZE_TYPES: &[&str] = &["Fixed", BATCH_SIZE_TYPE_PERCENTAGE];
+
+/// The highest share of an environment's instances one deployment batch can
+/// cover, which is the `MaxValue` the option reference publishes for
+/// [`OPTION_BATCH_SIZE`] (a percentage, so a hundred of them), and its
+/// documented default — "deploy to all of the instances at once".
+pub(super) const MAX_PUBLISHED_BATCH_SIZE: i32 = 100;
+
+/// [`OPTION_BATCH_SIZE`]'s documented default as the catalog publishes it: the
+/// whole of the group in one batch, which for the default batch size type is
+/// that maximum share of it — written out as the option value it is, beside the
+/// bound it is the whole of.
+pub(super) const DEFAULT_BATCH_SIZE_VALUE: &str = "100";
+
 /// The configuration options EVERY platform version this service publishes
 /// defines: the Auto Scaling group and launch configuration, the instances and
 /// the VPC they run in, the deployment command, the environment itself, health
@@ -469,21 +501,21 @@ pub const GENERAL_CONFIGURATION_OPTIONS: &[ConfigurationOption] = &[
     .with_values(LOG_RETENTION_IN_DAYS),
     // aws:elasticbeanstalk:command — how an application version is deployed.
     ConfigurationOption::new(
-        "aws:elasticbeanstalk:command",
-        "BatchSize",
+        NAMESPACE_COMMAND,
+        OPTION_BATCH_SIZE,
         CHANGE_SEVERITY_NO_INTERRUPTION,
-        "100",
+        DEFAULT_BATCH_SIZE_VALUE,
     )
-    .with_range(1, 100),
+    .with_range(1, MAX_PUBLISHED_BATCH_SIZE),
     ConfigurationOption::new(
-        "aws:elasticbeanstalk:command",
-        "BatchSizeType",
+        NAMESPACE_COMMAND,
+        OPTION_BATCH_SIZE_TYPE,
         CHANGE_SEVERITY_NO_INTERRUPTION,
-        "Percentage",
+        BATCH_SIZE_TYPE_PERCENTAGE,
     )
-    .with_values(&["Fixed", "Percentage"]),
+    .with_values(BATCH_SIZE_TYPES),
     ConfigurationOption::new(
-        "aws:elasticbeanstalk:command",
+        NAMESPACE_COMMAND,
         "DeploymentPolicy",
         CHANGE_SEVERITY_NO_INTERRUPTION,
         "AllAtOnce",
@@ -496,14 +528,14 @@ pub const GENERAL_CONFIGURATION_OPTIONS: &[ConfigurationOption] = &[
         "TrafficSplitting",
     ]),
     ConfigurationOption::new(
-        "aws:elasticbeanstalk:command",
+        NAMESPACE_COMMAND,
         "IgnoreHealthCheck",
         CHANGE_SEVERITY_NO_INTERRUPTION,
         "false",
     )
     .boolean(),
     ConfigurationOption::new(
-        "aws:elasticbeanstalk:command",
+        NAMESPACE_COMMAND,
         "Timeout",
         CHANGE_SEVERITY_NO_INTERRUPTION,
         "600",
