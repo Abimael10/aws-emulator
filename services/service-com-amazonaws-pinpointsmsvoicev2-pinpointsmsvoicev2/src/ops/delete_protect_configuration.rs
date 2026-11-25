@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteProtectConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteProtectConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteProtectConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +155,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteProtectConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteProtectConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteProtectConfiguration"))
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteProtectConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the protect-configuration store is unavailable".to_string(),
+                        ),
+                        request_id: None,
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = store.lock();
+
+        // `ProtectConfigurationId` is a `ProtectConfigurationIdOrArn`, so either form names
+        // the resource; the store is keyed by the bare id.
+        let named = crate::state::name_from_name_or_arn(&input.protect_configuration_id);
+        let Some(id) = state
+            .protect_configurations
+            .get(named)
+            .map(|record| record.id.clone())
+        else {
+            return Err(
+                DeleteProtectConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::resource_not_found_message(
+                            PROTECT_CONFIGURATION_RESOURCE_TYPE,
+                            named,
+                        )),
+                        resource_type: Some(PROTECT_CONFIGURATION_RESOURCE_TYPE.to_string()),
+                        resource_id: Some(named.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The documented precondition for the delete: "The protect configuration must have
+        // deletion protection disabled and must not be associated as the account default
+        // protect configuration or associated with a configuration set." Each state that
+        // breaks it is refused with the modelled reason that names it, and the record is
+        // left exactly as it was — so a caller can clear the blocker and retry.
+        let record = &state.protect_configurations[&id];
+        let blocker = if record.deletion_protection_enabled {
+            Some("DELETION_PROTECTION_ENABLED")
+        } else if record.account_default {
+            Some("PROTECT_CONFIGURATION_IS_ACCOUNT_DEFAULT")
+        } else if state
+            .configuration_sets
+            .values()
+            .any(|set| set.protect_configuration_id.as_deref() == Some(id.as_str()))
+        {
+            // The association lives on the configuration set that holds it, so a set being
+            // deleted or disassociated takes the blocker with it.
+            Some("PROTECT_CONFIGURATION_ASSOCIATED_WITH_CONFIGURATION_SET")
+        } else {
+            None
+        };
+        if let Some(reason) = blocker {
+            return Err(DeleteProtectConfigurationErrorModeled::ConflictException(
+                ConflictException {
+                    // AWS words this service's conflict message as a restatement of the
+                    // exception's own members, so both carry the same values.
+                    message: Some(crate::state::conflict_message(
+                        reason,
+                        PROTECT_CONFIGURATION_RESOURCE_TYPE,
+                        &id,
+                    )),
+                    reason: Some(reason.to_string()),
+                    resource_type: Some(PROTECT_CONFIGURATION_RESOURCE_TYPE.to_string()),
+                    resource_id: Some(id),
+                },
+            )
+            .into());
+        }
+
+        let removed = state
+            .protect_configurations
+            .remove(&id)
+            .expect("the protect configuration resolved above is present");
+        // The configuration is gone, so the idempotency entry that points at it is dead
+        // bookkeeping: drop it with the resource rather than retaining it forever.
+        state.forget_client_tokens_for(crate::state::CREATE_PROTECT_CONFIGURATION, &removed.id);
+
+        // The response is the record that was removed, so it reports what the service held
+        // rather than what the request named.
+        Ok(DeleteProtectConfigurationOutput {
+            protect_configuration_arn: removed.arn,
+            protect_configuration_id: removed.id,
+            created_timestamp: crate::state::to_timestamp(removed.created_timestamp),
+            account_default: removed.account_default,
+            deletion_protection_enabled: removed.deletion_protection_enabled,
+        })
     }
 }
+
+/// The `ResourceType` this operation's refusals name, as the model's enum spells it.
+const PROTECT_CONFIGURATION_RESOURCE_TYPE: &str = "protect-configuration";

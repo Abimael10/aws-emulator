@@ -43,6 +43,8 @@ pub const CREATE_CONFIGURATION_SET: &str = "CreateConfigurationSet";
 pub const REQUEST_PHONE_NUMBER: &str = "RequestPhoneNumber";
 /// See [`CREATE_CONFIGURATION_SET`].
 pub const CREATE_EVENT_DESTINATION: &str = "CreateEventDestination";
+/// See [`CREATE_CONFIGURATION_SET`].
+pub const CREATE_PROTECT_CONFIGURATION: &str = "CreateProtectConfiguration";
 
 /// What a `ClientToken` for an event-destination create points at: a destination is named
 /// only within one configuration set, so the set's name is part of the key. Neither name
