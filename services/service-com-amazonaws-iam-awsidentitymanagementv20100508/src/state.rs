@@ -514,18 +514,27 @@ const SAML_KEY_USE_SIGNING: &str = "signing";
 /// takes a fixed number of steps however deeply a document nests anything else around it.
 const SAML_KEY_DESCRIPTOR_ANCESTRY: usize = 4;
 
-/// The prefix of a minted `SAMLProviderUUID`. `privateKeyIdType` (which
-/// `GetSAMLProvider$SAMLProviderUUID` targets) is len 22..64 with pattern
-/// `^[A-Z0-9]+$`; this prefix plus [`UNIQUE_ID_SUFFIX_LEN`] base32 characters is 22
-/// characters of uppercase alphanumerics, so it satisfies both. AWS publishes no
-/// prefix for this identifier, so one is chosen here that cannot collide with the
-/// entity-id prefixes above.
-const SAML_PROVIDER_UUID_PREFIX: &str = "SAMLP";
+/// How many characters a minted `SAMLPrivateKey$KeyId` carries.
+///
+/// `privateKeyIdType` — which that member and `GetSAMLProvider$SAMLProviderUUID` both target
+/// — publishes nothing of its values but a length and an alphabet (len 22..64, pattern
+/// `^[A-Z0-9]+$`, `smithy_query(query="shape", shape="privateKeyIdType")`), and AWS
+/// publishes no entity-type prefix for it the way the "IAM identifiers" page of the IAM User
+/// Guide does for a user, a role or a certificate. So an id of this type is OPAQUE: every
+/// character is base32 ([`BASE32_ALPHABET`], uppercase alphanumerics), none of them spelling
+/// out what minted the value, and the count is the type's minimum length.
+pub const PRIVATE_KEY_ID_CHARACTERS: usize = 22;
 
-/// The prefix of a minted `SAMLPrivateKey$KeyId`, which targets the same
-/// `privateKeyIdType` as [`SAML_PROVIDER_UUID_PREFIX`] and is built the same way, from
-/// its own prefix so a key id is never a provider uuid.
-const SAML_PRIVATE_KEY_ID_PREFIX: &str = "SAMLK";
+/// What the counter behind a minted `SAMLProviderUUID` is keyed with, so the provider uuids
+/// and the private key ids — two id families of one opaque type, each counted from its own
+/// sequence — are drawn from independent mixes and a key id is never a provider uuid
+/// ([`opaque_id`], [`opaque_uuid`]). Keying the counter is what a visible prefix would
+/// otherwise have to do, and it leaves no trace of the family in the value.
+const SAML_PROVIDER_UUID_FAMILY_KEY: u64 = 0x5A4D_4C50_524F_5649;
+
+/// What the counter behind a minted `SAMLPrivateKey$KeyId` is keyed with, for the same
+/// reason [`SAML_PROVIDER_UUID_FAMILY_KEY`] exists.
+const SAML_PRIVATE_KEY_ID_FAMILY_KEY: u64 = 0x4B45_594D_4154_4552;
 
 /// The prefix AWS gives a server certificate's unique id — the `ASCA` prefix the "IAM
 /// identifiers" page of the IAM User Guide lists for a certificate under "unique ID
@@ -4113,6 +4122,35 @@ fn unique_id_of_length(prefix: &str, seq: u64, suffix_len: usize) -> String {
         word >>= 5;
     }
     id
+}
+
+/// An OPAQUE identifier at position `seq` of the id family keyed by `family`:
+/// `characters` base32 characters and nothing else.
+///
+/// What an id type publishes only as a length and an alphabet is minted with no prefix at
+/// all — a prefix would spell out which operation minted the value, which is a property of
+/// this emulator rather than of the identifier family AWS guarantees. Uniqueness comes from
+/// the same place [`unique_id`]'s does: `seq` is bijectively mixed into the first
+/// [`BASE32_CHARACTERS_PER_WORD`] characters, and `family` keys the counter so two families
+/// counted from their own sequences do not spell one id twice.
+fn opaque_id(family: u64, seq: u64, characters: usize) -> String {
+    unique_id_of_length("", seq ^ family, characters)
+}
+
+/// The uuid at position `seq` of the id family keyed by `family`, spelled for an id type
+/// that admits neither separators nor lowercase: 128 bits as 32 uppercase hex characters.
+///
+/// `privateKeyIdType`'s `^[A-Z0-9]+$` admits no `-`, so a member that NAMES its value a uuid
+/// (`GetSAMLProvider$SAMLProviderUUID`) carries the same 128 bits the 8-4-4-4-12 grouping
+/// spells ([`uuid_from_counter`]) without the grouping, and in the one case the pattern
+/// leaves. Unique for the same reason: the high word carries all 64 bits of the counter's
+/// bijective mix, and `family` keys the counter so two id families do not spell one id
+/// twice.
+fn opaque_uuid(family: u64, seq: u64) -> String {
+    let keyed = seq ^ family;
+    let high = splitmix64(keyed);
+    let low = splitmix64(keyed ^ JOB_ID_LOW_WORD_KEY);
+    format!("{high:016X}{low:016X}")
 }
 
 /// SplitMix64's finalizer: a bijection on `u64` that scatters consecutive inputs.

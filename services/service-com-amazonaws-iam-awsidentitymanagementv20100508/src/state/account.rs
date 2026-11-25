@@ -1264,22 +1264,30 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
 
     /// Mint the next SAML provider's `SAMLProviderUUID`.
     ///
-    /// Unique and stable for the same reason [`next_user_id`](Self::next_user_id) is:
-    /// the counter is bijectively mixed into the suffix, and the id is minted once and
-    /// then stored with the provider.
+    /// Unique and stable for the same reason [`next_user_id`](Self::next_user_id) is: the
+    /// counter is bijectively mixed into the value, and the id is minted once and then
+    /// stored with the provider. It carries no entity-type prefix — `privateKeyIdType`
+    /// publishes none — and the member names the value a uuid, so it is the 128 bits of
+    /// [`opaque_uuid`] spelled in the uppercase hex that type's `^[A-Z0-9]+$` leaves,
+    /// 32 characters, inside its len 22..64.
     pub fn next_saml_provider_uuid(&mut self) -> String {
         self.saml_provider_uuid_seq += 1;
-        unique_id(SAML_PROVIDER_UUID_PREFIX, self.saml_provider_uuid_seq)
+        opaque_uuid(SAML_PROVIDER_UUID_FAMILY_KEY, self.saml_provider_uuid_seq)
     }
 
     /// Mint the next uploaded SAML private key's `KeyId`.
     ///
-    /// Unique and stable for the same reason
-    /// [`next_saml_provider_uuid`](Self::next_saml_provider_uuid) is, and drawn from its
-    /// own counter and prefix so a key id is never a provider uuid.
+    /// The same opaque id family as
+    /// [`next_saml_provider_uuid`](Self::next_saml_provider_uuid) — both members target
+    /// `privateKeyIdType` — drawn from its own counter under its own family key, so a key
+    /// id is never a provider uuid.
     pub fn next_saml_private_key_id(&mut self) -> String {
         self.saml_private_key_id_seq += 1;
-        unique_id(SAML_PRIVATE_KEY_ID_PREFIX, self.saml_private_key_id_seq)
+        opaque_id(
+            SAML_PRIVATE_KEY_ID_FAMILY_KEY,
+            self.saml_private_key_id_seq,
+            PRIVATE_KEY_ID_CHARACTERS,
+        )
     }
 
     /// Mint the next server certificate's `ServerCertificateId`.

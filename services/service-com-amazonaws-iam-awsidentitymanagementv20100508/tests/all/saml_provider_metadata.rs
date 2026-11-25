@@ -58,17 +58,26 @@ use crate::user_lifecycle::{call, element, elements, router};
 #[derive(Debug, Clone)]
 pub(crate) struct SigningKey {
     /// What the document's `X509Certificate` element carries.
-    certificate: String,
-    /// The identifier of the key the certificate carries: the hex SHA-1 of its
-    /// `subjectPublicKey` bit string (RFC 5280 §4.2.1.2's first method), computed here from
-    /// the generated certificate rather than read out of any response.
-    key_hash: String,
+    pub(crate) certificate: String,
+    /// The identifier of the key the certificate carries: the hex SHA-384 of the key's
+    /// `SubjectPublicKeyInfo` DER, computed here from the generated certificate rather than
+    /// read out of any response.
+    pub(crate) key_hash: String,
 }
 
 /// Generate a real key pair and a self-signed certificate for it, and report the two forms
 /// above.
 pub(crate) fn signing_key(common_name: &str) -> SigningKey {
-    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("a key pair");
+    signing_key_using(&rcgen::PKCS_ECDSA_P256_SHA256, common_name)
+}
+
+/// [`signing_key`] over a chosen signature algorithm, so a rule about a published key can be
+/// shown to hold whatever kind of key the document publishes.
+pub(crate) fn signing_key_using(
+    algorithm: &'static rcgen::SignatureAlgorithm,
+    common_name: &str,
+) -> SigningKey {
+    let key = rcgen::KeyPair::generate_for(algorithm).expect("a key pair");
     let mut params =
         rcgen::CertificateParams::new(vec![common_name.to_string()]).expect("parameters");
     let mut subject = rcgen::DistinguishedName::new();
@@ -77,18 +86,13 @@ pub(crate) fn signing_key(common_name: &str) -> SigningKey {
     let certificate = params.self_signed(&key).expect("a self-signed certificate");
     let der = certificate.der().to_vec();
     let parsed = x509_cert::Certificate::from_der(&der).expect("the certificate parses");
-    let mut hasher = <sha1::Sha1 as sha1::Digest>::new();
-    sha1::Digest::update(
-        &mut hasher,
-        parsed
-            .tbs_certificate
-            .subject_public_key_info
-            .subject_public_key
-            .raw_bytes(),
-    );
+    let key_der = x509_cert::der::Encode::to_der(&parsed.tbs_certificate.subject_public_key_info)
+        .expect("the key re-encodes");
+    let mut hasher = <sha2::Sha384 as sha2::Digest>::new();
+    sha2::Digest::update(&mut hasher, &key_der);
     SigningKey {
         certificate: data_encoding::BASE64.encode(&der),
-        key_hash: hex::encode(sha1::Digest::finalize(hasher)),
+        key_hash: hex::encode(sha2::Digest::finalize(hasher)),
     }
 }
 

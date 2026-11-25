@@ -117,7 +117,7 @@ pub const OPEN_ID_CONNECT_URL_FORM_REFUSAL: crate::ops::types::InvalidInputExcep
 /// rather than of the request or the moment, and two providers never share one.
 ///
 /// The hex is [`data_encoding`]'s HEXLOWER, the one coding this crate spells a digest with
-/// ([`key_identifier`]).
+/// ([`key_hash`]).
 ///
 /// What it is NOT: a claim about a certificate the IdP presented. No chain is fetched here —
 /// this emulator opens no outbound connection, and a provider URL it cannot reach has no
@@ -147,14 +147,12 @@ pub fn stored_open_id_connect_thumbprints(issuer: &str, supplied: Vec<String>) -
 
 /// The hashes of the signing keys `metadata` publishes, paired with the issuer it names.
 ///
-/// A reader of a provider's metadata checks a message from that provider against the
-/// certificates the document publishes, so what identifies one of those KEYS without
-/// carrying it is the key identifier of its public key: the SHA-1 of the certificate's
-/// `subjectPublicKey` bit string, hex — the identifier RFC 5280 §4.2.1.2 derives from a
-/// public key, which is a property of the KEY rather than of the certificate carrying it,
-/// so renewing a certificate around the same key leaves the hash unchanged. The issuer is
-/// the entity descriptor's `entityID`, which is the name that provider's own messages carry
-/// as their `Issuer`.
+/// A reader of a provider's metadata checks a message from that provider against the keys
+/// the document publishes, so what names one of those KEYS without carrying it is the digest
+/// of the key itself ([`key_hash`]) — a property of the key rather than of the certificate
+/// around it, so a certificate renewed over one key keeps the key's hash. The issuer is the
+/// entity descriptor's `entityID`, which is the name that provider's own messages carry as
+/// their `Issuer`.
 ///
 /// A document publishing no readable key (none at all, a body that is not the base64 of a
 /// DER certificate, or one that is not an X.509 certificate) pairs nothing: there is no key
@@ -165,15 +163,14 @@ pub fn saml_key_hashes(metadata: &SamlMetadata) -> Vec<SAMLKeyHashEntry> {
         .iter()
         .filter_map(|certificate| ::data_encoding::BASE64.decode(certificate.as_bytes()).ok())
         .filter_map(|der| {
-            use ::x509_cert::der::Decode;
+            use ::x509_cert::der::{Decode, Encode};
             let certificate = ::x509_cert::Certificate::from_der(&der).ok()?;
-            Some(key_identifier(
-                certificate
-                    .tbs_certificate
-                    .subject_public_key_info
-                    .subject_public_key
-                    .raw_bytes(),
-            ))
+            let key = certificate
+                .tbs_certificate
+                .subject_public_key_info
+                .to_der()
+                .ok()?;
+            Some(key_hash(&key))
         })
         .collect();
     if key_hashes.is_empty() {
@@ -185,16 +182,19 @@ pub fn saml_key_hashes(metadata: &SamlMetadata) -> Vec<SAMLKeyHashEntry> {
     }]
 }
 
-/// The key identifier of the public key whose `subjectPublicKey` bits are `key_bits`: the
-/// SHA-1 of those bits, hex.
+/// The hash that names the public key whose `SubjectPublicKeyInfo` DER is `key_der`: the
+/// SHA-384 of that structure, hex.
 ///
-/// RFC 5280 §4.2.1.2's first method of forming one — "the SHA-1 hash of the BIT STRING
-/// subjectPublicKey (excluding the tag, length, and number of unused bits)" — so the
-/// identifier is the one every reader of that key derives for it, rather than a coding
-/// chosen here. The hex is [`data_encoding`]'s, the crate this service already spells
-/// base32 and hex with, so one coding is used everywhere rather than two.
-fn key_identifier(key_bits: &[u8]) -> String {
-    let mut hasher = <::sha1::Sha1 as ::sha1::Digest>::new();
-    ::sha1::Digest::update(&mut hasher, key_bits);
-    ::data_encoding::HEXLOWER.encode(&::sha1::Digest::finalize(hasher))
+/// Recorded behaviour fixes the digest: a key hash is 96 lowercase hex characters, a 384-bit
+/// digest, and it is derived from the key material the metadata document publishes rather
+/// than from the call that reads it — so one document always reports the same hash, and a
+/// client comparing a fingerprint of that family against it compares strings of the one
+/// width. What is hashed is the published key in the one encoding every reader of the
+/// document already has for it: the `SubjectPublicKeyInfo` of the certificate that carries
+/// it, algorithm and all, which is the structure a public-key fingerprint is taken over. The
+/// hex is [`data_encoding`]'s HEXLOWER, the one coding this crate spells a digest with.
+fn key_hash(key_der: &[u8]) -> String {
+    let mut hasher = <::sha2::Sha384 as ::sha2::Digest>::new();
+    ::sha2::Digest::update(&mut hasher, key_der);
+    ::data_encoding::HEXLOWER.encode(&::sha2::Digest::finalize(hasher))
 }
