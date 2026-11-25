@@ -187,7 +187,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Resuming, which is where the token names a position: one this service never minted
         // names none, and this operation models InvalidPaginationTokenException for exactly
         // that.
-        let after = crate::state::decode_cursor(input.next_token.as_deref()).map_err(|_| {
+        let after = crate::state::decode_cursor(
+            crate::state::CursorKind::Pipeline,
+            input.next_token.as_deref(),
+        )
+        .map_err(|_| {
             ListPipelinesErrorModeled::InvalidPaginationTokenException(
                 InvalidPaginationTokenException {
                     message: Some(
@@ -197,7 +201,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        let page = crate::state::page_of(ordered, after.as_deref(), input.max_results);
+        let page = crate::state::page_of(
+            crate::state::CursorKind::Pipeline,
+            ordered,
+            after.as_deref(),
+            input.max_results,
+        );
 
         let mut summaries: Vec<PipelineSummary> = Vec::with_capacity(page.items.len());
         for name in &page.items {

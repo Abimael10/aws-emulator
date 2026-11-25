@@ -14,6 +14,7 @@ mod configuration_roles;
 mod ingest_delivery;
 mod ingest_endpoint;
 mod pipeline_configuration;
+mod pipeline_endpoints;
 
 pub use blueprint_format::{
     document_as_json, BlueprintFormat, UnrenderableBlueprint, BLUEPRINT_FORMATS,
@@ -33,6 +34,10 @@ pub use ingest_endpoint::{
 pub use pipeline_configuration::{
     ingest_routes, normalized_path, route_at, IngestRoute, PipelineSink, S3Sink, SinkCodec,
     DEFAULT_HTTP_SOURCE_PATH, HTTP_SOURCE, S3_SINK,
+};
+pub use pipeline_endpoints::{
+    endpoint_ingest_url, interface_endpoint_id, pipeline_endpoint_id, StoredPipelineEndpoint,
+    ENDPOINT_STATUS_ACTIVE, ENDPOINT_STATUS_CREATING, MAX_PIPELINE_ENDPOINTS,
 };
 
 use crate::ops::types::{
@@ -793,6 +798,10 @@ pub struct ComAmazonawsOsisAmazonopensearchingestionserviceState {
     /// these: no caller creates or deletes one, so both blueprint operations are pure
     /// reports over this map and cannot disagree with each other.
     pub blueprints: BTreeMap<String, StoredBlueprint>,
+    /// Every VPC endpoint created for a pipeline, keyed by its endpoint id — unique per
+    /// account, and `ListPipelineEndpoints` lists "all pipeline endpoints in your account"
+    /// — and ordered by it, so that listing paginates deterministically.
+    pub pipeline_endpoints: BTreeMap<String, StoredPipelineEndpoint>,
 }
 
 /// The store a fresh engine hands this service: no pipelines yet, and the blueprint
@@ -802,6 +811,7 @@ impl Default for ComAmazonawsOsisAmazonopensearchingestionserviceState {
         Self {
             pipelines: BTreeMap::new(),
             blueprints: builtin_blueprints(),
+            pipeline_endpoints: BTreeMap::new(),
         }
     }
 }
@@ -823,6 +833,25 @@ impl ComAmazonawsOsisAmazonopensearchingestionserviceState {
         self.pipelines
             .values_mut()
             .find(|pipeline| pipeline.pipeline_arn == arn)
+    }
+
+    /// How many endpoints the account already holds for the pipeline this ARN names —
+    /// the ordinal a further one is minted with ([`pipeline_endpoint_id`]).
+    pub fn pipeline_endpoints_for(&self, pipeline_arn: &str) -> usize {
+        self.pipeline_endpoints
+            .values()
+            .filter(|endpoint| endpoint.pipeline_arn == pipeline_arn)
+            .count()
+    }
+
+    /// Drop every endpoint created for the pipeline this ARN names.
+    ///
+    /// An endpoint is a child of its pipeline, so deleting the pipeline takes its endpoints
+    /// with it exactly as it takes its tags and its resource policy: nothing is left for a
+    /// later listing to report against a pipeline that no longer exists.
+    pub fn remove_pipeline_endpoints_of(&mut self, pipeline_arn: &str) {
+        self.pipeline_endpoints
+            .retain(|_, endpoint| endpoint.pipeline_arn != pipeline_arn);
     }
 }
 
@@ -888,9 +917,7 @@ pub fn pipeline_arn(region: &str, pipeline_name: &str) -> String {
 /// `vpce-` plus a 17-hex-digit suffix is the shape EC2 interface-endpoint ids carry; the
 /// suffix is derived from the pipeline's ARN so it is stable across reads.
 pub fn vpc_endpoint_id(pipeline_arn: &str) -> String {
-    let digest = <::sha2::Sha256 as ::sha2::Digest>::digest(format!("vpce/{pipeline_arn}"));
-    let suffix = ::hex::encode(&digest[..9]);
-    format!("vpce-{}", &suffix[..17])
+    interface_endpoint_id(&format!("vpce/{pipeline_arn}"))
 }
 
 /// The VPC endpoint record a create with `VpcOptions` mints.
@@ -919,26 +946,50 @@ pub struct Page<T> {
 #[derive(Debug, Clone, Copy)]
 pub struct MalformedCursor;
 
-/// Prefix the cursor plaintext carries, so a token this service never minted cannot
-/// decode into a usable position.
-const CURSOR_PREFIX: &str = "osis-after-pipeline:";
-
-/// Encode the resume cursor that follows the pipeline named `pipeline_name`.
+/// WHICH listing of this service a cursor names a position in.
 ///
-/// Opaque to the caller (hex of the internal cursor text) and well within `NextToken`'s
-/// `@length(0, 3000)`. The cursor names a POSITION in the name ordering rather than an
-/// offset, so resuming never repeats or skips a pipeline when one is created or deleted
-/// between pages.
-///
-/// It is self-describing, so `ListPipelines` validates a token by decoding it and never
-/// has to record the tokens it issued — which matters because `ListPipelines` is a
-/// reporting operation: remembering an issued token would make a read mutate state.
-pub fn encode_cursor(pipeline_name: &str) -> String {
-    ::hex::encode(format!("{CURSOR_PREFIX}{pipeline_name}"))
+/// The kind is part of the cursor plaintext, so a token one listing minted names no
+/// position in another: the resources they page through are keyed differently, and a token
+/// carried across would otherwise resume at a position that means nothing there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorKind {
+    /// A position in the pipelines, ordered by pipeline name.
+    Pipeline,
+    /// A position in the pipeline endpoints, ordered by endpoint id.
+    PipelineEndpoint,
 }
 
-/// Decode a cursor minted by [`encode_cursor`]; `None` starts at the beginning.
-pub fn decode_cursor(next_token: Option<&str>) -> Result<Option<String>, MalformedCursor> {
+impl CursorKind {
+    /// Prefix the cursor plaintext carries, so a token this service never minted — or
+    /// minted for another listing — cannot decode into a usable position.
+    const fn prefix(self) -> &'static str {
+        match self {
+            Self::Pipeline => "osis-after-pipeline:",
+            Self::PipelineEndpoint => "osis-after-pipeline-endpoint:",
+        }
+    }
+}
+
+/// Encode the resume cursor that follows the item keyed `key` in the listing `kind`.
+///
+/// Opaque to the caller (hex of the internal cursor text) and well within `NextToken`'s
+/// `@length(0, 3000)`. The cursor names a POSITION in the key ordering rather than an
+/// offset, so resuming never repeats or skips an item when one is created or deleted
+/// between pages.
+///
+/// It is self-describing, so a listing validates a token by decoding it and never has to
+/// record the tokens it issued — which matters because a listing is a reporting operation:
+/// remembering an issued token would make a read mutate state.
+pub fn encode_cursor(kind: CursorKind, key: &str) -> String {
+    ::hex::encode(format!("{}{key}", kind.prefix()))
+}
+
+/// Decode a cursor minted by [`encode_cursor`] for the listing `kind`; `None` starts at the
+/// beginning.
+pub fn decode_cursor(
+    kind: CursorKind,
+    next_token: Option<&str>,
+) -> Result<Option<String>, MalformedCursor> {
     let Some(token) = next_token else {
         return Ok(None);
     };
@@ -949,17 +1000,19 @@ pub fn decode_cursor(next_token: Option<&str>) -> Result<Option<String>, Malform
     }
     let bytes = ::hex::decode(token).map_err(|_| MalformedCursor)?;
     let text = String::from_utf8(bytes).map_err(|_| MalformedCursor)?;
-    text.strip_prefix(CURSOR_PREFIX)
-        .map(|name| Some(name.to_string()))
+    text.strip_prefix(kind.prefix())
+        .map(|key| Some(key.to_string()))
         .ok_or(MalformedCursor)
 }
 
-/// Take the page of `ordered` (sorted by pipeline name) that follows `after`, at most
-/// `max_results` long.
+/// Take the page of `ordered` (sorted by the key each item is paired with) that follows
+/// `after`, at most `max_results` long, with the resume cursor minted for the listing
+/// `kind`.
 ///
 /// `max_results` is `@range(1, 100)`, so the boundary validator has already refused
 /// anything outside it; an absent one takes a full page.
 pub fn page_of<T>(
+    kind: CursorKind,
     ordered: impl IntoIterator<Item = (String, T)>,
     after: Option<&str>,
     max_results: Option<i32>,
@@ -985,7 +1038,7 @@ pub fn page_of<T>(
     }
     Page {
         items,
-        next_token: more_follow.then(|| encode_cursor(&last_name)),
+        next_token: more_follow.then(|| encode_cursor(kind, &last_name)),
     }
 }
 

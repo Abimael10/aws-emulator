@@ -169,7 +169,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A VPC endpoint created for this pipeline is a child of it, so the delete takes
+        // the endpoints with the pipeline, exactly as it takes its tags and its resource
+        // policy: no later listing reports an endpoint of a pipeline that is gone.
+        let pipeline_arn = stored.pipeline_arn.clone();
         store.pipelines.remove(&pipeline_name);
+        store.remove_pipeline_endpoints_of(&pipeline_arn);
         Ok(DeletePipelineOutput {})
     }
 }

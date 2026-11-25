@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPipelineEndpoints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPipelineEndpoints`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPipelineEndpoints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPORT over the endpoint records `CreatePipelineEndpoint` wrote: every pipeline
+//! endpoint of the account, ordered by endpoint id and paged with the cursor this service's
+//! listings share. The one write it makes is the status transition the clock already owes
+//! an endpoint it reports.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +149,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPipelineEndpoints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPipelineEndpointsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPipelineEndpoints"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let mut store = state.lock();
+
+        // The page is taken over the endpoint IDS first, so the only records this listing
+        // settles are the ones it reports back: an endpoint on a later page is neither read
+        // nor written here.
+        let ordered: Vec<(String, String)> = store
+            .pipeline_endpoints
+            .keys()
+            .map(|id| (id.clone(), id.clone()))
+            .collect();
+
+        // A listing with nothing to page through has exactly ONE page — the empty one — and
+        // it is the last: there is no position in it to resume from, so no pagination input
+        // decides anything and the account is reported empty.
+        if ordered.is_empty() {
+            return Ok(ListPipelineEndpointsOutput {
+                pipeline_endpoints: Some(Vec::new()),
+                next_token: None,
+            });
+        }
+
+        // Resuming, which is where the token names a position: one this listing never
+        // minted names none. This operation models no pagination-token error of its own, so
+        // a token it cannot read is a bad input field — 400 `ValidationException`.
+        let after = crate::state::decode_cursor(
+            crate::state::CursorKind::PipelineEndpoint,
+            input.next_token.as_deref(),
+        )
+        .map_err(|_| malformed_token())?;
+
+        let page = crate::state::page_of(
+            crate::state::CursorKind::PipelineEndpoint,
+            ordered,
+            after.as_deref(),
+            input.max_results,
+        );
+
+        let mut endpoints: Vec<PipelineEndpoint> = Vec::with_capacity(page.items.len());
+        for id in &page.items {
+            if let Some(endpoint) = store.pipeline_endpoints.get_mut(id) {
+                // The only write a report makes: the transition the clock already owes
+                // this record.
+                endpoint.settle(now);
+                endpoints.push(endpoint.to_endpoint());
+            }
+        }
+
+        Ok(ListPipelineEndpointsOutput {
+            pipeline_endpoints: Some(endpoints),
+            next_token: page.next_token,
+        })
     }
+}
+
+/// The `NextToken` names no position in this listing — HTTP 400 `ValidationException`,
+/// which is what this operation models for an invalid input field.
+fn malformed_token() -> ListPipelineEndpointsError {
+    ListPipelineEndpointsErrorModeled::ValidationException(ValidationException {
+        message: Some("Invalid pagination token: it was not issued by this service".to_string()),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server-side fault, modelled as `InternalException`
+/// (HTTP 500). Never answered by constructing a private engine.
+fn store_unavailable() -> ListPipelineEndpointsError {
+    ListPipelineEndpointsErrorModeled::InternalException(InternalException {
+        message: Some("the OpenSearch Ingestion pipeline store is unavailable".to_string()),
+    })
+    .into()
 }

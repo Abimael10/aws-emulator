@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePipelineEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePipelineEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePipelineEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A WRITE: it creates a VPC endpoint FOR the pipeline the ARN names, so the pipeline has
+//! to resolve first — an ARN no stored pipeline carries names no parent to attach an
+//! endpoint to, and is refused 404 `ResourceNotFoundException` with nothing recorded. For a
+//! pipeline that does exist the endpoint is stored
+//! ([`crate::state::StoredPipelineEndpoint`]) and answered from the stored record, so
+//! `ListPipelineEndpoints` reports exactly what this call minted.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +158,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePipelineEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePipelineEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePipelineEndpoint"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let mut store = state.lock();
+
+        // `PipelineArn` is `@length(46, 76)` with the pipeline-ARN pattern and the VPC ids
+        // carry their own `@length`/`@pattern`, so a malformed request was already refused
+        // before this handler ran. What is left is the lookup: an endpoint belongs to a
+        // pipeline, so an ARN no stored pipeline carries names no resource to create one
+        // for, and the request is refused before anything is recorded.
+        let pipeline = store
+            .pipeline_by_arn(&input.pipeline_arn)
+            .ok_or_else(not_found)?;
+        // The address this endpoint publishes is the pipeline's own ingestion endpoint,
+        // read out of the record rather than re-derived, so a client reaching the pipeline
+        // through the endpoint reaches the address the ingest plane answers on.
+        let ingest_endpoint_url = crate::state::endpoint_ingest_url(pipeline);
+        let pipeline_arn = pipeline.pipeline_arn.clone();
+
+        // The emulator's own ceiling on the endpoints one account may hold, which this
+        // operation models `LimitExceededException` for.
+        if store.pipeline_endpoints.len() >= crate::state::MAX_PIPELINE_ENDPOINTS {
+            return Err(limit_exceeded());
+        }
+
+        // An account may hold several endpoints for one pipeline, each its own resource:
+        // the id is minted from the pipeline, the VPC configuration asked for and how many
+        // endpoints that pipeline already has, so it is stable across reads and distinct
+        // per endpoint.
+        let ordinal = store.pipeline_endpoints_for(&pipeline_arn);
+        let endpoint_id =
+            crate::state::pipeline_endpoint_id(&pipeline_arn, &input.vpc_options, ordinal);
+        let record = crate::state::StoredPipelineEndpoint {
+            endpoint_id: endpoint_id.clone(),
+            pipeline_arn,
+            // A new endpoint is not reachable yet: the clock owes it ACTIVE.
+            status: crate::state::ENDPOINT_STATUS_CREATING.to_string(),
+            pending: Some(crate::state::PendingTransition {
+                to: crate::state::ENDPOINT_STATUS_ACTIVE.to_string(),
+                due_at: now + crate::state::TRANSITION_SPAN,
+            }),
+            vpc_options: input.vpc_options,
+            ingest_endpoint_url,
+        };
+        store.pipeline_endpoints.insert(endpoint_id.clone(), record);
+
+        // Answer from the stored record, so this response cannot drift from the state a
+        // later ListPipelineEndpoints reads.
+        let stored = store
+            .pipeline_endpoints
+            .get(&endpoint_id)
+            .ok_or_else(store_unavailable)?;
+        let endpoint = stored.to_endpoint();
+        Ok(CreatePipelineEndpointOutput {
+            pipeline_arn: endpoint.pipeline_arn,
+            endpoint_id: endpoint.endpoint_id,
+            status: endpoint.status,
+            vpc_id: endpoint.vpc_id,
+        })
     }
+}
+
+/// The ARN names no stored pipeline — HTTP 404 `ResourceNotFoundException`, this
+/// operation's modelled error for "a resource that does not exist".
+///
+/// The text is wholly fixed: it echoes neither the ARN the request carried nor anything
+/// else about the account's pipelines.
+fn not_found() -> CreatePipelineEndpointError {
+    CreatePipelineEndpointErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some("The pipeline could not be found".to_string()),
+    })
+    .into()
+}
+
+/// The account already holds as many pipeline endpoints as this emulator will keep — HTTP
+/// 409 `LimitExceededException`.
+fn limit_exceeded() -> CreatePipelineEndpointError {
+    CreatePipelineEndpointErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(format!(
+            "You have reached the maximum number of pipeline endpoints ({})",
+            crate::state::MAX_PIPELINE_ENDPOINTS
+        )),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server-side fault, modelled as `InternalException`
+/// (HTTP 500). Never answered by constructing a private engine.
+fn store_unavailable() -> CreatePipelineEndpointError {
+    CreatePipelineEndpointErrorModeled::InternalException(InternalException {
+        message: Some("the OpenSearch Ingestion pipeline store is unavailable".to_string()),
+    })
+    .into()
 }
