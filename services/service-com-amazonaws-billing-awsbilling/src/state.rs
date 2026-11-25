@@ -10,7 +10,9 @@
 //! [`ComAmazonawsBillingAwsbillingState::billing_view_segments`] — the periods
 //! over which its billing domain and account relationships did not change,
 //! which `ListBillingViewSegments` reports; see the `billing_view_segments`
-//! module below.
+//! module below. What a read reports as a view's **health** is not stored
+//! beside the view but derived, on every read, from the state that view depends
+//! on — see the `health` module below.
 //!
 //! Its second resource is the account's **billing preferences**:
 //! `UpdateBillingPreferences` writes [`ComAmazonawsBillingAwsbillingState::billing_preferences`]
@@ -54,9 +56,8 @@ use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_sta
 pub use ::service_common::page_tokens::PageTokenKey;
 
 use crate::ops::types::{
-    AccessDeniedException, BillingViewHealthStatus, BillingViewHealthStatusException, Expression,
-    ResourceNotFoundException, ResourceTag, ValidationException, ValidationExceptionField,
-    BILLING_FEATURE_VALUES,
+    AccessDeniedException, BillingViewHealthStatusException, Expression, ResourceNotFoundException,
+    ResourceTag, ValidationException, ValidationExceptionField, BILLING_FEATURE_VALUES,
 };
 
 /// The Support-eligible spend `ListBusinessSupportAccountCharges` prices.
@@ -108,6 +109,12 @@ pub use resource_policy::*;
 mod linked_accounts;
 
 pub use linked_accounts::*;
+
+/// The health a billing view reports, derived from the standing of its owner and
+/// from the views it draws from.
+mod health;
+
+pub use health::*;
 
 /// `CUSTOM`, the `BillingViewType` a view created through `CreateBillingView`
 /// carries (one of `BILLING_VIEW_TYPE_VALUES` in `ops::types`).
@@ -462,7 +469,12 @@ pub struct BillingView {
     pub created_at: SystemTime,
     pub updated_at: Option<SystemTime>,
     pub view_definition_last_updated_at: Option<SystemTime>,
-    /// A `BillingViewStatus` value, e.g. [`BILLING_VIEW_STATUS_HEALTHY`].
+    /// A `BillingViewStatus` value, e.g. [`BILLING_VIEW_STATUS_HEALTHY`] — the
+    /// condition the service RECORDED on this view itself, which is not the
+    /// whole of the health a read reports: see [`BillingView::recorded_health`]
+    /// and [`ComAmazonawsBillingAwsbillingState::view_health`], which derive the
+    /// rest from the standing of the view's owner and from the views it draws
+    /// from.
     pub health_status_code: String,
     /// The `BillingViewStatusReason` values explaining
     /// [`BillingView::health_status_code`], e.g. `SOURCE_VIEW_UNHEALTHY`
@@ -501,15 +513,6 @@ impl BillingView {
     /// appeared.
     pub fn is_always_active(&self) -> bool {
         self.billing_view_type == BILLING_VIEW_TYPE_PRIMARY
-    }
-
-    /// Whether this view's `BillingViewStatus` is
-    /// [`BILLING_VIEW_STATUS_HEALTHY`], the one status in which an operation may
-    /// act on it: every other value (`CREATING`, `UNHEALTHY`, `UPDATING`) is a
-    /// state the modeled `BillingViewHealthStatusException` names — see
-    /// [`billing_view_not_healthy`].
-    pub fn is_healthy(&self) -> bool {
-        self.health_status_code == BILLING_VIEW_STATUS_HEALTHY
     }
 
     /// The accounts owning the billing views this one draws its data from, in
@@ -1943,20 +1946,6 @@ pub fn decode_scoped_page_token<'scope>(
         // Every token this codec mints carries the cursor behind its scope, so a
         // payload with nothing behind it is not one it produced.
         None => ScopedPageToken::Unusable,
-    }
-}
-
-/// The `BillingViewHealthStatus` a read reports for `view`.
-///
-/// Both members are always present: the stored status code and the stored
-/// reason list, which is EMPTY for a status that needs no explaining rather
-/// than absent (see [`BillingView::health_status_reasons`]). Shared by every
-/// read that projects a billing view, so `GetBillingView` and
-/// `ListBillingViews` cannot report one view's health two ways.
-pub fn health_status(view: &BillingView) -> BillingViewHealthStatus {
-    BillingViewHealthStatus {
-        status_code: Some(view.health_status_code.clone()),
-        status_reasons: Some(view.health_status_reasons.clone()),
     }
 }
 

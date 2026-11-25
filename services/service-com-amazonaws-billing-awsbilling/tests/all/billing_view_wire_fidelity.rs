@@ -73,8 +73,10 @@ fn content_type(headers: &http::HeaderMap) -> String {
         .to_string()
 }
 
-/// Put the stored view's health status at `code` with `reasons`, the one way a
-/// view's health moves in this emulator: no modelled operation sets it.
+/// Record a condition on the stored view ITSELF — the code and the reasons its
+/// health then reports whatever the state it depends on says. The health a view
+/// derives from its owner's standing and from the views it draws from moves
+/// through the API instead; see `billing_view_health_propagation.rs`.
 fn set_health(engine: &Arc<engine::InMemoryEngine>, arn: &str, code: &str, reasons: &[String]) {
     let state = engine.state::<ComAmazonawsBillingAwsbillingState>();
     let mut state = state.lock();

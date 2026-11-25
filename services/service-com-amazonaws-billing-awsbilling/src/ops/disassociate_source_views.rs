@@ -218,6 +218,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // Which account manages the organization this account belongs to is AWS
+        // Organizations' own fact the health of a `CUSTOM` view depends on, read
+        // off that service's store BEFORE this one is locked, so serving this
+        // request never holds two services' stores at once.
+        let management_account = crate::state::organization_management_account_id(&*self.engine);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DisassociateSourceViewsErrorModeled::InternalServerException(InternalServerException {
                 message: "the billing view store is unavailable".to_string(),
@@ -234,26 +239,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The refusal is this operation's own sentence — see
         // [`not_a_custom_view`] — not the lifecycle writers' wording.
         let now = ::std::time::SystemTime::now();
-        let Some(view) = state.custom_view_mut(&input.arn) else {
+        if state.custom_view(&input.arn).is_none() {
             return Err(not_a_custom_view());
-        };
+        }
 
         // `BillingViewHealthStatusException`: "a billing view's health status
         // prevents an operation from being performed … if the billing view is in
-        // a state other than HEALTHY". The refusal is the one every writer of a
-        // stored view shares — see `crate::state::billing_view_not_healthy`.
-        if !view.is_healthy() {
+        // a state other than HEALTHY". The status is the one every read of the
+        // view reports (`crate::state::view_health`) and the refusal is the one
+        // every writer of a stored view shares — see
+        // `crate::state::billing_view_not_healthy`.
+        let health = state
+            .health_of(&input.arn, management_account.as_deref(), now)
+            .unwrap_or_else(crate::state::ViewHealth::healthy);
+        if !health.is_healthy() {
             return Err(
                 DisassociateSourceViewsErrorModeled::BillingViewHealthStatusException(
                     crate::state::billing_view_not_healthy(
                         &input.arn,
-                        &view.health_status_code,
+                        &health.status_code,
                         "disassociate source views",
                     ),
                 )
                 .into(),
             );
         }
+
+        let Some(view) = state.custom_view_mut(&input.arn) else {
+            return Err(not_a_custom_view());
+        };
 
         // The association is a SET and this operation is `@idempotent`, so the
         // request's effect is the set difference: a source the view draws from is

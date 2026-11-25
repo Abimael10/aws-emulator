@@ -390,6 +390,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(range) = &input.active_time_range {
             check_active_time_range(range)?;
         }
+        // Which account manages the organization this account belongs to is AWS
+        // Organizations' own fact, and the health of a `CUSTOM` billing view
+        // depends on it (`state::view_health`): it is read off that service's
+        // store BEFORE this one is locked, so serving this read never holds two
+        // services' stores at once.
+        let management_account = crate::state::organization_management_account_id(&*self.engine);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListBillingViewsErrorModeled::InternalServerException(InternalServerException {
                 message: "the billing view store is unavailable".to_string(),
@@ -448,6 +454,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None
         };
 
+        // Every entry's `healthStatus` is derived from the state that view
+        // depends on, at one reading of the clock for the whole page, so two
+        // entries of one answer cannot disagree about a source they share. The
+        // projection is the one `GetBillingView` reports from
+        // (`state::view_health`), so the two reads report one view's health
+        // identically.
+        let now = ::std::time::SystemTime::now();
         Ok(ListBillingViewsOutput {
             billing_views: matched
                 .into_iter()
@@ -458,7 +471,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     owner_account_id: Some(view.owner_account_id.clone()),
                     source_account_id: view.source_account_id().map(str::to_string),
                     billing_view_type: Some(view.billing_view_type.clone()),
-                    health_status: Some(crate::state::health_status(view)),
+                    health_status: Some(crate::state::health_status(&state.view_health(
+                        view,
+                        management_account.as_deref(),
+                        now,
+                    ))),
                 })
                 .collect(),
             next_token,

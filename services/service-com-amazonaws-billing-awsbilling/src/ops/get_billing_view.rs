@@ -172,6 +172,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // Which account manages the organization this account belongs to is AWS
+        // Organizations' own fact, and the health of a `CUSTOM` billing view
+        // depends on it (`state::view_health`): it is read off that service's
+        // store BEFORE this one is locked, so serving this read never holds two
+        // services' stores at once.
+        let management_account = crate::state::organization_management_account_id(&*self.engine);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetBillingViewErrorModeled::InternalServerException(InternalServerException {
                 message: "the billing view store is unavailable".to_string(),
@@ -209,6 +215,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let derived_view_count = caller_created
             .then(|| i32::try_from(state.derived_view_arns(&view.arn).len()).unwrap_or(i32::MAX));
 
+        // `healthStatus` is derived from the state the view depends on — the
+        // standing of the account that owns it and the views it draws from — on
+        // every read, for the same reason the counts are: a copy kept beside the
+        // view could disagree with what the store holds. See
+        // `state::view_health`.
+        let health = state.view_health(
+            view,
+            management_account.as_deref(),
+            ::std::time::SystemTime::now(),
+        );
+
         Ok(GetBillingViewOutput {
             billing_view: BillingViewElement {
                 arn: Some(view.arn.clone()),
@@ -225,7 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 view_definition_last_updated_at: view
                     .view_definition_last_updated_at
                     .map(crate::state::timestamp),
-                health_status: Some(crate::state::health_status(view)),
+                health_status: Some(crate::state::health_status(&health)),
             },
         })
     }

@@ -210,6 +210,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::check_data_filter_expression(expression)
                 .map_err(|why| invalid_field("dataFilterExpression", why))?;
         }
+        // Which account manages the organization this account belongs to is AWS
+        // Organizations' own fact the health of a `CUSTOM` view depends on, read
+        // off that service's store BEFORE this one is locked, so serving this
+        // request never holds two services' stores at once.
+        let management_account = crate::state::organization_management_account_id(&*self.engine);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateBillingViewErrorModeled::InternalServerException(InternalServerException {
                 message: "the billing view store is unavailable".to_string(),
@@ -222,25 +227,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // or the account's `PRIMARY` view — is one refusal, and the modeled
         // `ResourceNotFoundException` would tell a caller which of the two it
         // was.
-        let view = state.custom_view_mut(&input.arn).ok_or_else(|| {
-            UpdateBillingViewErrorModeled::ValidationException(crate::state::not_a_custom_view(
-                &input.arn, "edited",
-            ))
-        })?;
+        if state.custom_view(&input.arn).is_none() {
+            return Err(UpdateBillingViewErrorModeled::ValidationException(
+                crate::state::not_a_custom_view(&input.arn, "edited"),
+            )
+            .into());
+        }
 
+        let updated_at = std::time::SystemTime::now();
         // `BillingViewHealthStatusException`: "a billing view's health status
         // prevents an operation from being performed … if the billing view is in
         // a state other than HEALTHY". Nothing below this line is reached unless
         // the view is HEALTHY, so a refused update leaves the record — and the
-        // instants a later read reports from it — exactly as it was. The refusal
-        // is the one every writer of a stored view shares — see
+        // instants a later read reports from it — exactly as it was. The status
+        // is the one every read of the view reports
+        // (`crate::state::view_health`) and the refusal is the one every writer
+        // of a stored view shares — see
         // `crate::state::billing_view_not_healthy`.
-        if !view.is_healthy() {
+        let health = state
+            .health_of(&input.arn, management_account.as_deref(), updated_at)
+            .unwrap_or_else(crate::state::ViewHealth::healthy);
+        if !health.is_healthy() {
             return Err(
                 UpdateBillingViewErrorModeled::BillingViewHealthStatusException(
                     crate::state::billing_view_not_healthy(
                         &input.arn,
-                        &view.health_status_code,
+                        &health.status_code,
                         "be updated",
                     ),
                 )
@@ -248,7 +260,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let updated_at = std::time::SystemTime::now();
+        let Some(view) = state.custom_view_mut(&input.arn) else {
+            return Err(UpdateBillingViewErrorModeled::ValidationException(
+                crate::state::not_a_custom_view(&input.arn, "edited"),
+            )
+            .into());
+        };
+
         if let Some(name) = input.name {
             view.name = name;
         }

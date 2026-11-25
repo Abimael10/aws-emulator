@@ -125,8 +125,11 @@ fn source_views(body: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Put the stored view's `healthStatus.statusCode` at `status`, the one way a
-/// view's health moves in this emulator: no modelled operation sets it.
+/// Record a condition on the stored view ITSELF, which its health then reports
+/// whatever the state it depends on says — the one thing about a view's health
+/// no modelled operation writes (every other way a view's health moves is
+/// derived from the standing of its owner and from the views it draws from, and
+/// `billing_view_health_propagation.rs` moves it through the API).
 pub(crate) fn set_health_status(
     engine: &std::sync::Arc<engine::InMemoryEngine>,
     arn: &str,

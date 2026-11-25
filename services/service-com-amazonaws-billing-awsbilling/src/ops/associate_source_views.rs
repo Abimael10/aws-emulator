@@ -221,6 +221,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // Which account manages the organization this account belongs to is AWS
+        // Organizations' own fact the health of a `CUSTOM` view depends on, read
+        // off that service's store BEFORE this one is locked, so serving this
+        // request never holds two services' stores at once.
+        let management_account = crate::state::organization_management_account_id(&*self.engine);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             AssociateSourceViewsErrorModeled::InternalServerException(InternalServerException {
                 message: "the billing view store is unavailable".to_string(),
@@ -232,10 +237,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found(&input.arn));
         };
         let target_is_managed = target.is_managed();
-        // The gate below needs the status string for its refusal, and the borrow
-        // cannot outlive this block, so the status is cloned once and drives
-        // both the gate and its message.
-        let target_health = target.health_status_code.clone();
+        // The gate below needs the status for its refusal, and the borrow cannot
+        // outlive this block, so the health is derived once and drives both the
+        // gate and its message.
+        let target_health = state.view_health(
+            target,
+            management_account.as_deref(),
+            ::std::time::SystemTime::now(),
+        );
         let mut source_views = target.source_views.clone();
 
         // A view may not draw from itself, directly or through the chain of views
@@ -280,13 +289,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `BillingViewHealthStatusException`: "a billing view's health status
         // prevents an operation from being performed … if the billing view is in
-        // a state other than HEALTHY". The refusal is the one every writer of a
-        // stored view shares — see `crate::state::billing_view_not_healthy`.
-        if target_health != crate::state::BILLING_VIEW_STATUS_HEALTHY {
+        // a state other than HEALTHY". The status is the one every read of the
+        // view reports (`crate::state::view_health`) and the refusal is the one
+        // every writer of a stored view shares — see
+        // `crate::state::billing_view_not_healthy`.
+        if !target_health.is_healthy() {
             return Err(AssociateSourceViewsErrorModeled::BillingViewHealthStatusException(
                 crate::state::billing_view_not_healthy(
                     &input.arn,
-                    &target_health,
+                    &target_health.status_code,
                     "associate source views",
                 ),
             )

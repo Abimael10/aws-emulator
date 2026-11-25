@@ -419,6 +419,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (begin_secs, end_secs) =
             requested_period(&input, ::std::time::SystemTime::now())?;
 
+        // Which account manages the organization this account belongs to is AWS
+        // Organizations' own fact the health of a `CUSTOM` view depends on, read
+        // off that service's store BEFORE this one is locked, so serving this
+        // request never holds two services' stores at once.
+        let management_account = crate::state::organization_management_account_id(&*self.engine);
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| unavailable("the billing view store is unavailable"))?;
         let state = state.lock();
@@ -426,13 +431,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let view = resolve_view(&input, &state)?;
         // A view whose health status is not HEALTHY is one no operation may act
         // on — the modeled `BillingViewHealthStatusException` this operation
-        // declares — so its timeline is refused rather than reported.
-        if !view.is_healthy() {
+        // declares — so its timeline is refused rather than reported. The status
+        // is the one every read of the view reports
+        // (`crate::state::view_health`), derived from the standing of the
+        // account that owns it and from the views it draws from.
+        let health = state.view_health(
+            view,
+            management_account.as_deref(),
+            ::std::time::SystemTime::now(),
+        );
+        if !health.is_healthy() {
             return Err(
                 ListBillingViewSegmentsErrorModeled::BillingViewHealthStatusException(
                     crate::state::billing_view_not_healthy(
                         &view.arn,
-                        &view.health_status_code,
+                        &health.status_code,
                         "list its segments",
                     ),
                 )
