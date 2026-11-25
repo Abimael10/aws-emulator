@@ -40,6 +40,14 @@ const REGION: &str = "us-east-1";
 const POLL_DEADLINE: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
+/// The length a dataset description is bounded by, written out HERE rather than read from
+/// the crate so a drift in the enforced bound fails this suite instead of travelling with
+/// it. SOURCE: the `@length` 1..500 on `DataLakeDatasetDescription`, the shape the
+/// `description` member of `UpdateDataLakeDatasetRequest` targets
+/// (`smithy_query(query="operation", operation="UpdateDataLakeDataset")`).
+const DESCRIPTION_MIN_LENGTH: usize = 1;
+const DESCRIPTION_MAX_LENGTH: usize = 500;
+
 /// The emulator under test: one engine, one service, driven through the router.
 struct Emulator {
     router: MultiServiceRouter,
@@ -1229,6 +1237,294 @@ async fn an_update_of_an_absent_dataset_is_a_not_found_that_writes_nothing() {
         assert_eq!(
             status, 404,
             "case {case}: a refused update must create nothing, got {status} with {body}"
+        );
+    }
+}
+
+/// RULE: an update addresses ONE record by its whole (`instanceId`, `namespace`, `name`)
+/// triple, so it rewrites the description of that dataset alone — a sibling in the same
+/// namespace, the same dataset name under another namespace and the same triple in another
+/// instance keep every member their create persisted — and every reader of the data lake
+/// (`GetDataLakeDataset` and `ListDataLakeDatasets` alike) reports what the update left.
+#[tokio::test]
+async fn an_update_writes_only_the_dataset_its_triple_addresses() {
+    let emulator = Emulator::new();
+    let first = emulator.create_instance("first instance").await;
+    let second = emulator.create_instance("second instance").await;
+    let custom_namespace = "zone_one";
+    let (status, body) = emulator
+        .create_namespace(&first, custom_namespace)
+        .await;
+    assert_eq!(
+        status, 200,
+        "the custom namespace must be created first, got {status} with {body}"
+    );
+
+    // The triples the addressing rule generalises over: which part of the triple a row
+    // shares with the one being updated — the namespace (a sibling name), the name (another
+    // namespace of the same instance), the whole namespace-and-name pair (another
+    // instance).
+    let triples: Vec<(&str, String, &str, &str)> = vec![
+        (
+            "a dataset of the default namespace",
+            first.clone(),
+            "default",
+            "inventory_level",
+        ),
+        (
+            "a sibling of the same namespace",
+            first.clone(),
+            "default",
+            "shipment_lines",
+        ),
+        (
+            "the same dataset name under another namespace",
+            first.clone(),
+            custom_namespace,
+            "inventory_level",
+        ),
+        (
+            "the same triple in another instance",
+            second.clone(),
+            "default",
+            "inventory_level",
+        ),
+    ];
+
+    for (case, instance, namespace, name) in &triples {
+        let (status, body) = emulator
+            .create_dataset(
+                REGION,
+                instance,
+                namespace,
+                name,
+                json!({
+                    "schema": minimal_schema(),
+                    "description": format!("as created: {case}"),
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: CreateDataLakeDataset expected 200, got {status} with {body}"
+        );
+    }
+
+    // Every triple is updated in turn, so no row is privileged: each update must move the
+    // record it addresses and leave the other three byte for byte.
+    for (index, (case, instance, namespace, name)) in triples.iter().enumerate() {
+        let mut before: Vec<Value> = Vec::with_capacity(triples.len());
+        for (other_case, other_instance, other_namespace, other_name) in &triples {
+            let (status, body) = emulator
+                .get_dataset(other_instance, other_namespace, other_name)
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {other_case}: GetDataLakeDataset expected 200, got {status} with {body}"
+            );
+            before.push(dataset_of(other_case, &body));
+        }
+
+        let description = format!("rewritten while addressing {case}");
+        let (status, _error_type, body) = emulator
+            .update_dataset(
+                instance,
+                namespace,
+                name,
+                json!({ "description": description.clone() }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: UpdateDataLakeDataset expected 200, got {status} with {body}"
+        );
+        let updated = dataset_of(case, &body);
+        assert_eq!(
+            updated.get("description").and_then(Value::as_str),
+            Some(description.as_str()),
+            "case {case}: expected the description {description:?}, got {updated}"
+        );
+
+        for (position, (other_case, other_instance, other_namespace, other_name)) in
+            triples.iter().enumerate()
+        {
+            let (status, body) = emulator
+                .get_dataset(other_instance, other_namespace, other_name)
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {other_case}: GetDataLakeDataset expected 200, got {status} with {body}"
+            );
+            let read = dataset_of(other_case, &body);
+            if position == index {
+                assert_eq!(
+                    read, updated,
+                    "case {case}: the dataset read back must equal the one the update \
+                     answered, got {read}"
+                );
+            } else {
+                assert_eq!(
+                    read, before[position],
+                    "case {case}: the update must leave {other_case} exactly as it was, got \
+                     {read}"
+                );
+            }
+        }
+    }
+
+    // The listing reads the same records, so it reports every updated description too.
+    for (namespace, names) in [
+        ("default", vec!["inventory_level", "shipment_lines"]),
+        (custom_namespace, vec!["inventory_level"]),
+    ] {
+        let (status, body) = emulator.list_datasets(&first, namespace).await;
+        assert_eq!(
+            status, 200,
+            "case {namespace}: ListDataLakeDatasets expected 200, got {status} with {body}"
+        );
+        let listed = body
+            .get("datasets")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_else(|| panic!("case {namespace}: the listing carries no datasets: {body}"));
+        assert_eq!(
+            listed.len(),
+            names.len(),
+            "case {namespace}: expected {} dataset(s), got {listed:?}",
+            names.len()
+        );
+        for name in names {
+            let (status, read) = emulator.get_dataset(&first, namespace, name).await;
+            assert_eq!(
+                status, 200,
+                "case {namespace}/{name}: GetDataLakeDataset expected 200, got {status} with \
+                 {read}"
+            );
+            let read = dataset_of(name, &read);
+            assert!(
+                listed.contains(&read),
+                "case {namespace}/{name}: the listing must report the record the update left, \
+                 got {listed:?} without {read}"
+            );
+        }
+    }
+}
+
+/// RULE: a description outside the bound its shape publishes is a `ValidationException`
+/// (HTTP 400) naming the member and the requirement, and a refused update writes nothing —
+/// while the bound's own endpoints are accepted, so the refusal is the bound and not the
+/// member. The bound is `@length` 1..500 on `DataLakeDatasetDescription` (source: the
+/// `description` member of `UpdateDataLakeDatasetRequest`,
+/// `smithy_query(query="operation", operation="UpdateDataLakeDataset")`).
+#[tokio::test]
+async fn an_update_outside_the_description_bound_is_refused_and_writes_nothing() {
+    let emulator = Emulator::new();
+    let instance_id = emulator.create_instance("bounded description").await;
+    let (status, body) = emulator
+        .create_dataset(
+            REGION,
+            &instance_id,
+            "default",
+            "bounded",
+            json!({ "schema": minimal_schema(), "description": "as created" }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "the dataset to update must be created first, got {status} with {body}"
+    );
+    let (status, body) = emulator
+        .get_dataset(&instance_id, "default", "bounded")
+        .await;
+    assert_eq!(
+        status, 200,
+        "the created dataset must be readable, got {status} with {body}"
+    );
+    let stored = dataset_of("as created", &body);
+
+    // Rows: each published bound, one character outside it.
+    let rows: Vec<(&str, String, String)> = vec![
+        (
+            "one character below the published minimum",
+            String::new(),
+            format!("Member must have length greater than or equal to {DESCRIPTION_MIN_LENGTH}"),
+        ),
+        (
+            "one character past the published maximum",
+            "d".repeat(DESCRIPTION_MAX_LENGTH + 1),
+            format!("Member must have length less than or equal to {DESCRIPTION_MAX_LENGTH}"),
+        ),
+    ];
+
+    for (case, description, requirement) in rows {
+        let (status, _error_type, body) = emulator
+            .update_dataset(
+                &instance_id,
+                "default",
+                "bounded",
+                json!({ "description": description.clone() }),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case}: expected HTTP 400, got {status} with {body}"
+        );
+        assert!(
+            body.get("__type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("ValidationException"),
+            "case {case}: expected a ValidationException envelope, got {body}"
+        );
+        let expected = format!(
+            "1 validation error detected: Value at 'description' failed to satisfy constraint: \
+             {requirement}"
+        );
+        let message = body.get("message").and_then(Value::as_str);
+        assert_eq!(
+            message,
+            Some(expected.as_str()),
+            "case {case}: expected the member-and-requirement sentence {expected:?}, got \
+             {message:?}"
+        );
+
+        // Nothing of the refused request reached the store, so the dataset still holds
+        // every value it held — the description included.
+        let (status, body) = emulator
+            .get_dataset(&instance_id, "default", "bounded")
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: GetDataLakeDataset expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            dataset_of(case, &body),
+            stored,
+            "case {case}: a refused update must write nothing, got {body}"
+        );
+    }
+
+    for (case, description) in [
+        ("the published minimum length", "x".repeat(DESCRIPTION_MIN_LENGTH)),
+        ("the published maximum length", "d".repeat(DESCRIPTION_MAX_LENGTH)),
+    ] {
+        let (status, _error_type, body) = emulator
+            .update_dataset(
+                &instance_id,
+                "default",
+                "bounded",
+                json!({ "description": description.clone() }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: a description at the bound expected 200, got {status} with {body}"
+        );
+        let updated = dataset_of(case, &body);
+        assert_eq!(
+            updated.get("description").and_then(Value::as_str),
+            Some(description.as_str()),
+            "case {case}: expected the description the update named, got {updated}"
         );
     }
 }
