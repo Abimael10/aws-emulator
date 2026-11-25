@@ -590,8 +590,9 @@ pub trait ProgramFiles {
 /// their names.
 ///
 /// Each one's whole effect is inside the session and the tree it works over: `printf` writes
-/// one line of output, `mkdir`, `touch` and `rm` change the tree, `sync` flushes what was
-/// written to it (nothing is pending in a tree a write reaches at once, so it writes nothing
+/// one line of output, `mkdir`, `touch` and `rm` change the tree, `cp` and `mv` duplicate and
+/// rename what it holds, `sync` flushes what was written to it (nothing is pending in a tree a
+/// write reaches at once, so it writes nothing
 /// and succeeds), `tee` writes what it reads
 /// into the files it names and passes it on, `ls` names what the tree
 /// holds, `test` (and its `[`
@@ -611,8 +612,22 @@ pub trait ProgramFiles {
 /// name it performs and no catalog holds would be resolved as a PROGRAM and reported as a
 /// command the shell could not find, however completely this module implements it.
 pub const VOLUME_COMMANDS: &[&str] = &[
-    "printf", "mkdir", "touch", "rm", SYNC_COMMAND, TEE_COMMAND, LIST_COMMAND, "test", "[", "sh",
-    "bash", ".", "source", "sleep",
+    "printf",
+    "mkdir",
+    "touch",
+    "rm",
+    posix_shell_files::COPY_COMMAND,
+    posix_shell_files::MOVE_COMMAND,
+    SYNC_COMMAND,
+    TEE_COMMAND,
+    LIST_COMMAND,
+    "test",
+    "[",
+    "sh",
+    "bash",
+    ".",
+    "source",
+    "sleep",
 ];
 
 /// The command of [`VOLUME_COMMANDS`] that FLUSHES what was written to the tree, performed by

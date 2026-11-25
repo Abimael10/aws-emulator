@@ -17,8 +17,8 @@
 //!   session work over a machine's tree and another over a container's own layer with the
 //!   volumes mounted into it;
 //! * the file UTILITIES ([`FILE_COMMANDS`], [`perform_file_command`]) — `cat`, `ls`,
-//!   `mkdir`, `touch`, `rm` and `sync` — each with the output form and the diagnostic
-//!   wording the utility itself is specified to write;
+//!   `mkdir`, `touch`, `rm`, `cp`, `mv` and `sync` — each with the output form and the
+//!   diagnostic wording the utility itself is specified to write;
 //! * the `test` questions that are about a FILE ([`file_test_answer`]), beside the ones about
 //!   values alone ([`crate::posix_shell_session::value_test_answer`]);
 //! * the REDIRECTIONS of the three standard streams ([`Redirections`],
@@ -141,9 +141,28 @@ pub trait ShellFiles {
 ///
 /// Each one's whole effect is on those files and on what the command writes: `cat` reads
 /// files (or its standard input), `ls` names what the files hold, `mkdir`, `touch` and `rm`
-/// change them, and `sync` has nothing to flush, because a write to files held in memory is
-/// in them the instant the write is performed.
-pub const FILE_COMMANDS: &[&str] = &["cat", "ls", "mkdir", "touch", "rm", "sync"];
+/// change them, `cp` and `mv` DUPLICATE and RENAME what they hold ([`COPY_COMMAND`],
+/// [`MOVE_COMMAND`]), and `sync` has nothing to flush, because a write to files held in memory
+/// is in them the instant the write is performed.
+pub const FILE_COMMANDS: &[&str] =
+    &["cat", "ls", "mkdir", "touch", "rm", "sync", COPY_COMMAND, MOVE_COMMAND];
+
+/// The utility that DUPLICATES what the files hold: "the `cp` utility shall copy the contents
+/// of `source_file` to the destination path named by `target_file`", and, in its second form,
+/// each source file "to the destination path named by `target`/`basename source_file`".
+///
+/// Its whole effect is inside the session's own files, which is what every name in
+/// [`FILE_COMMANDS`] has in common — and it is how a program that serves what its IMAGE
+/// shipped puts that document where it serves it from, rather than writing a new one.
+pub const COPY_COMMAND: &str = "cp";
+
+/// The utility that RENAMES what the files hold: "the `mv` utility shall move the file named by
+/// the `source_file` operand to the destination specified by the `target_file`", and, in its
+/// second form, into the directory `target` names.
+///
+/// The same effect read as one step: the destination holds what the source held and the source
+/// is gone.
+pub const MOVE_COMMAND: &str = "mv";
 
 /// What performing one of [`FILE_COMMANDS`] produced: the status it answers and the bytes it
 /// wrote to each of its streams, which the session then plumbs through its own redirections.
@@ -179,7 +198,9 @@ impl FileCommandOutcome {
 /// `None` is a utility, option or operand form this module does not perform, which is the
 /// fail-closed answer a session reports as a command it could not run: `cat` with no operand
 /// and no input (there is no terminal behind it), `ls` with an option beyond `-1` and `-l`,
-/// and `ls -l` over files that keep no facts to report.
+/// `ls -l` over files that keep no facts to report, an option no `cp` or `mv` invocation here
+/// carries ([`copy`], [`rename`]), and an `mv` of a DIRECTORY, which no removal these files
+/// offer can complete.
 #[must_use]
 pub fn perform_file_command(
     name: &str,
@@ -193,6 +214,8 @@ pub fn perform_file_command(
         "mkdir" => Some(make_directories(arguments, files)),
         "touch" => Some(touch(arguments, files)),
         "rm" => Some(remove(arguments, files)),
+        COPY_COMMAND => copy(arguments, files),
+        MOVE_COMMAND => rename(arguments, files),
         // "sync() causes all pending modifications to filesystem metadata and cached file
         // data to be written": a write to these files is IN them the instant the write is
         // performed, so there is nothing pending and the utility writes nothing.
@@ -462,6 +485,376 @@ fn remove(arguments: &[String], files: &mut dyn ShellFiles) -> FileCommandOutcom
     outcome
 }
 
+/// The option letters a `cp` invocation here may carry, as the effect each one asks for.
+///
+/// `-R` and `-r` ask for the tree ("copy file hierarchies"), and `-a` is the archiving form
+/// that implies them. `-p` asks for the source's attributes to be duplicated and `-f` for a
+/// destination that cannot be written to be removed and written again — neither of which is
+/// anything other than the plain copy over files that keep no modes, no owners and no open
+/// descriptors: the copy IS the whole effect. Any other option is a form this does not
+/// perform, so the command fails closed instead of copying something other than what was
+/// asked for.
+const COPY_RECURSIVE_OPTIONS: [char; 3] = ['R', 'r', 'a'];
+const COPY_PLAIN_OPTIONS: [char; 2] = ['p', 'f'];
+
+/// The option letters an `mv` invocation here may carry: `-f` asks for a destination to be
+/// written without asking, which is what a move over these files does anyway.
+const MOVE_PLAIN_OPTIONS: [char; 1] = ['f'];
+
+/// Whether the options of `arguments` are ones this invocation performs, and whether they ask
+/// for the TREE — `None` for an option outside the two catalogs, which is a form the session
+/// does not perform at all. A utility that takes no tree option is read with none, so every
+/// letter it carries has to be one of its plain ones.
+///
+/// Options are read letter by letter, because that is how a utility reads them: `-rf` carries
+/// the two `-r` and `-f` ask for.
+fn tree_requested(
+    arguments: &[String],
+    recursive_options: &[char],
+    plain_options: &[char],
+) -> Option<bool> {
+    let mut recursive = false;
+    for argument in arguments {
+        if argument.len() < 2 || !argument.starts_with('-') {
+            continue;
+        }
+        for letter in argument.chars().skip(1) {
+            if recursive_options.contains(&letter) {
+                recursive = true;
+            } else if !plain_options.contains(&letter) {
+                return None;
+            }
+        }
+    }
+    Some(recursive)
+}
+
+/// The SOURCES and the TARGET of a `cp` or `mv` invocation: "the last operand … shall be the
+/// destination", and every operand before it is a source.
+///
+/// `None` where there are fewer than the two operands either utility takes, which is the
+/// invocation's own usage failure rather than a form the session cannot perform.
+fn sources_and_target(arguments: &[String]) -> Option<(Vec<String>, String)> {
+    let mut operands = operands_of(arguments);
+    if operands.len() < 2 {
+        return None;
+    }
+    let target = operands.pop()?;
+    Some((operands, target))
+}
+
+/// The usage failure of an invocation that named too few operands, in the wording the utility
+/// reports it in: it names the operand it was left without.
+fn missing_operand(utility: &str, arguments: &[String]) -> FileCommandOutcome {
+    let mut outcome = FileCommandOutcome::succeeding();
+    match operands_of(arguments).first() {
+        Some(named) => outcome.failed_with(&format!(
+            "{utility}: missing destination file operand after '{named}'\n"
+        )),
+        None => outcome.failed_with(&format!("{utility}: missing file operand\n")),
+    }
+    outcome
+}
+
+/// The name a path ends in, which is what the second form of either utility puts under the
+/// target directory: "the destination path named by `target`/`basename source_file`".
+///
+/// `None` for an operand that ends in no name at all — the root, or a run of separators — which
+/// is an operand form neither utility is given here.
+fn base_name(path: &str) -> Option<String> {
+    let named = path
+        .split('/')
+        .rfind(|part| !part.is_empty() && *part != ".")?;
+    Some(named.to_string())
+}
+
+/// Where ONE source of an invocation lands: the target itself for the single-file form, and
+/// the source's own name under the target for the form whose target is a DIRECTORY.
+///
+/// `None` where the source ends in no name to put under that directory ([`base_name`]).
+fn destination_of(source: &str, target: &str, into_directory: bool) -> Option<String> {
+    if into_directory {
+        return Some(entry_path(target, &base_name(source)?));
+    }
+    Some(target.to_string())
+}
+
+/// `cp [-R|-r|-a] [-p] [-f] SOURCE... TARGET`: what each source holds, written at its
+/// destination.
+///
+/// "If the `source_file` operand names a directory", the copy is one the `-R` family asks for
+/// and the whole hierarchy under it is copied ([`copy_tree`]); without it a directory is
+/// "omitted" and the utility fails, which is what keeps a program that meant to copy one file
+/// from silently copying nothing. More than one source needs a target directory to put them
+/// in, and every failure is reported in the utility's own wording without stopping the sources
+/// after it.
+fn copy(arguments: &[String], files: &mut dyn ShellFiles) -> Option<FileCommandOutcome> {
+    let recursive = tree_requested(arguments, &COPY_RECURSIVE_OPTIONS, &COPY_PLAIN_OPTIONS)?;
+    let Some((sources, target)) = sources_and_target(arguments) else {
+        return Some(missing_operand(COPY_COMMAND, arguments));
+    };
+    let mut outcome = FileCommandOutcome::succeeding();
+    let into_directory = files.is_directory(&target) || target.ends_with('/');
+    if sources.len() > 1 && !into_directory {
+        outcome.failed_with(&format!(
+            "{COPY_COMMAND}: target '{target}' is not a directory\n"
+        ));
+        return Some(outcome);
+    }
+    // Every destination is settled BEFORE the first one is written, so an operand form this
+    // does not perform leaves the whole invocation unperformed rather than half done.
+    let planned = planned_destinations(&sources, &target, into_directory)?;
+    for (source, destination) in &planned {
+        copy_one(COPY_COMMAND, source, destination, recursive, files, &mut outcome);
+    }
+    Some(outcome)
+}
+
+/// Where each source of an invocation lands ([`destination_of`]), settled in one pass — `None`
+/// where any of them is an operand form neither utility is given here.
+fn planned_destinations(
+    sources: &[String],
+    target: &str,
+    into_directory: bool,
+) -> Option<Vec<(String, String)>> {
+    let mut planned = Vec::with_capacity(sources.len());
+    for source in sources {
+        planned.push((
+            source.clone(),
+            destination_of(source, target, into_directory)?,
+        ));
+    }
+    Some(planned)
+}
+
+/// `mv [-f] SOURCE... TARGET`: what each source holds, written at its destination and removed
+/// from where it was.
+///
+/// A DIRECTORY source is a form this does not perform: moving one would leave the directory
+/// itself behind, because removing a directory is not something these files offer — and a move
+/// that only half happened is worse than a command that did not run.
+fn rename(arguments: &[String], files: &mut dyn ShellFiles) -> Option<FileCommandOutcome> {
+    tree_requested(arguments, &[], &MOVE_PLAIN_OPTIONS)?;
+    let Some((sources, target)) = sources_and_target(arguments) else {
+        return Some(missing_operand(MOVE_COMMAND, arguments));
+    };
+    if sources.iter().any(|source| files.is_directory(source)) {
+        return None;
+    }
+    let mut outcome = FileCommandOutcome::succeeding();
+    let into_directory = files.is_directory(&target) || target.ends_with('/');
+    if sources.len() > 1 && !into_directory {
+        outcome.failed_with(&format!(
+            "{MOVE_COMMAND}: target '{target}' is not a directory\n"
+        ));
+        return Some(outcome);
+    }
+    let planned = planned_destinations(&sources, &target, into_directory)?;
+    for (source, destination) in &planned {
+        // What the source holds, read before anything is written: the one thing this move must
+        // leave behind, whatever the two paths turn out to name.
+        let held = files.read(source).ok();
+        if !copy_one(MOVE_COMMAND, source, destination, false, files, &mut outcome) {
+            // The destination does not hold what the source held, so the source stays: a move
+            // removes nothing it did not manage to write.
+            continue;
+        }
+        if let Err(refusal) = files.remove_file(source) {
+            outcome.failed_with(&format!(
+                "{MOVE_COMMAND}: cannot remove '{source}': {}\n",
+                refusal.message()
+            ));
+            continue;
+        }
+        // Where the two paths named the SAME entry of these files — which only the holder
+        // resolves, so two spellings of one path can reach here — that removal took the
+        // destination with it. What the move was given is written back, because a move never
+        // loses it.
+        if let Some(held) = held.filter(|_| !files.exists(destination)) {
+            if let Err(refusal) = files.write(destination, &held, false) {
+                outcome.failed_with(&format!(
+                    "{MOVE_COMMAND}: cannot create regular file '{destination}': {}\n",
+                    refusal.message()
+                ));
+            }
+        }
+    }
+    Some(outcome)
+}
+
+/// Copy ONE source — a file, or a whole hierarchy where `recursive` — to `destination`,
+/// reporting what it could not do under the name `utility` was invoked by, and answering
+/// whether the destination now holds what the source held (which is what a MOVE removes its
+/// source on).
+///
+/// Two destinations are refused before anything is read, in the wording the utility refuses them
+/// in: the source ITSELF, which is no copy at all, and — for a directory — a path INSIDE the
+/// source, which is the copy that would feed itself what it just wrote. Both are decided on the
+/// paths COMPARABLY spelled ([`comparable_path`]), because the same entry can be written several
+/// ways; a spelling only the holder can resolve to the same place is caught by the walk's own
+/// budget instead ([`MAX_COPIED_ENTRIES`]).
+fn copy_one(
+    utility: &str,
+    source: &str,
+    destination: &str,
+    recursive: bool,
+    files: &mut dyn ShellFiles,
+    outcome: &mut FileCommandOutcome,
+) -> bool {
+    let (from, to) = (comparable_path(source), comparable_path(destination));
+    // The directory `from` names, as the prefix of every path inside it — which for the root
+    // itself is that one separator.
+    let inside = if from.ends_with('/') {
+        from.clone()
+    } else {
+        format!("{from}/")
+    };
+    let under_source = to.starts_with(&inside);
+    if from == to {
+        outcome.failed_with(&format!(
+            "{utility}: '{source}' and '{destination}' are the same file\n"
+        ));
+        return false;
+    }
+    if files.is_directory(source) && under_source {
+        outcome.failed_with(&copied_into_itself(utility, source, destination));
+        return false;
+    }
+    if files.is_directory(source) {
+        if !recursive {
+            outcome.failed_with(&format!(
+                "{utility}: -r not specified; omitting directory '{source}'\n"
+            ));
+            return false;
+        }
+        return copy_tree(utility, source, destination, files, outcome);
+    }
+    copy_file(utility, source, destination, files, outcome)
+}
+
+/// One path as the two guards above COMPARE it: without the trailing slashes a directory may be
+/// written with, without the `.` components that name the directory they stand in, and with each
+/// run of slashes read as the one separator it is ("multiple successive slashes are considered to
+/// be the same as one slash").
+///
+/// It is not a RESOLVED path — only the holder of the files can resolve one, which is why the
+/// walk below carries a budget of its own — but it makes the several spellings of ONE path the
+/// program may have written compare equal.
+fn comparable_path(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let components: Vec<&str> = path
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    let joined = components.join("/");
+    if absolute {
+        return format!("/{joined}");
+    }
+    if joined.is_empty() {
+        return ".".to_string();
+    }
+    joined
+}
+
+/// The refusal of a copy whose destination is INSIDE its own source, in the wording the utility
+/// refuses that with.
+fn copied_into_itself(utility: &str, source: &str, destination: &str) -> String {
+    format!("{utility}: cannot copy a directory, '{source}', into itself, '{destination}'\n")
+}
+
+/// How many entries ONE copy of a hierarchy may carry before the walk concludes its destination
+/// resolves INSIDE its own source.
+///
+/// THIS NUMBER IS THE EMULATOR'S. A real `cp` tells that case apart by the device and inode of
+/// each entry; this module is given the paths a program WROTE and the holder of the files
+/// resolves them ([`ShellFiles`]: "resolving one is the holder's"), so a spelling that lands
+/// inside the source without comparing equal to it — a relative one, say — is not caught by
+/// comparing paths. What catches it is the work it makes: such a copy keeps feeding the walk what
+/// it has just written, so it never runs out of entries, while a copy of a real tree is bounded
+/// by what a session's own files may hold — hundreds of entries for a container's own layer, and
+/// 1024 files beside 1024 directories for the largest volume this workspace mounts into one
+/// (`…efs…::state::file_system_data::FILE_SYSTEM_LIMITS`). A walk that
+/// passes this number is therefore that copy, and it is refused in the same wording — with the
+/// entries it had already written left where they are, as they are for any copy the utility
+/// reports a failure part-way through.
+const MAX_COPIED_ENTRIES: usize = 4096;
+
+/// Copy the hierarchy under the directory `source` to `destination`, directory by directory, and
+/// answer whether every entry of it was copied.
+///
+/// The walk is kept on a stack of its own rather than recursing, so the depth of the tree it
+/// copies costs no stack of this process, and what each directory holds is read BEFORE anything
+/// is written into it — so a destination written under a directory still to be walked cannot add
+/// itself to what that directory holds. What bounds the whole walk is what the files themselves
+/// may hold, and [`MAX_COPIED_ENTRIES`] past that.
+fn copy_tree(
+    utility: &str,
+    source: &str,
+    destination: &str,
+    files: &mut dyn ShellFiles,
+    outcome: &mut FileCommandOutcome,
+) -> bool {
+    let mut pending = vec![(source.to_string(), destination.to_string())];
+    let mut budget = MAX_COPIED_ENTRIES;
+    let mut copied = true;
+    while let Some((from, to)) = pending.pop() {
+        if budget == 0 {
+            outcome.failed_with(&copied_into_itself(utility, source, destination));
+            return false;
+        }
+        budget -= 1;
+        // What this directory holds, read before the destination is written: an entry written
+        // into it afterwards is not one of the entries this copy carries.
+        let names = files.entry_names(&from);
+        if let Err(refusal) = files.make_directories(&to) {
+            outcome.failed_with(&format!(
+                "{utility}: cannot create directory '{to}': {}\n",
+                refusal.message()
+            ));
+            copied = false;
+            continue;
+        }
+        for name in names {
+            let (held, written) = (entry_path(&from, &name), entry_path(&to, &name));
+            if files.is_directory(&held) {
+                pending.push((held, written));
+            } else if !copy_file(utility, &held, &written, files, outcome) {
+                copied = false;
+            }
+        }
+    }
+    copied
+}
+
+/// Copy the FILE `source` to `destination`: what the source holds, written from the start of
+/// the destination — answering whether it was.
+fn copy_file(
+    utility: &str,
+    source: &str,
+    destination: &str,
+    files: &mut dyn ShellFiles,
+    outcome: &mut FileCommandOutcome,
+) -> bool {
+    let held = match files.read(source) {
+        Ok(held) => held,
+        Err(refusal) => {
+            outcome.failed_with(&format!(
+                "{utility}: cannot stat '{source}': {}\n",
+                refusal.message()
+            ));
+            return false;
+        }
+    };
+    if let Err(refusal) = files.write(destination, &held, false) {
+        outcome.failed_with(&format!(
+            "{utility}: cannot create regular file '{destination}': {}\n",
+            refusal.message()
+        ));
+        return false;
+    }
+    true
+}
+
 /// What the `test` questions about a FILE answer for `arguments` over `files`, and `None` for
 /// an expression that asks about something else — which is then read as a question about
 /// values alone ([`crate::posix_shell_session::value_test_answer`]).
@@ -662,7 +1055,7 @@ mod tests {
 
     use super::{
         file_test_answer, perform_file_command, AppliedRedirect, FileEntry, FileRefusal,
-        ShellFiles,
+        ShellFiles, MAX_COPIED_ENTRIES,
     };
     use crate::posix_shell_volume::EntryKind;
 
@@ -981,6 +1374,450 @@ mod tests {
                 row.expected
             );
         }
+    }
+
+    /// RULE: the utilities that DUPLICATE and RENAME what the files hold are performed over
+    /// them: a copy leaves the destination holding what the source held (and the source where
+    /// it was), a move leaves the source gone, a directory travels only when the tree was asked
+    /// for, and every option, operand and target form outside the ones either utility takes
+    /// here is reported rather than guessed at.
+    #[test]
+    fn a_copy_and_a_move_carry_what_the_files_hold() {
+        /// One row: the command and its arguments, what each path then holds (`None` for a path
+        /// the files are to hold nothing at), whether it succeeded, and what its diagnostic
+        /// carries.
+        struct Row {
+            case: &'static str,
+            name: &'static str,
+            arguments: &'static [&'static str],
+            /// `None` for a form the module does not perform at all.
+            performed: bool,
+            succeeded: bool,
+            held: &'static [(&'static str, Option<&'static str>)],
+            diagnostic: Option<&'static str>,
+        }
+        let rows = [
+            Row {
+                case: "a file copied to a new path",
+                name: "cp",
+                arguments: &["/image/index.html", "/image/svc/index.html"],
+                performed: true,
+                succeeded: true,
+                held: &[
+                    ("/image/svc/index.html", Some("It works!\n")),
+                    ("/image/index.html", Some("It works!\n")),
+                ],
+                diagnostic: None,
+            },
+            Row {
+                case: "a file copied INTO a directory, which keeps its own name",
+                name: "cp",
+                arguments: &["/image/index.html", "/image/svc"],
+                performed: true,
+                succeeded: true,
+                held: &[("/image/svc/index.html", Some("It works!\n"))],
+                diagnostic: None,
+            },
+            Row {
+                case: "a file copied over one the destination already holds",
+                name: "cp",
+                arguments: &["/image/index.html", "/image/other.html"],
+                performed: true,
+                succeeded: true,
+                held: &[("/image/other.html", Some("It works!\n"))],
+                diagnostic: None,
+            },
+            Row {
+                case: "two files copied into a directory",
+                name: "cp",
+                arguments: &["/image/index.html", "/image/other.html", "/image/svc"],
+                performed: true,
+                succeeded: true,
+                held: &[
+                    ("/image/svc/index.html", Some("It works!\n")),
+                    ("/image/svc/other.html", Some("other\n")),
+                ],
+                diagnostic: None,
+            },
+            Row {
+                case: "two files whose target is no directory at all",
+                name: "cp",
+                arguments: &["/image/index.html", "/image/other.html", "/image/one.html"],
+                performed: true,
+                succeeded: false,
+                held: &[("/image/one.html", Some("one\n"))],
+                diagnostic: Some("cp: target '/image/one.html' is not a directory"),
+            },
+            Row {
+                case: "a source the files hold nothing at",
+                name: "cp",
+                arguments: &["/image/absent", "/image/one.html"],
+                performed: true,
+                succeeded: false,
+                held: &[("/image/one.html", Some("one\n"))],
+                diagnostic: Some("cp: cannot stat '/image/absent': No such file or directory"),
+            },
+            Row {
+                case: "a directory with no tree asked for, which is omitted",
+                name: "cp",
+                arguments: &["/image/conf", "/image/svc"],
+                performed: true,
+                succeeded: false,
+                held: &[("/image/svc/conf/httpd.conf", None)],
+                diagnostic: Some("cp: -r not specified; omitting directory '/image/conf'"),
+            },
+            Row {
+                case: "a directory copied with the tree, every file under it with it",
+                name: "cp",
+                arguments: &["-r", "/image/conf", "/image/svc/conf"],
+                performed: true,
+                succeeded: true,
+                held: &[
+                    ("/image/svc/conf/httpd.conf", Some("Listen 80\n")),
+                    ("/image/svc/conf/extra/deep.conf", Some("deep\n")),
+                ],
+                diagnostic: None,
+            },
+            Row {
+                case: "the archiving form, which asks for the tree too",
+                name: "cp",
+                arguments: &["-a", "/image/conf", "/image/svc/conf"],
+                performed: true,
+                succeeded: true,
+                held: &[("/image/svc/conf/httpd.conf", Some("Listen 80\n"))],
+                diagnostic: None,
+            },
+            Row {
+                case: "the two options a tree copy is usually written with, as one word",
+                name: "cp",
+                arguments: &["-rp", "/image/conf", "/image/svc/conf"],
+                performed: true,
+                succeeded: true,
+                held: &[("/image/svc/conf/httpd.conf", Some("Listen 80\n"))],
+                diagnostic: None,
+            },
+            Row {
+                case: "an option this invocation does not perform",
+                name: "cp",
+                arguments: &["--parents", "/image/index.html", "/image/svc"],
+                performed: false,
+                succeeded: false,
+                held: &[("/image/svc/index.html", None)],
+                diagnostic: None,
+            },
+            Row {
+                case: "a copy with no destination operand",
+                name: "cp",
+                arguments: &["/image/index.html"],
+                performed: true,
+                succeeded: false,
+                held: &[],
+                diagnostic: Some(
+                    "cp: missing destination file operand after '/image/index.html'",
+                ),
+            },
+            Row {
+                case: "a write the files refuse",
+                name: "cp",
+                arguments: &["/image/index.html", "/image/sealed"],
+                performed: true,
+                succeeded: false,
+                held: &[("/image/sealed", Some("kept\n"))],
+                diagnostic: Some(
+                    "cp: cannot create regular file '/image/sealed': Read-only file system",
+                ),
+            },
+            Row {
+                case: "a file moved to a new path, which leaves the source gone",
+                name: "mv",
+                arguments: &["/image/other.html", "/image/svc/other.html"],
+                performed: true,
+                succeeded: true,
+                held: &[
+                    ("/image/svc/other.html", Some("other\n")),
+                    ("/image/other.html", None),
+                ],
+                diagnostic: None,
+            },
+            Row {
+                case: "a file moved INTO a directory",
+                name: "mv",
+                arguments: &["/image/other.html", "/image/svc"],
+                performed: true,
+                succeeded: true,
+                held: &[
+                    ("/image/svc/other.html", Some("other\n")),
+                    ("/image/other.html", None),
+                ],
+                diagnostic: None,
+            },
+            Row {
+                case: "a move whose write is refused, which leaves the source where it was",
+                name: "mv",
+                arguments: &["/image/other.html", "/image/sealed"],
+                performed: true,
+                succeeded: false,
+                held: &[
+                    ("/image/other.html", Some("other\n")),
+                    ("/image/sealed", Some("kept\n")),
+                ],
+                diagnostic: Some(
+                    "mv: cannot create regular file '/image/sealed': Read-only file system",
+                ),
+            },
+            Row {
+                case: "a directory whose destination is inside it, which would feed itself",
+                name: "cp",
+                arguments: &["-r", "/image/conf", "/image/conf/inner"],
+                performed: true,
+                succeeded: false,
+                held: &[("/image/conf/inner/httpd.conf", None)],
+                diagnostic: Some(
+                    "cp: cannot copy a directory, '/image/conf', into itself, \
+                     '/image/conf/inner'",
+                ),
+            },
+            Row {
+                case: "a file copied onto itself, which is no copy at all",
+                name: "cp",
+                arguments: &["/image/one.html", "/image/one.html"],
+                performed: true,
+                succeeded: false,
+                held: &[("/image/one.html", Some("one\n"))],
+                diagnostic: Some("cp: '/image/one.html' and '/image/one.html' are the same file"),
+            },
+            Row {
+                case: "a file copied onto another SPELLING of itself, which is no copy either",
+                name: "cp",
+                arguments: &["/image/one.html", "/image//./one.html"],
+                performed: true,
+                succeeded: false,
+                held: &[("/image/one.html", Some("one\n"))],
+                diagnostic: Some("are the same file"),
+            },
+            Row {
+                case: "a directory whose destination is inside it under another spelling",
+                name: "cp",
+                arguments: &["-r", "/image/conf", "/image/./conf/inner"],
+                performed: true,
+                succeeded: false,
+                held: &[("/image/conf/inner/httpd.conf", None)],
+                diagnostic: Some("into itself"),
+            },
+            Row {
+                case: "a file moved onto itself, which leaves it where it is",
+                name: "mv",
+                arguments: &["/image/one.html", "/image/one.html"],
+                performed: true,
+                succeeded: false,
+                held: &[("/image/one.html", Some("one\n"))],
+                diagnostic: Some("mv: '/image/one.html' and '/image/one.html' are the same file"),
+            },
+            Row {
+                case: "a move of a DIRECTORY, which no removal here can complete",
+                name: "mv",
+                arguments: &["/image/conf", "/image/svc/conf"],
+                performed: false,
+                succeeded: false,
+                held: &[("/image/svc/conf/httpd.conf", None)],
+                diagnostic: None,
+            },
+        ];
+        for row in rows {
+            let case = row.case;
+            // Each row starts from the same image: the document the image ships, a second
+            // file, a directory with a file and a deeper one under it, and a path the files
+            // will not take a write to.
+            let mut held = Held {
+                directories: vec![
+                    "/image".to_string(),
+                    "/image/svc".to_string(),
+                    "/image/conf".to_string(),
+                    "/image/conf/extra".to_string(),
+                ],
+                read_only: vec!["/image/sealed".to_string()],
+                ..Held::default()
+            };
+            for (path, contents) in [
+                ("/image/index.html", "It works!\n"),
+                ("/image/other.html", "other\n"),
+                ("/image/one.html", "one\n"),
+                ("/image/sealed", "kept\n"),
+                ("/image/conf/httpd.conf", "Listen 80\n"),
+                ("/image/conf/extra/deep.conf", "deep\n"),
+            ] {
+                held.files.insert(path.to_string(), contents.to_string());
+            }
+            let arguments: Vec<String> = row
+                .arguments
+                .iter()
+                .map(|word| (*word).to_string())
+                .collect();
+            let outcome = perform_file_command(row.name, &arguments, &mut held, None);
+            let Some(outcome) = outcome else {
+                assert!(
+                    !row.performed,
+                    "case {case:?}: expected the invocation to be performed, got no outcome"
+                );
+                continue;
+            };
+            assert!(
+                row.performed,
+                "case {case:?}: expected a form that is not performed, got {outcome:?}"
+            );
+            assert_eq!(
+                outcome.succeeded, row.succeeded,
+                "case {case:?}: expected success to be {}, got {outcome:?}",
+                row.succeeded
+            );
+            for (path, contents) in row.held {
+                let read = held.read(path).ok();
+                assert_eq!(
+                    read.as_deref(),
+                    *contents,
+                    "case {case:?}: expected {path} to hold {contents:?}, got {read:?}"
+                );
+            }
+            match row.diagnostic {
+                Some(text) => assert!(
+                    outcome.errors.contains(text),
+                    "case {case:?}: expected a diagnostic carrying {text:?}, got {:?}",
+                    outcome.errors
+                ),
+                None => assert!(
+                    outcome.errors.is_empty(),
+                    "case {case:?}: expected no diagnostic, got {:?}",
+                    outcome.errors
+                ),
+            }
+        }
+    }
+
+    /// RULE: a copy of a hierarchy whose destination RESOLVES inside its own source — a spelling
+    /// only the holder of the files can resolve, so no comparison of the paths catches it — is
+    /// refused in the wording the utility refuses that with, instead of walking what it writes.
+    #[test]
+    fn a_copy_that_resolves_inside_its_own_source_is_refused() {
+        /// Files whose holder RESOLVES a relative path against one directory, which is what the
+        /// seam leaves to the holder — and what makes `conf/inner` the same place as
+        /// `/image/conf/inner` here.
+        #[derive(Default)]
+        struct Resolving {
+            files: BTreeMap<String, String>,
+            directories: Vec<String>,
+        }
+
+        impl Resolving {
+            fn at(&self, path: &str) -> String {
+                if path.starts_with('/') {
+                    return path.trim_end_matches('/').to_string();
+                }
+                format!("/image/{}", path.trim_end_matches('/'))
+            }
+        }
+
+        impl ShellFiles for Resolving {
+            fn read(&self, path: &str) -> Result<String, FileRefusal> {
+                self.files
+                    .get(&self.at(path))
+                    .cloned()
+                    .ok_or(FileRefusal::NotFound)
+            }
+
+            fn write(&mut self, path: &str, text: &str, append: bool) -> Result<(), FileRefusal> {
+                let held = self.files.entry(self.at(path)).or_default();
+                if !append {
+                    held.clear();
+                }
+                held.push_str(text);
+                Ok(())
+            }
+
+            fn make_directories(&mut self, path: &str) -> Result<(), FileRefusal> {
+                let resolved = self.at(path);
+                if !self.directories.contains(&resolved) {
+                    self.directories.push(resolved);
+                }
+                Ok(())
+            }
+
+            fn remove_file(&mut self, path: &str) -> Result<(), FileRefusal> {
+                self.files
+                    .remove(&self.at(path))
+                    .map(|_| ())
+                    .ok_or(FileRefusal::NotFound)
+            }
+
+            fn exists(&self, path: &str) -> bool {
+                self.files.contains_key(&self.at(path)) || self.is_directory(path)
+            }
+
+            fn is_file(&self, path: &str) -> bool {
+                self.files.contains_key(&self.at(path))
+            }
+
+            fn is_directory(&self, path: &str) -> bool {
+                self.directories.contains(&self.at(path))
+            }
+
+            fn writable(&self, _path: &str) -> bool {
+                true
+            }
+
+            fn entry_names(&self, path: &str) -> Vec<String> {
+                let under = format!("{}/", self.at(path));
+                let mut names: Vec<String> = self
+                    .files
+                    .keys()
+                    .chain(self.directories.iter())
+                    .filter_map(|held| held.strip_prefix(under.as_str()))
+                    .map(|name| name.split('/').next().unwrap_or(name).to_string())
+                    .collect();
+                names.sort();
+                names.dedup();
+                names
+            }
+        }
+
+        let mut held = Resolving {
+            directories: vec![
+                "/image".to_string(),
+                "/image/conf".to_string(),
+                "/image/conf/extra".to_string(),
+            ],
+            ..Resolving::default()
+        };
+        held.files.insert(
+            "/image/conf/extra/deep.conf".to_string(),
+            "Listen 80\n".to_string(),
+        );
+
+        // The destination resolves under a directory the walk has not reached yet, so the
+        // directory it writes there IS one of that directory's entries by the time it is read:
+        // the copy would go on discovering itself one level deeper for ever.
+        let arguments: Vec<String> = ["-r", "/image/conf", "conf/extra/inner"]
+            .iter()
+            .map(|word| (*word).to_string())
+            .collect();
+        let directories = held.directories.len();
+        let outcome = perform_file_command("cp", &arguments, &mut held, None)
+            .expect("the invocation is performed");
+        assert!(
+            !outcome.succeeded,
+            "expected the copy to be refused, got {outcome:?}"
+        );
+        assert!(
+            outcome.errors.contains("into itself"),
+            "expected the refusal of a copy into its own source, got {:?}",
+            outcome.errors
+        );
+        // Whatever it had written before it stopped, the walk STOPPED: the holder was handed no
+        // more than the entries one copy may carry, rather than an unbounded number of them.
+        assert!(
+            held.directories.len() <= directories + MAX_COPIED_ENTRIES,
+            "expected the walk to stop inside its own budget, got {} directories",
+            held.directories.len()
+        );
     }
 
     /// RULE: a redirection is read off the grammar's node into the descriptor it opens, and a
