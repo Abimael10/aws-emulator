@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAuditSuppression
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAuditSuppression`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAuditSuppression::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a Device Defender audit suppression: the record that filters out the findings
+//! one audit check makes about one resource.
+//!
+//! A suppression has no name, id or ARN of its own — the PAIR `checkName` +
+//! `resourceIdentifier` is its identity ([`crate::state::AuditSuppressionKey`]) — so a pair
+//! the account already holds a suppression for is a conflict
+//! ([`crate::state::existing_audit_suppression_message`]) and so is a repeat of a
+//! `clientRequestToken` the account already holds one under, which the model documents as
+//! unique across them. Both halves of the pair are read before anything is written, so a
+//! refused request records no suppression.
+//!
+//! What is persisted is the record `DescribeAuditSuppression` reports
+//! ([`crate::state::RegisteredAuditSuppression`]), so the create and the read cannot drift.
 //!
 //! ## Shape of an operation
 //!
@@ -119,6 +124,35 @@ impl From<CreateAuditSuppressionErrorModeled> for CreateAuditSuppressionError {
     }
 }
 
+/// Refuse this request as invalid, with the operation's modelled `InvalidRequestException`
+/// ("The request is not valid", HTTP 400).
+///
+/// The message names the member and the rule it broke; the rules themselves live with the
+/// suppression the request asked for ([`crate::state::AuditSuppressionRefusal`]).
+fn invalid_request(message: String) -> CreateAuditSuppressionError {
+    CreateAuditSuppressionErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse this request as a collision, with the operation's modelled
+/// `ResourceAlreadyExistsException` ("The resource already exists", HTTP 409).
+///
+/// Like the other Device Defender families whose 409 reports no identity members, the body
+/// carries the message alone: a suppression has no id or ARN of its own beside the pair the
+/// request already carried.
+fn already_exists(message: String) -> CreateAuditSuppressionError {
+    CreateAuditSuppressionErrorModeled::ResourceAlreadyExistsException(
+        ResourceAlreadyExistsException {
+            message: Some(message),
+            resource_id: None,
+            resource_arn: None,
+        },
+    )
+    .into()
+}
+
 /// The `CreateAuditSuppression` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -153,20 +187,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAuditSuppression` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAuditSuppressionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAuditSuppression"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAuditSuppressionErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        // WHAT THE SUPPRESSION IS ABOUT is its identity, so the pair is read first: it is a
+        // property of the request alone, whatever the account holds. The check must name an
+        // audit check and the identifier must identify a resource, both read through the one
+        // reading of this family's identity every operation of it makes.
+        let key = crate::state::audit_suppression_key(&input.check_name, &input.resource_identifier)
+            .map_err(|refusal| invalid_request(refusal.message()))?;
+
+        let mut store = state.lock();
+
+        // The pair is the identity, so a pair already suppressed is a conflict:
+        // `ResourceAlreadyExistsException` (HTTP 409), worded with this family's own
+        // already-exists sentence rather than one phrased here.
+        if store.audit_suppressions.contains_key(&key) {
+            return Err(already_exists(
+                crate::state::existing_audit_suppression_message(&key.check_name),
+            ));
+        }
+
+        // "Each audit supression must have a unique client request token. If you try to
+        // create a new audit suppression with the same token as one that already exists, an
+        // exception occurs": a token the account already holds a suppression under is its
+        // own collision, whichever pair that suppression is about.
+        if store
+            .audit_suppressions
+            .values()
+            .any(|suppression| suppression.client_request_token == input.client_request_token)
+        {
+            return Err(already_exists(
+                crate::state::existing_audit_suppression_token_message(&input.client_request_token),
+            ));
+        }
+
+        // Past the ceiling nothing is written and the create is refused with the modelled
+        // `LimitExceededException` ("A limit has been exceeded", HTTP 410), rather than
+        // growing the store without bound.
+        if store.audit_suppressions.len() >= crate::state::MAX_AUDIT_SUPPRESSIONS {
+            return Err(CreateAuditSuppressionErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "the maximum of {} audit suppressions is already reached",
+                        crate::state::MAX_AUDIT_SUPPRESSIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        store.audit_suppressions.insert(
+            key.clone(),
+            crate::state::RegisteredAuditSuppression::new(
+                key,
+                input.expiration_date,
+                input.suppress_indefinitely,
+                input.description,
+                input.client_request_token,
+            ),
+        );
+        // The response models no member at all, so what this call reports is the 200 itself;
+        // the record it persisted is what `DescribeAuditSuppression` hands back.
+        Ok(CreateAuditSuppressionOutput {})
     }
 }

@@ -140,6 +140,13 @@
 //! resources, check by check, so `DescribeAuditTask` after `StartOnDemandAuditTask` reports
 //! the audit that call performed (see [`audit_tasks`]).
 //!
+//! It also holds the account's DEVICE DEFENDER AUDIT SUPPRESSIONS, keyed by the pair that
+//! identifies one — the audit check whose finding is filtered out and the resource that
+//! finding is about — because the family models no id, name or ARN of its own and every
+//! operation of it addresses one by that pair. One record carries everything a reader hands
+//! back, so `DescribeAuditSuppression` after `CreateAuditSuppression` reports the created
+//! suppression member for member (see [`audit_suppressions`]).
+//!
 //! One collection in the store is NOT this account's: the AWS-MANAGED JOB TEMPLATE
 //! catalog, keyed by `templateName`. No operation creates, updates or deletes a managed
 //! template — `ListManagedJobTemplates` and `DescribeManagedJobTemplate` are the whole
@@ -1213,6 +1220,18 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// [`scheduled_audits::MAX_SCHEDULED_AUDITS`] is the ceiling `CreateScheduledAudit`
     /// refuses past.
     pub scheduled_audits: BTreeMap<String, ScheduledAudit>,
+    /// Every DEVICE DEFENDER AUDIT SUPPRESSION that exists, keyed by the pair that
+    /// identifies one ([`audit_suppressions::AuditSuppressionKey`]).
+    ///
+    /// The pair `checkName` + `resourceIdentifier` is the suppression's identity — both are
+    /// `@required` on every operation of the family and the family models no id, name or
+    /// ARN of its own — so a `BTreeMap` keyed by that pair is the store itself, ordered for
+    /// the same reason the scheduled audits are: `ListAuditSuppressions` is `@paginated`.
+    ///
+    /// A caller grows this store, so it is bounded:
+    /// [`audit_suppressions::MAX_AUDIT_SUPPRESSIONS`] is the ceiling
+    /// `CreateAuditSuppression` refuses past.
+    pub audit_suppressions: BTreeMap<AuditSuppressionKey, RegisteredAuditSuppression>,
     /// The AWS-MANAGED JOB TEMPLATE catalog: the published templates a job can be
     /// created from, keyed by `templateName`.
     ///
@@ -3552,6 +3571,17 @@ pub use scheduled_audits::{
     AUDIT_FREQUENCY_WEEKLY, MAX_SCHEDULED_AUDITS, MAX_SCHEDULED_AUDIT_TAGS,
 };
 
+// What a DEVICE DEFENDER AUDIT SUPPRESSION is — the pair that identifies one, the record
+// one holds and what a reader of one reports — lives in `state/audit_suppressions.rs`,
+// beside the audit configuration that holds the catalog of checks one can be created for.
+// Its names are re-exported here so a handler reaches them as `crate::state::<name>`.
+pub mod audit_suppressions;
+pub use audit_suppressions::{
+    audit_suppression_key, missing_audit_suppression_message, AuditSuppressionKey,
+    AuditSuppressionRefusal, RegisteredAuditSuppression, AUDIT_SUPPRESSION_CHECK_NAME_MEMBER,
+    AUDIT_SUPPRESSION_RESOURCE_MEMBER, MAX_AUDIT_SUPPRESSIONS,
+};
+
 // What a BILLING GROUP is — the record one holds, the ARN it is named by, the id a create
 // mints for it and what a reader of one reports — lives in `state/billing_groups.rs`,
 // beside the store accessor for the same reason the thing-group hierarchy does. Its names
@@ -3587,6 +3617,7 @@ pub use not_found::{
 // reaches them as `crate::state::<name>`.
 pub mod already_exists;
 pub use already_exists::{
+    existing_audit_suppression_message, existing_audit_suppression_token_message,
     existing_billing_group_message, existing_certificate_message,
     existing_certificate_provider_message, existing_command_message, existing_job_message,
     existing_job_template_message, existing_mitigation_action_message, existing_package_message,

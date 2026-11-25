@@ -37,6 +37,10 @@
 //! * The SOFTWARE PACKAGE family does not report an existing resource at all: it reports
 //!   a duplicate REQUEST, as a conditional-check failure
 //!   ([`existing_package_message`]).
+//! * The AUDIT SUPPRESSION family has no name, id or ARN to report: its identity is the
+//!   PAIR of an audit check and a resource identifier, so it names the member of the
+//!   request that carried the taken value and scopes the collision to the account
+//!   ([`existing_audit_suppression_message`], [`existing_audit_suppression_token_message`]).
 //! * The AUTHORIZER family's sentence lives beside that family's other rules
 //!   ([`super::existing_authorizer_message`]).
 //!
@@ -214,6 +218,39 @@ pub fn existing_mitigation_action_message(action_arn: &str) -> String {
 /// as the mitigation-action family's two sentences are.
 pub fn existing_scheduled_audit_message(scheduled_audit_arn: &str) -> String {
     resource_already_exists(scheduled_audit_arn)
+}
+
+/// How this service refuses a `CreateAuditSuppression` for a pair the account already holds
+/// an audit suppression for.
+///
+/// A suppression has no name, id or ARN of its own: its identity is the PAIR of the audit
+/// check and the resource identifier ([`super::AuditSuppressionKey`]), so the sentence
+/// names the member of that pair which IS a name — the check — and scopes the collision to
+/// the account, in the clause the role-alias family states one in
+/// ([`existing_role_alias_message`]). The member is named the way the Device Defender
+/// configuration families name the member a request carried a value at
+/// ([`super::unresolved_resource_message`]), so a caller is told which part of the request
+/// is already taken.
+pub fn existing_audit_suppression_message(check_name: &str) -> String {
+    format!(
+        "Audit suppression for {}={check_name} already exists for this account",
+        super::AUDIT_SUPPRESSION_CHECK_NAME_MEMBER
+    )
+}
+
+/// How this service refuses a `CreateAuditSuppression` whose `clientRequestToken` an audit
+/// suppression of the account already holds.
+///
+/// The model documents the token as unique across them — "each audit supression must have a
+/// unique client request token. If you try to create a new audit suppression with the same
+/// token as one that already exists, an exception occurs" — so a repeat token is its own
+/// collision, stated in this family's clause ([`existing_audit_suppression_message`]) with
+/// the member the request carried the token at as its variable part.
+pub fn existing_audit_suppression_token_message(client_request_token: &str) -> String {
+    format!(
+        "Audit suppression with clientRequestToken={client_request_token} already exists for \
+         this account"
+    )
 }
 
 /// How this service refuses a `CreatePackage` under a name the catalog already holds.
