@@ -49,7 +49,13 @@
 //!   socket or leaves the host. One settled run writes ONE object, keyed under the URI's own
 //!   prefix by the query the results belong to and the run's `queryId`, holding the run's result
 //!   rows as the JSON document a consumer of a published result set parses
-//!   ([`results_object_key`], [`results_json`]).
+//!   ([`results_object_key`], [`results_json`]). The REST of that destination's configuration
+//!   travels with the write, because each member states a condition of it: `ownerAccountId` is
+//!   "the Amazon Web Services accountId for the bucket owning account", so the write states the
+//!   owner it expects and the object store is what refuses a bucket another account owns, and
+//!   `kmsKeyId` is "the Amazon Resource Name (ARN) of the KMS encryption key", so the object is
+//!   written under server-side encryption with that key instead of under the destination
+//!   bucket's own default ([`deliver_to_s3`]).
 //!
 //! WHAT BOUNDS IT: one history read materialises at most [`MAX_CATCHUP_INSTANTS`] schedule
 //! instants, keeps at most [`MAX_TRIGGER_HISTORY_RECORDS`] of them per query and carries out at
@@ -790,6 +796,13 @@ fn record_run(
                     // specified Amazon S3 destination": the write is made under it, so it
                     // travels with the delivery it authorizes.
                     role_arn: s3.role_arn.clone(),
+                    // The two conditions the destination's own configuration puts on that
+                    // write, each stated by the write itself. A member the configuration
+                    // leaves empty states nothing: `ownerAccountId` and `kmsKeyId` are both
+                    // optional, so a destination naming neither is delivered to with no owner
+                    // expected and under the bucket's own default encryption.
+                    owner_account_id: stated(s3.owner_account_id.as_deref()),
+                    kms_key_id: stated(s3.kms_key_id.as_deref()),
                 })
             }
             // A destination that is no Amazon S3 URI addresses no bucket, so there is nowhere
@@ -843,6 +856,26 @@ struct S3Delivery {
     /// The role the write is made under, whose permissions decide whether it happens at all
     /// ([`super::scheduled_query_delivery_authorization`]).
     role_arn: String,
+    /// `S3Configuration$ownerAccountId` — "The Amazon Web Services accountId for the bucket
+    /// owning account" — which the write states as the owner it expects, so a bucket another
+    /// account owns is refused by the object store rather than written to.
+    owner_account_id: Option<String>,
+    /// `S3Configuration$kmsKeyId` — "The Amazon Resource Name (ARN) of the KMS encryption key"
+    /// — which the write states as the key the delivered object is encrypted under. A
+    /// destination naming none leaves the object to the destination bucket's own default
+    /// encryption configuration.
+    kms_key_id: Option<String>,
+}
+
+/// The value a member STATES, which is nothing at all for one left empty: `ownerAccountId` and
+/// `kmsKeyId` are both optional members of `S3Configuration`, and `kmsKeyId` admits the empty
+/// string (@length min 0), so a blank value names no owner and no key rather than one the write
+/// could state.
+fn stated(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 /// The lookup-table write one run owes, as the decision about it is taken with no store guard
@@ -943,6 +976,23 @@ async fn deliver_to_s3(
         .body(::aws_sdk_s3::primitives::ByteStream::from(
             delivery.body.clone().into_bytes(),
         ))
+        // "The Amazon Web Services accountId for the bucket owning account": the destination
+        // names the account the bucket is expected to belong to, so the write states it and
+        // Amazon S3 is what judges it — a bucket owned by anyone else takes nothing.
+        .set_expected_bucket_owner(delivery.owner_account_id.clone())
+        // "The Amazon Resource Name (ARN) of the KMS encryption key": a destination that names
+        // one has its object encrypted under that key, which is server-side encryption with a
+        // KMS key and so names that algorithm beside it ("This parameter is allowed if and only
+        // if SSEAlgorithm is set to aws:kms or aws:kms:dsse",
+        // `ApplyServerSideEncryptionByDefault$KMSMasterKeyID`). A destination that names no key
+        // states neither, which leaves the object to the bucket's own default configuration.
+        .set_server_side_encryption(
+            delivery
+                .kms_key_id
+                .as_ref()
+                .map(|_| ::aws_sdk_s3::types::ServerSideEncryption::AwsKms),
+        )
+        .set_ssekms_key_id(delivery.kms_key_id.clone())
         .send()
         .await;
     match answer {
