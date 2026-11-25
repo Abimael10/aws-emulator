@@ -381,6 +381,136 @@ async fn an_arn_that_names_no_app_instance_is_refused() {
     );
 }
 
+/// `GET` one app instance and return the created and last-updated instants the
+/// `AppInstance` it wraps reports.
+///
+/// Source: `smithy_query(query="operation",operation="DescribeAppInstance")` —
+/// `GET /app-instances/{AppInstanceArn}`, answering 200 with an `AppInstance` whose
+/// optional `LastUpdatedTimestamp` is the time the instance was last updated.
+async fn described_instants(emulator: &Emulator, arn: &str) -> (Option<f64>, Option<f64>) {
+    let (status, body) = emulator
+        .call("GET", &format!("/app-instances/{}", uri_encode(arn)), None)
+        .await;
+    assert_eq!(
+        status, 200,
+        "DescribeAppInstance answered: {status} {body:?}"
+    );
+    let instance = &body["AppInstance"];
+    (
+        instance["CreatedTimestamp"].as_f64(),
+        instance["LastUpdatedTimestamp"].as_f64(),
+    )
+}
+
+/// RULE: writing an instance's retention settings writes the instance, so the instant it
+/// reports as its last update moves to that write — at or after its created instant,
+/// which never moves, and never backwards — while an instance nothing has written to
+/// reports no last-updated instant at all and a refused put leaves both instants alone.
+#[tokio::test]
+async fn a_served_put_stamps_the_instance_and_a_refused_put_does_not() {
+    let emulator = Emulator::new();
+    let instance = emulator
+        .app_instance("retention-stamped", "tok-ret-stamped")
+        .await;
+
+    let (created, before_any_put) = described_instants(&emulator, &instance).await;
+    assert!(
+        created.is_some(),
+        "expected the created instance to report a created instant, got {created:?}"
+    );
+    assert!(
+        before_any_put.is_none(),
+        "expected an instance nothing has written to report no last-updated instant, \
+         got {before_any_put:?}"
+    );
+
+    // Rows spanning what the rule generalises over: both published bounds, a value
+    // between them, that same value AGAIN (a repeat is still a write), settings naming no
+    // number of days and settings carrying no channel member at all (both turn retention
+    // off, and so report no deletion instant), and a number of days set once more. Every
+    // row is a write, so every row must move the stamp.
+    let served: Vec<(&str, Value)> = vec![
+        ("the lower published bound", settings(MIN_RETENTION_DAYS)),
+        ("a value between the bounds", settings(180)),
+        ("that same value again", settings(180)),
+        ("the upper published bound", settings(MAX_RETENTION_DAYS)),
+        (
+            "channel settings naming no number of days",
+            json!({ "ChannelRetentionSettings": {} }),
+        ),
+        ("settings carrying no channel member at all", json!({})),
+        ("a number of days again", settings(14)),
+    ];
+
+    let mut stamped = before_any_put;
+    for (label, written) in served {
+        let (status, put_body) = put_retention(&emulator, &instance, written.clone()).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: expected the put to answer 200, got {status} {put_body:?}"
+        );
+
+        let (now_created, now_stamped) = described_instants(&emulator, &instance).await;
+        assert_eq!(
+            now_created, created,
+            "case {label:?}: a put must not move the created instant {created:?}, got \
+             {now_created:?}"
+        );
+        assert!(
+            now_stamped.is_some_and(|at| created.is_some_and(|born| at >= born)),
+            "case {label:?}: expected a last-updated instant at or after the created \
+             instant {created:?}, got {now_stamped:?}"
+        );
+        assert!(
+            stamped.is_none_or(|previous| now_stamped.is_some_and(|at| at >= previous)),
+            "case {label:?}: expected the last-updated instant to never move backwards \
+             from {stamped:?}, got {now_stamped:?}"
+        );
+        // One put is one write, so the instant the settings take effect from and the
+        // instant the instance reports as its last update are the same instant.
+        if let Some(deletion_instant) = reported_instant(&put_body) {
+            assert_eq!(
+                now_stamped,
+                Some(deletion_instant),
+                "case {label:?}: expected the instance to be stamped at the instant the \
+                 settings took effect, {deletion_instant}, got {now_stamped:?}"
+            );
+        }
+        stamped = now_stamped;
+    }
+
+    // Rows that are refused rather than served: a number of days outside the published
+    // range, and a body carrying none of the required member. Neither writes the
+    // instance, so neither stamps it.
+    let refused: Vec<(&str, Value)> = vec![
+        (
+            "one day below the lower bound",
+            json!({ "AppInstanceRetentionSettings": settings(MIN_RETENTION_DAYS - 1) }),
+        ),
+        (
+            "one day past the upper bound",
+            json!({ "AppInstanceRetentionSettings": settings(MAX_RETENTION_DAYS + 1) }),
+        ),
+        ("a body carrying no settings member", json!({})),
+    ];
+
+    for (label, body) in refused {
+        let (status, response) = put_retention_body(&emulator, &instance, body.clone()).await;
+        assert_eq!(
+            status, 400,
+            "case {label:?}: expected {body:?} to be refused with 400, got {status} \
+             {response:?}"
+        );
+        let (now_created, now_stamped) = described_instants(&emulator, &instance).await;
+        assert_eq!(
+            (now_created, now_stamped),
+            (created, stamped),
+            "case {label:?}: a refused put must move neither instant, got {now_created:?} \
+             / {now_stamped:?}"
+        );
+    }
+}
+
 /// RULE: retention settings belong to the instance they were written for, so each
 /// instance reports its own and a write to one is invisible to the others.
 #[tokio::test]

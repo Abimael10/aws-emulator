@@ -197,10 +197,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // instant this call hands back is when that run starts deleting what now falls
         // outside the window — the instant the settings took effect, which is this call's
         // own. It moves with every served put, since each one puts new settings in effect.
+        //
+        // The clock is read ONCE for the whole write, so the deletion instant the
+        // settings take effect from and the instant the instance reports as its last
+        // update are the same instant: this one write happened at one time.
         let settings = input.app_instance_retention_settings;
-        record.retention_deletion_initiated_at = crate::state::retention_days_in_effect(&settings)
-            .map(|_days| ::std::time::SystemTime::now());
+        let written_at = ::std::time::SystemTime::now();
+        record.retention_deletion_initiated_at =
+            crate::state::retention_days_in_effect(&settings).map(|_days| written_at);
         record.retention_settings = Some(settings.clone());
+        // Writing the settings writes the instance, so its last-updated instant moves to
+        // this write, the way every other operation that changes an instance stamps it.
+        record.last_updated_timestamp = Some(written_at);
 
         Ok(PutAppInstanceRetentionSettingsOutput {
             app_instance_retention_settings: Some(settings),
