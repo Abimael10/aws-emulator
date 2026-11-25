@@ -11,7 +11,8 @@
 //! * what the clock owes a started task ([`TaskRun`]): the full load becomes due once the
 //!   task is `running`, and a task whose migration type has NO change-data-capture phase
 //!   to follow stops itself when that load finishes, with the reason
-//!   [`FULL_LOAD_ONLY_FINISHED`];
+//!   [`FULL_LOAD_ONLY_FINISHED`], while a stop a caller asked for ends the run at the
+//!   instant that stop falls due, with the reason [`STOPPED_NORMALLY`];
 //! * what the full load actually MOVED ([`TableLoad`]), which is read off the endpoints'
 //!   own data plane rather than assumed: an Amazon S3 source holds a table's full-load
 //!   objects under `<BucketFolder>/<schema>/<table>/`, and an Amazon S3 target takes the
@@ -54,6 +55,13 @@ pub const MIGRATION_FULL_LOAD_AND_CDC: &str = "full-load-and-cdc";
 /// FULL_LOAD_ONLY_FINISHED\" – The task completed the full load phase"
 /// (`ReplicationTask$StopReason`). Fixed text, with no variable part.
 pub const FULL_LOAD_ONLY_FINISHED: &str = "Stop Reason FULL_LOAD_ONLY_FINISHED";
+
+/// Why a task a caller asked to stop stopped: "\"Stop Reason NORMAL\" – The task
+/// completed successfully with no additional information returned"
+/// (`ReplicationTask$StopReason`) — the one value that member publishes for a stop that
+/// reports nothing beyond itself, which is what `StopReplicationTask` asks for. Fixed
+/// text, with no variable part.
+pub const STOPPED_NORMALLY: &str = "Stop Reason NORMAL";
 
 /// The `TableStatistics$TableState` of a table whose load has not begun. One of the
 /// member's documented states: "Valid states: Table does not exist | Before load | Full
@@ -176,6 +184,10 @@ pub struct TaskRun {
     /// When the run's full load becomes due, or `None` for a migration type that has no
     /// full-load phase at all (`cdc`).
     pub full_load_due: Option<SystemTime>,
+    /// When the stop a caller asked for with `StopReplicationTask` comes due, or `None`
+    /// for a run nobody has asked to stop. That instant BOUNDS the run: nothing the clock
+    /// owes the run after it happens, since the task is no longer migrating by then.
+    pub stop_due: Option<SystemTime>,
     /// The full load, once it has run.
     pub full_load: Option<FullLoad>,
     /// How long the task has been running, which is `ReplicationTaskStats$ElapsedTimeMillis`.
@@ -196,6 +208,7 @@ impl TaskRun {
             // The load runs once the task is `running`, which is the status the clock owes
             // it one span after the start.
             full_load_due: loads_tables(migration_type).then(|| now + TRANSITION_DELAY),
+            stop_due: None,
             full_load: None,
             elapsed: Duration::ZERO,
             stopped: None,
@@ -248,35 +261,51 @@ impl ReplicationTaskRecord {
     /// Materialise what the clock owes this task's run at `now`.
     ///
     /// Called from [`super::ComAmazonawsDatabasemigrationserviceAmazondmsv20160101State::settle`],
-    /// so a read and a later read agree: the elapsed time of a running task, and the
-    /// finish of a full load whose instant has passed — which, for a task with no phase
-    /// after it, is also the stop that carries [`FULL_LOAD_ONLY_FINISHED`].
+    /// so a read and a later read agree: the elapsed time of a running task, the finish of
+    /// a full load whose instant has passed — which, for a task with no phase after it, is
+    /// also the stop that carries [`FULL_LOAD_ONLY_FINISHED`] — and the stop a caller asked
+    /// for ([`STOPPED_NORMALLY`]), once that falls due.
+    ///
+    /// A stop a caller asked for BOUNDS the run: the run's accounting is read at the
+    /// instant that stop was owed rather than at `now`, so a phase still due after the stop
+    /// never happens while one that was owed before it still does.
     pub(crate) fn settle_run(&mut self, now: SystemTime) {
         let running = self.status == TASK_RUNNING;
         let stops = stops_after_full_load(&self.migration_type);
         let Some(run) = self.run.as_mut() else {
             return;
         };
+        let requested_stop = run.stop_due.filter(|due| now >= *due);
+        let horizon = requested_stop.unwrap_or(now);
         if running {
-            run.elapsed = now.duration_since(run.started).unwrap_or_default();
+            run.elapsed = horizon.duration_since(run.started).unwrap_or_default();
         }
-        let Some(load) = run.full_load.as_mut() else {
-            return;
-        };
-        if load.finished || now < load.finish_due {
-            return;
+        // The stop this run arrives at, as `(when, why)`: the finish of a load that was
+        // the whole task, or the stop a caller asked for.
+        let mut stop: Option<(SystemTime, &'static str)> = None;
+        if let Some(load) = run.full_load.as_mut() {
+            if !load.finished && horizon >= load.finish_due {
+                load.finished = true;
+                if stops {
+                    stop = Some((load.finish_due, FULL_LOAD_ONLY_FINISHED));
+                }
+            }
         }
-        load.finished = true;
-        if stops {
-            // The load was the whole task, so the task stops itself at the instant the
-            // load finished — and the elapsed time it reports is frozen there too.
-            run.stopped = Some(load.finish_due);
-            run.elapsed = load
-                .finish_due
-                .duration_since(run.started)
-                .unwrap_or_default();
+        if let Some(due) = requested_stop {
+            run.stop_due = None;
+            // A run that had already arrived at a stop of its own keeps the reason it
+            // stopped for: the caller's stop found nothing left to stop.
+            if stop.is_none() && run.stopped.is_none() {
+                stop = Some((due, STOPPED_NORMALLY));
+            }
+        }
+        if let Some((at, reason)) = stop {
+            // The run stops at the instant the stop was owed — and the elapsed time it
+            // reports is frozen there too.
+            run.stopped = Some(at);
+            run.elapsed = at.duration_since(run.started).unwrap_or_default();
             self.status = TASK_STOPPED.to_string();
-            self.stop_reason = Some(FULL_LOAD_ONLY_FINISHED.to_string());
+            self.stop_reason = Some(reason.to_string());
         }
     }
 

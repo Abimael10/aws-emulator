@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopReplicationTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopReplicationTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopReplicationTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: takes the persisted task off the run it is on — it moves to `stopping`,
+//! and the run it was performing is owed the stop a caller asked for, which the clock
+//! materialises as `stopped` with the reason that stop carries ([`crate::state`]) — so a
+//! following `DescribeReplicationTasks` observes the new status and, once the clock has
+//! carried the task that far, the stopped run's frozen statistics. A task that is on no
+//! run has nothing to stop and is refused in the state it is in.
+//! The notes below are the scaffold's, kept for the next reader.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +136,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopReplicationTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopReplicationTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopReplicationTask"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(invalid_state(
+                "the dms emulator is mounted on an engine that holds no state for it".to_string(),
+            ));
+        };
+
+        let now = ::std::time::SystemTime::now();
+        // Whether the task is still on a run is what decides this stop, and a run the
+        // clock has already finished is one the task is no longer on: the work it owes
+        // happens before the status is read, so a task whose run has ended by itself is
+        // refused here rather than stopped a second time.
+        crate::state::advance_task_runs(&*self.engine, ctx.callback(), now).await;
+        let mut store = state.lock();
+        store.settle(now);
+
+        let Some(task) = store.replication_tasks.get_mut(&input.replication_task_arn) else {
+            return Err(StopReplicationTaskErrorModeled::ResourceNotFoundFault(
+                ResourceNotFoundFault {
+                    message: Some(format!(
+                        "ReplicationTaskArn {} does not name a replication task in this account",
+                        input.replication_task_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // Only a task that is carrying out a migration has a run to stop: one that is
+        // `ready`, `stopped`, still being created, already stopping or on its way out of
+        // the account is not running, which is what this refusal reports.
+        if !STOPPABLE_STATUSES.contains(&task.status.as_str()) {
+            return Err(invalid_state(format!(
+                "Replication Task: {} is currently not running.",
+                task.arn
+            )));
+        }
+
+        // `stopping` is not terminal: the task is owed `stopped`, so a caller that reads
+        // straight after this call still sees the task preparing to stop. The run it is
+        // on is owed that same instant, which is what freezes the run's accounting and
+        // records why it stopped.
+        let pending = crate::state::Pending::after(
+            now,
+            crate::state::Owed::ToStatus(crate::state::TASK_STOPPED),
+        );
+        if let Some(run) = task.run.as_mut() {
+            run.stop_due = Some(pending.due);
+        }
+        task.pending = Some(pending);
+        task.status = crate::state::TASK_STOPPING.to_string();
+
+        Ok(StopReplicationTaskOutput {
+            replication_task: Some(task.to_shape(false)),
+        })
     }
+}
+
+/// The statuses a task can be stopped from: one preparing to migrate and one that is
+/// migrating, which are the statuses a started task carries while it is on a run.
+const STOPPABLE_STATUSES: &[&str] = &[crate::state::TASK_STARTING, crate::state::TASK_RUNNING];
+
+/// The error this operation models for a resource that cannot be used for a migration
+/// in the state it is in. The DMS model declares no server-side fault, so the
+/// unreachable "no store" branch uses it too rather than a 501, which would claim the
+/// operation is unimplemented.
+fn invalid_state(message: String) -> StopReplicationTaskError {
+    StopReplicationTaskErrorModeled::InvalidResourceStateFault(InvalidResourceStateFault {
+        message: Some(message),
+    })
+    .into()
 }

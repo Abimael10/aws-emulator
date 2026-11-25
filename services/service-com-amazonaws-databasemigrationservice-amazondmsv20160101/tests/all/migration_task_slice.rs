@@ -3,8 +3,8 @@
 //! End-to-end cover for the DMS migration-task slice this crate implements:
 //! `CreateReplicationInstance`, `CreateEndpoint`, `CreateReplicationTask`,
 //! `DescribeReplicationInstances`, `DescribeEndpoints`, `DescribeReplicationTasks`,
-//! `ModifyReplicationInstance`, `StartReplicationTask`, `DeleteReplicationTask` and
-//! `DeleteEndpoint`.
+//! `ModifyReplicationInstance`, `StartReplicationTask`, `StopReplicationTask`,
+//! `DeleteReplicationTask` and `DeleteEndpoint`.
 //!
 //! Every case drives the real wire path — `POST /` with
 //! `X-Amz-Target: AmazonDMSv20160101.<Operation>` through the multi-service router — so
@@ -16,10 +16,11 @@ use std::time::{Duration, Instant, SystemTime};
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_databasemigrationservice_amazondmsv20160101::state::{
-    ENDPOINT_ACTIVE, ENDPOINT_DELETING, INSTANCE_AVAILABLE, INSTANCE_DELETING,
-    INSTANCE_IDENTIFIER_MAX_LEN, INSTANCE_MODIFYING, LOG_COMPONENTS, LOG_SEVERITY_DEFAULT,
-    MAX_RECORDS_MAX, MAX_RECORDS_MIN, NETWORK_TYPE_DUAL, NETWORK_TYPE_IPV4,
-    RESOURCE_IDENTIFIER_MAX_LEN, TRANSITION_DELAY,
+    ENDPOINT_ACTIVE, ENDPOINT_DELETING, FULL_LOAD_ONLY_FINISHED, INSTANCE_AVAILABLE,
+    INSTANCE_DELETING, INSTANCE_IDENTIFIER_MAX_LEN, INSTANCE_MODIFYING, LOG_COMPONENTS,
+    LOG_SEVERITY_DEFAULT, MAX_RECORDS_MAX, MAX_RECORDS_MIN, NETWORK_TYPE_DUAL, NETWORK_TYPE_IPV4,
+    RESOURCE_IDENTIFIER_MAX_LEN, STOPPED_NORMALLY, TASK_CREATING, TASK_DELETING, TASK_READY,
+    TASK_RUNNING, TASK_STARTING, TASK_STOPPED, TASK_STOPPING, TRANSITION_DELAY,
 };
 use service_com_amazonaws_databasemigrationservice_amazondmsv20160101::EmulatedService;
 use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
@@ -703,6 +704,10 @@ async fn an_arn_that_names_no_task_is_refused_as_not_found() {
                     "ReplicationTaskArn": arn,
                     "StartReplicationTaskType": "start-replication",
                 }),
+            ),
+            (
+                "StopReplicationTask",
+                json!({ "ReplicationTaskArn": arn }),
             ),
             (
                 "DeleteReplicationTask",
@@ -4045,4 +4050,420 @@ async fn a_modify_is_refused_when_a_member_names_nothing_the_service_accepts() {
         "case {case_prefix:?}: expected the longest documented identifier to be accepted, \
          got {renamed}"
     );
+}
+
+// ---- StopReplicationTask -------------------------------------------------------------
+//
+// "Stops the replication task": a task is stopped only while it is ON a run — `starting`,
+// the status a start leaves it in, or `running` — and the stop takes it off that run in
+// two steps the clock owns. It reports `stopping` at once, so a caller that reads straight
+// after the call sees the task preparing to stop, and once the clock makes the stop due the
+// task is `stopped`, carrying the reason that stop has and a run whose accounting is frozen
+// where it stopped. A task in any OTHER status is on no run, so there is nothing to stop:
+// the call is refused as a resource in a state that prevents it from being used for a
+// migration, in DMS's own sentence for that refusal, and it leaves the task where it was.
+//
+// The rows span what the rule generalises over: the migration type of the task being
+// stopped, and the status the task carries when the stop arrives — one still being created,
+// one created and never run, one that stopped itself when its full load finished, one a
+// caller already stopped, one still coming off its run, and one on its way out of the
+// account.
+
+/// The migration types whose task is still migrating once the clock has carried it past
+/// its start, so what ends its run is the stop a caller asks for.
+///
+/// `MigrationTypeValue` publishes `full-load`, `cdc` and `full-load-and-cdc`; the one left
+/// out here, `full-load`, stops itself when its load finishes, which
+/// [`a_task_on_no_run_is_refused_as_not_running`] covers.
+const KEEPS_RUNNING_MIGRATION_TYPES: &[&str] = &["full-load-and-cdc", "cdc"];
+
+/// The migration type whose only phase is the full load, so the task stops itself when
+/// that load finishes rather than waiting to be stopped.
+const FULL_LOAD_ONLY: &str = "full-load";
+
+/// A `Filters` request narrowing a describe to one replication task ARN.
+fn by_task_arn(arn: &str) -> Value {
+    json!({ "Filters": [{ "Name": "replication-task-arn", "Values": [arn] }] })
+}
+
+/// A replication instance that has finished provisioning, polled rather than waited for,
+/// and its ARN.
+async fn polled_instance(emulator: &Emulator, case: &str, identifier: &str) -> String {
+    let created = emulator
+        .ok(
+            case,
+            "CreateReplicationInstance",
+            &json!({
+                "ReplicationInstanceIdentifier": identifier,
+                "ReplicationInstanceClass": "dms.t3.medium",
+            }),
+        )
+        .await;
+    let arn = text(&created, "/ReplicationInstance/ReplicationInstanceArn");
+    poll_until_instance_available(emulator, case, &arn).await;
+    arn
+}
+
+/// Create a replication task of `migration_type` between the case's endpoints, and answer
+/// its ARN.
+async fn task_of(
+    emulator: &Emulator,
+    case: &str,
+    identifier: &str,
+    migration_type: &str,
+    endpoints: &TaskEndpoints,
+) -> String {
+    let created = emulator
+        .ok(
+            case,
+            "CreateReplicationTask",
+            &json!({
+                "ReplicationTaskIdentifier": identifier,
+                "SourceEndpointArn": endpoints.source,
+                "TargetEndpointArn": endpoints.target,
+                "ReplicationInstanceArn": endpoints.instance,
+                "MigrationType": migration_type,
+                "TableMappings": table_mappings(),
+            }),
+        )
+        .await;
+    text(&created, "/ReplicationTask/ReplicationTaskArn")
+}
+
+/// The resources every task of a stop case is created against.
+struct TaskEndpoints {
+    /// The replication instance the task runs on.
+    instance: String,
+    /// The endpoint the task reads.
+    source: String,
+    /// The endpoint the task writes.
+    target: String,
+}
+
+impl TaskEndpoints {
+    /// An available replication instance and a pair of endpoints, named after `prefix` so
+    /// two cases in one target hold their own.
+    async fn new(emulator: &Emulator, case: &str, prefix: &str) -> Self {
+        Self {
+            instance: polled_instance(emulator, case, &format!("{prefix}-instance")).await,
+            source: emulator
+                .endpoint(&format!("{prefix}-src"), "source", "mysql")
+                .await,
+            target: emulator
+                .endpoint(&format!("{prefix}-tgt"), "target", "postgres")
+                .await,
+        }
+    }
+}
+
+/// Start the task `arn` names and poll until it is migrating, which is the status a stop
+/// is accepted in.
+async fn start_and_poll_until_running(emulator: &Emulator, case: &str, arn: &str) {
+    poll_until_task_status(emulator, case, arn, TASK_READY).await;
+    emulator
+        .ok(
+            case,
+            "StartReplicationTask",
+            &json!({
+                "ReplicationTaskArn": arn,
+                "StartReplicationTaskType": "start-replication",
+            }),
+        )
+        .await;
+    poll_until_task_status(emulator, case, arn, TASK_RUNNING).await;
+}
+
+/// Poll `DescribeReplicationTasks` narrowed to `arn` until the task it reports carries
+/// `status`, and answer that describe. A task that never reaches it past [`POLL_BUDGET`]
+/// fails the case.
+async fn poll_until_task_status(
+    emulator: &Emulator,
+    case: &str,
+    arn: &str,
+    status: &str,
+) -> Value {
+    let deadline = Instant::now() + POLL_BUDGET;
+    loop {
+        let described = emulator
+            .ok(case, "DescribeReplicationTasks", &by_task_arn(arn))
+            .await;
+        let reported = text(&described, "/ReplicationTasks/0/Status");
+        if reported == status {
+            return described;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: the task never reached {status:?}, last {reported:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Push every transition the store still owes a replication task — the status it is owed,
+/// and the stop a caller asked for — an hour out, so a case about the transient status a
+/// call created reads that status instead of racing the clock that ends it.
+///
+/// This writes only the due instants the emulator itself stores; each transition is still
+/// applied by the store's own settling on the next request, exactly as in production.
+fn hold_task_transitions(engine: &engine::InMemoryEngine) {
+    let store = engine.state::<
+        service_com_amazonaws_databasemigrationservice_amazondmsv20160101::ComAmazonawsDatabasemigrationserviceAmazondmsv20160101State,
+    >();
+    let mut store = store.lock();
+    let held = SystemTime::now() + HELD_FOR;
+    for task in store.replication_tasks.values_mut() {
+        if let Some(pending) = task.pending.as_mut() {
+            pending.due = held;
+        }
+        if let Some(run) = task.run.as_mut() {
+            if run.stop_due.is_some() {
+                run.stop_due = Some(held);
+            }
+        }
+    }
+}
+
+/// The statistics of the one task a describe reports, or `Null` when it reports none.
+fn task_stats(described: &Value) -> Value {
+    described
+        .pointer("/ReplicationTasks/0/ReplicationTaskStats")
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// A stop takes a task that is migrating off its run: the call reports the task preparing
+/// to stop, the clock carries it to `stopped` with the reason a caller's stop carries, the
+/// run it was on freezes where it stopped, and the stopped task can be started again.
+#[tokio::test]
+async fn a_stop_takes_a_running_task_off_its_run() {
+    let emulator = Emulator::new();
+    let endpoints = TaskEndpoints::new(&emulator, "stop a running task", "stop-run").await;
+
+    for migration_type in KEEPS_RUNNING_MIGRATION_TYPES {
+        let case = format!("stop a running {migration_type} task");
+        let task_arn = task_of(
+            &emulator,
+            &case,
+            &format!("stop-{migration_type}"),
+            migration_type,
+            &endpoints,
+        )
+        .await;
+        start_and_poll_until_running(&emulator, &case, &task_arn).await;
+
+        let answered = emulator
+            .ok(
+                &case,
+                "StopReplicationTask",
+                &json!({ "ReplicationTaskArn": task_arn }),
+            )
+            .await;
+        assert_eq!(
+            (
+                text(&answered, "/ReplicationTask/ReplicationTaskArn"),
+                text(&answered, "/ReplicationTask/Status"),
+                text(&answered, "/ReplicationTask/MigrationType"),
+            ),
+            (
+                task_arn.clone(),
+                TASK_STOPPING.to_string(),
+                (*migration_type).to_string()
+            ),
+            "case {case:?}: expected the stop to answer with the task preparing to stop, \
+             got {answered}"
+        );
+
+        let stopped = poll_until_task_status(&emulator, &case, &task_arn, TASK_STOPPED).await;
+        assert_eq!(
+            text(&stopped, "/ReplicationTasks/0/StopReason"),
+            STOPPED_NORMALLY,
+            "case {case:?}: expected the reason a caller's stop carries, got {stopped}"
+        );
+        let stats = task_stats(&stopped);
+        assert!(
+            stats.get("StopDate").is_some(),
+            "case {case:?}: expected the stopped run to report when it stopped, got {stats}"
+        );
+
+        // The stopped run's accounting is frozen: a later read reports the same statistics
+        // rather than a task still running up the time it has been migrating.
+        let again = emulator
+            .ok(&case, "DescribeReplicationTasks", &by_task_arn(&task_arn))
+            .await;
+        assert_eq!(
+            task_stats(&again),
+            stats,
+            "case {case:?}: expected a stopped run's statistics to stay where they \
+             stopped, got {again}"
+        );
+
+        // A stopped task is one a start accepts again, and it carries neither the reason
+        // it stopped nor the statistics of the run it stopped on into the new one.
+        let restarted = emulator
+            .ok(
+                &case,
+                "StartReplicationTask",
+                &json!({
+                    "ReplicationTaskArn": task_arn,
+                    "StartReplicationTaskType": "resume-processing",
+                }),
+            )
+            .await;
+        assert_eq!(
+            (
+                text(&restarted, "/ReplicationTask/Status"),
+                text(&restarted, "/ReplicationTask/StopReason"),
+            ),
+            (TASK_STARTING.to_string(), "<missing>".to_string()),
+            "case {case:?}: expected a restarted task to be starting with no stop reason, \
+             got {restarted}"
+        );
+    }
+}
+
+/// Every status a task that is on NO run carries, and the one refusal a stop answers each
+/// of them with — which is also what the recorded refusal of a stop against a task that is
+/// ready or stopped reports.
+#[tokio::test]
+async fn a_task_on_no_run_is_refused_as_not_running() {
+    let emulator = Emulator::new();
+    let case = "a task on no run";
+    let endpoints = TaskEndpoints::new(&emulator, case, "no-run").await;
+
+    // Each row is one status a task can be in with no run under way, prepared through the
+    // operations that put it there: `(case, the status the task carries, its ARN)`.
+    let mut cases: Vec<(&str, &str, String)> = Vec::new();
+
+    // A task the service is still creating.
+    let creating = task_of(&emulator, case, "no-run-creating", "cdc", &endpoints).await;
+    hold_task_transitions(emulator.engine());
+    cases.push(("a task still being created", TASK_CREATING, creating));
+
+    // A task that was created and has never run.
+    let ready = task_of(&emulator, case, "no-run-ready", "cdc", &endpoints).await;
+    poll_until_task_status(&emulator, case, &ready, TASK_READY).await;
+    cases.push(("a created task that has never run", TASK_READY, ready));
+
+    // A task whose only phase was its full load, which stopped itself when that load
+    // finished — a stop that carries its own reason.
+    let self_stopped = task_of(
+        &emulator,
+        case,
+        "no-run-self-stopped",
+        FULL_LOAD_ONLY,
+        &endpoints,
+    )
+    .await;
+    poll_until_task_status(&emulator, case, &self_stopped, TASK_READY).await;
+    emulator
+        .ok(
+            case,
+            "StartReplicationTask",
+            &json!({
+                "ReplicationTaskArn": self_stopped,
+                "StartReplicationTaskType": "start-replication",
+            }),
+        )
+        .await;
+    let finished = poll_until_task_status(&emulator, case, &self_stopped, TASK_STOPPED).await;
+    assert_eq!(
+        text(&finished, "/ReplicationTasks/0/StopReason"),
+        FULL_LOAD_ONLY_FINISHED,
+        "case {case:?}: expected a task whose full load was its only phase to stop with \
+         the reason that finish carries, got {finished}"
+    );
+    cases.push((
+        "a task that stopped itself when its full load finished",
+        TASK_STOPPED,
+        self_stopped,
+    ));
+
+    // A task a caller has already stopped.
+    let stopped = task_of(&emulator, case, "no-run-stopped", "cdc", &endpoints).await;
+    start_and_poll_until_running(&emulator, case, &stopped).await;
+    emulator
+        .ok(
+            case,
+            "StopReplicationTask",
+            &json!({ "ReplicationTaskArn": stopped }),
+        )
+        .await;
+    poll_until_task_status(&emulator, case, &stopped, TASK_STOPPED).await;
+    cases.push((
+        "a task a caller has already stopped",
+        TASK_STOPPED,
+        stopped,
+    ));
+
+    // A task still coming off the run a stop took it off.
+    let stopping = task_of(&emulator, case, "no-run-stopping", "cdc", &endpoints).await;
+    start_and_poll_until_running(&emulator, case, &stopping).await;
+    emulator
+        .ok(
+            case,
+            "StopReplicationTask",
+            &json!({ "ReplicationTaskArn": stopping }),
+        )
+        .await;
+    hold_task_transitions(emulator.engine());
+    cases.push(("a task already preparing to stop", TASK_STOPPING, stopping));
+
+    // A task on its way out of the account.
+    let deleting = task_of(&emulator, case, "no-run-deleting", "cdc", &endpoints).await;
+    poll_until_task_status(&emulator, case, &deleting, TASK_READY).await;
+    emulator
+        .ok(
+            case,
+            "DeleteReplicationTask",
+            &json!({ "ReplicationTaskArn": deleting }),
+        )
+        .await;
+    hold_task_transitions(emulator.engine());
+    cases.push((
+        "a task on its way out of the account",
+        TASK_DELETING,
+        deleting,
+    ));
+
+    for (row, expected_status, task_arn) in &cases {
+        let described = emulator
+            .ok(row, "DescribeReplicationTasks", &by_task_arn(task_arn))
+            .await;
+        assert_eq!(
+            text(&described, "/ReplicationTasks/0/Status"),
+            *expected_status,
+            "case {row:?}: the case did not prepare the status it is about, got {described}"
+        );
+
+        let (status, response) = emulator
+            .call(
+                "StopReplicationTask",
+                &json!({ "ReplicationTaskArn": task_arn }),
+            )
+            .await;
+        assert_eq!(
+            (
+                status,
+                error_code(&response).contains("InvalidResourceStateFault"),
+                text(&response, "/message"),
+            ),
+            (
+                400,
+                true,
+                format!("Replication Task: {task_arn} is currently not running.")
+            ),
+            "case {row:?}: expected 400 InvalidResourceStateFault reporting a task that is \
+             not running, got {status} {response}"
+        );
+
+        // A refused stop writes nothing: the task is in the status it was in.
+        let after = emulator
+            .ok(row, "DescribeReplicationTasks", &by_task_arn(task_arn))
+            .await;
+        assert_eq!(
+            text(&after, "/ReplicationTasks/0/Status"),
+            *expected_status,
+            "case {row:?}: a refused stop must leave the task where it was, got {after}"
+        );
+    }
 }

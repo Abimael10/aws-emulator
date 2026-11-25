@@ -31,7 +31,7 @@ pub mod task_run;
 pub mod task_settings;
 
 pub use filters::{check_filter_names, unrecognized_filter_name_message};
-pub use task_run::{advance_task_runs, TaskRun};
+pub use task_run::{advance_task_runs, TaskRun, FULL_LOAD_ONLY_FINISHED, STOPPED_NORMALLY};
 pub use task_settings::{
     default_task_settings, resolve_task_settings, LOG_COMPONENTS, LOG_SEVERITY_DEFAULT,
 };
@@ -90,6 +90,11 @@ pub const TASK_READY: &str = "ready";
 pub const TASK_STARTING: &str = "starting";
 /// A task that is migrating data.
 pub const TASK_RUNNING: &str = "running";
+/// A task `StopReplicationTask` has accepted: "the task is preparing to stop in
+/// response to running the StopReplicationTask operation" (`ReplicationTask$Status`
+/// doc). The record is owed [`TASK_STOPPED`] ([`Owed::ToStatus`]), so a caller that
+/// reads straight after the stop still sees the task coming off its run.
+pub const TASK_STOPPING: &str = "stopping";
 /// A task that was stopped, and so can be started again.
 pub const TASK_STOPPED: &str = "stopped";
 /// A task `DeleteReplicationTask` has accepted: "the task is being deleted in
