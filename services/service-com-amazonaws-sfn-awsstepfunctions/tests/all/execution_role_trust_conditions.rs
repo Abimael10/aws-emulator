@@ -54,7 +54,9 @@ use crate::unassumable_role_encrypted_execution::{ended, unassumable_cause};
 
 /// An account that is not the one these resources belong to, for a clause the assume
 /// cannot satisfy.
-const ANOTHER_ACCOUNT: &str = "210987654321";
+///
+/// `pub(crate)` for the reason [`data_key_policy`] is.
+pub(crate) const ANOTHER_ACCOUNT: &str = "210987654321";
 
 /// The KMS calls sealing an execution's data makes, as the role's own policy allows
 /// them: a row that gets past the assume must not then be refused on what the role may
@@ -93,7 +95,12 @@ pub(crate) fn trust(condition: Option<Value>) -> Value {
 
 /// A role of this account at `path`, carrying `trust` as its trust policy and the KMS
 /// calls an execution's own cryptographic work makes as its inline policy, by its own ARN.
-async fn role_at(chain: &Chain, name: &str, path: &str, trust: &Value) -> String {
+///
+/// `pub(crate)` for the reason [`data_key_policy`] is: the sibling suite that drives the
+/// PERMANENCE of a refused assume
+/// (`tests/all/execution_role_trust_refusal_permanence.rs`) needs the very same role, so
+/// the setup is stated here once.
+pub(crate) async fn role_at(chain: &Chain, name: &str, path: &str, trust: &Value) -> String {
     let created = chain
         .iam(
             "CreateRole",
@@ -135,8 +142,18 @@ pub(crate) fn key_policy_with(statements: Vec<Value>) -> Value {
 
 /// The ARN a state machine of this account named `name` carries, which is the value the
 /// assume presents under `aws:SourceArn`.
-fn machine_arn(name: &str) -> String {
+///
+/// `pub(crate)` for the reason [`data_key_policy`] is.
+pub(crate) fn machine_arn(name: &str) -> String {
     format!("arn:aws:states:{REGION}:{ACCOUNT}:stateMachine:{name}")
+}
+
+/// The ARN one execution named `execution` of the state machine named `machine` carries,
+/// which is what a refused start must leave resolving to nothing.
+///
+/// Stated beside [`machine_arn`], and `pub(crate)` for the reason [`data_key_policy`] is.
+pub(crate) fn execution_arn(machine: &str, execution: &str) -> String {
+    format!("arn:aws:states:{REGION}:{ACCOUNT}:execution:{machine}:{execution}")
 }
 
 /// A state machine on `key` running as `role_arn`, by its ARN.
