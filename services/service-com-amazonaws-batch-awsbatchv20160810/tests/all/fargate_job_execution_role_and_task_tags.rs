@@ -42,6 +42,11 @@
 //! What is NOT asserted here, because other suites assert it: which SIDE may ask for the
 //! propagation (`core/router/tests/all/batch_propagated_tags_reach_the_ecs_task.rs`) and what a
 //! job whose container performed nothing reports (`propagated_task_tags.rs`, beside this file).
+//!
+//! The HARNESS below — the five services on one engine, the calls each protocol takes, the
+//! network ids Amazon EC2 mints and the execution role IAM holds — is `pub(crate)`, because every
+//! suite of this one test binary that drives a job onto Fargate capacity needs exactly it: it
+//! lives here once rather than in each of them.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -51,7 +56,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region every call below is signed for, and so the Region of every ARN minted for them.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The account this emulator mints its ARNs under, which the roles below are named in.
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
@@ -60,7 +65,7 @@ const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 /// rows below grant their role. Source: the IAM crate's own catalogue of AWS managed policies
 /// (`services/service-com-amazonaws-iam-awsidentitymanagementv20100508`), under the
 /// `/service-role/` path AWS files it in.
-const PUBLISHED_EXECUTION_POLICY: &str =
+pub(crate) const PUBLISHED_EXECUTION_POLICY: &str =
     "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy";
 
 /// The log group AWS Batch delivers a container job's output to when its configuration names no
@@ -71,9 +76,9 @@ const JOB_LOG_GROUP: &str = "/aws/batch/job";
 
 /// The terminal `JobStatus`es and the `CEStatus` a compute environment comes to rest in. Source:
 /// `smithy_query(query="shape",shape="JobStatus,CEStatus")`.
-const SUCCEEDED: &str = "SUCCEEDED";
-const FAILED: &str = "FAILED";
-const VALID: &str = "VALID";
+pub(crate) const SUCCEEDED: &str = "SUCCEEDED";
+pub(crate) const FAILED: &str = "FAILED";
+pub(crate) const VALID: &str = "VALID";
 
 /// The error class the Amazon ECS agent reports for an execution resource it could not bring up
 /// before starting a container, which is what a job whose role may not open its log stream ends
@@ -91,13 +96,13 @@ const OVER_COMBINED_TAGS_REASON: &str =
 /// The `/16` this suite's VPC is carved out of, the `/24` its one subnet takes, and the
 /// destination of the default route that gives that subnet a way to the registry the image below
 /// is fetched from.
-const VPC_CIDR: &str = "10.91.0.0/16";
-const SUBNET_CIDR: &str = "10.91.1.0/24";
-const DEFAULT_ROUTE: &str = "0.0.0.0/0";
+pub(crate) const VPC_CIDR: &str = "10.91.0.0/16";
+pub(crate) const SUBNET_CIDR: &str = "10.91.1.0/24";
+pub(crate) const DEFAULT_ROUTE: &str = "0.0.0.0/0";
 
 /// The image every job definition below runs: a repository of the Amazon ECR Public gallery, so
 /// the fetch is answered by the registry that holds it rather than left undecided.
-const IMAGE: &str = "public.ecr.aws/docker/library/busybox:1.36";
+pub(crate) const IMAGE: &str = "public.ecr.aws/docker/library/busybox:1.36";
 
 /// The tag keys the first test's rows use: one only the job definition carries, one only the job
 /// carries, and one BOTH carry — the key whose tie-break the rule names.
@@ -112,17 +117,17 @@ const FROM_JOB: &str = "written-by-the-job";
 /// How long a wait below gives the clocks: far above the spans Batch and Amazon ECS give the
 /// moves a placed job's task makes, and every wait looks again for the CONDITION rather than
 /// sleeping a fixed stretch, so a loaded machine delays a row instead of breaking it.
-const DEADLINE: Duration = Duration::from_secs(240);
+pub(crate) const DEADLINE: Duration = Duration::from_secs(240);
 
 /// How long one look waits before the next.
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// AWS Batch, Amazon ECS, Amazon EC2, CloudWatch Logs and IAM on ONE shared engine, the way
 /// `core/router/src/lib.rs` mounts every service: the task a placed job runs as is Amazon ECS's
 /// resource, the subnet and security group its placement names are Amazon VPC's, the log group
 /// and stream its output goes to are CloudWatch Logs', and the documents in force on the
 /// execution role the agent acts as are IAM's.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -167,7 +172,7 @@ fn decoded(payload: &[u8]) -> Value {
 }
 
 /// One AWS Batch call, as a client makes it: `POST /v1/<operation>` with a JSON body.
-async fn batch(router: &MultiServiceRouter, uri: &str, body: Value) -> Value {
+pub(crate) async fn batch(router: &MultiServiceRouter, uri: &str, body: Value) -> Value {
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("https://batch.{REGION}.amazonaws.com{uri}"))
@@ -187,7 +192,7 @@ async fn batch(router: &MultiServiceRouter, uri: &str, body: Value) -> Value {
 }
 
 /// One `awsJson1_1` call against the service whose signing name is `signing_name`.
-async fn rpc(
+pub(crate) async fn rpc(
     router: &MultiServiceRouter,
     signing_name: &str,
     target_prefix: &str,
@@ -216,7 +221,11 @@ async fn rpc(
 /// One Amazon EC2 call: an `ec2Query` service, so a form body naming the action, answered as XML.
 /// Every value below is a literal with nothing form encoding exists for, so the body carries them
 /// as they are.
-async fn ec2(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)]) -> String {
+pub(crate) async fn ec2(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(&str, &str)],
+) -> String {
     let mut body = format!("Action={action}&Version=2016-11-15");
     for (name, value) in params {
         assert!(
@@ -253,7 +262,11 @@ async fn ec2(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)])
 /// body of these calls needs: the only bytes form encoding exists for are `&`, `=`, `+`, `%` and
 /// whitespace, and no value below holds one — the trust document is written compactly for exactly
 /// that reason.
-async fn iam(router: &MultiServiceRouter, action: &str, params: &[(&str, String)]) -> String {
+pub(crate) async fn iam(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(&str, String)],
+) -> String {
     let mut body = format!("Action={action}&Version=2010-05-08");
     for (name, value) in params {
         assert!(
@@ -304,7 +317,11 @@ pub(crate) fn element(xml: &str, name: &str) -> String {
 
 /// Create the IAM role `name`, trusted by the Amazon ECS task runtime the way an execution role
 /// is, with the policies `attached` names — and answer its ARN.
-async fn execution_role(router: &MultiServiceRouter, name: &str, attached: &[&str]) -> String {
+pub(crate) async fn execution_role(
+    router: &MultiServiceRouter,
+    name: &str,
+    attached: &[&str],
+) -> String {
     let trust = json!({
         "Version": "2012-10-17",
         "Statement": [{
