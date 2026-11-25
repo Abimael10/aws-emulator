@@ -32,7 +32,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::support::{
     borrowed, create_classic_load_balancer, create_launch_template, create_target_group,
-    emulator_with_classic_elb, p, query, seed_subnets, tag_value, tag_values, vpc_of, REGION,
+    element_or_absent, emulator_with_classic_elb, named_list, p, query, seed_subnets, tag_value,
+    tag_values, vpc_of, REGION,
 };
 
 /// Every list-typed member of the group a read reports, from the model's own definition of
@@ -126,38 +127,6 @@ struct Account {
     given: Vec<Given>,
 }
 
-/// The XML inside the first element named `tag`: `Some("")` for an element with nothing in
-/// it, however the wire spells it (`<Tag/>` or `<Tag></Tag>`), and `None` when the document
-/// does not name the element at all.
-///
-/// The difference between an EMPTY member and an ABSENT one is the whole subject of this
-/// suite, so the two are read apart here rather than collapsed into a string. Matching is
-/// attribute-tolerant, because the envelope stamps the document's namespace onto the first
-/// element of a list, and name-exact, so `AvailabilityZones` never reads
-/// `AvailabilityZoneIds`.
-fn element_inner<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
-    let open = format!("<{tag}");
-    let close = format!("</{tag}>");
-    let mut rest = xml;
-    loop {
-        let at = rest.find(&open)?;
-        let after = &rest[at + open.len()..];
-        if !(after.starts_with('>') || after.starts_with('/') || after.starts_with(char::is_whitespace))
-        {
-            // A longer element name that merely begins like this one.
-            rest = after;
-            continue;
-        }
-        let open_end = after.find('>')?;
-        if after[..open_end].ends_with('/') {
-            return Some("");
-        }
-        let inner = &after[open_end + 1..];
-        let end = inner.find(&close)?;
-        return Some(&inner[..end]);
-    }
-}
-
 /// How many times `xml` names the element `tag` — one per group when every group an answer
 /// reports carries the member.
 fn element_count(xml: &str, tag: &str) -> usize {
@@ -176,20 +145,17 @@ fn element_count(xml: &str, tag: &str) -> usize {
 }
 
 /// The `<member>…</member>` entries of the list member `tag`, or `None` when the answer does
-/// not name that member at all.
+/// not name that member at all — read through the one scanner that keeps an EMPTY element
+/// apart from an ABSENT one ([`crate::support::element_or_absent`]).
 fn entries(xml: &str, tag: &str) -> Option<Vec<String>> {
-    element_inner(xml, tag).map(|inner| tag_values(inner, "member"))
+    element_or_absent(xml, tag).map(|inner| tag_values(inner, "member"))
 }
 
 /// The entries of the list member `tag`, failing the case when the member is ABSENT — which
-/// is the defect this suite exists for, so it is named rather than read as empty.
+/// is the defect this suite exists for, so it is named rather than read as empty. Through the
+/// one reader every suite here uses ([`crate::support::named_list`]).
 fn list_member(case: &str, xml: &str, tag: &str) -> Vec<String> {
-    match entries(xml, tag) {
-        Some(found) => found,
-        None => panic!(
-            "case {case:?}: expected the described group to name {tag} as a list, got {xml}"
-        ),
-    }
+    named_list(case, xml, tag)
 }
 
 /// `values` in ASCII order, so a case asserts the SET a member carries where the order it

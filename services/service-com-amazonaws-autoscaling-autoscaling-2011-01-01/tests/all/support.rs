@@ -664,6 +664,54 @@ pub fn tag_value(xml: &str, tag: &str) -> String {
     tag_values(xml, tag).first().cloned().unwrap_or_default()
 }
 
+/// The XML inside the first element named `tag`: `Some("")` for an element holding nothing,
+/// however the wire spells it (`<Tag/>` or `<Tag></Tag>`), and `None` when the document does
+/// not name the element at all.
+///
+/// THE ONE COPY for every suite here whose subject is the difference between an EMPTY member
+/// and an ABSENT one — a client reads an empty sequence off the one and nothing at all off the
+/// other — so the two are kept apart rather than collapsed into a string, as
+/// [`element_body`] below collapses them. Attribute-tolerant, because the envelope stamps the
+/// document's namespace onto the elements a modelled structure renders, and name-exact, so an
+/// element whose name merely BEGINS with the tag is not that element.
+pub fn element_or_absent<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut rest = xml;
+    loop {
+        let at = rest.find(&open)?;
+        let after = &rest[at + open.len()..];
+        let boundary = after.chars().next()?;
+        if !(boundary == '>' || boundary == '/' || boundary.is_whitespace()) {
+            // A longer element name that merely begins like this one.
+            rest = after;
+            continue;
+        }
+        let open_end = after.find('>')?;
+        if after[..open_end].ends_with('/') {
+            return Some("");
+        }
+        let inner = &after[open_end + 1..];
+        let end = inner.find(&close)?;
+        return Some(&inner[..end]);
+    }
+}
+
+/// The `<member>` entries of the list member `tag`, failing the case when the answer does not
+/// NAME that member at all.
+///
+/// THE ONE COPY for every suite here that reads a list member back: an absent member is
+/// reported as itself rather than read as an empty list, because a client that iterates the
+/// member can tell the two apart.
+pub fn named_list(case: &str, xml: &str, tag: &str) -> Vec<String> {
+    match element_or_absent(xml, tag) {
+        Some(inner) => tag_values(inner, "member"),
+        None => panic!(
+            "case {case:?}: expected the described group to name {tag} as a list, got {xml}"
+        ),
+    }
+}
+
 /// The inner text of the first `<tag …>…</tag>` ELEMENT, whose open tag may carry attributes
 /// — so a member of a structure is read inside the element it belongs to rather than as "the
 /// first element of that name in the document".
