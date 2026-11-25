@@ -20,7 +20,10 @@
 //!    `ResourceNotFoundException` at HTTP 404, whose detail member names the requested id;
 //!    one it never minted resolves no ARN for the front door to authorize and is refused
 //!    there, with no detail member value at all. A READ (`GetDomain`) resolves the domain
-//!    itself, so it reports the modelled 404 for either.
+//!    itself, so it reports the modelled 404 for either. The split turns on that history
+//!    ALONE and on nothing about the id itself, which is asserted by putting ONE AND THE
+//!    SAME id on both sides of it, and an id the account was allocated keeps the modelled
+//!    404 for every later delete, all the way through the purge the clock owes it.
 //! 3. A Domain-not-found answer reports `Domain not found: <domainId>`, the requested id
 //!    verbatim, from whichever operation resolved the Domain.
 //! 4. `GetMedicalScribeListeningSession` resolves a session only under the exact
@@ -471,6 +474,190 @@ async fn delete_domain_refuses_every_unresolvable_id_by_its_allocation_history()
         "the other Region's domain must be untouched by the refusals, got {status} \
          {still_there:?}"
     );
+}
+
+/// Remember that `domain_id` was allocated, the way a `CreateDomain` does
+/// (`state::ComAmazonawsConnecthealthConnecthealthState::record_domain_allocation`, which
+/// is the ledger that create writes and `DeleteDomain` reads).
+///
+/// Writing it directly is how one and the same id is put on BOTH sides of the split
+/// below: a create mints the id it allocates, so no request can give allocation history
+/// to an id chosen by the test.
+fn remember_allocation(emulator: &Emulator, domain_id: &str) {
+    let store = state::service_state(&**emulator.engine()).expect("this service's own store");
+    store.lock().record_domain_allocation(domain_id);
+}
+
+/// Assert that a refusal states no detail text at all, under either of the keys this
+/// service's planes write it under — the ABSENCE of the detail is what the front door's
+/// own refusal carries, so reading `message` must yield a value a client cannot mistake
+/// for a sentence.
+fn assert_no_detail_stated(case: &str, body: &Value) {
+    for member in crate::domain_subscription_lifecycle::DETAIL_MEMBERS {
+        assert!(
+            body.get(member).and_then(Value::as_str).is_none(),
+            "case {case:?}: this refusal states no detail text, so {member:?} carries no \
+             sentence, got {body:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn delete_domain_splits_one_and_the_same_id_on_its_allocation_history_alone() {
+    let emulator = Emulator::new("us-east-1");
+    // The rows differ along everything the modelled `DomainId` generalises over — both
+    // prefixes, both ends of the 20..25 length range, and digits-only, letters-only and
+    // mixed bodies. Each one is driven TWICE: once with no allocation history anywhere,
+    // then with that same id remembered as allocated and still resolving no domain. The
+    // request is identical in both passes, so whatever the answers differ by is the
+    // history and nothing about the id's own form.
+    let rows = [
+        (
+            "the shortest dom- id (20), letters only",
+            unresolvable_domain_id("dom-", 'a', 20),
+        ),
+        (
+            "a digits-only dom- id (24)",
+            unresolvable_domain_id("dom-", '7', 24),
+        ),
+        (
+            "the longest dom- id (25)",
+            unresolvable_domain_id("dom-", 'z', 25),
+        ),
+        (
+            "a legacy hai- id (21)",
+            unresolvable_domain_id("hai-", '0', 21),
+        ),
+        (
+            "a mixed dom- id (24)",
+            "dom-1a2b3c4d5e6f7a8b9c0d".to_string(),
+        ),
+    ];
+
+    for (row, domain_id) in &rows {
+        let path = format!("/domain/{domain_id}");
+        // An id with no allocation history names no resource an ARN can be resolved for,
+        // so the call is refused ahead of this service's own answer, with no detail. The
+        // repeat is answered identically: the model declares the operation `@idempotent`
+        // and a refused delete writes nothing.
+        for attempt in 1..=2 {
+            let case = format!("{row} ({domain_id}), never allocated, attempt {attempt}");
+            let (status, body) = emulator.send("DELETE", &path, None).await;
+            assert_delete_refusal(&case, Unresolvable::NeverAllocated, domain_id, status, &body);
+            assert_no_detail_stated(&case, &body);
+            assert!(
+                status < 500,
+                "case {case:?}: the condition lies in the request's own id and is \
+                 permanent, so it is never the server fault an SDK retries, got {status} \
+                 {body:?}"
+            );
+        }
+
+        // The SAME id, now remembered as allocated and still resolving no domain here: a
+        // resource this account had and has lost, which is the ONE error the operation
+        // models.
+        remember_allocation(&emulator, domain_id);
+        for attempt in 1..=2 {
+            let case = format!("{row} ({domain_id}), once allocated, attempt {attempt}");
+            let (status, body) = emulator.send("DELETE", &path, None).await;
+            assert_delete_refusal(&case, Unresolvable::AllocatedAndLost, domain_id, status, &body);
+        }
+
+        // The READ resolves the domain itself rather than an ARN for the front door, so
+        // the history leaves its answer alone: the modelled 404 either way.
+        let case = format!("{row} ({domain_id}), read back");
+        let (status, read) = emulator.send("GET", &path, None).await;
+        assert_eq!(
+            (status, error_code(&read).as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: GetDomain reports the modelled not-found whatever the id's \
+             history, got {status} {read:?}"
+        );
+        assert_eq!(
+            detail_text(&case, &read),
+            format!("Domain not found: {domain_id}"),
+            "case {case:?}: the not-found must name the requested id, got {read:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_id_this_account_was_allocated_keeps_the_modelled_not_found_past_its_purge() {
+    let emulator = Emulator::new("eu-central-1");
+    // Both ways a created domain reaches the end of its life: a deletion that finishes
+    // inside the deleting call, and one that cannot — a domain owning a web application
+    // passes through the non-terminal `DELETING` and is purged when the clock makes the
+    // purge due. Either way the id WAS allocated to this account, so every later delete
+    // of it is the modelled 404 and the idempotent-cleanup path can keep keying on it.
+    for (row, request) in [
+        (
+            "a domain with no web application",
+            json!({ "name": "clinic-plain" }),
+        ),
+        (
+            "a domain that owns a web application",
+            json!({
+                "name": "clinic-web",
+                "webAppSetupConfiguration": web_app_setup(),
+            }),
+        ),
+    ] {
+        let domain_id = string_at(&emulator.create_domain(&request).await, "domainId");
+        let path = format!("/domain/{domain_id}");
+
+        let (status, deleted) = emulator.send("DELETE", &path, None).await;
+        assert_eq!(status, 200, "case {row:?}: DeleteDomain got {status} {deleted:?}");
+        assert_eq!(
+            string_at(&deleted, "domainId"),
+            domain_id,
+            "case {row:?}: the delete echoes the id it was addressed at, got {deleted:?}"
+        );
+        let reported = string_at(&deleted, "status");
+        assert!(
+            matches!(reported.as_str(), "DELETING" | "DELETED"),
+            "case {row:?}: a deletion reports a deleting or deleted domain, got \
+             {reported:?} in {deleted:?}"
+        );
+
+        // The purge is observed by LOOKING again until it has fallen due, never by
+        // waiting a fixed interval.
+        let deadline = std::time::Instant::now() + PURGE_DEADLINE;
+        let read = loop {
+            let (status, read) = emulator.send("GET", &path, None).await;
+            if status == 404 {
+                break read;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "case {row:?}: {domain_id} was still held after {PURGE_DEADLINE:?}, last \
+                 read {status} with {read:?}"
+            );
+            ::tokio::task::yield_now().await;
+        };
+        assert_eq!(
+            error_code(&read).as_str(),
+            "ResourceNotFoundException",
+            "case {row:?}: the purged domain reads back as the modelled not-found, got \
+             {read:?}"
+        );
+        assert_eq!(
+            detail_text(row, &read),
+            format!("Domain not found: {domain_id}"),
+            "case {row:?}: the not-found must name the requested id, got {read:?}"
+        );
+
+        for attempt in 1..=3 {
+            let case = format!("{row} ({domain_id}), delete after the purge, attempt {attempt}");
+            let (status, body) = emulator.send("DELETE", &path, None).await;
+            assert_delete_refusal(&case, Unresolvable::AllocatedAndLost, &domain_id, status, &body);
+            assert_ne!(
+                error_code(&body).as_str(),
+                "AuthorizerConfigurationException",
+                "case {case:?}: an id this account WAS allocated is never refused as one \
+                 with no allocation history, got {status} {body:?}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
