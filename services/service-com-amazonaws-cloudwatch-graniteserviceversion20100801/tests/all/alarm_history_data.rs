@@ -6,12 +6,13 @@
 //!
 //! The rule under test: `HistoryData` is "Data about the alarm, in JSON format."
 //! (`smithy_query(query="shape",shape="AlarmHistoryItem")`, a `HistoryData` string with
-//! `@length 1..4095`) — a configuration-update item records the configuration the call stored
-//! (and the one it replaced), a state-update item records the alarm's state before and after
-//! the write. Every table row below is a different input along what that rule generalises over
-//! (which members the configuration carries, how many dimensions, actions and metric queries,
-//! which state the alarm moved to, and the form and size of the state reason data), so no
-//! assertion is keyed to one recorded request.
+//! `@length 1..4095`) — a configuration-update item records the alarm the call stored (and, for
+//! a write that replaced one, the original values of the members it changed), a state-update
+//! item records the alarm's state before and after the write. Every table row below is a
+//! different input along what that rule generalises over (which members the configuration
+//! carries, how many dimensions, actions and metric queries, which state the alarm moved to,
+//! and the form and size of the state reason data), so no assertion is keyed to one recorded
+//! request.
 
 use crate::harness::{build_router, ok, same_json_value};
 use serde_json::{json, Value};
@@ -85,15 +86,16 @@ fn history_data(case: &str, item: &Value) -> Value {
     document
 }
 
-/// Members of a `PutMetricAlarm` request and the member a configuration document records each
+/// Members of a `PutMetricAlarm` request and the member a history snapshot records each
 /// under: the model's own member name in lower camel case
-/// (`smithy_query(query="shape",shape="MetricAlarm")`).
+/// (`smithy_query(query="shape",shape="MetricAlarm")`), except the OK action list, which the
+/// alarm-history serialisation spells all in lower case.
 const CONFIGURATION_MEMBERS: &[(&str, &str)] = &[
     ("AlarmName", "alarmName"),
     ("AlarmDescription", "alarmDescription"),
     ("ActionsEnabled", "actionsEnabled"),
     ("AlarmActions", "alarmActions"),
-    ("OKActions", "okActions"),
+    ("OKActions", "okactions"),
     ("InsufficientDataActions", "insufficientDataActions"),
     ("Namespace", "namespace"),
     ("MetricName", "metricName"),
@@ -265,7 +267,7 @@ async fn a_configuration_update_records_the_configuration_it_wrote() {
             "case {case:?}: a first write created the alarm, got {document}"
         );
         assert!(
-            document.get("originalAlarm").is_none(),
+            document.get("originalUpdatedFields").is_none(),
             "case {case:?}: a created alarm replaced no configuration, got {document}"
         );
         let created = document
@@ -286,7 +288,7 @@ async fn a_configuration_update_records_the_configuration_it_wrote() {
 }
 
 #[tokio::test]
-async fn overwriting_an_alarm_records_both_configurations() {
+async fn overwriting_an_alarm_records_the_members_it_changed() {
     let router = build_router();
 
     // Rows differ in WHAT the second write changes: a threshold, a period and evaluation
@@ -375,14 +377,33 @@ async fn overwriting_an_alarm_records_both_configurations() {
             .cloned()
             .unwrap_or(Value::Null);
         assert_records_configuration(case, &second, &updated);
+        // What an update records of the alarm it replaced is the DELTA: the original value of
+        // every member the write changed, and nothing the write left alone.
         let original = document
-            .get("originalAlarm")
+            .get("originalUpdatedFields")
             .cloned()
             .unwrap_or(Value::Null);
-        assert_records_configuration(case, &first, &original);
-        assert_ne!(
-            updated, original,
-            "case {case:?}: the two configurations differ, got {document}"
+        let changed = original
+            .as_object()
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a delta object, got {document}"));
+        assert!(
+            document.get("originalAlarm").is_none(),
+            "case {case:?}: the update records the delta, not a second snapshot, got {document}"
+        );
+        for (member, before) in &changed {
+            assert_ne!(
+                Some(before),
+                updated.get(member),
+                "case {case:?}: {member} is reported as changed, so its original value must \
+                 differ from the stored one, got {document}"
+            );
+        }
+        // The write moved the alarm's configuration on, so the delta is never empty: the
+        // instant the configuration was updated at changed with this very write.
+        assert!(
+            changed.contains_key("alarmConfigurationUpdatedTimestamp"),
+            "case {case:?}: a write updates the configuration instant, got {document}"
         );
     }
 }

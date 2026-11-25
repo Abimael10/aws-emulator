@@ -1933,9 +1933,10 @@ impl AnomalyDetectorForm {
                 insert_member(&mut document, "metricName", json_text(&single.metric_name));
                 document.insert(
                     "dimensions".to_string(),
-                    dimensions_document(&dimension_list(&dimension_set(
-                        single.dimensions.as_deref(),
-                    ))),
+                    dimensions_document(
+                        &dimension_list(&dimension_set(single.dimensions.as_deref())),
+                        AlarmDocument::Configuration,
+                    ),
                 );
                 insert_member(&mut document, "stat", json_text(&single.stat));
             }
@@ -1946,7 +1947,9 @@ impl AnomalyDetectorForm {
                         math.metric_data_queries
                             .iter()
                             .flatten()
-                            .map(metric_query_document)
+                            .map(|query| {
+                                metric_query_document(query, AlarmDocument::Configuration)
+                            })
                             .collect(),
                     ),
                 );

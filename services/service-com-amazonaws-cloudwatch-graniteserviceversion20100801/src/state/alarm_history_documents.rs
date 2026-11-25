@@ -25,6 +25,29 @@ pub(super) const CONFIGURATION_CREATE: &str = "Create";
 /// A history document's `type` for an alarm the call OVERWROTE.
 pub(super) const CONFIGURATION_UPDATE: &str = "Update";
 
+/// Which of the two serialisations of an alarm a document states it in.
+///
+/// An alarm is written out in two places, and the two do not state it the same way, so the
+/// rendering is told which one it is writing rather than one of them being derived from the
+/// other:
+///
+/// * [`AlarmDocument::Configuration`] is the store's record of a CONFIGURATION — the member set
+///   the alarm's configuration consists of, under the model's own member names in lower camel
+///   case, and no state. It is what the configuration-change event carries and what decides
+///   whether a write changed an alarm at all ([`alarm_configuration_events`]).
+/// * [`AlarmDocument::History`] is the SNAPSHOT an alarm-history document records: the whole
+///   alarm the write left behind — its configuration, the instant it was configured at, and the
+///   state it is standing in — in the alarm-history serialisation's own spelling, which ends an
+///   alarm with its action lists, writes the OK list in lower case and states a dimension's
+///   value before its name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlarmDocument {
+    /// The configuration record.
+    Configuration,
+    /// The snapshot an alarm-history document records.
+    History,
+}
+
 /// One alarm's state, as a history document records it.
 ///
 /// The three state members EVERY kind of alarm carries, so one definition of a transition
@@ -104,11 +127,11 @@ pub fn state_update_history_data(previous: &MetricAlarm, updated: &MetricAlarm) 
     )
 }
 
-/// The JSON record of a configuration write: the alarm the call stored, and the configuration
-/// it replaced when the call overwrote an alarm that already existed.
+/// The JSON record of a configuration write: the alarm the call stored, and — for a write that
+/// overwrote an alarm that already existed — the ORIGINAL values of the members it changed.
 ///
-/// Takes the configuration documents rather than an alarm, so the metric-alarm and
-/// composite-alarm writers share one record layout and one length bound.
+/// Takes the snapshot documents rather than an alarm, so the metric-alarm, composite-alarm and
+/// log-alarm writers share one record layout and one length bound.
 pub(super) fn configuration_history_data(
     previous: Option<Value>,
     updated: Value,
@@ -131,11 +154,15 @@ pub(super) fn configuration_history_data(
     };
     // An alarm's configuration is itself unbounded in the modelled sense (up to 20 metric
     // queries, each with an expression of up to 2048 characters, or a rule of up to 10240),
-    // so the candidates drop fidelity in order: both configurations, then only the stored
-    // one, then the name of the alarm the item already belongs to — which always fits.
+    // so the candidates drop fidelity in order: the stored alarm with the delta an update
+    // made, then the stored alarm alone, then the name of the alarm the item already belongs
+    // to — which always fits.
     let mut full = heading(updated.clone());
-    if let (Some(previous), Value::Object(members)) = (previous, &mut full) {
-        members.insert("originalAlarm".to_string(), previous);
+    if let (Some(previous), Value::Object(members)) = (previous.as_ref(), &mut full) {
+        members.insert(
+            "originalUpdatedFields".to_string(),
+            original_updated_fields(previous, &updated),
+        );
     }
     bounded_history_data(&[
         full,
@@ -149,6 +176,32 @@ pub(super) fn configuration_history_data(
             .collect(),
         )),
     ])
+}
+
+/// The ORIGINAL values of the members an update CHANGED: one entry per member whose value
+/// differs between the alarm the write replaced and the alarm it stored, carrying the value the
+/// REPLACED alarm had.
+///
+/// What an update's history item is read for is the DELTA — which members the write changed and
+/// what they were before it — so the record names those members alone rather than a second full
+/// snapshot a consumer would have to diff itself. A member the stored alarm carries and the
+/// replaced one did not had no original value at all, which is what its entry reports.
+fn original_updated_fields(previous: &Value, updated: &Value) -> Value {
+    let (Value::Object(previous), Value::Object(updated)) = (previous, updated) else {
+        return Value::Object(Map::new());
+    };
+    let mut changed = Map::new();
+    for (member, original) in previous {
+        if updated.get(member) != Some(original) {
+            changed.insert(member.clone(), original.clone());
+        }
+    }
+    for member in updated.keys() {
+        if !previous.contains_key(member) {
+            changed.insert(member.clone(), Value::Null);
+        }
+    }
+    Value::Object(changed)
 }
 
 /// The `HistorySummary` of a `ConfigurationUpdate` item: "A summary of the alarm history, in
@@ -175,8 +228,8 @@ pub fn configuration_update_history_data(
     updated: &MetricAlarm,
 ) -> String {
     configuration_history_data(
-        previous.map(alarm_configuration_document),
-        alarm_configuration_document(updated),
+        previous.map(metric_alarm_history_snapshot),
+        metric_alarm_history_snapshot(updated),
         updated.alarm_name.as_deref(),
     )
 }
@@ -187,8 +240,8 @@ pub fn composite_configuration_update_history_data(
     updated: &CompositeAlarm,
 ) -> String {
     configuration_history_data(
-        previous.map(composite_alarm_configuration_document),
-        composite_alarm_configuration_document(updated),
+        previous.map(composite_alarm_history_snapshot),
+        composite_alarm_history_snapshot(updated),
         updated.alarm_name.as_deref(),
     )
 }
@@ -199,10 +252,90 @@ pub fn log_configuration_update_history_data(
     updated: &LogAlarm,
 ) -> String {
     configuration_history_data(
-        previous.map(log_alarm_configuration_document),
-        log_alarm_configuration_document(updated),
+        previous.map(log_alarm_history_snapshot),
+        log_alarm_history_snapshot(updated),
         updated.alarm_name.as_deref(),
     )
+}
+
+/// One METRIC alarm as an alarm-history document records it
+/// ([`AlarmDocument::History`]).
+pub(crate) fn metric_alarm_history_snapshot(alarm: &MetricAlarm) -> Value {
+    metric_alarm_document(alarm, AlarmDocument::History)
+}
+
+/// One COMPOSITE alarm as an alarm-history document records it.
+pub(crate) fn composite_alarm_history_snapshot(alarm: &CompositeAlarm) -> Value {
+    composite_alarm_document(alarm, AlarmDocument::History)
+}
+
+/// One LOG alarm as an alarm-history document records it.
+pub(crate) fn log_alarm_history_snapshot(alarm: &LogAlarm) -> Value {
+    log_alarm_document(alarm, AlarmDocument::History)
+}
+
+/// The instant a document states a modelled timestamp as ([`document_instant`]), for a
+/// timestamp the alarm carries.
+///
+/// Every instant INSIDE one of this service's JSON documents is written in that one form, so a
+/// snapshot's timestamps read like every other instant a document reports rather than like the
+/// modelled member beside them.
+fn document_instant_member(stamp: Option<&::aws_smithy_types::DateTime>) -> Option<Value> {
+    stamp
+        .map(from_timestamp)
+        .and_then(document_instant)
+        .map(Value::from)
+}
+
+/// The ACTION members of an alarm document, in the order and under the names the serialisation
+/// `style` states them.
+///
+/// The configuration record states them where the model lists them, under the model's own
+/// member names; an alarm-history document states them LAST, and spells the OK list all in
+/// lower case (`okactions`).
+fn insert_action_members(
+    document: &mut Map<String, Value>,
+    actions_enabled: Option<bool>,
+    ok_actions: &Option<Vec<String>>,
+    alarm_actions: &Option<Vec<String>>,
+    insufficient_data_actions: &Option<Vec<String>>,
+    style: AlarmDocument,
+) {
+    insert_member(document, "actionsEnabled", actions_enabled.map(Value::from));
+    if style == AlarmDocument::Configuration {
+        insert_member(document, "okActions", json_strings(ok_actions));
+    }
+    insert_member(document, "alarmActions", json_strings(alarm_actions));
+    insert_member(
+        document,
+        "insufficientDataActions",
+        json_strings(insufficient_data_actions),
+    );
+    if style == AlarmDocument::History {
+        insert_member(document, "okactions", json_strings(ok_actions));
+    }
+}
+
+/// The STATE members an alarm-history snapshot states after an alarm's configuration: the state
+/// the alarm is standing in and the instant it last reported it.
+///
+/// A snapshot records the alarm the write LEFT BEHIND, and an alarm is in a state whatever a
+/// configuration write does to it ("When you update an existing alarm, its state is left
+/// unchanged", `PutMetricAlarm`), so the state belongs to the snapshot even though it is not
+/// part of the configuration the write stored. WHY the alarm is in that state is not: the
+/// explanation of a state belongs to the state-transition item that moved the alarm there,
+/// which names the reason on both sides of the move ([`alarm_state_document`]).
+fn insert_state_members(
+    document: &mut Map<String, Value>,
+    state: &AlarmStateSnapshot,
+    state_updated: Option<&::aws_smithy_types::DateTime>,
+) {
+    insert_member(document, "stateValue", json_text(&state.state_value));
+    insert_member(
+        document,
+        "stateUpdatedTimestamp",
+        document_instant_member(state_updated),
+    );
 }
 
 /// A log alarm's configuration as a history document records it: every configuration member
@@ -214,6 +347,11 @@ pub fn log_configuration_update_history_data(
 ///
 /// `pub(crate)` for the reason [`alarm_configuration_document`] gives.
 pub(crate) fn log_alarm_configuration_document(alarm: &LogAlarm) -> Value {
+    log_alarm_document(alarm, AlarmDocument::Configuration)
+}
+
+/// One log alarm as the serialisation `style` states it.
+fn log_alarm_document(alarm: &LogAlarm, style: AlarmDocument) -> Value {
     let mut config = Map::new();
     insert_member(&mut config, "alarmName", json_text(&alarm.alarm_name));
     insert_member(&mut config, "alarmArn", json_text(&alarm.alarm_arn));
@@ -222,22 +360,23 @@ pub(crate) fn log_alarm_configuration_document(alarm: &LogAlarm) -> Value {
         "alarmDescription",
         json_text(&alarm.alarm_description),
     );
-    insert_member(
-        &mut config,
-        "actionsEnabled",
-        alarm.actions_enabled.map(Value::from),
-    );
-    insert_member(&mut config, "okActions", json_strings(&alarm.ok_actions));
-    insert_member(
-        &mut config,
-        "alarmActions",
-        json_strings(&alarm.alarm_actions),
-    );
-    insert_member(
-        &mut config,
-        "insufficientDataActions",
-        json_strings(&alarm.insufficient_data_actions),
-    );
+    if style == AlarmDocument::History {
+        insert_member(
+            &mut config,
+            "alarmConfigurationUpdatedTimestamp",
+            document_instant_member(alarm.alarm_configuration_updated_timestamp.as_ref()),
+        );
+    }
+    if style == AlarmDocument::Configuration {
+        insert_action_members(
+            &mut config,
+            alarm.actions_enabled,
+            &alarm.ok_actions,
+            &alarm.alarm_actions,
+            &alarm.insufficient_data_actions,
+            style,
+        );
+    }
     insert_member(
         &mut config,
         "scheduledQueryConfiguration",
@@ -293,6 +432,21 @@ pub(crate) fn log_alarm_configuration_document(alarm: &LogAlarm) -> Value {
             .as_ref()
             .map(action_configuration_document),
     );
+    if style == AlarmDocument::History {
+        insert_state_members(
+            &mut config,
+            &AlarmStateSnapshot::of_log_alarm(alarm),
+            alarm.state_updated_timestamp.as_ref(),
+        );
+        insert_action_members(
+            &mut config,
+            alarm.actions_enabled,
+            &alarm.ok_actions,
+            &alarm.alarm_actions,
+            &alarm.insufficient_data_actions,
+            style,
+        );
+    }
     Value::Object(config)
 }
 
@@ -364,6 +518,11 @@ pub(super) fn warm_up_configuration_document(warm_up: &WarmUpConfiguration) -> V
 ///
 /// `pub(crate)` for the reason [`alarm_configuration_document`] gives.
 pub(crate) fn composite_alarm_configuration_document(alarm: &CompositeAlarm) -> Value {
+    composite_alarm_document(alarm, AlarmDocument::Configuration)
+}
+
+/// One composite alarm as the serialisation `style` states it.
+fn composite_alarm_document(alarm: &CompositeAlarm, style: AlarmDocument) -> Value {
     let mut config = Map::new();
     insert_member(&mut config, "alarmName", json_text(&alarm.alarm_name));
     insert_member(&mut config, "alarmArn", json_text(&alarm.alarm_arn));
@@ -372,19 +531,24 @@ pub(crate) fn composite_alarm_configuration_document(alarm: &CompositeAlarm) -> 
         "alarmDescription",
         json_text(&alarm.alarm_description),
     );
+    if style == AlarmDocument::History {
+        insert_member(
+            &mut config,
+            "alarmConfigurationUpdatedTimestamp",
+            document_instant_member(alarm.alarm_configuration_updated_timestamp.as_ref()),
+        );
+    }
     insert_member(&mut config, "alarmRule", json_text(&alarm.alarm_rule));
-    insert_member(
-        &mut config,
-        "actionsEnabled",
-        alarm.actions_enabled.map(Value::from),
-    );
-    insert_member(&mut config, "okActions", json_strings(&alarm.ok_actions));
-    insert_member(&mut config, "alarmActions", json_strings(&alarm.alarm_actions));
-    insert_member(
-        &mut config,
-        "insufficientDataActions",
-        json_strings(&alarm.insufficient_data_actions),
-    );
+    if style == AlarmDocument::Configuration {
+        insert_action_members(
+            &mut config,
+            alarm.actions_enabled,
+            &alarm.ok_actions,
+            &alarm.alarm_actions,
+            &alarm.insufficient_data_actions,
+            style,
+        );
+    }
     insert_member(
         &mut config,
         "actionsSuppressor",
@@ -408,6 +572,21 @@ pub(crate) fn composite_alarm_configuration_document(alarm: &CompositeAlarm) -> 
             .as_ref()
             .map(action_configuration_document),
     );
+    if style == AlarmDocument::History {
+        insert_state_members(
+            &mut config,
+            &AlarmStateSnapshot::of_composite_alarm(alarm),
+            alarm.state_updated_timestamp.as_ref(),
+        );
+        insert_action_members(
+            &mut config,
+            alarm.actions_enabled,
+            &alarm.ok_actions,
+            &alarm.alarm_actions,
+            &alarm.insufficient_data_actions,
+            style,
+        );
+    }
     Value::Object(config)
 }
 
@@ -464,6 +643,11 @@ pub(super) fn alarm_state_document(alarm: &AlarmStateSnapshot, reason_data: bool
 /// both, so a write the history reports as an update cannot be one the event path reports as a
 /// no-op.
 pub(crate) fn alarm_configuration_document(alarm: &MetricAlarm) -> Value {
+    metric_alarm_document(alarm, AlarmDocument::Configuration)
+}
+
+/// One metric alarm as the serialisation `style` states it.
+fn metric_alarm_document(alarm: &MetricAlarm, style: AlarmDocument) -> Value {
     let mut config = Map::new();
     insert_member(&mut config, "alarmName", json_text(&alarm.alarm_name));
     insert_member(&mut config, "alarmArn", json_text(&alarm.alarm_arn));
@@ -472,22 +656,23 @@ pub(crate) fn alarm_configuration_document(alarm: &MetricAlarm) -> Value {
         "alarmDescription",
         json_text(&alarm.alarm_description),
     );
-    insert_member(
-        &mut config,
-        "actionsEnabled",
-        alarm.actions_enabled.map(Value::from),
-    );
-    insert_member(&mut config, "okActions", json_strings(&alarm.ok_actions));
-    insert_member(
-        &mut config,
-        "alarmActions",
-        json_strings(&alarm.alarm_actions),
-    );
-    insert_member(
-        &mut config,
-        "insufficientDataActions",
-        json_strings(&alarm.insufficient_data_actions),
-    );
+    if style == AlarmDocument::History {
+        insert_member(
+            &mut config,
+            "alarmConfigurationUpdatedTimestamp",
+            document_instant_member(alarm.alarm_configuration_updated_timestamp.as_ref()),
+        );
+    }
+    if style == AlarmDocument::Configuration {
+        insert_action_members(
+            &mut config,
+            alarm.actions_enabled,
+            &alarm.ok_actions,
+            &alarm.alarm_actions,
+            &alarm.insufficient_data_actions,
+            style,
+        );
+    }
     insert_member(&mut config, "namespace", json_text(&alarm.namespace));
     insert_member(&mut config, "metricName", json_text(&alarm.metric_name));
     insert_member(&mut config, "statistic", json_text(&alarm.statistic));
@@ -499,7 +684,10 @@ pub(crate) fn alarm_configuration_document(alarm: &MetricAlarm) -> Value {
     insert_member(
         &mut config,
         "dimensions",
-        alarm.dimensions.as_deref().map(dimensions_document),
+        alarm
+            .dimensions
+            .as_deref()
+            .map(|dimensions| dimensions_document(dimensions, style)),
     );
     insert_member(&mut config, "period", alarm.period.map(Value::from));
     insert_member(&mut config, "unit", json_text(&alarm.unit));
@@ -538,7 +726,12 @@ pub(crate) fn alarm_configuration_document(alarm: &MetricAlarm) -> Value {
         &mut config,
         "metrics",
         alarm.metrics.as_deref().map(|queries| {
-            Value::Array(queries.iter().map(metric_query_document).collect())
+            Value::Array(
+                queries
+                    .iter()
+                    .map(|query| metric_query_document(query, style))
+                    .collect(),
+            )
         }),
     );
     insert_member(
@@ -575,30 +768,47 @@ pub(crate) fn alarm_configuration_document(alarm: &MetricAlarm) -> Value {
             .as_ref()
             .map(action_configuration_document),
     );
+    if style == AlarmDocument::History {
+        insert_state_members(
+            &mut config,
+            &AlarmStateSnapshot::of_metric_alarm(alarm),
+            alarm.state_updated_timestamp.as_ref(),
+        );
+        insert_action_members(
+            &mut config,
+            alarm.actions_enabled,
+            &alarm.ok_actions,
+            &alarm.alarm_actions,
+            &alarm.insufficient_data_actions,
+            style,
+        );
+    }
     Value::Object(config)
 }
 
-/// A dimension list as a history document records it.
-pub(super) fn dimensions_document(dimensions: &[Dimension]) -> Value {
+/// A dimension list as the serialisation `style` states it.
+///
+/// A configuration record states a dimension the way the model lists it, its name before its
+/// value; an alarm-history document states the VALUE first.
+pub(super) fn dimensions_document(dimensions: &[Dimension], style: AlarmDocument) -> Value {
     Value::Array(
         dimensions
             .iter()
             .map(|dimension| {
-                Value::Object(
-                    [
-                        ("name".to_string(), Value::from(dimension.name.clone())),
-                        ("value".to_string(), Value::from(dimension.value.clone())),
-                    ]
-                    .into_iter()
-                    .collect(),
-                )
+                let name = ("name".to_string(), Value::from(dimension.name.clone()));
+                let value = ("value".to_string(), Value::from(dimension.value.clone()));
+                let members = match style {
+                    AlarmDocument::Configuration => [name, value],
+                    AlarmDocument::History => [value, name],
+                };
+                Value::Object(members.into_iter().collect())
             })
             .collect(),
     )
 }
 
-/// One metric-math query of a `Metrics` alarm as a history document records it.
-pub(super) fn metric_query_document(query: &MetricDataQuery) -> Value {
+/// One metric-math query of a `Metrics` alarm as the serialisation `style` states it.
+pub(super) fn metric_query_document(query: &MetricDataQuery, style: AlarmDocument) -> Value {
     let mut document = Map::new();
     document.insert("id".to_string(), Value::from(query.id.clone()));
     insert_member(&mut document, "expression", json_text(&query.expression));
@@ -624,7 +834,10 @@ pub(super) fn metric_query_document(query: &MetricDataQuery) -> Value {
             insert_member(
                 &mut metric,
                 "dimensions",
-                stat.metric.dimensions.as_deref().map(dimensions_document),
+                stat.metric
+                    .dimensions
+                    .as_deref()
+                    .map(|dimensions| dimensions_document(dimensions, style)),
             );
             let mut document = Map::new();
             document.insert("metric".to_string(), Value::Object(metric));

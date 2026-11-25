@@ -852,11 +852,14 @@ struct GradedAgainst<'alarm> {
 /// One datapoint ONE evaluation evaluated.
 #[derive(Debug, Clone, Copy)]
 struct Evaluated {
-    /// Which window of the evaluation range the datapoint came from, counting back from the
-    /// window the end of the evaluation's range fell in
-    /// ([`EvaluationGrid::newest_graded_period`]); `None` for a slot no real datapoint filled.
-    window: Option<usize>,
-    /// The statistic over that window, for a real datapoint.
+    /// Which window of the evaluation range this slot stands for, counting back from the window
+    /// the end of the evaluation's range fell in ([`EvaluationGrid::newest_graded_period`]) —
+    /// the period a real datapoint came from, and the period a missing-data arm stood in for
+    /// where no real datapoint filled it. Every slot stands for ONE period of the look-back, so
+    /// every slot can be named by that period's own instant.
+    period: usize,
+    /// The statistic over that window, for a real datapoint — and `None` for a slot no real
+    /// datapoint filled, which is what tells the two apart.
     value: Option<f64>,
     /// How many observations that window aggregated, for a real datapoint.
     sample_count: Option<f64>,
@@ -867,6 +870,14 @@ struct Evaluated {
     threshold: Option<f64>,
     /// How it stands against the threshold.
     datapoint: Datapoint,
+}
+
+impl Evaluated {
+    /// Whether a real datapoint of the series filled this slot, as against a missing-data arm
+    /// standing in for a period the series held nothing over.
+    fn measured(&self) -> bool {
+        self.value.is_some()
+    }
 }
 
 /// What the datapoints a verdict RESTS ON are: how a datapoint that satisfied the direction the
@@ -890,6 +901,7 @@ struct Evaluation {
     /// format." (`MetricAlarm$StateReason`)
     reason: String,
     /// `StateReasonData`: "An explanation for the alarm state, in JSON format."
+    /// (`MetricAlarm$StateReasonData`)
     reason_data: String,
 }
 
@@ -1516,7 +1528,7 @@ impl State {
                 continue;
             };
             evaluated.push(Evaluated {
-                window: Some(index),
+                period: index,
                 value: Some(datapoint.value),
                 // How many observations the window stood for, which is what a decision record
                 // reports beside the value the statistic took over them.
@@ -1969,9 +1981,18 @@ impl State {
             MISSING_NOT_BREACHING => Datapoint::NotBreaching,
             _ => Datapoint::Missing,
         };
+        // WHICH period each of those slots stands for: the periods of the look-back no real
+        // datapoint filled, newest first. A slot stands for the period the treatment decided
+        // FOR, so a record can name it by that period's own instant exactly as it names a
+        // period a datapoint really came from.
+        let filled: Vec<usize> = evaluated.iter().map(|slot| slot.period).collect();
+        let mut unfilled = (0..evaluation_periods).filter(|period| !filled.contains(period));
         for _ in evaluated.len()..evaluation_periods.saturating_sub(withheld) {
+            let Some(period) = unfilled.next() else {
+                break;
+            };
             evaluated.push(Evaluated {
-                window: None,
+                period,
                 value: None,
                 sample_count: None,
                 threshold: None,
@@ -1996,7 +2017,7 @@ impl State {
         // the reason has to report them as holes rather than as datapoints it counted.
         let substituted = evaluated
             .iter()
-            .filter(|slot| slot.window.is_none() && slot.datapoint != Datapoint::Missing)
+            .filter(|slot| !slot.measured() && slot.datapoint != Datapoint::Missing)
             .count();
         // "The number of data points that must be breaching to trigger the alarm. This is
         // used only if you are setting an "M out of N" alarm." — an alarm that names no M
@@ -2685,10 +2706,10 @@ fn cited_datapoints(
         if slot.datapoint != verdict.satisfying {
             continue;
         }
-        let (Some(index), Some(value)) = (slot.window, slot.value) else {
+        let Some(value) = slot.value else {
             continue;
         };
-        let entry = match reason_instant(grid.window_start(now_secs, index, period)) {
+        let entry = match reason_instant(grid.window_start(now_secs, slot.period, period)) {
             Some(at) => format!("{} ({at})", decimal_text(value)),
             None => decimal_text(value),
         };
@@ -2763,37 +2784,50 @@ impl GradedWindows {
     /// The start of the range the alarm's evaluation window selected
     /// ([`EvaluationGrid::look_back_start`]) — a clock boundary for an aligned window, and the
     /// look-back's own width behind the query instant for a rolling one — reaching back FURTHER
-    /// where a datapoint the verdict rests on is older than that: the range an evaluation
-    /// searches is deliberately wider than the look-back ([`evaluation_range_periods`]), so a
-    /// verdict may rest on a datapoint of a period before it, and the span a record opens at
-    /// covers every datapoint it names.
-    ///
-    /// `None` for an evaluation that graded no real datapoint at all: it read no window of the
-    /// series, so there is no span over the series to report.
-    fn span_start(self, now_secs: f64, evaluated: &[Evaluated]) -> Option<f64> {
-        let oldest_graded = evaluated
+    /// where a period the record names is older than that: the range an evaluation searches is
+    /// deliberately wider than the look-back ([`evaluation_range_periods`]), so a verdict may
+    /// rest on a datapoint of a period before it, and the span a record opens at covers every
+    /// period it names.
+    fn span_start(self, now_secs: f64, evaluated: &[Evaluated]) -> f64 {
+        let look_back = self
+            .grid
+            .look_back_start(now_secs, self.evaluation_periods, self.period);
+        evaluated
             .iter()
-            .filter_map(|slot| slot.window)
-            .map(|index| self.grid.window_start(now_secs, index, self.period))
-            .reduce(f64::min)?;
-        Some(oldest_graded.min(self.grid.look_back_start(
-            now_secs,
-            self.evaluation_periods,
-            self.period,
-        )))
+            .map(|slot| self.grid.window_start(now_secs, slot.period, self.period))
+            .reduce(f64::min)
+            .map_or(look_back, |oldest| oldest.min(look_back))
     }
 }
 
-/// The `StateReasonData` an evaluated state reports: the query the evaluation made, the values
-/// of the window it graded, and the datapoints the verdict RESTS ON — the ones that satisfied
-/// the direction the state was decided in, as many as that direction needed, each with the
-/// instant of the period it was aggregated out of and how many observations that period held.
+/// A span of seconds as one of this service's JSON documents states it: the whole number of
+/// seconds it is, and the number itself for a span that is not whole.
 ///
-/// A period the missing-data treatment substituted a datapoint for carries no instant and no
-/// value: nothing was measured over it, and the arm that decided it is what the entry names.
+/// A modelled span of this service is an integer number of seconds (`MetricAlarm$Period`,
+/// `MetricAlarm$EvaluationInterval`), so a document states it as an integer; the evaluation
+/// carries it as a real number because its arithmetic over the series is real.
+fn document_seconds(secs: f64) -> Value {
+    /// The largest whole number of seconds the integer form holds.
+    const MAX_WHOLE: f64 = 9.0e15;
+
+    if secs.is_finite() && secs.fract() == 0.0 && secs.abs() < MAX_WHOLE {
+        #[allow(clippy::cast_possible_truncation)]
+        return Value::from(secs as i64);
+    }
+    Value::from(secs)
+}
+
+/// The `StateReasonData` an evaluated state reports: the query the evaluation made, the values
+/// of the window it graded, and the periods the verdict RESTS ON — the ones that satisfied the
+/// direction the state was decided in, as many as that direction needed, each named by the
+/// instant of the period it stands for, with the value the statistic took over it and how many
+/// observations that period held.
+///
+/// A period the missing-data treatment substituted a datapoint for is named by its own instant
+/// too, and carries NO value and no sample count: the entry stands for a period of the
+/// look-back the series held nothing over, and nothing was measured over it to report.
 /// A state NO datapoint decided — insufficient data — names the periods it had no value for
 /// instead, each entry carrying that period's instant and nothing else.
-///
 /// "An explanation for the alarm state, in JSON format." (`MetricAlarm$StateReasonData`),
 /// bounded by [`MAX_STATE_REASON_DATA_LEN`] — a document is JSON, so it can never be
 /// truncated to fit: the datapoint list is dropped instead when an alarm evaluates more
@@ -2830,10 +2864,7 @@ fn state_reason_data(
     if let Some(at) = super::document_instant(now_secs) {
         document.insert("queryDate".to_string(), Value::from(at));
     }
-    if let Some(at) = windows
-        .span_start(now_secs, evaluated)
-        .and_then(super::document_instant)
-    {
+    if let Some(at) = super::document_instant(windows.span_start(now_secs, evaluated)) {
         document.insert("startDate".to_string(), Value::from(at));
     }
     // ONE member carries the statistic however the alarm spelled it: the name the windows were
@@ -2843,7 +2874,11 @@ fn state_reason_data(
     if let Some(statistic) = statistic {
         document.insert("statistic".to_string(), Value::from(statistic.name()));
     }
-    document.insert("period".to_string(), Value::from(period));
+    // How wide one of the periods it graded is, as the WHOLE NUMBER of seconds a period is:
+    // "The period, in seconds, over which the statistic is applied." (`MetricAlarm$Period`) is
+    // modelled as an integer, so a record states it as one rather than as the real number the
+    // evaluation carries its arithmetic in.
+    document.insert("period".to_string(), document_seconds(period));
     // The threshold the evaluation compared every window against, for an alarm compared
     // against a number. An alarm whose threshold is a model has no one threshold to report
     // here: the bound each window was compared against moves with the series, so it is
@@ -2871,14 +2906,17 @@ fn state_reason_data(
             .take(verdict.minimum)
         {
             let mut entry = Map::new();
-            if let Some(at) = slot
-                .window
-                .and_then(|index| {
-                    super::document_instant(grid.window_start(now_secs, index, period))
-                })
+            // WHICH period the entry stands for, named by that period's own start on the grid
+            // the evaluation graded: the one thing every entry carries, whether a datapoint was
+            // measured over the period or a missing-data arm stood in for it.
+            if let Some(at) =
+                super::document_instant(grid.window_start(now_secs, slot.period, period))
             {
                 entry.insert("timestamp".to_string(), Value::from(at));
             }
+            // What was MEASURED over that period, for a period that held a datapoint: nothing
+            // was measured over a period the treatment substituted a datapoint for, so its
+            // entry names the period and reports no measurement of it.
             if let Some(count) = slot.sample_count {
                 entry.insert("sampleCount".to_string(), Value::from(count));
             }
@@ -2891,19 +2929,6 @@ fn state_reason_data(
             if let Some(threshold) = slot.threshold {
                 entry.insert("threshold".to_string(), Value::from(threshold));
             }
-            // A slot no datapoint was MEASURED for reports the missing-data arm that stood in
-            // for it, since there is no measurement of it to report; a window that really held
-            // a datapoint reports what was measured over it and nothing else.
-            if slot.window.is_none() {
-                entry.insert(
-                    "datapoint".to_string(),
-                    Value::from(match slot.datapoint {
-                        Datapoint::Breaching => "breaching",
-                        Datapoint::NotBreaching => "notBreaching",
-                        Datapoint::Missing => "missing",
-                    }),
-                );
-            }
             datapoints.push(Value::Object(entry));
         }
     } else {
@@ -2913,10 +2938,14 @@ fn state_reason_data(
         // on the grid the evaluation graded and NOTHING else, because nothing was measured over
         // it. A period that really held a datapoint is named by `recentDatapoints` above and is
         // not one of these.
-        let graded: Vec<usize> = evaluated.iter().filter_map(|slot| slot.window).collect();
+        let graded: Vec<usize> = evaluated
+            .iter()
+            .filter(|slot| slot.measured())
+            .map(|slot| slot.period)
+            .collect();
         let unknown = evaluated
             .len()
-            .saturating_sub(evaluated.iter().filter(|slot| slot.value.is_some()).count());
+            .saturating_sub(evaluated.iter().filter(|slot| slot.measured()).count());
         for index in 0..evaluated.len() {
             if datapoints.len() >= unknown {
                 break;

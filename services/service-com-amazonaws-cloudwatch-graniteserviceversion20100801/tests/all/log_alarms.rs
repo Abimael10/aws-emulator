@@ -595,7 +595,7 @@ async fn each_write_is_recorded_in_the_alarms_history() {
             "HistoryData: expected the configuration this write stored, got {data}"
         );
     }
-    // The CREATE comes first and the replacement records the configuration it replaced.
+    // The CREATE comes first and the replacement records the members it changed.
     let newest: Value = items
         .iter()
         .filter_map(|item| item.get("HistoryData").and_then(Value::as_str))
@@ -603,9 +603,9 @@ async fn each_write_is_recorded_in_the_alarms_history() {
         .find(|data: &Value| data.get("updatedAlarm").is_some())
         .unwrap_or(Value::Null);
     assert!(
-        newest.get("originalAlarm").is_some(),
-        "HistoryData: expected the replacement to record the configuration it replaced, got \
-         {newest}"
+        newest.get("originalUpdatedFields").is_some(),
+        "HistoryData: expected the replacement to record the original values of the members it \
+         changed, got {newest}"
     );
 }
 

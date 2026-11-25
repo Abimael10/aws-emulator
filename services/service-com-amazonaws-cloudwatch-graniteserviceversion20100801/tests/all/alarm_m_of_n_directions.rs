@@ -290,8 +290,9 @@ const ROWS: &[Row] = &[
         ],
         recent_datapoints: 1,
         writes_record: true,
-        // The verdict rests on the two datapoints the arm substituted, and nothing was measured
-        // over the periods they stand for: those entries name the arm, not an instant.
+        // The verdict rests on the two datapoints the arm substituted: the record names the two
+        // periods they stand for, and reports no measurement of either, because nothing was
+        // measured over them.
         verdict_datapoints: 2,
         named_instants: false,
     },

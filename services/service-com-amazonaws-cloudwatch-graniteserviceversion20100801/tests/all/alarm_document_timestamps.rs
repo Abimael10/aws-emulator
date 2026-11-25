@@ -98,8 +98,9 @@ struct Row {
     data: &'static [Placed],
     /// The state the evaluation must put the alarm in.
     state: &'static str,
-    /// How many entries the graded-datapoint list must carry an instant for: a window a
-    /// missing-data arm substituted a datapoint for was never measured, so it names none.
+    /// How many entries the graded-datapoint list must carry an instant for: every entry stands
+    /// for a period of the look-back, and names that period's own instant whether a datapoint
+    /// was measured over it or a missing-data arm stood in for it.
     instant_bearing_datapoints: usize,
 }
 
@@ -185,8 +186,8 @@ const ROWS: &[Row] = &[
     },
     Row {
         // A window NOTHING was published into, decided by the missing-data arm alone: the
-        // entries stand for holes, so none of them names an instant and the document carries
-        // only the instant of the query itself.
+        // entries stand for the two periods of the look-back the series held nothing over, and
+        // each names the period it stands for even though nothing was measured over it.
         case: "a breaching arm over a series with no datapoints at all",
         period: 60,
         statistic: Some("Maximum"),
@@ -198,7 +199,7 @@ const ROWS: &[Row] = &[
         treat_missing_data: Some("breaching"),
         data: &[],
         state: "ALARM",
-        instant_bearing_datapoints: 0,
+        instant_bearing_datapoints: 2,
     },
 ];
 
