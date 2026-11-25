@@ -609,6 +609,26 @@ pub(crate) fn return_values(
             }
             (id, attributes)
         }
+        // "Ref returns the VPC origin ID"; Fn::GetAtt: Arn, CreatedTime, Id, LastModifiedTime,
+        // Status. CloudFront mints the id in its own namespace-labelled entity form
+        // ([`cloudfront_vpc_origin_id`]) and builds the ARN around it; a template declares the
+        // endpoint the origin fronts, never an identifier. The status and the two instants are
+        // that service's own report of the origin, which only it can state.
+        CLOUDFRONT_VPC_ORIGIN => {
+            let id = cloudfront_vpc_origin_id(name);
+            attributes.insert(
+                "Arn".to_string(),
+                cloudfront_arn(&format!("{CLOUDFRONT_VPC_ORIGIN_ARN_TYPE}/{id}")),
+            );
+            attributes.insert("Id".to_string(), id.clone());
+            for attribute in ["CreatedTime", "LastModifiedTime", "Status"] {
+                attributes.insert(
+                    attribute.to_string(),
+                    service_assigned_document(name, attribute),
+                );
+            }
+            (id, attributes)
+        }
         // "Ref returns the RestApi ID"; Fn::GetAtt: RestApiId, RootResourceId. API Gateway
         // ASSIGNS both ids — a template names the API but not its identifier — in the form
         // [`api_gateway_assigned_id`] describes, and the root resource is a resource of the

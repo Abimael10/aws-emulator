@@ -64,6 +64,11 @@ pub const CLOUDFRONT_FUNCTION: &str = "AWS::CloudFront::Function";
 /// values for it.
 pub const CLOUDFRONT_MONITORING_SUBSCRIPTION: &str = "AWS::CloudFront::MonitoringSubscription";
 
+/// The `AWS::CloudFront::VpcOrigin` resource type: the VPC origin a distribution reads a
+/// private load balancer or instance inside a VPC through, identified by the `vo_`-prefixed id
+/// CloudFront mints and named by the ARN built around that id.
+pub const CLOUDFRONT_VPC_ORIGIN: &str = "AWS::CloudFront::VpcOrigin";
+
 /// The Amazon API Gateway resource types whose published `Ref` is a SERVICE-ASSIGNED id
 /// rather than a name a template states: a REST API, a resource of one, and a deployment
 /// of one.
@@ -268,6 +273,7 @@ pub(crate) const CLOUDFRONT_CONNECTION_GROUP_ENDPOINT_SALT: &str =
     "cloudfront/connection-group-routing-endpoint";
 pub(crate) const CLOUDFRONT_CONNECTION_FUNCTION_ID_SALT: &str =
     "cloudfront/connection-function-id";
+pub(crate) const CLOUDFRONT_VPC_ORIGIN_ID_SALT: &str = "cloudfront/vpc-origin-id";
 pub(crate) const APIGATEWAY_REST_API_ID_SALT: &str = "apigateway/rest-api-id";
 pub(crate) const APIGATEWAY_ROOT_RESOURCE_ID_SALT: &str = "apigateway/root-resource-id";
 pub(crate) const APIGATEWAY_RESOURCE_ID_SALT: &str = "apigateway/resource-id";
@@ -371,6 +377,34 @@ pub(crate) const CLOUDFRONT_OPAQUE_ID_BODY_LEN: usize = 27;
 /// The namespace labels of the two resource kinds above, as CloudFront writes them.
 pub(crate) const CLOUDFRONT_CONNECTION_GROUP_ID_LABEL: &str = "cg_";
 pub(crate) const CLOUDFRONT_CONNECTION_FUNCTION_ID_LABEL: &str = "cf_";
+
+/// The namespace label a VPC origin's identifier carries, as the model's own VPC origin
+/// examples write one (`vo_`).
+pub(crate) const CLOUDFRONT_VPC_ORIGIN_ID_LABEL: &str = "vo_";
+
+/// An identifier of the shape CloudFront assigns a VPC ORIGIN: the namespace label
+/// ([`CLOUDFRONT_VPC_ORIGIN_ID_LABEL`]) followed by [`CLOUDFRONT_ID_BODY_LEN`] characters of
+/// the uppercase ENTITY alphabet — the width and alphabet this service's own VPC origin ids are
+/// minted at, which is narrower than the opaque body [`cloudfront_namespaced_id`] writes.
+///
+/// A stand-in of that shape, stable across reads for the reason [`derived_digits`] gives, and
+/// replaced by the id the owning service minted once the origin exists
+/// ([`identity_is_service_assigned`]).
+pub(crate) fn cloudfront_vpc_origin_id(name: &str) -> String {
+    format!(
+        "{CLOUDFRONT_VPC_ORIGIN_ID_LABEL}{}",
+        derived_digits(
+            CLOUDFRONT_VPC_ORIGIN_ID_SALT,
+            name,
+            CLOUDFRONT_ID_BODY_LEN,
+            Alphabet::Upper,
+        )
+    )
+}
+
+/// The resource type a VPC origin's ARN spells, as the model's own VPC origin examples write it
+/// (`arn:aws:cloudfront::<account>:vpcorigin/<Id>`) — WITHOUT the separator the route carries.
+pub(crate) const CLOUDFRONT_VPC_ORIGIN_ARN_TYPE: &str = "vpcorigin";
 
 /// The routing endpoint CloudFront publishes for a connection group: "the routing endpoint
 /// (also known as the DNS name) that is assigned to the connection group, such as

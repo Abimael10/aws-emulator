@@ -570,6 +570,9 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
             "RoutingEndpoint",
             "Status",
         ],
+        // A VPC origin publishes the ARN and the id CloudFront minted for it, the status that
+        // service reports it in and the two instants of its own clock.
+        CLOUDFRONT_VPC_ORIGIN => &["Arn", "CreatedTime", "Id", "LastModifiedTime", "Status"],
         APIGATEWAY_REST_API => &["RestApiId", "RootResourceId"],
         APIGATEWAY_RESOURCE => &["ResourceId"],
         // The AppSync types' own half of the catalogue, beside their return values.
@@ -950,6 +953,12 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         || resource_type == CLOUDFRONT_FUNCTION
         || resource_type == CLOUDFRONT_CONNECTION_FUNCTION
         || resource_type == CLOUDFRONT_CONNECTION_GROUP
+        // A VPC ORIGIN is one more: `CreateVpcOrigin` takes the endpoint CONFIGURATION and no
+        // identifier, and answers the `vo_…` id CloudFront minted together with the ARN built
+        // around it — which is what "Ref returns the VPC origin ID" publishes and what every
+        // call on one takes (`GetVpcOrigin$Id`, `DeleteVpcOrigin$Id`, an origin's
+        // `VpcOriginConfig$VpcOriginId`).
+        || resource_type == CLOUDFRONT_VPC_ORIGIN
         // A GuardDuty trusted IP list is the same case: `CreateIPSet` takes no identifier
         // for the list — the `Name` a declaration states is only the user-friendly name of
         // the IPSet — and answers the `IpSetId` GuardDuty minted, which is what that

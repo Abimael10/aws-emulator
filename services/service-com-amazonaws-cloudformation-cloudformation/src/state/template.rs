@@ -3068,6 +3068,9 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     CLOUDFRONT_ORIGIN_REQUEST_POLICY,
     CLOUDFRONT_PUBLIC_KEY,
     CLOUDFRONT_RESPONSE_HEADERS_POLICY,
+    // The VPC origin a distribution reads a private endpoint inside a VPC through, publishing
+    // the ARN and the id CloudFront mints for it beside that service's own report of it.
+    CLOUDFRONT_VPC_ORIGIN,
     "AWS::CloudWatch::Alarm",
     "AWS::CloudWatch::CompositeAlarm",
     CLOUDWATCH_METRIC_STREAM,

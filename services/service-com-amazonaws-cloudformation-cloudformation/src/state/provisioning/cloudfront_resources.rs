@@ -94,6 +94,10 @@ mod policy_and_key_resources;
 mod connection_and_store_resources;
 mod monitoring_subscription;
 
+/// The VPC origin a stack declares so a distribution can read a private load balancer or
+/// instance inside a VPC: another per-type half beside this one, reached through the same seam.
+mod vpc_origin;
+
 /// The two resource types this file provisions itself.
 pub(crate) const CLOUDFRONT_DISTRIBUTION: &str = "AWS::CloudFront::Distribution";
 pub(crate) const CLOUDFRONT_ORIGIN_ACCESS_CONTROL: &str = "AWS::CloudFront::OriginAccessControl";
@@ -116,6 +120,8 @@ pub(crate) enum Kind {
     /// `AWS::CloudFront::MonitoringSubscription`, whose arms are
     /// [`monitoring_subscription`]'s.
     MonitoringSubscription,
+    /// `AWS::CloudFront::VpcOrigin`, whose arms are [`vpc_origin`]'s.
+    VpcOrigin,
 }
 
 /// The kind of CloudFront resource `resource_type` is, or `None` for a type no module here
@@ -127,6 +133,7 @@ pub(crate) fn kind_of(resource_type: &str) -> Option<Kind> {
         monitoring_subscription::CLOUDFRONT_MONITORING_SUBSCRIPTION => {
             Some(Kind::MonitoringSubscription)
         }
+        vpc_origin::CLOUDFRONT_VPC_ORIGIN => Some(Kind::VpcOrigin),
         other => policy_and_key_resources::kind_of(other)
             .map(Kind::PolicyOrKey)
             .or_else(|| {
@@ -525,6 +532,7 @@ pub(super) async fn create(
         Kind::MonitoringSubscription => {
             monitoring_subscription::create(ctx, region, resource).await
         }
+        Kind::VpcOrigin => vpc_origin::create(ctx, region, resource, propagated).await,
     }
 }
 
@@ -536,7 +544,8 @@ pub(super) async fn create(
 /// CloudFront propagates the configuration to its edge locations and reports it
 /// `InProgress`; that is CloudFront's own transition rather than a wait on the creation,
 /// exactly as the DB instance an `AWS::RDS::DBInstance` creates is reported created while
-/// Amazon RDS still has it `creating`.
+/// Amazon RDS still has it `creating`. A VPC ORIGIN is in that same position: it exists and is
+/// nameable by an origin's `VpcOriginConfig` while that service still reports it `Deploying`.
 pub(super) fn ready() -> Readiness {
     Readiness::Ready
 }
@@ -611,6 +620,7 @@ pub(super) async fn update(
         Kind::MonitoringSubscription => {
             monitoring_subscription::update(ctx, region, resource, declared).await
         }
+        Kind::VpcOrigin => Ok(vpc_origin::update()),
     }
 }
 
@@ -661,6 +671,7 @@ pub(super) async fn delete(
         Kind::MonitoringSubscription => {
             monitoring_subscription::delete(ctx, region, resource).await
         }
+        Kind::VpcOrigin => vpc_origin::delete(ctx, region, resource).await,
     }
 }
 
@@ -682,6 +693,10 @@ pub(super) async fn removal(
         Kind::PolicyOrKey(_) => Ok(policy_and_key_resources::removal()),
         Kind::ConnectionOrStore(_) => Ok(connection_and_store_resources::removal()),
         Kind::MonitoringSubscription => Ok(monitoring_subscription::removal()),
+        // A VPC origin is not gone as its delete answers either: CloudFront refuses the delete
+        // of an origin whose endpoint has not reached the edge locations yet, so the deletion
+        // is asked for again until that service no longer holds it ([`vpc_origin::remove`]).
+        Kind::VpcOrigin => vpc_origin::remove(ctx, region, physical_resource_id).await,
     }
 }
 
