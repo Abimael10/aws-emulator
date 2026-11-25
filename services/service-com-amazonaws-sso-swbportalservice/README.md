@@ -117,7 +117,10 @@ service RESOLVES them where they are recorded, in the same shared engine:
   `CreateToken`), which is what `aws sso login` performs;
 - the accounts and roles are IAM Identity Center's own account assignments
   (`CreatePermissionSet` + `CreateAccountAssignment`), a role being the NAME of the
-  permission set an assignment grants;
+  permission set an assignment grants — the assignments made to the PRINCIPAL the mint
+  recorded for the sign-in, where it recorded one (the identity-store user a token minted
+  by `CreateTokenWithIAM`'s JWT-bearer exchange is bound to, and the groups of its
+  identity store that user is a member of);
 - an assigned account's `accountName`/`emailAddress` are the organization's records of that
   account, and are reported absent for an account the emulator holds no record of.
 

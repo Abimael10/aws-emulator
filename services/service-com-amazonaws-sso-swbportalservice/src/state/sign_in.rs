@@ -19,8 +19,9 @@
 //!   predecessor did, so anything this service scopes to a sign-in rather than to one
 //!   token is bound to that identifier ([`SignedIn::sign_in_session`]);
 //! * the accounts that sign-in may see, and the roles in each, are the account assignments
-//!   IAM Identity Center holds whose grant has completed — a role being the NAME of the
-//!   permission set the assignment grants, which is what the access portal offers a user;
+//!   IAM Identity Center holds whose grant has completed and whose PRINCIPAL is the
+//!   sign-in's own ([`SignInIdentity`]) — a role being the NAME of the permission set the
+//!   assignment grants, which is what the access portal offers a user;
 //! * an assigned account's display name and email address are the organization's own
 //!   records of that account, and nothing when the emulator holds no record of it.
 //!
@@ -47,6 +48,10 @@ use std::time::SystemTime;
 
 use super::{Account, ComAmazonawsSsoSwbportalserviceState, Session};
 
+/// The identity store of an IAM Identity Center instance, where the groups a user is a
+/// member of live: an assignment made to a GROUP is one of its MEMBERS' assignments, and
+/// that membership is the identity store's own record.
+use ::service_com_amazonaws_identitystore_awsidentitystore as identity_store;
 /// IAM Identity Center's own control plane: the permission sets and the account
 /// assignments an administrator made are its records, so they are read where they live.
 use ::service_com_amazonaws_ssoadmin_swbexternalservice as identity_center;
@@ -124,7 +129,7 @@ pub fn federated_sign_in<Eng: Send + Sync + 'static>(
         subject: minted.subject,
         sign_in_session: minted.sign_in_session,
         expires_at: minted.expires_at,
-        accounts: assigned_accounts(engine, now).unwrap_or_default(),
+        accounts: assigned_accounts(engine, minted.identity.as_ref(), now).unwrap_or_default(),
     })
 }
 
@@ -155,11 +160,33 @@ pub fn end_minted_sign_in<Eng: Send + Sync + 'static>(engine: &Eng, access_token
     tokens.end_sign_in_session(access_token)
 }
 
+/// The IAM Identity Center PRINCIPAL a sign-in is for, when the record that minted the
+/// sign-in names one: the identity-store user, the store that holds it and the instance
+/// that holds the store.
+///
+/// This is what makes the sign-in's view of IAM Identity Center its own. An assignment is
+/// made to a principal, so it is this user's assignments — the ones naming the user, and
+/// the ones naming a group the identity store records the user as a member of — that the
+/// portal reports ([`assigned_accounts`]), and this user that a role credential minted for
+/// the sign-in speaks for.
+#[derive(Debug, Clone)]
+pub struct SignInIdentity {
+    /// The `InstanceArn` of the IAM Identity Center instance the identity belongs to.
+    pub instance_arn: String,
+    /// The `IdentityStoreId` of that instance's identity store.
+    pub identity_store_id: String,
+    /// The `UserId` of the identity-store user the sign-in is for.
+    pub user_id: String,
+}
+
 /// What the emulator's own token mint records about the sign-in a presented access token
 /// belongs to.
 struct MintedSignIn {
     /// The identity the sign-in is attributed to; see [`minted_sign_in`].
     subject: String,
+    /// The identity-store principal the mint recorded for the sign-in, when it recorded
+    /// one; see [`SignInIdentity`] and [`minted_sign_in`].
+    identity: Option<SignInIdentity>,
     /// The mint's identifier for the sign-in session this token is one token OF, the same
     /// for every token of the chain.
     sign_in_session: String,
@@ -170,12 +197,17 @@ struct MintedSignIn {
 /// The sign-in the emulator's own token mint made for `access_token`: who it is attributed
 /// to, which sign-in session the token belongs to, and when the token stops being usable.
 ///
-/// IAM Identity Center attributes a sign-in to the identity-store user who approved it at
-/// the access portal, and that approval is made at the portal page rather than through any
-/// operation of this API or of the OIDC API, so the registration the token was ISSUED TO
-/// is the identity the emulator records for it. It is stable for the life of that
-/// registration — rotating a refresh token re-issues against the same `clientId` — so a
-/// credential minted before a refresh speaks for the same subject as one minted after.
+/// A sign-in is attributed to the IAM Identity Center identity the MINT recorded for the
+/// token. A token minted from a grant that authenticated a user of an identity store
+/// carries that user, and the mint keeps it on the token precisely so a later read
+/// resolves the same identity the caller was handed — so that user is the sign-in's
+/// subject and its principal ([`SignInIdentity`]). A token of a grant that authenticated
+/// only a CLIENT records no identity-store user: the approval that would name one is made
+/// at the access-portal page, which is no operation of this API or of the OIDC API, so
+/// such a sign-in is attributed to the registration the token was ISSUED TO and names no
+/// principal. Either attribution is stable for the life of the chain — rotating a refresh
+/// token re-issues against the same registration and the same identity — so a credential
+/// minted before a refresh speaks for the same subject as one minted after.
 ///
 /// `None` when the OIDC service holds no such token, or holds one whose own lifetime has
 /// run out: a token past its lifetime names no sign-in, which is exactly the
@@ -188,8 +220,20 @@ fn minted_sign_in<Eng: Send + Sync + 'static>(
     let tokens = oidc::state::service_state(engine)?;
     let tokens = tokens.lock();
     let issued = tokens.access_tokens.get(access_token)?;
-    (!issued.is_expired(now)).then(|| MintedSignIn {
-        subject: issued.client_id.clone(),
+    if issued.is_expired(now) {
+        return None;
+    }
+    let identity = issued.identity.as_ref().map(|bound| SignInIdentity {
+        instance_arn: bound.instance_arn.clone(),
+        identity_store_id: bound.identity_store_id.clone(),
+        user_id: bound.user_id.clone(),
+    });
+    Some(MintedSignIn {
+        subject: match identity.as_ref() {
+            Some(identity) => identity.user_id.clone(),
+            None => issued.client_id.clone(),
+        },
+        identity,
         // The session the token is a token of, which is the SAME identifier on every
         // token of the chain: the pair a refresh rotation mints belongs to the session the
         // pair it superseded belonged to.
@@ -198,8 +242,9 @@ fn minted_sign_in<Eng: Send + Sync + 'static>(
     })
 }
 
-/// The accounts IAM Identity Center's assignments put in force at `now`, with the roles
-/// each grants, and the organization's name and email address for each account.
+/// The accounts IAM Identity Center's assignments put in force for `identity` at `now`,
+/// with the roles each grants, and the organization's name and email address for each
+/// account.
 ///
 /// `None` only when IAM Identity Center's own store is not reachable — an emulator that
 /// mounted this service without it — which is no assignment rather than no sign-in (see
@@ -215,17 +260,25 @@ fn minted_sign_in<Eng: Send + Sync + 'static>(
 /// name, and so is one under an INSTANCE the account no longer holds — an instance that is
 /// gone grants nothing.
 ///
-/// Which PRINCIPAL an assignment names is not a filter here. The portal reports the
-/// accounts assigned to the signed-in user, and the emulator records no mapping from a
-/// device-authorization sign-in to one identity-store principal — the approval that would
-/// name one is made outside every API the emulator serves — so what a sign-in reports is
-/// the assignments the administrator made in the account's directory, all of them. The
-/// directory is one: IAM Identity Center allows a single instance per account, so the
-/// instances this filter admits are that one instance.
+/// Which PRINCIPAL an assignment names is a filter whenever the sign-in HAS one
+/// ([`SignInIdentity`]): the portal "lists all AWS accounts assigned to the user"
+/// (`ListAccounts`) and "all roles that are assigned to the user" (`ListAccountRoles`), so
+/// an assignment made to another principal is none of that sign-in's business. What it
+/// reports is the assignments naming the user itself and those naming a group of its
+/// identity store the user is a member of ([`assigned_principals`]), and only under the
+/// instance the identity belongs to. A sign-in the mint recorded no identity-store
+/// principal for names no principal to filter by, so what it reports is the assignments
+/// the administrator made in the account's directory, all of them. The directory is one:
+/// IAM Identity Center allows a single instance per account, so the instances this filter
+/// admits are that one instance.
 fn assigned_accounts<Eng: Send + Sync + 'static>(
     engine: &Eng,
+    identity: Option<&SignInIdentity>,
     now: SystemTime,
 ) -> Option<BTreeMap<String, Account>> {
+    // The identity store is read FIRST and its lock released, so IAM Identity Center's own
+    // lock below is the only one held while the assignments are walked.
+    let principals = identity.map(|identity| assigned_principals(engine, identity));
     let identity_center = identity_center::state::service_state(engine)?;
     let identity_center = identity_center.lock();
     let mut roles: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -233,6 +286,12 @@ fn assigned_accounts<Eng: Send + Sync + 'static>(
         if !identity_center
             .instances
             .contains_key(&assignment.instance_arn)
+        {
+            continue;
+        }
+        if principals
+            .as_ref()
+            .is_some_and(|principals| !principals.is_assigned_by(assignment))
         {
             continue;
         }
@@ -258,6 +317,85 @@ fn assigned_accounts<Eng: Send + Sync + 'static>(
     }
     drop(identity_center);
     Some(named_accounts(engine, roles))
+}
+
+/// The `PrincipalType` an assignment made to one identity-store USER carries — one of the
+/// two values the model's enum admits
+/// (`smithy_query(query="shape",shape="PrincipalType")`: `USER | GROUP`).
+const PRINCIPAL_TYPE_USER: &str = "USER";
+
+/// The `PrincipalType` an assignment made to an identity-store GROUP carries; see
+/// [`PRINCIPAL_TYPE_USER`].
+const PRINCIPAL_TYPE_GROUP: &str = "GROUP";
+
+/// The principals an account assignment may name for it to be one of a sign-in's own: the
+/// identity-store user itself, and every group of that identity store the user is a member
+/// of.
+#[derive(Debug)]
+struct AssignedPrincipals {
+    /// The instance the identity belongs to: an assignment under another instance is made
+    /// in another directory, so it names no principal of this one.
+    instance_arn: String,
+    /// The sign-in's `UserId`, keyed the way the identity store keys an id.
+    user: String,
+    /// The `GroupId` of every group the identity store records the user as a member of,
+    /// keyed the same way.
+    groups: BTreeSet<String>,
+}
+
+impl AssignedPrincipals {
+    /// Whether `assignment` is one of this sign-in's: made under its instance, to the user
+    /// itself or to a group the user is a member of.
+    ///
+    /// A `PrincipalId` is a GUID whose modelled pattern admits either letter case, and the
+    /// identity store keys an id by its own one reading of such a value
+    /// (`identity_store::state::resource_key`), so the two sides are compared through that
+    /// reading rather than byte for byte.
+    fn is_assigned_by(&self, assignment: &identity_center::state::AccountAssignmentRecord) -> bool {
+        if assignment.instance_arn != self.instance_arn {
+            return false;
+        }
+        let principal = identity_store::state::resource_key(&assignment.principal_id);
+        match assignment.principal_type.as_str() {
+            PRINCIPAL_TYPE_USER => principal == self.user,
+            PRINCIPAL_TYPE_GROUP => self.groups.contains(&principal),
+            // A principal type outside the modelled enum names neither a user nor a group
+            // of the identity store, so it names no principal of this sign-in.
+            _ => false,
+        }
+    }
+}
+
+/// Every principal an assignment may name for it to be `identity`'s own.
+///
+/// An administrator assigns account access to a user or to a GROUP the user belongs to
+/// ("Assign User Access", `ListAccounts`), and an assignment to a group is an assignment
+/// of each of its members — so the groups are resolved from the identity store that HOLDS
+/// the membership, through that store's own reader for the member side of it
+/// (`IdentityStoreData::groups_of_member`), exactly as the assignments are read where they
+/// live. A store this emulator holds no record of (one nothing was ever created in, or an
+/// emulator standing this service up without an identity store) records no membership,
+/// which is a user assigned through no group rather than a sign-in with no principal: the
+/// assignments naming the user itself are still its own.
+///
+/// LOCK ORDER: takes the identity store's state lock and nothing else, and holds no other
+/// lock while it does.
+fn assigned_principals<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    identity: &SignInIdentity,
+) -> AssignedPrincipals {
+    let mut groups = BTreeSet::new();
+    if let Some(stores) = identity_store::state::service_state(engine) {
+        let stores = stores.lock();
+        if let Some(store) = stores.store(&identity.identity_store_id) {
+            groups = store.groups_of_member(&identity.user_id);
+        }
+    }
+    AssignedPrincipals {
+        instance_arn: identity.instance_arn.clone(),
+        user: identity_store::state::resource_key(&identity.user_id),
+        groups,
+    }
 }
 
 /// `roles` as the accounts a listing reports: each with the display name and email address

@@ -28,6 +28,10 @@ service-com-amazonaws-ssooidc-awsssooidcservice = { workspace = true }
 # The account assignments an administrator made are IAM Identity Center's own records, and
 # they are what the portal reports, so they are read where they live.
 service-com-amazonaws-ssoadmin-swbexternalservice = { workspace = true }
+# An assignment made to a GROUP is an assignment of each of its members, and that
+# membership is the identity store's own record, so the groups a signed-in user belongs to
+# are read where they live.
+service-com-amazonaws-identitystore-awsidentitystore = { workspace = true }
 # An assigned account's display name and email address are the organization's records of
 # that account, which is what `AccountInfo` reports them from.
 service-com-amazonaws-organizations-awsorganizationsv20161128 = { workspace = true }

@@ -21922,6 +21922,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-identitystore-awsidentitystore",
  "service-com-amazonaws-organizations-awsorganizationsv20161128",
  "service-com-amazonaws-ssoadmin-swbexternalservice",
  "service-com-amazonaws-ssooidc-awsssooidcservice",

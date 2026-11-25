@@ -718,6 +718,15 @@ impl ComAmazonawsSsooidcAwsssooidcserviceState {
     /// the device authorizations, tokens and refresh grants that belonged to it:
     /// once the registration is gone nothing can authenticate for those records,
     /// so leaving them resident would be growth nothing could ever reclaim.
+    ///
+    /// A token minted for an APPLICATION rather than for a registration is none of this
+    /// sweep's business: the token the JWT-bearer exchange mints carries the application
+    /// ARN it was issued to as its [`IssuedToken::client_id`]
+    /// ([`Self::issue_identity_bound_token`]), which names no registration this store
+    /// holds, and nothing authenticates for such a token with a client secret — the
+    /// identity it is bound to is what it is spent on. So it is kept until its own lifetime
+    /// runs out ([`Self::purge_expired_tokens`]), the way every other record here is
+    /// reclaimed by the clock that made it due.
     pub fn purge_expired_clients(&mut self, now: SystemTime) {
         let at = epoch_seconds(now);
         self.clients
@@ -725,8 +734,9 @@ impl ComAmazonawsSsooidcAwsssooidcserviceState {
         let live_clients = &self.clients;
         self.device_auths
             .retain(|_, authorization| live_clients.contains_key(&authorization.client_id));
-        self.access_tokens
-            .retain(|_, token| live_clients.contains_key(&token.client_id));
+        self.access_tokens.retain(|_, token| {
+            token.identity.is_some() || live_clients.contains_key(&token.client_id)
+        });
         self.refresh_tokens
             .retain(|_, grant| live_clients.contains_key(&grant.client_id));
         let live_authorizations = &self.device_auths;

@@ -774,3 +774,112 @@ async fn a_grant_past_its_lifetime_is_refused_as_expired() {
         );
     }
 }
+
+/// RULE: the reclaim that follows an expired client registration takes the records OF that
+/// registration, so a token minted for an APPLICATION — which no `clientSecret`
+/// authenticates for, and which carries the identity it is bound to instead — is kept for
+/// its own lifetime, and a later read resolves the same identity the exchange answered.
+///
+/// The rows span what the rule generalises over: whose token it is (a live registration's,
+/// an expired registration's, an application's), and so whether the reclaim may take it.
+#[tokio::test]
+async fn the_registration_reclaim_keeps_a_token_minted_for_an_application() {
+    let emulator = Emulator::new();
+    let live = holder(&emulator, json!({"clientName": "live-app"})).await;
+    let expiring = holder(&emulator, json!({"clientName": "expiring-app"})).await;
+
+    // What the JWT-bearer exchange mints: a token issued to an APPLICATION, carrying the
+    // identity-store user whose assertion it spent. The exchange's own path needs an
+    // assertion signed by a trusted token issuer outside this suite's one service, so the
+    // record is written through the writer that exchange calls.
+    let instance_arn = "arn:aws:sso:::instance/ssoins-1234567890abcdef";
+    let application_arn = format!(
+        "arn:aws:sso::{}:application/ssoins-1234567890abcdef/apl-1234567890abcdef",
+        engine::emulator_account_id()
+    );
+    let bound_to = ssooidc::state::BoundIdentity {
+        instance_arn: instance_arn.to_string(),
+        identity_store_id: "d-1234567890".to_string(),
+        user_id: "f81d4fae-7dec-11d0-a765-00a0c91e6bf6".to_string(),
+        trusted_token_issuer_arn: format!(
+            "arn:aws:sso::{}:trustedTokenIssuer/ssoins-1234567890abcdef\
+             /tti-f81d4fae-7dec-11d0-a765-00a0c91e6bf6",
+            engine::emulator_account_id()
+        ),
+    };
+    let identity_bound = emulator
+        .state()
+        .lock()
+        .issue_identity_bound_token(
+            &application_arn,
+            REGION,
+            Vec::new(),
+            bound_to.clone(),
+            std::time::SystemTime::now(),
+        )
+        .access_token;
+
+    // The registration the clock has made spent: the records the reclaim is owed. The
+    // wall clock cannot be moved, so the persisted expiry is.
+    {
+        let state = emulator.state();
+        let mut store = state.lock();
+        let client = store
+            .clients
+            .get_mut(&expiring.client_id)
+            .expect("the registration the device flow was run for is on record");
+        client.client_secret_expires_at = 0;
+    }
+
+    // Any registration brings the reclaim about; nothing of this call names a token.
+    let (status, response) = emulator
+        .register_client(&json!({"clientName": "another-app", "clientType": "public"}))
+        .await;
+    assert_eq!(
+        status, 200,
+        "RegisterClient answered {status} {response}"
+    );
+
+    // `(the case, the token, whether the mint must still hold it)`.
+    let rows: Vec<(&str, &str, bool)> = vec![
+        (
+            "a token of a registration that is still live",
+            live.access_token.as_str(),
+            true,
+        ),
+        (
+            "a token of a registration whose clientSecret has expired",
+            expiring.access_token.as_str(),
+            false,
+        ),
+        (
+            "a token minted for an application, bound to an identity",
+            identity_bound.as_str(),
+            true,
+        ),
+    ];
+    for (case, access_token, held) in rows {
+        let store = emulator.state();
+        let store = store.lock();
+        assert_eq!(
+            store.access_tokens.contains_key(access_token),
+            held,
+            "case {case:?}: expected the mint to {} hold the token after the reclaim",
+            if held { "still" } else { "no longer" }
+        );
+    }
+
+    // And what the kept record is kept FOR: the identity it is bound to.
+    let store = emulator.state();
+    let store = store.lock();
+    let token = store
+        .access_tokens
+        .get(&identity_bound)
+        .expect("the identity-bound token is on record");
+    assert_eq!(
+        token.identity.as_ref(),
+        Some(&bound_to),
+        "the kept record must carry the identity the exchange answered, got {:?}",
+        token.identity
+    );
+}

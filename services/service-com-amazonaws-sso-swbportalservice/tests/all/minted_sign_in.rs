@@ -11,20 +11,26 @@
 //! are the organization's own records of that account.
 //!
 //! Every call here goes through `MultiServiceRouter::dispatch`, the one path a
-//! socket-served request takes, against the four services the production router mounts on
+//! socket-served request takes, against the services the production router mounts on
 //! one shared engine: the portal, IAM Identity Center OIDC (which mints the token), IAM
-//! Identity Center (where the administrator's assignments live) and Organizations (where an
-//! account's name and email live). Nothing is written into the portal's own store by the
+//! Identity Center (where the administrator's assignments live), its identity store (where
+//! the users and the group memberships an assignment names live) and Organizations (where
+//! an account's name and email live). Nothing is written into the portal's own store by the
 //! test: the sign-in and the assignments arrive the way they do in a running emulator.
 //!
-//! Two set-up steps are not calls, because the emulator serves no API for them, and both
-//! are the clock's or the user's business rather than the wire's:
+//! Three set-up steps are not calls, because the emulator serves no API for them, and each
+//! is the clock's, the user's or another service's business rather than the wire's:
 //!
 //! * the user's APPROVAL of the device authorization, which IAM Identity Center takes at
 //!   the access-portal page and no operation of the OIDC API performs;
 //! * the completion INSTANT of an assignment's asynchronous grant, moved so both sides of
 //!   it can be observed without the suite sleeping — the status itself is still derived by
-//!   IAM Identity Center, exactly as in production.
+//!   IAM Identity Center, exactly as in production;
+//! * the MINT of an identity-bound access token, written through the mint's own writer
+//!   (`issue_identity_bound_token`, the one `CreateTokenWithIAM`'s JWT-bearer exchange
+//!   calls): the assertion such an exchange spends is signed by a token issuer outside
+//!   this suite's four services, and what the portal reads is the mint's record of the
+//!   token either way.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -34,6 +40,7 @@ use http::{Method, Request, Response, StatusCode};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_identitystore_awsidentitystore as identity_store;
 use service_com_amazonaws_organizations_awsorganizationsv20161128 as organizations;
 use service_com_amazonaws_sso_swbportalservice::state::INVALID_SESSION_MESSAGE;
 use service_com_amazonaws_sso_swbportalservice::EmulatedService as PortalService;
@@ -98,7 +105,8 @@ pub(crate) fn granted() -> Vec<Granted> {
     ]
 }
 
-/// The four services the production router mounts, on one shared engine.
+/// The services the production router mounts, on one shared engine: the portal, the token
+/// mint, IAM Identity Center with its identity store, and Organizations.
 pub(crate) struct Emulator {
     engine: Arc<engine::InMemoryEngine>,
     router: MultiServiceRouter,
@@ -115,6 +123,9 @@ impl Emulator {
         router.register_service(PortalService::new(Arc::clone(&engine)));
         router.register_service(oidc::EmulatedService::new(Arc::clone(&engine)));
         router.register_service(identity_center::EmulatedService::new(Arc::clone(&engine)));
+        // The identity store of that instance: where the users an assignment names and
+        // the groups they are members of live.
+        router.register_service(identity_store::EmulatedService::new(Arc::clone(&engine)));
         router.register_service(organizations::EmulatedService::new(Arc::clone(&engine)));
         Self { engine, router }
     }
@@ -1470,5 +1481,722 @@ async fn logout_ends_a_token_the_exchange_issued_for_the_same_sign_in() {
         ),
         "exchanging the token of a logged-out sign-in must be an invalid grant, got \
          {status} {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// The identity-store PRINCIPAL the mint recorded for a sign-in
+//
+// RULE: a sign-in the emulator records an identity-store principal for is that principal's
+// — the portal "lists all AWS accounts assigned to the user" (`ListAccounts`) and "all
+// roles that are assigned to the user" (`ListAccountRoles`), so it reports the completed
+// assignments naming that user, and those naming a group of its identity store the user is
+// a member of, and no others; and a role credential it mints speaks for that user.
+// ---------------------------------------------------------------------------------------
+
+/// The `X-Amz-Target` prefix of the identity store's `awsJson1_1` front door (that
+/// service's OPERATIONS.md, "Wire protocol").
+const IDENTITY_STORE_TARGET_PREFIX: &str = "AWSIdentityStore";
+
+/// Which principal of the one identity store an administrator made an assignment to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Principal {
+    /// The user the first sign-in's token is bound to.
+    FirstUser,
+    /// That same `UserId` in the other letter case: `PrincipalId` is a GUID whose modelled
+    /// pattern admits either case
+    /// (`smithy_query(query="shape",shape="CreateAccountAssignmentRequest")`), so it names
+    /// the same principal.
+    FirstUserOtherCase,
+    /// A group the first user is a member of.
+    FirstUsersGroup,
+    /// The user the second sign-in's token is bound to.
+    SecondUser,
+    /// A group only the second user is a member of.
+    SecondUsersGroup,
+}
+
+impl Principal {
+    /// Whether this principal is one the FIRST user's sign-in is assigned through.
+    fn is_the_first_users(self) -> bool {
+        match self {
+            Self::FirstUser | Self::FirstUserOtherCase | Self::FirstUsersGroup => true,
+            Self::SecondUser | Self::SecondUsersGroup => false,
+        }
+    }
+
+    /// The `PrincipalType` an assignment to this principal carries — the model's enum is
+    /// `USER | GROUP` (`smithy_query(query="shape",shape="PrincipalType")`).
+    fn principal_type(self) -> &'static str {
+        match self {
+            Self::FirstUser | Self::FirstUserOtherCase | Self::SecondUser => "USER",
+            Self::FirstUsersGroup | Self::SecondUsersGroup => "GROUP",
+        }
+    }
+}
+
+/// One assignment the administrator of the fixture's instance made.
+struct AssignedRow {
+    label: &'static str,
+    /// `TargetId`, modelled `^\d{12}$`.
+    account_id: &'static str,
+    /// The permission set's `Name` — modelled `^[\w+=,.@-]+$`, length 1..32 — which is the
+    /// role name the portal reports for this assignment.
+    role: &'static str,
+    principal: Principal,
+    /// Whether the asynchronous grant has completed. A grant still running is in force for
+    /// nobody, whichever principal it names.
+    granted: bool,
+}
+
+/// The assignments the rule is asserted over: the rows differ in which principal they name
+/// (either user, a group of either user, and a user's id in the other letter case), in
+/// whether their grant has completed, and in whether the account they are made in carries
+/// an assignment of the other user as well.
+const ASSIGNED: &[AssignedRow] = &[
+    AssignedRow {
+        label: "the first user itself",
+        account_id: "111111111111",
+        role: "AdministratorAccess",
+        principal: Principal::FirstUser,
+        granted: true,
+    },
+    AssignedRow {
+        // The issue's own case: one account, two principals, one sign-in.
+        label: "the second user, in an account the first user is assigned in too",
+        account_id: "111111111111",
+        role: "Break-Glass_2",
+        principal: Principal::SecondUser,
+        granted: true,
+    },
+    AssignedRow {
+        label: "a group the first user is a member of",
+        account_id: "222222222222",
+        role: "ReadOnly",
+        principal: Principal::FirstUsersGroup,
+        granted: true,
+    },
+    AssignedRow {
+        label: "the first user, named by its id in the other letter case",
+        account_id: "222222222222",
+        role: "Audit_1",
+        principal: Principal::FirstUserOtherCase,
+        granted: true,
+    },
+    AssignedRow {
+        label: "a group the first user is not a member of",
+        account_id: "333333333333",
+        role: "Billing-Audit",
+        principal: Principal::SecondUsersGroup,
+        granted: true,
+    },
+    AssignedRow {
+        label: "the second user, in an account only it is assigned in",
+        account_id: "999999999999",
+        role: "ZZZ-Break.Glass",
+        principal: Principal::SecondUser,
+        granted: true,
+    },
+    AssignedRow {
+        label: "the first user, with the grant still running",
+        account_id: "444444444444",
+        role: "PendingAccess",
+        principal: Principal::FirstUser,
+        granted: false,
+    },
+];
+
+impl Emulator {
+    /// Call one identity-store (`awsJson1_1`) operation the way a client does.
+    async fn identity_store(&self, operation: &str, body: &Value) -> (u16, Value) {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/")
+            .header("content-type", "application/x-amz-json-1.1")
+            .header(
+                "x-amz-target",
+                format!("{IDENTITY_STORE_TARGET_PREFIX}.{operation}"),
+            )
+            .header("host", format!("identitystore.{REGION}.amazonaws.com"))
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 \
+                     Credential=AKIDEXAMPLE/20260101/{REGION}/identitystore/aws4_request, \
+                     SignedHeaders=host;x-amz-date, Signature=0"
+                ),
+            )
+            .body(Bytes::from(body.to_string()))
+            .expect("the test built a well-formed request");
+        parsed(self.router.dispatch(request).await)
+    }
+
+    /// Create one user of the instance's identity store and answer its `UserId`.
+    async fn identity_store_user(&self, identity_store_id: &str, user_name: &str) -> String {
+        let (status, body) = self
+            .identity_store(
+                "CreateUser",
+                &json!({"IdentityStoreId": identity_store_id, "UserName": user_name}),
+            )
+            .await;
+        assert_eq!(status, 200, "CreateUser({user_name}) answered {status} {body}");
+        text(&body, "UserId")
+    }
+
+    /// Create one group of that identity store and answer its `GroupId`.
+    async fn identity_store_group(&self, identity_store_id: &str, display_name: &str) -> String {
+        let (status, body) = self
+            .identity_store(
+                "CreateGroup",
+                &json!({"IdentityStoreId": identity_store_id, "DisplayName": display_name}),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "CreateGroup({display_name}) answered {status} {body}"
+        );
+        text(&body, "GroupId")
+    }
+
+    /// Make `user_id` a member of `group_id` and answer the `MembershipId` of the
+    /// membership that records it.
+    async fn group_membership(
+        &self,
+        identity_store_id: &str,
+        group_id: &str,
+        user_id: &str,
+    ) -> String {
+        let (status, body) = self
+            .identity_store(
+                "CreateGroupMembership",
+                &json!({
+                    "IdentityStoreId": identity_store_id,
+                    "GroupId": group_id,
+                    "MemberId": {"UserId": user_id},
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "CreateGroupMembership({group_id}, {user_id}) answered {status} {body}"
+        );
+        text(&body, "MembershipId")
+    }
+
+    /// End the membership `membership_id` records, the way an administrator does.
+    async fn end_group_membership(&self, identity_store_id: &str, membership_id: &str) {
+        let (status, body) = self
+            .identity_store(
+                "DeleteGroupMembership",
+                &json!({
+                    "IdentityStoreId": identity_store_id,
+                    "MembershipId": membership_id,
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "DeleteGroupMembership({membership_id}) answered {status} {body}"
+        );
+    }
+
+    /// Create the OAuth 2.0 customer managed application a token exchange is made for, and
+    /// answer its `ApplicationArn`.
+    ///
+    /// `CreateApplication` makes "an OAuth 2.0 customer managed application", so the
+    /// provider it runs under is one of the published catalog that backs such an
+    /// application; which entries those are is IAM Identity Center's answer, so the
+    /// catalog is enumerated and the first entry that accepts the create is used.
+    async fn application(&self, instance_arn: &str) -> String {
+        let (status, body) = self.admin("ListApplicationProviders", &json!({})).await;
+        assert_eq!(
+            status, 200,
+            "ListApplicationProviders answered {status} {body}"
+        );
+        let providers = body["ApplicationProviders"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !providers.is_empty(),
+            "the published application-provider catalog must not be empty: {body}"
+        );
+        for provider in &providers {
+            let provider_arn = text(provider, "ApplicationProviderArn");
+            let (status, body) = self
+                .admin(
+                    "CreateApplication",
+                    &json!({
+                        "InstanceArn": instance_arn,
+                        "ApplicationProviderArn": provider_arn,
+                        "Name": "emulator-test-application",
+                    }),
+                )
+                .await;
+            if status == 200 {
+                return text(&body, "ApplicationArn");
+            }
+        }
+        panic!("no published application provider accepted a customer managed application");
+    }
+
+    /// Create the trusted token issuer whose assertions the exchange below spends, and
+    /// answer its `TrustedTokenIssuerArn`.
+    async fn trusted_token_issuer(&self, instance_arn: &str) -> String {
+        let (status, body) = self
+            .admin(
+                "CreateTrustedTokenIssuer",
+                &json!({
+                    "InstanceArn": instance_arn,
+                    "Name": "emulator-test-issuer",
+                    "TrustedTokenIssuerType": "OIDC_JWT",
+                    "TrustedTokenIssuerConfiguration": {
+                        "OidcJwtConfiguration": {
+                            "IssuerUrl": "https://issuer.emulator.test/oidc",
+                            "ClaimAttributePath": "email",
+                            "IdentityStoreAttributePath": "emails.value",
+                            "JwksRetrievalOption": "OPEN_ID_DISCOVERY",
+                        },
+                    },
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "CreateTrustedTokenIssuer answered {status} {body}"
+        );
+        text(&body, "TrustedTokenIssuerArn")
+    }
+
+    /// An access token the emulator's own mint BOUND to one identity-store user: the record
+    /// `CreateTokenWithIAM`'s JWT-bearer exchange writes for the user whose assertion it
+    /// spent (`issue_identity_bound_token`), which is what the portal reads.
+    fn identity_bound_token(
+        &self,
+        bound_to: &oidc::state::BoundIdentity,
+        issued_to: &str,
+    ) -> String {
+        let state =
+            oidc::state::service_state(&*self.engine).expect("the OIDC store is reachable");
+        let mut state = state.lock();
+        state
+            .issue_identity_bound_token(
+                issued_to,
+                REGION,
+                Vec::new(),
+                bound_to.clone(),
+                SystemTime::now(),
+            )
+            .access_token
+    }
+
+    /// Put each grant made so far where the fixture says it stands: the grant of a
+    /// permission set in `completed` in the past, every other grant an hour out.
+    ///
+    /// Moving that INSTANT is the clock's business rather than the wire's (see
+    /// [`Self::grants_complete_at`]); an hour is far enough out that no case depends on how
+    /// fast the suite runs.
+    fn grants_settled(&self, completed: &[String]) {
+        let state = identity_center::state::service_state(&*self.engine)
+            .expect("the IAM Identity Center store is reachable");
+        let mut state = state.lock();
+        let running: Vec<String> = state
+            .account_assignments
+            .iter()
+            .filter(|row| !completed.contains(&row.permission_set_arn))
+            .map(|row| row.request_id.clone())
+            .collect();
+        let now = SystemTime::now();
+        for (request_id, operation) in &mut state.assignment_operations {
+            operation.succeeded_due = if running.contains(request_id) {
+                now + Duration::from_secs(3600)
+            } else {
+                now - Duration::from_secs(1)
+            };
+        }
+    }
+}
+
+/// An emulator whose one identity store holds two users and two groups, whose IAM Identity
+/// Center holds every row of [`ASSIGNED`], and which has minted an identity-bound access
+/// token for each user.
+struct IdentityBound {
+    emulator: Emulator,
+    instance_arn: String,
+    identity_store_id: String,
+    /// The `UserId` of the first user, and the token bound to it.
+    first_user: String,
+    first_token: String,
+    /// The same for the second user.
+    second_user: String,
+    second_token: String,
+    /// The `GroupId` of the group each user is a member of.
+    first_group: String,
+    second_group: String,
+    /// The application the exchange was made for, whose ARN the mint records as the token's
+    /// `clientId`.
+    application_arn: String,
+    /// The permission-set ARN of each row of [`ASSIGNED`], in row order.
+    permission_sets: Vec<String>,
+}
+
+impl IdentityBound {
+    /// The `PrincipalId` an assignment to `principal` names.
+    fn principal_id(&self, principal: Principal) -> String {
+        match principal {
+            Principal::FirstUser => self.first_user.clone(),
+            Principal::FirstUserOtherCase => self.first_user.to_ascii_uppercase(),
+            Principal::FirstUsersGroup => self.first_group.clone(),
+            Principal::SecondUser => self.second_user.clone(),
+            Principal::SecondUsersGroup => self.second_group.clone(),
+        }
+    }
+
+    /// The token of the sign-in of the first user, or of the second.
+    fn token(&self, the_first_users_sign_in: bool) -> &str {
+        if the_first_users_sign_in {
+            &self.first_token
+        } else {
+            &self.second_token
+        }
+    }
+
+    /// The roles one sign-in must be reported in `account_id`: the roles of the completed
+    /// rows whose principal that sign-in's user is assigned through, ascending.
+    fn expected_roles(&self, the_first_users_sign_in: bool, account_id: &str) -> Vec<String> {
+        let mut roles: Vec<String> = ASSIGNED
+            .iter()
+            .filter(|row| {
+                row.account_id == account_id
+                    && row.granted
+                    && row.principal.is_the_first_users() == the_first_users_sign_in
+            })
+            .map(|row| row.role.to_string())
+            .collect();
+        roles.sort();
+        roles
+    }
+
+    /// Every account any row of [`ASSIGNED`] names, ascending — the accounts a sign-in may
+    /// be reported, and the ones it must be refused.
+    fn accounts() -> Vec<String> {
+        let mut accounts: Vec<String> = ASSIGNED
+            .iter()
+            .map(|row| row.account_id.to_string())
+            .collect();
+        accounts.sort();
+        accounts.dedup();
+        accounts
+    }
+}
+
+/// Stand up [`IdentityBound`]: one directory, two users in it, two groups, the assignments
+/// of [`ASSIGNED`], and an identity-bound token for each user.
+async fn identity_bound_emulator() -> IdentityBound {
+    let emulator = Emulator::new();
+    emulator.create_organization();
+    let (instance_arn, identity_store_id) = emulator.instance().await;
+    let application_arn = emulator.application(&instance_arn).await;
+    let trusted_token_issuer_arn = emulator.trusted_token_issuer(&instance_arn).await;
+
+    let first_user = emulator
+        .identity_store_user(&identity_store_id, "first-user")
+        .await;
+    let second_user = emulator
+        .identity_store_user(&identity_store_id, "second-user")
+        .await;
+    let first_group = emulator
+        .identity_store_group(&identity_store_id, "first-users-group")
+        .await;
+    let second_group = emulator
+        .identity_store_group(&identity_store_id, "second-users-group")
+        .await;
+    emulator
+        .group_membership(&identity_store_id, &first_group, &first_user)
+        .await;
+    emulator
+        .group_membership(&identity_store_id, &second_group, &second_user)
+        .await;
+
+    let bound = |user_id: &str| oidc::state::BoundIdentity {
+        instance_arn: instance_arn.clone(),
+        identity_store_id: identity_store_id.clone(),
+        user_id: user_id.to_string(),
+        trusted_token_issuer_arn: trusted_token_issuer_arn.clone(),
+    };
+    let first_token = emulator.identity_bound_token(&bound(&first_user), &application_arn);
+    let second_token = emulator.identity_bound_token(&bound(&second_user), &application_arn);
+
+    let mut fixture = IdentityBound {
+        emulator,
+        instance_arn,
+        identity_store_id,
+        first_user,
+        first_token,
+        second_user,
+        second_token,
+        first_group,
+        second_group,
+        application_arn,
+        permission_sets: Vec::new(),
+    };
+
+    for row in ASSIGNED {
+        let permission_set_arn = fixture
+            .emulator
+            .permission_set(&fixture.instance_arn, row.role)
+            .await;
+        let (status, body) = fixture
+            .emulator
+            .admin(
+                "CreateAccountAssignment",
+                &json!({
+                    "InstanceArn": fixture.instance_arn,
+                    "TargetId": row.account_id,
+                    "TargetType": "AWS_ACCOUNT",
+                    "PermissionSetArn": permission_set_arn,
+                    "PrincipalType": row.principal.principal_type(),
+                    "PrincipalId": fixture.principal_id(row.principal),
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: CreateAccountAssignment answered {status} {body}",
+            row.label
+        );
+        fixture.permission_sets.push(permission_set_arn);
+    }
+    let completed: Vec<String> = ASSIGNED
+        .iter()
+        .zip(&fixture.permission_sets)
+        .filter(|(row, _)| row.granted)
+        .map(|(_, arn)| arn.clone())
+        .collect();
+    fixture.emulator.grants_settled(&completed);
+    fixture
+}
+
+/// RULE: the accounts and roles an identity-bound sign-in reports are the completed
+/// assignments naming its own principal — the user, or a group of its identity store the
+/// user is a member of — and a role it is not assigned vends no credential.
+#[tokio::test]
+async fn an_identity_bound_sign_in_reports_only_its_own_principals_assignments() {
+    let bound = identity_bound_emulator().await;
+    let emulator = &bound.emulator;
+
+    for the_first_users_sign_in in [true, false] {
+        let case = if the_first_users_sign_in {
+            "the first user's sign-in"
+        } else {
+            "the second user's sign-in"
+        };
+        let token = bound.token(the_first_users_sign_in);
+
+        let mut expected_accounts: Vec<String> = IdentityBound::accounts()
+            .into_iter()
+            .filter(|account_id| {
+                !bound
+                    .expected_roles(the_first_users_sign_in, account_id)
+                    .is_empty()
+            })
+            .collect();
+        expected_accounts.sort();
+        let (status, body) = emulator.list_accounts(token).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "case {case:?}: ListAccounts must succeed, got {status} {body}"
+        );
+        assert_eq!(
+            reported_accounts(&body),
+            expected_accounts,
+            "case {case:?}: expected the accounts assigned to this sign-in's principal \
+             ({expected_accounts:?}), got {body}"
+        );
+
+        for account_id in IdentityBound::accounts() {
+            let expected = bound.expected_roles(the_first_users_sign_in, &account_id);
+            let (status, body) = emulator.list_account_roles(token, &account_id).await;
+            if expected.is_empty() {
+                assert_eq!(
+                    (status, error_code(&body).as_str()),
+                    (StatusCode::NOT_FOUND, "ResourceNotFoundException"),
+                    "case {case:?} in {account_id:?}: an account no assignment of this \
+                     principal names must be absent, got {status} {body}"
+                );
+            } else {
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "case {case:?} in {account_id:?}: ListAccountRoles must succeed, got \
+                     {status} {body}"
+                );
+                assert_eq!(
+                    reported_roles(&body),
+                    expected,
+                    "case {case:?} in {account_id:?}: expected {expected:?}, got {body}"
+                );
+            }
+
+            // And a role vends a credential exactly where the listing reports it: every
+            // role ANY principal is assigned in the account is asked for.
+            for row in ASSIGNED.iter().filter(|row| row.account_id == account_id) {
+                let (status, body) = emulator
+                    .role_credentials(token, &account_id, row.role)
+                    .await;
+                if expected.contains(&row.role.to_string()) {
+                    assert_eq!(
+                        status,
+                        StatusCode::OK,
+                        "case {case:?} / {:?}: an assigned role must vend credentials, got \
+                         {status} {body}",
+                        row.label
+                    );
+                } else {
+                    assert_eq!(
+                        (status, error_code(&body).as_str()),
+                        (StatusCode::NOT_FOUND, "ResourceNotFoundException"),
+                        "case {case:?} / {:?}: a role this principal is not assigned must \
+                         be absent, got {status} {body}",
+                        row.label
+                    );
+                }
+            }
+        }
+    }
+
+    // The grant is the other half of the rule, and the principal filter leaves it alone:
+    // the row whose grant was still running is reported once the clock makes it due.
+    let still_running = ASSIGNED
+        .iter()
+        .position(|row| !row.granted)
+        .expect("the fixture holds a grant that has not completed");
+    emulator.grants_settled(&bound.permission_sets);
+    let row = &ASSIGNED[still_running];
+    let (status, body) = emulator
+        .list_account_roles(&bound.first_token, row.account_id)
+        .await;
+    assert_eq!(
+        (status, reported_roles(&body)),
+        (StatusCode::OK, vec![row.role.to_string()]),
+        "case {:?}: a completed grant to this sign-in's own user must be reported, got \
+         {status} {body}",
+        row.label
+    );
+}
+
+/// RULE: the subject a role credential speaks for is the identity the mint recorded for the
+/// sign-in it was issued to — the identity-store user for a token bound to one, and the
+/// registration the token was issued to for a token that records no user.
+#[tokio::test]
+async fn a_minted_credential_speaks_for_the_identity_the_mint_recorded() {
+    let bound = identity_bound_emulator().await;
+    let emulator = &bound.emulator;
+
+    let device_flow = emulator.minted_sign_in(&bound.identity_store_id).await;
+    // `(the case, the token, the subject the mint recorded for it, the row whose role it
+    // may ask credentials for)`. A sign-in may only be vended a role its own principal is
+    // assigned, so each identity-bound case names its own row; the device-flow token
+    // records no principal to narrow by, so any granted row serves it.
+    let cases: &[(&str, &str, &str, &AssignedRow)] = &[
+        (
+            "a token bound to the first identity-store user",
+            bound.first_token.as_str(),
+            bound.first_user.as_str(),
+            &ASSIGNED[0],
+        ),
+        (
+            "a token bound to the second identity-store user",
+            bound.second_token.as_str(),
+            bound.second_user.as_str(),
+            &ASSIGNED[1],
+        ),
+        (
+            "a token of a grant that authenticated only a client",
+            device_flow.access_token.as_str(),
+            device_flow.client_id.as_str(),
+            &ASSIGNED[0],
+        ),
+    ];
+
+    for (case, token, expected_subject, row) in cases {
+        let (status, body) = emulator
+            .role_credentials(token, row.account_id, row.role)
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "case {case:?}: GetRoleCredentials must succeed, got {status} {body}"
+        );
+        let access_key_id = text(&body["roleCredentials"], "accessKeyId");
+        let subject = emulator.signed_in_subject(&access_key_id);
+        assert_eq!(
+            subject.as_deref(),
+            Some(*expected_subject),
+            "case {case:?}: the credential must speak for the identity the mint recorded, \
+             got {subject:?}"
+        );
+        assert_ne!(
+            subject.as_deref(),
+            Some(bound.application_arn.as_str()),
+            "case {case:?}: the subject must not be the application the token was issued \
+             to, got {subject:?}"
+        );
+    }
+}
+
+/// RULE: which groups a user is a member of is the identity store's own record, read on
+/// every request — so joining a group puts its assignments in force for that sign-in at
+/// the next request, and leaving it withdraws them, with nothing to propagate.
+#[tokio::test]
+async fn a_group_membership_decides_what_a_sign_in_sees_at_the_next_request() {
+    let bound = identity_bound_emulator().await;
+    let emulator = &bound.emulator;
+    // The row assigned to the group only the SECOND user is a member of, so the first
+    // user's sign-in is not assigned through it to begin with.
+    let row = ASSIGNED
+        .iter()
+        .find(|row| row.principal == Principal::SecondUsersGroup)
+        .expect("the fixture holds an assignment to a group of the other user");
+
+    let (status, body) = emulator
+        .list_account_roles(&bound.first_token, row.account_id)
+        .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (StatusCode::NOT_FOUND, "ResourceNotFoundException"),
+        "case \"before the membership\": an account only another principal is assigned in \
+         must be absent, got {status} {body}"
+    );
+
+    let membership = emulator
+        .group_membership(
+            &bound.identity_store_id,
+            &bound.second_group,
+            &bound.first_user,
+        )
+        .await;
+    let (status, body) = emulator
+        .list_account_roles(&bound.first_token, row.account_id)
+        .await;
+    assert_eq!(
+        (status, reported_roles(&body)),
+        (StatusCode::OK, vec![row.role.to_string()]),
+        "case \"after joining the group\": the group's assignment must be in force, got \
+         {status} {body}"
+    );
+
+    emulator
+        .end_group_membership(&bound.identity_store_id, &membership)
+        .await;
+    let (status, body) = emulator
+        .list_account_roles(&bound.first_token, row.account_id)
+        .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (StatusCode::NOT_FOUND, "ResourceNotFoundException"),
+        "case \"after leaving the group\": the group's assignment must stop being in \
+         force, got {status} {body}"
     );
 }

@@ -10,7 +10,7 @@
 //! carrying a copy apiece that can drift. How a request the boundary validator refused
 //! is WORDED lives in `crate::service::validation`, beside the seam that answers it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -785,6 +785,25 @@ impl IdentityStoreData {
             .get(group_id)
             .map(|ids| ids.iter().filter_map(|id| self.memberships.get(id)).collect())
             .unwrap_or_default()
+    }
+
+    /// The `GroupId` of every group this store records `member_id` as a member of, each
+    /// keyed the way this store keys a resource id ([`resource_key`]), so `member_id` is
+    /// accepted in either of the forms that name the same user.
+    ///
+    /// The member side of a membership as a SET of groups, for a reader asking which groups
+    /// a user belongs to rather than for the membership records themselves
+    /// (`ListGroupMembershipsForMember` is that reader's paged form, and
+    /// `IsMemberInGroups` the one-group question): the two membership indexes this walks
+    /// are this store's own, so a reader outside it does not depend on their layout.
+    pub fn groups_of_member(&self, member_id: &str) -> BTreeSet<String> {
+        self.memberships_by_member
+            .get(&resource_key(member_id))
+            .into_iter()
+            .flatten()
+            .filter_map(|membership_id| self.memberships.get(membership_id))
+            .map(|membership| resource_key(&membership.group_id))
+            .collect()
     }
 }
 
