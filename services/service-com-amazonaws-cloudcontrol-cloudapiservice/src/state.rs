@@ -464,7 +464,8 @@ impl From<NativeRefusal> for EffectFailure {
             NativeRefusal::AlreadyExists => Self::ResourceExists,
             NativeRefusal::AtCapacity(detail)
             | NativeRefusal::Invalid(detail)
-            | NativeRefusal::Rejected(detail) => Self::Owning {
+            | NativeRefusal::Rejected(detail)
+            | NativeRefusal::Denied(detail) => Self::Owning {
                 code: refusal.handler_error_code(),
                 detail: detail.clone(),
             },
@@ -480,7 +481,9 @@ impl EffectFailure {
     /// ([`native::downstream_failure`]) rather than in the downstream service's words: the
     /// handler does not relay that service's diagnosis, so neither does the request's
     /// terminal event. Every other refusal is the handler's own verdict and keeps its own
-    /// wording ([`Self::from`]).
+    /// wording ([`Self::from`]) — an AUTHORIZATION denial among them, which is a decided
+    /// verdict about the call rather than an error that mapped to nothing, so the sentence
+    /// the refusing service states is what the terminal event carries.
     fn of(
         refusal: NativeRefusal,
         provider: &dyn native::NativeResourceProvider,

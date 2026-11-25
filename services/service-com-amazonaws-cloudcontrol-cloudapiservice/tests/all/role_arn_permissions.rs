@@ -8,10 +8,13 @@
 //! operation. The role specified must have the permissions required for this operation"
 //! (`CreateResource$RoleArn`) — so when the identity-based policies in force on that role do
 //! not allow the owning service's call the type's handler has to make, the request reaches a
-//! terminal `FAILED` `ProgressEvent` carrying the handler error code for an error the
-//! downstream service raised, and the owning service's resource is left exactly as it was.**
+//! terminal `FAILED` `ProgressEvent` carrying the handler error code for a call that was not
+//! authorized, and the owning service's resource is left exactly as it was.**
 //! A `SUCCESS` means the call happened, which is why a request the role could not have made
 //! must not report one.
+//!
+//! WHICH code that is, and the sentence beside it, are `denied_call_classification`'s rule;
+//! this suite holds the PERMISSION question itself through those same expectations.
 //!
 //! The rows differ along what the rule generalises over: which resource operation the
 //! request is (create, update, delete), which of IAM's rules withholds the grant (an
@@ -23,7 +26,8 @@
 
 use serde_json::{json, Value};
 
-use super::emulator::{element, progress, text, Emulator, STATUS_FAILED, STATUS_SUCCESS};
+use super::denied_call_classification::{assert_denied, Withheld};
+use super::emulator::{element, progress, text, Emulator, STATUS_SUCCESS};
 
 /// The type whose resources live in the Systems Manager service's own store.
 const PARAMETER: &str = "AWS::SSM::Parameter";
@@ -32,12 +36,6 @@ const PARAMETER: &str = "AWS::SSM::Parameter";
 /// the rule on a SECOND owning service.
 const LOG_GROUP: &str = "AWS::Logs::LogGroup";
 
-/// The `HandlerErrorCode` a request refused downstream reports: the owning service raised an
-/// error of its own that the type's handler maps to no other code, which is what
-/// "GeneralServiceException" stands for among the values the model's own `HandlerErrorCode`
-/// enum declares (`smithy_query(query="shape",shape="HandlerErrorCode")`).
-const GENERAL_SERVICE_EXCEPTION: &str = "GeneralServiceException";
-
 /// The error code Systems Manager answers for a parameter it does not hold.
 const PARAMETER_NOT_FOUND: &str = "ParameterNotFound";
 
@@ -45,7 +43,7 @@ const PARAMETER_NOT_FOUND: &str = "ParameterNotFound";
 const POLICY_VERSION: &str = "2012-10-17";
 
 /// A policy document stating one `effect` over `actions` and `resources`.
-fn one_statement(effect: &str, actions: Value, resources: Value) -> Value {
+pub(crate) fn one_statement(effect: &str, actions: Value, resources: Value) -> Value {
     json!({
         "Version": POLICY_VERSION,
         "Statement": [{ "Effect": effect, "Action": actions, "Resource": resources }],
@@ -54,7 +52,7 @@ fn one_statement(effect: &str, actions: Value, resources: Value) -> Value {
 
 /// A policy document that allows `allowed` everywhere and explicitly denies `denied`
 /// everywhere — the shape of a service role scoped by an explicit deny.
-fn allow_but_deny(allowed: Value, denied: Value) -> Value {
+pub(crate) fn allow_but_deny(allowed: Value, denied: Value) -> Value {
     json!({
         "Version": POLICY_VERSION,
         "Statement": [
@@ -77,7 +75,7 @@ fn trusts_cloud_control() -> Value {
 }
 
 /// One IAM call, required to succeed, answering the XML envelope it reported.
-async fn iam_ok(emulator: &Emulator, action: &str, params: &[(&str, &str)]) -> String {
+pub(crate) async fn iam_ok(emulator: &Emulator, action: &str, params: &[(&str, &str)]) -> String {
     let (status, body) = emulator.iam(action, params).await;
     assert_eq!(
         status, 200,
@@ -86,9 +84,10 @@ async fn iam_ok(emulator: &Emulator, action: &str, params: &[(&str, &str)]) -> S
     body
 }
 
-/// Create the role `name` carrying `policy` as its one inline policy, answering the ARN IAM
-/// assigned it — the value a request's `RoleArn` names.
-async fn role_with(emulator: &Emulator, name: &str, policy: &Value) -> String {
+/// Create the role `name` carrying NO policy at all, answering the ARN IAM assigned it — a
+/// role that may make no call of any service, which is the state a freshly created role is
+/// in until something is attached to it.
+pub(crate) async fn bare_role(emulator: &Emulator, name: &str) -> String {
     let created = iam_ok(
         emulator,
         "CreateRole",
@@ -106,6 +105,13 @@ async fn role_with(emulator: &Emulator, name: &str, policy: &Value) -> String {
         !arn.is_empty(),
         "role {name:?}: IAM must report the ARN it assigned, got {created}"
     );
+    arn
+}
+
+/// Create the role `name` carrying `policy` as its one inline policy, answering the ARN IAM
+/// assigned it — the value a request's `RoleArn` names.
+pub(crate) async fn role_with(emulator: &Emulator, name: &str, policy: &Value) -> String {
+    let arn = bare_role(emulator, name).await;
     iam_ok(
         emulator,
         "PutRolePolicy",
@@ -121,21 +127,24 @@ async fn role_with(emulator: &Emulator, name: &str, policy: &Value) -> String {
 
 /// Start `operation` with `request` and wait for the terminal `ProgressEvent` of the resource
 /// operation request it accepted.
-async fn terminal_event(emulator: &Emulator, case: &str, operation: &str, request: Value) -> Value {
+pub(crate) async fn terminal_event(
+    emulator: &Emulator,
+    case: &str,
+    operation: &str,
+    request: Value,
+) -> Value {
     let (status, body) = emulator.cc(operation, request).await;
     assert_eq!(
         status, 200,
         "case {case:?}: {operation} expected HTTP 200, got {status} with body {body:?}"
     );
     let accepted = progress(&body);
-    emulator
-        .terminal(&text(&accepted, "RequestToken"))
-        .await
+    emulator.terminal(&text(&accepted, "RequestToken")).await
 }
 
 /// The `CreateResource` request for `type_name` and `desired`, carrying `role_arn` when the
 /// case names one.
-fn create_request(type_name: &str, desired: &Value, role_arn: Option<&str>) -> Value {
+pub(crate) fn create_request(type_name: &str, desired: &Value, role_arn: Option<&str>) -> Value {
     let mut request = json!({
         "TypeName": type_name,
         "DesiredState": desired.to_string(),
@@ -144,30 +153,6 @@ fn create_request(type_name: &str, desired: &Value, role_arn: Option<&str>) -> V
         request["RoleArn"] = json!(role_arn);
     }
     request
-}
-
-/// Hold a terminal event to the refusal the rule states: `FAILED`, the handler error code for
-/// an error the downstream service raised, and the sentence a handler states for such an
-/// error — whose one variable part is the OWNING service's API operation the handler was
-/// making, named by `call`.
-fn assert_denied(case: &str, event: &Value, call: &str) {
-    assert_eq!(
-        text(event, "OperationStatus"),
-        STATUS_FAILED,
-        "case {case:?}: a call the role may not make must fail the request, got {event:?}"
-    );
-    assert_eq!(
-        text(event, "ErrorCode"),
-        GENERAL_SERVICE_EXCEPTION,
-        "case {case:?}: expected the {GENERAL_SERVICE_EXCEPTION} handler error code, got \
-         {event:?}"
-    );
-    let message = text(event, "StatusMessage");
-    let expected = format!("Error occurred during operation '{call}'.");
-    assert_eq!(
-        message, expected,
-        "case {case:?}: expected the status message {expected:?}, got {message:?}"
-    );
 }
 
 /// The `Parameter` Systems Manager's own read reports for `name`, or `None` when it holds
@@ -186,14 +171,15 @@ async fn native_parameter(emulator: &Emulator, case: &str, name: &str) -> Option
 }
 
 /// One row of the denial table: the case, the policy in force on the role, the operation the
-/// request is, whether the parameter is already there, and the OWNING service's API operation
-/// the handler would have been refused on.
+/// request is, whether the parameter is already there, the OWNING service's API action the
+/// handler would have been refused on, and which of IAM's rules withheld the grant.
 struct Denial {
     case: &'static str,
     policy: Value,
     operation: &'static str,
     existing: bool,
-    call: &'static str,
+    action: &'static str,
+    withheld: Withheld,
 }
 
 /// A request naming a role whose policies do not allow the call the handler has to make
@@ -210,14 +196,16 @@ async fn a_call_the_requests_role_may_not_make_fails_it_and_writes_nothing() {
             policy: allow_but_deny(json!("ssm:*"), json!("ssm:PutParameter")),
             operation: "CreateResource",
             existing: false,
-            call: "PutParameter",
+            action: "ssm:PutParameter",
+            withheld: Withheld::ExplicitDeny,
         },
         Denial {
             case: "a create no statement of the role allows",
             policy: one_statement("Allow", json!("s3:*"), json!("*")),
             operation: "CreateResource",
             existing: false,
-            call: "PutParameter",
+            action: "ssm:PutParameter",
+            withheld: Withheld::NoStatement,
         },
         Denial {
             case: "a create the role is granted the write on another resource only",
@@ -231,21 +219,24 @@ async fn a_call_the_requests_role_may_not_make_fails_it_and_writes_nothing() {
             ),
             operation: "CreateResource",
             existing: false,
-            call: "PutParameter",
+            action: "ssm:PutParameter",
+            withheld: Withheld::NoStatement,
         },
         Denial {
             case: "a patch no statement of the role allows",
             policy: one_statement("Allow", json!("ssm:GetParameter"), json!("*")),
             operation: "UpdateResource",
             existing: true,
-            call: "PutParameter",
+            action: "ssm:PutParameter",
+            withheld: Withheld::NoStatement,
         },
         Denial {
             case: "a delete the role is explicitly denied the removal by",
             policy: allow_but_deny(json!("ssm:*"), json!("ssm:DeleteParameter")),
             operation: "DeleteResource",
             existing: true,
-            call: "DeleteParameter",
+            action: "ssm:DeleteParameter",
+            withheld: Withheld::ExplicitDeny,
         },
     ];
 
@@ -285,7 +276,17 @@ async fn a_call_the_requests_role_may_not_make_fails_it_and_writes_nothing() {
             }),
         };
         let event = terminal_event(&emulator, case, row.operation, request).await;
-        assert_denied(case, &event, row.call);
+        assert_denied(
+            case,
+            &event,
+            &role,
+            row.action,
+            &service_com_amazonaws_ssm_amazonssm::state::parameter_arn(
+                super::emulator::SIGNING_REGION,
+                &name,
+            ),
+            row.withheld,
+        );
 
         // And the owning service holds exactly what it held before: nothing for a create
         // that was refused, and the untouched first version for the other two.
@@ -449,7 +450,17 @@ async fn the_boundary_in_force_on_the_role_caps_what_it_may_do() {
         ),
     )
     .await;
-    assert_denied(case, &event, "PutParameter");
+    assert_denied(
+        case,
+        &event,
+        &role,
+        "ssm:PutParameter",
+        &service_com_amazonaws_ssm_amazonssm::state::parameter_arn(
+            super::emulator::SIGNING_REGION,
+            name,
+        ),
+        Withheld::NoBoundary,
+    );
     assert!(
         native_parameter(&emulator, case, name).await.is_none(),
         "case {case:?}: the refused create must write nothing"
@@ -545,7 +556,18 @@ async fn the_rule_holds_for_every_owning_service_the_calls_are_made_on() {
                 "case {name:?}: the owning service must hold the group, got {held:?}"
             );
         } else {
-            assert_denied(name, &event, "CreateLogGroup");
+            assert_denied(
+                name,
+                &event,
+                &role,
+                "logs:CreateLogGroup",
+                &service_com_amazonaws_cloudwatchlogs_logs_20140328::state::log_group_arn(
+                    super::emulator::SIGNING_REGION,
+                    name,
+                    true,
+                ),
+                Withheld::ExplicitDeny,
+            );
             assert!(
                 held.is_empty(),
                 "case {name:?}: the refused create must write nothing, got {held:?}"

@@ -72,6 +72,12 @@ use ::std::time::{SystemTime, UNIX_EPOCH};
 /// whose call its own API would have refused the same way, is that service's error rather
 /// than the handler's verdict about the model, whichever of them the break is spotted by
 /// here ([`Self::Rejected`] against [`Self::Invalid`]).
+///
+/// A catch-all code is for a verdict that falls under no OTHER member of that enum, so a
+/// refusal the enum does name a member for carries that member instead: an AUTHORIZATION
+/// denial is `AccessDenied` ([`Self::Denied`]), never the code for a downstream error
+/// nothing could classify — the two are distinct members, and which one a failed request
+/// carries is what tells a client whether the failure is permanent until a policy changes.
 #[derive(Debug, PartialEq, Eq)]
 pub enum NativeRefusal {
     /// The owning service holds no such resource.
@@ -93,6 +99,14 @@ pub enum NativeRefusal {
     /// combination it will not take, the resource's own state, a call the credentials the
     /// handler ran with may not make. Carries that service's own diagnostic.
     Rejected(String),
+    /// The call the handler had to make was not AUTHORIZED: the policies in force on the
+    /// identity the handler ran as do not allow it, so the owning service would have refused
+    /// that very call with an authorization error. Carries that refusal's sentence.
+    ///
+    /// This is a decided verdict rather than an error nothing could place
+    /// ([`Self::Rejected`]): a client reading it knows the request cannot succeed until the
+    /// policies change, so retrying it unchanged is pointless.
+    Denied(String),
 }
 
 impl NativeRefusal {
@@ -105,6 +119,7 @@ impl NativeRefusal {
             Self::AtCapacity(_) => HANDLER_ERROR_SERVICE_LIMIT_EXCEEDED,
             Self::Invalid(_) => HANDLER_ERROR_INVALID_REQUEST,
             Self::Rejected(_) => HANDLER_ERROR_GENERAL_SERVICE_EXCEPTION,
+            Self::Denied(_) => HANDLER_ERROR_ACCESS_DENIED,
         }
     }
 }
@@ -117,6 +132,11 @@ pub const HANDLER_ERROR_SERVICE_LIMIT_EXCEEDED: &str = "ServiceLimitExceeded";
 /// the user, rather than anything the owning service was asked and answered
 /// ([`HANDLER_ERROR_GENERAL_SERVICE_EXCEPTION`]).
 pub const HANDLER_ERROR_INVALID_REQUEST: &str = "InvalidRequest";
+
+/// The `HandlerErrorCode` for a call the identity the type's handler ran as was not allowed
+/// to make: the member the model's own enum declares for an authorization denial, which is
+/// what a permission-denied downstream call is reported under.
+pub const HANDLER_ERROR_ACCESS_DENIED: &str = "AccessDenied";
 
 /// The `HandlerErrorCode` for an error the OWNING SERVICE raised that the resource type's
 /// handler maps to none of the others — which is what this code is for: the downstream
@@ -691,6 +711,7 @@ mod tests {
             NativeRefusal::AtCapacity("at the quota".to_string()),
             NativeRefusal::Invalid("not a property of the type".to_string()),
             NativeRefusal::Rejected("the resource is not in a state for this".to_string()),
+            NativeRefusal::Denied("no policy allows the call".to_string()),
         ] {
             let code = refusal.handler_error_code();
             assert!(

@@ -503,6 +503,22 @@ impl Emulator {
         })
     }
 
+    /// The same pairing for `AWS::SQS::Queue`: the service that owns it beside the IAM
+    /// service, so a case can hold a request naming a role to its permissions on the service
+    /// that owns a queue.
+    pub(crate) fn with_sqs_and_iam() -> Self {
+        Self::mounted(|router, engine| {
+            router.register_service(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new(
+                Arc::clone(&engine),
+            ));
+            router.register_service(
+                service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
+                    engine,
+                ),
+            );
+        })
+    }
+
     /// One operation of the Systems Manager service — the OWNING service's own API, the one
     /// a client uses when it is not going through Cloud Control API.
     pub(crate) async fn ssm(&self, operation: &str, body: Value) -> (u16, Value) {

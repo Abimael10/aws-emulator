@@ -15,11 +15,17 @@
 //!
 //! The refusal is the OWNING service's own: its API would have refused that very call the
 //! same way, and the authorization answer is a fact about the call rather than about the
-//! resource model the handler judged — so it is reported as that service's error
-//! ([`NativeRefusal::Rejected`]), in the sentence a handler states for a call of the owning
-//! service that raised an error it maps to no verdict of its own
-//! ([`super::downstream_failure`]), which is the rule this module's neighbours follow for
-//! everything the owning service decides.
+//! resource model the handler judged. What it is reported AS follows from that: an
+//! authorization denial is a verdict the model's `HandlerErrorCode` enum declares a member of
+//! its own for, so the request fails with `AccessDenied` ([`NativeRefusal::Denied`]) and never
+//! with the catch-all for a downstream error the handler could place nowhere — a client
+//! classifying a failed request off that code learns that the work cannot succeed until the
+//! policies in force on the role change, rather than that something downstream may have
+//! glitched. The sentence it carries is the one the owning service refuses such a call with
+//! ([`authz::not_authorized_by_identity_policy`]), named after the SESSION of the role the
+//! call was made as ([`::service_common::iam_role::assumed_role_session_arn`]) and stating
+//! which of IAM's rules withheld the grant, so this service and the owning service cannot
+//! word one decision two ways.
 //!
 //! The pieces, each held in exactly one place:
 //!
@@ -54,6 +60,15 @@ use ::service_common::iam_authorization::{self as authz, Decision};
 
 use super::{IamState, NativeRefusal, NativeResourceProvider};
 
+/// The name of the SESSION this service's handler calls are made under.
+///
+/// A role is never acted AS: a service handed one assumes it and makes its calls as a
+/// session of it, and the permissions in force on that session are the role's. So the
+/// identity an authorization refusal of such a call is about is
+/// `arn:<partition>:sts::<account>:assumed-role/<role name>/<this name>`, which is what the
+/// sentence below names rather than the role's own ARN.
+const SESSION_NAME: &str = "AWSCloudControlAPI";
+
 /// The account's roles, as this service reads them: a handle to the IAM store in the SAME
 /// shared engine, so a request is judged against the records IAM's own handlers wrote.
 ///
@@ -83,6 +98,13 @@ impl RolePermissions {
     /// the handler makes them all, so a role without one of them cannot carry the operation
     /// out. The refusal is about the FIRST such call, which is the one the handler would have
     /// been refused on.
+    ///
+    /// It is an authorization verdict ([`NativeRefusal::Denied`]), stated in the sentence the
+    /// owning service refuses such a call with: the session the call was made as, the action
+    /// it asked for as that service words an action in its own refusals
+    /// ([`authz::reported_action`]), the resource it was taken on, and which of IAM's rules
+    /// withheld the grant — an explicit `Deny`, no statement at all, or the ceiling the
+    /// permissions boundary sets.
     pub fn refusal(
         &self,
         role_arn: Option<&str>,
@@ -118,22 +140,34 @@ impl RolePermissions {
             .permissions_boundary_document(role_arn)
             .map(|document| authz::PreparedDocument::read(&document));
         for call in calls {
+            let action = authz::reported_action(call);
             let request = authz::Request::new(call, &resource, &[]);
-            let allowed = match authz::identity_decision_prepared(&documents, &request) {
-                Decision::Denied | Decision::NotStated => false,
+            let reason = match authz::identity_decision_prepared(&documents, &request) {
+                Decision::Denied => authz::IDENTITY_POLICY_EXPLICIT_DENY.to_string(),
+                Decision::NotStated => authz::no_identity_policy_allows(&action),
                 // The ceiling attached to the role caps what its own policies grant, so a
                 // call the boundary does not allow is withheld however widely the role is
                 // granted it.
-                Decision::Allowed => boundary.as_ref().is_none_or(|boundary| {
-                    authz::identity_decision_prepared(
+                Decision::Allowed => {
+                    let Some(boundary) = boundary.as_ref() else {
+                        continue;
+                    };
+                    match authz::identity_decision_prepared(
                         ::std::slice::from_ref(boundary),
                         &request,
-                    ) == Decision::Allowed
-                }),
+                    ) {
+                        Decision::Allowed => continue,
+                        Decision::Denied => authz::PERMISSIONS_BOUNDARY_EXPLICIT_DENY.to_string(),
+                        Decision::NotStated => authz::no_permissions_boundary_allows(&action),
+                    }
+                }
             };
-            if !allowed {
-                return Some(NativeRefusal::Rejected(super::downstream_failure(call)));
-            }
+            // The identity the call was made as is what its refusal is about.
+            let principal =
+                ::service_common::iam_role::assumed_role_session_arn(role_arn, SESSION_NAME);
+            return Some(NativeRefusal::Denied(
+                authz::not_authorized_by_identity_policy(&principal, &action, &resource, &reason),
+            ));
         }
         None
     }
