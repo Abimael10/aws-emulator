@@ -668,6 +668,68 @@ where
     set
 }
 
+/// Whether two stored tag sets are the SAME set: the same keys, each carrying
+/// the same value.
+///
+/// Both sides are [`merge_tags`] sets, so a key occurs at most once in either
+/// and equal counts plus one-way containment is set equality. Compared by key
+/// and value rather than position: a resource's tags are a MAP, so the order a
+/// list reports them in is not part of what the resource carries.
+pub fn is_same_tag_set(left: &[Tag], right: &[Tag]) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|tag| {
+            right
+                .iter()
+                .any(|other| other.key == tag.key && other.value == tag.value)
+        })
+}
+
+/// A write handle on the tags of ONE stored resource, carrying with them the
+/// instant that record reports as its last modification — when its kind
+/// publishes one.
+///
+/// Handed out by
+/// [`ComAmazonawsMarketplacecatalogAwsmpseymourState::resource_tags_write`] so
+/// that a tag write reaches the whole record rather than its tag list alone:
+/// writing a resource's tags MODIFIES that resource, and what the record then
+/// reports as the last time it was modified is part of what the write leaves
+/// behind.
+#[derive(Debug)]
+pub struct ResourceTagsWrite<'a> {
+    tags: &'a mut Vec<Tag>,
+    last_modified_date: Option<&'a mut String>,
+}
+
+impl ResourceTagsWrite<'_> {
+    /// The tag set the record holds now — what the set a tag write stores is
+    /// computed from.
+    pub fn held(&self) -> &[Tag] {
+        self.tags
+    }
+
+    /// Leave the record holding the tag set `tags`, written at `at`.
+    ///
+    /// A write leaving a DIFFERENT set modifies the resource, so the record's
+    /// last-modified instant becomes `at` — the restamp the tag write a change
+    /// set carries performs
+    /// ([`ComAmazonawsMarketplacecatalogAwsmpseymourState::apply_changes`]),
+    /// which is what the entity member documented as the last time the entity
+    /// was modified reports and what the entity list filters and orders on. A
+    /// write that leaves the set it found modifies nothing, so it moves no
+    /// instant. A record whose kind publishes no last-modified instant — a
+    /// change set, whose timestamps are those of the run it is — takes the
+    /// tags alone.
+    pub fn store(&mut self, tags: Vec<Tag>, at: SystemTime) {
+        if is_same_tag_set(self.tags, &tags) {
+            return;
+        }
+        *self.tags = tags;
+        if let Some(stamp) = self.last_modified_date.as_mut() {
+            **stamp = iso8601(at);
+        }
+    }
+}
+
 /// The tag-key namespace Amazon Web Services keeps for the tags it generates
 /// itself.
 ///
@@ -2093,16 +2155,31 @@ impl ComAmazonawsMarketplacecatalogAwsmpseymourState {
         }
     }
 
-    /// Those same tags, for writing.
-    pub fn resource_tags_mut(&mut self, resource: &CatalogResource) -> Option<&mut Vec<Tag>> {
+    /// Those same tags, for writing — beside the instant the record reports as
+    /// its last modification, so a tag write restamps the record it modifies
+    /// ([`ResourceTagsWrite::store`]).
+    pub fn resource_tags_write(
+        &mut self,
+        resource: &CatalogResource,
+    ) -> Option<ResourceTagsWrite<'_>> {
         match resource {
             CatalogResource::Entity { entity_type, id } => self
                 .entities
                 .get_mut(id)
                 .filter(|held| &held.entity_type == entity_type)
-                .map(|held| &mut held.tags),
+                .map(|held| ResourceTagsWrite {
+                    tags: &mut held.tags,
+                    last_modified_date: Some(&mut held.last_modified_date),
+                }),
             CatalogResource::ChangeSet { id } => {
-                self.change_sets.get_mut(id).map(|held| &mut held.tags)
+                self.change_sets.get_mut(id).map(|held| ResourceTagsWrite {
+                    tags: &mut held.tags,
+                    // A change set reports `StartTime` and `EndTime`, the
+                    // instants of the run it is: it publishes no member saying
+                    // when it was last modified, so tagging one moves no
+                    // timestamp of it.
+                    last_modified_date: None,
+                })
             }
         }
     }

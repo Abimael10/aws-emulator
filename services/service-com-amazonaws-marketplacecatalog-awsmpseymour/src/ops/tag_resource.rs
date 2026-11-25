@@ -191,7 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // which is a change the clock owes rather than one this call makes.
         store.settle(now);
 
-        let Some(held) = store.resource_tags_mut(&resource) else {
+        let Some(mut held) = store.resource_tags_write(&resource) else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(&resource),
             )
@@ -204,7 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it, and every other key is appended — the merge every tag write of
         // this service shares, so the merged list holds each key once and its
         // length below is a count of KEYS.
-        let mut merged = held.clone();
+        let mut merged = held.held().to_vec();
         crate::state::merge_tags(&mut merged, input.tags);
         if merged.len() > crate::state::MAX_RESOURCE_TAGS {
             return Err(TagResourceErrorModeled::ValidationException(
@@ -219,7 +219,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        *held = merged;
+        // Tagging a resource modifies it, so the record takes the merged set
+        // AND the instant of this write as its last modification — the same
+        // restamp a change set's tag write leaves. A merge that leaves the set
+        // the resource already carried modifies nothing, so it moves no
+        // instant.
+        held.store(merged, now);
 
         Ok(TagResourceOutput {})
     }

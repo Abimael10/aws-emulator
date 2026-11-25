@@ -195,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // which is a change the clock owes rather than one this call makes.
         store.settle(now);
 
-        let Some(held) = store.resource_tags_mut(&resource) else {
+        let Some(mut held) = store.resource_tags_write(&resource) else {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(&resource),
             )
@@ -206,7 +206,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resource does not carry is already removed, so naming one is not an
         // error: the request asks for an end state, not for a deletion of a
         // specific entry.
-        held.retain(|tag| !input.tag_keys.contains(&tag.key));
+        let mut left = held.held().to_vec();
+        left.retain(|tag| !input.tag_keys.contains(&tag.key));
+        // Removing a tag modifies the resource, so the record takes the instant
+        // of this write as its last modification, exactly as adding one does. A
+        // request that names only keys the resource does not carry removes
+        // nothing, so it moves no instant.
+        held.store(left, now);
 
         Ok(UntagResourceOutput {})
     }
