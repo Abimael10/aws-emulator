@@ -1016,6 +1016,18 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// A caller grows this store, so it is bounded: [`MAX_CERTIFICATES`] is the ceiling
     /// `CreateKeysAndCertificate` refuses past.
     pub certificates: BTreeMap<String, RegisteredCertificate>,
+    /// The CERTIFICATE AUTHORITY this service signs a certificate it issues over a
+    /// caller's certificate signing request with, minted on the first such certificate
+    /// and `None` until then.
+    ///
+    /// It is state and not a value computed per call because every certificate
+    /// `CreateCertificateFromCsr` issues has to chain to ONE issuer: a client that
+    /// verified one of them against this authority's key verifies the next one against the
+    /// same key. The key material is held here in memory only — no operation reports it
+    /// and nothing writes it anywhere — and the record it is held in formats nothing
+    /// ([`IssuingCertificateAuthority`]). An `Arc`, so a request signs with it while this
+    /// store's lock is released.
+    pub issuing_certificate_authority: Option<::std::sync::Arc<IssuingCertificateAuthority>>,
     /// Every CA certificate the account has REGISTERED, keyed by `certificateId`.
     ///
     /// The id is the CA certificate's identity — the model binds it as the `@httpLabel`
@@ -3306,6 +3318,18 @@ pub use certificates::{
     CERTIFICATE_STATUS_REVOKED, DEFAULT_CERTIFICATE_PAGE_SIZE,
     FIRST_CERTIFICATE_CUSTOMER_VERSION, INTERNAL_CERTIFICATE_STATUSES, MAX_CERTIFICATES,
     PROVISIONING_CLAIM_VALIDITY,
+};
+
+// The CERTIFICATE SIGNING REQUEST a caller hands `CreateCertificateFromCsr` — what this
+// service reads out of it, what it refuses, and the authority it signs the requested
+// certificate with — lives in `state/certificate_signing_requests.rs`, beside the
+// certificate record it produces. Its names are re-exported here so a handler reaches
+// them as `crate::state::<name>`.
+pub mod certificate_signing_requests;
+pub use certificate_signing_requests::{
+    read_certificate_signing_request, unreadable_certificate_signing_request_message,
+    unsupported_csr_key_message, CertificateSigningRequestRefusal, IssuingCertificateAuthority,
+    CSR_EC_CURVES, MIN_CSR_RSA_KEY_BITS,
 };
 
 // The TRANSFER a device certificate is in — the record the source account holds while one

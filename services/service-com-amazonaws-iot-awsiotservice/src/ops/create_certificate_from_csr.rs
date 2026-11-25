@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCertificateFromCsr
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCertificateFromCsr`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCertificateFromCsr::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Issues the X.509 certificate a caller's PKCS#10 CERTIFICATE SIGNING REQUEST asks for:
+//! the certificate certifies the subject and the public key the request carries
+//! ([`crate::state::read_certificate_signing_request`]), is signed by this service's own
+//! issuing authority ([`crate::state::IssuingCertificateAuthority`]) because the caller
+//! keeps the private half, and is recorded under its `certificateId` in this service's
+//! certificate store ([`crate::state::ComAmazonawsIotAwsiotserviceState::certificates`]),
+//! which `DescribeCertificate` reads back.
+//!
+//! A request that is not a readable certification request, or whose public key is not one
+//! of the keys the operation documents, is refused `InvalidRequestException` (HTTP 400)
+//! and records nothing.
+//!
+//! A certificate PROVIDER the account has made the default for this operation — a Lambda
+//! function AWS IoT calls to sign the certificate instead of signing it itself
+//! ([`crate::state::certificate_provider_function`]) — is not consulted here: neither the
+//! model nor any recording states the event that function is called with or the answer it
+//! returns, so a certificate issued through one is nothing this change can claim. The
+//! certificate below is therefore the one AWS IoT issues itself, and nothing about a
+//! provider-signed certificate is reported.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +184,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCertificateFromCsr` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCertificateFromCsrErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCertificateFromCsr"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateCertificateFromCsrErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // The request's own content is read FIRST: what the certificate certifies is in
+        // it, and neither refusal it can earn depends on what the account holds.
+        let signing_request = crate::state::read_certificate_signing_request(
+            &input.certificate_signing_request,
+        )
+        .map_err(|refusal| {
+            CreateCertificateFromCsrErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(refusal.message().to_string()),
+                },
+            )
+        })?;
+
+        // The emulator holds every certificate in memory, so it stops issuing them at its
+        // own ceiling instead of growing without bound on request. The ceiling is read
+        // BEFORE the certificate is signed, so a request past it costs no CPU either; AWS
+        // IoT models no limit error on this operation, so the refusal is reported with the
+        // error the model has for a request it cannot complete.
+        if state.lock().certificates.len() >= crate::state::MAX_CERTIFICATES {
+            return Err(
+                CreateCertificateFromCsrErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some(format!(
+                            "this emulator stores at most {} certificates",
+                            crate::state::MAX_CERTIFICATES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let authority = self.issuing_authority(&state).await?;
+
+        // Signing is the certificate's own CPU, taken with the store's lock RELEASED, so
+        // no other request waits on the store while this one is signed.
+        let Some(issued) = authority.issue_certificate(
+            &region,
+            ::engine::emulator_account_id(),
+            &signing_request,
+            input.set_as_active,
+            ::std::time::SystemTime::now(),
+        ) else {
+            return Err(unissued_certificate_failure());
+        };
+
+        // The response is built from the record that is about to be persisted, so what
+        // this call reports and what the next `DescribeCertificate` reads are one value,
+        // not two that could drift.
+        let output = CreateCertificateFromCsrOutput {
+            certificate_arn: Some(issued.certificate_arn.clone()),
+            certificate_id: Some(issued.certificate_id.clone()),
+            certificate_pem: Some(issued.certificate_pem.clone()),
+        };
+
+        let mut store = state.lock();
+        // Re-read under the write lock: another request may have filled the store while
+        // this one was being signed.
+        if store.certificates.len() >= crate::state::MAX_CERTIFICATES {
+            return Err(
+                CreateCertificateFromCsrErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some(format!(
+                            "this emulator stores at most {} certificates",
+                            crate::state::MAX_CERTIFICATES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        store
+            .certificates
+            .insert(issued.certificate_id.clone(), issued);
+        Ok(output)
     }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateCertificateFromCsr<Eng> {
+    /// The authority every certificate this operation issues is signed by, minted on the
+    /// first call that needs one and read from this service's state by every later call.
+    ///
+    /// Generating the RSA key pair is hundreds of milliseconds of CPU, so it runs on the
+    /// blocking pool with the state lock RELEASED: `spawn_blocking(..).await` is a real
+    /// await point, so minting the authority cannot starve the worker that serves every
+    /// other request. Two first calls that race therefore both generate a key, and the
+    /// one that reaches the store first is the authority both of them sign with — there is
+    /// one issuer whichever order they arrive in.
+    async fn issuing_authority(
+        &self,
+        state: &::engine::ServiceState<crate::state::ComAmazonawsIotAwsiotserviceState>,
+    ) -> Result<
+        ::std::sync::Arc<crate::state::IssuingCertificateAuthority>,
+        CreateCertificateFromCsrError,
+    > {
+        if let Some(authority) = state.lock().issuing_certificate_authority.clone() {
+            return Ok(authority);
+        }
+        let minted =
+            ::tokio::task::spawn_blocking(crate::state::IssuingCertificateAuthority::generate)
+                .await;
+        let minted = match minted {
+            Ok(Some(minted)) => minted,
+            Ok(None) => return Err(unissued_certificate_failure()),
+            // A panic or a cancellation on the pool says nothing about the request, so it
+            // is reported as the server fault it is.
+            Err(error) => {
+                ::tracing::error!(
+                    operation = <Self as smithy_server_runtime::Operation>::NAME,
+                    error = %error,
+                    "the issuing authority's key pair did not complete"
+                );
+                return Err(unissued_certificate_failure());
+            }
+        };
+        let mut store = state.lock();
+        Ok(store
+            .issuing_certificate_authority
+            .get_or_insert_with(|| ::std::sync::Arc::new(minted))
+            .clone())
+    }
+}
+
+/// The server fault a certificate that could not be signed is reported as: the request
+/// said nothing wrong, so `InternalFailureException` ("An unexpected error has occurred")
+/// is the class, and no certificate is reported for one nothing issued.
+fn unissued_certificate_failure() -> CreateCertificateFromCsrError {
+    CreateCertificateFromCsrErrorModeled::InternalFailureException(InternalFailureException {
+        message: Some("the certificate could not be issued".to_string()),
+    })
+    .into()
 }

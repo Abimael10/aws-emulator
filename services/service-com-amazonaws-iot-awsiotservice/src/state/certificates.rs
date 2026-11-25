@@ -102,7 +102,7 @@ const CERTIFICATE_COMMON_NAME: &str = "AWS IoT Certificate";
 
 /// The organization name a certificate this service issues carries (RFC 5280 section
 /// 4.1.2.4).
-const CERTIFICATE_ORGANIZATION_NAME: &str = "Amazon Web Services IoT";
+pub(super) const CERTIFICATE_ORGANIZATION_NAME: &str = "Amazon Web Services IoT";
 
 /// The instant an issued certificate stops being valid, as epoch seconds:
 /// 2049-12-31T23:59:59Z. An AWS IoT-generated device certificate is long lived — it is
@@ -110,8 +110,14 @@ const CERTIFICATE_ORGANIZATION_NAME: &str = "Amazon Web Services IoT";
 /// future date rather than a span measured from the call.
 const CERTIFICATE_NOT_AFTER_EPOCH_SECONDS: u64 = 2_524_607_999;
 
+/// The instant an issued certificate stops being valid, as the clock reads it
+/// ([`CERTIFICATE_NOT_AFTER_EPOCH_SECONDS`]).
+pub(super) fn certificate_not_after() -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(CERTIFICATE_NOT_AFTER_EPOCH_SECONDS)
+}
+
 /// The object identifiers an issued certificate names.
-mod oid {
+pub(super) mod oid {
     use x509_cert::spki::ObjectIdentifier;
 
     /// `id-at-commonName` (RFC 5280 appendix A).
@@ -610,8 +616,13 @@ pub fn mint_keys_and_certificate(
     set_as_active: bool,
     now: SystemTime,
 ) -> Option<MintedKeysAndCertificate> {
-    let not_after = UNIX_EPOCH + Duration::from_secs(CERTIFICATE_NOT_AFTER_EPOCH_SECONDS);
-    mint_keys_and_certificate_valid_until(region, owned_by, set_as_active, now, not_after)
+    mint_keys_and_certificate_valid_until(
+        region,
+        owned_by,
+        set_as_active,
+        now,
+        certificate_not_after(),
+    )
 }
 
 /// How long the certificate `CreateProvisioningClaim` issues is valid for.
@@ -641,66 +652,30 @@ pub fn mint_keys_and_certificate_valid_until(
     not_after: SystemTime,
 ) -> Option<MintedKeysAndCertificate> {
     let key_pair = RsaKeyPairDer::generate()?;
-
-    let subject_public_key_info = SubjectPublicKeyInfoOwned::from_der(&key_pair.public_key_spki)
-        .ok()?;
-    let algorithm = AlgorithmIdentifierOwned {
-        oid: oid::SHA256_WITH_RSA,
-        // RSASSA-PKCS1-v1_5 takes an explicit NULL parameter (RFC 8017 appendix C).
-        parameters: Some(Any::new(DerTag::Null, Vec::new()).ok()?),
-    };
     let name = distinguished_name()?;
-    let tbs_certificate = TbsCertificate {
-        version: Version::V3,
-        serial_number: certificate_serial()?,
-        signature: algorithm.clone(),
-        // The certificate is signed by the key it names: the issuer is the subject.
-        issuer: name.clone(),
-        validity: X509Validity {
-            not_before: Time::try_from(now).ok()?,
-            not_after: Time::try_from(not_after).ok()?,
-        },
-        subject: name,
-        subject_public_key_info,
-        issuer_unique_id: None,
-        subject_unique_id: None,
-        // A device certificate is an end-entity certificate: it signs nothing else
-        // (RFC 5280 section 4.2.1.9, which requires the extension to be critical in a
-        // CA certificate).
-        extensions: Some(vec![end_entity_basic_constraints()?]),
-    };
-    let signature = key_pair.sign(&tbs_certificate.to_der().ok()?)?;
-    let certificate = Certificate {
-        tbs_certificate,
-        signature_algorithm: algorithm,
-        signature: BitString::from_bytes(&signature).ok()?,
-    };
-
-    let certificate_der = certificate.to_der().ok()?;
-    let certificate_id = certificate_id(&certificate_der);
-    let status = if set_as_active {
-        CERTIFICATE_STATUS_ACTIVE
-    } else {
-        CERTIFICATE_STATUS_INACTIVE
-    };
-    Some(MintedKeysAndCertificate {
-        certificate: RegisteredCertificate {
-            certificate_arn: certificate_arn(region, &certificate_id),
-            certificate_id,
-            certificate_pem: certificate.to_pem(LineEnding::LF).ok()?,
-            status: status.to_string(),
-            owned_by: owned_by.to_string(),
-            creation_date: now,
-            last_modified_date: now,
-            customer_version: FIRST_CERTIFICATE_CUSTOMER_VERSION,
-            generation_id: fresh_uuid(),
+    let certificate = sign_end_entity_certificate(
+        CertificateToIssue {
+            // The certificate is signed by the key it names: the issuer is the subject.
+            issuer: name.clone(),
+            subject: name,
+            subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(
+                &key_pair.public_key_spki,
+            )
+            .ok()?,
             not_before: now,
             not_after,
-            certificate_mode: CERTIFICATE_MODE_DEFAULT.to_string(),
-            // A freshly issued certificate is in no transfer: the only write that puts one
-            // in a transfer is `TransferCertificate`.
-            transfer: None,
         },
+        &key_pair,
+    )?;
+    Some(MintedKeysAndCertificate {
+        certificate: recorded_certificate(
+            region,
+            owned_by,
+            set_as_active,
+            now,
+            not_after,
+            &certificate,
+        )?,
         key_pair: KeyPair {
             public_key: Some(key_pair.public_key_pem()?),
             private_key: Some(key_pair.private_key_pem()?),
@@ -708,10 +683,118 @@ pub fn mint_keys_and_certificate_valid_until(
     })
 }
 
+/// What an END-ENTITY certificate this service issues is issued over: who signs it, whom
+/// it certifies, which key it certifies and over which period.
+///
+/// A struct rather than a parameter list because these are exactly the members that
+/// differ between the two certificates this service issues — the one it mints a key pair
+/// for itself, whose issuer IS its subject, and the one it issues over a caller's
+/// certificate signing request, whose subject and key are the request's and whose issuer
+/// is this service's own authority ([`super::certificate_signing_requests`]). Everything
+/// else about the X.509 structure is the same for both, which is why it is written once,
+/// in [`sign_end_entity_certificate`].
+pub(super) struct CertificateToIssue {
+    /// The name of the certificate authority the certificate is signed by, which has to
+    /// be the subject of `signing_key`'s own certificate.
+    pub issuer: Name,
+    /// The name the certificate certifies.
+    pub subject: Name,
+    /// The public key it certifies for that name.
+    pub subject_public_key_info: SubjectPublicKeyInfoOwned,
+    /// "The certificate is not valid before this date".
+    pub not_before: SystemTime,
+    /// "The certificate is not valid after this date".
+    pub not_after: SystemTime,
+}
+
+/// Write and SIGN the end-entity X.509 certificate `to_issue` describes, signed
+/// RSASSA-PKCS1-v1_5 over SHA-256 (`sha256WithRSAEncryption`) by `signing_key` over the
+/// DER of the certificate's own `TBSCertificate`.
+///
+/// `None` when a field cannot be encoded (an instant X.509 cannot represent, say) or the
+/// library refuses to sign.
+pub(super) fn sign_end_entity_certificate(
+    to_issue: CertificateToIssue,
+    signing_key: &RsaKeyPairDer,
+) -> Option<Certificate> {
+    let algorithm = AlgorithmIdentifierOwned {
+        oid: oid::SHA256_WITH_RSA,
+        // RSASSA-PKCS1-v1_5 takes an explicit NULL parameter (RFC 8017 appendix C).
+        parameters: Some(Any::new(DerTag::Null, Vec::new()).ok()?),
+    };
+    let tbs_certificate = TbsCertificate {
+        version: Version::V3,
+        serial_number: certificate_serial()?,
+        signature: algorithm.clone(),
+        issuer: to_issue.issuer,
+        validity: X509Validity {
+            not_before: Time::try_from(to_issue.not_before).ok()?,
+            not_after: Time::try_from(to_issue.not_after).ok()?,
+        },
+        subject: to_issue.subject,
+        subject_public_key_info: to_issue.subject_public_key_info,
+        issuer_unique_id: None,
+        subject_unique_id: None,
+        // A device certificate is an end-entity certificate: it signs nothing else
+        // (RFC 5280 section 4.2.1.9, which requires the extension to be critical in a
+        // CA certificate).
+        extensions: Some(vec![end_entity_basic_constraints()?]),
+    };
+    let signature = signing_key.sign(&tbs_certificate.to_der().ok()?)?;
+    Some(Certificate {
+        tbs_certificate,
+        signature_algorithm: algorithm,
+        signature: BitString::from_bytes(&signature).ok()?,
+    })
+}
+
+/// The RECORD this service keeps of `certificate`, as every operation that issues one
+/// writes it: the identity derived from the certificate's own DER, the ARN minted over
+/// that id, and the status the create's `setAsActive` resolved to.
+///
+/// One function, so a certificate issued over a caller's signing request and one issued
+/// over a key pair this service minted are recorded — and therefore described, listed,
+/// updated and deleted — identically.
+///
+/// `None` when the certificate cannot be encoded.
+pub(super) fn recorded_certificate(
+    region: &str,
+    owned_by: &str,
+    set_as_active: bool,
+    now: SystemTime,
+    not_after: SystemTime,
+    certificate: &Certificate,
+) -> Option<RegisteredCertificate> {
+    let certificate_der = certificate.to_der().ok()?;
+    let certificate_id = certificate_id(&certificate_der);
+    let status = if set_as_active {
+        CERTIFICATE_STATUS_ACTIVE
+    } else {
+        CERTIFICATE_STATUS_INACTIVE
+    };
+    Some(RegisteredCertificate {
+        certificate_arn: certificate_arn(region, &certificate_id),
+        certificate_id,
+        certificate_pem: certificate.to_pem(LineEnding::LF).ok()?,
+        status: status.to_string(),
+        owned_by: owned_by.to_string(),
+        creation_date: now,
+        last_modified_date: now,
+        customer_version: FIRST_CERTIFICATE_CUSTOMER_VERSION,
+        generation_id: fresh_uuid(),
+        not_before: now,
+        not_after,
+        certificate_mode: CERTIFICATE_MODE_DEFAULT.to_string(),
+        // A freshly issued certificate is in no transfer: the only write that puts one
+        // in a transfer is `TransferCertificate`.
+        transfer: None,
+    })
+}
+
 /// An RSA key pair, as the two DER encodings a certificate and a response need.
-struct RsaKeyPairDer {
+pub(super) struct RsaKeyPairDer {
     /// The public half, a DER X.509 `SubjectPublicKeyInfo`.
-    public_key_spki: Vec<u8>,
+    pub(super) public_key_spki: Vec<u8>,
     /// The private half, PKCS#8 DER.
     private_key_pkcs8: Vec<u8>,
 }
@@ -719,7 +802,7 @@ struct RsaKeyPairDer {
 impl RsaKeyPairDer {
     /// A fresh RSA-2048 key pair from `aws-lc-rs` — the "2048-bit RSA key pair"
     /// `CreateKeysAndCertificate` documents.
-    fn generate() -> Option<Self> {
+    pub(super) fn generate() -> Option<Self> {
         let private_key =
             ::aws_lc_rs::rsa::PrivateDecryptingKey::generate(::aws_lc_rs::rsa::KeySize::Rsa2048)
                 .ok()?;
@@ -731,7 +814,7 @@ impl RsaKeyPairDer {
 
     /// `message` signed by this key pair's private half, RSASSA-PKCS1-v1_5 over
     /// SHA-256 — the signature `sha256WithRSAEncryption` names.
-    fn sign(&self, message: &[u8]) -> Option<Vec<u8>> {
+    pub(super) fn sign(&self, message: &[u8]) -> Option<Vec<u8>> {
         let pair = ::aws_lc_rs::signature::RsaKeyPair::from_pkcs8(&self.private_key_pkcs8).ok()?;
         // A PKCS #1 signature is exactly as long as the key's modulus.
         let mut signature = vec![0u8; pair.public_modulus_len()];
@@ -805,7 +888,7 @@ fn distinguished_name() -> Option<Name> {
 
 /// One relative distinguished name: the `SET OF` holding the single attribute type and
 /// its UTF8String value.
-fn relative_distinguished_name(
+pub(super) fn relative_distinguished_name(
     attribute: ObjectIdentifier,
     value: &str,
 ) -> Option<RelativeDistinguishedName> {
