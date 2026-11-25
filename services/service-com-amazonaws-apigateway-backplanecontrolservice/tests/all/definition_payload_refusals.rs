@@ -398,18 +398,19 @@ async fn a_document_that_read_whole_and_is_no_definition_keeps_the_invalid_input
     );
 }
 
-/// RULE: a body the reader could not finish reading is no DOCUMENT, so it is refused as
-/// that — one sentence for every such body, whatever a prefix of it happened to write before
-/// the reading stopped, because a body that did not parse declares nothing for the version
-/// detection or the definition reading behind it to have read.
+/// RULE: which of the two formats a definition is written in is settled out of the two root
+/// members a document states its version in, and that detection answers in FRONT of the
+/// reading — so a body the reader could not finish is refused as no document only when it
+/// did write one of the two members, and one writing neither is refused as the version that
+/// could not be determined, exactly as a document that parsed and declares neither is.
 ///
 /// Rows differ along WHERE the body stops being parseable (a flow mapping, a flow sequence
-/// or a quoted scalar that never closes, a document cut off mid-member, bytes that are no
+/// or a quoted scalar that never closes, a document cut off mid-member, text that is no
 /// document at all), along the spelling the body starts out as (JSON and YAML), along
-/// whether the truncated prefix happens to carry a version member — the PAIRED rows are the
-/// same prefix with and without it, which is what shows it decides nothing — and along
+/// whether the truncated prefix carries a version member — the PAIRED rows are the same
+/// prefix with and without it, which is what shows which sentence it decides — and along
 /// whether the body is text in the first place. The control rows are the two neighbouring
-/// classes: a document that PARSED and declares no version, which keeps the
+/// classes: a document that PARSED and declares no version, which earns the same
 /// version-detection sentence, and a well-formed document, which is served.
 #[tokio::test]
 async fn a_body_the_reader_could_not_finish_is_refused_as_no_document() {
@@ -417,58 +418,78 @@ async fn a_body_the_reader_could_not_finish_is_refused_as_no_document() {
     let (api, _root) = create_api(&gateway, "unparseable-definitions").await;
     let before = api_count(&gateway, "before the refusals").await;
 
-    // (case, body bytes) — every one of them earns the one parse sentence.
-    let refused: Vec<(&str, Vec<u8>)> = vec![
+    // (case, body bytes, the sentence the body earns): the parse sentence for a body whose
+    // format IS settled, and the version-detection one for a body that declares none.
+    let refused: Vec<(&str, Vec<u8>, &str)> = vec![
         (
             "a JSON object cut off mid-member",
             b"{\"openapi\": \"3.0.1\", \"info\": {\"title\": \"cut off\" NOT A DOCUMENT !!!".to_vec(),
+            UNPARSEABLE_DEFINITION,
         ),
         (
             "the same object cut off with no version member",
             b"{\"info\": {\"title\": \"cut off\" NOT A DOCUMENT !!!".to_vec(),
+            UNDETERMINED_VERSION,
         ),
         (
             "an unterminated flow mapping",
             b"{\"openapi\": \"3.0.1\", \"paths\": {".to_vec(),
+            UNPARSEABLE_DEFINITION,
         ),
         (
             "the same flow mapping with no version member",
             b"{\"paths\": {".to_vec(),
+            UNDETERMINED_VERSION,
         ),
         (
             "an unterminated flow sequence",
             b"{\"swagger\": \"2.0\", \"schemes\": [\"https\"".to_vec(),
+            UNPARSEABLE_DEFINITION,
         ),
         (
             "the same flow sequence with no version member",
             b"{\"schemes\": [\"https\"".to_vec(),
+            UNDETERMINED_VERSION,
         ),
         (
             "an unterminated quoted scalar, written as YAML",
             b"openapi: \"3.0.1\ninfo:\n  title: x\n".to_vec(),
+            UNPARSEABLE_DEFINITION,
         ),
         (
             "an unterminated quoted scalar whose key is not a version member",
             b"title: \"x\ninfo:\n  title: x\n".to_vec(),
+            UNDETERMINED_VERSION,
         ),
         (
             "a YAML document whose flow mapping never closes",
             b"swagger: '2.0'\npaths: {\"/pets\": {\n".to_vec(),
+            UNPARSEABLE_DEFINITION,
         ),
         (
             "the same YAML document with no version member",
             b"paths: {\"/pets\": {\n".to_vec(),
+            UNDETERMINED_VERSION,
         ),
-        ("text that is no document at all", b"}not a document{".to_vec()),
         (
-            "a version-looking name inside a string value, with no member of that name",
-            b"{\"info\": {\"description\": \"see \\\"openapi\\\": 3\"}, \"paths\": {".to_vec(),
+            "text that is no document at all",
+            b"}not a document{".to_vec(),
+            UNDETERMINED_VERSION,
         ),
-        ("bytes that are not text", vec![0xff, 0xfe, 0x00, 0x9c, 0x01]),
+        (
+            "a version-looking name written as a member inside a string value",
+            b"{\"info\": {\"description\": \"see \\\"openapi\\\": 3\"}, \"paths\": {".to_vec(),
+            UNPARSEABLE_DEFINITION,
+        ),
+        (
+            "bytes that are not text",
+            vec![0xff, 0xfe, 0x00, 0x9c, 0x01],
+            UNDETERMINED_VERSION,
+        ),
     ];
 
-    for (case, body) in &refused {
-        let expected = UNPARSEABLE_DEFINITION;
+    for (case, body, expected) in &refused {
+        let expected = *expected;
         let imported = gateway
             .call_bytes(
                 "POST",
@@ -505,7 +526,8 @@ async fn a_body_the_reader_could_not_finish_is_refused_as_no_document() {
     );
 
     // The neighbouring class: a body that DID parse and declares neither version member
-    // keeps the version-detection sentence, so the two refusals stay apart.
+    // earns the version-detection sentence as well, which is the step both of them stop
+    // at; what tells the two refusals apart is the version member, not the parse.
     let parsed_without_version = import_rest_api(&gateway, "{\"info\": {\"title\": \"x\"}}").await;
     assert_refusal(
         &parsed_without_version,

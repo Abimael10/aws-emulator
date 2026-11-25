@@ -120,9 +120,10 @@
 //! the same `materialise_due_transitions` — including the chain an accepted
 //! deletion starts, at the end of which the data source HOLDS the document no
 //! more while its record stays behind carrying the terminal status the model
-//! gives a document that was not found, so the listing a client polls reports
-//! the outcome of the deletion it asked for. Only an identity nothing was ever
-//! stored under is answered by the [`not_found_document_detail`] projection.
+//! gives a document that was not found, so the collection a client polls
+//! reports the outcome of the deletion it asked for and then converges on what
+//! the data source holds. Only an identity nothing was ever stored under is
+//! answered by the [`not_found_document_detail`] projection.
 //!
 //! A flow's aliases (`CreateFlowAlias`, `GetFlowAlias`, `ListFlowAliases`) are
 //! backed by the
@@ -2406,6 +2407,22 @@ pub const DOCUMENT_STATUS_NOT_FOUND: &str = "NOT_FOUND";
 /// identity is answered from then on as one nothing was ever stored under.
 pub const DELETED_DOCUMENT_RECORDS_KEPT: usize = DOCUMENT_QUOTA;
 
+/// How long after a deletion has run to its end the data source keeps reporting
+/// the document it removed in its COLLECTION, under that deletion's terminal
+/// status, before the identity is enumerated no more.
+///
+/// CHOSEN, not documented: AWS publishes no duration for how long a removed
+/// document stays reportable. It is deliberately non-zero and SECONDS wide,
+/// because `NOT_FOUND` is the terminal status of a deletion that a client
+/// polling the collection waits for — a window narrower than the interval such a
+/// client polls at would hide the outcome it is waiting for — and it is bounded
+/// because the collection reports what the data source holds: once the window
+/// has passed the removal is settled and the identity is enumerated no more, so
+/// a client waiting for the identity to LEAVE converges as well. The outcome
+/// stays reportable to a targeted read of the identifier either way
+/// ([`DELETED_DOCUMENT_RECORDS_KEPT`]).
+pub const DOCUMENT_DELETED_LISTING_SPAN: Duration = Duration::from_secs(10);
+
 /// The most documents one `ListKnowledgeBaseDocuments` page reports when the
 /// request names no `maxResults`.
 ///
@@ -2505,11 +2522,13 @@ pub enum DocumentStatus {
     /// The document is gone from the data source — the terminal status of a
     /// deletion, which the modelled member documents as the status of a document
     /// that "wasn't found", so the clock owes it nothing more. The data source
-    /// HOLDS it no longer: it counts against no bound, carries no content, is
-    /// no source document and is enumerated by no listing of the data source's
-    /// contents. Its record stays behind so the deletion's outcome is reportable
-    /// through a TARGETED read — bounded by [`DELETED_DOCUMENT_RECORDS_KEPT`],
-    /// and the identity is free again for a later ingestion to take.
+    /// HOLDS it no longer: it counts against no bound, carries no content and is
+    /// no source document, and the identity is free again for a later ingestion
+    /// to take. Its record stays behind so the deletion's OUTCOME is reportable
+    /// — to a targeted read and to the collection the data source enumerates —
+    /// for [`DOCUMENT_DELETED_LISTING_SPAN`] after the deletion completed, and
+    /// is then forgotten (and bounded by [`DELETED_DOCUMENT_RECORDS_KEPT`]
+    /// besides).
     NotFound,
 }
 
@@ -2548,10 +2567,10 @@ impl DocumentStatus {
     ///
     /// Every status but the terminal one of a deletion is a document the data
     /// source holds: it counts against the data source's bound, its content can
-    /// be retrieved, an ingestion job over a pushed data source scans it and a
-    /// listing of the data source's contents enumerates it. A document whose
-    /// deletion has run to its end is held no longer — its record stays only to
-    /// report that outcome to a targeted read.
+    /// be retrieved and an ingestion job over a pushed data source scans it. A
+    /// document whose deletion has run to its end is held no longer — its record
+    /// stays only to report that outcome, which is a different question from
+    /// what the data source holds ([`DocumentRecord::reports_deletion_until`]).
     fn is_held(self) -> bool {
         !matches!(self, Self::NotFound)
     }
@@ -2778,6 +2797,27 @@ impl DocumentRecord {
     /// ([`DocumentStatus::is_held`]).
     pub fn is_held(&self) -> bool {
         self.status.is_held()
+    }
+
+    /// The instant up to which this record reports a COMPLETED deletion, after
+    /// which the identity is enumerated no more; `None` for a document the data
+    /// source still holds, whose record is not a deletion's outcome at all.
+    ///
+    /// A document's status chain is applied at the instant each transition came
+    /// due and `updated_at` carries that instant, so the window runs from when
+    /// the deletion COMPLETED rather than from when a reader noticed it
+    /// ([`DOCUMENT_DELETED_LISTING_SPAN`]).
+    pub fn reports_deletion_until(&self) -> Option<SystemTime> {
+        (!self.is_held()).then(|| self.updated_at + DOCUMENT_DELETED_LISTING_SPAN)
+    }
+
+    /// Whether the collection of this data source's documents reports this
+    /// document at `now`: every document the data source holds, and one whose
+    /// deletion has completed for as long as that deletion is still settling
+    /// ([`Self::reports_deletion_until`]).
+    pub fn is_reported_at(&self, now: SystemTime) -> bool {
+        self.reports_deletion_until()
+            .is_none_or(|until| now < until)
     }
 
     /// This record as the modelled `KnowledgeBaseDocumentDetail` shape: every
@@ -3442,11 +3482,12 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
         // the data source counts it against no bound, keeps none of its
         // content and offers it to no retrieval, and its identity is free for a
         // later ingestion to take. The record itself stays, reporting that
-        // terminal status, because the listing is how a client confirms which
-        // document a delete removed. The history it forms is bounded: past
-        // `DELETED_DOCUMENT_RECORDS_KEPT` per data source the oldest completed
-        // deletions are forgotten, and from then on their identities answer as
-        // ones nothing was ever stored under.
+        // terminal status — to a targeted read, and to the collection for as
+        // long as the deletion is still settling
+        // (`DocumentRecord::reports_deletion_until`). The history it forms is
+        // bounded: past `DELETED_DOCUMENT_RECORDS_KEPT` per data source the
+        // oldest completed deletions are forgotten, and from then on their
+        // identities answer as ones nothing was ever stored under.
         self.forget_oldest_deleted_documents();
         // A removal an accepted delete put on the clock is owed the same way:
         // once its instant has passed the resource is gone, whether or not
@@ -3678,14 +3719,15 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
     /// `page_size` of them, plus the token to resume from when more remain.
     ///
     /// The operation "retrieves all the documents contained in a data source",
-    /// so what a page carries is what the data source still HOLDS
-    /// ([`DocumentStatus::is_held`]): a document whose deletion is still in
-    /// flight is contained in it and reported under the status of that deletion,
-    /// and one whose deletion has run to its end is contained in it no longer
-    /// and is in no page — a client confirms a deletion by the identifier
-    /// LEAVING the collection. The outcome of that deletion stays reportable
-    /// through the targeted read, which answers the retained record's terminal
-    /// status ([`DELETED_DOCUMENT_RECORDS_KEPT`]).
+    /// and a document on its way out of one is still contained in it: a deletion
+    /// in flight is reported under the status of that deletion, and one that has
+    /// run to its end under its terminal status, so a client confirms from the
+    /// collection alone WHICH document a delete removed and that the removal
+    /// finished. A deletion stops being reported once it has settled
+    /// ([`DocumentRecord::reports_deletion_until`]), which is what makes the
+    /// identity leave the collection, while its outcome stays reportable through
+    /// the targeted read of that identifier
+    /// ([`DELETED_DOCUMENT_RECORDS_KEPT`]).
     ///
     /// No other data source's documents are reported: a document is identified
     /// within the data source it was ingested into. A data source holding none
@@ -3697,6 +3739,7 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
         data_source_id: &str,
         cursor: Option<DocumentPageCursor>,
         page_size: usize,
+        now: SystemTime,
     ) -> (Vec<KnowledgeBaseDocumentDetail>, Option<String>) {
         let mut ordered: Vec<&DocumentRecord> = self
             .documents
@@ -3704,7 +3747,7 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
             .filter(|record| {
                 record.knowledge_base_id == knowledge_base_id
                     && record.data_source_id == data_source_id
-                    && record.is_held()
+                    && record.is_reported_at(now)
             })
             .collect();
         ordered.sort_by(|left, right| left.key.sort_key().cmp(&right.key.sort_key()));

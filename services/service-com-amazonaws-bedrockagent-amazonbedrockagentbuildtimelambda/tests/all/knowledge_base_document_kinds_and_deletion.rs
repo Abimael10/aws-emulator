@@ -768,10 +768,11 @@ async fn one_mismatched_document_refuses_the_whole_request() {
 
 /// A deleted document LEAVES the data source: `DeleteKnowledgeBaseDocuments`
 /// answers 202 with the document on its way out, the clock carries the delete to
-/// completion, and from there the data source holds nothing for it — it is in no
-/// listing of the data source and a targeted read answers the status the model
-/// gives an identifier nothing is held for, while every other document of the
-/// same data source is untouched.
+/// completion, and from there the data source holds nothing for it — the
+/// collection reports the deletion's terminal status while it settles and then
+/// enumerates the identifier no more, and a targeted read answers the status the
+/// model gives an identifier nothing is held for, while every other document of
+/// the same data source is untouched.
 ///
 /// The rows differ along what the rule generalises over: the kind of data source
 /// the document lives in, the kind of content (each value of the modelled
@@ -1073,12 +1074,16 @@ async fn deleting_again_and_deleting_what_was_never_held() {
          gone changes nothing, got {:?}",
         again.detail(0)
     );
-    // The deletion's own outcome stays reportable through a TARGETED read,
-    // while the data source's listing holds nothing for the document any more:
-    // the identifier leaving the collection is how a client confirms which
-    // document was removed.
+    // The deletion's own outcome stays reportable through a TARGETED read, and
+    // the collection reports it too for as long as the deletion is still
+    // settling — after which the identifier leaves the collection, which is how
+    // a client confirms which document was removed.
     let listed = emulator
-        .list_documents(&knowledge_base_id, &data_source_id)
+        .poll_until_absent_from_listing(
+            &knowledge_base_id,
+            &data_source_id,
+            std::slice::from_ref(&identifier),
+        )
         .await;
     assert_eq!(
         listed.details().len(),

@@ -421,10 +421,12 @@ pub const INVALID_DEFINITION: &str = "Invalid OpenAPI input.";
 /// nothing from the request: not the position the reading stopped at, and not the parser's
 /// own complaint.
 ///
-/// It is the sentence for every body the reading could not finish — a truncated document, an
-/// unterminated collection or scalar, text that is no document, bytes that are not text —
-/// whatever version member a prefix of it happened to write, because a body that did not
-/// parse declared nothing.
+/// It is the sentence for a body the reading could not finish — a truncated document, an
+/// unterminated collection or scalar, text that is no document — that DID write one of the
+/// two version members: the format it is written in is settled, so what is left to state is
+/// that these bytes are no document of it. A body that did not finish AND writes neither
+/// member declares no version at all and earns [`UNDETERMINED_VERSION`] instead, because
+/// detection is the step that answers first ([`declares_version_in_text`]).
 pub const UNPARSEABLE_DEFINITION: &str = "Invalid OAS input";
 
 /// The refusal for a document that PARSED and declares no OAS/Swagger version.
@@ -438,11 +440,13 @@ pub const UNPARSEABLE_DEFINITION: &str = "Invalid OAS input";
 ///
 /// Detection is what the reader does FIRST, so it does not wait for the document to read:
 /// a body that is not a readable document at all, and that writes neither member, declares
-/// no version either and earns this same sentence — bytes that are not text among them. A
-/// body that writes one of the two members and is then not a readable definition of that
-/// format is the one whose format IS settled, and keeps the other sentence
+/// no version either and earns this same sentence — bytes that are not text among them
+/// ([`declares_version_in_text`]). A body that writes one of the two members has its format
+/// settled, and is refused by whichever step then failed instead: as no readable document
+/// ([`UNPARSEABLE_DEFINITION`]) or as no valid definition of that format
 /// ([`INVALID_DEFINITION`]). A caller has to be able to tell "nothing here says what this
-/// is" from "this is not a valid document of the format it says it is".
+/// is" from "these bytes are no document" from "this is not a valid document of the format
+/// it says it is".
 ///
 /// Whatever the document carries BESIDE those two members — an `info`, paths, a member
 /// whose name merely resembles the version field — and whichever shape it parsed to, it
@@ -955,10 +959,11 @@ fn guard_yaml_nesting(body: &str) -> Result<(), String> {
 /// The root members an OpenAPI/Swagger document declares the format it is written in in:
 /// `openapi` from 3.0 on, `swagger` before it.
 ///
-/// Which one of them a PARSED document carries is the first thing read of it, and whether
-/// either is there is what separates a document whose format could not be determined
-/// ([`UNDETERMINED_VERSION`]) from one that is no valid definition of the format it names
-/// ([`INVALID_DEFINITION`]).
+/// Which one of them a document carries is the first thing read of it, and whether either
+/// is there is what separates a body whose format could not be determined
+/// ([`UNDETERMINED_VERSION`]) from one whose format IS settled and that is then refused by
+/// the step that failed: as no document ([`UNPARSEABLE_DEFINITION`]) or as no valid
+/// definition of that format ([`INVALID_DEFINITION`]).
 const VERSION_MEMBERS: [&str; 2] = ["openapi", "swagger"];
 
 /// Whether `node` declares the format it is written in, which is one of
@@ -968,6 +973,41 @@ fn declares_version(node: &Node) -> bool {
     VERSION_MEMBERS
         .iter()
         .any(|member| node.member(member).is_some())
+}
+
+/// Whether `text` — the body as the bytes it was sent as — writes one of
+/// [`VERSION_MEMBERS`] as a member.
+///
+/// Version detection is the FIRST step of an import and does not wait for the document to
+/// be read, so it has to answer for a body no reader could finish as well: nothing of such
+/// a body's structure is known, so the name is looked for wherever it stands, as the KEY a
+/// mapping writes — the name, the quotes a spelling may wrap it in, then the colon both
+/// spellings separate a key from its value with. A name that is only part of a longer one
+/// (`swaggerVersion`) is no member of that name and is not one of these.
+fn declares_version_in_text(text: &str) -> bool {
+    VERSION_MEMBERS.iter().any(|member| {
+        text.match_indices(member).any(|(at, _)| {
+            let before_is_name = text[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|last| last.is_alphanumeric() || matches!(last, '_' | '-' | '.'));
+            let after = text[at + member.len()..]
+                .trim_start_matches(['"', '\'', '\\', ' ', '\t']);
+            !before_is_name && after.starts_with(':')
+        })
+    })
+}
+
+/// The refusal for a body the reader could not finish: the version detection in front of
+/// the reading answers first, so a body that writes neither version member is refused as
+/// the version that could not be determined, and only one whose format IS settled is
+/// refused as the input that is no document.
+fn unreadable_refusal(text: &str) -> String {
+    if declares_version_in_text(text) {
+        UNPARSEABLE_DEFINITION.to_string()
+    } else {
+        UNDETERMINED_VERSION.to_string()
+    }
 }
 
 /// The YAML spelling of a definition, read through the bounded event reader.
@@ -980,7 +1020,9 @@ fn parse_yaml(text: &str) -> Result<Node, String> {
     }
     // A body the parser stopped on, and a document whose collections never close, are the
     // same case: the reader did not finish the document, so there is no document — and the
-    // refusal says that and not where the reading stopped ([`UNPARSEABLE_DEFINITION`]).
+    // refusal says that and not where the reading stopped. Which of the two sentences in
+    // front of the reading that is, is settled by the caller over the body itself
+    // ([`unreadable_refusal`]).
     if read.is_err() || !builder.open.is_empty() {
         return Err(UNPARSEABLE_DEFINITION.to_string());
     }
@@ -1020,9 +1062,13 @@ pub fn parse_definition(body: &[u8], scope: &ImportScope) -> Result<ImportedDefi
             body.len()
         ));
     }
-    // Bytes that are not text are a body no reader could parse in either spelling, so they
-    // are refused as the input that is no document.
-    let text = std::str::from_utf8(body).map_err(|_| UNPARSEABLE_DEFINITION.to_string())?;
+    // Bytes that are not text are a body no reader could parse in either spelling; which of
+    // the two refusals in front of the reading that earns is settled over what of the body
+    // IS text, because a body writing neither version member declares no format.
+    let text = match std::str::from_utf8(body) {
+        Ok(text) => text,
+        Err(_) => return Err(unreadable_refusal(&String::from_utf8_lossy(body))),
+    };
     let document = match ::serde_json::from_str::<Node>(text) {
         Ok(document) => {
             // The YAML reader counts nodes AS it builds them
@@ -1035,7 +1081,17 @@ pub fn parse_definition(body: &[u8], scope: &ImportScope) -> Result<ImportedDefi
         }
         // Not JSON — or JSON past `serde_json`'s recursion limit, which the YAML reader's
         // own depth bound refuses in turn.
-        Err(_) => parse_yaml(text)?,
+        Err(_) => match parse_yaml(text) {
+            Ok(document) => document,
+            // The reading did not finish, so there is no document to detect a version in:
+            // the body itself decides which of the two sentences in front of the reading
+            // it earns. This emulator's own bounds on an untrusted body keep their own
+            // wording.
+            Err(refusal) if refusal == UNPARSEABLE_DEFINITION => {
+                return Err(unreadable_refusal(text))
+            }
+            Err(refusal) => return Err(refusal),
+        },
     };
     read_definition(&document, scope)
 }

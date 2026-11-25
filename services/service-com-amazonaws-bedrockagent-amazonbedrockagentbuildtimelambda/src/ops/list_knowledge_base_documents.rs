@@ -257,6 +257,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.data_source_id,
             cursor,
             page_size,
+            now,
         );
 
         Ok(ListKnowledgeBaseDocumentsOutput {
