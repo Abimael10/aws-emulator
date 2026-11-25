@@ -53,10 +53,6 @@ pub use vulnerability_catalog::*;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
-// The calendar arithmetic behind a chosen periodic schedule: which weekday, day of the
-// month and time of day a configuration's creation instant falls on.
-use chrono::{DateTime, Datelike, Timelike, Utc};
-
 use crate::ops::types::{
     CodeSecurityScanConfiguration, FilterCriteria, Schedule, ScopeSettings, Vulnerability,
 };
@@ -307,7 +303,7 @@ pub struct StoredCodeSecurityScanConfiguration {
     /// periodic and continuous-integration settings as sent, with the periodic schedule
     /// the service picks itself filled in by
     /// [`stored_code_security_scan_configuration`] — so a read renders back exactly the
-    /// configuration the scans run under.
+    /// configuration the scans run under, unchanged for as long as the record lives.
     pub configuration: CodeSecurityScanConfiguration,
     /// The scope settings as sent: `None` for a general scan configuration, and present
     /// for a default one, which is the distinction the create's `scopeSettings` member
@@ -661,44 +657,96 @@ pub fn tag_map(
     .unwrap_or_default()
 }
 
+/// The days of the week a scan schedule can name, in the order this service's own day
+/// vocabulary lists them, so index 0 is the first day of the week.
+///
+/// Source: `smithy_query(query="shape", shape="Day")` — this service names a day of the
+/// week by abbreviation (`SUN`, `MON`, `TUE`, `WED`, `THU`, `FRI`, `SAT`), which is also
+/// the day-of-week vocabulary an AWS cron expression accepts.
+pub const SCAN_DAYS_OF_WEEK: [&str; 7] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+
+/// The highest day of the month a monthly schedule may name: the last day EVERY month has,
+/// so a monthly scan recurs in every month including February.
+pub const LAST_DAY_EVERY_MONTH_HAS: usize = 28;
+
+/// The time of day — minute, then hour, as an AWS cron expression orders them — that a
+/// schedule Amazon Inspector chose itself runs at: the start of the day, UTC.
+///
+/// Fixed, not derived from anything: the only part of a chosen schedule the model licenses
+/// the service to pick is the DAY the scan runs on, so the time of day a chosen schedule
+/// names is the same for every configuration.
+///
+/// Source: `smithy_query(query="shape", shape="PeriodicScanConfiguration")` — the
+/// `frequency` member documents that Amazon Inspector chooses the day for the scan to run
+/// when `frequencyExpression` is not provided.
+const CHOSEN_SCHEDULE_TIME_OF_DAY: (u32, u32) = (0, 0);
+
+/// What the day of a chosen schedule is mixed under, so the index is this one choice's and
+/// no other derived value of this crate can collide with it.
+const SCHEDULE_DAY_SEED: &str = "code-security-periodic-scan-day";
+
+/// How many hex digits of the mixed id the day is read from: eight, the widest run that
+/// still parses into a `u32`.
+const SCHEDULE_DAY_HEX_DIGITS: usize = 8;
+
+/// Which day a schedule Amazon Inspector chose names, as an index into a `count`-day cycle
+/// — a non-zero cycle length: the two call sites pass the size of a day vocabulary —
+/// decided from the configuration's own identifier `configuration_id`.
+///
+/// The day is a property of the ONE configuration it was chosen for: it is the same on
+/// every read of that configuration for as long as the configuration exists, it does not
+/// move when the clock does, and two configurations need not run on the same day — which is
+/// what spreads scheduled scans across the cycle. The identifier is the only thing the
+/// choice reads, so nothing about the request or the moment it landed can change it.
+///
+/// The mixing is the workspace's one derivation of a value a service computes from what it
+/// identifies and then puts on the wire (`::service_common::stable_hex_id`), so the spread
+/// over the cycle is that function's and nothing is hand-rolled here.
+fn chosen_schedule_day_index(configuration_id: &str, count: usize) -> usize {
+    debug_assert!(count > 0, "a cycle of days has at least one day in it");
+    let mixed = ::service_common::stable_hex_id(&[SCHEDULE_DAY_SEED, configuration_id]);
+    let bucket = mixed
+        .get(..SCHEDULE_DAY_HEX_DIGITS)
+        .and_then(|digits| u32::from_str_radix(digits, 16).ok())
+        .unwrap_or_default();
+    usize::try_from(bucket).unwrap_or_default() % count
+}
+
 /// The cron schedule expression Amazon Inspector itself picks for a periodic code security
 /// scan that was asked for by `frequency` alone, or `None` for a frequency that names no
 /// schedule at all.
 ///
 /// A caller may name the frequency without naming a schedule, in which case the service
 /// chooses the day the scan runs on and the configuration carries a schedule expression
-/// matching that frequency; a caller that names the expression keeps its own. Which day the
-/// real service picks is not documented, so this emulator derives it from the
-/// configuration's OWN creation instant — the scan repeats on the weekday a weekly
-/// configuration was created on, and on the day of the month a monthly one was created on,
-/// at the time of day it was created at. The day is therefore a property of that one stored
-/// configuration rather than of its frequency: two configurations created at different
-/// times run on different days, and every read of one reports the schedule it was stored
-/// with.
+/// matching that frequency; a caller that names the expression keeps its own. The day is
+/// the only field the service picks ([`chosen_schedule_day_index`], from the
+/// configuration's own id): the time of day is the fixed
+/// [`CHOSEN_SCHEDULE_TIME_OF_DAY`], and the remaining fields are the wildcards that make
+/// the expression recur with the frequency asked for. So the schedule a configuration
+/// reports is the same on every read and the same on every run of the same program, rather
+/// than a value that moves with the clock.
 ///
 /// Source: `smithy_query(query="shape", shape="PeriodicScanConfiguration")` — the
 /// `frequency` member documents that Amazon Inspector chooses the day for the scan to run
 /// when `frequencyExpression` is not provided, and that a provided expression must match
 /// the frequency; `PeriodicScanFrequency` admits `WEEKLY`, `MONTHLY` and `NEVER`.
-pub fn chosen_frequency_expression(frequency: &str, created_at: SystemTime) -> Option<String> {
-    let created = DateTime::<Utc>::from(created_at);
-    let (minute, hour) = (created.minute(), created.hour());
+pub fn chosen_frequency_expression(frequency: &str, configuration_id: &str) -> Option<String> {
+    let (minute, hour) = CHOSEN_SCHEDULE_TIME_OF_DAY;
     match frequency {
-        // The weekday the configuration was created on names the day of the week, with the
-        // day-of-month field left as the `?` the AWS cron format requires when the
-        // day-of-week field names the day. AWS cron numbers the days of the week from 1 for
-        // Sunday, which is the numbering `number_from_sunday` answers.
+        // A weekly scan recurs on one day of the week, named the way this service names a
+        // day, with the day-of-month field left as the `?` the AWS cron format requires
+        // when the day-of-week field names the day.
         "WEEKLY" => Some(format!(
             "cron({minute} {hour} ? * {day_of_week} *)",
-            day_of_week = created.weekday().number_from_sunday()
+            day_of_week = SCAN_DAYS_OF_WEEK
+                [chosen_schedule_day_index(configuration_id, SCAN_DAYS_OF_WEEK.len())]
         )),
-        // The day of the month the configuration was created on names the day, with
-        // day-of-week left as `?`. A day past the 28th does not occur in every month, so a
-        // configuration created on one runs on the 28th instead, which keeps the scan
-        // monthly.
+        // A monthly scan recurs on one day of the month, with day-of-week left as `?`. The
+        // day is one every month has, so the scan does not skip a short month.
         "MONTHLY" => Some(format!(
             "cron({minute} {hour} {day_of_month} * ? *)",
-            day_of_month = created.day().min(28)
+            day_of_month =
+                1 + chosen_schedule_day_index(configuration_id, LAST_DAY_EVERY_MONTH_HAS)
         )),
         // `NEVER` turns periodic scanning off, so there is no schedule to express.
         "NEVER" => None,
@@ -711,20 +759,25 @@ pub fn chosen_frequency_expression(frequency: &str, created_at: SystemTime) -> O
 
 /// One `CodeSecurityScanConfiguration` as the service STORES it: what the request carried,
 /// with the periodic schedule the service chooses itself filled in
-/// ([`chosen_frequency_expression`]) when the periodic settings name a frequency but no
-/// expression. Stored this way rather than derived on each read, so every read of the
-/// configuration — and an update that round-trips one — sees the one schedule the
-/// configuration runs on.
+/// ([`chosen_frequency_expression`], for the configuration `arn` names) when the periodic
+/// settings name a frequency but no expression. Stored this way rather than derived on each
+/// read, so every read of the configuration — and an update that round-trips one — sees the
+/// one schedule the configuration runs on.
 pub fn stored_code_security_scan_configuration(
     mut configuration: crate::ops::types::CodeSecurityScanConfiguration,
-    created_at: SystemTime,
+    arn: &str,
 ) -> crate::ops::types::CodeSecurityScanConfiguration {
+    // The configuration's own id — the last segment of the ARN
+    // [`ComAmazonawsInspector2Inspector2State::mint_code_security_scan_configuration_arn`]
+    // minted for it, which identifies this one configuration and nothing else. `split`
+    // always yields at least one part, so a value carrying no `/` at all is its own id.
+    let configuration_id = arn.split('/').next_back().unwrap_or(arn);
     if let Some(periodic) = configuration.periodic_scan_configuration.as_mut() {
         periodic.frequency_expression = periodic.frequency_expression.take().or_else(|| {
             periodic
                 .frequency
                 .as_deref()
-                .and_then(|frequency| chosen_frequency_expression(frequency, created_at))
+                .and_then(|frequency| chosen_frequency_expression(frequency, configuration_id))
         });
     }
     configuration

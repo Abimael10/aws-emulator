@@ -306,7 +306,6 @@ async fn a_created_configuration_is_read_back_as_stored_and_gone_after_delete() 
                 case,
                 frequency,
                 expression,
-                crate::code_security_periodic_schedule::created_at(case, &read),
             );
         }
         assert_eq!(

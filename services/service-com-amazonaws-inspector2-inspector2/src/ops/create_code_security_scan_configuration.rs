@@ -214,11 +214,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 name: input.name,
                 level: input.level,
                 // Stored as sent, with the periodic schedule the service chooses itself
-                // filled in from this configuration's own creation instant when the
-                // request named a frequency without an expression.
+                // filled in for this configuration when the request named a frequency
+                // without an expression.
                 configuration: crate::state::stored_code_security_scan_configuration(
                     input.configuration,
-                    now,
+                    &arn,
                 ),
                 // Stored as sent: a create carrying `scopeSettings` asks for a DEFAULT
                 // scan configuration and one without it for a general one, so the absence
