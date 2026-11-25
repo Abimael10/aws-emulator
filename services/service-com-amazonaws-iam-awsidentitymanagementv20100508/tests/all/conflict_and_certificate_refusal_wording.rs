@@ -12,8 +12,9 @@
 //!    versions and whichever of them is the default;
 //! 2. where SEVERAL classes of dependent block one delete, the refusal names the one AWS
 //!    names: the binding a separate resource holds (the instance profile that holds a
-//!    role) before the entity's own policies, and a policy EMBEDDED in the entity before
-//!    a managed policy ATTACHED to it;
+//!    role) before the entity's own policies, and then the class that entity's delete is
+//!    recorded naming — the managed policies ATTACHED to a user or a role before the
+//!    policies EMBEDDED in it, the embedded ones first for a group;
 //! 3. `UploadSigningCertificate` refuses a body it cannot read as a certificate with the
 //!    sentence that QUOTES the value it was sent;
 //! 4. `UploadServerCertificate` refuses certificate material it cannot read with its own
@@ -247,9 +248,11 @@ struct Blocked {
 }
 
 /// RULE 2: a blocked delete carries AWS's fixed sentence for the class of dependent AWS
-/// names, and where several classes block one delete it names exactly one of them, in
-/// AWS's own precedence — the instance profile that holds a role, then the policies
-/// embedded in the entity, then the managed policies attached to it.
+/// names, and where several classes block one delete it names exactly one of them, in the
+/// precedence that entity's delete is observed answering with — the instance profile that
+/// holds a role first, then, for a user and a role, the managed policies ATTACHED to it
+/// before the policies EMBEDDED in it, while a group's delete names its embedded policies
+/// first.
 ///
 /// The rows span the identity kinds and the COMBINATIONS: each class alone, each pair, and
 /// all three together.
@@ -286,7 +289,7 @@ async fn a_delete_blocked_by_several_dependents_names_the_one_aws_names() {
             inline: true,
             attached: true,
             profile: false,
-            expected: MUST_DELETE_POLICIES,
+            expected: MUST_DETACH_ALL_POLICIES,
         },
         Blocked {
             case: "a role embedding a policy and held by an instance profile",
@@ -334,7 +337,7 @@ async fn a_delete_blocked_by_several_dependents_names_the_one_aws_names() {
             inline: true,
             attached: true,
             profile: false,
-            expected: MUST_DELETE_POLICIES,
+            expected: MUST_DETACH_ALL_POLICIES,
         },
         Blocked {
             case: "a group embedding an inline policy",
@@ -353,6 +356,9 @@ async fn a_delete_blocked_by_several_dependents_names_the_one_aws_names() {
             expected: MUST_DETACH_ALL_POLICIES,
         },
         Blocked {
+            // The contrast with the two rows above: a GROUP's delete names the policies
+            // it embeds while an attachment blocks it too, which is what its own
+            // recorded refusal carries.
             case: "a group embedding and carrying a policy",
             entity: Entity::Group,
             inline: true,

@@ -219,10 +219,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // removed by different operations: a member is REMOVED (`RemoveUserFromGroup`),
         // an inline policy is DELETED (`DeleteGroupPolicy`) and an attachment is
         // DETACHED (`DetachGroupPolicy`), so the caller can tell from the message which
-        // call it has to make. Where both policy kinds block one delete, the EMBEDDED one
-        // is named first, as the delete-conflict constants' documentation states, and as
-        // `crate::ops::delete_user` and `crate::ops::delete_role` name the same two, so a
-        // group, a user and a role carrying both are refused alike.
+        // call it has to make. Where both policy kinds block one GROUP's delete, the
+        // EMBEDDED one is named first, which is the sentence a group carrying both is
+        // recorded being refused with; a user's and a role's delete name their
+        // ATTACHMENTS first instead (`crate::ops::delete_user`,
+        // `crate::ops::delete_role`), as the delete-conflict constants' documentation
+        // states, because each entity's delete is refused in its own observed order.
         let holds_users = store
             .group_members
             .get(&key)

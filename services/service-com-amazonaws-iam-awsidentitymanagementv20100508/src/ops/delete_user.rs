@@ -217,30 +217,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // IAM refuses to delete an entity that still has dependents: the caller
         // must delete them first, so the user is never half-deleted and nothing is
         // removed behind the caller's back. Several classes can block one delete and IAM
-        // names exactly one, in the fixed precedence the delete-conflict constants'
-        // documentation states: a policy EMBEDDED in the user before a managed policy
-        // ATTACHED to it.
+        // names exactly one, in the precedence the delete-conflict constants'
+        // documentation states: a managed policy ATTACHED to the user before a policy
+        // EMBEDDED in it.
         //
-        // A policy the user EMBEDS is a dependent: this operation's own documentation
-        // lists "Inline policies (DeleteUserPolicy)" among the items to remove before
-        // deleting a user, so a user that still embeds one is refused rather than having
-        // the policy cascade-deleted behind the caller's back. `PutUserPolicy` is what
-        // fills that map.
-        let has_inline_policies = store
-            .user_inline_policies
-            .get(&key)
-            .is_some_and(|policies| !policies.is_empty());
-        if has_inline_policies {
-            return Err(DeleteUserErrorModeled::DeleteConflictException(
-                DeleteConflictException {
-                    message: Some(crate::state::DELETE_CONFLICT_DELETE_POLICIES.to_string()),
-                },
-            )
-            .into());
-        }
-        // So is a managed policy ATTACHED to it, refused the same way rather than being
-        // detached behind the caller's back: this operation's own documentation lists
-        // "Attached managed policies (DetachUserPolicy)" among the same items, and
+        // A managed policy ATTACHED to the user is a dependent: this operation's own
+        // documentation lists "Attached managed policies (DetachUserPolicy)" among the
+        // items to remove before deleting a user, so a user that still carries one is
+        // refused rather than having the policy detached behind the caller's back, and it
+        // is the class IAM names while an embedded policy blocks the same delete.
         // `AttachUserPolicy` is what fills that map.
         let has_attached_policies = store
             .user_attached_policies
@@ -250,6 +235,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(DeleteUserErrorModeled::DeleteConflictException(
                 DeleteConflictException {
                     message: Some(crate::state::DELETE_CONFLICT_DETACH_POLICIES.to_string()),
+                },
+            )
+            .into());
+        }
+        // So is a policy the user EMBEDS, refused the same way rather than being
+        // cascade-deleted behind the caller's back: this operation's own documentation
+        // lists "Inline policies (DeleteUserPolicy)" among the same items, and
+        // `PutUserPolicy` is what fills that map.
+        let has_inline_policies = store
+            .user_inline_policies
+            .get(&key)
+            .is_some_and(|policies| !policies.is_empty());
+        if has_inline_policies {
+            return Err(DeleteUserErrorModeled::DeleteConflictException(
+                DeleteConflictException {
+                    message: Some(crate::state::DELETE_CONFLICT_DELETE_POLICIES.to_string()),
                 },
             )
             .into());

@@ -3711,13 +3711,15 @@ pub fn principal_has_no_scope(principal_id: &str) -> String {
 /// membership and retry sees the same text whichever entity kind it addressed.
 ///
 /// Where SEVERAL classes block one delete, IAM names exactly one of them, and which one
-/// follows a fixed precedence: a binding held by a SEPARATE resource (the instance
-/// profile that holds a role) comes first, then a policy EMBEDDED in the entity, then a
-/// managed policy ATTACHED to it — the binding no delete of this entity could clear
-/// before the policies, and the policies in the order the entity deletes' own
-/// documentation lists the items to remove in ("inline policies, attached managed
-/// policies"). Each delete handler checks in that order, so the caller is told to remove
-/// the same dependent IAM would name.
+/// is the precedence that entity's delete is OBSERVED answering with — not the order the
+/// operation's own documentation happens to list the items to remove in. A binding held
+/// by a SEPARATE resource (the instance profile that holds a role) comes first, because
+/// no delete of the entity itself could clear it. Of the two policy classes, a USER's and
+/// a ROLE's delete names the managed policies ATTACHED to the identity before the
+/// policies EMBEDDED in it — recorded behaviour for an identity carrying both — while a
+/// GROUP's delete names the policies it embeds first, which is the sentence its own
+/// recorded refusal carries. Each delete handler checks in the order its own entity is
+/// refused in, so the caller is told to remove the dependent IAM would name.
 pub const DELETE_CONFLICT_DETACH_POLICIES: &str =
     "Cannot delete entity, must detach all policies first.";
 
