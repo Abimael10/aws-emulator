@@ -232,9 +232,10 @@ async fn every_deploy_discards_the_plan_its_execution_carried_out() {
             );
 
             // The delete the tool issues straight after the execution settles, in the form it
-            // addresses the change set by. Either is the operation's own empty result: the ARN
-            // addresses the record of the execution, and the NAME addresses no plan the stack
-            // still holds, which the model gives no not-found error for.
+            // addresses the change set by. Either form addresses the record of that execution —
+            // its own ARN, and the name it was created under beside its stack, both of which go
+            // on addressing the record for as long as it is there — so either is the
+            // operation's own empty result.
             let addressed = match addressed_by {
                 AddressedBy::Arn => arn.as_str(),
                 AddressedBy::NameAndStack => DEPLOY_SET,
@@ -242,33 +243,25 @@ async fn every_deploy_discards_the_plan_its_execution_carried_out() {
             let (code, body) = delete_change_set(&router, addressed, &stack).await;
             assert_empty_result(&case, code, &body);
             // ...and discarding what this call already discarded changes nothing: the same
-            // request is the same empty success.
+            // request is the same empty success, now addressing no record at all.
             let (code, body) = delete_change_set(&router, addressed, &stack).await;
             assert_empty_result(&format!("{case} repeated"), code, &body);
 
-            // The record is gone exactly where the delete addressed it: discarded by its ARN it
-            // reads back as the modelled not-found, and left alone by a delete of the free name
-            // it still reports the execution it carried out.
+            // The record the delete took away is gone whichever form addressed it: a read of it
+            // is the modelled not-found.
             let (code, body) = describe_change_set(&router, &arn, None).await;
-            match addressed_by {
-                AddressedBy::Arn => assert_eq!(
-                    (code, refusal(&body)),
+            assert_eq!(
+                (code, refusal(&body)),
+                (
+                    404,
                     (
-                        404,
-                        (
-                            "ChangeSetNotFound".to_string(),
-                            format!("ChangeSet [{arn}] does not exist"),
-                        ),
+                        "ChangeSetNotFound".to_string(),
+                        format!("ChangeSet [{arn}] does not exist"),
                     ),
-                    "case {case:?}: expected the discarded record to read back as not found, \
-                     got {code} {body}"
                 ),
-                AddressedBy::NameAndStack => assert_eq!(
-                    (code, xml_text(&body, "ExecutionStatus").unwrap_or_default()),
-                    (200, execution_status::EXECUTE_COMPLETE.to_string()),
-                    "case {case:?}: a delete of the free name took nothing, got {code} {body}"
-                ),
-            }
+                "case {case:?}: expected the discarded record to read back as not found, got \
+                 {code} {body}"
+            );
 
             // Either way the stack holds no plan, so the next round plans under the same name...
             let names = listed(&case, &router, &stack).await;

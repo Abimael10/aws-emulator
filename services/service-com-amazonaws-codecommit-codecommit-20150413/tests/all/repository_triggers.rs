@@ -8,10 +8,11 @@
 //! configuration and a get reports exactly what the last put stored — every member of
 //! every trigger, under the `configurationId` that write minted — while a
 //! configuration the repository cannot hold is refused with the error the model
-//! declares for the member at fault and leaves the stored configuration alone. The
-//! tables below span that class (trigger counts, event sets, branch scopes, custom
-//! data, name and destination forms, both published bounds and one past each) rather
-//! than one recorded request.
+//! declares for the member at fault — carrying the service's own sentence for that
+//! refusal, which every operation judging a trigger list words identically — and
+//! leaves the stored configuration alone. The tables below span that class (trigger
+//! counts, event sets, branch scopes, custom data, name and destination forms, both
+//! published bounds and one past each) rather than one recorded request.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_codecommit_codecommit_20150413::state::{
@@ -388,6 +389,172 @@ async fn the_two_reasons_an_events_list_is_refused_are_worded_apart() {
         read_triggers, stored,
         "a refused put must leave the stored configuration alone, got {read_triggers}"
     );
+}
+
+/// The sentence `MaximumBranchesExceededException` carries: the service's own
+/// statement of the per-trigger branch constraint. Everything in it is fixed apart
+/// from the limit — no trigger name, repository name, branch name or submitted count
+/// is interpolated — so every operation that judges a trigger configuration answers
+/// this one text.
+const BRANCH_LIMIT_MESSAGE: &str = "A repository trigger cannot have more than 10 branches.";
+
+/// `count` branch names a repository could hold, as a trigger's `branches`.
+fn branch_names(count: usize) -> Vec<String> {
+    (0..count)
+        .map(|index| format!("release/{index:03}"))
+        .collect()
+}
+
+#[tokio::test]
+async fn the_branch_bound_refusal_words_the_constraint_on_every_operation() {
+    let router = emulator();
+    seed(&router, "trigger-branch-bound").await;
+
+    // The only variable part of the sentence is the bound, which is the published
+    // per-trigger branch quota this crate enforces.
+    assert_eq!(
+        BRANCH_LIMIT_MESSAGE,
+        format!("A repository trigger cannot have more than {MAX_BRANCHES_PER_TRIGGER} branches."),
+        "case \"the sentence's one variable part\": the text names the enforced bound \
+         {MAX_BRANCHES_PER_TRIGGER}"
+    );
+
+    // A configuration AT the bound, which the refusals below must leave in place.
+    let at_the_bound = json!([{
+        "name": "at-the-bound",
+        "destinationArn": topic_arn(REGION, "bound"),
+        "events": ["all"],
+        "branches": branch_names(MAX_BRANCHES_PER_TRIGGER),
+    }]);
+    put(&router, "trigger-branch-bound", &at_the_bound).await;
+
+    // (case, the `triggers` value as sent). Rows differ along how far past the bound
+    // the list reaches (one, two, three times the bound), the destination kind, the
+    // event set, whether the trigger carries custom data, whether the branch names
+    // repeat, and where in a multi-trigger list the offending trigger sits.
+    let one_past = branch_names(MAX_BRANCHES_PER_TRIGGER + 1);
+    let two_past = branch_names(MAX_BRANCHES_PER_TRIGGER + 2);
+    let far_past = branch_names(MAX_BRANCHES_PER_TRIGGER * 3);
+    let mut repeated = branch_names(MAX_BRANCHES_PER_TRIGGER);
+    repeated.push("release/000".to_string());
+    let rows: Vec<(&str, Value)> = vec![
+        (
+            "one branch past the bound, on every event",
+            json!([{
+                "name": "one-past",
+                "destinationArn": topic_arn(REGION, "one-past"),
+                "events": ["all"],
+                "branches": one_past,
+            }]),
+        ),
+        (
+            "two past the bound, to a function, on two events, with custom data",
+            json!([{
+                "name": "two-past",
+                "destinationArn": function_arn(REGION, "two-past"),
+                "events": ["createReference", "deleteReference"],
+                "branches": two_past,
+                "customData": "team=platform",
+            }]),
+        ),
+        (
+            "three times the bound",
+            json!([{
+                "name": "far-past",
+                "destinationArn": topic_arn(REGION, "far-past"),
+                "events": ["updateReference"],
+                "branches": far_past,
+            }]),
+        ),
+        (
+            "one past the bound where one name is named twice",
+            json!([{
+                "name": "repeating",
+                "destinationArn": topic_arn(REGION, "repeating"),
+                "events": ["all"],
+                "branches": repeated,
+            }]),
+        ),
+        (
+            "the second trigger of a list whose first trigger is fine",
+            json!([
+                trigger("fine", &topic_arn(REGION, "fine"), &["all"]),
+                {
+                    "name": "second-past",
+                    "destinationArn": topic_arn(REGION, "second-past"),
+                    "events": ["all"],
+                    "branches": branch_names(MAX_BRANCHES_PER_TRIGGER + 1),
+                },
+            ]),
+        ),
+    ];
+
+    for (case, triggers) in rows {
+        // Both operations judge the same list, so both word the same refusal.
+        for operation in ["PutRepositoryTriggers", "TestRepositoryTriggers"] {
+            let (code, message) = error_with_message(
+                &router,
+                operation,
+                &json!({ "repositoryName": "trigger-branch-bound", "triggers": triggers }),
+                400,
+            )
+            .await;
+            assert_eq!(
+                code, "MaximumBranchesExceededException",
+                "case {case:?} on {operation}: expected MaximumBranchesExceededException, got \
+                 {code}: {message}"
+            );
+            assert_eq!(
+                message, BRANCH_LIMIT_MESSAGE,
+                "case {case:?} on {operation}: expected message {BRANCH_LIMIT_MESSAGE:?}, got \
+                 {message:?}"
+            );
+        }
+
+        // A refused configuration is not stored, even partly.
+        let (_, read_triggers) = read(&router, "trigger-branch-bound").await;
+        assert_eq!(
+            read_triggers, at_the_bound,
+            "case {case:?}: a refused configuration must leave the stored one alone, got \
+             {read_triggers}"
+        );
+    }
+
+    // Both ends of the accepted range: a trigger naming exactly as many branches as
+    // one may, and one naming none at all (which scopes it to every branch). Each is
+    // accepted by both operations — the test path reports per-trigger deliveries
+    // rather than refusing the configuration.
+    let bounds: Vec<(&str, Value)> = vec![
+        ("exactly the bound", at_the_bound.clone()),
+        (
+            "no branch at all",
+            json!([{
+                "name": "every-branch",
+                "destinationArn": topic_arn(REGION, "every-branch"),
+                "events": ["all"],
+                "branches": [],
+            }]),
+        ),
+    ];
+    for (case, triggers) in bounds {
+        put(&router, "trigger-branch-bound", &triggers).await;
+        let (_, read_triggers) = read(&router, "trigger-branch-bound").await;
+        assert_eq!(
+            read_triggers, triggers,
+            "case {case:?}: a configuration within the bound must be stored, got {read_triggers}"
+        );
+        let tested = ok(
+            &router,
+            "TestRepositoryTriggers",
+            &json!({ "repositoryName": "trigger-branch-bound", "triggers": triggers }),
+        )
+        .await;
+        assert!(
+            tested.get("failedExecutions").is_some() || tested.get("successfulExecutions").is_some(),
+            "case {case:?}: a configuration within the bound must be tested rather than refused, \
+             got {tested}"
+        );
+    }
 }
 
 #[tokio::test]

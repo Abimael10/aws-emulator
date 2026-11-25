@@ -160,11 +160,13 @@ impl TriggerProblem {
     /// once so the operations that take a `RepositoryTriggersList` cannot word
     /// the same code differently — a malformed destination ARN carries
     /// [`TRIGGER_DESTINATION_ARN_MALFORMED_MESSAGE`], which is fixed text with no
-    /// part of it read off the request. For the problems whose own wording is not
+    /// part of it read off the request, and a branch list past the per-trigger
+    /// bound carries the service's sentence for that constraint, built from the
+    /// bound this crate enforces. For the problems whose own wording is not
     /// recorded anywhere this crate can read it, the text is the documented
     /// sentence of the error shape the problem names (the `//! ## Errors` list in
-    /// `src/ops/put_repository_triggers.rs`); the two bounded problems state the
-    /// bound they tripped over, as this crate's other quota refusals do.
+    /// `src/ops/put_repository_triggers.rs`), followed by the bound the request
+    /// tripped over where one was tripped.
     pub fn message(self) -> String {
         match self {
             Self::TooManyTriggers => format!(
@@ -206,9 +208,14 @@ impl TriggerProblem {
                 "Repository trigger events cannot contain '{REPOSITORY_TRIGGER_EVENT_ALL}' and \
                  additional event types simultaneously"
             ),
+            // The service's own sentence for the per-trigger branch bound, stated as
+            // the CONSTRAINT rather than as the observation the error shape's
+            // documentation makes: fixed text whose only variable part is the bound
+            // itself ([`MAX_BRANCHES_PER_TRIGGER`]). Nothing is read off the request —
+            // not the trigger, not the repository, not the branches submitted and not
+            // how many there were.
             Self::TooManyBranches => format!(
-                "The number of branches for the trigger was exceeded. The maximum number of \
-                 branches for a trigger is {MAX_BRANCHES_PER_TRIGGER}."
+                "A repository trigger cannot have more than {MAX_BRANCHES_PER_TRIGGER} branches."
             ),
             Self::BranchNameInvalid => {
                 "One or more branch names specified for the trigger is not valid.".to_string()
