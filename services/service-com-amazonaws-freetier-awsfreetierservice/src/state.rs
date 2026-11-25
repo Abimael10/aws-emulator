@@ -933,8 +933,9 @@ pub fn enum_value_refusal(member: &str, value: &str, declared: &[&str]) -> Optio
 /// so it is written by the same module and reports the FIRST element outside the
 /// set, exactly as the walk reporting the same list would. The list is quoted
 /// under the same ceiling as a clause restored from that walk
-/// (`service_common::validation::quoted_echo`), so no message is sized by the
-/// request.
+/// (`crate::service::validation::LARGEST_QUOTED_VALUE_BYTES`, the maximum the
+/// member carrying the message declares), and the sentence as a whole is held to
+/// that member by the module that words it, so no message is sized by the request.
 pub fn enum_element_refusal(
     member: &str,
     submitted: &[String],
@@ -951,7 +952,10 @@ pub fn enum_element_refusal(
         index + 1,
         value,
         declared,
-        &::service_common::validation::quoted_echo(&rendered),
+        &::service_common::validation::quoted_echo_up_to(
+            &rendered,
+            crate::service::validation::LARGEST_QUOTED_VALUE_BYTES,
+        ),
     ))
 }
 

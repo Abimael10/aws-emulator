@@ -45,12 +45,13 @@ use service_com_amazonaws_freetier_awsfreetierservice::ops::get_account_activity
     GetAccountActivity, GetAccountActivityErrorModeled,
 };
 use service_com_amazonaws_freetier_awsfreetierservice::ops::types::{
-    GetAccountActivityInput, ACTIVITY_STATUS_VALUES, DIMENSION_VALUES, LANGUAGE_CODE_VALUES,
-    MATCH_OPTION_VALUES,
+    GetAccountActivityInput, ACCOUNT_PLAN_TYPE_VALUES, ACTIVITY_STATUS_VALUES, DIMENSION_VALUES,
+    LANGUAGE_CODE_VALUES, MATCH_OPTION_VALUES,
 };
 use service_com_amazonaws_freetier_awsfreetierservice::scaffolded::Scaffolded;
 use service_com_amazonaws_freetier_awsfreetierservice::state::{
-    stated_validation, ComAmazonawsFreetierAwsfreetierserviceState, ACCOUNT_PLAN_TYPE_VALUE_SET,
+    enum_element_refusal, enum_value_refusal, stated_validation,
+    ComAmazonawsFreetierAwsfreetierserviceState, ACCOUNT_PLAN_TYPE_VALUE_SET,
     ACTIVITIES_INVALID_NEXT_TOKEN, INVALID_NEXT_TOKEN, PAYMENT_INSTRUMENT_VET_FAILURE,
     PLAN_STATUS_ACTIVE, PLAN_STATUS_EXPIRED, PLAN_TYPE_FREE, PLAN_TYPE_PAID,
 };
@@ -1579,5 +1580,307 @@ async fn a_handlers_recheck_of_a_modelled_constraint_states_the_boundarys_messag
         other => panic!(
             "case the unheld id {unheld}: expected the modelled not-found, got {other:?}"
         ),
+    }
+}
+
+/// The `@length` maximum the model declares for the member every error shape of this
+/// service carries its prose in: `ValidationException$message` is a `GenericString` of
+/// `@length(0, 1024)`, and `ResourceNotFoundException$message`,
+/// `AccessDeniedException$message`, `InternalServerException$message` and
+/// `ThrottlingException$message` are that same shape
+/// (`smithy_query(query="shape", shape="ValidationException,GenericString")`).
+///
+/// A string's `@length` counts characters, so a message within this many BYTES is within
+/// the bound either way; both are asserted below.
+const MESSAGE_MAX: usize = 1024;
+
+/// What the clause of one row must state in place of the value the request carried.
+#[derive(Debug)]
+enum Quotes {
+    /// The value fits the member carrying the message, so the clause quotes it whole.
+    InFull(String),
+    /// The value does not fit, so the clause states an elision of it that still names how
+    /// many bytes were submitted.
+    ByteCount(usize),
+}
+
+/// One row of the message-bound table: what distinguishes it, the operation called, the
+/// request body, the member paths the refusal must still name, and what its clause quotes.
+#[derive(Debug)]
+struct BoundRow {
+    case: &'static str,
+    operation: &'static str,
+    body: Value,
+    members: &'static [&'static str],
+    quotes: Quotes,
+}
+
+/// A list of `count` elements of `length` characters each, outside the `ActivityStatus`
+/// value set, and the whole list as a clause stated at the list member renders it — the
+/// elements comma-separated in brackets, the form `tests/all/enum_value_set_wording.rs`
+/// writes out for the same clause.
+fn oversized_statuses(count: usize, length: usize) -> (Value, usize) {
+    let elements: Vec<String> = (0..count).map(|_| "Z".repeat(length)).collect();
+    let rendered = format!("[{}]", elements.join(", "));
+    (json!(elements), rendered.len())
+}
+
+/// RULE: no refusal of this service is sized by the VALUES a request carried. Every
+/// `message` fits the member that has to carry it ([`MESSAGE_MAX`]); a value small enough
+/// to fit is still quoted WHOLE, and one that is not is quoted as an elision naming how
+/// many bytes were submitted, so a caller can still read back what it got wrong and how
+/// much it sent.
+///
+/// The rows span what the rule generalises over: the operation and the member (a page
+/// token, a status filter, an activity id, a plan type, a nested filter value), the
+/// constraint class broken (a `@length`, a `@pattern`, a `@range`, an enum value set, a
+/// list's element constraints), where the clause is stated (at the member itself, at the
+/// LIST whose element failed, at a member nested two levels inside a filter), how far past
+/// the bound the value sits (from well under it to 1 MiB, including one row at the member's
+/// own published maximum and one past it), how many clauses the sentence joins (one, two
+/// over one member, three over three), and whether the value is ASCII or multi-byte — so no
+/// single input's shape decides the bound.
+#[tokio::test]
+async fn no_refusal_message_is_sized_by_the_request() {
+    let router = harness().0;
+    let (one_long_status, one_long_status_bytes) = oversized_statuses(1, 5_000);
+    let (many_statuses, many_statuses_bytes) = oversized_statuses(20, 500);
+    // The modelled `nextToken` bound, `@length(1, 8192)`
+    // (`smithy_query(query="operation", operation="ListAccountActivities")`): one past the
+    // maximum is the boundary's to refuse, and far past it is the same refusal.
+    let token_past_maximum = "T".repeat(8_193);
+    let token_far_past_maximum = "T".repeat(9_000);
+    // `ActivityId` is `@length(32, 32)` with `@pattern ^[a-zA-Z0-9]+$`, so an id of
+    // punctuation breaks both at once and one sentence joins two clauses over one member.
+    let short_bad_id = "!".repeat(40);
+    let multibyte_id = "é".repeat(500);
+    let huge_id = "!".repeat(60_000);
+    let huge_plan_type = "Z".repeat(1_024 * 1_024);
+    let nested_value = "x".repeat(4_000);
+
+    let rows: Vec<BoundRow> = vec![
+        BoundRow {
+            case: "a nextToken one character past its modelled maximum",
+            operation: "ListAccountActivities",
+            body: json!({"nextToken": token_past_maximum}),
+            members: &["nextToken"],
+            quotes: Quotes::ByteCount(token_past_maximum.len()),
+        },
+        BoundRow {
+            case: "a nextToken far past its modelled maximum",
+            operation: "ListAccountActivities",
+            body: json!({"nextToken": token_far_past_maximum}),
+            members: &["nextToken"],
+            quotes: Quotes::ByteCount(token_far_past_maximum.len()),
+        },
+        BoundRow {
+            case: "the same oversized token on the other paginated operation",
+            operation: "GetFreeTierUsage",
+            body: json!({"nextToken": token_far_past_maximum}),
+            members: &["nextToken"],
+            quotes: Quotes::ByteCount(token_far_past_maximum.len()),
+        },
+        BoundRow {
+            case: "one filter status of 5 000 characters",
+            operation: "ListAccountActivities",
+            body: json!({"filterActivityStatuses": one_long_status}),
+            members: &["filterActivityStatuses"],
+            quotes: Quotes::ByteCount(one_long_status_bytes),
+        },
+        BoundRow {
+            case: "twenty filter statuses of 500 characters each",
+            operation: "ListAccountActivities",
+            body: json!({"filterActivityStatuses": many_statuses}),
+            members: &["filterActivityStatuses"],
+            quotes: Quotes::ByteCount(many_statuses_bytes),
+        },
+        BoundRow {
+            case: "a filter status that fits is quoted whole",
+            operation: "ListAccountActivities",
+            body: json!({"filterActivityStatuses": ["NOPE"]}),
+            members: &["filterActivityStatuses"],
+            quotes: Quotes::InFull("[NOPE]".to_string()),
+        },
+        BoundRow {
+            case: "an activityId that fits is quoted whole, in both its clauses",
+            operation: "GetAccountActivity",
+            body: json!({"activityId": short_bad_id}),
+            members: &["activityId"],
+            quotes: Quotes::InFull(short_bad_id.clone()),
+        },
+        BoundRow {
+            case: "an activityId of 500 multi-byte characters over two clauses",
+            operation: "GetAccountActivity",
+            body: json!({"activityId": multibyte_id}),
+            members: &["activityId"],
+            quotes: Quotes::ByteCount(multibyte_id.len()),
+        },
+        BoundRow {
+            case: "an activityId of 60 000 characters",
+            operation: "GetAccountActivity",
+            body: json!({"activityId": huge_id}),
+            members: &["activityId"],
+            quotes: Quotes::ByteCount(huge_id.len()),
+        },
+        BoundRow {
+            case: "an accountPlanType of 1 MiB",
+            operation: "UpgradeAccountPlan",
+            body: json!({"accountPlanType": huge_plan_type}),
+            members: &["accountPlanType"],
+            quotes: Quotes::ByteCount(huge_plan_type.len()),
+        },
+        BoundRow {
+            case: "a filter value nested two levels inside an expression",
+            operation: "GetFreeTierUsage",
+            body: json!({
+                "filter": {
+                    "Dimensions": {
+                        "Key": "SERVICE",
+                        "Values": [nested_value],
+                        "MatchOptions": ["EQUALS"],
+                    }
+                }
+            }),
+            members: &["filter.dimensions.values"],
+            quotes: Quotes::ByteCount(nested_value.len() + 2),
+        },
+        BoundRow {
+            case: "three members of one request broken at once",
+            operation: "ListAccountActivities",
+            body: json!({
+                "nextToken": token_past_maximum,
+                "filterActivityStatuses": one_long_status,
+                "maxResults": 5_000,
+            }),
+            members: &["nextToken", "filterActivityStatuses", "maxResults"],
+            quotes: Quotes::ByteCount(one_long_status_bytes),
+        },
+    ];
+
+    for row in &rows {
+        let message = refusal_message(&router, row.case, row.operation, &row.body).await;
+
+        assert!(
+            message.len() <= MESSAGE_MAX,
+            "case {}: the message must fit the modelled @length(0, {MESSAGE_MAX}) of the \
+             member that carries it, got {} bytes: {message:?}",
+            row.case,
+            message.len()
+        );
+        assert!(
+            message.chars().count() <= MESSAGE_MAX,
+            "case {}: the message must fit the modelled @length(0, {MESSAGE_MAX}), got {} \
+             characters: {message:?}",
+            row.case,
+            message.chars().count()
+        );
+        // Held, not truncated to nothing: the sentence is still the AWS validation
+        // envelope, and still names every member the request got wrong.
+        assert!(
+            message.contains(" validation error"),
+            "case {}: expected the AWS validation envelope, got {message:?}",
+            row.case
+        );
+        for member in row.members {
+            assert!(
+                message.contains(&format!("at '{member}' failed to satisfy constraint: ")),
+                "case {}: expected a clause naming '{member}' and its requirement, got \
+                 {message:?}",
+                row.case
+            );
+        }
+        match &row.quotes {
+            Quotes::InFull(value) => assert!(
+                message.contains(&format!("Value '{value}'")),
+                "case {}: a value the member can carry is quoted whole, got {message:?}",
+                row.case
+            ),
+            Quotes::ByteCount(submitted) => assert!(
+                message.contains(&format!("{submitted} bytes]")),
+                "case {}: an elided clause must name how much was sent ({submitted} bytes), \
+                 got {message:?}",
+                row.case
+            ),
+        }
+    }
+
+    // The positive control: a request that breaks no constraint is served, so a bounded
+    // message cannot mean "every request is refused".
+    let served = ok(&router, "ListAccountActivities", &json!({"maxResults": 1})).await;
+    assert!(
+        served["activities"].is_array(),
+        "case the positive control: expected a served listing, got {served}"
+    );
+}
+
+/// RULE, at the OTHER layer that produces a refusal: a clause a handler words for itself
+/// ([`enum_value_refusal`], [`enum_element_refusal`]) is held to the same maximum, because
+/// the bound belongs to the member the message is carried in and not to the layer that
+/// wrote it.
+///
+/// The rows differ along the layer, the member, whether the value is a scalar or a list,
+/// how many elements the list carries and how far past the bound the value sits — including
+/// values that FIT, which must still be quoted whole.
+#[test]
+fn a_clause_the_handler_words_itself_is_held_to_the_same_maximum() {
+    // (case, the message the handler layer states, what it must quote)
+    let one_long: Vec<String> = vec!["Z".repeat(5_000)];
+    let many: Vec<String> = (0..20).map(|_| "Z".repeat(500)).collect();
+    let rows: Vec<(String, Option<String>, Quotes)> = vec![
+        (
+            "a plan type of 64 KiB".to_string(),
+            enum_value_refusal(
+                "accountPlanType",
+                &"Z".repeat(64 * 1_024),
+                ACCOUNT_PLAN_TYPE_VALUES,
+            ),
+            Quotes::ByteCount(64 * 1_024),
+        ),
+        (
+            "a plan type that fits".to_string(),
+            enum_value_refusal("accountPlanType", "NOPE", ACCOUNT_PLAN_TYPE_VALUES),
+            Quotes::InFull("NOPE".to_string()),
+        ),
+        (
+            "one status element of 5 000 characters".to_string(),
+            enum_element_refusal("filterActivityStatuses", &one_long, ACTIVITY_STATUS_VALUES),
+            Quotes::ByteCount(5_002),
+        ),
+        (
+            "twenty status elements of 500 characters each".to_string(),
+            enum_element_refusal("filterActivityStatuses", &many, ACTIVITY_STATUS_VALUES),
+            Quotes::ByteCount(20 * 500 + 19 * 2 + 2),
+        ),
+        (
+            "a status element that fits".to_string(),
+            enum_element_refusal(
+                "filterActivityStatuses",
+                &["NOPE".to_string()],
+                ACTIVITY_STATUS_VALUES,
+            ),
+            Quotes::InFull("[NOPE]".to_string()),
+        ),
+    ];
+
+    for (case, stated, quotes) in rows {
+        let message = stated
+            .unwrap_or_else(|| panic!("case {case}: the handler layer must refuse the value"));
+        assert!(
+            message.len() <= MESSAGE_MAX && message.chars().count() <= MESSAGE_MAX,
+            "case {case}: the message must fit the modelled @length(0, {MESSAGE_MAX}), got {} \
+             bytes: {message:?}",
+            message.len()
+        );
+        match &quotes {
+            Quotes::InFull(value) => assert!(
+                message.contains(&format!("Value '{value}'")),
+                "case {case}: a value the member can carry is quoted whole, got {message:?}"
+            ),
+            Quotes::ByteCount(submitted) => assert!(
+                message.contains(&format!("{submitted} bytes]")),
+                "case {case}: an elided clause must name how much was sent ({submitted} \
+                 bytes), got {message:?}"
+            ),
+        }
     }
 }

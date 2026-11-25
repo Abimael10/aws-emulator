@@ -108,6 +108,12 @@
 //! Beyond any of these the framework's elided text stands: a shortened echo is a
 //! divergence in one message, while an unbounded one is a response sized by the request.
 //!
+//! A service whose model bounds the member a refusal is CARRIED in has one more thing to
+//! state: what the echoes of one message may quote TOGETHER, which a per-value ceiling does
+//! not bound. [`echoes_held_within`] is that division — the member's declared maximum, less
+//! the message's own prose, handed out over the echoes through [`echo_held_to`] — so the
+//! rule lives here once however many parts a service's sentence joins.
+//!
 //! # Why this lives here at all
 //!
 //! The structurally right place for this is the frozen crate: carry the unelided value
@@ -1232,6 +1238,44 @@ pub fn echo_held_to(echo: &str, max_echo: usize) -> ::std::borrow::Cow<'_, str> 
     };
     let room = max_echo.saturating_sub(marker.len());
     ::std::borrow::Cow::Owned(format!("{}{marker}", char_prefix(value_prefix, room)))
+}
+
+/// Every echo of ONE message, each held to its share of what the member that carries that
+/// message leaves once the message's own PROSE is in it ([`echo_held_to`]).
+///
+/// For a service whose model declares an `@length` maximum on the member a refusal is
+/// carried in: the parts of one refusal are joined into ONE message, so what they may quote
+/// is bounded TOGETHER — a per-value ceiling that fits one of them fits two of them twice
+/// over — and the holding is therefore a division of one budget rather than a cap applied
+/// value by value. `max_message` is that member's declared maximum and `prose` what the
+/// message states around its echoes, both the SERVICE's to state; the echoes come back in
+/// the order they were handed in, so each clause takes its own.
+///
+/// What the prose leaves is handed out SHORTEST echo first, so an echo needing less than an
+/// equal share leaves the rest to the ones that state more and the message carries as much
+/// of each as the member admits. Holding an echo keeps the byte count it names
+/// ([`echo_held_to`]), so every part still reports how much was sent, and where the prose
+/// ALONE fills the member each echo is stated by that count alone — the one thing a caller
+/// can read nowhere else — rather than by dropping a part the caller has to act on.
+///
+/// Counted in BYTES, which a character-counted `@length` can only be larger than, so an echo
+/// carrying multi-byte characters is held more tightly rather than less.
+#[must_use]
+pub fn echoes_held_within(max_message: usize, prose: usize, echoes: &[&str]) -> Vec<String> {
+    let mut shortest_first: Vec<usize> = (0..echoes.len()).collect();
+    shortest_first.sort_by_key(|at| echoes[*at].len());
+
+    let mut budget = max_message.saturating_sub(prose);
+    let mut held: Vec<String> = echoes.iter().map(|echo| (*echo).to_string()).collect();
+    let mut left = shortest_first.len();
+    for at in shortest_first {
+        let share = budget / left.max(1);
+        let echo = echo_held_to(echoes[at], share);
+        budget -= echo.len().min(budget);
+        held[at] = echo.into_owned();
+        left -= 1;
+    }
+    held
 }
 
 /// Where the marker naming a submitted byte count starts in `echo`, when `echo` is an

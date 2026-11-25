@@ -323,7 +323,7 @@ fn held_within_the_message_maximum(
 
 /// Each of `quoted` held to its share of what the member a refusal is CARRIED in leaves once
 /// `prose` bytes of that refusal's own wording are in it
-/// ([`service_common::validation::echo_held_to`]).
+/// ([`service_common::validation::echoes_held_within`]).
 ///
 /// THE ONE place a refusal of this service holds a caller-sized value, whichever path words
 /// it: the values the framework's clauses quote ([`held_within_the_message_maximum`]), the
@@ -333,31 +333,16 @@ fn held_within_the_message_maximum(
 /// bounded by THAT model rather than by this one, so a sentence carrying it is not inside
 /// this member by construction the way one interpolating only this model's own members is.
 ///
-/// Why a SHARE rather than a per-value ceiling: the parts of one refusal are joined into ONE
-/// `Message`, so what they may state together is bounded TOGETHER — a ceiling that fits one
-/// of them fits two of them twice over. What the prose leaves is handed out shortest value
-/// first, so a value needing less than an equal share leaves the rest to the values that
-/// state more and the sentence carries as much of each as the member admits. Holding a value
-/// keeps the byte count it names, so every part still reports how much there was.
-///
-/// Where the prose ALONE fills the member there is nothing caller-sized left to hold: each
-/// value is then stated by its byte count alone, which is the one thing a caller can read
-/// nowhere else.
+/// What this service states is WHICH maximum its sentence is held to
+/// ([`LARGEST_MESSAGE_BYTES`], read off the member that carries it) and how much of it the
+/// sentence's own prose takes; the division itself is the tree's shared one, so every service
+/// whose model bounds that member divides one budget the same way: what the prose leaves is
+/// handed out shortest value first, and holding a value keeps the byte count it names, so
+/// every part still reports how much there was. Where the prose ALONE fills the member each
+/// value is stated by that count alone, which is the one thing a caller can read nowhere
+/// else.
 pub(crate) fn each_held_within_the_message_maximum(prose: usize, quoted: &[&str]) -> Vec<String> {
-    let mut shortest_first: Vec<usize> = (0..quoted.len()).collect();
-    shortest_first.sort_by_key(|at| quoted[*at].len());
-
-    let mut budget = LARGEST_MESSAGE_BYTES.saturating_sub(prose);
-    let mut held: Vec<String> = quoted.iter().map(|value| (*value).to_string()).collect();
-    let mut left = shortest_first.len();
-    for at in shortest_first {
-        let share = budget / left;
-        let value = service_common::validation::echo_held_to(quoted[at], share);
-        budget -= value.len().min(budget);
-        held[at] = value.into_owned();
-        left -= 1;
-    }
-    held
+    service_common::validation::echoes_held_within(LARGEST_MESSAGE_BYTES, prose, quoted)
 }
 
 /// The names that identify THIS service to the router: its SigV4 signing name — shared

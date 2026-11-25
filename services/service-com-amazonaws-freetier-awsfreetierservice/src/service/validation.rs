@@ -48,7 +48,18 @@
 //!    walk's own too — a `@length`, a `@pattern`, any bound the framework enforces over a
 //!    built input — is re-checked by running that walk again over the input the handler
 //!    holds ([`outside_declared_constraints`]), so neither the condition nor the sentence
-//!    is restated for it.
+//!    is restated for it;
+//! 9. no refusal is sized by the VALUES a request carried: what one clause quotes is
+//!    restored only up to the maximum the model declares for the member the message is
+//!    carried in ([`LARGEST_QUOTED_VALUE_BYTES`]), and what the clauses of one sentence
+//!    quote TOGETHER is held to what their own prose leaves of that maximum
+//!    ([`LARGEST_MESSAGE_BYTES`], [`held_within_the_message_maximum`]) — on every path
+//!    through this module, so the bound cannot hold for the boundary walk's refusal and not
+//!    for a handler's own. The one thing the maximum does NOT bound is this service's own
+//!    clause PROSE: a request breaking enough members that the clauses' wording alone fills
+//!    the member is still told about every one of them, each value reduced to the byte count
+//!    it names, because a clause a caller has to act on is worse lost than stated past the
+//!    bound (`service_common::validation::echoes_held_within`).
 //!
 //! Rules 1-3 and 5 are `services/common`'s already
 //! (`service_common::validation_message::aws_validation_refusal`), which cannot be
@@ -71,7 +82,9 @@ use ::aws_smithy_schema_server::constraints::{
     ViolationKind,
 };
 use ::aws_smithy_schema::serde::SerializableStruct;
-use ::service_common::validation::{list_of_element, quoted_echo, unanchored, with_submitted_values};
+use ::service_common::validation::{
+    echoes_held_within, list_of_element, quoted_echo_up_to, unanchored, with_submitted_values_up_to,
+};
 use ::service_common::validation_message::{list_item_count, map_entry_count};
 use ::smithy_server_runtime::Refused;
 
@@ -88,6 +101,35 @@ const CLAUSE_MARKER: &str = "failed to satisfy constraint: ";
 
 /// How a clause nests the requirements of a LIST's elements (rule 4).
 const NESTED_REQUIREMENT: &str = "Member must satisfy constraint";
+
+/// The largest `message` a refusal of this service states (rule 9), in bytes.
+///
+/// The maximum the model declares for the member every one of this service's error shapes
+/// carries its prose in: `ValidationException$message` is a `GenericString` of
+/// `@length(0, 1024)` (`smithy_query(query="shape", shape="ValidationException")`), and
+/// `ResourceNotFoundException$message`, `AccessDeniedException$message`,
+/// `InternalServerException$message` and `ThrottlingException$message` are that same shape.
+/// Nothing enforces an OUTPUT constraint at runtime — the validating walk runs on operation
+/// inputs — so the bound holds only if what a refusal quotes is held to it here.
+///
+/// Counted in BYTES against a maximum the model counts in characters, which is the
+/// conservative reading of the same bound: a value of at most this many bytes is at most
+/// this many characters.
+pub(crate) const LARGEST_MESSAGE_BYTES: usize = 1024;
+
+/// The largest single value ONE clause of a refusal of this service quotes back, which is
+/// what the collecting walk is asked for
+/// (`service_common::validation::refusing_violations_with_lists_quoting_up_to`, and
+/// `quoted_echo_up_to` for a clause a handler words itself) instead of the shared default.
+///
+/// A value no `message` of this service could carry even alone is one no clause can quote in
+/// full, so the per-value ceiling is the carrying member's own maximum: it is a MODEL
+/// constant and never request-sized. Past it the framework's own shortened rendering stands
+/// — a character-boundary-safe prefix plus the marker naming the submitted byte count. What
+/// the clauses of one refusal may quote TOGETHER is bounded by
+/// [`LARGEST_MESSAGE_BYTES`] itself ([`held_within_the_message_maximum`]), because they are
+/// joined into one `message`.
+pub(crate) const LARGEST_QUOTED_VALUE_BYTES: usize = LARGEST_MESSAGE_BYTES;
 
 /// This service's wording for the violations the framework found, or `None` when there
 /// is nothing to word (no violations) or a violation class this module has no wording
@@ -125,9 +167,37 @@ pub(super) fn refusal(
 /// A violation found on a list element is stated at the LIST member with the element
 /// requirements nested, which is why two bad elements of one list are ONE clause rather
 /// than two, while a member that broke two different rules still states both.
+///
+/// THE ONE renderer every refusal of this service reaches, which is why rule 9's bound is
+/// applied here: a sentence past the member that has to carry it is worded again with what
+/// its clauses quote held to what their prose leaves, so neither the boundary walk's refusal
+/// nor a handler's own re-check can state a message sized by the request.
 fn message(violations: &[Violation], lists: &HashMap<String, String>) -> Option<String> {
+    let clauses = stated_clauses(violations, lists)?;
+    let sentence = envelope(&worded(&clauses))?;
+    if sentence.len() <= LARGEST_MESSAGE_BYTES {
+        return Some(sentence);
+    }
+    // Rule 9: the sentence is past the member that has to hold it, so the only part of it
+    // the caller sized is held to what the clauses' own prose leaves. A sentence whose own
+    // PROSE already fills the member keeps every clause, each value reduced to the byte
+    // count it names — the one case rule 9's bound does not bring the whole sentence inside
+    // the member, stated here rather than by dropping a clause a caller has to act on.
+    Some(held_within_the_message_maximum(&clauses, &sentence).unwrap_or(sentence))
+}
+
+/// The clauses of one refusal, in the order the walk found the violations, or `None` for a
+/// violation class this module has no wording for (which keeps the framework's own).
+///
+/// Each clause is kept in PARTS — its member path, its requirement and the value it quotes —
+/// rather than as finished text, because rule 9 words the same clauses a second time with
+/// the quoted value held to its share of the message maximum.
+fn stated_clauses(
+    violations: &[Violation],
+    lists: &HashMap<String, String>,
+) -> Option<Vec<Clause>> {
     let mut stated: HashSet<(String, String)> = HashSet::new();
-    let mut clauses: Vec<String> = Vec::new();
+    let mut clauses: Vec<Clause> = Vec::new();
     for violation in violations {
         let element = list_of_element(&violation.path);
         let path = element.unwrap_or(violation.path.as_str()).to_string();
@@ -149,10 +219,128 @@ fn message(violations: &[Violation], lists: &HashMap<String, String>) -> Option<
         if !stated.insert((path.clone(), requirement.clone())) {
             continue;
         }
-        let subject = subject(violation, element.and_then(|list| lists.get(list)));
-        clauses.push(format!("{subject} at '{path}' {CLAUSE_MARKER}{requirement}"));
+        let quoted = quoted(violation, element.and_then(|list| lists.get(list)));
+        clauses.push(Clause {
+            path,
+            requirement,
+            quoted,
+        });
     }
-    envelope(&clauses)
+    Some(clauses)
+}
+
+/// Every clause of `clauses` as it reads, quoting the value it was built with.
+fn worded(clauses: &[Clause]) -> Vec<String> {
+    clauses
+        .iter()
+        .map(|clause| clause.stated(&clause.quoted))
+        .collect()
+}
+
+/// `clauses` worded again with every quoted value held to its share of what the member a
+/// refusal is CARRIED in leaves once the clauses' own prose is in it, for a sentence that did
+/// not fit that member (rule 9) — and `None` when no clause quotes a value, so there is
+/// nothing caller-sized to hold and the sentence stands as it was worded.
+///
+/// The division of that budget over the clauses is the tree's shared one
+/// (`service_common::validation::echoes_held_within`), which hands out what the prose leaves
+/// shortest value first and keeps the byte count each elision names, so a clause still
+/// reports how much was sent. Where the clauses' own prose ALONE fills the member, every
+/// clause is still stated with its value reduced to that count rather than dropped.
+///
+/// The only thing read off `sentence` is the PROSE the clauses state around their values —
+/// the sentence just worded, less the echoes interpolated into it — so no count of clause
+/// text is kept by hand and the envelope, the paths and the requirements are the ones
+/// [`worded`] already wrote.
+fn held_within_the_message_maximum(clauses: &[Clause], sentence: &str) -> Option<String> {
+    let quoted: Vec<&str> = clauses.iter().filter_map(Clause::quoted_value).collect();
+    if quoted.is_empty() {
+        return None;
+    }
+    let echoed: usize = quoted.iter().map(|value| value.len()).sum();
+    let prose = sentence.len().saturating_sub(echoed);
+    // The division is the tree's shared one, so this service states only WHICH maximum its
+    // sentence is held to and what its own prose takes of it. It answers one held echo per
+    // echo handed in, which is what lets the clauses be paired with them below.
+    let held = echoes_held_within(LARGEST_MESSAGE_BYTES, prose, &quoted);
+    let mut held = held.iter();
+    let worded: Vec<String> = clauses
+        .iter()
+        .map(|clause| {
+            // A clause that quotes no value takes no share, so it leaves the held echoes to
+            // the clauses that do.
+            if clause.quoted_value().is_none() {
+                return clause.stated(&clause.quoted);
+            }
+            match held.next() {
+                Some(held) => clause.stated(&Quoted::Value(held.clone())),
+                // A share that went missing leaves the clause the value it was worded with
+                // rather than losing it.
+                None => clause.stated(&clause.quoted),
+            }
+        })
+        .collect();
+    envelope(&worded)
+}
+
+/// One clause of a refusal, in the parts rule 9 words it from: the member's dotted path, the
+/// requirement it failed, and what the clause states in place of the value.
+#[derive(Debug)]
+struct Clause {
+    /// The dotted member path the clause names — a list member for a violation found on one
+    /// of its elements (rule 4).
+    path: String,
+    /// The requirement half of the clause, in the framework's own words.
+    requirement: String,
+    /// The value half of the clause, as it reads when the sentence fits the member that
+    /// carries it.
+    quoted: Quoted,
+}
+
+impl Clause {
+    /// This clause as it reads, stating `quoted` in place of its value — its own
+    /// [`Clause::quoted`] for the sentence as first worded, and the held echo for the one
+    /// rule 9 words again.
+    fn stated(&self, quoted: &Quoted) -> String {
+        format!(
+            "{} at '{}' {CLAUSE_MARKER}{}",
+            quoted.subject(),
+            self.path,
+            self.requirement
+        )
+    }
+
+    /// The value this clause quotes, and `None` for a clause that quotes none — the only
+    /// part of a refusal the caller sizes.
+    fn quoted_value(&self) -> Option<&str> {
+        match &self.quoted {
+            Quoted::Value(value) => Some(value.as_str()),
+            Quoted::Null | Quoted::Counted => None,
+        }
+    }
+}
+
+/// What one clause states in place of the value it is about.
+#[derive(Debug)]
+enum Quoted {
+    /// The member was ABSENT, so there is no value at all.
+    Null,
+    /// A clause about a COLLECTION's own `@length`, whose only rendering from the walk is an
+    /// element count rather than something the caller sent (rule 5).
+    Counted,
+    /// The value the caller submitted, as this clause quotes it.
+    Value(String),
+}
+
+impl Quoted {
+    /// The subject half of a clause stating this value.
+    fn subject(&self) -> String {
+        match self {
+            Self::Null => "Value null".to_string(),
+            Self::Counted => "Value".to_string(),
+            Self::Value(value) => format!("Value '{value}'"),
+        }
+    }
 }
 
 /// The envelope over the clauses of one refusal: `1 validation error detected: <clause>`
@@ -172,7 +360,7 @@ fn envelope(clauses: &[String]) -> Option<String> {
     }
 }
 
-/// The value half of a clause.
+/// The value half of a clause, as the clause states it.
 ///
 /// * an ABSENT member has no value at all and is stated as the null it was;
 /// * a clause stated at a LIST member because one of its ELEMENTS failed states the
@@ -183,12 +371,12 @@ fn envelope(clauses: &[String]) -> Option<String> {
 ///   sent (rule 5);
 /// * everything else echoes the value carried on the violation, which the seam has
 ///   already restored to the bytes the caller submitted.
-fn subject(violation: &Violation, rendered_list: Option<&String>) -> String {
+fn quoted(violation: &Violation, rendered_list: Option<&String>) -> Quoted {
     match (&violation.value, rendered_list) {
-        (None, _) => "Value null".to_string(),
-        (Some(_), Some(rendered)) => format!("Value '{rendered}'"),
-        (Some(_), None) if states_a_count(violation) => "Value".to_string(),
-        (Some(shown), None) => format!("Value '{shown}'"),
+        (None, _) => Quoted::Null,
+        (Some(_), Some(rendered)) => Quoted::Value(rendered.clone()),
+        (Some(_), None) if states_a_count(violation) => Quoted::Counted,
+        (Some(shown), None) => Quoted::Value(shown.clone()),
     }
 }
 
@@ -329,10 +517,11 @@ pub(crate) fn outside_declared_constraints(
     member: &str,
 ) -> Option<String> {
     let found = ::aws_smithy_schema_server::constraints::validate(input, schema);
-    let at_member: Vec<Violation> = with_submitted_values(found, input, schema)
-        .into_iter()
-        .filter(|violation| violation.path == member)
-        .collect();
+    let at_member: Vec<Violation> =
+        with_submitted_values_up_to(found, input, schema, LARGEST_QUOTED_VALUE_BYTES)
+            .into_iter()
+            .filter(|violation| violation.path == member)
+            .collect();
     if at_member.is_empty() {
         return None;
     }
@@ -344,16 +533,17 @@ pub(crate) fn outside_declared_constraints(
 /// records one so the clause writer cannot tell the two apart.
 ///
 /// The value is quoted under the SAME ceiling as a clause restored from that walk
-/// (`service_common::validation::quoted_echo`), so neither refusal path of this service
-/// states a message sized by the request. The membership check itself is made against the
-/// value the caller sent, never against this rendering.
+/// ([`LARGEST_QUOTED_VALUE_BYTES`], the maximum the member carrying the message declares),
+/// so neither refusal path of this service states a message sized by the request. The
+/// membership check itself is made against the value the caller sent, never against this
+/// rendering.
 fn enum_violation(path: String, value: &str, declared: &[&str]) -> Violation {
     Violation {
         path,
         kind: ViolationKind::EnumValue(
             declared.iter().map(|value| (*value).to_string()).collect(),
         ),
-        value: Some(quoted_echo(value).into_owned()),
+        value: Some(quoted_echo_up_to(value, LARGEST_QUOTED_VALUE_BYTES).into_owned()),
         sensitive: false,
     }
 }
@@ -797,6 +987,75 @@ mod tests {
             actual.is_none(),
             "case no violations: expected no wording, got {actual:?}"
         );
+    }
+
+    /// RULE 9 at the two places a wire test of this service cannot reach: a sentence whose
+    /// clauses can still quote their values whole, and one whose CLAUSES' own prose already
+    /// fills the member — where there is nothing caller-sized left to hand out, so each
+    /// value is stated by its byte count alone rather than by dropping the clauses a caller
+    /// has to act on.
+    ///
+    /// The rows differ in how many members one request broke, from one — whose prose leaves
+    /// room to quote the value whole — through the counts whose prose fills the message, so
+    /// the holding is pinned on both sides of the point where nothing is left to hand out.
+    #[test]
+    fn every_clause_of_one_sentence_is_held_to_its_share_of_the_member() {
+        let submitted = "Z".repeat(600);
+        // (the members broken, whether a value is still quoted whole, whether the clauses'
+        // own prose leaves the sentence inside the member that carries it)
+        let rows: [(usize, bool, bool); 4] = [
+            (1, true, true),
+            (2, false, true),
+            (8, false, true),
+            (40, false, false),
+        ];
+
+        for (count, quoted_whole, prose_fits) in rows {
+            let violations: Vec<Violation> = (0..count)
+                .map(|index| {
+                    violation(
+                        &format!("member{index}"),
+                        ViolationKind::MaxLength(32),
+                        &submitted,
+                    )
+                })
+                .collect();
+            let stated = refusal(&violations, HashMap::new)
+                .unwrap_or_else(|| panic!("case {count} violations: expected a wording"));
+            let marker = format!("... [{} bytes]", submitted.len());
+            if quoted_whole {
+                assert!(
+                    stated.message.contains(&format!("Value '{submitted}'")),
+                    "case {count} violations: a value the member can carry is quoted whole, \
+                     got {:?}",
+                    stated.message
+                );
+            } else {
+                assert_eq!(
+                    stated.message.matches(marker.as_str()).count(),
+                    count,
+                    "case {count} violations: every clause must state an elision naming how \
+                     much was sent, got {:?}",
+                    stated.message
+                );
+            }
+            if prose_fits {
+                assert!(
+                    stated.message.len() <= LARGEST_MESSAGE_BYTES,
+                    "case {count} violations: the message must fit the carrying member's \
+                     {LARGEST_MESSAGE_BYTES} bytes, got {}: {:?}",
+                    stated.message.len(),
+                    stated.message
+                );
+            }
+            for index in 0..count {
+                assert!(
+                    stated.message.contains(&format!("at 'member{index}'")),
+                    "case {count} violations: no clause may be dropped, got {:?}",
+                    stated.message
+                );
+            }
+        }
     }
 
     /// GUARD on [`request_shapes`]: every list member the MODEL declares with

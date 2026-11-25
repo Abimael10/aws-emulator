@@ -234,18 +234,27 @@ impl<O> StatedPerOperation<O> {
 /// framework's own walk answers in its own envelope.
 ///
 /// The collecting half is the tree's shared one,
-/// `service_common::validation::refusing_violations_with_lists`: one read of the request
-/// yields the framework's own violations (the protocol's deserializer for an absent
-/// `@required` member, `constraints::validate` over the built input) with each value echo
-/// restored to the bytes the caller sent, plus the request's own lists — the value a
+/// `service_common::validation::refusing_violations_with_lists_quoting_up_to`: one read of
+/// the request yields the framework's own violations (the protocol's deserializer for an
+/// absent `@required` member, `constraints::validate` over the built input) with each value
+/// echo restored to the bytes the caller sent, plus the request's own lists — the value a
 /// clause stated at a LIST member needs and no violation carries. Nothing is re-checked
 /// here, and no second copy of that walk lives in this crate.
+///
+/// How LONG a value it restores is this service's own, and is stated from the model
+/// ([`validation::LARGEST_QUOTED_VALUE_BYTES`]) rather than left to the shared default,
+/// because this model bounds the member every refusal of this service is CARRIED in
+/// (rule 9); what the clauses quote together is bounded by [`validation`] as it words them.
 fn stated_refusal<O: Operation>(
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
 ) -> Option<(Vec<Violation>, Refused)> {
     let (violations, lists) =
-        service_common::validation::refusing_violations_with_lists::<O>(protocol, req);
+        service_common::validation::refusing_violations_with_lists_quoting_up_to::<O>(
+            protocol,
+            req,
+            validation::LARGEST_QUOTED_VALUE_BYTES,
+        );
     let stated = validation::refusal(&violations, || lists)?;
     Some((violations, stated))
 }

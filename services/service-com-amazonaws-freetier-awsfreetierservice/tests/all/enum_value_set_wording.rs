@@ -71,11 +71,13 @@ type MemberRow<'row> = (
     &'row [&'row str],
 );
 
-/// The size one refusal must stay under whatever the request carried: an upper
-/// bound on the service's own clause ceiling, not that ceiling itself (which is
-/// `services/common`'s and is not published). What it pins is that the bound
-/// exists — the same cap holds for a request of any size.
-const CLAUSE_SIZE_CAP: usize = 32 * 1_024;
+/// The size one refusal must stay within whatever the request carried: the `@length`
+/// maximum the model declares for the member that has to hold it
+/// (`ValidationException$message`, a `GenericString` of `@length(0, 1024)` —
+/// `smithy_query(query="shape", shape="ValidationException")`). The rule it pins and the
+/// table that spans it live in `tests/all/validation_message_rules.rs`; here it holds the
+/// oversized rows below to the same bound as every other refusal of this service.
+const CLAUSE_SIZE_CAP: usize = 1_024;
 
 /// The AWS clause for a value outside an enumerated type, written out here
 /// rather than read off the service so the expectation and the implementation do
@@ -288,10 +290,10 @@ async fn a_list_element_outside_its_enumerated_type_is_refused_in_one_wording() 
 ///
 /// The rows differ along how far past the ceiling the value sits, and the cap they
 /// are held to is the SAME at both sizes, so a message that grew with the request
-/// fails here. The ceiling itself is `services/common`'s and is not published, so
-/// nothing below names it: a value under it is quoted whole and pinned against the
-/// other layer by the table above, and these rows assert what holds at any size —
-/// a bounded message that still names the value set and how much was sent.
+/// fails here: a value under the bound is quoted whole and pinned against the other
+/// layer by the table above, and these rows assert what holds at any size — a message
+/// inside the modelled maximum of the member that carries it, still naming the value
+/// set and how much was sent.
 #[tokio::test]
 async fn an_oversized_value_is_quoted_under_a_bounded_ceiling() {
     let router = harness().0;
@@ -324,10 +326,12 @@ async fn an_oversized_value_is_quoted_under_a_bounded_ceiling() {
                 "case {case}: an elided clause must name how much was sent, got {message:?}"
             );
             // The same cap holds at every size above, so the message is bounded by
-            // the service: a clause interpolating the value would grow with it.
+            // the model's own maximum for the member carrying it: a clause
+            // interpolating the value would grow with it.
             assert!(
-                message.len() < CLAUSE_SIZE_CAP,
-                "case {case}: the refusal must be bounded by the service, got {} bytes",
+                message.len() <= CLAUSE_SIZE_CAP,
+                "case {case}: the refusal must fit the modelled maximum of \
+                 {CLAUSE_SIZE_CAP} bytes, got {} bytes",
                 message.len()
             );
         }

@@ -405,6 +405,100 @@ fn an_echo_held_again_keeps_the_count_it_names() {
     );
 }
 
+/// RULE: the echoes of ONE message are held to shares of what the carrying member leaves
+/// once the message's prose is in it — the whole message within that maximum where the
+/// prose leaves room, every echo still naming how much was sent, and an echo needing less
+/// than an equal share leaving the rest to the ones that state more.
+///
+/// The rows differ along the number of echoes, their relative sizes (equal, one short and
+/// one long, all tiny), the encoding, and how much of the maximum the prose takes —
+/// including a prose that fills it, where each echo is reduced to its count alone.
+#[test]
+fn the_echoes_of_one_message_are_held_to_shares_of_what_its_prose_leaves() {
+    const MAXIMUM: usize = 1024;
+    // (case, the prose around the echoes, the echoes a message quotes)
+    let rows: Vec<(&str, usize, Vec<String>)> = vec![
+        ("one echo well inside the maximum", 100, vec!["bob".to_string()]),
+        ("one echo past the maximum", 100, vec!["v".repeat(5_000)]),
+        (
+            "two echoes of one size",
+            200,
+            vec!["v".repeat(5_000), "w".repeat(5_000)],
+        ),
+        (
+            "a short echo beside a long one",
+            200,
+            vec!["bob".to_string(), "w".repeat(5_000)],
+        ),
+        (
+            "multibyte echoes",
+            200,
+            vec!["€".repeat(2_000), "é".repeat(2_000)],
+        ),
+        (
+            "prose that fills the maximum",
+            MAXIMUM + 1,
+            vec!["v".repeat(5_000), "w".repeat(5_000)],
+        ),
+    ];
+
+    for (case, prose, echoes) in rows {
+        let quoted: Vec<&str> = echoes.iter().map(String::as_str).collect();
+        let held = super::echoes_held_within(MAXIMUM, prose, &quoted);
+        assert_eq!(
+            held.len(),
+            quoted.len(),
+            "case {case:?}: every echo must come back, got {held:?}"
+        );
+        let total: usize = held.iter().map(String::len).sum();
+        if prose < MAXIMUM {
+            assert!(
+                prose + total <= MAXIMUM,
+                "case {case:?}: the message must fit {MAXIMUM} bytes, got {} with {prose} \
+                 bytes of prose",
+                prose + total
+            );
+        }
+        for (at, echo) in held.iter().enumerate() {
+            let submitted = quoted[at];
+            if echo == submitted {
+                assert!(
+                    submitted.len() + prose <= MAXIMUM,
+                    "case {case:?}: an echo kept whole must fit the message, got {} bytes \
+                     beside {prose} of prose",
+                    submitted.len()
+                );
+                continue;
+            }
+            assert!(
+                echo.ends_with(&format!("... [{} bytes]", submitted.len())),
+                "case {case:?}: a held echo must name how much was sent, got {echo:?}"
+            );
+            assert!(
+                is_elision_of(echo, submitted),
+                "case {case:?}: a held echo must still be an elision of the value, got \
+                 {echo:?}"
+            );
+        }
+    }
+
+    // The short echo keeps its whole value and the long one takes what it left, so the
+    // shares are not divided equally when one of them needs less.
+    let short = "bob";
+    let long = "w".repeat(5_000);
+    let held = super::echoes_held_within(MAXIMUM, 200, &[short, long.as_str()]);
+    assert_eq!(
+        held.first().map(String::as_str),
+        Some(short),
+        "case \"a short echo beside a long one\": the short echo is kept whole, got {held:?}"
+    );
+    assert!(
+        held.get(1).is_some_and(|echo| echo.len() > (MAXIMUM - 200) / 2),
+        "case \"a short echo beside a long one\": the long echo takes what the short one \
+         left, got {held:?}"
+    );
+}
+
 /// RULE: an echo elided with a marker of the service's own keeps at most the bound in
 /// bytes, ends on a character boundary, and ends with that marker — and a value inside
 /// the bound is borrowed back unchanged, whatever the marker.
