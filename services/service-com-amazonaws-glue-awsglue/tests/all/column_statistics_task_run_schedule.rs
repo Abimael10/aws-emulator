@@ -40,7 +40,11 @@ use crate::column_statistics_task_settings::{create_body, get_settings, read_bod
 use crate::wire::{call, emulator, error_code, error_message, ok, string_list, ACCOUNT_ID};
 
 /// The two operations this suite drives, so every row of a table below is asked of both.
-const SCHEDULE_OPERATIONS: [&str; 2] = [
+///
+/// `pub(crate)` so the suite that tables the VALUES of the settings key
+/// ([`crate::column_statistics_schedule_settings_key`]) asks the same two operations rather
+/// than naming them a second time.
+pub(crate) const SCHEDULE_OPERATIONS: [&str; 2] = [
     "StartColumnStatisticsTaskRunSchedule",
     "StopColumnStatisticsTaskRunSchedule",
 ];
@@ -55,7 +59,9 @@ const SCHEDULE_OPERATIONS: [&str; 2] = [
 /// start and stop report it: fixed text around the record's composite key — the catalog the
 /// request addressed, the account whose estate it is in, and the database and table the
 /// settings would belong to, as the request named them.
-fn settings_not_found(catalog_id: &str, database: &str, table: &str) -> String {
+/// `pub(crate)` for the reason [`SCHEDULE_OPERATIONS`] is: the wording lives in ONE place, so
+/// it cannot drift between the suites that assert it.
+pub(crate) fn settings_not_found(catalog_id: &str, database: &str, table: &str) -> String {
     format!(
         "ColumnStatisticsTaskSettings {catalog_id}:{ACCOUNT_ID}:{database}-{table} not found."
     )
@@ -70,7 +76,8 @@ const CATALOG_NOT_FOUND: &str = "Catalog not found.";
 
 /// The body that addresses one table's schedule, plus whatever `extra` adds — the same three
 /// members both operations take (`DatabaseName`, `TableName`, the optional `CatalogID`).
-fn schedule_body(database: &str, table: &str, extra: &Value) -> Value {
+/// `pub(crate)` for the reason [`SCHEDULE_OPERATIONS`] is.
+pub(crate) fn schedule_body(database: &str, table: &str, extra: &Value) -> Value {
     let mut body = json!({ "DatabaseName": database, "TableName": table });
     if let Some(members) = extra.as_object() {
         for (member, value) in members {
