@@ -76,8 +76,40 @@ pub async fn export_grant_is_not_creatable(
         || ::service_common::iam_role::role_is_absent(ctx, region, role_arn).await
 }
 
-/// Judge the export role the way Amazon RDS does before it accepts an export: `None` for a
-/// role the export can run under, and the defect that stops it otherwise.
+/// ONE of the calls an export makes on its destination, which the export's role is judged
+/// for one at a time.
+///
+/// An export makes them IN ORDER — it reads the bucket's location before it writes an object
+/// ("include the following required actions ... s3:GetBucketLocation", `IamRoleArn`) — and the
+/// ANSWER to the first of them is what tells the export whether the destination is a bucket
+/// it can write at all, so each call is judged where the export makes it rather than both at
+/// once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportDestinationCall {
+    /// The bucket-location read ([`EXPORT_BUCKET_LOCATION_ACTION`]), authorized on the bucket
+    /// itself ("arn:aws:s3:::your-s3-bucket", `IamRoleArn`): the FIRST call the export makes.
+    BucketLocation,
+    /// The object write ([`EXPORT_OBJECT_WRITE_ACTION`]), authorized on one of the objects the
+    /// export writes ("arn:aws:s3:::your-s3-bucket/*"): the call it makes once the destination
+    /// has answered where it is.
+    ObjectWrite,
+}
+
+impl ExportDestinationCall {
+    /// The IAM action this call is authorized by, which is also the call a refusal of it names
+    /// ([`super::export_role_missing_permissions_message`]).
+    #[must_use]
+    pub fn action(self) -> &'static str {
+        match self {
+            Self::BucketLocation => EXPORT_BUCKET_LOCATION_ACTION,
+            Self::ObjectWrite => EXPORT_OBJECT_WRITE_ACTION,
+        }
+    }
+}
+
+/// What IAM and the object store ANSWERED about one export's role and one destination,
+/// resolved ONCE so that the calls the export makes there are judged in the ORDER it makes
+/// them without either service being asked twice.
 ///
 /// `bucket` is the destination, whose own policy is the other half of every call's decision,
 /// and `object_key` one of the objects the export would write into it — the resource the
@@ -91,75 +123,113 @@ pub async fn export_grant_is_not_creatable(
 /// untaken — they ground no refusal, and they withdraw none either: the destination's own
 /// explicit deny is an answer the object store gave, so it still refuses the export. Only
 /// what IAM and the object store ANSWERED grounds a defect.
-pub async fn export_role_defect<Eng: Send + Sync + 'static>(
-    ctx: &::smithy_server_runtime::OperationContext<'_>,
-    engine: &Eng,
-    region: &str,
-    role_arn: &str,
-    bucket: &str,
-    object_key: &str,
-) -> Option<ExportRoleDefect> {
-    // Every question below is a question about a role of THIS account — what its trust
-    // document says, and what its policies let it do — so a value that names none is judged
-    // for nothing here: that it resolves to no role is the GRANT's answer
-    // ([`export_grant_is_not_creatable`]), taken before this.
-    ::service_common::iam_role::role_name(role_arn)?;
-    if ::service_common::iam_role::held_role_is_unassumable(
-        ctx,
-        region,
-        role_arn,
-        super::EXPORT_SERVICE_PRINCIPAL,
-    )
-    .await
-    {
-        return Some(ExportRoleDefect::NotAssumable);
+pub struct ExportRoleAccess {
+    /// Whether the value the request carried names a role of THIS account at all. Every
+    /// question below is a question about such a role — what its trust document says, and what
+    /// its policies let it do — so a value that names none is judged for nothing here: that it
+    /// resolves to no role is the GRANT's answer ([`export_grant_is_not_creatable`]), taken
+    /// before this.
+    names_a_role: bool,
+    /// Whether IAM answered that it HOLDS the role and the export principal cannot assume it.
+    unassumable: bool,
+    /// Every identity-based document IAM holds for the role, or `None` where they could not be
+    /// read at all ([`role_identity_documents`]).
+    documents: Option<Vec<String>>,
+    /// The destination's own policy, where the object store holds one for it.
+    policy: Option<String>,
+    /// Every spelling of the identity the calls an export makes carry
+    /// ([`destination_principals`]).
+    principals: Vec<String>,
+    /// The condition keys those calls carry ([`export_context`]).
+    context: Vec<(String, String)>,
+    /// The destination itself, which the bucket-level call is authorized on.
+    destination: String,
+    /// One of the objects the export writes, which the object write is authorized on: the key
+    /// of a call rather than the wildcard, because a policy element states a rule that IAM
+    /// matches against the resource the CALL names.
+    object: String,
+}
+
+impl ExportRoleAccess {
+    /// Ask IAM and the object store everything the judgement below rests on, in one pass.
+    pub async fn resolve<Eng: Send + Sync + 'static>(
+        ctx: &::smithy_server_runtime::OperationContext<'_>,
+        engine: &Eng,
+        region: &str,
+        role_arn: &str,
+        bucket: &str,
+        object_key: &str,
+    ) -> Self {
+        let names_a_role = ::service_common::iam_role::role_name(role_arn).is_some();
+        let unassumable = names_a_role
+            && ::service_common::iam_role::held_role_is_unassumable(
+                ctx,
+                region,
+                role_arn,
+                super::EXPORT_SERVICE_PRINCIPAL,
+            )
+            .await;
+        // The role's own identity policies: a role carrying none of them can make none of the
+        // calls an export makes, which is what the missing-permissions fault reports. A set of
+        // documents this emulator could not read establishes NOTHING about what the role may
+        // do, so that half of the decision is simply not taken — it never turns into a
+        // refusal, and it never withdraws the other half either.
+        let documents = if names_a_role {
+            role_identity_documents(ctx, region, role_arn).await
+        } else {
+            None
+        };
+        Self {
+            names_a_role,
+            unassumable,
+            documents,
+            policy: bucket_policy(engine, bucket),
+            principals: destination_principals(role_arn),
+            context: export_context(role_arn),
+            destination: ::service_com_amazonaws_s3_amazons3::state::bucket_arn(bucket),
+            object: ::service_com_amazonaws_s3_amazons3::state::object_arn(bucket, object_key),
+        }
     }
-    // The destination itself, which the bucket-level call is authorized on
-    // ("arn:aws:s3:::your-s3-bucket", `IamRoleArn`), and ONE of the objects the export
-    // writes, which the object write is ("arn:aws:s3:::your-s3-bucket/*"): the key of a call
-    // rather than the wildcard, because a policy element states a rule that IAM matches
-    // against the resource the CALL names.
-    let destination = ::service_com_amazonaws_s3_amazons3::state::bucket_arn(bucket);
-    let objects = ::service_com_amazonaws_s3_amazons3::state::object_arn(bucket, object_key);
-    let principals = destination_principals(role_arn);
-    let context = export_context(role_arn);
-    let policy = bucket_policy(engine, bucket);
-    // The role's own identity policies: a role carrying none of them can make none of the
-    // calls below, which is what the missing-permissions fault reports. A set of documents
-    // this emulator could not read establishes NOTHING about what the role may do, so that
-    // half of the decision is simply not taken — it never turns into a refusal, and it never
-    // withdraws the other half either.
-    let documents = role_identity_documents(ctx, region, role_arn).await;
-    // Each call the export makes on the destination, IN THE ORDER it makes them: the role is
-    // judged call by call and the FIRST one it cannot make is the one reported, because that
-    // is the call that failed — the export never gets to the next one.
-    for (action, resource) in [
-        (EXPORT_BUCKET_LOCATION_ACTION, destination.as_str()),
-        (EXPORT_OBJECT_WRITE_ACTION, objects.as_str()),
-    ] {
+
+    /// Judge the export role for ONE of the calls the export makes on its destination, the way
+    /// Amazon RDS does before it accepts an export: `None` for a call the role can make, and
+    /// the defect that stops it otherwise.
+    #[must_use]
+    pub fn defect_on(&self, call: ExportDestinationCall) -> Option<ExportRoleDefect> {
+        if !self.names_a_role {
+            return None;
+        }
+        if self.unassumable {
+            return Some(ExportRoleDefect::NotAssumable);
+        }
+        let action = call.action();
+        let resource = match call {
+            ExportDestinationCall::BucketLocation => self.destination.as_str(),
+            ExportDestinationCall::ObjectWrite => self.object.as_str(),
+        };
         let request =
-            ::service_common::iam_authorization::Request::new(action, resource, &principals)
-                .with_context(&context);
+            ::service_common::iam_authorization::Request::new(action, resource, &self.principals)
+                .with_context(&self.context);
         // The bucket's own policy is read first: "an explicit deny in any policy overrides
         // any allow", so a bucket that denies the role this call refuses the export whatever
         // the role carries — and whether or not the role's own documents could be read, since
         // a deny does not depend on them.
-        if let Some(policy) = &policy {
+        if let Some(policy) = &self.policy {
             if ::service_common::iam_authorization::resource_decision(policy, &request)
                 == ::service_common::iam_authorization::Decision::Denied
             {
                 return Some(ExportRoleDefect::MissingPermissions(action));
             }
         }
-        if let Some(documents) = &documents {
+        if let Some(documents) = &self.documents {
             if ::service_common::iam_authorization::identity_decision(documents, &request)
                 != ::service_common::iam_authorization::Decision::Allowed
             {
                 return Some(ExportRoleDefect::MissingPermissions(action));
             }
         }
+        None
     }
-    None
 }
 
 /// Every spelling of the role a resource-based policy may name: the role's own ARN, and the

@@ -303,6 +303,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // "The name of the Amazon S3 bucket to export the snapshot or cluster data to"
+        // (`S3BucketName`): a value outside Amazon S3's published general-purpose bucket
+        // naming rules is a name that service holds no bucket under in any account, so it
+        // names no destination at all and no call is ever made with it — the modelled
+        // `InvalidS3BucketFault`, which is the one fault that reports a destination this
+        // export cannot be run to. It is decided from the REQUEST alone, by the one reading
+        // every service in this workspace judges a caller-supplied bucket name by, so it sits
+        // here with the other request-only checks: whether the object store HOLDS a bucket of
+        // a well-formed name is a question for that service, asked further down, and is
+        // reported as the same fault.
+        if !::service_common::s3_bucket_name::is_well_formed(&input.s3_bucket_name) {
+            return Err(StartExportTaskErrorModeled::InvalidS3BucketFault(
+                InvalidS3BucketFault {
+                    message: Some(crate::state::invalid_s3_bucket_message(
+                        &input.s3_bucket_name,
+                    )),
+                },
+            )
+            .into());
+        }
+
         // No store means this service was mounted on an engine it has no state in, so it
         // cannot serve the operation at all; 501 is the honest answer, never an export
         // nothing started.
@@ -384,10 +405,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             resolve_export_source(&store, &region, &input.source_arn)?
         };
 
-        // The destination bucket is a resource of ANOTHER service, so it is resolved where
-        // that service holds it: a bucket Amazon S3 holds nothing under can take no export,
-        // which is the modelled `InvalidS3BucketFault`. An engine with no object store
-        // beside this service establishes nothing and refuses nothing.
+        // Where every object of this export is written, which the calls below are authorized
+        // on: "the Amazon S3 bucket prefix to use as the file name and path of the exported
+        // data" (`S3Prefix`) with the export task's own folder below it. Resolved here
+        // because the authorization probe needs it — a destination policy is written about
+        // the KEYS a call writes — and used again by the export itself further down.
+        let prefix =
+            crate::state::export_prefix(input.s3_prefix.as_deref(), &input.export_task_identifier);
+
+        // "The provided IAM role must have access to the S3 bucket". The role IAM holds is
+        // judged call by call, and each answer is reported as the fault that answer carries:
+        // a role IAM HOLDS that the
+        // export principal cannot assume is the modelled `IamRoleNotFoundFault`; and a role
+        // that can be assumed but cannot make one of the calls the export makes on the
+        // destination — because nothing grants it, or because the bucket's own policy denies
+        // it — is the modelled `IamRoleMissingPermissionsFault`, naming the call that failed.
+        // Whether the value resolves to a role of this account AT ALL was decided above, with
+        // the grant that is created for it.
+        //
+        // The object write is judged on an object this export really writes — its own summary
+        // file, which every export leaves behind — because that is the resource of the call:
+        // a policy written about the keys under the export's prefix decides it as IAM does.
+        // Everything IAM and the object store answer about the role and this destination is
+        // resolved ONCE here, because the calls are judged in the ORDER the export makes them
+        // and the destination's own answer comes between them.
+        let access = crate::state::ExportRoleAccess::resolve(
+            ctx,
+            &*self.engine,
+            &region,
+            &input.iam_role_arn,
+            &input.s3_bucket_name,
+            &crate::state::export_info_key(&prefix, &input.export_task_identifier),
+        )
+        .await;
+
+        // The FIRST call the export makes on its destination is the bucket-location read
+        // ("include the following required actions ... s3:GetBucketLocation", `IamRoleArn`),
+        // and that call's ANSWER is the only thing that tells the export where — or whether —
+        // the destination is: the object store reports a bucket's location to a caller its
+        // policies allow that read and refuses the call otherwise, disclosing neither the
+        // location nor the bucket's existence. So the role is judged for this ONE call before
+        // anything is said about the destination itself, and a role that may not read a
+        // destination's location is reported as the missing-permissions fault whether or not
+        // this Region holds a bucket of that name.
+        if let Some(defect) = access.defect_on(crate::state::ExportDestinationCall::BucketLocation)
+        {
+            return Err(role_refusal(
+                defect,
+                &input.iam_role_arn,
+                &input.s3_bucket_name,
+            ));
+        }
+
+        // What that call ANSWERS, for a role that may make it. The destination bucket is a
+        // resource of ANOTHER service, so it is resolved where that service holds it: a bucket
+        // Amazon S3 holds nothing under can take no export, which is the modelled
+        // `InvalidS3BucketFault` — the one fault that reports both halves of what the location
+        // read can answer ("either it isn't located in the current AWS Region or it doesn't
+        // exist"), and the same fault a name no bucket can carry is refused with above. An
+        // engine with no object store beside this service establishes nothing and refuses
+        // nothing.
         if crate::state::bucket_is_absent(&*self.engine, &input.s3_bucket_name) == Some(true) {
             return Err(StartExportTaskErrorModeled::InvalidS3BucketFault(
                 InvalidS3BucketFault {
@@ -413,60 +490,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Where every object of this export is written, which the calls below are authorized
-        // on: "the Amazon S3 bucket prefix to use as the file name and path of the exported
-        // data" (`S3Prefix`) with the export task's own folder below it. Resolved here
-        // because the authorization probe needs it — a destination policy is written about
-        // the KEYS a call writes — and used again by the export itself further down.
-        let prefix =
-            crate::state::export_prefix(input.s3_prefix.as_deref(), &input.export_task_identifier);
-
-        // "The provided IAM role must have access to the S3 bucket". The role IAM holds is
-        // judged call by call, and each answer is reported as the fault that answer carries:
-        // a role IAM HOLDS that the
-        // export principal cannot assume is the modelled `IamRoleNotFoundFault`; and a role
-        // that can be assumed but cannot make one of the calls the export makes on the
-        // destination — because nothing grants it, or because the bucket's own policy denies
-        // it — is the modelled `IamRoleMissingPermissionsFault`, naming the first such call.
-        // Whether the value resolves to a role of this account AT ALL was decided above, with
-        // the grant that is created for it.
-        //
-        // The object write is judged on an object this export really writes — its own summary
-        // file, which every export leaves behind — because that is the resource of the call:
-        // a policy written about the keys under the export's prefix decides it as IAM does.
-        match crate::state::export_role_defect(
-            ctx,
-            &*self.engine,
-            &region,
-            &input.iam_role_arn,
-            &input.s3_bucket_name,
-            &crate::state::export_info_key(&prefix, &input.export_task_identifier),
-        )
-        .await
-        {
-            Some(crate::state::ExportRoleDefect::NotAssumable) => {
-                return Err(StartExportTaskErrorModeled::IamRoleNotFoundFault(
-                    IamRoleNotFoundFault {
-                        message: Some(crate::state::export_role_not_found_message(
-                            &input.iam_role_arn,
-                        )),
-                    },
-                )
-                .into())
-            }
-            Some(crate::state::ExportRoleDefect::MissingPermissions(action)) => {
-                return Err(StartExportTaskErrorModeled::IamRoleMissingPermissionsFault(
-                    IamRoleMissingPermissionsFault {
-                        message: Some(crate::state::export_role_missing_permissions_message(
-                            &input.iam_role_arn,
-                            action,
-                            &input.s3_bucket_name,
-                        )),
-                    },
-                )
-                .into())
-            }
-            None => {}
+        // And the WRITE the export performs into a destination it has now established is
+        // there: the call it makes after the location read, so it is judged after that read's
+        // own answer has been reported.
+        if let Some(defect) = access.defect_on(crate::state::ExportDestinationCall::ObjectWrite) {
+            return Err(role_refusal(
+                defect,
+                &input.iam_role_arn,
+                &input.s3_bucket_name,
+            ));
         }
 
         // And the key the exported data is encrypted under has to be one the export can USE
@@ -755,6 +787,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let answer = record.to_wire();
         Ok(answered(answer))
+    }
+}
+
+/// The refusal ONE defect of the export's role is answered with: a role IAM holds that the
+/// export principal cannot assume is the modelled `IamRoleNotFoundFault`, and a call on the
+/// destination the role cannot make is the modelled `IamRoleMissingPermissionsFault`, whose
+/// sentence names that call ([`crate::state::export_role_missing_permissions_message`]).
+///
+/// Written once because the role is judged for each call the export makes on its destination
+/// where that call is made ([`crate::state::ExportDestinationCall`]), and every one of those
+/// answers is reported as the same two faults.
+fn role_refusal(
+    defect: crate::state::ExportRoleDefect,
+    role_arn: &str,
+    bucket: &str,
+) -> StartExportTaskError {
+    match defect {
+        crate::state::ExportRoleDefect::NotAssumable => {
+            StartExportTaskErrorModeled::IamRoleNotFoundFault(IamRoleNotFoundFault {
+                message: Some(crate::state::export_role_not_found_message(role_arn)),
+            })
+            .into()
+        }
+        crate::state::ExportRoleDefect::MissingPermissions(action) => {
+            StartExportTaskErrorModeled::IamRoleMissingPermissionsFault(
+                IamRoleMissingPermissionsFault {
+                    message: Some(crate::state::export_role_missing_permissions_message(
+                        role_arn, action, bucket,
+                    )),
+                },
+            )
+            .into()
+        }
     }
 }
 

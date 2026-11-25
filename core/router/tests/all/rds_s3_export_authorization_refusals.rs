@@ -363,12 +363,34 @@ fn an_export_is_judged_role_and_destination_call_by_call() {
                 std::slice::from_ref(&bucket_arn),
             );
 
+            // A role that may read and write EVERY bucket: a destination's own condition —
+            // a bucket this Region holds nothing under — is what the bucket-location read
+            // ANSWERS a role that may MAKE that read, so the row about such a destination is
+            // asked with this role.
+            let every_bucket = policy_document(
+                "Allow",
+                None,
+                &[
+                    "s3:PutObject*",
+                    "s3:GetObject*",
+                    "s3:ListBucket",
+                    "s3:DeleteObject*",
+                    "s3:GetBucketLocation",
+                ],
+                &["arn:aws:s3:::*".to_string(), "arn:aws:s3:::*/*".to_string()],
+            );
+
             // (the role's name, its trust document, the policy it carries if any)
-            let roles: [(&str, &str, Option<&str>); 4] = [
+            let roles: [(&str, &str, Option<&str>); 5] = [
                 ("probe-export-granted", EXPORT_TRUST, Some(&every_action)),
                 ("probe-export-read-only", EXPORT_TRUST, Some(&read_only)),
                 ("probe-export-no-policy", EXPORT_TRUST, None),
                 ("probe-export-other-trust", OTHER_TRUST, Some(&every_action)),
+                (
+                    "probe-export-every-bucket",
+                    EXPORT_TRUST,
+                    Some(&every_bucket),
+                ),
             ];
             let mut role_arns: Vec<String> = Vec::new();
             for (name, trust, policy) in roles {
@@ -401,6 +423,7 @@ fn an_export_is_judged_role_and_destination_call_by_call() {
             let read_only_role = role_arns[1].clone();
             let no_policy_role = role_arns[2].clone();
             let other_trust_role = role_arns[3].clone();
+            let every_bucket_role = role_arns[4].clone();
             // A well-formed ARN of this account naming a role IAM holds nothing under: the
             // granted role's own ARN with another name in it.
             let absent_role = format!(
@@ -523,7 +546,7 @@ fn an_export_is_judged_role_and_destination_call_by_call() {
                     Attempt {
                         case: "a destination this Region holds nothing under",
                         task: "probe-absent-bucket",
-                        role_arn: &granted,
+                        role_arn: &every_bucket_role,
                         bucket: ABSENT_BUCKET,
                     },
                     400,

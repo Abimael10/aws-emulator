@@ -1185,6 +1185,18 @@ async fn each_documented_export_refusal_is_answered_with_its_own_code() {
     let fixture = export_fixture("emu-export-refusals", "rds-export-refusal-role").await;
     let router = &fixture.router;
 
+    // A role granted the export's calls on EVERY bucket: a destination's OWN condition — a
+    // bucket Amazon S3 holds nothing under, or one outside this Region — is what the
+    // bucket-location read ANSWERS a role that may MAKE that read, so the two rows below
+    // about the destination are asked with such a role.
+    let everywhere = role(
+        router,
+        "rds-export-refusal-everywhere",
+        st::EXPORT_SERVICE_PRINCIPAL,
+        Some(export_role_policy("*")),
+    )
+    .await;
+
     // A bucket Amazon S3 holds nothing under.
     expect_error(
         "a destination bucket that does not exist",
@@ -1195,7 +1207,7 @@ async fn each_documented_export_refusal_is_answered_with_its_own_code() {
                 "ExportTaskIdentifier" => "emu-refuse-bucket",
                 "SourceArn" => fixture.snapshot_arn,
                 "S3BucketName" => "emu-export-bucket-that-does-not-exist",
-                "IamRoleArn" => fixture.role_arn,
+                "IamRoleArn" => everywhere,
                 "KmsKeyId" => fixture.key_id,
             ],
         )
@@ -1215,7 +1227,7 @@ async fn each_documented_export_refusal_is_answered_with_its_own_code() {
                 "ExportTaskIdentifier" => "emu-refuse-region",
                 "SourceArn" => fixture.snapshot_arn,
                 "S3BucketName" => "emu-export-elsewhere",
-                "IamRoleArn" => fixture.role_arn,
+                "IamRoleArn" => everywhere,
                 "KmsKeyId" => fixture.key_id,
             ],
         )

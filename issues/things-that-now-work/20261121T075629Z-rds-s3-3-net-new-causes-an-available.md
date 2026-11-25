@@ -14,6 +14,28 @@ Issue-Commit: bccbad003e7099c3c9072bea417f676e8df40816
 
 # rds__s3: 3 net-new causes — an available Aurora cluster publishes a writer Endpoint on a host the emulator does not serve, no engine answers at that host:port, and the snapshot/export lifecycle never settles
 
+## Fix record
+
+Per replay key, as the replay reported them when this report was moved:
+
+- Cause 1 (four keys, `PublishedUrlRejected` on the published cluster endpoint): FIXED — a
+  served cluster publishes the host and port of the listener its engine wire is answered on
+  (`services/service-com-amazonaws-rds-amazonrdsv19/src/state/clusters.rs`,
+  `state/cluster_endpoint_names.rs`).
+- Cause 2 (`rds-load-from-s3-role-association-positive`): FIXED — the cluster's MySQL wire is
+  served at that address and `LOAD DATA FROM S3` runs under the associated s3Import role
+  (`src/state/data_plane/mysql_server.rs`, `mysql_wire.rs`, `mysql_s3_load.rs`).
+- Cause 3: `cli-rds-start-export-task-workflow` FIXED; `cli-rds-create-snapshot-export-to-s3-workflow`
+  MOVED — it now fails later, on `_poll_until#19|Timeout|return last`, a key the open issue
+  `20261122T005804Z-rds-s3-4-net-new-causes-in-snapshot.md` carries together with the rest of that
+  non-settling family; `rds-export-task-wrong-bucket-negative` is NOT CLOSED — its key still
+  times out at the replay's 60 s cap inside the check's own retry sleep, with no response
+  captured. What this fix changed on that path is the order in which `StartExportTask` reports a
+  destination's own condition and the export role's authorization for the bucket-location read
+  (`src/ops/start_export_task.rs`, `src/state/export_access.rs`), pinned by
+  `core/router/tests/all/rds_s3_export_destination_grant_sets.rs`, which drives that whole
+  scenario end to end.
+
 > _Note: this issue was identified against the code base at commit `bccbad003e7099c3c9072bea417f676e8df40816`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

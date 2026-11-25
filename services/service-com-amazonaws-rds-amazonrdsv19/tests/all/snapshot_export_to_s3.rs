@@ -419,7 +419,8 @@ async fn available_cluster_snapshot(
     format!("arn:aws:rds:{REGION}:{ACCOUNT}:cluster-snapshot:{snapshot}")
 }
 
-/// Start one export, as a client starts it — against the destination's own bucket and key.
+/// Start one export, as a client starts it — against the destination's own bucket, key and
+/// role.
 async fn start_export(
     destination: &Destination,
     identifier: &str,
@@ -428,12 +429,23 @@ async fn start_export(
 ) -> (u16, String) {
     let bucket = destination.bucket.clone();
     let key_id = destination.key_id.clone();
-    start_export_naming(destination, identifier, source_arn, prefix, &bucket, &key_id).await
+    let role_arn = destination.role_arn.clone();
+    start_export_naming(
+        destination,
+        identifier,
+        source_arn,
+        prefix,
+        &bucket,
+        &key_id,
+        &role_arn,
+    )
+    .await
 }
 
 /// The same call with the destination the request NAMES spelled out, so one row may name a
-/// bucket or a key other than the destination's own and change nothing else about the
+/// bucket, a key or a role other than the destination's own and change nothing else about the
 /// request.
+#[allow(clippy::too_many_arguments)]
 async fn start_export_naming(
     destination: &Destination,
     identifier: &str,
@@ -441,12 +453,13 @@ async fn start_export_naming(
     prefix: Option<&str>,
     bucket: &str,
     key_id: &str,
+    role_arn: &str,
 ) -> (u16, String) {
     let mut request: Vec<(&str, String)> = params![
         "ExportTaskIdentifier" => identifier,
         "SourceArn" => source_arn,
         "S3BucketName" => bucket,
-        "IamRoleArn" => destination.role_arn,
+        "IamRoleArn" => role_arn,
         "KmsKeyId" => key_id,
     ]
     .to_vec();
@@ -891,11 +904,23 @@ async fn each_export_refusal_carries_the_services_own_sentence() {
     .await
     .id;
 
+    // A role granted the export's calls on EVERY bucket: a destination's OWN condition — a
+    // bucket the object store holds nothing under, or one outside this Region — is what the
+    // bucket-location read ANSWERS a role that may MAKE that read, so the rows about the
+    // destination are asked with a role whose own authorization does not stop it first.
+    let everywhere = role(
+        &destination.router,
+        "emu-refusal-everywhere",
+        st::EXPORT_SERVICE_PRINCIPAL,
+        Some(export_role_policy("*")),
+    )
+    .await;
+
     let rows = [
         RefusalRow {
             case: "a destination bucket Amazon S3 holds nothing under",
             bucket: Some("emu-refusal-no-such-bucket".to_string()),
-            role_arn: None,
+            role_arn: Some(everywhere.clone()),
             key_id: None,
             status: 400,
             code: "InvalidS3BucketFault",
@@ -917,7 +942,7 @@ async fn each_export_refusal_carries_the_services_own_sentence() {
         RefusalRow {
             case: "a destination bucket in another Region",
             bucket: Some(elsewhere.to_string()),
-            role_arn: None,
+            role_arn: Some(everywhere.clone()),
             key_id: None,
             status: 400,
             code: "InvalidParameterValue",
@@ -1340,6 +1365,17 @@ async fn an_export_refused_for_an_unresolvable_destination_is_accepted_once_it_r
     )
     .await;
 
+    // A role granted the export's calls on EVERY bucket: the destination's own condition is
+    // what the bucket-location read ANSWERS a role that may make that read, so the row about
+    // a destination this Region holds nothing under is asked with such a role.
+    let everywhere = role(
+        &destination.router,
+        "emu-paired-everywhere",
+        st::EXPORT_SERVICE_PRINCIPAL,
+        Some(export_role_policy("*")),
+    )
+    .await;
+
     let rows = [
         PairedRow {
             case: "a destination bucket Amazon S3 holds nothing under",
@@ -1380,7 +1416,7 @@ async fn an_export_refused_for_an_unresolvable_destination_is_accepted_once_it_r
     for (index, row) in rows.iter().enumerate() {
         // The one parameter that cannot be resolved, and the sentence the refusal carries for
         // it: fixed text, with the value the request named as its only variable part.
-        let (bucket, key_id, expected_message) = match &row.unresolvable {
+        let (bucket, key_id, expected_message, role_arn) = match &row.unresolvable {
             Unresolvable::Bucket(bucket) => (
                 (*bucket).to_string(),
                 destination.key_id.clone(),
@@ -1388,11 +1424,13 @@ async fn an_export_refused_for_an_unresolvable_destination_is_accepted_once_it_r
                     "The S3 bucket {bucket} isn't valid. Either it isn't located in the \
                      current AWS Region or it doesn't exist."
                 ),
+                everywhere.clone(),
             ),
             Unresolvable::AbsentKey(reference) => (
                 destination.bucket.clone(),
                 (*reference).to_string(),
                 format!("The KMS key {reference} doesn't exist or is disabled."),
+                destination.role_arn.clone(),
             ),
             Unresolvable::KeyDenying(action) => {
                 let key = created_key(
@@ -1403,7 +1441,12 @@ async fn an_export_refused_for_an_unresolvable_destination_is_accepted_once_it_r
                 .await
                 .id;
                 let message = format!("The KMS key {key} doesn't exist or is disabled.");
-                (destination.bucket.clone(), key, message)
+                (
+                    destination.bucket.clone(),
+                    key,
+                    message,
+                    destination.role_arn.clone(),
+                )
             }
             Unresolvable::DisabledKey => {
                 let key = created_key(&destination.router, row.case, None).await.id;
@@ -1419,7 +1462,12 @@ async fn an_export_refused_for_an_unresolvable_destination_is_accepted_once_it_r
                         )
                     });
                 let message = format!("The KMS key {key} doesn't exist or is disabled.");
-                (destination.bucket.clone(), key, message)
+                (
+                    destination.bucket.clone(),
+                    key,
+                    message,
+                    destination.role_arn.clone(),
+                )
             }
         };
 
@@ -1437,6 +1485,7 @@ async fn an_export_refused_for_an_unresolvable_destination_is_accepted_once_it_r
                 row.prefix,
                 &bucket,
                 &key_id,
+                &role_arn,
             )
             .await,
             400,

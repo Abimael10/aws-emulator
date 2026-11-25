@@ -270,7 +270,7 @@ async fn every_class_of_export_source_completes_its_stack_and_is_held_by_the_ser
                 task: row.task.to_string(),
                 source: source.clone(),
                 bucket: json!({"Ref": BUCKET}),
-                role: Role::TheExportRole,
+                role: Role::Export,
             }),
         )
         .await;
@@ -447,7 +447,7 @@ async fn every_refused_provider_call_rolls_its_stack_back_and_changes_nothing_it
             task: TAKEN_TASK.to_string(),
             source: held_snapshot.clone(),
             bucket: json!({"Ref": BUCKET}),
-            role: Role::TheExportRole,
+            role: Role::Export,
         }),
     )
     .await;
@@ -496,7 +496,7 @@ async fn every_refused_provider_call_rolls_its_stack_back_and_changes_nothing_it
                     Named::TheHeldDbSnapshot => held_snapshot.clone(),
                 },
                 bucket: json!({"Ref": BUCKET}),
-                role: Role::TheExportRole,
+                role: Role::Export,
             }),
         )
         .await;
