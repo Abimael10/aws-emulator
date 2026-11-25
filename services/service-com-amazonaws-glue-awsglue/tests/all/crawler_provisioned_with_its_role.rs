@@ -7,13 +7,16 @@
 //! The rule under test: `CreateCrawler` judges the request it was SENT — the crawler's name,
 //! the role it would run as, and that at least one target is named ("at least one crawl
 //! target must be specified, in the s3Targets field, the jdbcTargets field, or the
-//! DynamoDBTargets field") — and it decides nothing about the data another service holds
+//! DynamoDBTargets field") — and it decides nothing about the DATA another service holds
 //! behind a target, which it merely REFERS to. So a crawler whose role IAM shows Glue can
-//! assume and whose target names an Amazon S3 path is accepted with an empty body, and
-//! `GetCrawler` then serves it in `READY` carrying exactly the definition that was sent,
-//! whether or not the object store holds that bucket. The only refusals left are the modelled
-//! ones about the request itself, whose wording this suite pins: `InvalidInputException` for a
-//! `Targets` naming no store, and `EntityNotFoundException` for a crawler nothing created.
+//! assume and whose target names a path in a bucket Amazon S3's namespace holds is accepted
+//! with an empty body, and `GetCrawler` then serves it in `READY` carrying exactly the
+//! definition that was sent, whether or not anything has been written under that path yet. The
+//! only refusals left are the modelled ones about the request itself, whose wording this suite
+//! pins: `InvalidInputException` for a `Targets` naming no store, and
+//! `EntityNotFoundException` for a crawler nothing created. (That the target's BUCKET must be
+//! one the namespace holds at all is the separate rule
+//! [`crate::crawler_s3_target_resolution`] drives.)
 //!
 //! WHY it matters: a client that provisions the role and the crawler together wraps the create
 //! in a deadline-bounded retry over exactly `InvalidInputException` (the transient refusal real
@@ -22,10 +25,10 @@
 //! converges — the client spins until its own deadline instead of ever holding a crawler.
 //!
 //! The rows differ along what the rule generalises over: the form the `Role` member names the
-//! role by, how deep the Amazon S3 path reaches into a bucket the store does not hold, and
-//! whether the target's bucket exists at all. Amazon S3 is mounted so the store really answers
-//! about those buckets, and IAM is mounted so the role resolution really has records to read.
-//! Every call goes over the wire through the shared [`crate::wire`] harness.
+//! role by, how deep the Amazon S3 path reaches into the bucket, and whether anything is written
+//! under it. Amazon S3 is mounted so the store really answers about that bucket, and IAM is
+//! mounted so the role resolution really has records to read. Every call goes over the wire
+//! through the shared [`crate::wire`] harness.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -40,11 +43,9 @@ const ROLE_NAME: &str = "sim2real-glue-crawler-service-role";
 /// The database a crawler writes its tables into.
 const DATABASE: &str = "crawler_provisioning_db";
 
-/// A bucket the object store DOES hold, for the row that varies only in that.
+/// A bucket the object store holds, under which this suite writes nothing: the data a crawler
+/// is registered ahead of.
 const HELD_BUCKET: &str = "glue-crawler-provisioned-bucket";
-
-/// A bucket no `CreateBucket` ever ran for: the data a crawler is registered ahead of.
-const ABSENT_BUCKET: &str = "glue-crawler-unwritten-bucket";
 
 /// `Crawler$State` of a crawler that is not crawling.
 const READY: &str = "READY";
@@ -68,29 +69,29 @@ fn rows() -> Vec<Row> {
     vec![
         Row {
             // The recorded case: the role was just created, and the data is not written yet.
-            case: "the role by ARN, over a prefix of a bucket the store does not hold",
-            role_by_arn: true,
-            path: format!("s3://{ABSENT_BUCKET}/data/"),
-        },
-        Row {
-            case: "the role by ARN, over the root of a bucket the store does not hold",
-            role_by_arn: true,
-            path: format!("s3://{ABSENT_BUCKET}"),
-        },
-        Row {
-            case: "the role by ARN, over a deep prefix of a bucket the store does not hold",
-            role_by_arn: true,
-            path: format!("s3://{ABSENT_BUCKET}/year=2026/month=01/day=02/"),
-        },
-        Row {
-            case: "the role by its bare name, over a bucket the store does not hold",
-            role_by_arn: false,
-            path: format!("s3://{ABSENT_BUCKET}/data/"),
-        },
-        Row {
-            case: "the role by ARN, over a prefix of a bucket the store DOES hold",
+            case: "the role by ARN, over a prefix under which nothing is written yet",
             role_by_arn: true,
             path: format!("s3://{HELD_BUCKET}/data/"),
+        },
+        Row {
+            case: "the role by ARN, over the root of the bucket",
+            role_by_arn: true,
+            path: format!("s3://{HELD_BUCKET}"),
+        },
+        Row {
+            case: "the role by ARN, over a deep prefix under which nothing is written yet",
+            role_by_arn: true,
+            path: format!("s3://{HELD_BUCKET}/year=2026/month=01/day=02/"),
+        },
+        Row {
+            case: "the role by its bare name, over a prefix of the bucket",
+            role_by_arn: false,
+            path: format!("s3://{HELD_BUCKET}/data/"),
+        },
+        Row {
+            case: "the role by its bare name, over the root of the bucket",
+            role_by_arn: false,
+            path: format!("s3://{HELD_BUCKET}"),
         },
     ]
 }
@@ -106,7 +107,7 @@ fn crawler_body(name: &str, role: &str, path: &str) -> Value {
 }
 
 /// A crawler built on a freshly created Glue-assumable role is accepted over an ordinary
-/// Amazon S3 target, whatever the object store holds behind it, and is then served in `READY`
+/// Amazon S3 target, whatever the object store holds UNDER it, and is then served in `READY`
 /// carrying the definition that was sent.
 #[tokio::test]
 async fn a_crawler_on_a_glue_assumable_role_is_created_over_any_s3_target() {

@@ -21,8 +21,13 @@
 //! refused (see [`crate::state::crawl_target_grant_refusal`]).
 //!
 //! An S3 target's `Path` names the data a LATER crawl walks rather than a resource this
-//! service owns, so it is persisted as written: the object store is not asked whether it holds
-//! that bucket yet, because a crawler is registered before the data it crawls exists.
+//! service owns, so it is persisted as written — except for the one thing the object store
+//! itself answers for: a target whose BUCKET Amazon S3 answers it holds nothing under names no
+//! data anywhere, and the create is refused with `InvalidInputException` naming that target and
+//! the 404 (see [`crate::state::absent_s3_target`]). A bucket that is there but may not be
+//! read, and an emulator with no object store to ask, establish no such thing and are accepted:
+//! a crawler is registered before the DATA it crawls is written, and whether a crawl can read a
+//! target it resolved is decided by the crawl.
 //!
 //! ## Shape of an operation
 //!
@@ -274,14 +279,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `S3Target$Path` is the Amazon S3 path a LATER crawl of this crawler would walk, not
-        // a resource this create brings into being: the crawler definition merely REFERS to
-        // it, and the operation models no not-found error for one. So the path is stored as
-        // written and the object store is never asked whether it holds that bucket — a
-        // crawler is routinely registered before the bucket or the data behind it exists,
-        // and a crawl that cannot read a target reports that on the crawl itself (see
-        // `crate::state::crawl`).
-
         // A target the crawl reads through ANOTHER service's data plane is read as the
         // crawler's `Role`, so the policies in force on that role have to admit the calls
         // the crawl makes there: the queue operations of an S3 target crawled in event mode,
@@ -348,6 +345,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into());
                 }
             }
+        }
+
+        // `S3Target$Path` is the Amazon S3 path a LATER crawl of this crawler would walk, not a
+        // resource this create brings into being: the crawler definition merely REFERS to it,
+        // so the path is stored as written and a crawl that cannot READ a target reports that
+        // on the crawl itself (see `crate::state::crawl`). The one thing settled here is what
+        // the object store ANSWERS about the target's bucket: a bucket Amazon S3 says it holds
+        // nothing under is a target that names no data anywhere, which is a fault in this
+        // request rather than in a later crawl. Only that answer refuses the create — a bucket
+        // that is there and may not be read, and an emulator with no object store to ask,
+        // establish nothing (see `crate::state::absent_s3_target`). Awaited before the store is
+        // locked, and bounded on the number of distinct buckets the targets name.
+        if let Some(path) =
+            crate::state::absent_s3_target(ctx, &region, &input.targets).await
+        {
+            return Err(CreateCrawlerErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::messages::s3_target_does_not_exist(&path)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
         }
 
         let mut store = state.lock();

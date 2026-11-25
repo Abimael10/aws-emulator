@@ -252,8 +252,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The `Targets` this update leaves behind are stored as written, for the reason the
         // create records: an `S3Target$Path` names the data a LATER crawl walks rather than a
-        // resource this service owns, so the object store is not asked whether it holds that
-        // bucket yet.
+        // resource this service owns. The one thing settled here is the same one the create
+        // settles — what the object store ANSWERS about the bucket behind each Amazon S3 target
+        // this request would leave the crawler with: a bucket Amazon S3 says it holds nothing
+        // under names no data anywhere, and every other answer establishes nothing (see
+        // `crate::state::absent_s3_target`). A request that names no `Targets` keeps the stored
+        // ones, which the write that set them already resolved.
+        if let Some(targets) = input.targets.as_ref() {
+            let region = crate::state::request_region(ctx.parts());
+            if let Some(path) = crate::state::absent_s3_target(ctx, &region, targets).await {
+                return Err(invalid_input(
+                    crate::state::messages::s3_target_does_not_exist(&path),
+                ));
+            }
+        }
 
         // `Role` is "the IAM role or Amazon Resource Name (ARN) of an IAM role that is
         // used by the crawler to access customer resources" and is required on the
