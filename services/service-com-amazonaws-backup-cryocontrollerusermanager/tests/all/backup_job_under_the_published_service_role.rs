@@ -61,7 +61,11 @@ const ACCESS_DENIED_CATEGORY: &str = "AccessDenied";
 
 /// The ARNs of the two halves of the service role AWS publishes for AWS Backup, as the AWS
 /// Managed Policy Reference spells them.
-const BACKUP_POLICY_ARN: &str =
+///
+/// The backup half is `pub(crate)` for the sibling suite covering which FAILURE CLASS a job
+/// settles in (`backup_job_failure_class.rs`): the role AWS's own instructions provision is
+/// named by this one ARN wherever a suite needs it.
+pub(crate) const BACKUP_POLICY_ARN: &str =
     "arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup";
 const RESTORES_POLICY_ARN: &str =
     "arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores";
@@ -217,7 +221,15 @@ fn backup_trust() -> String {
 
 /// Attach the managed policy `policy_arn` to the role `role_name` through IAM's OWN awsQuery
 /// wire, so what the decision reads is the attachment IAM recorded.
-async fn attach_role_policy(router: &MultiServiceRouter, role_name: &str, policy_arn: &str) {
+///
+/// `pub(crate)` for the sibling suite covering which FAILURE CLASS a job settles in
+/// (`backup_job_failure_class.rs`): a role whose permissions come from an ATTACHED policy is
+/// provisioned by exactly this call, so both suites make it one way rather than two.
+pub(crate) async fn attach_role_policy(
+    router: &MultiServiceRouter,
+    role_name: &str,
+    policy_arn: &str,
+) {
     let body = format!(
         "Action=AttachRolePolicy&Version=2010-05-08&RoleName={}&PolicyArn={}",
         form_value(role_name),
