@@ -25,3 +25,42 @@ Expected: within the check's delivery budget, the SQS target of the us-east-1 ru
 
 ## Steps to Reproduce
 In us-east-1: create an S3 bucket with the CloudTrail service policy, create and start a multi-region trail writing to it, create an SQS queue and an EventBridge rule whose pattern matches source 'aws.iam' / detail-type 'AWS API Call via CloudTrail' / detail.eventName of an IAM write, with the queue as target and the InputTransformer template above. Perform the IAM writes, then long-poll the queue for the delivered bodies; also poll a twin rule+queue in another region and expect nothing there.
+
+## Resolution
+The channel this report describes as absent is served by the emulator, for a GLOBAL service's
+records as much as for a regional one, and the reported wiring is now driven end to end by tests
+in both configurations — so the report is filed here rather than left open:
+
+- `core/router/tests/all/cloudtrail_iam_api_call_events_on_a_started_emulator.rs` drives exactly
+  these steps against the emulator a customer STARTS (the built binary on its own port, request
+  authentication on, every call signed and made over TLS, the authority an SDK pointed at the
+  emulator sends): the bucket and its CloudTrail policy, a multi-Region trail with
+  `IncludeGlobalServiceEvents` that is logging, one rule pinned to `CreateRole`/`TagRole`/`DeleteRole`
+  with an SQS target delivering through
+  `{"rule": "<aws.events.rule-name>", "event": <aws.events.event.json>}`, and its TWIN — the same
+  rule and queue names on a second Region's bus. The three IAM writes land as exactly three
+  envelopes on the leader Region's queue, one per matching call, each carrying `source` `aws.iam`,
+  `detail-type` `AWS API Call via CloudTrail`, the account, `region`/`detail.awsRegion` `us-east-1`,
+  `detail.eventSource` `iam.amazonaws.com`, `detail.readOnly` false, the role the call named and —
+  for the create — the `RoleId` its own response answered; the comparison Region's twin stays empty.
+  The whole flow, emulator start included, takes a few seconds.
+- `core/router/tests/all/events_queue_target_grant_forms.rs` pins the document that decides that
+  delivery, over the forms a client writes one grant in (the service principal as a string or a
+  one-element list, the action or resource as a list, a wildcard action, `Resource` `*`, the action's
+  service prefix in capitals as the console writes it, `ArnEquals`/`ArnLike` on `aws:SourceArn`,
+  `StringEquals` on `aws:SourceAccount`, every principal scoped to the one rule, one `Statement`
+  written as an object) beside the three that grant nothing: no policy, a grant scoped to another
+  rule, and an explicit deny.
+- The sibling suites already pinned the rest of the channel this check leans on:
+  `core/router/tests/all/cloudtrail_api_call_events_by_region.rs` (the global/regional Region split
+  in process), `core/router/tests/all/cloudtrail_api_call_events_on_a_started_emulator.rs` (the
+  regional half on the started binary) and
+  `core/router/tests/all/dynamodb_api_call_events_on_a_started_emulator.rs` (the envelope reaching a
+  long poll that was ALREADY in flight when the call was made, which is the wait shape this check
+  uses).
+
+The replay unit still ends `Check timed out after 60.0s`. That is the replay harness's own ceiling
+on a whole check — the check's own delivery budget is 1000 s cold — and not an observation of a
+missing delivery: on the emulator a client starts, every one of these envelopes reaches its SQS
+target in well under a second. So this record is kept here as "the behaviour works, and is pinned",
+not as a confirmed pass of that check.
