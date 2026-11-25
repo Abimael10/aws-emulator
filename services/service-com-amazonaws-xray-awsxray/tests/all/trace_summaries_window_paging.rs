@@ -72,9 +72,20 @@ fn next_token(answer: &Answer) -> Option<String> {
     answer.get("NextToken").as_str().map(str::to_string)
 }
 
+/// The ids `stored` in the order ONE STEP of a window serves them: newest
+/// first, "the most recent results, closest to the end of the time frame".
+///
+/// [`seed`] hands ids out in the order of the offsets it was given, so for a
+/// case whose offsets ASCEND — each trace later than the one before it — that
+/// order reversed is the order of descending start time.
+fn newest_first(stored: &[String]) -> Vec<String> {
+    stored.iter().rev().cloned().collect()
+}
+
 /// Store one trace per entry of `offsets`, the `index`th of them starting
 /// `offsets[index]` seconds from [`ALIGNED`], and answer their ids in the order
-/// the ids sort.
+/// the ids sort — which, since the ids are handed out in the order `offsets`
+/// names them, is the order of `offsets` itself.
 async fn seed(xray: &Xray, offsets: &[f64]) -> Vec<String> {
     let mut stored = Vec::new();
     for (index, offset) in offsets.iter().enumerate() {
@@ -376,8 +387,9 @@ async fn a_step_holding_more_than_one_page_is_served_over_several_pages() {
         }
     }
     assert_eq!(
-        seen, stored,
-        "paging one step must yield every trace of it exactly once, got {seen:?}"
+        seen,
+        newest_first(&stored),
+        "paging one step must yield every trace of it exactly once, newest first, got {seen:?}"
     );
 }
 
@@ -541,11 +553,12 @@ fn grid_cases(stored: &[String]) -> Vec<GridCase> {
             first_page: vec![before.clone()],
         },
         GridCase {
+            // One step holds both, and a step is served newest first.
             label: "a minutes-wide window straddling a boundary, a trace each side",
             start: ALIGNED - 60.0,
             end: ALIGNED + 60.0,
-            whole: vec![before.clone(), inside.clone()],
-            first_page: vec![before.clone(), inside.clone()],
+            whole: vec![inside.clone(), before.clone()],
+            first_page: vec![inside.clone(), before.clone()],
         },
         GridCase {
             label: "a window ending exactly on a boundary",
@@ -957,9 +970,9 @@ async fn a_short_window_pages_on_its_results_rather_than_on_an_hour_boundary() {
         );
         assert_eq!(
             reported_trace_ids(&pages),
-            stored,
-            "case {label:?}: the pages must yield every trace the window holds exactly once, got \
-             {pages:?}"
+            newest_first(&stored),
+            "case {label:?}: the pages must yield every trace the window holds exactly once, \
+             newest first, got {pages:?}"
         );
     }
 }
@@ -1053,7 +1066,10 @@ async fn a_filtered_short_window_answers_its_matches_identically() {
         // not the third.
         let start = anchor - 600.0;
         let end = anchor + 120.0;
-        let in_window = vec![stored[0].clone(), stored[1].clone()];
+        // Both lie in the window, and the one the table names second started
+        // later, so a page reporting the window's most recent results first
+        // reports it first.
+        let in_window = vec![stored[1].clone(), stored[0].clone()];
         let matching = vec![stored[0].clone()];
 
         let rows: Vec<(&str, Option<String>, Vec<String>)> = vec![
@@ -1175,6 +1191,7 @@ fn token_cases() -> Vec<TokenCase> {
     vec![
         TokenCase {
             label: "a two-step window, one trace in each step",
+            // Each step holds one trace, so only the steps order these pages.
             offsets: vec![10.0, HOUR + 10.0],
             start: 0.0,
             end: 2.0 * HOUR,
@@ -1209,9 +1226,11 @@ fn token_cases() -> Vec<TokenCase> {
             start: 0.0,
             end: 1_800.0,
             filter: None,
+            // One step, served newest first: the last-started traces fill the
+            // first page and the two earliest are left for the second.
             pages: vec![
-                (0..TRACE_SUMMARIES_PAGE_SIZE).collect(),
-                (TRACE_SUMMARIES_PAGE_SIZE..TRACE_SUMMARIES_PAGE_SIZE + 2).collect(),
+                (2..TRACE_SUMMARIES_PAGE_SIZE + 2).rev().collect(),
+                vec![1, 0],
             ],
         },
         TokenCase {
@@ -1221,8 +1240,8 @@ fn token_cases() -> Vec<TokenCase> {
             end: 2.0 * HOUR,
             filter: None,
             pages: vec![
-                (0..TRACE_SUMMARIES_PAGE_SIZE).collect(),
-                vec![TRACE_SUMMARIES_PAGE_SIZE],
+                (1..TRACE_SUMMARIES_PAGE_SIZE + 1).rev().collect(),
+                vec![0],
                 vec![earlier_step],
             ],
         },

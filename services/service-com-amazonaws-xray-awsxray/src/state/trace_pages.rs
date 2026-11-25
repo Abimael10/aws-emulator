@@ -26,10 +26,21 @@
 //! can place in the range it asked about, and the page a single-step window is
 //! answered in reports the requested `StartTime`.
 //!
-//! One concern, one file: the stepping, the instant a page reports and the form
-//! of the token that resumes it are stated once here, so the handler that serves
-//! a page and the one that resumes one cannot disagree about which step a token
-//! names.
+//! WITHIN one step the summaries are served NEWEST FIRST — "the first page
+//! contains the most recent results, closest to the end of the time frame" — so
+//! the order a step's summaries are cut into pages in is the order of the time
+//! each trace falls in the window at, descending from the end of the step, with
+//! the traces sharing one instant ordered by their ids so that order is total
+//! ([`step_order`]). A step holding more summaries than one page carries
+//! therefore puts its most recent ones on the first page, never the ones whose
+//! ids happen to spell lowest, and what a page holds does not change as
+//! unrelated traces are written.
+//!
+//! One concern, one file: the stepping, the order a step is served in, the
+//! instant a page reports and the form of the token that resumes it are stated
+//! once here, so the handler that serves a page and the one that resumes one
+//! cannot disagree about which step a token names or where inside it the next
+//! page starts.
 //!
 //! The token itself is OPAQUE. `NextToken` is "the pagination token returned by a
 //! previous request"
@@ -44,6 +55,8 @@
 //! page at all, which is what the caller refuses
 //! ([`super::invalid_next_token_message`]).
 
+use ::std::cmp::Ordering;
+
 use ::service_common::page_tokens::PageTokenKey;
 
 /// How long one page's step of a trace query's window is, in seconds.
@@ -53,10 +66,11 @@ use ::service_common::page_tokens::PageTokenKey;
 /// window is cut into pages and the instant each page reports.
 pub const TRACE_PAGE_SECONDS: i64 = 60 * 60;
 
-/// The separator between the two parts of the CURSOR a page token carries: the
-/// step the next page serves, and — when that step still has summaries left in
-/// it — the trace the next page resumes at. A trace id carries no colon
-/// (`smithy_query(query="shape",shape="TraceId")`), so the split is unambiguous.
+/// The separator between the parts of the CURSOR a page token carries: the step
+/// the next page serves, and — when that step still has summaries left in it —
+/// where inside the step's own order that page resumes ([`StepCursor`]). Neither
+/// a trace id (`smithy_query(query="shape",shape="TraceId")`) nor a rendered
+/// instant carries a colon, so the split is unambiguous.
 ///
 /// It is a detail of what travels INSIDE the token, never of the token's own
 /// text: the cursor is authenticated and encoded before it reaches the wire
@@ -152,24 +166,86 @@ pub fn window_page(start: f64, end: f64, index: usize) -> Option<WindowPage> {
     })
 }
 
-/// The token that resumes a query at the page `index`, at `trace` when that
+/// WHERE inside one step's own order a page resumes: the position of the first
+/// summary that page serves.
+///
+/// A step is served newest first ([`step_order`]), so a position in it is the
+/// instant the trace falls in the window at together with that trace's id, which
+/// orders the traces sharing one instant. A position rather than a trace alone,
+/// so a page resumes at the right place in that time order even when the trace
+/// the previous page stopped at has since been evicted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepCursor {
+    /// The instant the trace this page starts at falls in the window at — the
+    /// time the query's `TimeRangeType` selects.
+    pub instant: f64,
+    /// That trace's id, which decides the order among the traces sharing one
+    /// instant.
+    pub trace: String,
+}
+
+impl StepCursor {
+    /// The position of the trace `trace` falling in the window at `instant`.
+    #[must_use]
+    pub fn new(instant: f64, trace: &str) -> Self {
+        Self {
+            instant,
+            trace: trace.to_string(),
+        }
+    }
+}
+
+/// The ORDER the summaries of one step are served in: by the instant each trace
+/// falls in the window at, DESCENDING — the most recent first, closest to the
+/// end of the step — with the traces sharing one instant ordered by their ids,
+/// so the order is total and a page of a step is the same page whenever that
+/// step is asked for.
+///
+/// Compared with [`f64::total_cmp`], so two instants always have an order and no
+/// trace falls out of the ordering it is cut into pages by.
+#[must_use]
+pub fn step_order(left: &StepCursor, right: &StepCursor) -> Ordering {
+    right
+        .instant
+        .total_cmp(&left.instant)
+        .then_with(|| left.trace.cmp(&right.trace))
+}
+
+/// Whether the summary at `position` is one a page resuming at `cursor` serves:
+/// the positions from that cursor onwards in the step's own order.
+#[must_use]
+pub fn at_or_after(position: &StepCursor, cursor: &StepCursor) -> bool {
+    step_order(position, cursor) != Ordering::Less
+}
+
+/// The token that resumes a query at the page `index`, at `resume` when that
 /// page's step still holds summaries past the page just served.
 ///
-/// The step and the trace are the CURSOR; the token is that cursor authenticated
-/// under the issuing store's secret `key` and rendered base64, which is the one
-/// opaque spelling this read hands a cursor out in: a caller sends it back
-/// unread, and nothing about which step or trace it names can be read off it.
+/// The step and that position are the CURSOR; the token is that cursor
+/// authenticated under the issuing store's secret `key` and rendered base64,
+/// which is the one opaque spelling this read hands a cursor out in: a caller
+/// sends it back unread, and nothing about which step or position it names can be
+/// read off it.
 #[must_use]
-pub fn page_token(key: &PageTokenKey, index: usize, trace: Option<&str>) -> String {
-    let cursor = match trace {
-        Some(trace) => format!("{index}{TOKEN_SEPARATOR}{trace}"),
+pub fn page_token(key: &PageTokenKey, index: usize, resume: Option<&StepCursor>) -> String {
+    let cursor = match resume {
+        Some(at) => {
+            // Rendered so the instant read back is the instant written: the
+            // position a page resumes at has to compare exactly as it did when
+            // the page before it stopped there.
+            let instant = at.instant;
+            format!(
+                "{index}{TOKEN_SEPARATOR}{instant:?}{TOKEN_SEPARATOR}{trace}",
+                trace = at.trace
+            )
+        }
         None => index.to_string(),
     };
     ::service_common::page_tokens::page_token(key, &cursor)
 }
 
-/// The page and the trace a token issued by [`page_token`] names, or `None` for
-/// a value no page of any window ever handed out — which the caller refuses as
+/// The page and the position inside it that a token issued by [`page_token`]
+/// names, or `None` for a value no page of any window ever handed out — which the caller refuses as
 /// the uninterpretable token it is
 /// ([`super::invalid_next_token_message`]).
 ///
@@ -183,13 +259,26 @@ pub fn page_token(key: &PageTokenKey, index: usize, trace: Option<&str>) -> Stri
 /// one naming a page beyond the window now being asked about did not come from
 /// it, however well formed it looks.
 #[must_use]
-pub fn parse_page_token(key: &PageTokenKey, token: &str) -> Option<(usize, Option<String>)> {
+pub fn parse_page_token(key: &PageTokenKey, token: &str) -> Option<(usize, Option<StepCursor>)> {
     let cursor = ::service_common::page_tokens::page_cursor(key, token)?;
-    let (index, trace) = match cursor.split_once(TOKEN_SEPARATOR) {
-        Some((_, "")) => return None,
-        Some((index, trace)) => (index.to_string(), Some(trace.to_string())),
-        None => (cursor, None),
+    let mut parts = cursor.splitn(3, TOKEN_SEPARATOR);
+    let index: usize = parts.next()?.parse().ok()?;
+    let resume = match (parts.next(), parts.next()) {
+        (None, _) => None,
+        (Some(instant), Some(trace)) if !trace.is_empty() => {
+            // An instant at all: a value that is no instant — one that compares
+            // with nothing, or one reaching past every instant there is — names
+            // no position in any step's order, the same judgement the window
+            // itself is read with above.
+            let instant: f64 = instant.parse().ok()?;
+            if !instant.is_finite() {
+                return None;
+            }
+            Some(StepCursor::new(instant, trace))
+        }
+        // A cursor carrying a position with no trace, or a trace with no
+        // instant, names no position in any step's order.
+        _ => return None,
     };
-    let index: usize = index.parse().ok()?;
-    (index < MAX_WINDOW_PAGES).then_some((index, trace))
+    (index < MAX_WINDOW_PAGES).then_some((index, resume))
 }

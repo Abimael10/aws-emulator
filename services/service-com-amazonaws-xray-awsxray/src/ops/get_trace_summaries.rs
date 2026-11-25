@@ -33,10 +33,17 @@
 //! a `NextToken` is due while the query has anything left to serve — the rest of
 //! a step holding more summaries than one page carries
 //! ([`TRACE_SUMMARIES_PAGE_SIZE`]), or the step before it while the window
-//! reaches into one. That token is OPAQUE: the step and the trace it resumes at
-//! travel inside it, authenticated under the store's own secret, so a caller
+//! reaches into one. That token is OPAQUE: the step and the position it resumes
+//! at travel inside it, authenticated under the store's own secret, so a caller
 //! hands it back unread and nothing of this service's paging is legible on the
 //! wire, while a value this read never issued carries no cursor and is refused.
+//!
+//! Inside one step the summaries are served NEWEST FIRST — "the first page
+//! contains the most recent results, closest to the end of the time frame" — so
+//! a step is ordered by the time each trace falls in the window at, descending,
+//! before the page is cut from it ([`crate::state::step_order`]), and what a
+//! page holds therefore follows from WHEN its traces were recorded rather than
+//! from what their ids spell or from the order the store is walked in.
 //!
 //! A request outside what this read serves is REFUSED with
 //! `InvalidRequestException` rather than answered over part of it: an inverted
@@ -385,15 +392,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cannot be resumed from; both are refused in the crate's one wording
         // for such a token, which reports it verbatim.
         let supplied = input.next_token.as_deref();
-        let mut resume: Option<String> = None;
+        let mut resume: Option<crate::state::StepCursor> = None;
         let page: Option<crate::state::WindowPage> = match supplied {
             None => crate::state::window_page(start, end, 0),
             Some(token) => {
-                let (index, trace) = crate::state::parse_page_token(&page_tokens, token)
+                let (index, at) = crate::state::parse_page_token(&page_tokens, token)
                     .ok_or_else(|| {
                         invalid_request(crate::state::invalid_next_token_message(token))
                     })?;
-                resume = trace;
+                resume = at;
                 Some(crate::state::window_page(start, end, index).ok_or_else(|| {
                     invalid_request(crate::state::invalid_next_token_message(token))
                 })?)
@@ -407,31 +414,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (candidates, traces_processed) = {
             let store = state.lock();
 
-            // A token that resumes INSIDE a step names the trace the next page
-            // starts at. One still inside the keyspace being walked is honoured
-            // even if that exact trace has since been evicted, so an eviction
-            // between pages does not fail an in-flight paginator; one beyond it
-            // never came from here.
-            if let (Some(token), Some(trace)) = (supplied, resume.as_deref()) {
-                let within_keyspace = store
-                    .traces
-                    .keys()
-                    .next_back()
-                    .is_some_and(|last| trace <= last.as_str());
-                if !within_keyspace {
-                    return Err(invalid_request(
-                        crate::state::invalid_next_token_message(token),
-                    ));
-                }
-            }
-
-            // `traces` is a `BTreeMap`, so the walk is in trace-id order and a
-            // page resumes at the first id at or after the token. The whole
-            // keyspace is walked on every page — neither the token nor the step
-            // narrows the walk, because the count below is of the window rather
-            // than of the page — which is bounded by the stored trace cap
-            // ([`crate::state::MAX_TRACES`]), the same bound the unpaged walk
-            // already had.
+            // The whole keyspace is walked on every page — neither the token
+            // nor the step narrows the walk, because the count below is of the
+            // window rather than of the page — which is bounded by the stored
+            // trace cap ([`crate::state::MAX_TRACES`]), the same bound the
+            // unpaged walk already had. What ORDER the walk happens to visit the
+            // store in decides nothing: the traces this page's step holds are
+            // put in the step's own order below.
+            //
+            // A token that resumes INSIDE a step names WHERE IN THAT ORDER the
+            // next page starts ([`crate::state::StepCursor`]), so the page it
+            // serves is the summaries from that position on. A position rather
+            // than a trace, so an eviction between two pages does not fail an
+            // in-flight paginator: the trace the cursor was taken from need not
+            // still be stored for the rest of the step to be served.
             //
             // `TracesProcessedCount` is "the total number of traces processed,
             // including traces that did not match the specified filter
@@ -445,7 +441,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // filter expression is deliberately not applied to it, because what
             // the filter selected is `TraceSummaries`.
             let mut processed: i64 = 0;
-            let mut candidates: Vec<String> = Vec::new();
+            let mut candidates: Vec<crate::state::StepCursor> = Vec::new();
             for trace in store.traces.values() {
                 let instant = window_instant(trace);
                 if instant < start || instant >= end {
@@ -453,7 +449,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 processed = processed.saturating_add(1);
                 // And of those, the ones THIS PAGE's step holds, from the
-                // trace a token resumed it at. A window naming no interval is
+                // position a token resumed it at. A window naming no interval is
                 // served in no page at all, so it selects nothing.
                 let Some(page) = page else {
                     continue;
@@ -461,10 +457,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if instant < page.start || instant >= page.end {
                     continue;
                 }
-                if resume.as_deref().is_none_or(|from| trace.id.as_str() >= from) {
-                    candidates.push(trace.id.clone());
+                let position = crate::state::StepCursor::new(instant, &trace.id);
+                if resume
+                    .as_ref()
+                    .is_none_or(|from| crate::state::at_or_after(&position, from))
+                {
+                    candidates.push(position);
                 }
             }
+            // "The first page contains the most recent results, closest to the
+            // end of the time frame": a step is served NEWEST FIRST, so the
+            // traces it holds are put in that order ([`crate::state::step_order`])
+            // before the page is cut from them — which is what makes a page the
+            // most recent summaries of its step rather than whichever of them
+            // the store happened to be walked into first.
+            candidates.sort_by(crate::state::step_order);
             (candidates, processed)
         };
 
@@ -480,10 +487,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is for a paginator resuming after an eviction.
         let mut budget = crate::state::filter::QueryBudget::new();
         let mut selected: Vec<TraceSummary> = Vec::new();
-        // The trace the NEXT page of this same step starts at, when the step
-        // holds more summaries than one page carries.
-        let mut resume_at: Option<String> = None;
-        for (position, trace_id) in candidates.iter().enumerate() {
+        // Where the NEXT page of this same step starts, when the step holds more
+        // summaries than one page carries.
+        let mut resume_at: Option<crate::state::StepCursor> = None;
+        for (position, candidate) in candidates.iter().enumerate() {
             // Checked FIRST, and before the non-match path can `continue` past
             // it: once the budget is spent, evaluation answers "no match" for
             // every remaining trace, so a selection built from here on would be
@@ -498,7 +505,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             {
                 let store = state.lock();
-                let Some(trace) = store.traces.get(trace_id) else {
+                let Some(trace) = store.traces.get(&candidate.trace) else {
                     continue;
                 };
                 if !filters
@@ -517,7 +524,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if selected.len() == TRACE_SUMMARIES_PAGE_SIZE {
                     // One past the page: the token names where the next page
                     // starts, and nothing after it needs evaluating.
-                    resume_at = Some(trace.id.clone());
+                    resume_at = Some(candidate.clone());
                 } else {
                     selected.push(summary_of(trace));
                 }
@@ -545,14 +552,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // held nothing, because a client that stops at the first empty page has
         // read only the end of the range it asked about.
         //
-        // Whichever of the two it is, the step and the trace it names travel
+        // Whichever of the two it is, the step and the position it names travel
         // inside an OPAQUE token ([`crate::state::page_token`]): a caller hands
         // the value back unread, so no instant, step ordinal or trace id of this
         // service's paging is published on the wire.
         let next_token = match (resume_at, page.and_then(|page| page.earlier)) {
-            (Some(trace), _) => page.map(|page| {
-                crate::state::page_token(&page_tokens, page.index, Some(trace.as_str()))
-            }),
+            (Some(at), _) => {
+                page.map(|page| crate::state::page_token(&page_tokens, page.index, Some(&at)))
+            }
             (None, Some(earlier)) => Some(crate::state::page_token(&page_tokens, earlier, None)),
             (None, None) => None,
         };
@@ -585,8 +592,15 @@ const FILTER_YIELD_EVERY: usize = 32;
 /// The model declares no page size for `GetTraceSummaries`, so this is the
 /// emulator's: it bounds how many summaries one page of one step of the window
 /// carries ([`crate::state::TRACE_PAGE_SECONDS`]), and a step holding more is
-/// served over as many pages as it takes.
-pub const TRACE_SUMMARIES_PAGE_SIZE: usize = 5;
+/// served over as many pages as it takes — the most recent ones first
+/// ([`crate::state::step_order`]).
+///
+/// CHOSEN large enough that the minutes-wide window a client reads just after
+/// writing is answered WHOLE: the traffic such a window holds fits on one page,
+/// so a reader that does not paginate still sees everything the window holds,
+/// while a window holding more than this still pages and still reports the most
+/// recent summaries first.
+pub const TRACE_SUMMARIES_PAGE_SIZE: usize = 25;
 
 /// `TimeRangeType` `TraceId`: the window is applied to each trace's own start
 /// time, which is the earliest `start_time` its segments reported. The default

@@ -542,12 +542,14 @@ async fn terms_joined_by_the_doubled_symbols_are_read_like_the_worded_operators(
         (
             "a disjunction written as the doubled symbol",
             "service(\"checkout\") || service(\"payments\")",
-            vec![trace_id(1), trace_id(2)],
+            // The page serves the matches newest first, and the trace the other
+            // service reported started later.
+            vec![trace_id(2), trace_id(1)],
         ),
         (
             "both forms in one expression",
             "ok and service(\"checkout\") || service(\"payments\") && ok",
-            vec![trace_id(1), trace_id(2)],
+            vec![trace_id(2), trace_id(1)],
         ),
         (
             "the doubled symbol beside a group scope",
