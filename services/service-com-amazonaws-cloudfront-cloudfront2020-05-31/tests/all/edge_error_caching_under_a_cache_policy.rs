@@ -141,7 +141,8 @@ fn config_xml(caller_reference: &str, origin: &str, cache_policy_id: &str) -> St
     )
 }
 
-/// One deployed distribution over `origin` under `cache_policy_id`: the `DomainName` it published.
+/// One deployed distribution over `origin` under `cache_policy_id`: the `DomainName` it
+/// published, which a viewer addresses.
 async fn deployed(
     topology: &Topology,
     case: &str,
@@ -149,11 +150,11 @@ async fn deployed(
     origin: &str,
     cache_policy_id: &str,
 ) -> String {
-    let (id, _arn, domain) = topology
+    let (id, _arn, edge) = topology
         .created_distribution(case, &config_xml(reference, origin, cache_policy_id))
         .await;
     topology.awaited_deployment(case, &id).await;
-    domain
+    edge.domain
 }
 
 /// Ask for each row's own path twice back to back and hold the two answers to carrying the status

@@ -40,6 +40,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 // The ONE percent-encoder and element readers this test crate keeps for the wire suites
 // (`all/query_wire.rs`: "Nothing new should write another one — call this module").
+use crate::cloudfront_oac_s3_origin_edge::is_assigned_edge_domain;
 use crate::query_wire::{element, form_encode, opt_element};
 
 /// The Region every setup call is signed for.
@@ -486,17 +487,14 @@ async fn deployed_distribution(
     }
 }
 
-/// The request a VIEWER composing `https://<domain>/<object>` sends: the host it dials and the
-/// path it asks for.
+/// The request a VIEWER handed the published `domain` sends: the host it states and the path it
+/// asks for.
 ///
 /// A domain name states no port, so the port the viewer dials is the one its client reaches this
-/// emulator on — this suite's requests are dispatched in process, so the host is what the
-/// published name names and the path is the one the composition produced.
+/// emulator on — this suite's requests are dispatched in process, so the host is the published
+/// name itself and the path is the object the viewer asked for.
 fn viewer_request(domain: &str, object: &str) -> (String, String) {
-    match domain.split_once('/') {
-        Some((host, path)) => (host.to_string(), format!("/{path}{object}")),
-        None => (domain.to_string(), object.to_string()),
-    }
+    (domain.to_string(), object.to_string())
 }
 
 /// One row: who makes the request, and what it says about the secret header.
@@ -556,19 +554,12 @@ async fn the_published_edge_reaches_a_vpc_origin_whose_rule_requires_the_origin_
     let vpc_origin = deployed_vpc_origin(&router, &load_balancer_arn).await;
     let domain = deployed_distribution(&router, &published, &vpc_origin).await;
 
-    // The published address names the HOST of the endpoint this emulator is served at, with the
-    // distribution in the reserved data-plane path beneath it: a domain name states no port, and
-    // the host is the one address a client of this process resolves.
-    let served_host = SERVED_AT
-        .trim_start_matches("https://")
-        .split(':')
-        .next()
-        .unwrap_or_default();
-    assert_eq!(
-        domain,
-        format!("{served_host}/_aws/cloudfront/{}", distribution_of(&domain)),
-        "expected the distribution published on the host of the endpoint the create reached \
-         ({served_host}), got {domain:?}"
+    // The published name is the DNS name CloudFront assigns a distribution — labels and nothing
+    // else, whatever address the create was reached at — and this emulator answers on it.
+    assert!(
+        is_assigned_edge_domain(&domain),
+        "expected the DNS name CloudFront assigns a distribution (d<label>.cloudfront.net), got \
+         {domain:?}"
     );
 
     for row in ROWS {
@@ -626,12 +617,3 @@ async fn the_published_edge_reaches_a_vpc_origin_whose_rule_requires_the_origin_
     }
 }
 
-/// The distribution id the published `domain` names in its reserved path, so the assertion above
-/// states the whole published value rather than a prefix of it.
-fn distribution_of(domain: &str) -> String {
-    domain
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .to_string()
-}

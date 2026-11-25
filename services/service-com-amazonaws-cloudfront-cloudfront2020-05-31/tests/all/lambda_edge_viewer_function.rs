@@ -46,11 +46,11 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::EmulatedService;
 use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 
 use crate::distribution_lifecycle::{
-    awaited_deployment, create_distribution, get_distribution, is_reachable_authority,
-    list_distributions, API_VERSION, POLL_INTERVAL, READY_DEADLINE,
+    awaited_deployment, create_distribution, edge_listener_authority, get_distribution,
+    is_assigned_edge_domain, list_distributions, API_VERSION, POLL_INTERVAL, READY_DEADLINE,
 };
 use crate::lambda_edge_association::{refusal_message, reported_arns};
-use crate::published_edge_address::dial;
+use crate::published_edge_address::dial_as;
 
 /// The Region the function lives in, which is the Region a Lambda@Edge function has to be
 /// created in, and the Region every setup call below is made for.
@@ -186,6 +186,10 @@ fn package() -> Vec<u8> {
 struct Topology {
     router: MultiServiceRouter,
     callback: EmbeddedEmulator,
+    /// The shared engine, read for the address this emulator opened for a distribution's edge
+    /// ([`crate::distribution_lifecycle::edge_listener_authority`]): a viewer dials that and
+    /// states the name the distribution published.
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Topology {
@@ -206,11 +210,20 @@ impl Topology {
         );
         router.register_service(
             service_com_amazonaws_sts_awssecuritytokenservicev20110615::EmulatedService::new(
-                engine,
+                Arc::clone(&engine),
             ),
         );
         let callback = EmbeddedEmulator::from_router(router.clone());
-        Self { router, callback }
+        Self {
+            router,
+            callback,
+            engine,
+        }
+    }
+
+    /// The `host:port` a viewer dials the distribution `id`'s edge at.
+    fn edge_address(&self, case: &str, id: &str) -> String {
+        edge_listener_authority(&self.engine, case, id)
     }
 
     /// The IAM client, built by the one shared constructor over the in-process callback.
@@ -407,9 +420,11 @@ struct Served {
 }
 
 impl Served {
-    /// The answer of one viewer request to `domain`, dialled in the clear with no credential.
-    async fn of(case: &str, domain: &str, path: &str) -> Self {
-        let raw = dial(domain, "GET", path).await;
+    /// The answer of one viewer request for the distribution published at `domain`, dialled in
+    /// the clear at `address` with no credential: the client dials where that name resolves and
+    /// states the name as the host it addressed.
+    async fn of(case: &str, address: &str, domain: &str, path: &str) -> Self {
+        let raw = dial_as(address, "GET", path, domain).await;
         let status = raw
             .split_whitespace()
             .nth(1)
@@ -553,8 +568,9 @@ async fn the_edge_association_lifecycle_refuses_then_serves_the_functions_own_an
         .unwrap_or_default()
         .to_string();
     assert!(
-        !id.is_empty() && is_reachable_authority(&domain),
-        "case {case:?}: expected an id and an address a viewer can dial, got {}",
+        !id.is_empty() && is_assigned_edge_domain(&domain),
+        "case {case:?}: expected an id and the DNS name CloudFront assigns a distribution, got \
+         {}",
         created.raw
     );
 
@@ -601,7 +617,8 @@ async fn the_edge_association_lifecycle_refuses_then_serves_the_functions_own_an
 
     // (5) Deployed, the association ANSWERS: the function generates the response itself.
     awaited_deployment(&topology.router, case, &id).await;
-    let served = Served::of(case, &domain, "/sim2real/first").await;
+    let address = topology.edge_address(case, &id);
+    let served = Served::of(case, &address, &domain, "/sim2real/first").await;
     assert_eq!(
         served.status, 200,
         "case {case:?}: expected the function's own answer at the published address, got {} \
@@ -773,9 +790,10 @@ async fn the_edge_continues_with_the_object_the_associated_function_returned() {
         .unwrap_or_default()
         .to_string();
     awaited_deployment(&topology.router, case, &id).await;
+    let address = topology.edge_address(case, &id);
 
     for row in rows() {
-        let served = Served::of(row.case, &domain, row.path).await;
+        let served = Served::of(row.case, &address, &domain, row.path).await;
         assert_eq!(
             served.status, row.status,
             "case {:?}: expected HTTP {}, got {} with {:?}",

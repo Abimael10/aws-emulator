@@ -3,15 +3,15 @@
 //! WHICH service answers at an address this one PUBLISHED, for exactly as long as it answers
 //! there.
 //!
-//! The rule under test: **every address this service publishes for a resource it opened a
-//! listener for — a distribution's `DomainName`, a connection group's `RoutingEndpoint` — is
-//! recorded, in the one engine-wide register of published data planes, as an address THIS
-//! service answers at, and that record is withdrawn when the resource is deleted and its port
-//! closes.** Nobody can read a service off a `host:port`, so that register is what another
-//! plane asks before reading such a request's PATH as one of its own addressings: without it,
-//! a viewer request to a distribution's edge domain whose path happens to spell another
-//! plane's resource is claimed twice, and a record left behind after a delete would claim a
-//! port this service no longer answers on.
+//! The rule under test: **every address this service OPENED a listener at for a resource — the
+//! address a viewer dials a distribution's published `DomainName` at, and a connection group's
+//! `RoutingEndpoint` — is recorded, in the one engine-wide register of published data planes,
+//! as an address THIS service answers at, and that record is withdrawn when the resource is
+//! deleted and its port closes.** Nobody can read a service off a `host:port`, so that register
+//! is what another plane asks before reading such a request's PATH as one of its own
+//! addressings: without it, a viewer request to a distribution's edge whose path happens to
+//! spell another plane's resource is claimed twice, and a record left behind after a delete
+//! would claim a port this service no longer answers on.
 //!
 //! The rows differ along what the rule generalises over: the KIND of resource the address was
 //! opened for (a distribution and a connection group, the two addresses this service
@@ -30,8 +30,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::connection_groups::create_connection_group;
 use crate::distribution_lifecycle::{
-    awaited_deployment, config, create_distribution, delete_distribution, is_reachable_authority,
-    update_distribution, Config, API_VERSION,
+    awaited_deployment, config, create_distribution, delete_distribution, edge_listener_authority,
+    is_reachable_authority, update_distribution, Config, API_VERSION,
 };
 
 /// The signing name every address of this service is recorded under, which is the key the
@@ -48,9 +48,15 @@ fn emulator_with_its_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine
     (router, engine)
 }
 
-/// Create one distribution and answer `(Id, DomainName, ETag)`.
+/// Create one distribution and answer `(Id, the address its edge is served at, ETag)`.
+///
+/// The address is not a modelled member: what the distribution PUBLISHES is the DNS name
+/// CloudFront assigned it, and the address that name resolves to is the listener this emulator
+/// opened for it ([`edge_listener_authority`]) — which is the address the register under test
+/// records.
 async fn created_distribution(
     router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
     row: &Config,
 ) -> (String, String, String) {
     let created = create_distribution(router, &row.xml()).await;
@@ -62,15 +68,9 @@ async fn created_distribution(
         created.status,
         created.raw
     );
-    (
-        created.root().text_at("Id").unwrap_or_default().to_string(),
-        created
-            .root()
-            .text_at("DomainName")
-            .unwrap_or_default()
-            .to_string(),
-        created.header("etag").to_string(),
-    )
+    let id = created.root().text_at("Id").unwrap_or_default().to_string();
+    let address = edge_listener_authority(engine, row.case, &id);
+    (id, address, created.header("etag").to_string())
 }
 
 /// Create one connection group and answer its `RoutingEndpoint`.
@@ -106,16 +106,20 @@ async fn a_published_address_resolves_to_this_service_until_its_port_closes() {
     // connection group, which publishes the other kind of address this service opens.
     let first = config("the first distribution", "published-address-first");
     let second = config("the second distribution", "published-address-second");
-    let (first_id, first_domain, first_etag) = created_distribution(&router, &first).await;
-    let (_second_id, second_domain, _second_etag) = created_distribution(&router, &second).await;
+    let (first_id, first_domain, first_etag) = created_distribution(&router, &engine, &first).await;
+    let (_second_id, second_domain, _second_etag) =
+        created_distribution(&router, &engine, &second).await;
     let group_endpoint = created_group_endpoint(&router, "published-address-group").await;
 
     // Each address is one a client can DIAL — the `host:port` of a listener of this
     // emulator's own — which is the class of address nothing can read a service off, and so
     // the one the register exists for.
     let addresses: [(&str, &str); 3] = [
-        ("a distribution's DomainName", first_domain.as_str()),
-        ("another distribution's DomainName", second_domain.as_str()),
+        ("the address a distribution's edge is served at", first_domain.as_str()),
+        (
+            "the address another distribution's edge is served at",
+            second_domain.as_str(),
+        ),
         ("a connection group's RoutingEndpoint", group_endpoint.as_str()),
     ];
     for (case, address) in addresses {
@@ -188,7 +192,10 @@ async fn a_published_address_resolves_to_this_service_until_its_port_closes() {
          its port is closed, got {answering:?}"
     );
     for (case, address) in [
-        ("another distribution's DomainName", second_domain.as_str()),
+        (
+            "the address another distribution's edge is served at",
+            second_domain.as_str(),
+        ),
         ("a connection group's RoutingEndpoint", group_endpoint.as_str()),
     ] {
         let answering = published.answering_service(address);

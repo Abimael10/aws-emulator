@@ -64,16 +64,23 @@ pub(crate) const PERIOD: i64 = 60;
 /// the CloudWatch store, so both have to be mounted on the same engine for a client to read
 /// back what the edge reported.
 pub(crate) fn emulator() -> MultiServiceRouter {
+    emulator_with_engine().0
+}
+
+/// The same emulator, with the shared ENGINE handed back beside it — for a suite whose viewer
+/// DIALS a socket and so needs the address this emulator opened for a distribution
+/// ([`crate::distribution_lifecycle::edge_listener_authority`]).
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
     router.register_service(
         service_com_amazonaws_cloudwatch_graniteserviceversion20100801::EmulatedService::new(
-            engine,
+            Arc::clone(&engine),
         ),
     );
-    router
+    (router, engine)
 }
 
 /// One viewer request: no AWS credential, addressed to the distribution's own domain name,

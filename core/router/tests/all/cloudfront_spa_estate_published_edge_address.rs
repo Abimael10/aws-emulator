@@ -52,6 +52,7 @@ use crate::cloudformation_firehose_stream_stabilisation::wait_for_stack_status;
 // client can dial": both written by the sibling dialled-address suite, which this suite dials
 // the same way with a method and an entity of its own.
 use crate::cloudfront_dialled_edge_address_over_a_private_s3_origin::{dial_with, is_dialable};
+use crate::cloudfront_oac_s3_origin_edge::{edge_listener_authority, is_assigned_edge_domain};
 use crate::query_wire::{form_encode, physical_ids_of};
 
 /// The Region every call is signed for, and the Region the origin hosts name.
@@ -151,11 +152,11 @@ def handler(event, context):
 /// Request authentication is off: a setup call carries a credential scope (which is what routes
 /// it and what names the Region) without a computed signature, and the VIEWER carries no
 /// credential at all, as a client of a distribution sends none.
-fn emulator() -> MultiServiceRouter {
+fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = aws_emulator_router::build_router(engine);
+    let mut router = aws_emulator_router::build_router(Arc::clone(&engine));
     router.set_request_authentication(false);
-    router
+    (router, engine)
 }
 
 /// A SigV4 `Authorization` whose credential scope names `signing_name`, which is what routes
@@ -869,7 +870,7 @@ fn posted(index: usize) -> (String, String, String) {
 
 #[tokio::test]
 async fn the_published_domain_name_serves_the_spa_shell_and_carries_its_api_writes() {
-    let router = emulator();
+    let (router, engine) = emulator();
 
     // The estate: the two functions and the table they write, the deployed api in front of
     // them, and the bucket the shell is served from.
@@ -880,26 +881,33 @@ async fn the_published_domain_name_serves_the_spa_shell_and_carries_its_api_writ
     let (id, domain, arn) = create_distribution(&router, &control, &api).await;
     grant_shell_reads(&router, &arn).await;
 
-    // The published name is an address a client on this machine can open a connection to, or
-    // there is nothing for a viewer to dial at all.
+    // The published name is the DNS name CloudFront assigns a distribution, and the address
+    // below is where a client on this machine reaches it — or there is nothing for a viewer to
+    // dial at all.
     assert!(
-        is_dialable(&domain),
-        "expected a host:port a client on this machine can dial as the published DomainName, \
-         got {domain:?}"
+        is_assigned_edge_domain(&domain),
+        "expected the DNS name CloudFront assigns a distribution (d<label>.cloudfront.net) as \
+         the published DomainName, got {domain:?}"
     );
-    // The address CloudFront reports on a READ is the same one the create published: the name
+    let address = edge_listener_authority(&engine, &id)
+        .expect("this emulator opened an address for the distribution");
+    assert!(
+        is_dialable(&address),
+        "expected a host:port a client on this machine can dial for {domain:?}, got {address:?}"
+    );
+    // The name CloudFront reports on a READ is the same one the create published: the name
     // is the distribution's, not the create response's.
     let read_back = awaited_deployment(&router, &id).await;
     assert_eq!(
         read_back, domain,
-        "expected GetDistribution to report the published address {domain:?}, got {read_back:?}"
+        "expected GetDistribution to report the published name {domain:?}, got {read_back:?}"
     );
 
     for (index, row) in rows().iter().enumerate() {
         let case = row.case;
         let (item_id, item_data, body) = posted(index);
         let sent = if row.posts { body.as_str() } else { "" };
-        let answer = dial_with(case, &domain, row.method, &row.path, sent).await;
+        let answer = dial_with(case, &address, &domain, row.method, &row.path, sent).await;
         // Whatever the answer is, it is the edge's: CloudFront identifies the request it
         // served, which is what says the dialled address is a distribution's data plane and not
         // some other listener that happened to accept the connection.

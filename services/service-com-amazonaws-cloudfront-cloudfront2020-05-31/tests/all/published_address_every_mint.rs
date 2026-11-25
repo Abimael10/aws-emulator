@@ -34,11 +34,12 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::connection_mode_immutable::get_distribution_config;
 use crate::distribution_copy::copy_distribution;
 use crate::distribution_lifecycle::{
-    awaited_deployment, config, create_distribution, emulator, get_distribution,
-    is_reachable_authority, list_distributions, update_distribution, Config, HOST,
+    awaited_deployment, config, create_distribution, edge_listener_authority,
+    emulator_with_engine, get_distribution, is_assigned_edge_domain, list_distributions,
+    update_distribution, Config, HOST,
 };
 use crate::distribution_tags::create_distribution_with_tags;
-use crate::published_edge_address::dial;
+use crate::published_edge_address::dial_as;
 
 /// The path a viewer fetches through each published address. The origin below is this
 /// service's own control-plane endpoint, so this is an object the origin really serves and
@@ -85,13 +86,14 @@ fn one_tag() -> Vec<(String, Option<String>)> {
     vec![("owner".to_string(), Some("published-address".to_string()))]
 }
 
-/// A distribution this suite minted: the row that minted it, its id, the address it
-/// published and its current version token.
+/// A distribution this suite minted: the row that minted it, its id, the name it
+/// published, the address a viewer dials that name at and its current version token.
 #[derive(Debug, Clone)]
 struct Minted {
     case: &'static str,
     id: String,
     domain: String,
+    address: String,
     etag: String,
 }
 
@@ -105,8 +107,13 @@ fn served_origin_config(reference: &str) -> Config {
     }
 }
 
-/// Mint one distribution through `how` and read the address it published.
-async fn mint_distribution(router: &MultiServiceRouter, how: Mint, reference: &str) -> Minted {
+/// Mint one distribution through `how` and read the name it published.
+async fn mint_distribution(
+    router: &MultiServiceRouter,
+    engine: &::std::sync::Arc<engine::InMemoryEngine>,
+    how: Mint,
+    reference: &str,
+) -> Minted {
     let case = how.case();
     let config = served_origin_config(reference);
     let (answer, minted_from) = match how {
@@ -157,28 +164,31 @@ async fn mint_distribution(router: &MultiServiceRouter, how: Mint, reference: &s
         .unwrap_or_default()
         .to_string();
     assert!(
-        is_reachable_authority(&domain),
-        "case {case}: expected the address of the listener this distribution's edge is \
-         served on, got {domain:?}"
+        is_assigned_edge_domain(&domain),
+        "case {case}: expected the DNS name CloudFront assigns a distribution \
+         (d<label>.cloudfront.net), got {domain:?}"
     );
     if let Some(primary_domain) = minted_from {
         assert_ne!(
             domain, primary_domain,
-            "case {case}: expected the copy to publish an address of its own, got the \
+            "case {case}: expected the copy to publish a name of its own, got the \
              primary's {primary_domain:?}"
         );
     }
+    let address = edge_listener_authority(engine, case, &id);
     Minted {
         case,
         id,
         domain,
+        address,
         etag: answer.header("etag").to_string(),
     }
 }
 
-/// Fetch the viewer path through `domain` and assert the origin's own answer came back.
-async fn assert_serves(case: &str, domain: &str, context: &str) {
-    let served = dial(domain, "GET", VIEWER_PATH).await;
+/// Fetch the viewer path for the published name `domain`, dialled at `address`, and assert the
+/// origin's own answer came back.
+async fn assert_serves(case: &str, address: &str, domain: &str, context: &str) {
+    let served = dial_as(address, "GET", VIEWER_PATH, domain).await;
     assert!(
         served.starts_with("HTTP/1.1 200"),
         "case {case} ({context}): expected the published address {domain} to serve the \
@@ -207,17 +217,19 @@ async fn assert_serves(case: &str, domain: &str, context: &str) {
 /// document, and no two distributions publish the same address.
 #[tokio::test]
 async fn every_operation_that_mints_a_distribution_publishes_an_address_that_serves() {
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
     let mut minted: Vec<Minted> = Vec::new();
     for how in MINTS {
-        minted.push(mint_distribution(&router, how, &format!("ref-mint-{}", how.case())).await);
+        minted.push(
+            mint_distribution(&router, &engine, how, &format!("ref-mint-{}", how.case())).await,
+        );
     }
 
     let mut addresses: BTreeSet<String> = BTreeSet::new();
     for one in &minted {
         assert!(
             addresses.insert(one.domain.clone()),
-            "case {}: the address {} was already published by another distribution",
+            "case {}: the name {} was already published by another distribution",
             one.case,
             one.domain
         );
@@ -225,7 +237,13 @@ async fn every_operation_that_mints_a_distribution_publishes_an_address_that_ser
 
     for one in &minted {
         awaited_deployment(&router, one.case, &one.id).await;
-        assert_serves(one.case, &one.domain, "the address the minting call published").await;
+        assert_serves(
+            one.case,
+            &one.address,
+            &one.domain,
+            "the name the minting call published",
+        )
+        .await;
     }
 }
 
@@ -234,9 +252,15 @@ async fn every_operation_that_mints_a_distribution_publishes_an_address_that_ser
 /// configuration has been resubmitted.
 #[tokio::test]
 async fn every_projection_reports_the_address_the_minting_call_published() {
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
     for how in MINTS {
-        let one = mint_distribution(&router, how, &format!("ref-projection-{}", how.case())).await;
+        let one = mint_distribution(
+            &router,
+            &engine,
+            how,
+            &format!("ref-projection-{}", how.case()),
+        )
+        .await;
         let case = one.case;
 
         let read = get_distribution(&router, &one.id).await;
@@ -300,6 +324,12 @@ async fn every_projection_reports_the_address_the_minting_call_published() {
         );
 
         awaited_deployment(&router, case, &one.id).await;
-        assert_serves(case, &one.domain, "the address after a reconfiguration").await;
+        assert_serves(
+            case,
+            &one.address,
+            &one.domain,
+            "the name after a reconfiguration",
+        )
+        .await;
     }
 }

@@ -47,9 +47,9 @@ use smithy_server_runtime::MultiServiceRouter;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::cloudfront_oac_s3_origin_edge::{
-    call, create_bucket, create_origin_access_control, emulator, origin_domain, policy,
-    put_bucket_policy, put_object, regional_endpoint, view, API_VERSION, CLOUDFRONT_HOST,
-    CLOUDFRONT_PRINCIPAL,
+    call, create_bucket, create_origin_access_control, edge_listener_authority, emulator,
+    is_assigned_edge_domain, origin_domain, policy, put_bucket_policy, put_object,
+    regional_endpoint, view, API_VERSION, CLOUDFRONT_HOST, CLOUDFRONT_PRINCIPAL,
 };
 
 /// The account every emulated ARN carries, which is the account the ARN below names.
@@ -221,34 +221,39 @@ impl Served {
     }
 }
 
-/// Whether `domain` is an address a client on the machine this emulator runs on can DIAL: a
+/// Whether `authority` is an address a client on the machine this emulator runs on can DIAL: a
 /// `host:port`, which is exactly the set of values a client reaches without resolving a name.
-/// A name under a zone nothing here serves resolves to nothing, so a distribution reporting
-/// one would publish an address no viewer could open a connection to.
-pub(crate) fn is_dialable(domain: &str) -> bool {
-    domain.parse::<SocketAddr>().is_ok()
-}
-
-/// Dial `authority` in the clear and send one HTTP/1.1 `GET`, answering what came back: the
-/// [`dial_with`] every viewer that asks for an object makes.
-pub(crate) async fn dial(case: &str, authority: &str, path: &str) -> Served {
-    dial_with(case, authority, "GET", path, "").await
-}
-
-/// Dial `authority` in the clear and send one HTTP/1.1 request of `method` for `path`, carrying
-/// `body` as a JSON entity when the caller sends one, answering what came back.
 ///
-/// This is the VIEWER: a client holding nothing but the address the create published, with no
-/// AWS credential of any kind, speaking the protocol that address answers rather than going
-/// through the router — which is the one thing an in-process dispatch addressed by `Host`
-/// cannot show.
+/// What a distribution PUBLISHES is a domain name
+/// ([`crate::cloudfront_oac_s3_origin_edge::is_assigned_edge_domain`]); this is the address
+/// that name resolves to for a client on this machine — the listener this emulator opened for
+/// the distribution — which is what a viewer opens its connection to.
+pub(crate) fn is_dialable(authority: &str) -> bool {
+    authority.parse::<SocketAddr>().is_ok()
+}
+
+/// Dial `authority` in the clear and send one HTTP/1.1 `GET` stating `host` as the host it
+/// addressed: the [`dial_with`] every viewer that asks for an object makes.
+pub(crate) async fn dial(case: &str, authority: &str, host: &str, path: &str) -> Served {
+    dial_with(case, authority, host, "GET", path, "").await
+}
+
+/// Dial `authority` in the clear and send one HTTP/1.1 request of `method` for `path`, stating
+/// `host` as the host it addressed and carrying `body` as a JSON entity when the caller sends
+/// one, answering what came back.
+///
+/// This is the VIEWER: a client handed the name a distribution published, dialling the address
+/// that name resolves to and carrying the name itself as the host it addressed, with no AWS
+/// credential of any kind, speaking the protocol that address answers rather than going
+/// through the router — which is the one thing an in-process dispatch cannot show.
 ///
 /// The dial names the LOOPBACK interface explicitly and takes only the PORT from the
-/// published authority — the caller has already held that authority to being one of this
-/// emulator's own listeners — so nothing here opens a connection anywhere else.
+/// authority — the caller has already held it to being one of this emulator's own listeners —
+/// so nothing here opens a connection anywhere else.
 pub(crate) async fn dial_with(
     case: &str,
     authority: &str,
+    host: &str,
     method: &str,
     path: &str,
     body: &str,
@@ -281,7 +286,7 @@ pub(crate) async fn dial_with(
         )
     };
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {authority}\r\n{entity}Connection: close\r\n\r\n{body}"
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\n{entity}Connection: close\r\n\r\n{body}"
     );
     stream
         .write_all(request.as_bytes())
@@ -473,6 +478,9 @@ struct Prepared {
     expected: Expected,
     id: String,
     domain: String,
+    /// The `host:port` the published name resolves to for a client on this machine — the
+    /// address this emulator opened for the distribution, which the viewer dials.
+    address: String,
 }
 
 #[tokio::test]
@@ -508,12 +516,25 @@ async fn the_published_domain_name_dialled_on_a_socket_serves_a_private_s3_origi
             row.root_object,
         )
         .await;
-        // The published name is an address a client can open a connection to, or there is
-        // nothing for a viewer to dial at all.
+        // The published name is the DNS name CloudFront assigns a distribution, and the
+        // address below is where a client on this machine reaches it — or there is nothing for
+        // a viewer to dial at all.
         assert!(
-            is_dialable(&domain),
-            "case {:?}: expected a host:port a client on this machine can dial as the \
-             published DomainName, got {domain:?}",
+            is_assigned_edge_domain(&domain),
+            "case {:?}: expected the DNS name CloudFront assigns a distribution \
+             (d<label>.cloudfront.net) as the published DomainName, got {domain:?}",
+            row.case
+        );
+        let address = edge_listener_authority(&engine, &id).unwrap_or_else(|| {
+            panic!(
+                "case {:?}: this emulator opened no address for the distribution {id}",
+                row.case
+            )
+        });
+        assert!(
+            is_dialable(&address),
+            "case {:?}: expected a host:port a client on this machine can dial, got \
+             {address:?}",
             row.case
         );
         // The document is written AFTER the distribution exists, because a row that scopes it
@@ -547,6 +568,7 @@ async fn the_published_domain_name_dialled_on_a_socket_serves_a_private_s3_origi
             expected: row.expected,
             id,
             domain,
+            address,
         });
     }
 
@@ -557,12 +579,12 @@ async fn the_published_domain_name_dialled_on_a_socket_serves_a_private_s3_origi
         let read_back = awaited_deployment(&setup, case, &row.id).await;
         assert_eq!(
             read_back, row.domain,
-            "case {case:?}: expected GetDistribution to report the published address \
+            "case {case:?}: expected GetDistribution to report the published name \
              {:?}, got {read_back:?}",
             row.domain
         );
 
-        let answer = dial(case, &row.domain, row.request_path).await;
+        let answer = dial(case, &row.address, &row.domain, row.request_path).await;
         // Whatever the answer is, it is the edge's: CloudFront identifies the request it
         // served, which is what says the dialled address is a distribution's data plane and
         // not some other listener that happened to accept the connection.

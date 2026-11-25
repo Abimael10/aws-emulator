@@ -44,11 +44,13 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::ops::types::REALTIME_
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::service::edge_metrics;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::distribution_lifecycle::{awaited_deployment, is_reachable_authority};
+use crate::distribution_lifecycle::{
+    awaited_deployment, edge_listener_authority, is_assigned_edge_domain,
+};
 use crate::edge_additional_metric_reconciliation::{Outcome, CACHE_ERROR, CACHE_HIT, CACHE_MISS};
 use crate::edge_additional_metrics::{created, subscribe};
-use crate::edge_request_metrics::{emulator, held, now_secs, Held};
-use crate::published_edge_address::dial;
+use crate::edge_request_metrics::{emulator_with_engine, held, now_secs, Held};
+use crate::published_edge_address::dial_as;
 
 /// The `RealtimeMetricsSubscriptionStatus` value that enables the additional series, as the
 /// enumerated type spells it.
@@ -63,23 +65,36 @@ const WHOLE_PERCENT: f64 = 100.0;
 /// division.
 const TOLERANCE: f64 = 1e-9;
 
-/// One distribution of a row, as the client that created it knows it: its id, and the address
-/// it published for a viewer to dial.
+/// One distribution of a row, as the client that created it knows it: its id, the NAME it
+/// published for a viewer to address, and the address this emulator opened for its edge, which
+/// is where a viewer dials that name.
 #[derive(Debug, Clone)]
 struct Subject {
     id: String,
     domain: String,
+    address: String,
 }
 
-/// Create one distribution, holding its published `DomainName` to the one rule about it: an
-/// address a client on this machine can DIAL.
-async fn subject(router: &MultiServiceRouter, case: &str, caller_reference: &str) -> Subject {
+/// Create one distribution, holding its published `DomainName` to the one rule about it: the
+/// DNS name CloudFront assigns a distribution.
+async fn subject(
+    router: &MultiServiceRouter,
+    engine: &::std::sync::Arc<engine::InMemoryEngine>,
+    case: &str,
+    caller_reference: &str,
+) -> Subject {
     let (id, domain) = created(router, caller_reference).await;
     assert!(
-        is_reachable_authority(&domain),
-        "case {case:?}: expected a published address a viewer can dial, got {domain:?}"
+        is_assigned_edge_domain(&domain),
+        "case {case:?}: expected the DNS name CloudFront assigns a distribution \
+         (d<label>.cloudfront.net), got {domain:?}"
     );
-    Subject { id, domain }
+    let address = edge_listener_authority(engine, case, &id);
+    Subject {
+        id,
+        domain,
+        address,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -169,11 +184,12 @@ fn count_of(served: &[Outcome], predicate: impl Fn(&Outcome) -> bool) -> f64 {
     counted
 }
 
-/// Dial every request of [`driven`] at `domain` and answer what the edge served each one.
-async fn dialled(case: &str, domain: &str) -> Vec<Outcome> {
+/// Dial every request of [`driven`] at `address`, stating the published name `domain` as the
+/// host it addressed, and answer what the edge served each one.
+async fn dialled(case: &str, address: &str, domain: &str) -> Vec<Outcome> {
     let mut served = Vec::new();
     for request in driven() {
-        let raw = dial(domain, request.method, request.path).await;
+        let raw = dial_as(address, request.method, request.path, domain).await;
         let answer = outcome_of(case, &raw);
         assert_eq!(
             answer.status, request.status,
@@ -234,17 +250,25 @@ fn rows() -> Vec<Row> {
 
 #[tokio::test]
 async fn traffic_dialled_at_a_published_address_fills_that_distributions_series() {
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
     let table = rows();
 
     // Every row's distribution, plus the control nothing dials, is created first and then
     // waited for, so the propagation the clock owes them is waited out once for all of them.
     let mut subjects: Vec<Subject> = Vec::new();
     for (index, row) in table.iter().enumerate() {
-        subjects.push(subject(&router, row.case, &format!("dialled-metrics-{index}")).await);
+        subjects.push(
+            subject(
+                &router,
+                &engine,
+                row.case,
+                &format!("dialled-metrics-{index}"),
+            )
+            .await,
+        );
     }
     let control_case = "a subscribed distribution nothing dials";
-    let control = subject(&router, control_case, "dialled-metrics-control").await;
+    let control = subject(&router, &engine, control_case, "dialled-metrics-control").await;
     for (row, subject) in table.iter().zip(subjects.iter()) {
         awaited_deployment(&router, row.case, &subject.id).await;
     }
@@ -266,10 +290,10 @@ async fn traffic_dialled_at_a_published_address_fills_that_distributions_series(
         // than around the first row's, so a slow host cannot move them out of it.
         let at = now_secs();
 
-        // The traffic, dialled at the address this distribution published — a socket is opened
-        // to it and the requests are written on it, which is what a viewer handed that name
-        // does.
-        let served = dialled(case, &subject.domain).await;
+        // The traffic, dialled at the address this emulator opened for the distribution, with
+        // the name it published stated as the host — a socket is opened and the requests are
+        // written on it, which is what a viewer handed that name does.
+        let served = dialled(case, &subject.address, &subject.domain).await;
         let requests = count_of(&served, |_| true);
         let cacheable = count_of(&served, Outcome::cacheable);
         let from_cache = count_of(&served, Outcome::served_by_cache);

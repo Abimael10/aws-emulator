@@ -27,7 +27,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::announced_location_uri::{addressed_hosts, created_id, origin_access_identity_xml};
 use crate::distribution_lifecycle::{
-    call_from_host, config, create_distribution, emulator, is_reachable_authority, API_VERSION,
+    call_from_host, config, create_distribution, emulator, is_assigned_edge_domain, API_VERSION,
     AUTHORIZATION,
 };
 
@@ -113,9 +113,9 @@ async fn an_addressed_own_endpoint_is_a_port_no_edge_listener_can_take() {
             .unwrap_or_else(|| panic!("round {round}: the create carries no DomainName"))
             .to_string();
         assert!(
-            is_reachable_authority(&domain),
-            "round {round}: expected the distribution to publish the address of its own \
-             listener, got {domain:?}"
+            is_assigned_edge_domain(&domain),
+            "round {round}: expected the distribution to publish the DNS name CloudFront \
+             assigns it (d<label>.cloudfront.net), got {domain:?}"
         );
         for row in hosts.rows.iter() {
             assert!(
@@ -160,7 +160,7 @@ async fn an_addressed_own_endpoint_is_a_port_no_edge_listener_can_take() {
         }
     }
 
-    // And the authority an edge listener really holds is the one case the edge claims: a create
+    // And the name a distribution published is the one case the edge claims: a create
     // addressed there is viewer traffic to that distribution, so nothing is created.
     for (round, domain) in served.iter().enumerate() {
         let status = answered_status(
@@ -172,7 +172,7 @@ async fn an_addressed_own_endpoint_is_a_port_no_edge_listener_can_take() {
         .await;
         assert!(
             !(200..300).contains(&status),
-            "round {round}: expected a create addressed to the edge authority {domain:?} to be \
+            "round {round}: expected a create addressed to the published name {domain:?} to be \
              answered by the edge, got {status}"
         );
     }

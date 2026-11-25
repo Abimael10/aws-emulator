@@ -551,10 +551,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message,
             )));
         }
-        let edge_address = if crate::state::is_multi_tenant(&input.distribution_config) {
+        let edge_endpoint = if crate::state::is_multi_tenant(&input.distribution_config) {
             None
         } else {
-            crate::state::published_edge_address(&*self.engine, ctx).await
+            crate::state::opened_edge_endpoint(&*self.engine, ctx).await
         };
         let created = {
             let mut store = state.lock();
@@ -568,7 +568,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     input.distribution_config,
                     crate::state::TagSet::new(),
                     now,
-                    edge_address,
+                    edge_endpoint,
                 )
                 .map_err(create_refusal)?
         };

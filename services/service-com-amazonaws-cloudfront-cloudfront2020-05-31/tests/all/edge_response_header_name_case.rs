@@ -22,9 +22,10 @@
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::distribution_lifecycle::{
-    awaited_deployment, create_distribution, emulator, is_reachable_authority, API_VERSION, HOST,
+    awaited_deployment, create_distribution, edge_listener_authority, emulator_with_engine,
+    is_assigned_edge_domain, API_VERSION, HOST,
 };
-use crate::published_edge_address::dial;
+use crate::published_edge_address::dial_as;
 
 /// A viewer path the origin these rows point at — this service's own control-plane endpoint —
 /// answers with a `DistributionList`.
@@ -53,13 +54,15 @@ fn config_xml(reference: &str, viewer_protocol_policy: &str) -> String {
     )
 }
 
-/// Create one deployed distribution and answer the address it published.
+/// Create one deployed distribution and answer the `(name it published, address a viewer
+/// dials that name at)`.
 async fn deployed(
     router: &MultiServiceRouter,
+    engine: &::std::sync::Arc<engine::InMemoryEngine>,
     case: &str,
     reference: &str,
     viewer_protocol_policy: &str,
-) -> String {
+) -> (String, String) {
     let created = create_distribution(router, &config_xml(reference, viewer_protocol_policy)).await;
     assert_eq!(
         created.status, 201,
@@ -77,11 +80,13 @@ async fn deployed(
         .unwrap_or_default()
         .to_string();
     assert!(
-        is_reachable_authority(&domain),
-        "case {case}: expected an address a viewer can dial, got {domain:?}"
+        is_assigned_edge_domain(&domain),
+        "case {case}: expected the DNS name CloudFront assigns a distribution \
+         (d<label>.cloudfront.net), got {domain:?}"
     );
     awaited_deployment(router, case, &id).await;
-    domain
+    let address = edge_listener_authority(engine, case, &id);
+    (domain, address)
 }
 
 /// The head of one raw answer: the status line and the header lines, as they came off the
@@ -142,13 +147,14 @@ const GENERATED_ANSWER_HEADERS: &[&str] = &[
 /// CloudFront generated itself all name their headers canonically.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_answer_the_published_address_serves_names_its_headers_canonically() {
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
 
     // One: the answer the ORIGIN produced for this request, and two: the same request again,
     // which the edge cache holds the answer to.
     let case = "an answer the origin produced";
-    let domain = deployed(&router, case, "header-case-served", "allow-all").await;
-    let fetched = dial(&domain, "GET", SERVED_PATH).await;
+    let (domain, address) =
+        deployed(&router, &engine, case, "header-case-served", "allow-all").await;
+    let fetched = dial_as(&address, "GET", SERVED_PATH, &domain).await;
     let fetched = head(case, &fetched);
     carries_canonical_names(case, &fetched, ORIGIN_ANSWER_HEADERS);
     assert!(
@@ -157,7 +163,7 @@ async fn every_answer_the_published_address_serves_names_its_headers_canonically
     );
 
     let case = "an answer the edge cache held";
-    let held = dial(&domain, "GET", SERVED_PATH).await;
+    let held = dial_as(&address, "GET", SERVED_PATH, &domain).await;
     let held = head(case, &held);
     carries_canonical_names(case, &held, ORIGIN_ANSWER_HEADERS);
     assert!(
@@ -169,8 +175,15 @@ async fn every_answer_the_published_address_serves_names_its_headers_canonically
     // `ViewerProtocolPolicy` is `redirect-to-https`, whose target is the one header this whole
     // rule is about.
     let case = "the redirect CloudFront generated";
-    let domain = deployed(&router, case, "header-case-redirect", "redirect-to-https").await;
-    let redirected = dial(&domain, "GET", "/index.html").await;
+    let (domain, address) = deployed(
+        &router,
+        &engine,
+        case,
+        "header-case-redirect",
+        "redirect-to-https",
+    )
+    .await;
+    let redirected = dial_as(&address, "GET", "/index.html", &domain).await;
     let redirected = head(case, &redirected);
     carries_canonical_names(case, &redirected, GENERATED_ANSWER_HEADERS);
     carries_canonical_names(case, &redirected, &["Location"]);
@@ -182,8 +195,9 @@ async fn every_answer_the_published_address_serves_names_its_headers_canonically
     // Four: the refusal CloudFront generates itself for a method the matched behaviour does
     // not allow, which carries no origin bytes at all.
     let case = "the refusal CloudFront generated";
-    let domain = deployed(&router, case, "header-case-refused", "allow-all").await;
-    let refused = dial(&domain, "DELETE", SERVED_PATH).await;
+    let (domain, address) =
+        deployed(&router, &engine, case, "header-case-refused", "allow-all").await;
+    let refused = dial_as(&address, "DELETE", SERVED_PATH, &domain).await;
     let refused = head(case, &refused);
     assert!(
         refused.starts_with("HTTP/1.1 403"),

@@ -5,11 +5,11 @@
 //!
 //! Three rules are under test here:
 //!
-//! * a distribution reports, as its `DomainName`, an address a client on this machine can
-//!   DIAL: the `host:port` of the listener its edge is served on. The name is not a
-//!   decoration — the suite opens a socket to it and fetches an object through it, which is
-//!   what a viewer handed that name does — and both schemes a viewer may dial are served at
-//!   that one address;
+//! * a distribution reports, as its `DomainName`, the DNS name CloudFront assigns it — one
+//!   label under `cloudfront.net` — and the emulator ANSWERS on that name: the suite opens a
+//!   socket to the address this emulator opened for the distribution, states the published
+//!   name as the host it addressed (which is what a client handed a domain name sends) and
+//!   fetches an object through it, and both schemes a viewer may dial are served there;
 //! * a MULTI-TENANT distribution's configuration may state none of the members the service
 //!   documents as supported only on a standard distribution (or as a connection group's to
 //!   carry): each is refused `InvalidArgument` (HTTP 400) with the sentence that names it,
@@ -41,8 +41,9 @@ use smithy_server_runtime::MultiServiceRouter;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::distribution_lifecycle::{
-    call, create_distribution, emulator, get_distribution, is_reachable_authority,
-    past_propagation, update_distribution, Answer, API_VERSION, CUSTOM_VIEWER_CERTIFICATE, HOST,
+    awaited_deployment, call, create_distribution, edge_listener_authority, emulator,
+    emulator_with_engine, get_distribution, is_assigned_edge_domain, update_distribution, Answer,
+    API_VERSION, CUSTOM_VIEWER_CERTIFICATE, HOST,
 };
 use crate::function_lifecycle::{create_table, Create};
 use crate::function_publish::{create_one, publish_function};
@@ -536,25 +537,38 @@ async fn a_function_association_names_a_published_stage() {
 // The address a distribution publishes
 // ---------------------------------------------------------------------------
 
-/// The `DomainName` a create reported, asserted to be an address a client can dial.
-async fn published_domain(router: &MultiServiceRouter, reference: &str) -> String {
+/// One created distribution, DEPLOYED: the DNS name CloudFront assigned it, held to that
+/// form, and the `host:port` this emulator opened for its edge, which is what a client on this
+/// machine dials to reach that name.
+///
+/// The wait is on the CONDITION the record reports ([`awaited_deployment`]) rather than on a
+/// span of the host's clock: a configuration that has not reached the edge locations serves no
+/// viewer, and the clock is what owes it that.
+async fn published_domain(
+    router: &MultiServiceRouter,
+    engine: &::std::sync::Arc<engine::InMemoryEngine>,
+    reference: &str,
+) -> (String, String) {
     let created = create_distribution(
         &router.clone(),
         &config_xml(reference, "", None, DIRECT_MEMBERS),
     )
     .await;
     let case = "the published domain name";
-    let _ = created_id(&created, case);
+    let id = created_id(&created, case);
     let domain = created
         .root()
         .find_text("DomainName")
         .unwrap_or_default()
         .to_string();
     assert!(
-        is_reachable_authority(&domain),
-        "case {case}: expected an address a client can dial, got {domain:?}"
+        is_assigned_edge_domain(&domain),
+        "case {case}: expected the DNS name CloudFront assigns a distribution \
+         (d<label>.cloudfront.net), got {domain:?}"
     );
-    domain
+    let address = edge_listener_authority(engine, case, &id);
+    awaited_deployment(router, case, &id).await;
+    (domain, address)
 }
 
 /// How long the dial below waits to CONNECT to the published address, and how long it then
@@ -568,34 +582,20 @@ async fn published_domain(router: &MultiServiceRouter, reference: &str) -> Strin
 const DIAL_DEADLINE: Duration = Duration::from_secs(60);
 const ANSWER_DEADLINE: Duration = Duration::from_secs(120);
 
-/// Dial `authority` in the clear and send one HTTP/1.1 request, answering the status line
-/// and the headers and body that follow it.
+/// Dial `authority` in the clear and send one HTTP/1.1 request stating `host` as the host it
+/// addressed, answering the status line and the headers and body that follow it.
 ///
-/// A viewer dials the name the distribution published, with no AWS credential: this is that
-/// client, speaking the protocol the address answers on rather than going through the
-/// router, so what it proves is that the PUBLISHED address serves.
+/// A viewer dials the address the name it was handed resolves to, with no AWS credential, and
+/// states that name as the host: this is that client, speaking the protocol the address
+/// answers on rather than going through the router, so what it proves is that the address this
+/// emulator opened serves the name the distribution PUBLISHED.
 ///
-/// The dial names the LOOPBACK address explicitly and takes only the PORT from the
-/// published authority: the address under test is one of this emulator's own listeners
-/// ([`is_reachable_authority`] has already held it to that), and nothing here opens a
+/// The dial names the LOOPBACK address explicitly and takes only the PORT from `authority`:
+/// the address under test is one of this emulator's own listeners, and nothing here opens a
 /// connection to anywhere else.
 ///
-/// `pub(crate)` so every suite that reads a published domain name dials it the same way
+/// `pub(crate)` so every suite whose viewer dials a published name dials it the same way
 /// rather than carrying its own copy of this client.
-pub(crate) async fn dial(authority: &str, method: &str, path: &str) -> String {
-    dial_as(authority, method, path, authority).await
-}
-
-/// [`dial`] with the HOST the viewer addressed stated separately from the authority it
-/// DIALLED.
-///
-/// The two are the same for a distribution's own edge domain, which a viewer reaches by
-/// dialling the name it published. They differ wherever the published address serves
-/// traffic for a name of its own: a distribution tenant is reached through its connection
-/// group's routing endpoint under the TENANT's domain, which is the name its DNS record
-/// points at that endpoint.
-///
-/// `pub(crate)` so every suite that dials a published address uses this one client.
 pub(crate) async fn dial_as(authority: &str, method: &str, path: &str, host: &str) -> String {
     dial_with(authority, method, path, host, &[]).await
 }
@@ -640,23 +640,30 @@ pub(crate) async fn dial_with(
     String::from_utf8_lossy(&answer).to_string()
 }
 
-/// The address a distribution publishes ANSWERS: a viewer that dials it in the clear is
-/// served the object from the origin the behaviour targets, reported as a cache miss, and a
-/// method the behaviour does not allow is refused by CloudFront itself at that same address.
+/// The name a distribution publishes ANSWERS: a viewer that dials the address that name
+/// resolves to, in the clear, stating the name as the host it addressed, is served the object
+/// from the origin the behaviour targets, reported as a cache miss, and a method the behaviour
+/// does not allow is refused by CloudFront itself there.
 #[tokio::test]
 async fn the_published_domain_name_answers_a_viewer() {
-    let router = emulator();
-    let domain = published_domain(&router, "ref-published-address").await;
-    // The distribution has to have reached the edge locations before a viewer is served.
-    ::tokio::time::sleep(past_propagation()).await;
+    let (router, engine) = emulator_with_engine();
+    // `published_domain` waits for the condition the record reports, so the distribution has
+    // reached the edge locations by the time a viewer is served.
+    let (domain, address) = published_domain(&router, &engine, "ref-published-address").await;
 
     // The origin is this service's own control-plane endpoint, whose
     // `GET /2020-05-31/distribution` answers a `DistributionList` — an origin this emulator
     // really serves, so what comes back is the origin's own answer.
-    let served = dial(&domain, "GET", &format!("/{API_VERSION}/distribution")).await;
+    let served = dial_as(
+        &address,
+        "GET",
+        &format!("/{API_VERSION}/distribution"),
+        &domain,
+    )
+    .await;
     assert!(
         served.starts_with("HTTP/1.1 200"),
-        "expected the published address to serve the origin's answer, got {served:?}"
+        "expected the published name {domain:?} to serve the origin's answer, got {served:?}"
     );
     assert!(
         served.contains("DistributionList"),
@@ -667,9 +674,15 @@ async fn the_published_domain_name_answers_a_viewer() {
         "expected the edge to report a cache miss, got {served:?}"
     );
 
-    // The same address, a method the default cache behaviour does not allow: CloudFront
+    // The same name, a method the default cache behaviour does not allow: CloudFront
     // refuses it itself, so no origin answer is served at all.
-    let refused = dial(&domain, "DELETE", &format!("/{API_VERSION}/distribution")).await;
+    let refused = dial_as(
+        &address,
+        "DELETE",
+        &format!("/{API_VERSION}/distribution"),
+        &domain,
+    )
+    .await;
     assert!(
         refused.starts_with("HTTP/1.1 403"),
         "expected CloudFront's own refusal of a method the behaviour disallows, got {refused:?}"
@@ -680,23 +693,28 @@ async fn the_published_domain_name_answers_a_viewer() {
     );
 }
 
-/// Each distribution publishes an address of its OWN, and each of those addresses serves
-/// the distribution it was minted for: the published name is what resolves the
-/// distribution, so two distributions are two addresses and a viewer that dials one is
-/// served by that one.
+/// Each distribution publishes a name of its OWN, and each of those names is served by the
+/// distribution it was minted for: the published name is what resolves the distribution, so a
+/// viewer stating one is served by that one.
 #[tokio::test]
 async fn each_distribution_publishes_an_address_of_its_own() {
-    let router = emulator();
-    let first = published_domain(&router, "ref-published-first").await;
-    let second = published_domain(&router, "ref-published-second").await;
+    let (router, engine) = emulator_with_engine();
+    let first = published_domain(&router, &engine, "ref-published-first").await;
+    let second = published_domain(&router, &engine, "ref-published-second").await;
     assert_ne!(
-        first, second,
-        "expected each distribution to publish an address of its own, got {first:?} for both"
+        first.0, second.0,
+        "expected each distribution to publish a name of its own, got {:?} for both",
+        first.0
     );
-    ::tokio::time::sleep(past_propagation()).await;
 
-    for (case, domain) in [("the first", &first), ("the second", &second)] {
-        let served = dial(domain, "GET", &format!("/{API_VERSION}/distribution")).await;
+    for (case, (domain, address)) in [("the first", &first), ("the second", &second)] {
+        let served = dial_as(
+            address,
+            "GET",
+            &format!("/{API_VERSION}/distribution"),
+            domain,
+        )
+        .await;
         assert!(
             served.starts_with("HTTP/1.1 200"),
             "case {case}: expected {domain} to serve the origin's answer, got {served:?}"
@@ -722,8 +740,8 @@ fn renamed(create: &Create, name: &str) -> Create {
 /// control plane answers its own routes, so the edge claims only the names it minted.
 #[tokio::test]
 async fn an_address_no_distribution_published_serves_no_edge_traffic() {
-    let router = emulator();
-    let _ = published_domain(&router, "ref-published-other").await;
+    let (router, engine) = emulator_with_engine();
+    let _ = published_domain(&router, &engine, "ref-published-other").await;
     let answer = call(
         &router,
         "GET",

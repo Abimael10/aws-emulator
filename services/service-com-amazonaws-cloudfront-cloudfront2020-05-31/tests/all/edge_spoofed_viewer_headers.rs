@@ -56,7 +56,7 @@ use serde_json::Value;
 
 use crate::distribution_lifecycle::API_VERSION;
 use crate::edge_lambda_url_origin::{
-    element, header_names, viewer_ip, Answered, Topology, ALL_VIEWER_AND_CLOUDFRONT,
+    element, header_names, viewer_ip, Answered, Edge, Topology, ALL_VIEWER_AND_CLOUDFRONT,
     ALL_VIEWER_EXCEPT_HOST, MISS, OPEN_PATH, ORIGIN_MARKER,
 };
 // `X-Cache` for an answer the edge cache held, beside the `MISS` the origin produced: the one
@@ -136,8 +136,8 @@ fn config_xml(
     )
 }
 
-/// One deployed distribution over `origin` carrying those two policies: the `DomainName` a
-/// viewer dials.
+/// One deployed distribution over `origin` carrying those two policies: where a viewer
+/// reaches its edge ([`Edge`]).
 async fn deployed(
     topology: &Topology,
     case: &str,
@@ -145,15 +145,15 @@ async fn deployed(
     origin: &str,
     cache_policy: &str,
     origin_request_policy: &str,
-) -> String {
-    let (id, _arn, domain) = topology
+) -> Edge {
+    let (id, _arn, edge) = topology
         .created_distribution(
             case,
             &config_xml(caller_reference, origin, cache_policy, origin_request_policy),
         )
         .await;
     topology.awaited_deployment(case, &id).await;
-    domain
+    edge
 }
 
 /// The `CloudFront-*` header names the origin was handed.

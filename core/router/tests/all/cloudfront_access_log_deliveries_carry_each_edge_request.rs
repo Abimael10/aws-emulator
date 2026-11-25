@@ -137,6 +137,10 @@ pub(crate) struct Pipeline {
     /// way rather than standing one up again.
     pub(crate) viewers: MultiServiceRouter,
     pub(crate) domain: String,
+    /// The `host:port` the published name resolves to for a client on this machine — the
+    /// address this emulator opened for the distribution, which a viewer that DIALS a socket
+    /// opens its connection to. `None` where this engine vended no listener for it.
+    pub(crate) address: Option<String>,
     pub(crate) deliveries: Vec<Wired>,
 }
 
@@ -305,10 +309,12 @@ pub(crate) async fn wire(
     }
 
     wait_until_deployed(&setup, case, &id).await;
+    let address = crate::cloudfront_oac_s3_origin_edge::edge_listener_authority(&engine, &id);
     Pipeline {
         setup,
         viewers,
         domain,
+        address,
         deliveries,
     }
 }

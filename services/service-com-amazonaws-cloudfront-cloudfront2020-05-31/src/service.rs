@@ -215,10 +215,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             Some(key) => key == self.entry.identity().signing_name(),
             None => false,
         };
+        // A request in ABSOLUTE FORM names the server it addresses in its own target, and
+        // "when an origin server receives a request with an absolute-form of request-target,
+        // the server MUST ignore the received Host header field (if any) and instead use the
+        // host information of the request-target" (RFC 9112 section 3.2.2). A RELAYED request
+        // is where the two differ, and this service makes one: an ORIGIN FETCH names the
+        // origin in its target and carries the VIEWER's own `Host` wherever the matched
+        // behaviour's policies forward it (`edge::origin_request_host`). So a fetch of an
+        // origin served at this service's endpoint is claimed by the endpoint its target
+        // names, rather than refused because the name a viewer addressed resolves to no
+        // service.
+        let addresses_this_endpoint = parts
+            .uri
+            .authority()
+            .map(http::uri::Authority::as_str)
+            .and_then(::service_common::data_plane_addressing::service_named_by_host)
+            .is_some_and(|service| service == self.entry.identity().signing_name());
         // Beside it, a viewer request addressed to the edge domain of a distribution this
         // service HOLDS: no route key names that host, so without this the emulator
         // answers `404 UnknownService` for the hostname a distribution publishes.
-        control_plane || edge::claims_parts(&*self.edge.engine, parts)
+        control_plane || addresses_this_endpoint || edge::claims_parts(&*self.edge.engine, parts)
     }
 
     fn override_operation(

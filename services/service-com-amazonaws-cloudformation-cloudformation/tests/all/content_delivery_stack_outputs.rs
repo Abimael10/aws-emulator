@@ -63,16 +63,20 @@ fn is_cloudfront_id(value: &str) -> bool {
     })
 }
 
-/// Whether `value` is an address a viewer can DIAL the distribution on.
+/// Whether `value` is the DNS name CloudFront ASSIGNS a distribution.
 ///
 /// `Distribution$DomainName` is documented as "the domain name that corresponds to the
-/// distribution … such as `d111111abcdef8.cloudfront.net`", and what this emulator publishes
-/// for a distribution it really holds is the authority of the loopback listener its edge is
-/// served on — a name a client on this machine can reach, which a `cloudfront.net` label
-/// could not be. So the FORM asserted here is an authority: a host and a numeric port.
-fn is_reachable_authority(value: &str) -> bool {
-    value.rsplit_once(':').is_some_and(|(host, port)| {
-        !host.is_empty() && !port.is_empty() && port.chars().all(|c| c.is_ascii_digit())
+/// distribution … such as `d111111abcdef8.cloudfront.net`" — a domain NAME, so the member
+/// carries labels and nothing else: no address of this emulator, no port and no path. A client
+/// takes it as a host (a `Host` header, a TLS server name, a Route 53 alias target), and the
+/// emulator answers on the name it published rather than naming itself in the member. So the
+/// FORM asserted here is one label under CloudFront's own zone.
+fn is_assigned_edge_domain(value: &str) -> bool {
+    value.strip_suffix(".cloudfront.net").is_some_and(|label| {
+        !label.is_empty()
+            && label
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
     })
 }
 
@@ -309,15 +313,18 @@ fn cases() -> Vec<Case> {
                 ),
                 (
                     "DistributionDomainName",
-                    form("an address a viewer can dial", is_reachable_authority),
+                    form(
+                        "the DNS name CloudFront assigns (d<label>.cloudfront.net)",
+                        is_assigned_edge_domain,
+                    ),
                 ),
                 (
                     "DistributionUrl",
-                    form("https://<the published address>/index.html", |value| {
+                    form("https://<the published name>/index.html", |value| {
                         value
                             .strip_prefix("https://")
                             .and_then(|rest| rest.strip_suffix("/index.html"))
-                            .is_some_and(is_reachable_authority)
+                            .is_some_and(is_assigned_edge_domain)
                     }),
                 ),
                 (
@@ -439,11 +446,17 @@ fn cases() -> Vec<Case> {
                 ),
                 (
                     "FirstDomainName",
-                    form("an address a viewer can dial", is_reachable_authority),
+                    form(
+                        "the DNS name CloudFront assigns (d<label>.cloudfront.net)",
+                        is_assigned_edge_domain,
+                    ),
                 ),
                 (
                     "SecondDomainName",
-                    form("an address a viewer can dial", is_reachable_authority),
+                    form(
+                        "the DNS name CloudFront assigns (d<label>.cloudfront.net)",
+                        is_assigned_edge_domain,
+                    ),
                 ),
             ],
         },

@@ -44,6 +44,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // The awsQuery form encoder and the XML element readers this test crate writes ONCE
 // (`tests/all/query_wire.rs`): "Nothing new should write another one — call this module."
+use super::cloudfront_oac_s3_origin_edge::{edge_listener_authority, is_assigned_edge_domain};
 use super::query_wire::{elements, form_encode, opt_element, outputs_of};
 
 /// The Region every call here is signed for, and so the Region the stack's resources belong
@@ -87,7 +88,7 @@ const ANSWER_WITHIN: Duration = Duration::from_secs(30);
 /// suite here: a setup call carries a credential scope (which is what routes it and what
 /// names the Region) without a computed signature, and a VIEWER carries no credential at
 /// all, as a client of a distribution sends none.
-fn build_router() -> MultiServiceRouter {
+fn build_router() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -102,9 +103,9 @@ fn build_router() -> MultiServiceRouter {
         )),
     );
     router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
-        engine,
+        Arc::clone(&engine),
     ));
-    router
+    (router, engine)
 }
 
 /// A SigV4 `Authorization` header whose credential scope names `service` in [`REGION`],
@@ -279,7 +280,7 @@ impl Served {
 /// published authority — the address under test is one of this emulator's own listeners,
 /// which the caller has already held it to — so nothing here opens a connection anywhere
 /// else.
-async fn dial(case: &str, authority: &str, path: &str) -> Served {
+async fn dial(case: &str, authority: &str, host: &str, path: &str) -> Served {
     let port = authority
         .parse::<SocketAddr>()
         .unwrap_or_else(|error| {
@@ -298,7 +299,7 @@ async fn dial(case: &str, authority: &str, path: &str) -> Served {
         panic!("case {case:?}: the published address {authority:?} refused a connection: {error}")
     });
     let request =
-        format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .await
@@ -561,22 +562,21 @@ fn yaml_template(row: &Row) -> String {
     .join("\n")
 }
 
-/// Whether `value` is an address a client on this machine can DIAL: the `host:port` of one
-/// of this emulator's own listeners, which is what [`SocketAddr`] parses and what [`dial`]
-/// then opens a connection to.
+/// Whether `value` is the DNS name CloudFront ASSIGNS a distribution, which is what the
+/// `DomainName` the stack publishes carries — one label under CloudFront's own zone, and no
+/// address, port or path
+/// ([`crate::cloudfront_oac_s3_origin_edge::is_assigned_edge_domain`] is the whole rule).
 ///
-/// A name in CloudFront's production zone is not one — nothing on this machine resolves it,
-/// so a port of it cannot be dialled either — which is why the form asserted here is an
-/// ADDRESS rather than the example name the model documents. The check is the same one the
-/// viewer below needs, so a published value that fails the rule is reported by the
-/// assertion that states the rule instead of by the dial.
-fn is_an_address_this_emulator_serves(value: &str) -> bool {
-    value.parse::<SocketAddr>().is_ok()
+/// A name in that zone resolves to nothing on this machine, so the viewer below dials the
+/// address this emulator opened for the distribution and carries the published name as the host
+/// it addressed — which is what a client that resolved the name sends.
+fn is_the_assigned_domain_name(value: &str) -> bool {
+    is_assigned_edge_domain(value)
 }
 
 #[tokio::test]
 async fn a_deployed_distribution_is_reached_at_the_domain_name_its_stack_published() {
-    let router = build_router();
+    let (router, engine) = build_router();
 
     for row in ROWS {
         let case = row.case;
@@ -628,13 +628,13 @@ async fn a_deployed_distribution_is_reached_at_the_domain_name_its_stack_publish
              {bucket:?}"
         );
 
-        // The published address is one a client can DIAL, and it is the one the OWNING
+        // The published name is the one CloudFront ASSIGNS, and it is the one the OWNING
         // service holds for this distribution: a stack publishes what CloudFront assigned,
         // not a second value of its own.
         assert!(
-            is_an_address_this_emulator_serves(&domain),
-            "case {case:?}: expected the DomainName output to be an address this emulator \
-             itself answers on, which a viewer can dial, got {domain:?}"
+            is_the_assigned_domain_name(&domain),
+            "case {case:?}: expected the DomainName output to be the DNS name CloudFront \
+             assigns a distribution (d<label>.cloudfront.net), got {domain:?}"
         );
         let distribution = wait_until_deployed(&router, case, &distribution_id).await;
         assert_eq!(
@@ -660,8 +660,15 @@ async fn a_deployed_distribution_is_reached_at_the_domain_name_its_stack_publish
             row.key
         );
 
-        // The viewer: a socket to the address the stack published, and one HTTP/1.1 GET.
-        let served = dial(case, &domain, &format!("/{}", row.key)).await;
+        // The viewer: a socket to the address the published name resolves to, carrying that
+        // name as the host it addressed, and one HTTP/1.1 GET.
+        let address = edge_listener_authority(&engine, &distribution_id).unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: this emulator opened no address for the distribution \
+                 {distribution_id}"
+            )
+        });
+        let served = dial(case, &address, &domain, &format!("/{}", row.key)).await;
         match row.expected {
             Expected::TheObject => {
                 assert_eq!(

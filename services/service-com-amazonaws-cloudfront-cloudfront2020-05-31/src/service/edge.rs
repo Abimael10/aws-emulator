@@ -749,13 +749,10 @@ fn resolve<'s, 'r>(
 /// distribution reports no domain of its own and so is served on none: its viewers reach
 /// it through a connection group's routing endpoint.
 ///
-/// The `DomainName` is compared against the host AS ADDRESSED first, because the name a
-/// distribution publishes is the address of the listener its edge is served on
-/// (`crate::state::EdgeEndpoint`) and that address names a PORT: two distributions differ in
-/// exactly that port, so a comparison that dropped it would resolve every one of them to
-/// whichever the store lists first. A published name that carries no port — the name
-/// CloudFront's own zone would give it — matches the host without its port, which is what a
-/// client that resolves such a name sends.
+/// The `DomainName` is compared against the host AS ADDRESSED first and then without its
+/// port: the name CloudFront assigns carries none — it is a domain name — so a viewer
+/// addresses it with whatever port its own client dialled, and a value that does carry one
+/// still names the distribution it belongs to.
 ///
 /// An alias is only read when it is a name a VIEWER could be sent to: the alternate domain
 /// names are caller-supplied and unverifiable here, so one spelled like another service's
@@ -763,7 +760,12 @@ fn resolve<'s, 'r>(
 /// client on this machine dials ([`addressable_alias`]). The domain CloudFront itself
 /// assigned is never such a name, and a distribution whose alias is one is still reachable
 /// through the reserved data-plane path.
-fn serves_host(distribution: &StoredDistribution, host: &str) -> bool {
+///
+/// `pub(crate)` for the listeners this service opens
+/// ([`crate::state::edge_endpoint`]): a viewer that dials one of them states the name the
+/// distribution published as the host it addressed, so what that address admits is decided by
+/// this one rule rather than by a second reading of it.
+pub(crate) fn serves_host(distribution: &StoredDistribution, host: &str) -> bool {
     if same_domain(&distribution.domain_name, host) {
         return true;
     }

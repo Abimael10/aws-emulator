@@ -2,27 +2,27 @@
 
 //! The CloudFront edge, and the `AWS/CloudFront` series it fills, driven against the emulator
 //! a customer STARTS: the built binary, on its own port, with request authentication on, every
-//! control-plane call signed over TLS and the viewer request made by DIALLING the address the
-//! distribution published.
+//! control-plane call signed over TLS and the viewer request made by a client holding nothing
+//! but the name the distribution published.
 //!
-//! RULE: **the value a distribution publishes as `Distribution$DomainName` is an address the
-//! client that read it can dial; once the distribution reports `Deployed`, a viewer request
-//! dialled there is answered out of the distribution's own origin (the object's bytes for a key
-//! the origin holds, the origin's own refusal for one it does not), and every answer served
-//! there is counted into THAT distribution's `AWS/CloudFront` series, dimensioned
-//! `DistributionId` beside `Region=Global`, with the DEFAULT series published for every
-//! distribution and the ADDITIONAL ones (the cache hit rate, the origin latency and the
-//! per-status-code error rates) published and listed exactly while that distribution's
-//! monitoring subscription carries `RealtimeMetricsSubscriptionStatus` `Enabled`.**
+//! RULE: **the value a distribution publishes as `Distribution$DomainName` is the DNS name
+//! CloudFront assigns it, and this emulator ANSWERS on that name; once the distribution reports
+//! `Deployed`, a viewer request carrying it is answered out of the distribution's own origin
+//! (the object's bytes for a key the origin holds, the origin's own refusal for one it does
+//! not), and every answer served there is counted into THAT distribution's `AWS/CloudFront`
+//! series, dimensioned `DistributionId` beside `Region=Global`, with the DEFAULT series
+//! published for every distribution and the ADDITIONAL ones (the cache hit rate, the origin
+//! latency and the per-status-code error rates) published and listed exactly while that
+//! distribution's monitoring subscription carries `RealtimeMetricsSubscriptionStatus`
+//! `Enabled`.**
 //!
-//! The address a distribution created THROUGH a started emulator publishes is that emulator's
-//! own endpoint, with the distribution named in the reserved data-plane path beneath it: the
-//! endpoint is the one address a client of that process has, and the whole surface is served
-//! there. The core terminates TLS on it, as it does on every endpoint this emulator publishes,
-//! so the viewer rows below dial it over `https`; the plaintext half of an address belongs to a
-//! per-resource listener, which is what a distribution publishes when there is no endpoint of
-//! this emulator to name, and both halves of one are pinned by
-//! [`crate::cloudfront_dialled_edge_scheme_publishes_its_series`].
+//! A name under CloudFront's own zone is resolved by DNS, which a client of this started
+//! emulator cannot ask of the host it runs on: so the viewer rows below reach the endpoint they
+//! already hold — the one the control-plane calls go to — and carry the published NAME in the
+//! first path segment, the addressing the edge reads for a client that cannot carry it in the
+//! host. The core terminates TLS on that endpoint, as it does on every endpoint this emulator
+//! publishes, so the rows dial it over `https`; the plaintext half of a per-resource listener's
+//! address is pinned by [`crate::cloudfront_dialled_edge_scheme_publishes_its_series`].
 //!
 //! The sibling suites pin that rule on a router a test assembles in its own process
 //! ([`crate::cloudfront_dialled_edge_scheme_publishes_its_series`], whose vocabulary for a
@@ -64,7 +64,7 @@ use crate::cloudfront_dialled_edge_scheme_publishes_its_series::{
 };
 use crate::cloudfront_edge_metrics_drive_the_alarm_chain::now_secs;
 use crate::cloudfront_oac_s3_origin_edge::{
-    policy, API_VERSION, CLOUDFRONT_PRINCIPAL, REGION,
+    is_assigned_edge_domain, policy, API_VERSION, CLOUDFRONT_PRINCIPAL, REGION,
 };
 use crate::query_wire::element;
 
@@ -150,33 +150,22 @@ fn cloudwatch(started: &Started, case: &str, operation: &str, body: &Value) -> V
     serde_json::from_str(&text).unwrap_or(Value::Null)
 }
 
-/// Whether `domain` is the address the client that read it reaches this emulator at: the HOST
-/// of the endpoint it is served on, with the distribution named in the reserved data-plane path
-/// beneath it — what a distribution created through a request to that endpoint publishes. A
-/// domain name states no port, so the host is held to being the one the endpoint this suite
-/// started answers on and the port a viewer dials is that endpoint's own
-/// ([`viewer_authority`]).
-fn is_the_served_endpoints_host(started: &Started, domain: &str) -> bool {
-    let Some((host, path)) = domain.split_once('/') else {
-        return false;
-    };
-    let served_host = started
-        .authority()
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    host == served_host && path.starts_with("_aws/cloudfront/")
+/// Whether `domain` is the DNS name CloudFront assigns a distribution, which is what the
+/// published member carries whatever address the create was reached at
+/// ([`crate::cloudfront_oac_s3_origin_edge::is_assigned_edge_domain`]).
+fn is_the_assigned_domain_name(domain: &str) -> bool {
+    is_assigned_edge_domain(domain)
 }
 
-/// The authority a viewer DIALS the published `domain` at, and the path it asks `key` for: a
-/// domain name carries no port, so the port is the one of the endpoint this client reached the
-/// emulator on, and the path the published name carries names the distribution.
+/// The authority a viewer DIALS to reach the published `domain`, and the path it asks `key`
+/// for.
+///
+/// A domain name is resolved by DNS, which a client of this started emulator cannot ask of the
+/// host it runs on: so the viewer dials the endpoint it already reached the emulator at and
+/// carries the published NAME in the first path segment, which is the addressing the edge reads
+/// for a client that cannot carry it in the host.
 fn viewer_authority(started: &Started, domain: &str) -> (String, String) {
-    match domain.split_once('/') {
-        Some((_host, path)) => (started.authority(), format!("/{path}")),
-        None => (domain.to_string(), String::new()),
-    }
+    (started.authority(), format!("/{domain}"))
 }
 
 /// One viewer request made by DIALLING the address the distribution published — at the endpoint
@@ -469,13 +458,12 @@ fn the_started_emulators_published_edge_serves_and_fills_its_series() {
     for (row, (id, domain, _arn)) in table.iter().zip(subjects.iter()) {
         let case = row.case;
         awaited_deployment(&started, case, id);
-        // The published name names the HOST of the endpoint this client reached the emulator
-        // on, with the distribution in the reserved path, which is what the rows below dial.
+        // The published name is the DNS name CloudFront assigns a distribution, which the
+        // rows below carry in the path of the endpoint this client reached the emulator on.
         assert!(
-            is_the_served_endpoints_host(&started, domain),
-            "case {case:?}: expected the published address to name the host of the endpoint \
-             this emulator is served on ({}), got {domain:?}",
-            started.authority()
+            is_the_assigned_domain_name(domain),
+            "case {case:?}: expected the DNS name CloudFront assigns a distribution \
+             (d<label>.cloudfront.net), got {domain:?}"
         );
         if row.subscribed {
             subscribe(&started, case, id);

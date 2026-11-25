@@ -50,6 +50,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::service::edge_metrics;
 
 use crate::cloudfront_dialled_edge_address_over_a_private_s3_origin::is_dialable;
+use crate::cloudfront_oac_s3_origin_edge::{edge_listener_authority, is_assigned_edge_domain};
 use crate::cloudfront_edge_metrics_drive_the_alarm_chain::{emulator, now_secs};
 use crate::cloudfront_oac_s3_origin_edge::{
     awaited_deployment, call, create_bucket, create_distribution, create_origin_access_control,
@@ -338,26 +339,39 @@ fn rows() -> [Row; 4] {
     ]
 }
 
-/// One viewer request made by DIALLING `authority` over `scheme`, with no credential of any
-/// kind — a stock client fetching the name the distribution published.
+/// One viewer request made by DIALLING the address the published name `domain` resolves to,
+/// over `scheme`, with no credential of any kind — a stock client fetching the name the
+/// distribution published.
+///
+/// The client is TOLD where that name resolves (`address`, the port this emulator opened for
+/// the distribution, on the loopback interface its listeners are bound on) rather than asked to
+/// look it up, which is the one thing a test cannot ask of the host it runs on; the URL, the
+/// TLS handshake and the request all carry the published name.
 ///
 /// The exchange runs on a blocking thread, so the listener it addresses — a task of this same
 /// runtime — is served while the call waits for the answer. The client verifies no certificate,
 /// which is what a client of a local emulator does for an address it signed itself. It is built
 /// and dropped INSIDE that blocking thread: a blocking client owns a runtime of its own, and
 /// dropping one from an asynchronous context panics, so it cannot be hoisted out of here.
-async fn dial(case: &str, scheme: &str, authority: &str, key: &str) -> Served {
-    let url = format!("{scheme}://{authority}/{key}");
+async fn dial(case: &str, scheme: &str, address: &str, domain: &str, key: &str) -> Served {
+    let url = format!("{scheme}://{domain}/{key}");
     let named = case.to_string();
     let dialled = url.clone();
+    let port = address
+        .parse::<::std::net::SocketAddr>()
+        .unwrap_or_else(|error| panic!("case {case:?}: {address} is no address: {error}"))
+        .port();
+    let resolved = ::std::net::SocketAddr::from((::std::net::Ipv4Addr::LOCALHOST, port));
+    let host = domain.to_string();
     ::tokio::task::spawn_blocking(move || {
         let client = ::reqwest::blocking::Client::builder()
             .danger_accept_invalid_certs(true)
+            .resolve(&host, resolved)
             .timeout(DIAL_DEADLINE)
             .build()
             .expect("a client");
         let answered = client.get(&dialled).send().unwrap_or_else(|error| {
-            panic!("case {named:?}: the published address {dialled} answered nothing: {error}")
+            panic!("case {named:?}: the published name {dialled} answered nothing: {error}")
         });
         let status = answered.status().as_u16();
         let x_cache = answered
@@ -569,9 +583,17 @@ async fn a_viewer_dialling_either_half_of_the_published_address_fills_the_series
         let case = row.case;
         awaited_deployment(&setup, case, id).await;
         assert!(
-            is_dialable(domain),
-            "case {case:?}: expected a published address a viewer on this machine can dial, got \
-             {domain:?}"
+            is_assigned_edge_domain(domain),
+            "case {case:?}: expected the DNS name CloudFront assigns a distribution \
+             (d<label>.cloudfront.net), got {domain:?}"
+        );
+        let address = edge_listener_authority(&engine, id).unwrap_or_else(|| {
+            panic!("case {case:?}: this emulator opened no address for the distribution {id}")
+        });
+        assert!(
+            is_dialable(&address),
+            "case {case:?}: expected an address a viewer on this machine can dial for \
+             {domain:?}, got {address:?}"
         );
         if row.subscribed {
             subscribe(&setup, case, id).await;
@@ -580,7 +602,7 @@ async fn a_viewer_dialling_either_half_of_the_published_address_fills_the_series
         let at = now_secs();
         let mut tally = Tally::default();
         for request in driven() {
-            let served = dial(case, row.scheme, domain, request.key).await;
+            let served = dial(case, row.scheme, &address, domain, request.key).await;
             assert_eq!(
                 served.status, request.status,
                 "case {case:?} ({}): expected the dialled address to answer {}, got {served:?}",

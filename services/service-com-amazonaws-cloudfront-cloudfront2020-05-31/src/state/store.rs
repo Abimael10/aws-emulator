@@ -1463,7 +1463,7 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         config: DistributionConfig,
         tags: TagSet,
         now: SystemTime,
-        edge_address: Option<EdgeAddress>,
+        edge_endpoint: Option<EdgeEndpoint>,
     ) -> Result<CreatedDistribution, CreateRefusal> {
         // "The value of Quantity and the size of Items don't match", and then the published
         // per-list quotas: the refusals a configuration carries BY ITSELF, read through the
@@ -1626,17 +1626,13 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         }
 
         let id = self.allocate_distribution_id();
-        // The domain name a VIEWER is handed: an address this emulator ANSWERS at, so a
-        // client that dials what it was told reaches this distribution — the endpoint the
-        // create was reached at with this distribution named in the reserved data-plane path,
-        // or the address of a listener of its own ([`EdgeAddress`]). A distribution with no
-        // address of this emulator to publish — a multi-tenant one, which reports no domain at
-        // all, and a create on an engine that is served nowhere and vends no listeners —
-        // carries the name CloudFront's own zone would give it.
-        let domain_name = match &edge_address {
-            Some(address) => address.published_domain_name(&id),
-            None => self.allocate_domain_name(),
-        };
+        // The domain name a VIEWER is handed: the DNS name CloudFront assigns the
+        // distribution — a generated label under `cloudfront.net` — which is what the member
+        // carries and all it carries, no address of this emulator's own, no port and no path.
+        // The emulator ANSWERS on that name rather than naming itself in it
+        // ([`crate::state::edge_endpoint`]), and a multi-tenant distribution reports no domain
+        // of its own at all ([`StoredDistribution::reported_domain_name`]).
+        let domain_name = self.allocate_domain_name();
         let etag = self.next_etag();
         let stored = StoredDistribution {
             arn: distribution_arn(&id),
@@ -1674,8 +1670,9 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         self.caller_references.insert(caller_reference, id.clone());
         // A listener this distribution was given now has a distribution to serve, and its
         // handle is held for as long as that distribution is: dropping it closes the port. A
-        // distribution published on the emulator's own endpoint holds no socket at all.
-        if let Some(EdgeAddress::Listener(endpoint)) = edge_address {
+        // distribution created through the emulator's own endpoint holds no socket at all —
+        // the edge is served at that endpoint, under the name the distribution published.
+        if let Some(endpoint) = edge_endpoint {
             endpoint.serves(&id);
             self.edge_endpoints.insert(id.clone(), endpoint);
         }
@@ -2215,16 +2212,41 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         )
     }
 
+    /// The `host:port` the listener this distribution's edge was given answers on, or `None`
+    /// for a distribution that was given none — one created through the emulator's own
+    /// endpoint, where the whole surface including the edge is already served.
+    ///
+    /// NOT what the distribution publishes: `Distribution$DomainName` is the DNS name
+    /// CloudFront assigns it ([`Self::allocate_domain_name`]), which is what every read of the
+    /// distribution reports and what the edge resolves a viewer request by. This is the
+    /// address of this emulator a client with no other address of it can DIAL, where a request
+    /// addressed to the published name arrives ([`crate::state::edge_endpoint`]), and no
+    /// modelled member carries it.
+    pub fn edge_listener_authority(&self, distribution_id: &str) -> Option<&str> {
+        self.edge_endpoints
+            .get(distribution_id)
+            .map(EdgeEndpoint::authority)
+    }
+
     /// Allocate the domain name a distribution is served on: a generated label under
     /// `cloudfront.net`, in the lowercase DNS labels take.
+    ///
+    /// The one derivation of that name, for every distribution this store mints: the member
+    /// carries the name CloudFront ASSIGNS, so it never names an address of this emulator
+    /// (see [`crate::state::edge_endpoint`] for what makes the name reach it).
     ///
     /// What a distribution REPORTS is [`StoredDistribution::reported_domain_name`]: a
     /// multi-tenant distribution has no domain of its own, so it reports the placeholder
     /// instead of the label allocated here.
     ///
     /// A connection group's `RoutingEndpoint` is "also known as the DNS name ... such as
-    /// `d111111abcdef8.cloudfront.net`" — the same generated name in the same shape, so it
-    /// is drawn from here too rather than from a second rendering of the mint.
+    /// `d111111abcdef8.cloudfront.net`" — the same generated name in the same shape, so a group
+    /// that is given no address of its own takes its endpoint from here rather than from a
+    /// second rendering of the mint. A group this emulator opened a listener for publishes that
+    /// listener's `host:port` instead ([`Self::minted_routing_endpoint`]): a viewer reaches a
+    /// TENANT by the domain IT addressed, so the group's own member is the address that viewer
+    /// dials, which is a reading of `RoutingEndpoint` the open issue
+    /// `20261117T114529Z-acm-cloudfront-s3` owns rather than this one.
     pub fn allocate_domain_name(&mut self) -> String {
         let label = self.mint(ID_BODY_LEN).to_lowercase();
         format!("d{label}{CLOUDFRONT_DOMAIN_SUFFIX}")

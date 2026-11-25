@@ -248,9 +248,9 @@ async fn deployed(
          <Enabled>true</Enabled>\
          </DistributionConfig>"
     );
-    let (id, _arn, domain) = topology.created_distribution(case, &config).await;
+    let (id, _arn, edge) = topology.created_distribution(case, &config).await;
     topology.awaited_deployment(case, &id).await;
-    domain
+    edge.domain
 }
 
 /// The origin's own report out of one answer the edge served, decoded under the coding the

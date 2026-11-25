@@ -24,7 +24,8 @@ use bytes::Bytes;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::distribution_lifecycle::{
-    awaited_deployment, create_distribution, emulator, API_VERSION, HOST,
+    awaited_deployment, create_distribution, edge_listener_authority, emulator,
+    emulator_with_engine, API_VERSION, HOST,
 };
 use crate::response_headers_policy_lifecycle::{
     create_policy as create_response_headers_policy, Policy as ResponseHeadersPolicy, ServerTiming,
@@ -128,7 +129,9 @@ pub(crate) async fn timing_policy(
 }
 
 /// Create one distribution attaching `response_headers_policy` under the cache policy
-/// `cache_policy`, let the clock deploy it, and report the domain name a viewer addresses.
+/// `cache_policy`, let the clock deploy it, and report the `(DomainName, id)` of it: the name a
+/// viewer addresses, and the id the address a viewer DIALS that name at is read by
+/// ([`edge_listener_authority`]).
 ///
 /// `pub(crate)` so a sibling suite drives the same configuration rather than copying it.
 pub(crate) async fn deployed(
@@ -136,7 +139,7 @@ pub(crate) async fn deployed(
     reference: &str,
     cache_policy: &str,
     response_headers_policy: &str,
-) -> String {
+) -> (String, String) {
     let config = format!(
         "<DistributionConfig xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
          <CallerReference>{reference}</CallerReference>\
@@ -172,7 +175,7 @@ pub(crate) async fn deployed(
         .expect("the created distribution reports a domain name")
         .to_string();
     awaited_deployment(router, reference, &id).await;
-    domain
+    (domain, id)
 }
 
 /// The metric names one `Server-Timing` value carries, in the order it lists them: each member
@@ -225,7 +228,7 @@ async fn an_enabled_group_adds_the_metrics_of_the_exchange() {
         }),
     )
     .await;
-    let domain = deployed(&router, "timing-every", CACHING_DISABLED, &policy).await;
+    let (domain, _id) = deployed(&router, "timing-every", CACHING_DISABLED, &policy).await;
 
     // Several requests, because "every response" is the rule: each one carries the header, and
     // each one carries its OWN request id.
@@ -304,7 +307,7 @@ async fn the_cache_metric_reports_what_the_edge_cache_did() {
         }),
     )
     .await;
-    let domain = deployed(&router, "timing-cache", CACHING_OPTIMIZED, &policy).await;
+    let (domain, _id) = deployed(&router, "timing-cache", CACHING_OPTIMIZED, &policy).await;
 
     // (case, which request this is, the metric it must carry, the X-Cache it must report).
     let first = view(&router, &domain, "GET", SERVED_PATH).await;
@@ -350,7 +353,7 @@ async fn the_cache_metric_reports_what_the_edge_cache_did() {
 /// through the router.
 #[tokio::test]
 async fn the_published_address_serves_the_header_to_a_viewer_that_dials_it() {
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
     let policy = timing_policy(
         &router,
         "timing-dialled",
@@ -360,9 +363,11 @@ async fn the_published_address_serves_the_header_to_a_viewer_that_dials_it() {
         }),
     )
     .await;
-    let domain = deployed(&router, "timing-dialled", CACHING_DISABLED, &policy).await;
+    let (domain, id) = deployed(&router, "timing-dialled", CACHING_DISABLED, &policy).await;
+    let address = edge_listener_authority(&engine, "timing-dialled", &id);
 
-    let raw = crate::published_edge_address::dial(&domain, "GET", SERVED_PATH).await;
+    let raw =
+        crate::published_edge_address::dial_as(&address, "GET", SERVED_PATH, &domain).await;
     let lowercase = raw.to_ascii_lowercase();
     assert!(
         lowercase.contains("server-timing:"),
@@ -382,7 +387,7 @@ async fn the_published_address_serves_the_header_to_a_viewer_that_dials_it() {
 /// runtime — is served while this call waits for the answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_published_address_serves_the_header_over_tls() {
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
     let policy = timing_policy(
         &router,
         "timing-tls",
@@ -392,12 +397,22 @@ async fn the_published_address_serves_the_header_over_tls() {
         }),
     )
     .await;
-    let domain = deployed(&router, "timing-tls", CACHING_DISABLED, &policy).await;
+    let (domain, id) = deployed(&router, "timing-tls", CACHING_DISABLED, &policy).await;
+    let address = edge_listener_authority(&engine, "timing-tls", &id);
     let url = format!("https://{domain}{SERVED_PATH}");
+    // The client is TOLD where the published name resolves — the address this emulator opened
+    // for that distribution — rather than asked to look it up.
+    let port = address
+        .parse::<::std::net::SocketAddr>()
+        .unwrap_or_else(|error| panic!("the address {address} is no address: {error}"))
+        .port();
+    let resolved = ::std::net::SocketAddr::from((::std::net::Ipv4Addr::LOCALHOST, port));
+    let host = domain.clone();
 
     let (status, timing) = ::tokio::task::spawn_blocking(move || {
         let client = ::reqwest::blocking::Client::builder()
             .danger_accept_invalid_certs(true)
+            .resolve(&host, resolved)
             // Generous: nothing here measures the wait, only what came back.
             .timeout(::std::time::Duration::from_secs(60))
             .build()
@@ -498,7 +513,7 @@ async fn the_sampling_rate_decides_which_responses_carry_the_header() {
 
     for (index, (case, timing, expected)) in rows.into_iter().enumerate() {
         let policy = timing_policy(&router, &format!("timing-rate-{index}"), timing).await;
-        let domain = deployed(
+        let (domain, _id) = deployed(
             &router,
             &format!("timing-rate-{index}"),
             CACHING_DISABLED,

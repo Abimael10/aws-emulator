@@ -42,6 +42,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::cloudfront_apigateway_origin_edge::{
     apigw, cloudfront, dispatch, member, view, Answer, API_VERSION, REGION, STAGE,
 };
+use super::cloudfront_oac_s3_origin_edge::{edge_listener_authority, is_assigned_edge_domain};
 
 /// The resource path of the api's one method, and the key the bucket's one object sits at.
 const ECHO_PATH: &str = "echo";
@@ -98,7 +99,7 @@ const DIAL_WITHIN: Duration = Duration::from_secs(30);
 /// in the other two services. Request authentication is off, so a setup call carries a
 /// credential scope (which is what routes it and names the Region) without a computed
 /// signature; a viewer carries no credential at all beyond the header a row asks about.
-fn emulator() -> MultiServiceRouter {
+fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -113,9 +114,23 @@ fn emulator() -> MultiServiceRouter {
         )),
     );
     router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
-        engine,
+        Arc::clone(&engine),
     ));
-    router
+    (router, engine)
+}
+
+/// Where a viewer reaches the distribution `id`: the `host:port` this emulator opened for its
+/// edge, which is what a client dials, with the name the distribution published — held to the
+/// one CloudFront assigns — stated as the host it addressed.
+fn dialled_edge(engine: &Arc<engine::InMemoryEngine>, case: &str, id: &str, domain: &str) -> String {
+    assert!(
+        is_assigned_edge_domain(domain),
+        "case {case:?}: expected the DNS name CloudFront assigns a distribution \
+         (d<label>.cloudfront.net), got {domain:?}"
+    );
+    edge_listener_authority(engine, id).unwrap_or_else(|| {
+        panic!("case {case:?}: this emulator opened no address for the distribution {id}")
+    })
 }
 
 /// Poll `GetDistribution` until CloudFront first reports the distribution `Deployed`, which is
@@ -411,13 +426,21 @@ impl Served {
     }
 }
 
-/// DIAL the address the distribution published and send one request of `method` for `path`
-/// carrying `headers`, exactly as a browser reaches a distribution: a client holding nothing
-/// but that address, speaking the protocol it answers rather than going through the router.
+/// DIAL the address the published name resolves to and send one request of `method` for `path`
+/// carrying `headers`, stating `host` as the host it addressed — exactly as a browser handed a
+/// domain name reaches a distribution: a client speaking the protocol that address answers
+/// rather than going through the router.
 ///
-/// The dial names the LOOPBACK interface explicitly and takes only the PORT from the published
+/// The dial names the LOOPBACK interface explicitly and takes only the PORT from the
 /// authority, so nothing here opens a connection anywhere else.
-async fn dial(case: &str, authority: &str, method: &str, path: &str, headers: &[(&str, &str)]) -> Served {
+async fn dial(
+    case: &str,
+    authority: &str,
+    host: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> Served {
     let port = authority
         .parse::<SocketAddr>()
         .unwrap_or_else(|error| {
@@ -441,7 +464,7 @@ async fn dial(case: &str, authority: &str, method: &str, path: &str, headers: &[
         .collect::<Vec<_>>()
         .join("");
     let request =
-        format!("{method} {path} HTTP/1.1\r\nHost: {authority}\r\n{stated}Connection: close\r\n\r\n");
+        format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\n{stated}Connection: close\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .await
@@ -555,7 +578,7 @@ fn rows() -> Vec<Row> {
 /// The first half of the rule, over the reflecting table.
 #[tokio::test]
 async fn the_origin_receives_every_header_the_behaviour_names_with_the_viewers_own_value() {
-    let router = emulator();
+    let (router, _engine) = emulator();
     let api = deployed_reflecting_api(&router).await;
     let origin_host = format!("{api}.execute-api.{REGION}.amazonaws.com");
 
@@ -714,7 +737,7 @@ async fn created_policies(
 /// one the EDGE generates, the viewer's credential that neither policy names).
 #[tokio::test]
 async fn the_origin_receives_every_header_either_policy_names_generated_ones_included() {
-    let router = emulator();
+    let (router, _engine) = emulator();
     let api = deployed_reflecting_api(&router).await;
     let origin_host = format!("{api}.execute-api.{REGION}.amazonaws.com");
     // The cache policy keys on a viewer header and on a header the edge generates; the origin
@@ -807,7 +830,7 @@ async fn the_origin_receives_every_header_either_policy_names_generated_ones_inc
 #[tokio::test]
 async fn a_preflight_is_answered_from_the_origin_only_where_the_behaviour_forwards_the_origin_header()
 {
-    let router = emulator();
+    let (router, engine) = emulator();
     let bucket = "cloudfront-preflight-origin";
     staged_bucket(&router, bucket).await;
     let origin_host = format!("{bucket}.s3.{REGION}.amazonaws.com");
@@ -838,9 +861,11 @@ async fn a_preflight_is_answered_from_the_origin_only_where_the_behaviour_forwar
         )
         .await;
         wait_until_deployed(&router, case, &id).await;
+        let address = dialled_edge(&engine, case, &id, &domain);
 
         let served = dial(
             case,
+            &address,
             &domain,
             "OPTIONS",
             &format!("/{OBJECT_KEY}"),
@@ -879,7 +904,7 @@ async fn a_preflight_is_answered_from_the_origin_only_where_the_behaviour_forwar
 
         // And the object itself is served to a viewer that asks for it, whatever the behaviour
         // forwards: withholding a header is not refusing the request.
-        let object = dial(case, &domain, "GET", &format!("/{OBJECT_KEY}"), &[]).await;
+        let object = dial(case, &address, &domain, "GET", &format!("/{OBJECT_KEY}"), &[]).await;
         assert_eq!(
             object.status, 200,
             "case {case:?}: expected the object through the edge, got {} with {:?}",

@@ -46,9 +46,10 @@ use smithy_server_runtime::MultiServiceRouter;
 // repeated: one reading of how a setup call, a viewer request and the wait for a deployed
 // distribution are made, so a change to the setup path is made once.
 use super::cloudfront_apigateway_origin_edge::{
-    apigw, authorization, cloudfront, dispatch, emulator, member, view, wait_until_deployed,
-    Answer, API_VERSION, POLL, POLLS, REGION, STAGE,
+    apigw, authorization, cloudfront, dispatch, emulator, emulator_with_engine, member, view,
+    wait_until_deployed, Answer, API_VERSION, POLL, POLLS, REGION, STAGE,
 };
+use super::cloudfront_oac_s3_origin_edge::{edge_listener_authority, is_assigned_edge_domain};
 
 /// The two resources the reflecting api carries: the one a viewer reaches through the
 /// behaviour that names an origin request policy, and the one it reaches through the default
@@ -1057,19 +1058,30 @@ async fn a_function_url_origin_is_told_the_country_and_the_scheme_the_viewer_dia
 /// measures the wait, only what came back.
 const DIAL_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Fetch `url` with a client of its own, over the scheme the URL names, carrying no
+/// Fetch the published name `domain` with a client of its own, over `scheme`, carrying no
 /// credential — a VIEWER handed the name a distribution published, speaking the protocol that
 /// address answers on rather than going through the router.
 ///
+/// The client is TOLD where that name resolves (`address`, the port this emulator opened for
+/// the distribution, on the loopback interface its listeners are bound on) rather than asked to
+/// look it up, which is the one thing a test cannot ask of the host it runs on.
+///
 /// The request runs on a blocking thread so the listener it addresses — a task of this same
 /// runtime — is served while this call waits for the answer.
-async fn dial(case: &str, url: String) -> (u16, String) {
+async fn dial(case: &str, address: &str, domain: &str, url: String) -> (u16, String) {
+    let port = address
+        .parse::<::std::net::SocketAddr>()
+        .unwrap_or_else(|error| panic!("case {case:?}: {address} is no address: {error}"))
+        .port();
+    let resolved = ::std::net::SocketAddr::from((::std::net::Ipv4Addr::LOCALHOST, port));
+    let host = domain.to_string();
     ::tokio::task::spawn_blocking(move || {
         let client = ::reqwest::blocking::Client::builder()
+            .resolve(&host, resolved)
             .timeout(DIAL_DEADLINE)
             .build()
             .expect("a client");
-        let answer = client.get(&url).send().expect("the published address answers");
+        let answer = client.get(&url).send().expect("the published name answers");
         let status = answer.status().as_u16();
         (status, answer.text().unwrap_or_default())
     })
@@ -1079,7 +1091,7 @@ async fn dial(case: &str, url: String) -> (u16, String) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_published_address_tells_the_origin_the_scheme_the_viewer_dialled() {
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
     let api = deployed_reflecting_api(&router).await;
     let case = "the address the distribution published";
     let policy = create_origin_request_policy(
@@ -1101,11 +1113,13 @@ async fn the_published_address_tells_the_origin_the_scheme_the_viewer_dialled() 
     .await;
     wait_until_deployed(&router, case, &id).await;
     assert!(
-        domain
-            .rsplit_once(':')
-            .is_some_and(|(host, port)| host == "127.0.0.1" && port.parse::<u16>().is_ok()),
-        "setup {case:?}: expected an address a client on this machine can dial, got {domain:?}"
+        is_assigned_edge_domain(&domain),
+        "setup {case:?}: expected the DNS name CloudFront assigns a distribution \
+         (d<label>.cloudfront.net), got {domain:?}"
     );
+    let address = edge_listener_authority(&engine, &id).unwrap_or_else(|| {
+        panic!("setup {case:?}: this emulator opened no address for the distribution {id}")
+    });
 
     // Dialled in the CLEAR, which is the half of the one published address a stock client
     // reaches without the certificate this emulator signed itself; the TLS half is what every
@@ -1118,7 +1132,7 @@ async fn the_published_address_tells_the_origin_the_scheme_the_viewer_dialled() 
     let scheme = "http";
     let mut resolved_country: Option<String> = None;
     for (case, path, generated) in rows.iter().copied() {
-        let (status, body) = dial(case, format!("{scheme}://{domain}{path}")).await;
+        let (status, body) = dial(case, &address, &domain, format!("{scheme}://{domain}{path}")).await;
         assert_eq!(
             status, 200,
             "case {case:?}: expected the published address to serve the origin's answer, got \

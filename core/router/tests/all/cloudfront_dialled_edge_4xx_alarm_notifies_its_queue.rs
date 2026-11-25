@@ -45,6 +45,7 @@
 //! (a `host:port` a client can dial), that `GetDistribution` reports the same one, and what it
 //! answers.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -52,6 +53,7 @@ use serde_json::Value;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cloudfront_dialled_edge_address_over_a_private_s3_origin::{dial, is_dialable};
+use crate::cloudfront_oac_s3_origin_edge::{edge_listener_authority, is_assigned_edge_domain};
 use crate::cloudfront_edge_metrics_drive_the_alarm_chain::{
     alarm_state, emulator, given_alarm, now_secs, reported_rate, ALARM_THRESHOLD, CHAIN_DEADLINE,
     REGION,
@@ -125,6 +127,8 @@ struct Prepared<'row> {
     row: &'row Row,
     id: String,
     domain: String,
+    /// The `host:port` the published name resolves to for a client on this machine.
+    address: String,
     alarm: String,
     queue: String,
 }
@@ -151,14 +155,16 @@ async fn published_domain(router: &MultiServiceRouter, case: &str, id: &str) -> 
     read.element("DomainName")
 }
 
-/// Create one distribution over the shared origin, holding the address it published to the one
-/// rule about it: a `host:port` a client on this machine can DIAL.
+/// Create one distribution over the shared origin, holding the name it published to the one
+/// rule about it — the DNS name CloudFront assigns a distribution — and answering
+/// `(Id, that name, the address a viewer dials it at)`.
 async fn subject(
     router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
     case: &str,
     caller_reference: &str,
     control: &str,
-) -> (String, String) {
+) -> (String, String, String) {
     let (id, domain, _arn) = create_distribution(
         router,
         case,
@@ -169,20 +175,27 @@ async fn subject(
     )
     .await;
     assert!(
-        is_dialable(&domain),
-        "case {case:?}: expected a host:port a viewer on this machine can dial as the published \
-         DomainName, got {domain:?}"
+        is_assigned_edge_domain(&domain),
+        "case {case:?}: expected the DNS name CloudFront assigns a distribution \
+         (d<label>.cloudfront.net) as the published DomainName, got {domain:?}"
     );
-    (id, domain)
+    let address = edge_listener_authority(engine, &id).unwrap_or_else(|| {
+        panic!("case {case:?}: this emulator opened no address for the distribution {id}")
+    });
+    assert!(
+        is_dialable(&address),
+        "case {case:?}: expected a host:port a viewer on this machine can dial, got {address:?}"
+    );
+    (id, domain, address)
 }
 
-/// Dial `domain` for every request of `row`'s burst and answer how many of those answers were
-/// in the 4xx class — read off the answers themselves, which is what the series is compared
-/// against.
-async fn dialled_burst(case: &str, domain: &str, row: &Row) -> usize {
+/// Dial the published name `domain`, at the `address` it resolves to, for every request of
+/// `row`'s burst and answer how many of those answers were in the 4xx class — read off the
+/// answers themselves, which is what the series is compared against.
+async fn dialled_burst(case: &str, address: &str, domain: &str, row: &Row) -> usize {
     let mut four_xx = 0;
     for request in 0..row.missing {
-        let served = dial(case, domain, &format!("/{MISSING_KEY}")).await;
+        let served = dial(case, address, domain, &format!("/{MISSING_KEY}")).await;
         assert!(
             (400..500).contains(&served.status),
             "case {case:?}: dialled request {request} for a key the origin does not hold must be \
@@ -193,7 +206,7 @@ async fn dialled_burst(case: &str, domain: &str, row: &Row) -> usize {
         four_xx += 1;
     }
     for request in 0..row.present {
-        let served = dial(case, domain, &format!("/{PRESENT_KEY}")).await;
+        let served = dial(case, address, domain, &format!("/{PRESENT_KEY}")).await;
         assert_eq!(
             served.status, 200,
             "case {case:?}: dialled request {request} for the key the origin holds must be \
@@ -261,8 +274,9 @@ async fn a_4xx_burst_dialled_at_the_published_address_fires_the_alarm_to_its_que
     // the clock owes them is waited out once for all of them.
     let mut prepared: Vec<Prepared<'_>> = Vec::new();
     for (index, row) in ROWS.iter().enumerate() {
-        let (id, domain) = subject(
+        let (id, domain, address) = subject(
             &router,
+            &engine,
             row.case,
             &format!("dialled-alarm-subject-{index}"),
             &control,
@@ -272,12 +286,13 @@ async fn a_4xx_burst_dialled_at_the_published_address_fires_the_alarm_to_its_que
             row,
             id,
             domain,
+            address,
             alarm: format!("dialled-edge-4xx-subject-{index}"),
             queue: String::new(),
         });
     }
-    let (quiet_id, quiet_domain) =
-        subject(&router, CONTROL_CASE, "dialled-alarm-control", &control).await;
+    let (quiet_id, quiet_domain, quiet_address) =
+        subject(&router, &engine, CONTROL_CASE, "dialled-alarm-control", &control).await;
     for row in &prepared {
         awaited_deployment(&router, row.row.case, &row.id).await;
     }
@@ -321,7 +336,7 @@ async fn a_4xx_burst_dialled_at_the_published_address_fires_the_alarm_to_its_que
         // The instant THIS row's burst is served at, which is what its own series is read
         // against.
         let at = now_secs();
-        let four_xx = dialled_burst(case, &row.domain, row.row).await;
+        let four_xx = dialled_burst(case, &row.address, &row.domain, row.row).await;
         let requests = row.row.missing + row.row.present;
 
         // What the edge counted is the share of the dialled burst that was answered 4xx.
@@ -375,8 +390,9 @@ async fn a_4xx_burst_dialled_at_the_published_address_fires_the_alarm_to_its_que
     // nothing did, so its series holds nothing. Read once every row's own chain has completed,
     // which is the evidence that the evaluation has run over this account's alarms.
     assert!(
-        is_dialable(&quiet_domain),
-        "case {CONTROL_CASE:?}: expected a dialable published DomainName, got {quiet_domain:?}"
+        is_dialable(&quiet_address),
+        "case {CONTROL_CASE:?}: expected a dialable address for the published name \
+         {quiet_domain:?}, got {quiet_address:?}"
     );
     let quiet_state = alarm_state(&router, CONTROL_CASE, quiet_alarm).await;
     assert_eq!(

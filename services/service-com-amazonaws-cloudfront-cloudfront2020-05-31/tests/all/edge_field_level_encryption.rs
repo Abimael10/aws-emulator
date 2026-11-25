@@ -747,7 +747,7 @@ async fn the_designated_fields_of_a_posted_form_reach_the_origin_as_ciphertext()
         },
     )
     .await;
-    let (id, _arn, domain) = topology
+    let (id, _arn, edge) = topology
         .created_distribution(
             case,
             &distribution_xml("fle-request-path", &origin, &config, &[]),
@@ -756,6 +756,11 @@ async fn the_designated_fields_of_a_posted_form_reach_the_origin_as_ciphertext()
     // A configuration that has not reached the edge locations serves no viewer, and the CLOCK
     // owes that propagation: the condition is polled for, never a span waited out.
     topology.awaited_deployment(case, &id).await;
+    let domain = edge.domain.clone();
+    // Where a viewer DIALS that name: the address this emulator opened for the distribution.
+    let address = edge.address.clone().unwrap_or_else(|| {
+        panic!("case {case:?}: this distribution was given no address of its own to dial")
+    });
 
     for row in BODIES {
         let pairs: Vec<(&str, &str)> = row
@@ -839,6 +844,7 @@ async fn the_designated_fields_of_a_posted_form_reach_the_origin_as_ciphertext()
     let plaintext = "4111111111111111";
     let (status, body) = dial_over_tls(
         case,
+        &address,
         format!("https://{domain}/post"),
         Some((
             FORM_MEDIA_TYPE,
@@ -956,7 +962,7 @@ async fn the_profile_selected_for_a_request_decides_which_of_its_fields_are_encr
         },
     )
     .await;
-    let (id, _arn, domain) = topology
+    let (id, _arn, edge) = topology
         .created_distribution(
             case,
             &distribution_xml(
@@ -971,6 +977,7 @@ async fn the_profile_selected_for_a_request_decides_which_of_its_fields_are_encr
         )
         .await;
     topology.awaited_deployment(case, &id).await;
+    let domain = edge.domain.clone();
 
     let body = form_body(&[
         ("secret_field", "4111111111111111"),

@@ -74,14 +74,15 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::EmulatedService;
 use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 
 use crate::distribution_lifecycle::{
-    is_served_edge_address, API_VERSION, AUTHORIZATION, HOST, POLL_INTERVAL, READY_DEADLINE,
+    edge_listener_address, is_assigned_edge_domain, API_VERSION, AUTHORIZATION, HOST,
+    POLL_INTERVAL, READY_DEADLINE,
 };
 use crate::edge_request_metrics::{cloudwatch, now_secs, window, PERIOD};
 use crate::edge_signed_access::{
     canned_policy, canned_query, create_key_group, custom_policy, custom_query, far_future,
     upload_public_key, Signer, CACHING_DISABLED,
 };
-use crate::published_edge_address::{dial, dial_with};
+use crate::published_edge_address::{dial_as, dial_with};
 
 /// The Region every setup call below is made in, and the Region CloudFront's own calls are
 /// signed for.
@@ -548,13 +549,14 @@ impl Topology {
         id
     }
 
-    /// One distribution from `config`: its `(Id, ARN, DomainName)`, with the domain held to
-    /// being an address a client on this machine can dial.
+    /// One distribution from `config`: its `(Id, ARN, edge)` — the published name held to the
+    /// DNS name CloudFront assigns a distribution, beside the address a viewer dials it at
+    /// ([`Edge`]).
     pub(crate) async fn created_distribution(
         &self,
         case: &str,
         config: &str,
-    ) -> (String, String, String) {
+    ) -> (String, String, Edge) {
         let (status, raw) = self
             .cloudfront(case, "POST", &format!("/{API_VERSION}/distribution"), Some(config))
             .await;
@@ -572,11 +574,31 @@ impl Topology {
             "setup {case}: the created distribution reports no Id or ARN: {raw}"
         );
         assert!(
-            is_served_edge_address(&domain),
-            "setup {case}: expected an address a viewer can reach this emulator at, got \
-             {domain:?}"
+            is_assigned_edge_domain(&domain),
+            "setup {case}: expected the DNS name CloudFront assigns a distribution \
+             (d<label>.cloudfront.net), got {domain:?}"
         );
-        (id, arn, domain)
+        let address = self.edge_address(&id);
+        (
+            id,
+            arn,
+            Edge {
+                domain,
+                address,
+            },
+        )
+    }
+
+    /// The `host:port` a viewer dials this distribution's edge at: the address this emulator
+    /// opened for it, read from the store the create wrote it to
+    /// ([`crate::distribution_lifecycle::edge_listener_address`]) — and `None` for a
+    /// distribution created through the emulator's own endpoint, where the edge is served at
+    /// that endpoint and no port of its own was opened.
+    ///
+    /// A viewer dials this and states the distribution's published `DomainName` as the host it
+    /// addressed, which is what a client handed a domain name does.
+    pub(crate) fn edge_address(&self, id: &str) -> Option<String> {
+        edge_listener_address(&self.engine, id)
     }
 
     /// Look again until `GetDistribution` reports `id` `Deployed` — a configuration that has
@@ -609,7 +631,7 @@ impl Topology {
     }
 
     /// One deployed distribution over the function URL `origin` with the behaviours
-    /// `behaviors` carries: the `DomainName` it published.
+    /// `behaviors` carries: where a viewer reaches its edge ([`Edge`]).
     ///
     /// `pub(crate)` so a sibling suite over the same topology stages its distribution the same
     /// way rather than writing a second configuration for it.
@@ -619,8 +641,8 @@ impl Topology {
         caller_reference: &str,
         origin: &str,
         behaviors: &str,
-    ) -> String {
-        let (id, _arn, domain) = self
+    ) -> Edge {
+        let (id, _arn, edge) = self
             .created_distribution(
                 case,
                 &config_xml(
@@ -633,7 +655,7 @@ impl Topology {
             )
             .await;
         self.awaited_deployment(case, &id).await;
-        domain
+        edge
     }
 }
 
@@ -693,6 +715,41 @@ fn trusted_behavior(key_group: &str) -> String {
 // Reading one answer off the connection
 // ---------------------------------------------------------------------------
 
+/// Where a viewer reaches one distribution's edge: the NAME the distribution published, which
+/// a client handed a domain name states as the host it addressed, and the `host:port` that name
+/// resolves to for a client on this machine — the address this emulator opened for that
+/// distribution.
+///
+/// Published as ONE value because a viewer needs both and they come from two places: the name
+/// from the create's own answer (`Distribution$DomainName`, a domain name), the address from
+/// the store the create wrote it to (no modelled member carries an address). It DISPLAYS as the
+/// name, which is what every message about a viewer request names it by.
+#[derive(Debug, Clone)]
+pub(crate) struct Edge {
+    /// The `DomainName` the distribution published.
+    pub(crate) domain: String,
+    /// The `host:port` a viewer dials that name at, where this emulator opened one for the
+    /// distribution. A distribution created through the emulator's OWN endpoint has none: the
+    /// edge is served at that endpoint, and a viewer reaches it there
+    /// ([`Answered::through`]).
+    pub(crate) address: Option<String>,
+}
+
+impl Edge {
+    /// The address a viewer dials this name at, which every dialling case needs.
+    fn dialled(&self, case: &str) -> &str {
+        self.address.as_deref().unwrap_or_else(|| {
+            panic!("case {case:?}: this distribution was given no address of its own to dial")
+        })
+    }
+}
+
+impl ::std::fmt::Display for Edge {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        formatter.write_str(&self.domain)
+    }
+}
+
 /// What one exchange on the published address observed.
 pub(crate) struct Answered {
     pub(crate) status: u16,
@@ -703,9 +760,11 @@ pub(crate) struct Answered {
 }
 
 impl Answered {
-    /// The answer of one viewer request to `domain`, dialled in the clear with no credential.
-    async fn of(case: &str, domain: &str, method: &str, path_and_query: &str) -> Self {
-        let raw = dial(domain, method, path_and_query).await;
+    /// The answer of one viewer request for the distribution `edge` publishes, dialled in the
+    /// clear with no credential: a client handed a domain name dials the address that name
+    /// resolves to and states the name as the host it addressed.
+    async fn of(case: &str, edge: &Edge, method: &str, path_and_query: &str) -> Self {
+        let raw = dial_as(edge.dialled(case), method, path_and_query, &edge.domain).await;
         Self::read(case, raw)
     }
 
@@ -713,40 +772,41 @@ impl Answered {
     /// browser that carries a header the edge reads about the connection it opened.
     pub(crate) async fn of_stating(
         case: &str,
-        domain: &str,
+        edge: &Edge,
         method: &str,
         path_and_query: &str,
         headers: &[(&str, &str)],
     ) -> Self {
-        let raw = dial_with(domain, method, path_and_query, domain, headers).await;
+        let raw = dial_with(
+            edge.dialled(case),
+            method,
+            path_and_query,
+            &edge.domain,
+            headers,
+        )
+        .await;
         Self::read(case, raw)
     }
 
-    /// [`Answered::of_stating`] for the address a distribution published on the emulator's
-    /// OWN endpoint — `{authority}/_aws/cloudfront/{id}`, which is what a distribution minted
-    /// by a request that reached that endpoint publishes.
+    /// [`Answered::of`] for a distribution created through the emulator's OWN endpoint, which
+    /// was given no address of its own: the whole surface — the edge among it — is served at
+    /// that endpoint, so a viewer handed the published name reaches it there.
     ///
-    /// A viewer composes `https://<DomainName>/<object>` and dials the authority it names,
-    /// which is this emulator's own front door: a suite DECLARES that endpoint without
-    /// binding a socket for it, so the composed request is sent through the front door in
-    /// process — the same request a client dialling that address would deliver there. A
-    /// published name that is a listener of this process is dialled over that socket as ever.
+    /// A suite DECLARES that endpoint without binding a socket for it, so the viewer's request
+    /// is sent through the front door in process, carrying the published name as the host it
+    /// addressed — the same request a client that resolved that name would deliver there.
     pub(crate) async fn through(
         router: &MultiServiceRouter,
         case: &str,
-        domain: &str,
+        edge: &Edge,
         method: &str,
         path_and_query: &str,
         headers: &[(&str, &str)],
     ) -> Self {
-        if !domain.contains('/') {
-            return Self::of_stating(case, domain, method, path_and_query, headers).await;
-        }
-        let (authority, path) = viewer_target(domain, path_and_query);
         let mut request = ::http::Request::builder()
             .method(method)
-            .uri(path)
-            .header("host", authority);
+            .uri(path_and_query)
+            .header("host", &edge.domain);
         for (name, value) in headers {
             request = request.header(*name, *value);
         }
@@ -895,7 +955,7 @@ async fn the_published_domain_serves_a_function_url_origin_and_gates_the_method(
     let case = "a function URL origin behind a published edge domain";
     let function = "cf-edge-method-gate";
     let origin = topology.public_function_url_host(case, function).await;
-    let domain = topology
+    let edge = topology
         .deployed_distribution(case, "edge-lambda-url-methods", &origin, "")
         .await;
 
@@ -939,7 +999,7 @@ async fn the_published_domain_serves_a_function_url_origin_and_gates_the_method(
     ];
     for row in rows {
         let before = topology.invocations(row.case, function).await;
-        let answered = Answered::of(row.case, &domain, row.method, OPEN_PATH).await;
+        let answered = Answered::of(row.case, &edge, row.method, OPEN_PATH).await;
         let after = topology.invocations(row.case, function).await;
         if !row.allowed {
             assert_eq!(
@@ -1039,7 +1099,7 @@ async fn a_trusted_key_group_decides_a_function_url_origin_at_the_published_doma
     let other = upload_public_key(&topology.router, "edge-lambda-url-stranger", &stranger).await;
     let (group, _etag) =
         create_key_group(&topology.router, "edge-lambda-url", &[key.as_str()]).await;
-    let domain = topology
+    let edge = topology
         .deployed_distribution(
             case,
             "edge-lambda-url-signed",
@@ -1047,12 +1107,13 @@ async fn a_trusted_key_group_decides_a_function_url_origin_at_the_published_doma
             &trusted_behavior(&group),
         )
         .await;
+    let domain = edge.domain.clone();
 
     // The baseline the signed rows are read against: the open behaviour, unsigned, served by
     // the function — and the address the EDGE observed for this viewer, as it reported it to
     // the origin.
     let baseline_case = "the unsigned open behaviour";
-    let baseline = Answered::of(baseline_case, &domain, "GET", OPEN_PATH).await;
+    let baseline = Answered::of(baseline_case, &edge, "GET", OPEN_PATH).await;
     assert_eq!(
         baseline.status, 200,
         "case {baseline_case:?}: expected the open behaviour to serve the function's answer, \
@@ -1145,7 +1206,7 @@ async fn a_trusted_key_group_decides_a_function_url_origin_at_the_published_doma
 
     for (case, path_and_query, expected) in rows {
         let before = topology.invocations(&case, function).await;
-        let answered = Answered::of(&case, &domain, "GET", &path_and_query).await;
+        let answered = Answered::of(&case, &edge, "GET", &path_and_query).await;
         let after = topology.invocations(&case, function).await;
         match expected {
             Expected::Served => {
@@ -1199,9 +1260,16 @@ async fn a_trusted_key_group_decides_a_function_url_origin_at_the_published_doma
 /// measures the wait, only what came back.
 const TLS_DIAL_DEADLINE: Duration = Duration::from_secs(30);
 
-/// One viewer that dials the published address with `https://`, as a client handed a
+/// One viewer that dials the published name with `https://`, as a client handed a
 /// distribution's `DomainName` does: a stock TLS client that does not verify this emulator's
 /// self-signed certificate. Answers the status and the body.
+///
+/// `url` is composed from the name the distribution PUBLISHED, and `address` is the
+/// `host:port` that name resolves to for a client on this machine — the address this emulator
+/// opened for that distribution — which the client is told rather than asked to look up: a
+/// name under CloudFront's own zone is resolved by DNS, which is the one thing a test cannot
+/// ask of the host it runs on. The dial itself, the TLS handshake and the request all carry
+/// the published name, so what is exercised is that name being served.
 ///
 /// `sending` is the `(content type, body)` a viewer that SUBMITS one carries, and `None` is a
 /// plain read.
@@ -1209,17 +1277,32 @@ const TLS_DIAL_DEADLINE: Duration = Duration::from_secs(30);
 /// The request runs on a blocking thread, so the listener it addresses — a task of this same
 /// runtime — is served while this call waits for the answer.
 ///
-/// `pub(crate)` so every suite whose viewer dials the published address over TLS uses this one
+/// `pub(crate)` so every suite whose viewer dials a published name over TLS uses this one
 /// client rather than carrying its own copy of it.
 pub(crate) async fn dial_over_tls(
     case: &str,
+    address: &str,
     url: String,
     sending: Option<(&str, String)>,
 ) -> (u16, String) {
     let sending = sending.map(|(content_type, body)| (content_type.to_string(), body));
+    // The port of the address this emulator opened, dialled on the loopback interface its
+    // listeners are bound on: nothing here opens a connection to anywhere else.
+    let port = address
+        .parse::<::std::net::SocketAddr>()
+        .unwrap_or_else(|error| panic!("case {case:?}: the address {address} is no address: {error}"))
+        .port();
+    let resolved = ::std::net::SocketAddr::from((::std::net::Ipv4Addr::LOCALHOST, port));
+    let host = url
+        .split("://")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or_default()
+        .to_string();
     ::tokio::task::spawn_blocking(move || {
         let client = ::reqwest::blocking::Client::builder()
             .danger_accept_invalid_certs(true)
+            .resolve(&host, resolved)
             .timeout(TLS_DIAL_DEADLINE)
             .build()
             .expect("a TLS client");
@@ -1249,11 +1332,18 @@ async fn the_published_domain_serves_the_https_a_viewer_dials() {
     let case = "a viewer that dialled TLS at the published address";
     let function = "cf-edge-tls-viewer";
     let origin = topology.public_function_url_host(case, function).await;
-    let domain = topology
+    let edge = topology
         .deployed_distribution(case, "edge-lambda-url-tls", &origin, "")
         .await;
+    let domain = &edge.domain;
 
-    let (status, body) = dial_over_tls(case, format!("https://{domain}{OPEN_PATH}"), None).await;
+    let (status, body) = dial_over_tls(
+        case,
+        edge.dialled(case),
+        format!("https://{domain}{OPEN_PATH}"),
+        None,
+    )
+    .await;
     assert_eq!(
         status, 200,
         "case {case:?}: expected the published address to serve the origin's answer over TLS, \
@@ -1318,7 +1408,7 @@ async fn an_oac_signs_a_function_url_origin_named_by_its_published_authority() {
     let control = topology
         .origin_access_control(case, "edge-lambda-url-oac-served")
         .await;
-    let (id, arn, domain) = topology
+    let (id, arn, edge) = topology
         .created_distribution(
             case,
             &config_xml(
@@ -1352,7 +1442,7 @@ async fn an_oac_signs_a_function_url_origin_named_by_its_published_authority() {
     let through_the_edge = Answered::through(
         &topology.router,
         case,
-        &domain,
+        &edge,
         "GET",
         &format!("{OPEN_PATH}?nonce=abc"),
         &[],
@@ -1408,7 +1498,7 @@ async fn an_origin_access_control_signs_a_function_url_origin_the_direct_caller_
     let control = topology
         .origin_access_control(case, "edge-lambda-url-oac")
         .await;
-    let (id, arn, domain) = topology
+    let (id, arn, edge) = topology
         .created_distribution(
             case,
             &config_xml(
@@ -1437,7 +1527,7 @@ async fn an_origin_access_control_signs_a_function_url_origin_the_direct_caller_
     }
     topology.awaited_deployment(case, &id).await;
 
-    let through_the_edge = Answered::of(case, &domain, "GET", OPEN_PATH).await;
+    let through_the_edge = Answered::of(case, &edge, "GET", OPEN_PATH).await;
     assert_eq!(
         through_the_edge.status, 200,
         "case {case:?}: expected the signed origin fetch to be served, got {} with {:?}",
@@ -1471,7 +1561,7 @@ async fn an_origin_access_control_signs_a_function_url_origin_the_direct_caller_
 
     // And the distribution still serves it afterwards: the refusal of the direct caller is
     // about the caller, not about the function.
-    let again = Answered::of(case, &domain, "GET", OPEN_PATH).await;
+    let again = Answered::of(case, &edge, "GET", OPEN_PATH).await;
     assert_eq!(
         again.status, 200,
         "case {case:?}: expected the distribution to keep serving the signed origin, got {} \
@@ -1525,34 +1615,20 @@ fn restrictions(restriction_type: &str, locations: &[&str]) -> String {
     )
 }
 
-/// The authority a viewer DIALS for the published name `domain`, and the request path it sends
-/// for the object `path`: `https://<DomainName>/<object>` as a client composes it, split back
-/// into the two things the wire carries.
-///
-/// A name that is a listener's `host:port` carries no path, so the object path is the request
-/// path; one published on the emulator's own endpoint carries the distribution's reserved path,
-/// which the object path follows.
-pub(crate) fn viewer_target(domain: &str, path: &str) -> (String, String) {
-    match domain.split_once('/') {
-        Some((authority, prefix)) => (authority.to_string(), format!("/{prefix}{path}")),
-        None => (domain.to_string(), path.to_string()),
-    }
-}
-
-/// One VIEWER request to `domain`, carrying no credential and stating `country` the way
-/// CloudFront states it — a client of a distribution, addressing the domain the distribution
-/// published.
+/// One VIEWER request for the distribution published at `domain`, carrying no credential and
+/// stating `country` the way CloudFront states it — a client of a distribution, addressing the
+/// name that distribution published, which the emulator answers on.
 async fn viewer(
     router: &MultiServiceRouter,
-    domain: &str,
+    edge: &Edge,
     path: &str,
     country: Option<&str>,
 ) -> (u16, String, String) {
-    let (authority, path) = viewer_target(domain, path);
+    let domain = &edge.domain;
     let mut builder = ::http::Request::builder()
         .method("GET")
-        .uri(format!("https://{authority}{path}"))
-        .header("host", authority);
+        .uri(format!("https://{domain}{path}"))
+        .header("host", domain);
     if let Some(country) = country {
         builder = builder.header(VIEWER_COUNTRY_HEADER, country);
     }
@@ -1912,7 +1988,7 @@ async fn the_origin_sees_its_origin_path_ahead_of_the_viewer_path_and_the_edges_
             pattern: Some("/echo/*"),
         },
     ];
-    let (id, _arn, domain) = topology
+    let (id, _arn, edge) = topology
         .created_distribution(
             case,
             &origin_path_config_xml("edge-origin-path", &backend, &origins),
@@ -1995,7 +2071,8 @@ async fn the_origin_sees_its_origin_path_ahead_of_the_viewer_path_and_the_edges_
             .map(|country| vec![(VIEWER_COUNTRY_HEADER, country)])
             .unwrap_or_default();
         let before = topology.invocations(row.case, function).await;
-        let answered = Answered::of_stating(row.case, &domain, "GET", row.viewer, &stated).await;
+        let answered =
+            Answered::of_stating(row.case, &edge, "GET", row.viewer, &stated).await;
         let after = topology.invocations(row.case, function).await;
         assert_eq!(
             answered.status, 200,
@@ -2089,8 +2166,14 @@ async fn the_origin_sees_its_origin_path_ahead_of_the_viewer_path_and_the_edges_
     // same path over the `https://` half of that one published address is reported as `https`,
     // and is asked of the origin under the same `OriginPath`.
     let tls_case = "the same viewer path dialled over TLS";
-    let (status, body) =
-        dial_over_tls(tls_case, format!("https://{domain}{OPEN_PATH}"), None).await;
+    let domain = &edge.domain;
+    let (status, body) = dial_over_tls(
+        tls_case,
+        edge.dialled(tls_case),
+        format!("https://{domain}{OPEN_PATH}"),
+        None,
+    )
+    .await;
     assert_eq!(
         status, 200,
         "case {tls_case:?}: expected the origin's answer over TLS, got {status} with {body:?}"

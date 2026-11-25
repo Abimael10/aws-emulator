@@ -46,6 +46,7 @@ use super::cloudfront_access_log_deliveries_carry_each_edge_request::{
     FROM_CLOUDFRONT, PRIMARY_FIELDS,
 };
 use super::cloudfront_dialled_edge_address_over_a_private_s3_origin::{dial, is_dialable};
+use super::cloudfront_oac_s3_origin_edge::is_assigned_edge_domain;
 use super::logs_delivery_source_cloudfront_resource::logs;
 
 /// The bucket this suite's distribution takes its origin from, and the object it holds.
@@ -70,10 +71,11 @@ const ROWS: &[Row] = &[
     },
 ];
 
-/// Dial `domain` for `row`'s path and answer the identifier the edge stamped on what came back,
-/// having held the answer to the status and the classification the row declares.
-async fn dialled(domain: &str, row: &Row) -> String {
-    let served = dial(row.case, domain, row.path).await;
+/// Dial the published name `domain`, at the `address` it resolves to, for `row`'s path and
+/// answer the identifier the edge stamped on what came back, having held the answer to the
+/// status and the classification the row declares.
+async fn dialled(address: &str, domain: &str, row: &Row) -> String {
+    let served = dial(row.case, address, domain, row.path).await;
     assert_eq!(
         served.status, row.status,
         "case {:?}: expected the published address to answer {}, got {} with {:?}",
@@ -168,11 +170,21 @@ async fn a_viewer_dialling_the_published_address_is_vended_to_every_live_deliver
     )
     .await;
 
-    // There is nothing for a viewer to dial unless the published name is an address a client on
-    // the machine this emulator runs on can open a connection to.
+    // There is nothing for a viewer to dial unless the name the distribution published is the
+    // one CloudFront assigns and this emulator opened an address it resolves to.
     assert!(
-        is_dialable(&pipeline.domain),
-        "expected a host:port a viewer can dial as the published DomainName, got {:?}",
+        is_assigned_edge_domain(&pipeline.domain),
+        "expected the DNS name CloudFront assigns a distribution (d<label>.cloudfront.net) as \
+         the published DomainName, got {:?}",
+        pipeline.domain
+    );
+    let address = pipeline
+        .address
+        .clone()
+        .expect("this emulator opened an address for the distribution");
+    assert!(
+        is_dialable(&address),
+        "expected a host:port a viewer can dial for {:?}, got {address:?}",
         pipeline.domain
     );
 
@@ -180,7 +192,7 @@ async fn a_viewer_dialling_the_published_address_is_vended_to_every_live_deliver
     // each answer, which is what joins an answer to its record.
     let mut served: Vec<(&Row, String)> = Vec::new();
     for row in ROWS {
-        served.push((row, dialled(&pipeline.domain, row).await));
+        served.push((row, dialled(&address, &pipeline.domain, row).await));
     }
     let identifiers: Vec<&str> = served
         .iter()
@@ -226,7 +238,7 @@ async fn a_viewer_dialling_the_published_address_is_vended_to_every_live_deliver
     );
 
     let later = &ROWS[0];
-    let later_id = dialled(&pipeline.domain, later).await;
+    let later_id = dialled(&address, &pipeline.domain, later).await;
 
     // The sibling delivery on the same source keeps carrying what the published address serves.
     let carried = records_until(&pipeline.setup, &barrier.log_group, ROWS.len() + 1).await;

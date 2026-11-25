@@ -32,7 +32,7 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
 };
 
 use crate::distribution_lifecycle::{
-    create_distribution, emulator, get_distribution, is_reachable_authority, list_distributions,
+    create_distribution, emulator, get_distribution, is_assigned_edge_domain, list_distributions,
     update_distribution, Answer, Node, API_VERSION,
 };
 
@@ -570,9 +570,9 @@ async fn a_multi_tenant_distribution_reports_no_domain_of_its_own() {
             );
         } else {
             assert!(
-                is_reachable_authority(&domain),
-                "case {label}: expected the address of the listener this distribution's edge \
-                 is served on, got {domain:?}"
+                is_assigned_edge_domain(&domain),
+                "case {label}: expected the DNS name CloudFront assigns a distribution \
+                 (d<label>.cloudfront.net), got {domain:?}"
             );
         }
 

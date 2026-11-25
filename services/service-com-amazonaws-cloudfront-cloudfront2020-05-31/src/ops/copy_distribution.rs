@@ -464,7 +464,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.lock().at_distribution_capacity() {
             return Err(create_refusal(crate::state::too_many_distributions()));
         }
-        let edge_address = crate::state::published_edge_address(&*self.engine, ctx).await;
+        let edge_endpoint = crate::state::opened_edge_endpoint(&*self.engine, ctx).await;
         // EVERYTHING THIS REQUEST READS AND WRITES OF THE STORE IS WEIGHED UNDER ONE GUARD,
         // which is released as the block ends: the grant that follows the standard logging
         // the copy runs under awaits, and a guard held across an await would make this
@@ -558,7 +558,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `CreateDistribution` creates one — and, like that operation, this request
             // carries no tag set, so the copy starts with no tags.
             let created = store
-                .create_distribution(config, crate::state::TagSet::new(), now, edge_address)
+                .create_distribution(config, crate::state::TagSet::new(), now, edge_endpoint)
                 .map_err(create_refusal)?;
             (created, logging)
         };

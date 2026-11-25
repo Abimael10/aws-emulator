@@ -4,34 +4,42 @@
 //! answer there.
 //!
 //! Two members are such an address. `Distribution$DomainName` is "the domain name that
-//! CloudFront assigns when you create a distribution", and
-//! `ConnectionGroup$RoutingEndpoint` is "the routing endpoint (also known as the DNS name)
-//! that is assigned to the connection group" — the name a distribution TENANT's own domain
-//! is pointed at. Each is the address a VIEWER is handed: a client takes it and fetches
-//! `https://<it>/<object>`. A name under a zone this emulator does not serve resolves to
-//! nothing on the machine it runs on, so a resource that reported one would publish an
-//! address no client could reach — the one thing a published endpoint must never be.
+//! CloudFront assigns when you create a distribution" — "for example:
+//! d111111abcdef8.cloudfront.net" — and `ConnectionGroup$RoutingEndpoint` is "the routing
+//! endpoint (also known as the DNS name) that is assigned to the connection group" — the name
+//! a distribution TENANT's own domain is pointed at. Each is the address a VIEWER is handed: a
+//! client takes it and fetches `https://<it>/<object>`.
 //!
-//! WHICH address of this emulator is published is decided by the address the CALLER reached
-//! it at, because that is the only address such a client resolves. A create that reached the
-//! emulator's OWN endpoint — the one address a client on this machine dials, and the one this
-//! emulator serves its whole surface at — publishes the HOST of that endpoint with the
-//! distribution named in the reserved data-plane path beneath it ([`EdgeAddress::Endpoint`],
-//! the `{host}/_aws/cloudfront/{id}` form [`published_edge_domain`] spells): a viewer appends
-//! its own path to the name it was handed, so the request arrives at the host its client is
-//! already talking to — on the port that client reaches this emulator on, since a domain name
-//! states none — and the data plane resolves the distribution from the path
-//! ([`crate::service::edge`]'s prefixed path-style addressing). Nothing is bound for it: the
-//! endpoint already answers.
+//! A distribution's `DomainName` is the DNS NAME CloudFront assigns it — a generated label
+//! under `cloudfront.net`, which
+//! [`super::ComAmazonawsCloudfrontCloudfront20200531State::allocate_domain_name`] mints — and
+//! carries no address of this emulator's own, no port and no path: the member is a domain
+//! name, and every consumer of one takes it as a host (a Route 53 alias target, a `CNAME`
+//! value, a TLS server name, a `Host` header).
 //!
-//! A create there is NO endpoint of this emulator to name on — one an in-process host served
-//! on no port at all reached on a service host — publishes a listener of the EMULATOR's own
-//! instead ([`EdgeAddress::Listener`]), opened through the core
-//! (`engine.listeners().tcp_plaintext(..)`, which owns the socket and the bind interface), and
-//! publishes the `host:port` that listener answers on. A connection group publishes one
-//! always: its viewers address a TENANT's own domain, which decides which tenant is served, and
-//! a path under the reserved prefix carries no domain. Either way a viewer dials exactly what
-//! it was told.
+//! A connection group still publishes the `host:port` of the listener opened for it (see
+//! [`super::ComAmazonawsCloudfrontCloudfront20200531State::minted_routing_endpoint`]): its
+//! `RoutingEndpoint` is the address a TENANT's own DNS record is pointed at and that a client
+//! of such a tenant dials, and what that member's form should be is the open issue
+//! `20261117T114529Z-acm-cloudfront-s3`'s to settle rather than this module's.
+//!
+//! What makes that name REACH this emulator is that the emulator ANSWERS on it. The edge
+//! resolves a viewer request by the name the distribution publishes wherever that request
+//! arrives — in the `Host` a client states, and in the first path segment where a client
+//! carries what it cannot carry in the host ([`crate::service::edge`]'s host-style and
+//! path-style addressing) — so a client handed the name reaches that distribution at every
+//! address of this emulator it can dial, and the listeners here answer the published name as
+//! well ([`EdgeTarget::routes_host`]).
+//!
+//! A create that reached NO endpoint of this emulator — an in-process host served on no port
+//! at all, reached on a service host — is given an address to be dialled at: a listener of the
+//! EMULATOR's own ([`EdgeEndpoint`]), opened through the core
+//! (`engine.listeners().tcp_plaintext(..)`, which owns the socket and the bind interface),
+//! which serves that distribution at the `host:port` it is bound on. A create that reached the
+//! emulator's own endpoint needs none: the whole surface is already served there, the edge
+//! among it. A connection group opens one always, because its viewers address a TENANT's own
+//! domain — which is what decides which tenant is served, and a path under the reserved prefix
+//! carries no domain.
 //!
 //! A viewer reaches either address over HTTP or over HTTPS — "viewers can use HTTP or
 //! HTTPS" is what `ViewerProtocolPolicy` is about — so both are served at that one address:
@@ -293,10 +301,23 @@ impl EdgeTarget for ServedDistribution {
         self.distribution.get().cloned()
     }
 
-    /// A viewer reaches this address by DIALLING it, so the only hosts it serves are the
-    /// addresses of the interface it is bound on.
-    fn routes_host(&self, _host: &str) -> bool {
-        false
+    /// A viewer reaches this address by DIALLING it, and the name it states while doing so is
+    /// the name the distribution PUBLISHED: `Distribution$DomainName` is a domain name, so a
+    /// client handed one dials an address of this emulator and carries that name as the host it
+    /// addressed. The hosts this address serves are therefore the addresses of the interface it
+    /// is bound on ([`host_allowed`]) and the names the distribution it was opened for is
+    /// served on — its published domain name and the alternate domain names its `Aliases`
+    /// carry, read through the ONE rule the data plane resolves a host by
+    /// ([`crate::service::edge::serves_host`]).
+    fn routes_host(&self, host: &str) -> bool {
+        let Some(id) = self.distribution.get() else {
+            return false;
+        };
+        let store = self.state.lock();
+        store
+            .distributions
+            .get(id)
+            .is_some_and(|distribution| crate::service::edge::serves_host(distribution, host))
     }
 
     fn records(
@@ -434,86 +455,33 @@ impl EdgeEndpoint {
     }
 }
 
-/// The ADDRESS a distribution a create mints publishes as its `DomainName`, and whatever
-/// keeps that address answering.
+/// The ADDRESS of its own the distribution one create mints is DIALLED at, where this
+/// emulator has one to give it — `None` where it has none.
 ///
-/// The two readings of "an address this emulator serves" this module's header states, so the
-/// create path reports one address per distribution and nothing has to re-derive which of
-/// them a caller was handed.
-pub enum EdgeAddress {
-    /// The emulator's OWN endpoint the create was reached at, as an authority: the whole
-    /// surface is served there, so the distribution is published on it with its id in the
-    /// reserved data-plane path and no listener of its own is opened.
-    Endpoint(String),
-    /// A listener of this distribution's own, for a create there is no endpoint of this
-    /// emulator to name. Held for as long as the distribution is: dropping it closes the
-    /// port.
-    Listener(EdgeEndpoint),
-}
-
-impl std::fmt::Debug for EdgeAddress {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Endpoint(authority) => f.debug_tuple("Endpoint").field(authority).finish(),
-            Self::Listener(endpoint) => f.debug_tuple("Listener").field(endpoint).finish(),
-        }
-    }
-}
-
-impl EdgeAddress {
-    /// The `DomainName` the distribution `id` publishes at this address: the HOST of the
-    /// emulator's own endpoint with the distribution named in the reserved data-plane path
-    /// beneath it, or the listener's own `host:port`.
-    #[must_use]
-    pub fn published_domain_name(&self, id: &str) -> String {
-        match self {
-            Self::Endpoint(authority) => published_edge_domain(authority, id),
-            Self::Listener(endpoint) => endpoint.authority().to_string(),
-        }
-    }
-}
-
-/// The address a viewer dials for the distribution `id` served at the emulator's own endpoint
-/// `authority`: the HOST of that endpoint, with the distribution named in the reserved
-/// data-plane path.
+/// What the distribution PUBLISHES is not this: `Distribution$DomainName` is the DNS name
+/// CloudFront assigns it, minted by
+/// [`super::ComAmazonawsCloudfrontCloudfront20200531State::allocate_domain_name`] and reported
+/// whatever answers where. This is only about whether a client that can dial nothing of this
+/// emulator yet is given a port to dial, and the edge serves the published name there
+/// ([`EdgeTarget::routes_host`]).
 ///
-/// A domain name carries NO port — `Distribution$DomainName` is "the domain name that
-/// CloudFront assigns", and the port a viewer dials is the one the scheme or its own client
-/// names — so the port of the authority this request reached is not part of the published
-/// name; what IS published is the host that endpoint answers on, which is the one address a
-/// client on this machine resolves, and the path that says which distribution.
-///
-/// A viewer composes `https://<DomainName>/<object>`, so the composition produces the prefixed
-/// path-style addressing [`crate::service::edge`] reads on whatever host a request arrives at
-/// — the distribution resolved from the path, the viewer's own path behind it — at whichever
-/// port that client reaches this emulator on.
-#[must_use]
-pub fn published_edge_domain(authority: &str, id: &str) -> String {
-    format!(
-        "{}{EDGE_PATH_PREFIX}/{id}",
-        ::service_common::data_plane_addressing::host_only(authority.trim_end_matches('/'))
-    )
-}
-
-/// The address the distribution one create mints is published at, with whatever answers there
-/// opened: the emulator's OWN endpoint this create reached where there is one
-/// ([`crate::state::announced_endpoint_authority`]), and a listener of the distribution's own
-/// otherwise — `None` on an engine that vends no listeners either, in which case the caller
-/// falls back to the name CloudFront's own zone would carry.
+/// A create that reached the emulator's OWN endpoint
+/// ([`crate::state::announced_endpoint_authority`]) needs no address of its own: the whole
+/// surface is served at that endpoint, the edge among it, so nothing is bound. A create that
+/// reached no endpoint of this emulator is given a listener of its own — `None` on an engine
+/// that vends no listeners, where there is no address to open at all.
 ///
 /// The ONE reading every create of a distribution follows, so `CreateDistribution`,
-/// `CreateDistributionWithTags` and `CopyDistribution` publish one address apiece under one
+/// `CreateDistributionWithTags` and `CopyDistribution` open one address apiece under one
 /// rule.
-pub async fn published_edge_address<Eng: Send + Sync + 'static>(
+pub async fn opened_edge_endpoint<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
-) -> Option<EdgeAddress> {
-    if let Some(authority) = super::announced_endpoint_authority(ctx) {
-        return Some(EdgeAddress::Endpoint(authority));
+) -> Option<EdgeEndpoint> {
+    if super::announced_endpoint_authority(ctx).is_some() {
+        return None;
     }
-    open_edge_endpoint(engine, ctx.callback().clone())
-        .await
-        .map(EdgeAddress::Listener)
+    open_edge_endpoint(engine, ctx.callback().clone()).await
 }
 
 /// Open the listener one distribution's edge is served on, and report the address it

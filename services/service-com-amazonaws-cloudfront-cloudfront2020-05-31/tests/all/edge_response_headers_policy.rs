@@ -45,7 +45,8 @@ use bytes::Bytes;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::distribution_lifecycle::{
-    awaited_deployment, create_distribution, emulator, is_reachable_authority, API_VERSION, HOST,
+    awaited_deployment, create_distribution, edge_listener_authority, emulator,
+    emulator_with_engine, is_assigned_edge_domain, API_VERSION, HOST,
 };
 use crate::published_edge_address::dial_with;
 use crate::response_headers_policy_lifecycle::{create_policy, Cors, Hsts, Policy, Security, Xss};
@@ -214,9 +215,13 @@ fn config(caller_reference: &str, policy: &str) -> String {
     )
 }
 
-/// Create `policy`, attach it to a new distribution, and report the address that
-/// distribution publishes once the clock has deployed it.
-async fn given_distribution(router: &MultiServiceRouter, reference: &str, policy: Policy) -> String {
+/// Create `policy`, attach it to a new distribution, and report the `(name it publishes, id)`
+/// once the clock has deployed it.
+async fn given_distribution(
+    router: &MultiServiceRouter,
+    reference: &str,
+    policy: Policy,
+) -> (String, String) {
     let created = create_policy(router, &policy.xml()).await;
     assert_eq!(
         created.status, 201,
@@ -245,12 +250,13 @@ async fn given_distribution(router: &MultiServiceRouter, reference: &str, policy
         .expect("the created distribution reports a domain name")
         .to_string();
     assert!(
-        is_reachable_authority(&domain),
-        "case {reference}: expected an address a client can dial, got {domain:?}"
+        is_assigned_edge_domain(&domain),
+        "case {reference}: expected the DNS name CloudFront assigns a distribution \
+         (d<label>.cloudfront.net), got {domain:?}"
     );
     // A configuration that has not reached the edge locations serves no viewer.
     awaited_deployment(router, reference, &id).await;
-    domain
+    (domain, id)
 }
 
 // ---------------------------------------------------------------------------
@@ -379,13 +385,13 @@ async fn assert_rows(router: &MultiServiceRouter, rows: &[Row<'_>]) {
 #[tokio::test]
 async fn the_cors_group_decorates_the_answer_for_an_origin_the_policy_grants() {
     let router = emulator();
-    let named = given_distribution(
+    let (named, _named_id) = given_distribution(
         &router,
         "rhp-edge-named",
         named_origins_policy("rhp-edge-named", true),
     )
     .await;
-    let wildcard = given_distribution(
+    let (wildcard, _wildcard_id) = given_distribution(
         &router,
         "rhp-edge-wildcard",
         wildcard_policy("rhp-edge-wildcard"),
@@ -543,19 +549,19 @@ async fn the_cors_group_decorates_the_answer_for_an_origin_the_policy_grants() {
 #[tokio::test]
 async fn the_configured_headers_are_written_and_the_removed_ones_are_gone() {
     let router = emulator();
-    let groups = given_distribution(
+    let (groups, _groups_id) = given_distribution(
         &router,
         "rhp-edge-groups",
         header_groups_policy("rhp-edge-groups"),
     )
     .await;
-    let overriding = given_distribution(
+    let (overriding, _overriding_id) = given_distribution(
         &router,
         "rhp-edge-override",
         overriding_custom_header_policy("rhp-edge-override", true),
     )
     .await;
-    let yielding = given_distribution(
+    let (yielding, _yielding_id) = given_distribution(
         &router,
         "rhp-edge-yield",
         overriding_custom_header_policy("rhp-edge-yield", false),
@@ -626,13 +632,14 @@ async fn the_configured_headers_are_written_and_the_removed_ones_are_gone() {
 /// it, so such a read is served and simply carries none of the CORS headers.
 #[tokio::test]
 async fn the_published_address_serves_the_origins_the_distribution_names() {
-    let router = emulator();
-    let domain = given_distribution(
+    let (router, engine) = emulator_with_engine();
+    let (domain, id) = given_distribution(
         &router,
         "rhp-edge-dialled",
         named_origins_policy("rhp-edge-dialled", true),
     )
     .await;
+    let address = edge_listener_authority(&engine, "rhp-edge-dialled", &id);
 
     // The rows differ along the origin (named, the second named one, not named, none at all),
     // along the method (a read, a preflight, a state-changing one) and along whether a BROWSER
@@ -719,7 +726,7 @@ async fn the_published_address_serves_the_origins_the_distribution_names() {
     ];
 
     for row in cases {
-        let answer = dial_with(&domain, row.method, SERVED_PATH, &domain, row.headers).await;
+        let answer = dial_with(&address, row.method, SERVED_PATH, &domain, row.headers).await;
         let lowered = answer.to_ascii_lowercase();
         let case = row.case;
         for expected in row.contains {

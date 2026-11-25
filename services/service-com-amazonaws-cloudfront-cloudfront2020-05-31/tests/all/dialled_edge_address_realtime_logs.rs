@@ -35,13 +35,15 @@
 //! reused rather than copied; what is new here is the viewer being a SOCKET client of the
 //! published address rather than a request dispatched in process.
 
-use crate::distribution_lifecycle::{awaited_deployment, is_reachable_authority, API_VERSION};
+use crate::distribution_lifecycle::{
+    awaited_deployment, edge_listener_authority, is_assigned_edge_domain, API_VERSION,
+};
 use crate::edge_realtime_logs::{
     assert_record, awaited_active, data_stream, delivery_role, distribution,
-    emulator_with_kinesis_and_iam, policy, realtime_log_config, stream_records, window, EndPoint,
-    Probe, DEFAULT_BEHAVIOR_PATTERN,
+    emulator_with_kinesis_and_iam_engine, policy, realtime_log_config, stream_records, window,
+    EndPoint, Probe, DEFAULT_BEHAVIOR_PATTERN,
 };
-use crate::published_edge_address::dial;
+use crate::published_edge_address::dial_as;
 
 /// The fields the configuration under test sends, each one a value THIS request or THIS answer
 /// carries: when it was served, where the viewer came from, what it asked for, at which host,
@@ -111,7 +113,7 @@ impl Answered {
 /// none to the endpoints whose role may not.
 #[tokio::test]
 async fn a_viewer_dialling_the_published_domain_delivers_a_record_through_each_permitted_role() {
-    let router = emulator_with_kinesis_and_iam();
+    let (router, engine) = emulator_with_kinesis_and_iam_engine();
     let rows: [RoleRow; 4] = [
         RoleRow {
             case: "a role allowed to put a record on its stream",
@@ -175,13 +177,16 @@ async fn a_viewer_dialling_the_published_domain_delivers_a_record_through_each_p
     }
     awaited_deployment(&router, "dialled-realtime-logs", &subject.id).await;
 
-    // The published name is the address of this distribution's own listener, which is what
-    // makes the dial below the thing a viewer handed that name does.
+    // The name the distribution published is the DNS name CloudFront assigns one, and the
+    // address below is where a viewer handed that name dials it — which is what makes the
+    // dialled requests the thing a viewer does.
     assert!(
-        is_reachable_authority(&subject.domain),
-        "expected a published DomainName a viewer can dial, got {:?}",
+        is_assigned_edge_domain(&subject.domain),
+        "expected the DNS name CloudFront assigns a distribution (d<label>.cloudfront.net), \
+         got {:?}",
         subject.domain
     );
+    let address = edge_listener_authority(&engine, "dialled-realtime-logs", &subject.id);
 
     let requests = [
         Request {
@@ -198,7 +203,7 @@ async fn a_viewer_dialling_the_published_domain_delivers_a_record_through_each_p
     let clock = window();
     let mut expected: Vec<(&str, Probe)> = Vec::new();
     for request in &requests {
-        let raw = dial(&subject.domain, request.method, &request.path).await;
+        let raw = dial_as(&address, request.method, &request.path, &subject.domain).await;
         let answered = Answered::read(request.case, &raw);
         assert_eq!(
             answered.status, 200,

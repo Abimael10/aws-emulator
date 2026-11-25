@@ -128,7 +128,7 @@ async fn every_sampled_response_names_the_point_of_presence_that_served_it() {
     let mut reported: Vec<(&str, String)> = Vec::new();
     for (index, exchange) in exchanges.iter().enumerate() {
         let case = exchange.case;
-        let domain = deployed(
+        let (domain, _id) = deployed(
             &router,
             &format!("timing-pop-{index}"),
             exchange.cache_policy,

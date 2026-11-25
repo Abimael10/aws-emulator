@@ -38,7 +38,8 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    DEFAULT_PRICE_CLASS, MAX_INVALIDATION_PATHS, MAX_ITEMS, PROPAGATION_DELAY,
+    ComAmazonawsCloudfrontCloudfront20200531State, DEFAULT_PRICE_CLASS, MAX_INVALIDATION_PATHS,
+    MAX_ITEMS, PROPAGATION_DELAY,
 };
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -77,6 +78,19 @@ pub(crate) const API_VERSION: &str = "2020-05-31";
 /// `pub(crate)` so the sibling suites in `tests/all/` stand one up the same way rather
 /// than each writing its own harness.
 pub(crate) fn emulator() -> MultiServiceRouter {
+    emulator_with_engine().0
+}
+
+/// The same emulator, with the shared ENGINE it was built over handed back beside it.
+///
+/// A suite needs the engine to read the `host:port` the listener a distribution's edge was
+/// given answers on ([`edge_listener_authority`]): no modelled member carries that address —
+/// what a distribution PUBLISHES is the DNS name CloudFront assigned it — so a suite whose
+/// viewer is a SOCKET client reads the address to dial from the store the create wrote it to.
+///
+/// `pub(crate)` for exactly that: every suite that dials a socket reads the address the same
+/// way rather than each guessing one.
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -87,9 +101,41 @@ pub(crate) fn emulator() -> MultiServiceRouter {
         ),
     );
     router.register_service(
-        service_com_amazonaws_wafv2_awswaf_20190729::EmulatedService::new(engine),
+        service_com_amazonaws_wafv2_awswaf_20190729::EmulatedService::new(Arc::clone(&engine)),
     );
-    router
+    (router, engine)
+}
+
+/// The `host:port` of the listener the distribution `id`'s edge is served on, as the store
+/// the create wrote it to reports it
+/// ([`ComAmazonawsCloudfrontCloudfront20200531State::edge_listener_authority`]).
+///
+/// The address a client with no other address of this emulator DIALS. It is not the
+/// distribution's `DomainName` — that is the DNS name CloudFront assigned, which a viewer
+/// carries as the host it addressed — so a suite dials this and states that.
+///
+/// `pub(crate)` so every suite that dials a distribution's edge dials the one address the
+/// service opened for it.
+pub(crate) fn edge_listener_authority(
+    engine: &engine::InMemoryEngine,
+    case: &str,
+    id: &str,
+) -> String {
+    edge_listener_address(engine, id).unwrap_or_else(|| {
+        panic!("case {case}: the distribution {id} was given no listener to dial")
+    })
+}
+
+/// [`edge_listener_authority`] for a suite that asks WHETHER this emulator opened an address
+/// for the distribution `id`: `None` for a distribution created through the emulator's own
+/// endpoint, where the edge is served at that endpoint and no port of its own was opened.
+pub(crate) fn edge_listener_address(
+    engine: &engine::InMemoryEngine,
+    id: &str,
+) -> Option<String> {
+    let state = engine.state::<ComAmazonawsCloudfrontCloudfront20200531State>();
+    let authority = state.lock().edge_listener_authority(id).map(str::to_string);
+    authority
 }
 
 /// Long enough after a mutation that the clock owes the distribution its deployment.
@@ -135,44 +181,44 @@ pub(crate) async fn awaited_deployment(router: &MultiServiceRouter, case: &str, 
     }
 }
 
-/// Whether `domain` is an address a client on the machine this emulator runs on can DIAL:
-/// the `host:port` of the listener a distribution's edge is served on, which is what a
-/// distribution publishes as its `DomainName` when there is no endpoint of this emulator to
-/// name instead ([`is_served_edge_address`] is the whole rule).
+/// Whether `domain` is a DNS name CloudFront ASSIGNS a distribution: one label under
+/// CloudFront's own zone, `d<label>.cloudfront.net`.
 ///
-/// A name under CloudFront's own zone resolves to nothing here, so a distribution that
-/// reported one would publish an address no viewer could reach; what it reports instead is
-/// the authority of its own listener, and `SocketAddr` is exactly the set of values a client
-/// can dial without resolving a name (an IPv6 literal included, which carries brackets).
+/// `Distribution$DomainName` is "the distribution's CloudFront domain name. For example:
+/// `d111111abcdef8.cloudfront.net`" — a domain NAME, so what the member carries is labels and
+/// nothing else: no address of this emulator, no port, no path. A client takes that name as a
+/// host — a Route 53 alias target, a `CNAME` value, a TLS server name, a `Host` header — and
+/// every one of those consumers rejects a value carrying any of the three.
+///
+/// What makes the name reach this emulator is that the emulator ANSWERS on it: the edge
+/// resolves a viewer request by the name the distribution published, in the `Host` a client
+/// states or in the first path segment where a client carries what its host cannot.
 ///
 /// `pub(crate)` so every suite that reads a published domain name holds it to the one rule.
-pub(crate) fn is_reachable_authority(domain: &str) -> bool {
-    domain.parse::<std::net::SocketAddr>().is_ok()
+pub(crate) fn is_assigned_edge_domain(domain: &str) -> bool {
+    let Some(label) = domain.strip_suffix(CLOUDFRONT_ZONE) else {
+        return false;
+    };
+    !label.is_empty()
+        && label
+            .chars()
+            .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
 }
 
-/// The reserved data-plane path a distribution published on the emulator's OWN endpoint is
-/// named under, ahead of its id: `{authority}/_aws/cloudfront/{id}`.
-///
-/// Spelled as a client reading the published name sees it — what it appends its own object
-/// path to.
-pub(crate) const EDGE_PATH_PREFIX: &str = "_aws/cloudfront/";
+/// The zone CloudFront assigns a distribution's domain name in, with the separating dot.
+pub(crate) const CLOUDFRONT_ZONE: &str = ".cloudfront.net";
 
-/// Whether `domain` is an address a viewer composing `https://<domain>/<object>` reaches this
-/// emulator at: the HOST of the endpoint this emulator is served at, with the distribution
-/// named in the reserved data-plane path beneath it — a domain name states no port, so the
-/// port a viewer dials is the one its client reaches this emulator on — or the `host:port` of
-/// a listener of its own ([`is_reachable_authority`]), which is what a distribution created
-/// through a request that reached no endpoint of this emulator publishes.
+/// Whether `domain` is an address a client on the machine this emulator runs on can DIAL:
+/// the `host:port` of a listener this emulator opened, which is what a CONNECTION GROUP
+/// publishes as its `RoutingEndpoint` — the address a tenant's own DNS record is pointed at.
 ///
-/// `pub(crate)` for the reason [`is_reachable_authority`] is: one rule about a published
-/// address, read by every suite that reads one.
-pub(crate) fn is_served_edge_address(domain: &str) -> bool {
-    match domain.split_once('/') {
-        Some((host, path)) => {
-            !host.is_empty() && !host.contains(':') && path.starts_with(EDGE_PATH_PREFIX)
-        }
-        None => is_reachable_authority(domain),
-    }
+/// `SocketAddr` is exactly the set of values a client can dial without resolving a name (an
+/// IPv6 literal included, which carries brackets).
+///
+/// `pub(crate)` so every suite that reads a published routing endpoint holds it to the one
+/// rule.
+pub(crate) fn is_reachable_authority(domain: &str) -> bool {
+    domain.parse::<std::net::SocketAddr>().is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -967,9 +1013,9 @@ async fn create_persists_the_configuration_every_read_then_reports() {
             .unwrap_or_default()
             .to_string();
         assert!(
-            is_reachable_authority(&domain),
-            "case {case}: expected the address of the listener this distribution's edge is \
-             served on, got {domain:?}"
+            is_assigned_edge_domain(&domain),
+            "case {case}: expected the DNS name CloudFront assigns a distribution \
+             (d<label>.cloudfront.net), got {domain:?}"
         );
         assert!(
             seen_domains.insert(domain.clone()),

@@ -108,6 +108,13 @@ impl Answer {
 /// it) without a computed signature, and a VIEWER request carries no credential at all, as a
 /// client of a distribution sends none.
 pub(crate) fn emulator() -> MultiServiceRouter {
+    emulator_with_engine().0
+}
+
+/// The same emulator, with the shared ENGINE handed back beside it — for a suite whose viewer
+/// DIALS a socket and so needs the address this emulator opened for a distribution's edge
+/// ([`crate::cloudfront_oac_s3_origin_edge::edge_listener_authority`]).
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -117,9 +124,11 @@ pub(crate) fn emulator() -> MultiServiceRouter {
         )),
     );
     router.register_service(
-        service_com_amazonaws_apigateway_backplanecontrolservice::EmulatedService::new(engine),
+        service_com_amazonaws_apigateway_backplanecontrolservice::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
     );
-    router
+    (router, engine)
 }
 
 /// A SigV4 `Authorization` whose credential scope names `signing_name`, which is what routes

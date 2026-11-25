@@ -62,6 +62,53 @@ const CACHING_DISABLED: &str = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad";
 /// The service principal an origin access control makes CloudFront's origin request as.
 pub(crate) const CLOUDFRONT_PRINCIPAL: &str = "cloudfront.amazonaws.com";
 
+/// The zone CloudFront assigns a distribution's domain name in, with the separating dot.
+pub(crate) const CLOUDFRONT_ZONE: &str = ".cloudfront.net";
+
+/// Whether `domain` is a DNS name CloudFront ASSIGNS a distribution: one label under
+/// CloudFront's own zone, `d<label>.cloudfront.net`.
+///
+/// `Distribution$DomainName` is "the distribution's CloudFront domain name. For example:
+/// `d111111abcdef8.cloudfront.net`" — a domain NAME, so what the member carries is labels and
+/// nothing else: no address of this emulator, no port, no path. A client takes that name as a
+/// host — a `Host` header, a TLS server name, a Route 53 alias target — and every one of those
+/// consumers rejects a value carrying any of the three. What makes the name reach this
+/// emulator is that the emulator ANSWERS on it: the edge resolves a viewer request by the name
+/// the distribution published, stated as the `Host` it addressed or carried in the first path
+/// segment where a client cannot carry it in the host.
+///
+/// `pub(crate)` so every suite that reads a published domain name holds it to the one rule.
+pub(crate) fn is_assigned_edge_domain(domain: &str) -> bool {
+    let Some(label) = domain.strip_suffix(CLOUDFRONT_ZONE) else {
+        return false;
+    };
+    !label.is_empty()
+        && label
+            .chars()
+            .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
+}
+
+/// The `host:port` of the listener the distribution `id`'s edge is served on, as the store the
+/// create wrote it to reports it — `None` for a distribution created through the emulator's own
+/// endpoint, where the edge is served at that endpoint and no port of its own was opened.
+///
+/// The address a client with no other address of this emulator DIALS. It is not the
+/// distribution's `DomainName`: that is the DNS name CloudFront assigned, which a viewer
+/// carries as the host it addressed, and no modelled member carries an address.
+///
+/// `pub(crate)` so every suite whose viewer dials a published name dials the one address this
+/// emulator opened for that distribution.
+pub(crate) fn edge_listener_authority(
+    engine: &Arc<engine::InMemoryEngine>,
+    id: &str,
+) -> Option<String> {
+    let state = engine.state::<
+        service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::ComAmazonawsCloudfrontCloudfront20200531State,
+    >();
+    let authority = state.lock().edge_listener_authority(id).map(str::to_string);
+    authority
+}
+
 /// The code and message S3 refuses a read nothing granted with (Amazon S3 "Error responses").
 const ACCESS_DENIED: &str = "AccessDenied";
 

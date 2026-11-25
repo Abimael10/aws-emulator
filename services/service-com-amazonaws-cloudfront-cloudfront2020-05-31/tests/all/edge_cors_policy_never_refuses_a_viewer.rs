@@ -40,8 +40,10 @@ use std::sync::Arc;
 
 use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 
-use crate::distribution_lifecycle::{awaited_deployment, call, is_reachable_authority, API_VERSION};
-use crate::edge_lambda_url_origin::Answered;
+use crate::distribution_lifecycle::{
+    awaited_deployment, call, edge_listener_address, is_assigned_edge_domain, API_VERSION,
+};
+use crate::edge_lambda_url_origin::{Answered, Edge};
 use crate::edge_signed_access::CACHING_DISABLED;
 use crate::edge_signed_s3_origin::{create_origin_access_control, grant, mounted, origin_domain};
 use crate::response_headers_policy_lifecycle::{create_policy, Cors, Policy};
@@ -168,7 +170,9 @@ fn config(reference: &str, bucket: &str, control: &str, policy: &str) -> String 
 /// for the whole run.
 struct Staged {
     s3: ::aws_sdk_s3::Client,
-    domain: String,
+    /// Where a viewer reaches the staged distribution's edge: the name it published and the
+    /// address that name resolves to for a client on this machine.
+    domain: Edge,
 }
 
 /// Stage the whole recorded shape: a private bucket holding [`OBJECTS`], an origin access
@@ -249,13 +253,21 @@ async fn staged(reference: &str, bucket: &str, granted: &[&str]) -> Staged {
         .await
         .unwrap_or_else(|error| panic!("the policy of {bucket} must be stored, got {error:?}"));
     assert!(
-        is_reachable_authority(&domain),
-        "expected an address a viewer can dial, got {domain:?}"
+        is_assigned_edge_domain(&domain),
+        "expected the DNS name CloudFront assigns a distribution (d<label>.cloudfront.net), \
+         got {domain:?}"
     );
     // A configuration that has not reached the edge locations serves no viewer, and the CLOCK
     // owes that propagation: the condition is polled for, never a span waited out.
     awaited_deployment(&setup, reference, &id).await;
-    Staged { s3, domain }
+    let address = edge_listener_address(&engine, &id);
+    Staged {
+        s3,
+        domain: Edge {
+            domain,
+            address,
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -271,7 +283,7 @@ async fn staged(reference: &str, bucket: &str, granted: &[&str]) -> Staged {
 /// adds only the path a key is asked for.
 async fn viewed(
     case: &str,
-    domain: &str,
+    domain: &Edge,
     method: &str,
     key: &str,
     headers: &[(&str, &str)],

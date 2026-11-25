@@ -27,9 +27,10 @@
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::distribution_lifecycle::{
-    awaited_deployment, create_distribution, emulator, is_reachable_authority, API_VERSION, HOST,
+    awaited_deployment, create_distribution, edge_listener_authority, emulator_with_engine,
+    is_assigned_edge_domain, API_VERSION, HOST,
 };
-use crate::published_edge_address::dial;
+use crate::published_edge_address::dial_as;
 
 /// A viewer path the origin these rows point at — this service's own control-plane endpoint —
 /// answers with a `DistributionList`, so a row that is SERVED carries the origin's own bytes.
@@ -84,15 +85,16 @@ fn config_xml(reference: &str, default_policy: &str, ordered_policy: Option<&str
     )
 }
 
-/// Create one deployed distribution and answer the address it published, which is what a
-/// viewer dials.
+/// Create one deployed distribution and answer the `(name it published, address a viewer
+/// dials that name at)`.
 async fn deployed(
     router: &MultiServiceRouter,
+    engine: &::std::sync::Arc<engine::InMemoryEngine>,
     case: &str,
     reference: &str,
     default_policy: &str,
     ordered_policy: Option<&str>,
-) -> String {
+) -> (String, String) {
     let created =
         create_distribution(router, &config_xml(reference, default_policy, ordered_policy)).await;
     assert_eq!(
@@ -111,12 +113,14 @@ async fn deployed(
         .unwrap_or_default()
         .to_string();
     assert!(
-        is_reachable_authority(&domain),
-        "case {case}: expected an address a viewer can dial, got {domain:?}"
+        is_assigned_edge_domain(&domain),
+        "case {case}: expected the DNS name CloudFront assigns a distribution \
+         (d<label>.cloudfront.net), got {domain:?}"
     );
     // A configuration that has not reached the edge locations serves no viewer.
     awaited_deployment(router, case, &id).await;
-    domain
+    let address = edge_listener_authority(engine, case, &id);
+    (domain, address)
 }
 
 /// What one viewer request was answered with: the status, and the headers read by name
@@ -167,23 +171,46 @@ enum Dialled {
     Tls,
 }
 
-/// Send one viewer request to `domain` over `dialled`, with no AWS credential.
-async fn view(case: &str, domain: &str, dialled: Dialled, path_and_query: &str) -> Answered {
+/// Send one viewer request for the distribution published at `domain` over `dialled`, with no
+/// AWS credential: the client dials `address` — where that name resolves for a client on this
+/// machine — and carries the name itself as the host it addressed.
+async fn view(
+    case: &str,
+    address: &str,
+    domain: &str,
+    dialled: Dialled,
+    path_and_query: &str,
+) -> Answered {
     match dialled {
-        Dialled::Plaintext => Answered::read(case, dial(domain, "GET", path_and_query).await),
+        Dialled::Plaintext => {
+            Answered::read(case, dial_as(address, "GET", path_and_query, domain).await)
+        }
         Dialled::Tls => {
             let url = format!("https://{domain}{path_and_query}");
             let owned = case.to_string();
+            // The port of the address this emulator opened, on the loopback interface its
+            // listeners are bound on: the client is TOLD where the published name resolves
+            // rather than asked to look it up, which is the one thing a test cannot ask of the
+            // host it runs on.
+            let port = address
+                .parse::<::std::net::SocketAddr>()
+                .unwrap_or_else(|error| {
+                    panic!("case {case}: the address {address} is no address: {error}")
+                })
+                .port();
+            let resolved = ::std::net::SocketAddr::from((::std::net::Ipv4Addr::LOCALHOST, port));
+            let host = domain.to_string();
             ::tokio::task::spawn_blocking(move || {
                 let client = ::reqwest::blocking::Client::builder()
                     .danger_accept_invalid_certs(true)
+                    .resolve(&host, resolved)
                     .redirect(::reqwest::redirect::Policy::none())
                     // Generous: nothing here measures the wait, only what came back.
                     .timeout(::std::time::Duration::from_secs(120))
                     .build()
                     .expect("a TLS client");
                 let answered = client.get(&url).send().unwrap_or_else(|error| {
-                    panic!("case {owned}: the published address did not answer {url}: {error}")
+                    panic!("case {owned}: the published name did not answer {url}: {error}")
                 });
                 let status = answered.status().as_u16();
                 let headers = answered
@@ -340,18 +367,19 @@ fn rows() -> Vec<Row> {
 /// policy the behaviour its path matched states.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_matched_behaviours_viewer_protocol_policy_decides_the_answer() {
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
     for (index, row) in rows().into_iter().enumerate() {
         let case = row.case;
-        let domain = deployed(
+        let (domain, address) = deployed(
             &router,
+            &engine,
             case,
             &format!("vpp-{index}"),
             row.default_policy,
             row.ordered_policy,
         )
         .await;
-        let answered = view(case, &domain, row.dialled, row.path_and_query).await;
+        let answered = view(case, &address, &domain, row.dialled, row.path_and_query).await;
         let location = answered.header("location").map(str::to_string);
         match row.expected {
             Expected::Served => {

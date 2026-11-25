@@ -156,11 +156,11 @@ async fn deployed(
     origin: &str,
     min_ttl: u64,
 ) -> String {
-    let (id, _arn, domain) = topology
+    let (id, _arn, edge) = topology
         .created_distribution(case, &config_xml(reference, origin, min_ttl))
         .await;
     topology.awaited_deployment(case, &id).await;
-    domain
+    edge.domain
 }
 
 /// Ask for `path` twice back to back and report the two bodies, each held to carrying the status

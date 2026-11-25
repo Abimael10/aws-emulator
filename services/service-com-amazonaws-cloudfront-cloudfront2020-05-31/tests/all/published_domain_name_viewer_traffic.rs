@@ -41,10 +41,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::announced_location_uri::addressed_hosts;
 use crate::distribution_lifecycle::{
-    awaited_deployment, create_distribution, emulator, get_distribution, is_reachable_authority,
-    API_VERSION, HOST,
+    awaited_deployment, create_distribution, edge_listener_address, emulator_with_engine,
+    get_distribution, is_assigned_edge_domain, API_VERSION, HOST,
 };
-use crate::edge_lambda_url_origin::Answered;
+use crate::edge_lambda_url_origin::{Answered, Edge};
 use crate::edge_request_shaping::cache_policy;
 
 /// An origin this emulator SERVES: this service's own control-plane endpoint.
@@ -106,13 +106,18 @@ fn config_xml(reference: &str, cache_policy_id: &str) -> String {
 }
 
 /// One deployed distribution over the served origin, under a cache policy that keys on
-/// [`KEYED`] alone: its id and the address it PUBLISHED.
+/// [`KEYED`] alone: its id and where a viewer reaches its edge ([`Edge`]).
 ///
-/// The published address is held to being one a client on this machine can dial, and to being
-/// the RECORD's own rather than the minting call's — `GetDistribution` reports the same one —
-/// and the distribution is waited for until it reports itself deployed, a configuration that has
-/// not reached the edge locations serving no viewer.
-async fn deployed(router: &MultiServiceRouter, case: &str, reference: &str) -> (String, String) {
+/// The published name is held to being the DNS name CloudFront assigns a distribution, and to
+/// being the RECORD's own rather than the minting call's — `GetDistribution` reports the same
+/// one — and the distribution is waited for until it reports itself deployed, a configuration
+/// that has not reached the edge locations serving no viewer.
+async fn deployed(
+    router: &MultiServiceRouter,
+    engine: &::std::sync::Arc<engine::InMemoryEngine>,
+    case: &str,
+    reference: &str,
+) -> (String, Edge) {
     let policy = cache_policy(
         router,
         &format!("{reference}-policy"),
@@ -140,19 +145,27 @@ async fn deployed(router: &MultiServiceRouter, case: &str, reference: &str) -> (
         .unwrap_or_default()
         .to_string();
     assert!(
-        is_reachable_authority(&domain),
-        "case {case}: expected a published DomainName a client can dial, got {domain:?}"
+        is_assigned_edge_domain(&domain),
+        "case {case}: expected the DNS name CloudFront assigns a distribution \
+         (d<label>.cloudfront.net), got {domain:?}"
     );
     let read = get_distribution(router, &id).await;
     assert_eq!(
         read.root().find_text("DomainName"),
         Some(domain.as_str()),
-        "case {case}: expected the record's own address to be the one the create published \
+        "case {case}: expected the record's own name to be the one the create published \
          ({domain:?}), got {:?}",
         read.root().find_text("DomainName")
     );
     awaited_deployment(router, case, &id).await;
-    (id, domain)
+    let address = edge_listener_address(engine, &id);
+    (
+        id,
+        Edge {
+            domain,
+            address,
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -240,9 +253,9 @@ struct CacheRow {
 /// opens a cache entry no other row touches and a row's reading is its own.
 #[tokio::test]
 async fn the_dialled_published_address_serves_the_behaviours_cache() {
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
     let case = "viewer traffic dialled at the published address";
-    let (_id, domain) = deployed(&router, case, "published-viewer-cache").await;
+    let (_id, domain) = deployed(&router, &engine, case, "published-viewer-cache").await;
 
     let rows = [
         CacheRow {
@@ -320,10 +333,10 @@ async fn the_dialled_published_address_serves_the_behaviours_cache() {
 /// How a client reaches one distribution's edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Addressing {
-    /// A connection OPENED to the address the distribution published, which is what a client
-    /// handed that address does.
+    /// A connection OPENED to the address the published name resolves to, which is what a
+    /// client handed that name does.
     Dialled,
-    /// The published authority stated as the `Host` of a request placed in process.
+    /// The published NAME stated as the `Host` of a request placed in process.
     HostStyle,
     /// The reserved data-plane path, naming the distribution's id, on the emulator's own
     /// endpoint — the addressing a client that resolves no published name has.
@@ -334,8 +347,8 @@ impl Addressing {
     /// The row's own name for this addressing, which every assertion names its case by.
     fn case(self) -> &'static str {
         match self {
-            Self::Dialled => "dialled at the published address",
-            Self::HostStyle => "the published authority as the Host",
+            Self::Dialled => "dialled at the address the published name resolves to",
+            Self::HostStyle => "the published name as the Host",
             Self::PrefixedPath => "the reserved data-plane path on the emulator's own endpoint",
         }
     }
@@ -345,7 +358,7 @@ impl Addressing {
         self,
         case: &str,
         router: &MultiServiceRouter,
-        domain: &str,
+        domain: &Edge,
         id: &str,
         own_endpoint: &str,
         query: &str,
@@ -356,7 +369,7 @@ impl Addressing {
                     Answered::of_stating(case, domain, "GET", &viewer_path(query), &[]).await;
                 Served::off_the_wire(&answered)
             }
-            Self::HostStyle => view(router, domain, &viewer_path(query)).await,
+            Self::HostStyle => view(router, &domain.domain, &viewer_path(query)).await,
             Self::PrefixedPath => {
                 view(
                     router,
@@ -379,9 +392,9 @@ impl Addressing {
 /// pair fetches an object of its own.
 #[tokio::test]
 async fn every_addressing_of_the_published_edge_shares_one_cache() {
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
     let case = "one edge behind every addressing";
-    let (id, domain) = deployed(&router, case, "published-viewer-addressing").await;
+    let (id, domain) = deployed(&router, &engine, case, "published-viewer-addressing").await;
     // The own-endpoint authority is a port THIS process holds, so no edge listener of this
     // engine can be given it and the row addresses the emulator's own endpoint rather than some
     // distribution's edge. The reservation lives as long as `hosts` does.

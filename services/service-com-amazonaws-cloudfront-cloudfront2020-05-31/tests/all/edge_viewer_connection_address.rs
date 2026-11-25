@@ -24,7 +24,7 @@
 //! reused rather than copied: its default behaviour already carries the managed origin request
 //! policy that forwards the `CloudFront-*` headers, without which no origin sees them.
 
-use crate::edge_lambda_url_origin::{viewer_ip, Answered, Topology, MISS, OPEN_PATH};
+use crate::edge_lambda_url_origin::{viewer_ip, Answered, Edge, Topology, MISS, OPEN_PATH};
 
 /// The header the edge generates for the connection, lower case as an origin request carries
 /// it, and the header a viewer that traversed a proxy states its own address in — the one the
@@ -129,7 +129,7 @@ fn assert_connection(case: &str, reported: &str, expected: &str) {
 /// served.
 async fn reported_connection(
     case: &str,
-    domain: &str,
+    domain: &Edge,
     stated: &[(&str, &str)],
 ) -> String {
     let answered = Answered::of_stating(case, domain, "GET", OPEN_PATH, stated).await;

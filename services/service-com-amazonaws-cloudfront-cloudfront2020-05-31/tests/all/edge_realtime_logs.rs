@@ -93,6 +93,14 @@ fn emulator_with_kinesis() -> MultiServiceRouter {
 /// The same router with IAM beside them, for the rules about what the DELIVERY ROLE allows:
 /// that decision is IAM's, so IAM has to be there to answer it.
 pub(crate) fn emulator_with_kinesis_and_iam() -> MultiServiceRouter {
+    emulator_with_kinesis_and_iam_engine().0
+}
+
+/// The same emulator, with the shared ENGINE handed back beside it — for a suite whose viewer
+/// DIALS a socket and so needs the address this emulator opened for a distribution
+/// ([`crate::distribution_lifecycle::edge_listener_authority`]).
+pub(crate) fn emulator_with_kinesis_and_iam_engine(
+) -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -101,9 +109,11 @@ pub(crate) fn emulator_with_kinesis_and_iam() -> MultiServiceRouter {
         service_com_amazonaws_kinesis_kinesis_20131202::EmulatedService::new(Arc::clone(&engine)),
     );
     router.register_service(
-        service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(engine),
+        service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
     );
-    router
+    (router, engine)
 }
 
 /// A SigV4 credential scope naming `signing_name`, which is what routes a request to that

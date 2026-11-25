@@ -325,7 +325,7 @@ async fn every_request_of_one_pooled_client_is_answered_at_the_published_address
     // viewer and a refused one: the refused rows below state one of those countries, which is
     // how a viewer of a loopback emulator says where it is.
     let elsewhere: Vec<String> = ELSEWHERE.iter().map(|code| (*code).to_string()).collect();
-    let (id, _arn, domain) = topology
+    let (id, _arn, edge) = topology
         .created_distribution(
             setup,
             &config_xml(
@@ -337,6 +337,7 @@ async fn every_request_of_one_pooled_client_is_answered_at_the_published_address
         )
         .await;
     topology.awaited_deployment(setup, &id).await;
+    let domain = edge.domain.clone();
 
     // The rows: whether the request states a blocklisted country, interleaved so a served
     // answer follows a refused one and the other way round — each one on the connection the
@@ -351,10 +352,23 @@ async fn every_request_of_one_pooled_client_is_answered_at_the_published_address
     ];
 
     let url = format!("http://{domain}{OPEN_PATH}");
+    // The client is TOLD where the published name resolves — the address this emulator opened
+    // for that distribution, on the loopback interface its listeners are bound on — rather than
+    // asked to look it up, which is the one thing a test cannot ask of the host it runs on.
+    let dialled = edge.address.clone().unwrap_or_else(|| {
+        panic!("setup {setup:?}: this distribution was given no address of its own to dial")
+    });
+    let port = dialled
+        .parse::<::std::net::SocketAddr>()
+        .unwrap_or_else(|error| panic!("setup {setup:?}: {dialled} is no address: {error}"))
+        .port();
+    let resolved = ::std::net::SocketAddr::from((::std::net::Ipv4Addr::LOCALHOST, port));
+    let host = domain.clone();
     let answered = ::tokio::task::spawn_blocking(move || {
         // ONE client for every row, so each request after the first is asked on the
         // connection the client is holding.
         let client = ::reqwest::blocking::Client::builder()
+            .resolve(&host, resolved)
             .timeout(POOLED_CLIENT_DEADLINE)
             .build()
             .expect("an HTTP client");

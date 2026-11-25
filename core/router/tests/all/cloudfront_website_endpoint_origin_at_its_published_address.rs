@@ -26,11 +26,14 @@
 //! another value, nothing at all).
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use smithy_server_runtime::MultiServiceRouter;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use super::cloudfront_oac_s3_origin_edge::edge_listener_authority;
 
 /// The Region the buckets are created in, and so the Region their website hosts name.
 const REGION: &str = "us-east-1";
@@ -74,13 +77,13 @@ const ANSWER_WITHIN: Duration = Duration::from_secs(120);
 /// The whole emulator over one engine, exactly as the binary assembles it — so which service
 /// claims each request, the edge's own origin request to a bucket's website host included, is
 /// decided by the production mount.
-fn router() -> MultiServiceRouter {
+fn router() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine = aws_emulator_router::new_engine();
-    let mut router = aws_emulator_router::build_router(engine);
+    let mut router = aws_emulator_router::build_router(Arc::clone(&engine));
     // Signature verification is the front door's concern, not this suite's: a browser fetching
     // a static site through a distribution signs nothing.
     router.set_request_authentication(false);
-    router
+    (router, engine)
 }
 
 /// A SigV4 `Authorization` whose credential scope names `service`, which is what routes a
@@ -330,14 +333,14 @@ async fn awaited_deployment(router: &MultiServiceRouter, id: &str) {
     }
 }
 
-/// Dial the address the distribution published and send one HTTP/1.1 request, answering the
-/// whole message that comes back.
+/// Dial the address the published name resolves to and send one HTTP/1.1 request stating that
+/// name as the host it addressed, answering the whole message that comes back.
 ///
 /// This is the client a viewer handed a published name is: it speaks the protocol on a socket
-/// rather than going through the router, which is what makes the published address the thing
-/// under test. Only the PORT is taken from the published authority, and the loopback address is
+/// rather than going through the router, which is what makes the published name the thing
+/// under test. Only the PORT is taken from the authority, and the loopback address is
 /// named explicitly, so nothing here opens a connection to anywhere else.
-async fn dialled(authority: &str, path: &str) -> String {
+async fn dialled(authority: &str, host: &str, path: &str) -> String {
     let port = authority
         .parse::<SocketAddr>()
         .unwrap_or_else(|error| panic!("the published address {authority} is no address: {error}"))
@@ -351,7 +354,7 @@ async fn dialled(authority: &str, path: &str) -> String {
     .unwrap_or_else(|error| {
         panic!("the published address {authority} refused a connection: {error}")
     });
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .await
@@ -374,10 +377,12 @@ struct PathRow {
 
 #[tokio::test]
 async fn a_website_endpoint_origin_is_served_to_a_viewer_dialling_the_published_address() {
-    let router = router();
+    let (router, engine) = router();
     published_site(&router, PUBLIC_BUCKET, false).await;
-    let (_id, domain) =
+    let (id, domain) =
         created_distribution(&router, "router-website-public", PUBLIC_BUCKET, None).await;
+    let address = edge_listener_authority(&engine, &id)
+        .expect("this emulator opened an address for the distribution");
 
     let rows = [
         PathRow {
@@ -401,7 +406,7 @@ async fn a_website_endpoint_origin_is_served_to_a_viewer_dialling_the_published_
         // Twice: a client polling a freshly deployed distribution asks again, and the second
         // answer carries the same document whether it came from the origin or the edge cache.
         for attempt in 1..=2 {
-            let served = dialled(&domain, row.path).await;
+            let served = dialled(&address, &domain, row.path).await;
             assert!(
                 served.starts_with("HTTP/1.1 200"),
                 "case {:?} (attempt {attempt}): expected the site's document from {domain}, \
@@ -432,7 +437,7 @@ struct RefererRow {
 
 #[tokio::test]
 async fn a_referer_conditioned_site_admits_exactly_the_origin_requests_stating_that_referer() {
-    let router = router();
+    let (router, engine) = router();
     published_site(&router, CONDITIONED_BUCKET, true).await;
 
     let rows = [
@@ -460,14 +465,16 @@ async fn a_referer_conditioned_site_admits_exactly_the_origin_requests_stating_t
     ];
 
     for row in rows {
-        let (_id, domain) = created_distribution(
+        let (id, domain) = created_distribution(
             &router,
             row.reference,
             CONDITIONED_BUCKET,
             row.stated,
         )
         .await;
-        let served = dialled(&domain, "/").await;
+        let address = edge_listener_authority(&engine, &id)
+            .expect("this emulator opened an address for the distribution");
+        let served = dialled(&address, &domain, "/").await;
         assert!(
             served.starts_with(&format!("HTTP/1.1 {}", row.status)),
             "case {:?}: expected HTTP {} from {domain}, got {served:?}",
