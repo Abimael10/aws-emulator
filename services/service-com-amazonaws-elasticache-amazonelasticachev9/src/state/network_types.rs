@@ -77,3 +77,19 @@ pub fn group_network_types(subnets: &[SubnetRecord]) -> Vec<String> {
 pub fn reported_network_types(supported: Vec<String>) -> Option<Vec<String>> {
     (!supported.is_empty()).then_some(supported)
 }
+
+/// The `NetworkType` a cache cluster or replication group created without one runs on.
+///
+/// `CacheCluster$NetworkType` / `ReplicationGroup$NetworkType` are "Either `ipv4` | `ipv6`
+/// | `dual_stack`", with IPv6 available only on the engine versions and instances AWS lists
+/// for it; a cache the request states no network type for is created on IPv4, the family
+/// every placement this service serves is addressed in. Resolved when the cache is created,
+/// so a read reports the type the cache runs rather than nothing.
+pub const DEFAULT_CACHE_NETWORK_TYPE: &str = NETWORK_TYPE_IPV4;
+
+/// The `IpDiscovery` a cache cluster or replication group created without one runs with.
+///
+/// `IpDiscovery` is "either `ipv4` | `ipv6`" (model enum `IpDiscovery`) and selects which
+/// family the engine's own node discovery announces; it follows the network type the cache
+/// is created on, so a cache that states neither discovers over IPv4.
+pub const DEFAULT_CACHE_IP_DISCOVERY: &str = NETWORK_TYPE_IPV4;

@@ -20,6 +20,8 @@
 //! against what the describe ANSWERS first, so the table cannot drift from the published
 //! catalogue, and every "absent" row is checked to be absent from it.
 
+use service_com_amazonaws_elasticache_amazonelasticachev9::state;
+
 use crate::harness::{params, Emulator, Reply, PAST_TRANSITION};
 
 /// The `awsQuery` error code the refusal carries, from the model:
@@ -162,9 +164,9 @@ async fn a_version_the_catalogue_offers_is_accepted_and_one_it_does_not_is_refus
         );
         assert_eq!(
             created.text("CacheCluster/EngineVersion"),
-            Some(*version),
-            "case {engine} {version}: the cluster must report the version it was created on, \
-             got {:?}",
+            Some(state::patch_release(engine, version)),
+            "case {engine} {version}: the cluster must report the release behind the version it \
+             was created on, got {:?}",
             created.text("CacheCluster/EngineVersion")
         );
         // Memcached has no replication groups; the other two engines do.

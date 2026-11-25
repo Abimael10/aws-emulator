@@ -848,7 +848,10 @@ async fn a_cluster_created_without_a_version_runs_a_published_one() {
             .to_string();
 
         // The version it runs is the default of that engine's newest version
-        // line, which is the last row `DefaultOnly` reports for the engine…
+        // line, which is the last row `DefaultOnly` reports for the engine — a
+        // cluster reports the RELEASE behind that line, which is what
+        // `CacheCluster$EngineVersion` ("the version of the cache engine that is
+        // used in this cluster") carries.
         let (_, default_only) = describe(
             &emulator,
             &id,
@@ -859,9 +862,10 @@ async fn a_cluster_created_without_a_version_runs_a_published_one() {
             .last()
             .unwrap_or_else(|| panic!("case {id}: {engine} must publish a version line"));
         assert_eq!(
-            newest.engine_version, version,
-            "case {id}: the cluster runs {version}, so that is the default version of {engine}'s \
-             newest line, got {:?}",
+            state::patch_release(engine, &newest.engine_version),
+            version,
+            "case {id}: the cluster runs {version}, so that is the release behind the default \
+             version of {engine}'s newest line, got {:?}",
             newest.engine_version
         );
 
@@ -870,12 +874,17 @@ async fn a_cluster_created_without_a_version_runs_a_published_one() {
         let (_, exact) = describe(
             &emulator,
             &id,
-            &params(&[("Engine", engine), ("EngineVersion", &version)]),
+            &params(&[("Engine", engine), ("EngineVersion", &newest.engine_version)]),
         )
         .await;
         let family = exact
             .first()
-            .unwrap_or_else(|| panic!("case {id}: {engine} {version} must be published"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {id}: {engine} {} must be published",
+                    newest.engine_version
+                )
+            })
             .family
             .clone();
         assert_eq!(

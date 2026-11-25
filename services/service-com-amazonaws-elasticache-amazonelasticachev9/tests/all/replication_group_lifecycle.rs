@@ -395,7 +395,8 @@ async fn a_created_replication_group_is_read_back_from_persisted_state() {
             );
             // The group's primary endpoint is the address of the member holding
             // the primary role, which for a group this emulator serves is the
-            // socket that member answers on; its reader endpoint is a replica's.
+            // socket that member answers on; its reader endpoint is a replica's,
+            // or the primary's where the shard holds no replica to read from.
             assert_own_endpoint(
                 case.stored_id,
                 "the shard's primary endpoint",
@@ -403,13 +404,13 @@ async fn a_created_replication_group_is_read_back_from_persisted_state() {
                 described.text("NodeGroup/PrimaryEndpoint/Port"),
             );
             let reader = described.text("NodeGroup/ReaderEndpoint/Address");
+            assert_own_endpoint(
+                case.stored_id,
+                "the shard's reader endpoint",
+                reader.unwrap_or_default(),
+                described.text("NodeGroup/ReaderEndpoint/Port"),
+            );
             if case.members.len() > 1 {
-                assert_own_endpoint(
-                    case.stored_id,
-                    "the shard's reader endpoint",
-                    reader.unwrap_or_default(),
-                    described.text("NodeGroup/ReaderEndpoint/Port"),
-                );
                 assert_ne!(
                     described.text("NodeGroup/ReaderEndpoint/Port"),
                     described.text("NodeGroup/PrimaryEndpoint/Port"),
@@ -417,9 +418,13 @@ async fn a_created_replication_group_is_read_back_from_persisted_state() {
                      it writes at, got {reader:?}"
                 );
             } else {
-                assert!(
-                    reader.is_none(),
-                    "case {case:?}: a shard with no replica has no reader endpoint, got {reader:?}"
+                // A shard with no replica still publishes a reader endpoint —
+                // where its reads are served from is the member holding the
+                // primary role.
+                assert_eq!(
+                    described.text("NodeGroup/ReaderEndpoint/Port"),
+                    described.text("NodeGroup/PrimaryEndpoint/Port"),
+                    "case {case:?}: a shard with no replica reads where it writes, got {reader:?}"
                 );
             }
         }

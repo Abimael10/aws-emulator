@@ -257,8 +257,9 @@ async fn a_create_may_name_the_versions_the_catalog_offers_and_no_others() {
         );
         assert_eq!(
             created.text("CacheCluster/EngineVersion"),
-            Some(version),
-            "case {case}: the cluster must run the version the request named, got {}",
+            Some(state::patch_release(cache_engine, version)),
+            "case {case}: the cluster must run the release behind the version the request \
+             named, got {}",
             created.body
         );
     }

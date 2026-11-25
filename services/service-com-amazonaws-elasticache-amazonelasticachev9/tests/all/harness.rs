@@ -322,6 +322,23 @@ pub(crate) fn unescape_xml(text: &str) -> String {
         .replace("&amp;", "&")
 }
 
+/// Whether `body` carries an element named `name` at all — including one that is present
+/// and EMPTY (`<name></name>`, `<name/>`) or carrying attributes (`<name xmlns="…">`).
+///
+/// `pub(crate)` for the same reason as the rest of this harness: the scanner below drops an
+/// element whose text is empty, so a suite that asserts a list or a structure holding
+/// nothing was SERIALIZED has to read the raw body, and reads it the one way rather than
+/// carrying a second copy of this.
+pub(crate) fn carries_element(body: &str, name: &str) -> bool {
+    [
+        format!("<{name}>"),
+        format!("<{name}/>"),
+        format!("<{name} "),
+    ]
+    .iter()
+    .any(|open| body.contains(open.as_str()))
+}
+
 /// Parse an XML document into `(element path, text)` pairs in document order.
 ///
 /// Deliberately a local scanner rather than an XML-crate dependency: adding one

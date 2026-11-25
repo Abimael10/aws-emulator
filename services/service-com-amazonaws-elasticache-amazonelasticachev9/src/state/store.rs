@@ -201,11 +201,24 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
             preferred_maintenance_window: new.preferred_maintenance_window,
             cache_subnet_group_name: new.cache_subnet_group_name,
             replication_group_id: new.replication_group_id,
-            replication_group_log_delivery_enabled: new.replication_group_log_delivery_enabled,
+            // The members ElastiCache RESOLVES when it creates a cache — a
+            // non-optional `Boolean`, or an enum whose default the service picks
+            // — are resolved here, so the record holds the value the cluster was
+            // created with and every read of it reports one: a request that named
+            // none took the service's default rather than nothing. They are
+            // [`replication_group_log_delivery_enabled`],
+            // [`auto_minor_version_upgrade`], both encryption flags,
+            // [`network_type`] and [`ip_discovery`], below.
+            replication_group_log_delivery_enabled: Some(
+                new.replication_group_log_delivery_enabled.unwrap_or(false),
+            ),
             cache_parameter_group_name: new.cache_parameter_group_name,
             snapshot_retention_limit: new.snapshot_retention_limit,
             snapshot_window: new.snapshot_window,
-            auto_minor_version_upgrade: new.auto_minor_version_upgrade,
+            auto_minor_version_upgrade: Some(
+                new.auto_minor_version_upgrade
+                    .unwrap_or(DEFAULT_AUTO_MINOR_VERSION_UPGRADE),
+            ),
             security_group_ids: new.security_group_ids,
             notification_topic_arn: new.notification_topic_arn,
             // A topic a create configures is ACTIVE: "notifications are sent
@@ -220,11 +233,17 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
             // once the record is stored and writes the address it answers on
             // then (`crate::state::serve_cache_cluster`).
             served_endpoint: None,
-            transit_encryption_enabled: new.transit_encryption_enabled,
+            transit_encryption_enabled: Some(new.transit_encryption_enabled.unwrap_or(false)),
             transit_encryption_mode: new.transit_encryption_mode,
-            at_rest_encryption_enabled: new.at_rest_encryption_enabled,
-            network_type: new.network_type,
-            ip_discovery: new.ip_discovery,
+            at_rest_encryption_enabled: Some(new.at_rest_encryption_enabled.unwrap_or(false)),
+            network_type: Some(
+                new.network_type
+                    .unwrap_or_else(|| DEFAULT_CACHE_NETWORK_TYPE.to_string()),
+            ),
+            ip_discovery: Some(
+                new.ip_discovery
+                    .unwrap_or_else(|| DEFAULT_CACHE_IP_DISCOVERY.to_string()),
+            ),
             log_delivery_configurations: new.log_delivery_configurations,
             nodes: Vec::new(),
             pending_modified_values: PendingValues::default(),
@@ -1533,9 +1552,22 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
                 SETTING_DISABLED
             }
             .to_string(),
-            auto_minor_version_upgrade: new.auto_minor_version_upgrade,
-            network_type: new.network_type,
-            ip_discovery: new.ip_discovery,
+            // Resolved when the group is created, by the same reading as a member
+            // cluster's own ([`Self::insert_cluster`]): ElastiCache populates each
+            // of these on every read of a group, so a request that named none took
+            // the service's default rather than nothing.
+            auto_minor_version_upgrade: Some(
+                new.auto_minor_version_upgrade
+                    .unwrap_or(DEFAULT_AUTO_MINOR_VERSION_UPGRADE),
+            ),
+            network_type: Some(
+                new.network_type
+                    .unwrap_or_else(|| DEFAULT_CACHE_NETWORK_TYPE.to_string()),
+            ),
+            ip_discovery: Some(
+                new.ip_discovery
+                    .unwrap_or_else(|| DEFAULT_CACHE_IP_DISCOVERY.to_string()),
+            ),
             user_group_ids: new.user_group_ids,
             log_delivery_configurations: new.log_delivery_configurations,
             durability: new.durability,

@@ -149,7 +149,12 @@ struct ClusterCase {
     /// The identity the cluster is stored and reported under.
     stored_id: &'static str,
     engine: &'static str,
-    engine_version: &'static str,
+    /// The RELEASE the cluster reports running: the version itself where
+    /// ElastiCache names it by a patch release, and the release behind the
+    /// version LINE where it names it by the line (`state::patch_release`).
+    engine_release: &'static str,
+    /// The port the cluster's endpoints carry: the one the request asked for,
+    /// where this emulator serves the cache no data plane of its own.
     port: &'static str,
     num_cache_nodes: usize,
     parameter_group: &'static str,
@@ -168,7 +173,7 @@ async fn a_created_cluster_is_read_back_from_persisted_state() {
             extra: &[("CacheNodeType", "cache.t3.micro")],
             stored_id: "demo-cluster",
             engine: "redis",
-            engine_version: "7.1",
+            engine_release: "7.1.0",
             port: "6379",
             num_cache_nodes: 1,
             parameter_group: "default.redis7",
@@ -180,7 +185,7 @@ async fn a_created_cluster_is_read_back_from_persisted_state() {
             // engine name.
             stored_id: "mixed-case-id",
             engine: "redis",
-            engine_version: "6.2",
+            engine_release: "6.2.6",
             port: "6379",
             num_cache_nodes: 1,
             // Redis OSS 6 is the one published family whose version line is
@@ -197,7 +202,7 @@ async fn a_created_cluster_is_read_back_from_persisted_state() {
             ],
             stored_id: "memcached-three",
             engine: "memcached",
-            engine_version: "1.6.22",
+            engine_release: "1.6.22",
             port: "11211",
             num_cache_nodes: 3,
             parameter_group: "default.memcached1.6",
@@ -212,7 +217,7 @@ async fn a_created_cluster_is_read_back_from_persisted_state() {
             ],
             stored_id: "memcached-max",
             engine: "memcached",
-            engine_version: "1.6.22",
+            engine_release: "1.6.22",
             port: "11222",
             num_cache_nodes: 40,
             parameter_group: "default.memcached1.6",
@@ -222,7 +227,7 @@ async fn a_created_cluster_is_read_back_from_persisted_state() {
             extra: &[("Engine", "valkey"), ("Port", "7000")],
             stored_id: "valkey-cluster",
             engine: "valkey",
-            engine_version: "9.1",
+            engine_release: "9.1.0",
             port: "7000",
             num_cache_nodes: 1,
             parameter_group: "default.valkey9",
@@ -276,7 +281,7 @@ async fn a_created_cluster_is_read_back_from_persisted_state() {
         for (field, expected) in [
             ("CacheCluster/CacheClusterId", case.stored_id),
             ("CacheCluster/Engine", case.engine),
-            ("CacheCluster/EngineVersion", case.engine_version),
+            ("CacheCluster/EngineVersion", case.engine_release),
             (
                 "CacheParameterGroup/CacheParameterGroupName",
                 case.parameter_group,
@@ -289,11 +294,14 @@ async fn a_created_cluster_is_read_back_from_persisted_state() {
                 described.text(field)
             );
         }
-        // WHERE the cluster is reached. A Valkey / Redis OSS cluster is served by
-        // this emulator's own RESP socket, so its endpoint is the address that
-        // socket answers on and the port is the one the core assigned it; a
-        // Memcached cluster is served by nothing here, so it keeps the name
-        // ElastiCache's own zone would carry and the port the request asked for.
+        // WHERE the cluster is reached, and from WHEN. A cluster whose nodes are
+        // still being provisioned publishes no endpoint — there is nothing
+        // listening for a client to be pointed at yet. Once they are, a Valkey /
+        // Redis OSS cluster is served by this emulator's own RESP socket, so its
+        // endpoint is the address that socket answers on and the port is the one
+        // the core assigned it; a Memcached cluster is served by nothing here, so
+        // it keeps the name ElastiCache's own zone would carry and the port the
+        // request asked for.
         let serves_resp = case.engine != "memcached";
         if serves_resp {
             assert_own_endpoint(
@@ -312,6 +320,14 @@ async fn a_created_cluster_is_read_back_from_persisted_state() {
                 described.text("ConfigurationEndpoint/Port")
             );
         }
+        // The create answered before any node was provisioned, so it carried no
+        // endpoint at all.
+        assert!(
+            created.text("ConfigurationEndpoint/Address").is_none(),
+            "case {case:?}: a cluster whose nodes are still being provisioned publishes no \
+             endpoint, got {:?}",
+            created.text("ConfigurationEndpoint/Address")
+        );
         assert_eq!(
             described.text("CacheCluster/NumCacheNodes"),
             Some(case.num_cache_nodes.to_string().as_str()),
@@ -323,7 +339,6 @@ async fn a_created_cluster_is_read_back_from_persisted_state() {
         // value the service minted, not just on the ones the request carried.
         for minted in [
             "CacheCluster/ARN",
-            "ConfigurationEndpoint/Address",
             "CacheCluster/CacheClusterCreateTime",
             "CacheCluster/PreferredAvailabilityZone",
             "CacheCluster/PreferredMaintenanceWindow",
@@ -1656,6 +1671,8 @@ async fn modify_refuses_a_member_that_names_no_change_it_can_make() {
         vec!["available", "available", "creating"],
         "the added node is still being provisioned, got {growing:?}"
     );
+    // The provisioned nodes report their endpoint and the one still being added
+    // does not.
     assert_eq!(
         grown.all("CacheNodes/CacheNode/Endpoint/Address").len(),
         2,
@@ -2478,13 +2495,19 @@ async fn the_documented_identifier_port_and_tag_constraints_are_enforced() {
                 reply.status, reply.body
             );
             // A `Port` inside the range is ACCEPTED; what the cluster then
-            // publishes is the port its own socket answers on, which the core
-            // assigns (see `a_created_cluster_is_read_back_from_persisted_state`).
-            // A `Port` inside the range is ACCEPTED; what the cluster then
-            // publishes is the port its own socket answers on, which the core
-            // assigns — the same port every later read of the cluster reports,
-            // which is what this asserts rather than any port at all.
-            let published = reply
+            // publishes, once its node is provisioned, is the port its own socket
+            // answers on, which the core assigns (see
+            // `a_created_cluster_is_read_back_from_persisted_state`) — the same
+            // port every later read of the cluster reports, which is what this
+            // asserts rather than any port at all.
+            let described = poll_cluster_status(
+                &emulator,
+                &format!("port {port}"),
+                &id,
+                state::STATUS_AVAILABLE,
+            )
+            .await;
+            let published = described
                 .text("ConfigurationEndpoint/Port")
                 .map(str::to_string);
             assert!(
@@ -2495,14 +2518,14 @@ async fn the_documented_identifier_port_and_tag_constraints_are_enforced() {
                 "case port {port}: the endpoint must carry the port the cache answers on, got \
                  {published:?}"
             );
-            let described = describe_cluster(&emulator, &id).await;
+            let again = describe_cluster(&emulator, &id).await;
             assert_eq!(
-                described.text("ConfigurationEndpoint/Port"),
+                again.text("ConfigurationEndpoint/Port"),
                 published.as_deref(),
                 "case port {port}: every read must report the one port the cache answers on, got \
                  {:?} then {:?}",
                 published,
-                described.text("ConfigurationEndpoint/Port")
+                again.text("ConfigurationEndpoint/Port")
             );
             assert!(
                 described
@@ -2755,13 +2778,25 @@ async fn arns_and_endpoints_name_the_region_the_request_was_signed_for() {
         // The ENDPOINT is not regional: a cache this emulator serves a RESP data
         // plane for is reached at the address its own socket answers on, which is
         // where the emulator runs rather than where the request was signed. What
-        // the signing region decides is the ARN above and the zone below.
+        // the signing region decides is the ARN above and the zone below. It is
+        // read off the SETTLED cluster, because a cluster whose nodes are still
+        // being provisioned publishes no endpoint yet.
+        let settled = poll_until(
+            &emulator,
+            region,
+            region,
+            "the cluster reaching available with its node provisioned",
+            "DescribeCacheClusters",
+            &params(&[("CacheClusterId", "regional")]),
+            |reply| reply.text("CacheCluster/CacheClusterStatus") == Some("available"),
+        )
+        .await;
         assert!(
-            created
+            settled
                 .text("ConfigurationEndpoint/Address")
                 .is_some_and(is_own_host),
             "case {region}: the endpoint must be an address the emulator answers on, got {:?}",
-            created.text("ConfigurationEndpoint/Address")
+            settled.text("ConfigurationEndpoint/Address")
         );
         assert!(
             created

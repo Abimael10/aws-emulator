@@ -492,22 +492,21 @@ impl NodeGroupRecord {
     ///
     /// `PrimaryEndpoint` / `ReaderEndpoint` are the cluster mode DISABLED
     /// group's endpoints: a cluster mode enabled group is reached through the
-    /// group's `ConfigurationEndpoint` instead. The reader endpoint exists only
-    /// where there is a replica to read from.
+    /// group's `ConfigurationEndpoint` instead. Both are reported for every
+    /// cluster mode disabled shard — the reader endpoint is where a client sends
+    /// its reads, and a shard with no replica to read from serves them from the
+    /// member holding the primary role.
     pub fn to_modeled(
         &self,
         group: &ReplicationGroupRecord,
         clusters: &BTreeMap<String, CacheClusterRecord>,
     ) -> NodeGroup {
         let per_node_endpoints = !group.cluster_enabled;
-        let has_replica = self.members.len() > 1;
         NodeGroup {
             node_group_id: Some(self.node_group_id.clone()),
             status: Some(self.status.clone()),
             primary_endpoint: per_node_endpoints.then(|| self.primary_endpoint(group, clusters)),
-            reader_endpoint: (per_node_endpoints && has_replica)
-                .then(|| self.reader_endpoint(group, clusters))
-                .flatten(),
+            reader_endpoint: per_node_endpoints.then(|| self.reader_endpoint(group, clusters)),
             slots: self.slots.clone(),
             node_group_members: Some(
                 self.members
@@ -577,23 +576,30 @@ impl NodeGroupRecord {
     }
 
     /// The endpoint a READER of this shard connects to: one of its replicas' sockets, by
-    /// the same reading as [`Self::primary_endpoint`]. `None` for a shard whose replicas
-    /// are not provisioned yet, which reports no reader endpoint.
+    /// the same reading as [`Self::primary_endpoint`]. A shard with no replica reads at the
+    /// member holding the PRIMARY role, which is where its reads are served from; where this
+    /// emulator serves no socket for the member a reader would reach, the endpoint keeps the
+    /// `replica.` name ElastiCache's own zone carries for a reader rather than the writer's.
     pub(super) fn reader_endpoint(
         &self,
         group: &ReplicationGroupRecord,
         clusters: &BTreeMap<String, CacheClusterRecord>,
-    ) -> Option<Endpoint> {
-        let replica = self
+    ) -> Endpoint {
+        let reader = self
             .members
             .iter()
-            .find(|member| member.current_role != ROLE_PRIMARY)?;
-        Some(
-            served_member_endpoint(replica, clusters).unwrap_or_else(|| Endpoint {
+            .find(|member| member.current_role != ROLE_PRIMARY)
+            .or_else(|| {
+                self.members
+                    .iter()
+                    .find(|member| member.current_role == ROLE_PRIMARY)
+            });
+        reader
+            .and_then(|member| served_member_endpoint(member, clusters))
+            .unwrap_or_else(|| Endpoint {
                 address: Some(group.reader_endpoint_address()),
                 port: Some(group.port),
-            }),
-        )
+            })
     }
 }
 
@@ -637,27 +643,13 @@ pub struct ReplicationGroupPendingValues {
 }
 
 impl ReplicationGroupPendingValues {
-    /// True when nothing is pending.
-    pub fn is_empty(&self) -> bool {
-        self.primary_cluster_id.is_none()
-            && self.automatic_failover_status.is_none()
-            && self.auth_token_status.is_none()
-            && self.user_group_ids_to_add.is_empty()
-            && self.user_group_ids_to_remove.is_empty()
-            && self.log_delivery_configurations.is_empty()
-            && self.transit_encryption_enabled.is_none()
-            && self.transit_encryption_mode.is_none()
-            && self.cluster_mode.is_none()
-    }
-
-    /// These values as the modelled shape, or `None` when nothing is pending —
-    /// a group with no deferred change reports no member rather than an empty
-    /// structure.
-    pub fn to_modeled(&self) -> Option<ReplicationGroupPendingModifiedValues> {
-        if self.is_empty() {
-            return None;
-        }
-        Some(ReplicationGroupPendingModifiedValues {
+    /// These values as the modelled shape.
+    ///
+    /// `ReplicationGroup$PendingModifiedValues` is a member ElastiCache always
+    /// serializes, so a group with nothing deferred reports the EMPTY structure
+    /// rather than no member at all; see [`PendingValues::to_modeled`].
+    pub fn to_modeled(&self) -> ReplicationGroupPendingModifiedValues {
+        ReplicationGroupPendingModifiedValues {
             primary_cluster_id: self.primary_cluster_id.clone(),
             automatic_failover_status: self.automatic_failover_status.clone(),
             // An online resharding is `ModifyReplicationGroupShardConfiguration`'s
@@ -687,7 +679,7 @@ impl ReplicationGroupPendingValues {
             transit_encryption_enabled: self.transit_encryption_enabled,
             transit_encryption_mode: self.transit_encryption_mode.clone(),
             cluster_mode: self.cluster_mode.clone(),
-        })
+        }
     }
 }
 
@@ -747,8 +739,15 @@ pub struct ReplicationGroupRecord {
     pub kms_key_id: Option<String>,
     /// [`SETTING_ENABLED`] or [`SETTING_DISABLED`].
     pub data_tiering: String,
+    /// Whether this group opts in to the next auto minor version upgrade
+    /// campaign, and which network families it runs on. All three are RESOLVED
+    /// when the group is created ([`DEFAULT_AUTO_MINOR_VERSION_UPGRADE`],
+    /// [`DEFAULT_CACHE_NETWORK_TYPE`], [`DEFAULT_CACHE_IP_DISCOVERY`]), because
+    /// ElastiCache populates each of them on every read of a group.
     pub auto_minor_version_upgrade: Option<bool>,
+    /// See [`ReplicationGroupRecord::auto_minor_version_upgrade`].
     pub network_type: Option<String>,
+    /// See [`ReplicationGroupRecord::auto_minor_version_upgrade`].
     pub ip_discovery: Option<String>,
     pub user_group_ids: Vec<String>,
     pub log_delivery_configurations: Vec<LogDeliveryRecord>,
@@ -991,15 +990,15 @@ impl ReplicationGroupRecord {
             description: Some(self.description.clone()),
             // The Global datastore this group is a member of, if the Global
             // datastore operations have made it one; see
-            // [`ReplicationGroupRecord::global_replication_group_id`].
-            global_replication_group_info: self.global_replication_group_id.as_ref().map(|id| {
-                GlobalReplicationGroupInfo {
-                    global_replication_group_id: Some(id.clone()),
-                    global_replication_group_member_role: self.global_member_role.clone(),
-                }
+            // [`ReplicationGroupRecord::global_replication_group_id`]. The
+            // structure is always serialized, so a group in no datastore reports
+            // it EMPTY rather than withholding the member.
+            global_replication_group_info: Some(GlobalReplicationGroupInfo {
+                global_replication_group_id: self.global_replication_group_id.clone(),
+                global_replication_group_member_role: self.global_member_role.clone(),
             }),
             status: Some(self.status.clone()),
-            pending_modified_values: self.pending_modified_values.to_modeled(),
+            pending_modified_values: Some(self.pending_modified_values.to_modeled()),
             member_clusters: Some(self.member_clusters()),
             node_groups: Some(
                 self.node_groups
@@ -1044,12 +1043,14 @@ impl ReplicationGroupRecord {
             arn: Some(self.arn.clone()),
             user_group_ids: (!self.user_group_ids.is_empty())
                 .then(|| self.user_group_ids.clone()),
-            log_delivery_configurations: (!self.log_delivery_configurations.is_empty()).then(|| {
+            // "Returns the destination, format and type of the logs": always
+            // serialized, so a group delivering none reports the EMPTY list.
+            log_delivery_configurations: Some(
                 self.log_delivery_configurations
                     .iter()
                     .map(LogDeliveryRecord::to_modeled)
-                    .collect()
-            }),
+                    .collect(),
+            ),
             replication_group_create_time: Some(::aws_smithy_types::DateTime::from(
                 self.created_at,
             )),

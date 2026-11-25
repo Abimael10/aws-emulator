@@ -59,6 +59,25 @@ impl CacheNodeRecord {
     }
 }
 
+/// `CacheCluster$ClientDownloadLandingPage`: "The URL of the web page where you
+/// can download the latest ElastiCache client library".
+///
+/// The console's own client-download page, which is where the library
+/// ElastiCache itself ships is downloaded from — so it is a constant of the
+/// service rather than per-cluster state.
+pub const CLIENT_DOWNLOAD_LANDING_PAGE: &str =
+    "https://console.aws.amazon.com/elasticache/home#client-download:";
+
+/// What `AutoMinorVersionUpgrade` is resolved to for a cache created without
+/// one.
+///
+/// `CacheCluster$AutoMinorVersionUpgrade` and
+/// `ReplicationGroup$AutoMinorVersionUpgrade` are both the non-optional
+/// `Boolean`, so a cache always reports one; a request that opts neither in nor
+/// out is created opted IN to the next auto minor version upgrade campaign,
+/// which is what the member then reports.
+pub const DEFAULT_AUTO_MINOR_VERSION_UPGRADE: bool = true;
+
 /// The changes a `ModifyCacheCluster` deferred to the maintenance window: the
 /// members `PendingModifiedValues` models, which are exactly the ones
 /// `ApplyImmediately` governs. A member that shape does NOT model (the
@@ -77,23 +96,15 @@ pub struct PendingValues {
 }
 
 impl PendingValues {
-    /// True when nothing is pending.
-    pub fn is_empty(&self) -> bool {
-        self.num_cache_nodes.is_none()
-            && self.cache_node_type.is_none()
-            && self.engine_version.is_none()
-            && self.cache_node_ids_to_remove.is_empty()
-            && self.scale_config.is_none()
-    }
-
-    /// These values as the modelled shape, or `None` when nothing is pending —
-    /// a cluster with no pending change reports no member rather than an empty
-    /// structure.
-    pub fn to_modeled(&self) -> Option<PendingModifiedValues> {
-        if self.is_empty() {
-            return None;
-        }
-        Some(PendingModifiedValues {
+    /// These values as the modelled shape.
+    ///
+    /// `CacheCluster$PendingModifiedValues` is a member ElastiCache always
+    /// serializes, so a cluster with nothing deferred reports the EMPTY
+    /// structure rather than no member at all: a client reads "nothing is
+    /// pending" off it instead of having to tell an absent member from an empty
+    /// one.
+    pub fn to_modeled(&self) -> PendingModifiedValues {
+        PendingModifiedValues {
             num_cache_nodes: self.num_cache_nodes,
             cache_node_ids_to_remove: (!self.cache_node_ids_to_remove.is_empty())
                 .then(|| self.cache_node_ids_to_remove.clone()),
@@ -109,7 +120,7 @@ impl PendingValues {
             log_delivery_configurations: None,
             transit_encryption_enabled: None,
             transit_encryption_mode: None,
-        })
+        }
     }
 }
 
@@ -194,8 +205,10 @@ pub struct CacheClusterRecord {
     /// on, so that filter reads stored state rather than a constant.
     pub replication_group_id: Option<String>,
     /// `CacheCluster$ReplicationGroupLogDeliveryEnabled` — whether log delivery
-    /// is enabled for the replication group this cluster belongs to. `None` on a
-    /// standalone cluster, which belongs to no group.
+    /// is enabled for the replication group this cluster belongs to. Resolved
+    /// when the cluster is created (`false` for a standalone cluster, which
+    /// belongs to no group), because the member is the non-optional `Boolean`
+    /// every read of a cluster carries.
     pub replication_group_log_delivery_enabled: Option<bool>,
     pub cache_parameter_group_name: String,
     pub snapshot_retention_limit: Option<i32>,
@@ -225,8 +238,9 @@ pub struct CacheClusterRecord {
     /// it is absent on a standalone cluster.
     pub transit_encryption_mode: Option<String>,
     /// Whether data is encrypted at rest. `CreateCacheCluster` has no member for
-    /// it, so it is absent on a standalone cluster and carries the group's
-    /// setting on a member cluster.
+    /// it, so it is resolved to the service's own default when the cluster is
+    /// created and carries the group's setting on a member cluster; it "cannot be
+    /// modified after the cluster is created".
     pub at_rest_encryption_enabled: Option<bool>,
     pub network_type: Option<String>,
     pub ip_discovery: Option<String>,
@@ -465,6 +479,27 @@ impl CacheClusterRecord {
         self.status != STATUS_CREATING && self.status != STATUS_DELETING
     }
 
+    /// Whether this cluster has an ENDPOINT to report yet.
+    ///
+    /// A cluster still being CREATED has none: `DescribeCacheClusters` documents
+    /// that "if cache nodes are currently being added to the cluster, node
+    /// endpoint information and creation time for the additional nodes are not
+    /// displayed until they are completely provisioned" — nothing is listening
+    /// for a client to be pointed at while the cluster is being built, so neither
+    /// its nodes ([`CacheNodeRecord::to_modeled`]) nor the cluster-wide spelling
+    /// of their address report one. A cluster that HAS been provisioned keeps
+    /// reporting the address it is reached at for the rest of its life, including
+    /// while it is torn down: the delete acknowledgement is a snapshot of the
+    /// cluster as it leaves.
+    ///
+    /// WHICH address that is, is [`crate::state::cache_data_plane`]'s answer: the
+    /// socket this emulator opened for the cache where it serves one, and the
+    /// name ElastiCache's own zone would carry for a cache whose clients speak a
+    /// protocol this emulator has nothing to answer with.
+    pub fn publishes_endpoint(&self) -> bool {
+        self.status != STATUS_CREATING
+    }
+
     /// Record that every node of this cluster is owed a reboot before it runs
     /// the values its cache parameter group holds: what
     /// `CacheParameterGroupStatus$ParameterApplyStatus` reports as
@@ -516,16 +551,23 @@ impl CacheClusterRecord {
     pub fn to_modeled(&self, include_nodes: bool) -> CacheCluster {
         CacheCluster {
             cache_cluster_id: Some(self.cache_cluster_id.clone()),
-            configuration_endpoint: Some(Endpoint {
+            configuration_endpoint: self.publishes_endpoint().then(|| Endpoint {
                 address: Some(self.endpoint_address.clone()),
                 port: Some(self.endpoint_port),
             }),
-            // The client-library download page is a console URL, not state this
-            // emulator holds.
-            client_download_landing_page: None,
+            // "The URL of the web page where you can download the latest
+            // ElastiCache client library": the one page ElastiCache publishes its
+            // own client library at, which is a constant of the service rather
+            // than per-cluster state, so every cluster carries it.
+            client_download_landing_page: Some(CLIENT_DOWNLOAD_LANDING_PAGE.to_string()),
             cache_node_type: self.cache_node_type.clone(),
             engine: Some(self.engine.clone()),
-            engine_version: Some(self.engine_version.clone()),
+            // "The version of the cache engine that is used in this cluster":
+            // the RELEASE the cluster runs. ElastiCache names some engine
+            // versions by their version LINE alone (`6.2`, `7.1`), which is the
+            // spelling a create has to use and the one the catalog publishes,
+            // and the cluster runs that line's release ([`patch_release`]).
+            engine_version: Some(patch_release(&self.engine, &self.engine_version).to_string()),
             cache_cluster_status: Some(self.status.clone()),
             num_cache_nodes: Some(self.num_cache_nodes),
             preferred_availability_zone: self.preferred_availability_zone(),
@@ -535,7 +577,7 @@ impl CacheClusterRecord {
             preferred_outpost_arn: None,
             cache_cluster_create_time: Some(::aws_smithy_types::DateTime::from(self.created_at)),
             preferred_maintenance_window: Some(self.preferred_maintenance_window.clone()),
-            pending_modified_values: self.pending_modified_values.to_modeled(),
+            pending_modified_values: Some(self.pending_modified_values.to_modeled()),
             notification_configuration: self.notification_topic_arn.as_ref().map(|arn| {
                 NotificationConfiguration {
                     topic_arn: Some(arn.clone()),
@@ -548,18 +590,18 @@ impl CacheClusterRecord {
             }),
             // Cache security groups (the pre-VPC, EC2-Classic mechanism) cannot
             // exist here: the whole surface is closed for this account, see
-            // [`CACHE_SECURITY_GROUPS_UNSUPPORTED`].
-            cache_security_groups: None,
+            // [`CACHE_SECURITY_GROUPS_UNSUPPORTED`] — so the list ElastiCache
+            // always serializes is reported EMPTY rather than withheld, which is
+            // how a client reads "this cluster is in none".
+            cache_security_groups: Some(Vec::new()),
             cache_parameter_group: Some(CacheParameterGroupStatus {
                 cache_parameter_group_name: Some(self.cache_parameter_group_name.clone()),
                 parameter_apply_status: Some(self.parameter_apply_status().to_string()),
                 // "A list of the cache node IDs which need to be rebooted for
-                // parameter changes to be applied": nothing to name while the
-                // nodes already run the group's current values.
-                cache_node_ids_to_reboot: {
-                    let ids = self.cache_node_ids_to_reboot();
-                    (!ids.is_empty()).then_some(ids)
-                },
+                // parameter changes to be applied": the list is always
+                // serialized, and is empty while the nodes already run the
+                // group's current values.
+                cache_node_ids_to_reboot: Some(self.cache_node_ids_to_reboot()),
             }),
             cache_subnet_group_name: self.cache_subnet_group_name.clone(),
             cache_nodes: (include_nodes && self.reports_node_detail())
@@ -585,22 +627,23 @@ impl CacheClusterRecord {
                 .auth_token_last_modified
                 .map(::aws_smithy_types::DateTime::from),
             transit_encryption_enabled: self.transit_encryption_enabled,
-            // At-rest encryption "cannot be modified after the cluster is
-            // created" and `CreateCacheCluster` has no member to set it, so a
-            // standalone cluster carries none; a replication group's member
-            // cluster carries the group's setting.
+            // At-rest and in-transit encryption, and the network members: each
+            // is resolved when the cluster is created, so a read reports the
+            // posture the cluster has rather than nothing (see
+            // [`ComAmazonawsElasticacheAmazonelasticachev9State::insert_cluster`]).
             at_rest_encryption_enabled: self.at_rest_encryption_enabled,
             arn: Some(self.arn.clone()),
-            // Log delivery "for the replication group": absent on a standalone
-            // cluster, and on a member cluster whatever its group was created
-            // with.
+            // Log delivery "for the replication group", and the configurations
+            // themselves: both are resolved when the cache is created, so the
+            // flag carries the posture this cluster was created with and the list
+            // is serialized empty for a cluster delivering no logs.
             replication_group_log_delivery_enabled: self.replication_group_log_delivery_enabled,
-            log_delivery_configurations: (!self.log_delivery_configurations.is_empty()).then(|| {
+            log_delivery_configurations: Some(
                 self.log_delivery_configurations
                     .iter()
                     .map(LogDeliveryRecord::to_modeled)
-                    .collect()
-            }),
+                    .collect(),
+            ),
             network_type: self.network_type.clone(),
             ip_discovery: self.ip_discovery.clone(),
             // The in-transit encryption MODE is set when a replication group is
