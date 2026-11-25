@@ -4,9 +4,9 @@
 //!
 //! `ScanSbom` is this service's only operation, and it answers from the advisory
 //! data held here: the seeded [`VulnRecord`] set plus the `(package_type,
-//! package_name)` lookup index built over it. A finding in a scan response is
-//! always a projection of one of these records onto one component of the
-//! submitted SBOM — never a literal in the handler.
+//! distribution, package_name)` lookup index built over it. A finding in a scan
+//! response is always a projection of one of these records onto one component of
+//! the submitted SBOM — never a literal in the handler.
 
 use sha2::Digest;
 use std::collections::{HashMap, VecDeque};
@@ -52,6 +52,15 @@ pub struct VulnRecord {
     /// The purl ecosystem this advisory applies to (`npm`, `pypi`, `maven`,
     /// `golang`, `deb`, `rpm`).
     pub package_type: String,
+    /// The distribution the packaged release this advisory was published for was
+    /// built by (`debian`, `redhat`, `alpine`), for an ecosystem that scopes its
+    /// packages by one. `None` for an ecosystem that does not: there the package
+    /// name alone, in the ecosystem's own convention, is the whole coordinate.
+    ///
+    /// Part of the coordinate the advisory is KEYED by ([`lookup_key`]), because
+    /// the same package name in another distribution is another package, with
+    /// its own advisories.
+    pub distribution: Option<String>,
     /// The affected releases, as the interval the advisory states.
     pub affected: VersionRange,
     /// The first version carrying the fix, when one has shipped.
@@ -187,8 +196,12 @@ impl ScannerBuild {
             .iter()
             .map(|record| {
                 format!(
-                    "{}|{}|{}|{}",
-                    record.package_type, record.package_name, record.cve_id, record.modified
+                    "{}|{}|{}|{}|{}",
+                    record.package_type,
+                    record.distribution.as_deref().unwrap_or_default(),
+                    record.package_name,
+                    record.cve_id,
+                    record.modified
                 )
             })
             .collect();
@@ -215,10 +228,10 @@ impl ScannerBuild {
 pub struct ComAmazonawsInspectorscanInspectorscanState {
     /// The advisory data every finding is projected from.
     pub vulnerability_db: Vec<VulnRecord>,
-    /// `(package_type, folded package_name)` -> indices into
+    /// `(package_type, distribution, folded package_name)` -> indices into
     /// `vulnerability_db`. The per-component lookup path; build it with
     /// [`build_index`] so the keys agree with [`Self::matching_advisories`].
-    pub index: HashMap<(String, String), Vec<usize>>,
+    pub index: HashMap<(String, String, String), Vec<usize>>,
     /// Completed scans, keyed for O(1) idempotent-repeat resolution. Private:
     /// the cap and the eviction order are invariants of this pair, so records
     /// go in through [`Self::record_scan`] and come out through
@@ -250,18 +263,23 @@ impl Default for ComAmazonawsInspectorscanInspectorscanState {
 }
 
 impl ComAmazonawsInspectorscanInspectorscanState {
-    /// Every advisory that applies to `package_name` in `package_type` at
-    /// `version`, as indices into [`Self::vulnerability_db`].
+    /// Every advisory that applies to `package_name` in `package_type`, built by
+    /// `distribution` where that ecosystem scopes its packages by one, at
+    /// `version` — as indices into [`Self::vulnerability_db`].
     ///
     /// An empty result is the normal answer for a package with no known
     /// advisory, and for a version that is already past the affected range.
     pub fn matching_advisories(
         &self,
         package_type: &str,
+        distribution: Option<&str>,
         package_name: &str,
         version: &str,
     ) -> Vec<usize> {
-        let Some(candidates) = self.index.get(&lookup_key(package_type, package_name)) else {
+        let Some(candidates) = self
+            .index
+            .get(&lookup_key(package_type, distribution, package_name))
+        else {
             return Vec::new();
         };
         candidates
@@ -285,9 +303,14 @@ impl ComAmazonawsInspectorscanInspectorscanState {
     /// [`Self::matching_advisories`] being empty, which means a rule was
     /// applied and the resolved version fell outside every affected range —
     /// i.e. the component was ruled on and is clean.
-    pub fn has_supported_rules(&self, package_type: &str, package_name: &str) -> bool {
+    pub fn has_supported_rules(
+        &self,
+        package_type: &str,
+        distribution: Option<&str>,
+        package_name: &str,
+    ) -> bool {
         self.index
-            .get(&lookup_key(package_type, package_name))
+            .get(&lookup_key(package_type, distribution, package_name))
             .is_some_and(|candidates| !candidates.is_empty())
     }
 
@@ -398,26 +421,42 @@ fn name_is_case_insensitive(package_type: &str) -> bool {
     )
 }
 
-/// The index key for a package coordinate: the type always folded, the name
-/// folded only where its ecosystem is case-insensitive.
-fn lookup_key(package_type: &str, package_name: &str) -> (String, String) {
+/// The index key for a package coordinate: every part of the coordinate the
+/// ecosystem names a package by, and nothing else.
+///
+/// The type is always folded, the distribution too (purl writes a namespace
+/// naming one in lowercase), and the name only where its ecosystem is
+/// case-insensitive. An ecosystem that does not scope its packages by a
+/// distribution keys on the empty distribution, so a coordinate carrying none is
+/// a DIFFERENT key from one that names a distribution rather than the same key
+/// with the value ignored.
+fn lookup_key(
+    package_type: &str,
+    distribution: Option<&str>,
+    package_name: &str,
+) -> (String, String, String) {
     let package_type = package_type.to_ascii_lowercase();
+    let distribution = distribution.unwrap_or_default().to_ascii_lowercase();
     let package_name = if name_is_case_insensitive(&package_type) {
         package_name.to_ascii_lowercase()
     } else {
         package_name.to_string()
     };
-    (package_type, package_name)
+    (package_type, distribution, package_name)
 }
 
 /// Build the advisory lookup index over `db`, keyed exactly as
 /// [`ComAmazonawsInspectorscanInspectorscanState::matching_advisories`] looks
 /// up — through [`lookup_key`], so the two cannot disagree.
-pub fn build_index(db: &[VulnRecord]) -> HashMap<(String, String), Vec<usize>> {
-    let mut index: HashMap<(String, String), Vec<usize>> = HashMap::new();
+pub fn build_index(db: &[VulnRecord]) -> HashMap<(String, String, String), Vec<usize>> {
+    let mut index: HashMap<(String, String, String), Vec<usize>> = HashMap::new();
     for (i, record) in db.iter().enumerate() {
         index
-            .entry(lookup_key(&record.package_type, &record.package_name))
+            .entry(lookup_key(
+                &record.package_type,
+                record.distribution.as_deref(),
+                &record.package_name,
+            ))
             .or_default()
             .push(i);
     }
@@ -589,6 +628,10 @@ pub fn normalize_version(version: &str) -> Option<ReleaseVersion> {
 /// base scores and vectors. The Inspector rating is the environment-adjusted
 /// score Inspector reports beside the NVD one, and the EPSS probability the
 /// exploit-prediction estimate reported beside both.
+///
+/// An OS-package record names the DISTRIBUTION the build it was published for
+/// came from, because that is part of the coordinate it applies to: the same
+/// package name built by another distribution is another package.
 fn seed_vulnerability_db() -> Vec<VulnRecord> {
     vec![
         VulnRecord {
@@ -597,6 +640,8 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
             source_url: Some("https://nvd.nist.gov/vuln/detail/CVE-2021-23337".to_string()),
             package_name: "lodash".to_string(),
             package_type: "npm".to_string(),
+            // Packages in this ecosystem are not scoped by a distribution.
+            distribution: None,
             affected: VersionRange::before(ReleaseVersion::new(4, 17, 21)),
             fixed_in_version: Some("4.17.21".to_string()),
             cvss_v3_score: 7.2,
@@ -619,6 +664,7 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
             source_url: Some("https://nvd.nist.gov/vuln/detail/CVE-2021-44906".to_string()),
             package_name: "minimist".to_string(),
             package_type: "npm".to_string(),
+            distribution: None,
             affected: VersionRange::before(ReleaseVersion::new(1, 2, 6)),
             fixed_in_version: Some("1.2.6".to_string()),
             cvss_v3_score: 9.8,
@@ -639,6 +685,7 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
             source_url: Some("https://nvd.nist.gov/vuln/detail/CVE-2021-33503".to_string()),
             package_name: "urllib3".to_string(),
             package_type: "pypi".to_string(),
+            distribution: None,
             affected: VersionRange::before(ReleaseVersion::new(1, 26, 5)),
             fixed_in_version: Some("1.26.5".to_string()),
             cvss_v3_score: 7.5,
@@ -661,6 +708,7 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
             source_url: Some("https://nvd.nist.gov/vuln/detail/CVE-2020-14343".to_string()),
             package_name: "pyyaml".to_string(),
             package_type: "pypi".to_string(),
+            distribution: None,
             affected: VersionRange::before(ReleaseVersion::new(5, 4, 0)),
             fixed_in_version: Some("5.4".to_string()),
             cvss_v3_score: 9.8,
@@ -683,6 +731,7 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
             source_url: Some("https://nvd.nist.gov/vuln/detail/CVE-2021-44228".to_string()),
             package_name: "org.apache.logging.log4j:log4j-core".to_string(),
             package_type: "maven".to_string(),
+            distribution: None,
             affected: VersionRange::between(
                 ReleaseVersion::new(2, 0, 0),
                 ReleaseVersion::new(2, 15, 0),
@@ -709,6 +758,7 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
             source_url: Some("https://nvd.nist.gov/vuln/detail/CVE-2015-7501".to_string()),
             package_name: "commons-collections:commons-collections".to_string(),
             package_type: "maven".to_string(),
+            distribution: None,
             affected: VersionRange::before(ReleaseVersion::new(3, 2, 2)),
             fixed_in_version: Some("3.2.2".to_string()),
             cvss_v3_score: 9.8,
@@ -735,6 +785,7 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
             source_url: Some("https://nvd.nist.gov/vuln/detail/CVE-2020-36518".to_string()),
             package_name: "com.fasterxml.jackson.core:jackson-databind".to_string(),
             package_type: "maven".to_string(),
+            distribution: None,
             affected: VersionRange::between(
                 ReleaseVersion::new(2, 0, 0),
                 ReleaseVersion::new(2, 12, 6),
@@ -762,6 +813,7 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
             source_url: Some("https://nvd.nist.gov/vuln/detail/CVE-2020-28483".to_string()),
             package_name: "github.com/gin-gonic/gin".to_string(),
             package_type: "golang".to_string(),
+            distribution: None,
             affected: VersionRange::before(ReleaseVersion::new(1, 7, 7)),
             fixed_in_version: Some("1.7.7".to_string()),
             cvss_v3_score: 7.5,
@@ -784,6 +836,9 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
             source_url: Some("https://nvd.nist.gov/vuln/detail/CVE-2022-3602".to_string()),
             package_name: "openssl".to_string(),
             package_type: "deb".to_string(),
+            // The advisory was published for the Debian build of the package:
+            // another distribution's `openssl` is another package.
+            distribution: Some("debian".to_string()),
             affected: VersionRange::between(
                 ReleaseVersion::new(3, 0, 0),
                 ReleaseVersion::new(3, 0, 7),
@@ -810,6 +865,7 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
             source_url: Some("https://nvd.nist.gov/vuln/detail/CVE-2023-4911".to_string()),
             package_name: "glibc".to_string(),
             package_type: "rpm".to_string(),
+            distribution: Some("redhat".to_string()),
             affected: VersionRange::between(
                 ReleaseVersion::new(2, 34, 0),
                 ReleaseVersion::new(2, 38, 1),

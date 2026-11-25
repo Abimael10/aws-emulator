@@ -7,8 +7,10 @@
 //!
 //! The whole operation is: parse the document, refuse anything that is not a
 //! CycloneDX 1.5 BOM, resolve each `components[]` entry to a package coordinate
-//! (purl ecosystem + ecosystem-canonical name + version), look that coordinate
-//! up in the state's advisory index, and render the matched advisories — plus
+//! (purl ecosystem + the distribution that ecosystem scopes its packages by,
+//! where it scopes them by one + ecosystem-canonical name + version), look that
+//! coordinate up in the state's advisory index, and render the matched
+//! advisories — plus
 //! the scan summary and the components nothing could be concluded about — in
 //! the requested `outputFormat`. Nothing in the report is a literal: every
 //! rating, CWE and fixed-in version is a field of the matched
@@ -316,7 +318,11 @@ fn skip_reason(
     if component.purl.is_some() && !resolves_to_a_scanned_package(component) {
         return Some(SkipReason::UnsupportedPurlNamespace);
     }
-    if !store.has_supported_rules(&component.package_type, &component.package_name) {
+    if !store.has_supported_rules(
+        &component.package_type,
+        component.distribution(),
+        &component.package_name,
+    ) {
         return Some(SkipReason::NoSupportedRules);
     }
     None
@@ -554,6 +560,26 @@ struct ScannedComponent {
     purl_namespace: Option<String>,
 }
 
+impl ScannedComponent {
+    /// The DISTRIBUTION part of this component's coordinate: the purl
+    /// `namespace` where the ecosystem scopes its packages by one
+    /// ([`namespace_is_distribution`]), and `None` everywhere else — either
+    /// because the ecosystem does not scope its packages that way (there the
+    /// namespace is already part of [`Self::package_name`]) or because the
+    /// coordinate carries no namespace at all.
+    ///
+    /// Derived from the resolved coordinate rather than stored beside it, so the
+    /// part of the namespace the NAME leaves out and the part the LOOKUP keys on
+    /// cannot fall out of step.
+    fn distribution(&self) -> Option<&str> {
+        if namespace_is_distribution(&self.package_type) {
+            self.purl_namespace.as_deref()
+        } else {
+            None
+        }
+    }
+}
+
 /// One `pkg:` coordinate, decomposed into the parts the purl specification
 /// names.
 ///
@@ -684,12 +710,16 @@ fn parse_purl(raw: &str) -> Option<ParsedPurl> {
 /// convention of each), and for the OS types (`deb`, `rpm`, `apk`) it is the
 /// distribution VENDOR — `debian`, `redhat`, `alpine` — which is not part of the
 /// package's name at all.
+///
+/// A namespace left out of the NAME is not left out of the COORDINATE: it is the
+/// component's distribution ([`ScannedComponent::distribution`]), which the
+/// advisory lookup is keyed by beside the type and the name.
 fn canonical_package_name(package_type: &str, namespace: Option<&str>, name: &str) -> String {
     let lowered = package_type.to_ascii_lowercase();
     match namespace {
         None => name.to_string(),
         // The vendor namespace names the distribution, not the package.
-        Some(_) if matches!(lowered.as_str(), "deb" | "rpm" | "apk") => name.to_string(),
+        Some(_) if namespace_is_distribution(&lowered) => name.to_string(),
         Some(ns) if lowered == "maven" => format!("{ns}:{name}"),
         Some(ns) => format!("{ns}/{name}"),
     }
@@ -1418,6 +1448,22 @@ const SCANNED_ECOSYSTEMS: &[(&str, &str, Namespace)] = &[
     ("apk", "OS", Namespace::Required),
 ];
 
+/// The Amazon Inspector `packageManager` the OS package ecosystems are reported
+/// under, and so the entry of [`SCANNED_ECOSYSTEMS`] that says an ecosystem's
+/// purl `namespace` names the DISTRIBUTION its packages were built by.
+const OS_PACKAGE_MANAGER: &str = "OS";
+
+/// Does a purl in this ecosystem name the DISTRIBUTION its packages were built
+/// by in its `namespace`, rather than a part of the package's own name?
+///
+/// Read off [`SCANNED_ECOSYSTEMS`] — the OS package ecosystems are exactly the
+/// ones reported under [`OS_PACKAGE_MANAGER`] — so the table that says WHICH
+/// ecosystems those are is the one that says what their namespace means.
+fn namespace_is_distribution(package_type: &str) -> bool {
+    scanned_ecosystem(package_type)
+        .is_some_and(|(package_manager, _)| package_manager == OS_PACKAGE_MANAGER)
+}
+
 /// The Inspector `packageManager` and namespace rule for a purl ecosystem this
 /// scanner scans, and `None` for an ecosystem outside [`SCANNED_ECOSYSTEMS`].
 ///
@@ -1930,16 +1976,21 @@ fn inspector_report(
             // one package, which is what one stored record is — so every match
             // on a node shares the package the node names, and a vulnerability
             // affecting two packages reports one node per package rather than
-            // one node naming whichever came first. The key also orders the
-            // nodes (by id, then by the package), so a repeat of this
-            // `@idempotent` scan answers the identical list.
-            let mut by_advisory: BTreeMap<(&str, &str, &str), Vec<&Finding>> = BTreeMap::new();
+            // one node naming whichever came first. The package is the
+            // advisory's whole coordinate, distribution included, so one
+            // vulnerability published for two distributions' builds of one name
+            // reports a node per distribution. The key also orders the nodes (by
+            // id, then by the package), so a repeat of this `@idempotent` scan
+            // answers the identical list.
+            let mut by_advisory: BTreeMap<(&str, &str, &str, &str), Vec<&Finding>> =
+                BTreeMap::new();
             for finding in findings {
                 let advisory = &finding.advisory;
                 by_advisory
                     .entry((
                         advisory.cve_id.as_str(),
                         advisory.package_type.as_str(),
+                        advisory.distribution.as_deref().unwrap_or_default(),
                         advisory.package_name.as_str(),
                     ))
                     .or_default()
@@ -2070,9 +2121,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             for component in &parsed.components {
                 if let Some(reason) = skip_reason(&store, component) {
                     skipped.insert(component.bom_ref.clone(), reason);
+                    // A component the scan drew no conclusion about reports no
+                    // finding: one report cannot both rule on a component and
+                    // declare that it was not ruled on. The lookup is skipped
+                    // rather than run and discarded, so one condition decides
+                    // both halves of the report.
+                    continue;
                 }
                 for index in store.matching_advisories(
                     &component.package_type,
+                    component.distribution(),
                     &component.package_name,
                     &component.version,
                 ) {

@@ -68,22 +68,22 @@ fn affected_release(range: &VersionRange) -> Option<String> {
     range.before_excluding.map(|_| "0.0.1".to_string())
 }
 
-/// The purl of a component `record` applies to, written so the handler's
-/// `canonical_package_name` reads the stored package name back out of it: the
-/// maven groupId and the Go module path prefix are the purl `namespace`, and the
-/// OS ecosystems name the distribution there (the package name is the last
-/// segment either way).
+/// The purl of a component `record` applies to, written so the handler resolves
+/// the stored coordinate back out of it: the maven groupId and the Go module
+/// path prefix are the purl `namespace`, and an ecosystem that scopes its
+/// packages by a distribution names the record's own distribution there (the
+/// package name is the last segment either way).
 fn purl_for(record: &VulnRecord, version: &str) -> String {
     let package_type = record.package_type.as_str();
     let name = record.package_name.as_str();
+    if let Some(distribution) = &record.distribution {
+        return format!("pkg:{package_type}/{distribution}/{name}@{version}");
+    }
     match package_type {
         "maven" => match name.split_once(':') {
             Some((group, artifact)) => format!("pkg:maven/{group}/{artifact}@{version}"),
             None => format!("pkg:maven/{name}@{version}"),
         },
-        "deb" => format!("pkg:deb/debian/{name}@{version}"),
-        "rpm" => format!("pkg:rpm/redhat/{name}@{version}"),
-        "apk" => format!("pkg:apk/alpine/{name}@{version}"),
         _ => format!("pkg:{package_type}/{name}@{version}"),
     }
 }

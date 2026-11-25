@@ -110,6 +110,8 @@ pub(crate) fn inject_advisory(
         source_url: None,
         package_name: package_name.to_string(),
         package_type: package_type.to_string(),
+        // The fixture ecosystems are not scoped by a distribution.
+        distribution: None,
         affected: VersionRange::before(ReleaseVersion::new(9, 0, 0)),
         fixed_in_version: Some("9.0.0".to_string()),
         cvss_v3_score: 5.0,

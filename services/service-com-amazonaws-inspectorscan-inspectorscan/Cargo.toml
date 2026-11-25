@@ -54,5 +54,11 @@ service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
+[dev-dependencies]
+# One integration-test target rooted at `tests/all/main.rs`: `automod` declares
+# one module per `tests/all/<name>.rs`, so a new suite is a new file with nothing
+# to declare.
+automod = { workspace = true }
+
 [lints]
 workspace = true

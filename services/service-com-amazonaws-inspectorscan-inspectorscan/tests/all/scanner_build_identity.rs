@@ -74,6 +74,8 @@ fn inject_advisory(engine: &Arc<engine::InMemoryEngine>, id: &str, package_name:
         source_url: None,
         package_name: package_name.to_string(),
         package_type: "npm".to_string(),
+        // npm packages are not scoped by a distribution.
+        distribution: None,
         affected: VersionRange::before(ReleaseVersion::new(9, 0, 0)),
         fixed_in_version: Some("9.0.0".to_string()),
         cvss_v3_score: 5.0,
