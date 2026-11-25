@@ -240,6 +240,16 @@ const REFUSALS: &[Refusal] = &[
         status: 400,
         code: "MissingParameterException",
     },
+    // A class reached through neither cited operation, so the rule is tested on the
+    // service's refusal paths rather than on the ones a divergence was seen on.
+    Refusal {
+        case: "a read of statistics this engine has not generated",
+        method: "GET",
+        uri: "/propertygraph/statistics",
+        body: None,
+        status: 400,
+        code: "StatisticsNotAvailableException",
+    },
 ];
 
 /// The body of `refusal`, as the case states it.

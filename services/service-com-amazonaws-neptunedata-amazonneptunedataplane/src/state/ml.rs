@@ -32,8 +32,8 @@ pub const ML_RESOURCE_NOT_FOUND_MESSAGE: &str =
     "Invalid ID provided. Please check whether a resource with the given ID exists.";
 
 /// The `MLResourceNotFoundException` payload for an id that names no ML resource this
-/// engine holds. `code` carries the HTTP status, which is what the member's own
-/// documentation says it is.
+/// engine holds; the error CLASS a client branches on is written from the shape's own name
+/// (see `crate::ops::types::error_message_wire`).
 pub fn ml_resource_not_found() -> MLResourceNotFoundException {
     MLResourceNotFoundException {
         detailed_message: ML_RESOURCE_NOT_FOUND_MESSAGE.to_string(),

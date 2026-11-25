@@ -56,8 +56,8 @@ pub const MODE_ENABLE_AUTO_COMPUTE: &str = "enableAutoCompute";
 pub const MODE_REFRESH: &str = "refresh";
 
 /// The `StatisticsNotAvailableException` payload for a read of statistics this engine does
-/// not hold. `code` carries the HTTP status, which is what the member's own documentation
-/// says it is.
+/// not hold; the error CLASS a client branches on is written from the shape's own name (see
+/// `crate::ops::types::error_message_wire`).
 pub fn statistics_not_available() -> StatisticsNotAvailableException {
     StatisticsNotAvailableException {
         detailed_message: STATISTICS_NOT_AVAILABLE_MESSAGE.to_string(),

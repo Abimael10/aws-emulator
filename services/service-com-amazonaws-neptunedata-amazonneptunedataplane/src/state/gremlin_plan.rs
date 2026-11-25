@@ -258,8 +258,8 @@ impl QueryRejection {
 /// The `MalformedQueryException` payload for a query this engine could not read as a
 /// Gremlin traversal. `reason` is the parser's own report of where the parse stopped and
 /// what it could not continue past (see [`super::gremlin_parse_failure`]), so the caller
-/// can fix the query from the message alone, and `code` carries the HTTP status the
-/// member's own documentation says it carries.
+/// can fix the query from the message alone; the error CLASS a client branches on is
+/// written from the shape's own name (see `crate::ops::types::error_message_wire`).
 pub fn malformed_gremlin_query(reason: &str) -> MalformedQueryException {
     MalformedQueryException {
         detailed_message: format!("Failed to interpret Gremlin query: {reason}"),

@@ -1145,13 +1145,10 @@ async fn a_gremlin_traversal_is_answered_from_the_stored_graph() {
         ),
         ("g.V('a1').id()", vec![Value::from("a1")]),
         ("g.V('a1').label()", vec![Value::from("airport")]),
-        (
-            "g.V('a1')",
-            vec![serde_json::json!({
-                "@type": "g:Vertex",
-                "@value": { "id": "a1", "label": "airport" },
-            })],
-        ),
+        // A traversal answering the ELEMENT itself carries the properties set on it as
+        // well as its id and its label, so its whole GraphSON form is asserted in
+        // `a_vertex_a_traversal_answers_carries_the_properties_the_store_holds` (and its
+        // edge counterpart) rather than here.
         (
             "g.V('a1').out('route').values('code')",
             vec![Value::from("SEA")],
@@ -1431,4 +1428,373 @@ async fn a_gremlin_traversal_that_cannot_be_evaluated_as_written_is_refused() {
         "a refused traversal must change neither the graph nor the registry, they hold \
          {held:?}"
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// The GraphSON an ELEMENT is answered as: its identity and the properties the store holds
+// for it.
+// ---------------------------------------------------------------------------------------
+
+/// One property of a seeded element: the key the store holds it under, the value it holds,
+/// and the GraphSON value a client must read back — one per value the property holds, since
+/// a vertex property may be multi-valued.
+struct PropertyCase {
+    key: &'static str,
+    stored: Value,
+    written: Vec<Value>,
+}
+
+/// One seeded element and the properties set on it.
+struct ElementCase {
+    case: &'static str,
+    id: &'static str,
+    label: &'static str,
+    properties: Vec<PropertyCase>,
+}
+
+/// The GraphSON types a property value is written as, beside [`graphson_int`] and
+/// [`graphson_count`] above: a fraction carries the double type.
+fn graphson_double(value: f64) -> Value {
+    serde_json::json!({ "@type": "g:Double", "@value": value })
+}
+
+/// The elements the two suites below read back. The rows differ along everything the rule
+/// generalises over: how many properties the element carries (none, one, several), the TYPE
+/// of each value (string, 32-bit and 64-bit whole numbers, a fraction, a boolean), and
+/// whether a property holds one value or several.
+fn element_cases() -> Vec<ElementCase> {
+    vec![
+        ElementCase {
+            case: "an element carrying no property at all",
+            id: "p-none",
+            label: "airport",
+            properties: Vec::new(),
+        },
+        ElementCase {
+            case: "one string property",
+            id: "p-one",
+            label: "airport",
+            properties: vec![PropertyCase {
+                key: "code",
+                stored: Value::from("ANC"),
+                written: vec![Value::from("ANC")],
+            }],
+        },
+        ElementCase {
+            case: "properties of several value types",
+            id: "p-typed",
+            label: "airport",
+            properties: vec![
+                PropertyCase {
+                    key: "code",
+                    stored: Value::from("SEA"),
+                    written: vec![Value::from("SEA")],
+                },
+                PropertyCase {
+                    key: "elev",
+                    stored: Value::from(433),
+                    written: vec![graphson_int(433)],
+                },
+                PropertyCase {
+                    key: "longest",
+                    stored: Value::from(2_500_000_000_i64),
+                    written: vec![graphson_count(2_500_000_000)],
+                },
+                PropertyCase {
+                    key: "lat",
+                    stored: Value::from(47.449),
+                    written: vec![graphson_double(47.449)],
+                },
+                PropertyCase {
+                    key: "international",
+                    stored: Value::Bool(true),
+                    written: vec![Value::Bool(true)],
+                },
+            ],
+        },
+        ElementCase {
+            case: "a property holding several values",
+            id: "p-multi",
+            label: "airport",
+            properties: vec![
+                PropertyCase {
+                    key: "iata",
+                    stored: Value::from(vec!["PDX", "KPDX"]),
+                    written: vec![Value::from("PDX"), Value::from("KPDX")],
+                },
+                PropertyCase {
+                    key: "code",
+                    stored: Value::from("PDX"),
+                    written: vec![Value::from("PDX")],
+                },
+            ],
+        },
+    ]
+}
+
+/// The properties of `case` as the store holds them.
+fn stored_properties(case: &ElementCase) -> std::collections::BTreeMap<String, Value> {
+    case.properties
+        .iter()
+        .map(|property| (property.key.to_string(), property.stored.clone()))
+        .collect()
+}
+
+/// Every property id the GraphSON of `vertex` reports, after asserting that each property
+/// of `case` is written as the GraphSON 3.0 vertex form carries one.
+///
+/// Source for the form: the Apache TinkerPop GraphSON 3.0 element encoding Neptune's
+/// Gremlin endpoint answers in — a vertex's `properties` is a map keyed by property name
+/// whose values are lists of `g:VertexProperty`, each carrying `id`, `value` and `label`.
+fn asserted_vertex_properties(case: &ElementCase, vertex: &Value) -> Vec<i64> {
+    let mut ids = Vec::new();
+    let held = &vertex["@value"]["properties"];
+    if case.properties.is_empty() {
+        assert!(
+            held.is_null(),
+            "case {:?}: an element carrying no property is answered without the member, \
+             got {vertex:?}",
+            case.case
+        );
+        return ids;
+    }
+    let written = held.as_object().unwrap_or_else(|| {
+        panic!(
+            "case {:?}: properties is a map keyed by property name, got {vertex:?}",
+            case.case
+        )
+    });
+    assert_eq!(
+        written.len(),
+        case.properties.len(),
+        "case {:?}: every property the store holds is reported and no other, got {vertex:?}",
+        case.case
+    );
+    for property in &case.properties {
+        let entries = written
+            .get(property.key)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            entries.len(),
+            property.written.len(),
+            "case {:?}: {} carries {} value(s), got {entries:?}",
+            case.case,
+            property.key,
+            property.written.len()
+        );
+        for (entry, value) in entries.iter().zip(&property.written) {
+            assert_eq!(
+                entry["@type"].as_str(),
+                Some("g:VertexProperty"),
+                "case {:?}: {} is written as a typed vertex property, got {entry:?}",
+                case.case,
+                property.key
+            );
+            assert_eq!(
+                &entry["@value"]["value"],
+                value,
+                "case {:?}: {} carries the value the store holds, got {entry:?}",
+                case.case,
+                property.key
+            );
+            assert_eq!(
+                entry["@value"]["label"].as_str(),
+                Some(property.key),
+                "case {:?}: a vertex property's label is its own name, got {entry:?}",
+                case.case
+            );
+            assert_eq!(
+                entry["@value"]["id"]["@type"].as_str(),
+                Some("g:Int32"),
+                "case {:?}: {} carries an id of the 32-bit type, got {entry:?}",
+                case.case,
+                property.key
+            );
+            let id = entry["@value"]["id"]["@value"].as_i64().unwrap_or(-1);
+            assert!(
+                id >= 0,
+                "case {:?}: {} carries a non-negative id, got {entry:?}",
+                case.case,
+                property.key
+            );
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+#[tokio::test]
+async fn a_vertex_a_traversal_answers_carries_the_properties_the_store_holds() {
+    let Emulator { router, engine } = emulator();
+    let cases = element_cases();
+    {
+        let state = engine.state::<ComAmazonawsNeptunedataAmazonneptunedataplaneState>();
+        let mut store = state.lock();
+        for case in &cases {
+            store
+                .graph
+                .insert_node(
+                    Some(case.id.to_string()),
+                    vec![case.label.to_string()],
+                    stored_properties(case),
+                )
+                .expect("the seeded node is within every ceiling");
+        }
+    }
+
+    let mut reported_ids: Vec<i64> = Vec::new();
+    for case in &cases {
+        let query = format!("g.V('{}')", case.id);
+        let answer = execute_gremlin(&router, &query).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {:?}: expected 200, got {} with body {:?}",
+            case.case, answer.status, answer.body
+        );
+        let data = gremlin_data(&answer);
+        assert_eq!(
+            data.len(),
+            1,
+            "case {:?}: the traversal answers the one vertex its id names, got {:?}",
+            case.case,
+            answer.body["result"]
+        );
+        let vertex = &data[0];
+        assert_eq!(
+            vertex["@type"].as_str(),
+            Some("g:Vertex"),
+            "case {:?}: an element is answered as a typed vertex, got {vertex:?}",
+            case.case
+        );
+        assert_eq!(
+            (
+                vertex["@value"]["id"].as_str(),
+                vertex["@value"]["label"].as_str()
+            ),
+            (Some(case.id), Some(case.label)),
+            "case {:?}: the vertex names the element it is, got {vertex:?}",
+            case.case
+        );
+        reported_ids.extend(asserted_vertex_properties(case, vertex));
+
+        // A read does not change what a later caller sees: the same element read again
+        // carries the same properties under the same ids.
+        let again = execute_gremlin(&router, &query).await;
+        assert_eq!(
+            gremlin_data(&again),
+            data,
+            "case {:?}: reading the element again answers the same GraphSON, got {:?}",
+            case.case,
+            again.body["result"]
+        );
+    }
+
+    // No two properties of this graph are reported under one id.
+    let minted = reported_ids.len();
+    reported_ids.sort_unstable();
+    reported_ids.dedup();
+    assert_eq!(
+        reported_ids.len(),
+        minted,
+        "each property carries an id of its own, {minted} properties carry {} ids",
+        reported_ids.len()
+    );
+}
+
+#[tokio::test]
+async fn an_edge_a_traversal_answers_carries_the_properties_the_store_holds() {
+    let Emulator { router, engine } = emulator();
+    // The edges join the same two nodes, so what differs between the rows is only the
+    // properties set on them.
+    let cases = element_cases();
+    {
+        let state = engine.state::<ComAmazonawsNeptunedataAmazonneptunedataplaneState>();
+        let mut store = state.lock();
+        for id in ["from", "to"] {
+            store
+                .graph
+                .insert_node(Some(id.to_string()), vec!["airport".to_string()], [].into())
+                .expect("the seeded node is within every ceiling");
+        }
+        for case in &cases {
+            store
+                .graph
+                .insert_relationship(
+                    Some(case.id.to_string()),
+                    "route".to_string(),
+                    "from",
+                    "to",
+                    stored_properties(case),
+                )
+                .expect("the seeded relationship is within every ceiling");
+        }
+    }
+
+    for case in &cases {
+        let answer = execute_gremlin(&router, &format!("g.E('{}')", case.id)).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {:?}: expected 200, got {} with body {:?}",
+            case.case, answer.status, answer.body
+        );
+        let data = gremlin_data(&answer);
+        assert_eq!(
+            data.len(),
+            1,
+            "case {:?}: the traversal answers the one edge its id names, got {:?}",
+            case.case,
+            answer.body["result"]
+        );
+        let edge = &data[0];
+        assert_eq!(
+            edge["@type"].as_str(),
+            Some("g:Edge"),
+            "case {:?}: an element is answered as a typed edge, got {edge:?}",
+            case.case
+        );
+        assert_eq!(
+            (
+                edge["@value"]["id"].as_str(),
+                edge["@value"]["outV"].as_str(),
+                edge["@value"]["inV"].as_str()
+            ),
+            (Some(case.id), Some("from"), Some("to")),
+            "case {:?}: the edge names itself and the nodes it joins, got {edge:?}",
+            case.case
+        );
+        let held = &edge["@value"]["properties"];
+        if case.properties.is_empty() {
+            assert!(
+                held.is_null(),
+                "case {:?}: an edge carrying no property is answered without the member, \
+                 got {edge:?}",
+                case.case
+            );
+            continue;
+        }
+        // Source: the Apache TinkerPop GraphSON 3.0 edge encoding — an edge property is
+        // single-valued, so each key carries ONE `g:Property` with the key and the value
+        // and no id of its own.
+        for property in &case.properties {
+            let entry = &held[property.key];
+            let written = if property.written.len() == 1 {
+                property.written[0].clone()
+            } else {
+                serde_json::json!({ "@type": "g:List", "@value": property.written.clone() })
+            };
+            assert_eq!(
+                entry,
+                &serde_json::json!({
+                    "@type": "g:Property",
+                    "@value": { "key": property.key, "value": written },
+                }),
+                "case {:?}: {} is written as a typed edge property carrying the value the \
+                 store holds, got {edge:?}",
+                case.case,
+                property.key
+            );
+        }
+    }
 }

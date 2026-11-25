@@ -39,7 +39,7 @@
 //! step has a host primitive to reach even if one named it. The one allocation a step may
 //! grow, and the time it may spend, are charged against that budget before the work.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use ::serde_json::Value;
@@ -362,7 +362,7 @@ impl Run<'_> {
                 "label" => self.labels(stream)?,
                 "count" => vec![Item::Count(i64::try_from(stream.len()).unwrap_or(i64::MAX))],
                 "limit" => self.limited(step, stream)?,
-                "dedup" => deduplicated(stream),
+                "dedup" => deduplicated(&self.budget, stream)?,
                 "property" => self.write_property(step, stream)?,
                 "drop" => self.drop_elements(stream)?,
                 // A modulator or a step label configures the step it follows, and this
@@ -390,7 +390,7 @@ impl Run<'_> {
             // The next result, or none when the traversal produced none.
             "next" | "tryNext" => Ok(stream.into_iter().take(1).collect()),
             "hasNext" => Ok(vec![Item::Data(Value::Bool(!stream.is_empty()))]),
-            "toSet" | "toBulkSet" => Ok(deduplicated(stream)),
+            "toSet" | "toBulkSet" => deduplicated(&self.budget, stream),
             "toList" | "toStream" | "fill" => Ok(stream),
             // The traversal is driven to exhaustion for its side effects, so it answers
             // with no result at all.
@@ -1110,48 +1110,86 @@ impl Run<'_> {
     }
 
     /// The stream as the Gremlin endpoint answers it: one GraphSON value per result.
+    ///
+    /// BOUNDED AS IT IS BUILT, so a small request cannot be answered with an arbitrarily
+    /// large response and nothing past the ceiling is ever rendered: what ONE element
+    /// contributes is charged from what the store holds for it BEFORE that element is
+    /// written (so an answer carrying a large element, or carrying the same one many
+    /// times, pays for each copy), and the running total of the whole answer is checked
+    /// against [`MAX_RESULT_CHARS`] on every result rather than once the vector exists.
     fn rendered(&self, stream: &[Item]) -> Result<Vec<Value>, TraversalFailure> {
         let mut data = Vec::with_capacity(stream.len());
         let mut rendered = 0usize;
         for item in stream {
             self.budget.charge(1)?;
+            if let Item::Vertex(id) | Item::Edge(id) = item {
+                self.budget
+                    .charge_size(self.graph.element_bytes(id), MAX_RESULT_CHARS)?;
+            }
             let value = self.graphson(item);
-            rendered = rendered.saturating_add(value.to_string().len());
+            let size = value.to_string().len();
+            self.budget.charge_size(size, MAX_RESULT_CHARS)?;
+            rendered = rendered.saturating_add(size);
+            // The whole answer, checked with this result counted in, so what is kept
+            // never passes the ceiling.
+            self.budget.charge_item(rendered, MAX_RESULT_CHARS)?;
             data.push(value);
         }
-        // The last bound: what one request may be ANSWERED with, taken on the rendered
-        // results rather than on the elements they came from.
-        self.budget.charge_size(rendered, MAX_RESULT_CHARS)?;
         Ok(data)
     }
 
     /// One result as GraphSON 3.0 writes it: a typed value, which is the form the Gremlin
     /// endpoint answers in.
+    ///
+    /// An ELEMENT is written with the properties the store holds for it as well as its id
+    /// and its label — the form every TinkerPop client reads a returned element's
+    /// properties off — so a vertex or an edge a traversal answers with carries what is
+    /// set on it rather than only its identity. An element carrying no property is written
+    /// without the member at all, which is how GraphSON distinguishes it.
     fn graphson(&self, item: &Item) -> Value {
         match item {
-            Item::Vertex(id) => ::serde_json::json!({
-                GRAPHSON_TYPE: GRAPHSON_VERTEX,
-                GRAPHSON_VALUE: {
+            Item::Vertex(id) => {
+                let mut value = ::serde_json::json!({
                     "id": id,
                     "label": self.label_of(item).unwrap_or_default(),
-                },
-            }),
+                });
+                // Read from the stored element rather than copied out of it: the
+                // properties are written straight into the answer.
+                let written = self
+                    .graph
+                    .node(id)
+                    .and_then(|node| vertex_properties(id, &node.properties));
+                if let (Some(members), Some(written)) = (value.as_object_mut(), written) {
+                    members.insert(GRAPHSON_PROPERTIES.to_string(), written);
+                }
+                ::serde_json::json!({
+                    GRAPHSON_TYPE: GRAPHSON_VERTEX,
+                    GRAPHSON_VALUE: value,
+                })
+            }
             Item::Edge(id) => {
                 let Some(relationship) = self.graph.relationship(id) else {
                     return Value::Null;
                 };
                 let from = Item::Vertex(relationship.from_node.clone());
                 let to = Item::Vertex(relationship.to_node.clone());
+                let mut value = ::serde_json::json!({
+                    "id": id,
+                    "label": relationship.rel_type.clone(),
+                    "outV": relationship.from_node.clone(),
+                    "outVLabel": self.label_of(&from).unwrap_or_default(),
+                    "inV": relationship.to_node.clone(),
+                    "inVLabel": self.label_of(&to).unwrap_or_default(),
+                });
+                if let (Some(members), Some(written)) = (
+                    value.as_object_mut(),
+                    edge_properties(&relationship.properties),
+                ) {
+                    members.insert(GRAPHSON_PROPERTIES.to_string(), written);
+                }
                 ::serde_json::json!({
                     GRAPHSON_TYPE: GRAPHSON_EDGE,
-                    GRAPHSON_VALUE: {
-                        "id": id,
-                        "label": relationship.rel_type.clone(),
-                        "outV": relationship.from_node.clone(),
-                        "outVLabel": self.label_of(&from).unwrap_or_default(),
-                        "inV": relationship.to_node.clone(),
-                        "inVLabel": self.label_of(&to).unwrap_or_default(),
-                    },
+                    GRAPHSON_VALUE: value,
                 })
             }
             // A count is a 64-bit integer whatever its value, as the Java type a counting
@@ -1176,11 +1214,109 @@ const GRAPHSON_VALUE: &str = "@value";
 /// graph structure types and the Java number types a value is written as.
 const GRAPHSON_VERTEX: &str = "g:Vertex";
 const GRAPHSON_EDGE: &str = "g:Edge";
+const GRAPHSON_VERTEX_PROPERTY: &str = "g:VertexProperty";
+const GRAPHSON_PROPERTY: &str = "g:Property";
 const GRAPHSON_LIST: &str = "g:List";
 const GRAPHSON_MAP: &str = "g:Map";
 const GRAPHSON_INT32: &str = "g:Int32";
 const GRAPHSON_INT64: &str = "g:Int64";
 const GRAPHSON_DOUBLE: &str = "g:Double";
+
+/// The member an element carries the properties set on it in, and the members one property
+/// is written with.
+const GRAPHSON_PROPERTIES: &str = "properties";
+const GRAPHSON_PROPERTY_KEY: &str = "key";
+const GRAPHSON_PROPERTY_LABEL: &str = "label";
+const GRAPHSON_PROPERTY_VALUE: &str = "value";
+const GRAPHSON_PROPERTY_ID: &str = "id";
+
+/// A vertex's `properties` map as GraphSON 3.0 writes it: keyed by property name, each
+/// key's value a LIST of `g:VertexProperty` — one per value the property holds, since a
+/// vertex property may be multi-valued — each carrying its own id, its value and the
+/// property name as its label.
+///
+/// `None` when the element carries no property at all, which is the case GraphSON leaves
+/// the member out for altogether rather than writing an empty map.
+fn vertex_properties(element_id: &str, properties: &BTreeMap<String, Value>) -> Option<Value> {
+    if properties.is_empty() {
+        return None;
+    }
+    let mut written = ::serde_json::Map::with_capacity(properties.len());
+    for (key, held) in properties {
+        // A property holding several values is a multi-property: one `g:VertexProperty`
+        // per value, which is how the same property answers one result per value in
+        // `values`.
+        let values: Vec<&Value> = match held {
+            Value::Array(items) => items.iter().collect(),
+            value => vec![value],
+        };
+        let entries: Vec<Value> = values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                ::serde_json::json!({
+                    GRAPHSON_TYPE: GRAPHSON_VERTEX_PROPERTY,
+                    GRAPHSON_VALUE: {
+                        GRAPHSON_PROPERTY_ID: typed_integer(
+                            i64::from(property_id(element_id, key, index)),
+                        ),
+                        GRAPHSON_PROPERTY_VALUE: graphson_value(value),
+                        GRAPHSON_PROPERTY_LABEL: key,
+                    },
+                })
+            })
+            .collect();
+        written.insert(key.clone(), Value::Array(entries));
+    }
+    Some(Value::Object(written))
+}
+
+/// An edge's `properties` map as GraphSON 3.0 writes it: keyed by property name, each
+/// key's value ONE `g:Property` carrying the key and the value — an edge property is
+/// single-valued, so it carries neither an id of its own nor a list.
+///
+/// `None` for an edge carrying no property, as for a vertex.
+fn edge_properties(properties: &BTreeMap<String, Value>) -> Option<Value> {
+    if properties.is_empty() {
+        return None;
+    }
+    let mut written = ::serde_json::Map::with_capacity(properties.len());
+    for (key, held) in properties {
+        written.insert(
+            key.clone(),
+            ::serde_json::json!({
+                GRAPHSON_TYPE: GRAPHSON_PROPERTY,
+                GRAPHSON_VALUE: {
+                    GRAPHSON_PROPERTY_KEY: key,
+                    GRAPHSON_PROPERTY_VALUE: graphson_value(held),
+                },
+            }),
+        );
+    }
+    Some(Value::Object(written))
+}
+
+/// The id one vertex property is reported under: a non-negative 32-bit number this engine
+/// derives from the element the property is set on, the property's name and which of the
+/// property's values it is.
+///
+/// Derived rather than stored, so it is the SAME id every read of that property reports —
+/// a property a caller reads twice does not change id — and two properties of one element,
+/// or the same property name on two elements, do not share one. Nothing the caller sends
+/// addresses a property by this id: it is what GraphSON writes in a vertex property's `id`
+/// member, and nothing authenticates on it.
+///
+/// The mixing is the shared one every derived-and-published id in this tree uses
+/// (`service_common::stable_hex_id`, SHA-256 from the `sha2` crate); the number is its
+/// leading 32 bits with the sign bit cleared, so it is a non-negative value of the type
+/// GraphSON writes an id as.
+fn property_id(element_id: &str, key: &str, index: usize) -> i32 {
+    const HEX_DIGITS_OF_32_BITS: usize = 8;
+    let mixed = ::service_common::stable_hex_id(&[element_id, key, &index.to_string()]);
+    let leading: String = mixed.chars().take(HEX_DIGITS_OF_32_BITS).collect();
+    let whole = u32::from_str_radix(&leading, 16).unwrap_or_default();
+    i32::try_from(whole & 0x7fff_ffff).unwrap_or_default()
+}
 
 /// One value as GraphSON 3.0 writes it.
 ///
@@ -1377,14 +1513,33 @@ fn literal(argument: &Argument) -> Result<Value, TraversalFailure> {
 
 /// The stream with the results it carries more than once removed, keeping the first of
 /// each — which is what a step that answers each result once answers.
-fn deduplicated(stream: Vec<Item>) -> Vec<Item> {
+///
+/// Each result is looked up in a SET of the results already kept, keyed by a canonical
+/// form of the result, so the step costs one lookup per result rather than one comparison
+/// per result per result; and each result is charged against the run's budget, so the work
+/// ceiling and the run's deadline stop this step like every other one.
+fn deduplicated(budget: &Budget, stream: Vec<Item>) -> Result<Vec<Item>, TraversalFailure> {
     let mut kept: Vec<Item> = Vec::with_capacity(stream.len());
+    let mut seen: BTreeSet<String> = BTreeSet::new();
     for item in stream {
-        if !kept.contains(&item) {
+        let key = dedup_key(&item);
+        budget.charge_size(key.len(), MAX_RESULT_CHARS)?;
+        if seen.insert(key) {
             kept.push(item);
         }
     }
-    kept
+    Ok(kept)
+}
+
+/// One result as a key a set holds it under: two results have the same key exactly when
+/// they are the same result.
+fn dedup_key(item: &Item) -> String {
+    match item {
+        Item::Vertex(id) => format!("v\u{1f}{id}"),
+        Item::Edge(id) => format!("e\u{1f}{id}"),
+        Item::Count(count) => format!("c\u{1f}{count}"),
+        Item::Data(value) => format!("d\u{1f}{value}"),
+    }
 }
 
 /// The id of the node `item` names, for a step that walks from one.
