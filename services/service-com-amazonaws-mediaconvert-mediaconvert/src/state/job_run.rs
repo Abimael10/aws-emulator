@@ -383,6 +383,11 @@ struct PlannedOutput {
 /// is made first, so a read of one job reports that job's own run rather than spending the
 /// pass on another's.
 ///
+/// The rest are made in the order the CLOCK owed them, oldest due instant first, because the
+/// next step each of those jobs is owed is the END of its run: a job whose run has been due
+/// longest is the one whose finish lands soonest, so it is made before a run that came due
+/// since rather than left behind the newer one by this pass's bound.
+///
 /// Call it with NO store guard held — it awaits.
 pub async fn run_due_job_runs<Eng: Send + Sync + 'static>(
     callback: &EmbeddedEmulator,
@@ -396,15 +401,24 @@ pub async fn run_due_job_runs<Eng: Send + Sync + 'static>(
     let now = ::std::time::SystemTime::now();
     let due: Vec<String> = {
         let guard = state.lock();
-        let mut due: Vec<String> = guard
+        // The sort key: the job the request is about, then the instant the clock owes this
+        // job its next step at — oldest first, and a job owed no instant at all last.
+        let mut due: Vec<(bool, bool, Option<::std::time::SystemTime>, String)> = guard
             .jobs
             .values()
             .filter(|job| run_is_due(job, Instant::now(), now))
-            .map(|job| job.id.clone())
+            .map(|job| {
+                (
+                    asked_about != Some(job.id.as_str()),
+                    job.settles_at.is_none(),
+                    job.settles_at,
+                    job.id.clone(),
+                )
+            })
             .collect();
-        due.sort_by_key(|id| asked_about != Some(id.as_str()));
+        due.sort();
         due.truncate(MAX_RUNS_PER_PASS);
-        due
+        due.into_iter().map(|(.., id)| id).collect()
     };
     for job_id in due {
         // The guard is taken and RELEASED around the claim, so this service's store is never

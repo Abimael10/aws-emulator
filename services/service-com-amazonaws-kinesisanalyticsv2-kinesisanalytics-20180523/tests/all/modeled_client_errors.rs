@@ -18,7 +18,8 @@
 //!   applications on: it refuses the retired SQL runtime family with
 //!   `UnsupportedOperationException`, and a withdrawn generation of the Studio-notebook
 //!   family with `InvalidArgumentException` and the deprecation sentence, whatever the
-//!   request names around it — as does an update that would move an application onto one;
+//!   request names around it and before every other rule the create applies to the request
+//!   — as does an update that would move an application onto one;
 //! * an operation that looks an application up by name reports a miss with the error code
 //!   its own model declares for that path — `ResourceNotFoundException` for the readers,
 //!   `InvalidArgumentException` for `CreateApplicationSnapshot` — and never as a 5xx;
@@ -43,8 +44,9 @@ use service_com_amazonaws_kinesisanalyticsv2_kinesisanalytics_20180523::ops::typ
 // both read one response envelope. The runtime table is plumbing too: every suite that picks
 // the runtime of a case reads from it which runtimes this API creates an application on.
 use super::harness::{
-    call, create_body, current_notebook_runtime, error_code, error_message, notebook_runtimes,
-    router, runtimes_with, RuntimeOutcome, ACCOUNT, RUNTIME_OUTCOMES, SETTLE_WAIT,
+    call, create_body, create_body_carrying, current_notebook_runtime, describe, error_code,
+    error_message, notebook_runtimes, router, runtimes_with, RuntimeOutcome, ACCOUNT,
+    RUNTIME_OUTCOMES, SETTLE_WAIT,
 };
 use super::stated_enum_value_set::NAMED_RUNTIME_ENVIRONMENT_VALUES;
 
@@ -336,17 +338,7 @@ async fn a_deprecated_runtime_is_refused_whatever_the_request_names_around_it() 
             let router = router();
             let name = "mode-independent";
             let case = format!("{runtime}/{shape}");
-            let mut body = json!({
-                "ApplicationName": name,
-                "RuntimeEnvironment": runtime,
-                "ServiceExecutionRole": "arn:aws:iam::000000000000:role/kda-service-role",
-            });
-            for (member, value) in extra
-                .as_object()
-                .expect("each row's members are a JSON object")
-            {
-                body[member] = value.clone();
-            }
+            let body = create_body_carrying(name, runtime, extra);
 
             let (status, answered) = call(&router, "CreateApplication", &body).await;
             assert_deprecation_refusal(&case, runtime, status, &answered);
@@ -454,6 +446,276 @@ async fn an_update_that_moves_an_application_onto_a_deprecated_runtime_is_refuse
              on the same runtime, got {detail}"
         );
     }
+}
+
+/// One OTHER rule `CreateApplication` applies to the request, and a request that breaks it.
+struct OtherRule {
+    /// What an assertion names this row by.
+    case: &'static str,
+    /// The members the create carries beside its name, its runtime and its role — breaking
+    /// exactly this row's rule and no other.
+    extra: Value,
+    /// The error code that rule refuses with on a runtime generation this API still creates
+    /// applications on.
+    code: &'static str,
+    /// The whole `Message` that rule refuses with there.
+    message: String,
+}
+
+/// Every rule `CreateApplication` applies to the REQUEST besides the runtime generation it
+/// names, each paired with a request that breaks exactly that one: the catalog a Studio
+/// notebook reads its tables through, the parallelism the application runs at, the
+/// user-defined tag ceiling, the form a notebook's inline code takes, and the mode the
+/// runtime runs applications in.
+///
+/// Each row's own wording is pinned by the suite that owns that rule (named on the row);
+/// what the table is here for is the PRECEDENCE between each of them and the withdrawal of
+/// the runtime generation.
+fn other_create_rules(name: &str) -> Vec<OtherRule> {
+    // A value that is not the ARN of a Glue database at all, and one naming a database of a
+    // Region other than the one the request is made in: two `DatabaseARN`s the catalog half
+    // of a notebook's create refuses on the ARN alone (`tests/all/studio_notebook_catalog.rs`).
+    const NOT_A_DATABASE_ARN: &str = "arn:aws:s3:::analytics-notes";
+    const OTHER_REGION: &str = "us-west-2";
+    // The Region `super::harness::call` signs for, which is the Region whose Data Catalog an
+    // application created through it reads.
+    const REGION: &str = "us-east-1";
+    // The ceiling on user-defined application tags this service applies
+    // (`tests/all/tags_versions_and_snapshots.rs`).
+    const USER_TAG_CEILING: usize = 50;
+    // The greatest `ParallelismPerKPU` the service runs an application at
+    // (`a_parallelism_per_kpu_past_the_supported_value_is_refused` above).
+    const SUPPORTED_PARALLELISM_PER_KPU: i32 = 8;
+
+    let over_the_ceiling: Vec<Value> = (0..=USER_TAG_CEILING)
+        .map(|index| json!({"Key": format!("key-{index}"), "Value": "v"}))
+        .collect();
+    let tag_count = over_the_ceiling.len();
+    let other_region_database_arn = format!("arn:aws:glue:{OTHER_REGION}:{ACCOUNT}:database/orders");
+
+    vec![
+        OtherRule {
+            case: "a DatabaseARN that is no Glue database ARN",
+            extra: json!({
+                "ApplicationMode": "INTERACTIVE",
+                "ApplicationConfiguration": {
+                    "ZeppelinApplicationConfiguration": {
+                        "CatalogConfiguration": {
+                            "GlueDataCatalogConfiguration": {"DatabaseARN": NOT_A_DATABASE_ARN},
+                        },
+                    },
+                },
+            }),
+            code: "InvalidArgumentException",
+            message: format!(
+                "The DatabaseARN '{NOT_A_DATABASE_ARN}' is not the ARN of a Glue Data Catalog \
+                 database"
+            ),
+        },
+        OtherRule {
+            case: "a DatabaseARN naming another Region's catalog",
+            extra: json!({
+                "ApplicationMode": "INTERACTIVE",
+                "ApplicationConfiguration": {
+                    "ZeppelinApplicationConfiguration": {
+                        "CatalogConfiguration": {
+                            "GlueDataCatalogConfiguration": {
+                                "DatabaseARN": other_region_database_arn,
+                            },
+                        },
+                    },
+                },
+            }),
+            code: "InvalidArgumentException",
+            message: format!(
+                "Incorrect region in DatabaseArn, expecting '{REGION}' but found '{OTHER_REGION}'."
+            ),
+        },
+        OtherRule {
+            case: "a ParallelismPerKPU past the value the service runs",
+            extra: json!({
+                "ApplicationMode": "INTERACTIVE",
+                "ApplicationConfiguration": {
+                    "FlinkApplicationConfiguration": {
+                        "ParallelismConfiguration": {
+                            "ConfigurationType": "CUSTOM",
+                            "ParallelismPerKPU": SUPPORTED_PARALLELISM_PER_KPU + 1,
+                        },
+                    },
+                },
+            }),
+            code: "InvalidArgumentException",
+            message: format!(
+                "FlinkApplicationParallelismPerKPU provided for the application {name} should be \
+                 a positive integer and should not be larger than the supported limit \
+                 {SUPPORTED_PARALLELISM_PER_KPU}"
+            ),
+        },
+        OtherRule {
+            case: "more user-defined tags than are allowed",
+            extra: json!({"ApplicationMode": "INTERACTIVE", "Tags": over_the_ceiling}),
+            code: "TooManyTagsException",
+            message: format!(
+                "{tag_count} tags were supplied; at most {USER_TAG_CEILING} user-defined \
+                 application tags are allowed"
+            ),
+        },
+        OtherRule {
+            case: "inline code that is not a Zeppelin note",
+            extra: json!({
+                "ApplicationMode": "INTERACTIVE",
+                "ApplicationConfiguration": {
+                    "ApplicationCodeConfiguration": {
+                        "CodeContentType": "PLAINTEXT",
+                        "CodeContent": {"TextContent": "%flink.ssql\nSELECT 1"},
+                    },
+                },
+            }),
+            code: "InvalidArgumentException",
+            message: "Zeppelin application code provided in TextContent must be a valid Zeppelin \
+                      note JSON object containing 'id' and 'name' fields"
+                .to_string(),
+        },
+        OtherRule {
+            // The mode of the other kind of application, which the notebook runtime of the
+            // control below does not run applications in.
+            case: "the mode the runtime does not run applications in",
+            extra: json!({"ApplicationMode": "STREAMING"}),
+            code: "InvalidArgumentException",
+            message: format!(
+                "Invalid configuration provided. ApplicationMode 'STREAMING' is not applicable \
+                 to runtime environment : {}",
+                current_notebook_runtime()
+            ),
+        },
+    ]
+}
+
+/// The withdrawal of the runtime generation is decided BEFORE every other rule
+/// `CreateApplication` applies to the request, so a request that also breaks one of those is
+/// still told that the generation is gone — the remedy the other refusal would point at
+/// cannot work while the runtime is withdrawn.
+///
+/// Every row is driven twice: once on the generation this API still creates a notebook on,
+/// where it draws the other rule's own refusal (which is what makes the row a request
+/// another rule would answer), and once on each withdrawn generation, where the same request
+/// draws the deprecation sentence and stores nothing.
+#[tokio::test]
+async fn the_deprecation_refusal_is_answered_before_every_other_create_rule() {
+    let name = "precedence-probe";
+    for rule in other_create_rules(name) {
+        // The control: one engine for it, so "nothing was stored" is read off a store only
+        // this call wrote to.
+        let supported = current_notebook_runtime();
+        let control = router();
+        let case = format!("{supported}/{}", rule.case);
+        let (status, answered) = call(
+            &control,
+            "CreateApplication",
+            &create_body_carrying(name, supported, &rule.extra),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&answered).as_str()),
+            (400, rule.code),
+            "case {case}: expected the rule's own refusal, got {status} {answered}"
+        );
+        assert_eq!(
+            error_message(&answered),
+            rule.message,
+            "case {case}: expected the rule's own message, got {answered}"
+        );
+        assert_nothing_stored(&control, &case, name).await;
+
+        for runtime in deprecated_runtimes() {
+            let router = router();
+            let case = format!("{runtime}/{}", rule.case);
+            let (status, answered) = call(
+                &router,
+                "CreateApplication",
+                &create_body_carrying(name, runtime, &rule.extra),
+            )
+            .await;
+            assert_deprecation_refusal(&case, runtime, status, &answered);
+            assert_nothing_stored(&router, &case, name).await;
+        }
+    }
+}
+
+/// The withdrawal is a property of the REQUEST, decided before the store is read for the
+/// name, so a create naming a withdrawn generation under a name an application already
+/// occupies draws the deprecation sentence rather than the name-in-use refusal — and the
+/// application already stored under that name is left exactly as it was.
+///
+/// The control is the same second create on a generation this API still creates applications
+/// on, which is the call that does reach the name.
+#[tokio::test]
+async fn a_deprecated_runtime_is_refused_before_the_name_is_looked_up() {
+    let name = "occupied-name";
+    let stored_runtime = current_notebook_runtime();
+
+    for runtime in deprecated_runtimes() {
+        let router = router();
+        let case = format!("{runtime} over {stored_runtime}");
+        let (status, created) = call(
+            &router,
+            "CreateApplication",
+            &create_body(name, stored_runtime),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: CreateApplication got {status} {created}"
+        );
+
+        let (status, answered) = call(
+            &router,
+            "CreateApplication",
+            &create_body_carrying(name, runtime, &json!({"ApplicationMode": "INTERACTIVE"})),
+        )
+        .await;
+        assert_deprecation_refusal(&case, runtime, status, &answered);
+
+        let detail = describe(&router, name).await;
+        assert_eq!(
+            (
+                detail["RuntimeEnvironment"].as_str(),
+                detail["ApplicationVersionId"].as_i64()
+            ),
+            (Some(stored_runtime), Some(1)),
+            "case {case}: expected the stored application to be left as it was, got {detail}"
+        );
+    }
+
+    // The control: a second create on a supported generation is the one that reaches the
+    // name, and is refused for the name.
+    let router = router();
+    let (status, created) = call(
+        &router,
+        "CreateApplication",
+        &create_body(name, stored_runtime),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case control: CreateApplication got {status} {created}"
+    );
+    let (status, answered) = call(
+        &router,
+        "CreateApplication",
+        &create_body(name, stored_runtime),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&answered).as_str()),
+        (400, "ResourceInUseException"),
+        "case control: expected the name to be reported in use, got {status} {answered}"
+    );
+    assert_eq!(
+        error_message(&answered),
+        format!("Application '{name}' already exists."),
+        "case control: expected the in-use sentence, got {answered}"
+    );
 }
 
 // ---------------------------------------------------------------------------

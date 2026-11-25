@@ -26,8 +26,12 @@
 //! the DUE instant, not the instant the pump happened to wake up, and the pump performs no
 //! work of its own: it applies the very same settle every reporting door applies.
 //!
-//! Each wake-up settles the store and then drains the queue of recorded changes
-//! ([`super::publish_pending`]) with NO store guard held: EventBridge is reached through the
+//! Each wake-up makes the runs the clock has already made due, settles the store and then
+//! drains the queue of recorded changes ([`super::publish_pending`]) with NO store guard
+//! held: that is the order every reporting door applies them in, and a run is made before
+//! what is due is materialised because a job's run is owed from the instant it leaves its
+//! queue's backlog — a wake-up that found both steps of one run due would otherwise end a
+//! job whose outputs nothing had produced yet. EventBridge is reached through the
 //! framework's in-process callback, and a target the event sets off may call back into this
 //! service, so holding the store across the publication would deadlock the call the event
 //! set off.
@@ -228,16 +232,20 @@ pub fn drive_job_clock<Eng: Send + Sync + 'static>(
                 .unwrap_or_default()
                 .clamp(MIN_CLOCK_WAIT, MAX_CLOCK_WAIT);
             ::tokio::time::sleep(wait).await;
+            // The runs the clock has already made due, made BEFORE what is due is
+            // materialised — the order every reporting door applies them in
+            // (`crate::ops::get_job`): a job's run is owed from the instant it leaves its
+            // queue's backlog, so a wake-up that finds both steps of one run due has to make
+            // the run before it ends it, or the job would be finished as a job nothing ran
+            // ([`super::run_due_job_runs`]). With no store guard held, as the publication
+            // below is. A client that reacts to a job on an EventBridge rule makes no further
+            // MediaConvert call, so its job's transcode cannot wait for a read that never
+            // comes.
+            super::run_due_job_runs(&callback, &*engine, &region, None).await;
             // The same settle every reporting door makes, at the instant the pump woke: it
             // applies what the clock had already made due and nothing else.
             state.lock().settle(SystemTime::now());
             super::publish_pending(&callback, &*engine, &region).await;
-            // And the run every job that has BEGUN is owed: a client that reacts to a job
-            // on an EventBridge rule makes no further MediaConvert call, so its job's
-            // transcode cannot wait for a read that never comes
-            // ([`super::run_due_job_runs`]). With no store guard held, as the publication
-            // above is.
-            super::run_due_job_runs(&callback, &*engine, &region, None).await;
         }
         if capped {
             // Only THIS pump's claim, so a pump started since is left holding its own.

@@ -136,6 +136,25 @@ pub(crate) fn create_body(name: &str, runtime: &str) -> Value {
     })
 }
 
+/// A `CreateApplication` body carrying `extra`'s members beside the three every create needs
+/// — the name, the runtime and the service-execution role — so a case can name the
+/// `ApplicationMode`, leave it out, or carry a configuration of its own. The sibling of
+/// [`create_body`] for a suite whose rows differ in what they carry around the runtime.
+pub(crate) fn create_body_carrying(name: &str, runtime: &str, extra: &Value) -> Value {
+    let mut body = json!({
+        "ApplicationName": name,
+        "RuntimeEnvironment": runtime,
+        "ServiceExecutionRole": "arn:aws:iam::000000000000:role/kda-service-role",
+    });
+    for (member, value) in extra
+        .as_object()
+        .expect("each row's members are a JSON object")
+    {
+        body[member] = value.clone();
+    }
+    body
+}
+
 /// The `ApplicationMode` an application on `runtime` runs in: `INTERACTIVE` for the
 /// Studio-notebook (Zeppelin) runtime family, `STREAMING` for every other.
 pub(crate) fn runtime_mode(runtime: &str) -> &'static str {
