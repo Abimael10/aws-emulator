@@ -244,8 +244,8 @@ pub use metrics::{
 };
 pub mod sqs_poller;
 pub use sqs_poller::{
-    batch_is_due, claim_poll_passes, drive_sqs_pollers, poll_due, poll_passes_once, PollSession,
-    POLL_INTERVAL,
+    batch_is_due, claim_poll_passes, drive_sqs_pollers, poll_due, poll_passes_once,
+    records_of_one_read, PollSession, POLL_INTERVAL,
 };
 
 /// And [`mq_poller`] for a mapping on an Amazon MQ for RabbitMQ broker, whose queue hands the

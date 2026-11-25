@@ -858,13 +858,17 @@ impl DrivenPolling {
     /// batch it took has been handed to its function and what the attempt came to is
     /// recorded.
     pub(crate) async fn poll_once(&mut self) {
-        poll_passes_once(
-            &self.callback,
-            &mut self.session,
-            &self.engine,
-            SystemTime::now(),
-        )
-        .await;
+        self.poll_once_at(SystemTime::now()).await;
+    }
+
+    /// [`Self::poll_once`] with the instant the pass is made AT named by the caller.
+    ///
+    /// For a suite whose rule is about records that become available at instants of their OWN —
+    /// a send that states a `DelaySeconds` of its own makes its message available that much
+    /// later — so the pass can be made at an instant past them instead of the suite waiting for
+    /// the clock to reach it.
+    pub(crate) async fn poll_once_at(&mut self, now: SystemTime) {
+        poll_passes_once(&self.callback, &mut self.session, &self.engine, now).await;
     }
 }
 

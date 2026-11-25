@@ -29,7 +29,15 @@
 //!   spends gathering records before invoking the function" — holds a batch it has not
 //!   filled for up to that long, taking up what arrives meanwhile, so its function is
 //!   invoked with the records that accumulated over the window rather than with each as it
-//!   arrives ([`gathered`]). A poll also
+//!   arrives ([`gathered`]). That window is the ONLY span over which records that became
+//!   available at different instants are merged into one batch: one read of a queue answers
+//!   with the records that are available when it is made, so it takes the records that were
+//!   available TOGETHER ([`records_of_one_read`]) — every record already waiting when the
+//!   mapping's reads opened, up to `BatchSize`, and otherwise the arrival that ended the wait —
+//!   and the records that arrive while the batch it found is being handed to the function
+//!   belong to the next read. A mapping that spends no time gathering therefore invokes its
+//!   function with one arrival's records, however much its `BatchSize` would admit, and a
+//!   mapping that states a window is the one that merges arrivals. A poll also
 //!   applies what the queue's own `RedrivePolicy` owes first, so a
 //!   message that has had every delivery that policy allows is moved to the dead-letter
 //!   queue the policy names instead of being handed over again. The reads of that poll are
@@ -111,6 +119,12 @@
 //! the store's poll claim ([`claim_poll_passes`], which keeps those pollers from starting at
 //! all) and then makes each pass with [`poll_passes_once`]: the same work, awaited rather
 //! than raced.
+//!
+//! That cadence is also the GRANULARITY of a read: this emulator looks at a queue on
+//! [`POLL_INTERVAL`], so two arrivals closer than that are arrivals no two of its reads could
+//! have fallen between, and one read takes both however short the window the mapping gathers
+//! over ([`ONE_READ_SPREAD`]). The interval and that floor are this emulator's own spans, like
+//! the other spans this module owns, and no number Lambda publishes.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -138,6 +152,17 @@ use super::{
 /// It is deliberately non-zero, so the loop hands the runtime back between wake-ups instead
 /// of spinning, and short enough that a caller watching its queue sees the mapping consume.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How far apart two records may have become available on a queue and still be taken by ONE
+/// read of it, whatever batching window the mapping gathers over.
+///
+/// An EMULATOR-CHOSEN floor, for the same reason as [`POLL_INTERVAL`] — this is the span that
+/// interval makes a read of a queue able to tell apart. A read AWS makes returns as soon as
+/// the queue has records ("if a message is available, the call returns sooner than
+/// `WaitTimeSeconds`"), so it takes the records that were available TOGETHER; this emulator's
+/// reads are made on that interval, so two records that became available closer than one
+/// interval apart are records one read could not have been made between.
+const ONE_READ_SPREAD: Duration = POLL_INTERVAL;
 
 /// How often the hold on a batch an attempt is still running on is renewed, at the fastest.
 ///
@@ -272,6 +297,14 @@ pub struct PollSession {
     /// with a `MaximumBatchingWindowInSeconds` of its own, whose batch is neither full nor
     /// out of time yet.
     gathering: BTreeMap<String, Gathering>,
+    /// For each mapping, the instant its reads of its source BEGAN — the first pass that read
+    /// it, and afresh when a pass could take nothing out of it at all, because the reads a
+    /// refusal withheld are reads the mapping did not make.
+    ///
+    /// What one read of a source finds WAITING is decided against it ([`records_of_one_read`]):
+    /// a backlog is what was already there when the reading began, and everything after it is
+    /// an arrival the reading was open for.
+    reading_since: BTreeMap<String, SystemTime>,
     /// For each mapping, the minute (epoch seconds divided by sixty) its last 0-valued poll
     /// count was published in.
     idle_minute: BTreeMap<String, i64>,
@@ -300,6 +333,7 @@ impl ::std::fmt::Debug for PollSession {
         formatter
             .debug_struct("PollSession")
             .field("gathering", &self.gathering)
+            .field("reading_since", &self.reading_since)
             .field("idle_minute", &self.idle_minute)
             .field("failures", &self.failures)
             .finish_non_exhaustive()
@@ -575,6 +609,14 @@ async fn poll_mapping_due<Eng: Send + Sync + 'static>(
     let polling: ::std::collections::BTreeSet<String> =
         targets.iter().map(|target| target.uuid.clone()).collect();
     session.gathering.retain(|uuid, _| polling.contains(uuid));
+    // A mapping this pass polls is one whose reads are open from this pass on, unless they were
+    // already open: what is waiting on its source when they open is the backlog one read takes
+    // ([`records_of_one_read`]), and a mapping that stopped polling begins afresh when it polls
+    // again.
+    session.reading_since.retain(|uuid, _| polling.contains(uuid));
+    for uuid in &polling {
+        session.reading_since.entry(uuid.clone()).or_insert(now);
+    }
     // And it is bookkeeping of nobody's: a mapping this pass does not poll has no idle minute
     // to claim and no run of failures to count, so what this session remembers about it is let
     // go with it rather than kept for the life of the store.
@@ -599,6 +641,10 @@ async fn poll_mapping_due<Eng: Send + Sync + 'static>(
             // over again once their hold lapses — rather than being handed over later, under
             // receipt handles that lapsed with it, by a pass whose window has long run.
             session.gathering.remove(&target.uuid);
+            // And it is not READING it either, so its reads begin again when the grant is
+            // back: what accumulated meanwhile is a backlog, exactly as it is for a mapping
+            // that has just begun polling.
+            session.reading_since.insert(target.uuid.clone(), now);
             continue;
         }
         // How long one delivery of this queue's messages hides them for, which is also the
@@ -640,6 +686,9 @@ async fn poll_mapping_due<Eng: Send + Sync + 'static>(
             // The batch this pass took is let go rather than kept for a later pass, for the
             // reason a withheld read lets one go: its receipt handles lapse with the hold.
             session.gathering.remove(&target.uuid);
+            // And the reads begin again when the key can be used, for the same reason as a
+            // withheld read above.
+            session.reading_since.insert(target.uuid.clone(), now);
             continue;
         }
         // What the filter admits of each batch, decided before any of them is handed over: a
@@ -827,6 +876,14 @@ fn due_batches(
     now: SystemTime,
     hold_seconds: i64,
 ) -> Due {
+    // When this mapping's reads of its source opened, which is what decides what ONE of them
+    // finds waiting ([`records_of_one_read`]); this pass's instant for a mapping whose reads
+    // open here.
+    let reading_since = session
+        .reading_since
+        .get(&target.uuid)
+        .copied()
+        .unwrap_or(now);
     let mut batches: Vec<Vec<PolledMessage>> = Vec::new();
     while batches.len() < target.in_flight_batches {
         let polled = take_batch(
@@ -835,6 +892,7 @@ fn due_batches(
             now,
             gathering_room(session, target),
             hold_seconds,
+            reading_since,
         );
         match gathered(session, target, polled, now) {
             Gathered::Due(polled) => batches.push(polled),
@@ -1107,6 +1165,55 @@ pub fn batch_is_due(
     gathered > 0 && (gathered >= batch_size || waited >= window)
 }
 
+/// How many of the records a queue would hand over ONE read of it takes, given the instant
+/// each of those records became AVAILABLE in the order the queue hands them over, the instant
+/// the mapping's reads of that queue BEGAN, and the batching window it gathers a batch over.
+///
+/// A read of a queue returns the records that are available when it is made — "if a message is
+/// available, the call returns sooner than `WaitTimeSeconds`"
+/// (`ReceiveMessageRequest$WaitTimeSeconds`) — so it takes the records that were available
+/// together and not the ones that become available after it has answered. The only span over
+/// which records that became available at DIFFERENT instants are merged into one batch is
+/// therefore "the maximum amount of time, in seconds, that Lambda spends gathering records
+/// before invoking the function" (`MaximumBatchingWindowInSeconds`): a mapping that spends no
+/// time gathering hands over the records of one read, so its batch holds only records that
+/// were available together — and never records that arrived a window apart, however much its
+/// `BatchSize` would admit.
+///
+/// The read OPENS at `reading_since`, the instant the mapping began reading this source
+/// ("Lambda reads items from the event source and invokes the function", which it does for as
+/// long as the mapping is enabled), and answers as soon as a record is available. So the two
+/// cases a backlog and a trickle are:
+///
+/// * a record that was ALREADY waiting when the read opened is one the read is answered with
+///   at that instant, so every record waiting then goes in one batch, up to `BatchSize` —
+///   which is the backlog a mapping made, re-enabled or granted its reads again finds;
+/// * a record that becomes available after the read opened ends the wait itself, so the read
+///   is answered then and the records that become available later belong to the next read.
+///
+/// Hence the span is counted from the later of `reading_since` and the first record of the
+/// read, and is never shorter than [`ONE_READ_SPREAD`], the span this emulator's reads can
+/// tell apart at all.
+///
+/// `pub` because it is the whole of what ONE read of a queue takes, stated in one place, and
+/// the counterpart of [`batch_is_due`], which decides when what was gathered goes.
+#[must_use]
+pub fn records_of_one_read(
+    available_since: &[SystemTime],
+    reading_since: SystemTime,
+    window: Duration,
+) -> usize {
+    let spread = window.max(ONE_READ_SPREAD);
+    let Some(first) = available_since.first().copied() else {
+        return 0;
+    };
+    let opened = first.max(reading_since);
+    available_since
+        .iter()
+        .take_while(|since| since.duration_since(opened).unwrap_or_default() <= spread)
+        .count()
+}
+
 /// The batching window a mapping gathers ONE batch over: "the maximum amount of time, in
 /// seconds, that Lambda spends gathering records before invoking the function"
 /// (`MaximumBatchingWindowInSeconds`).
@@ -1195,6 +1302,7 @@ fn take_batch(
     now: SystemTime,
     room: usize,
     hold_seconds: i64,
+    reading_since: SystemTime,
 ) -> Vec<PolledMessage> {
     if room == 0 {
         return Vec::new();
@@ -1216,6 +1324,12 @@ fn take_batch(
     let Some(queue) = store.queue_by_arn_mut(&target.queue_arn) else {
         return Vec::new();
     };
+    // ONE read takes the records that were available TOGETHER, inside the span the mapping
+    // gathers a batch over ([`records_of_one_read`]): the records that become available while
+    // this pass is handing the last batch to the function are the next read's, not this one's,
+    // so a mapping that spends no time gathering never merges arrivals a window apart into one
+    // invocation.
+    let room = one_read_room(queue, now, room, target.batching_window, reading_since);
     // The batch is hidden for as long as this poller holds it: the window it is gathered
     // over and the attempt it is then handed to; see `invisible_for_seconds`, and
     // [`renew_hold`] for the attempt that outlasts one span of it.
@@ -1231,6 +1345,32 @@ fn take_batch(
             })
         })
         .collect()
+}
+
+/// How many messages of `queue` ONE read of it takes at `now`: the ones available together
+/// inside the span `window` admits, counted from the later of `reading_since` and the first of
+/// them ([`records_of_one_read`]), of the at most `room` messages the queue would hand over.
+///
+/// Each candidate's availability instant is the QUEUE's own reading of it
+/// ([`sqs::state::StoredMessage::available_since`]), so this reader compares the instants the
+/// service that owns the messages keeps rather than deriving them here.
+fn one_read_room(
+    queue: &sqs::state::Queue,
+    now: SystemTime,
+    room: usize,
+    window: Duration,
+    reading_since: SystemTime,
+) -> usize {
+    let instants: Vec<SystemTime> = queue
+        // The candidates are the messages the queue may hand over at `now`, so each one's
+        // availability instant is one that has passed; a message still in flight is not among
+        // them.
+        .delivery_order(now, room)
+        .into_iter()
+        .filter_map(|index| queue.messages.get(index))
+        .map(sqs::state::StoredMessage::available_since)
+        .collect();
+    records_of_one_read(&instants, reading_since, window)
 }
 
 /// How long one delivery of `target`'s queue hides the messages it hands over for, in
@@ -1949,6 +2089,7 @@ mod tests {
             sender_id: "AIDACKCEVSQ6C2EXAMPLE".to_string(),
             available_at: at_millis(SENT_AT_MILLIS),
             invisible_until: None,
+            visible_again_at: None,
             receive_count: 1,
             queue_receive_count: 1,
             first_received_at: Some(at_millis(FIRST_RECEIVED_AT_MILLIS)),

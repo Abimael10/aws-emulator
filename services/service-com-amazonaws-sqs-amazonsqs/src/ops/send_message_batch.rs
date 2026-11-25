@@ -555,6 +555,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 sender_id: sender_id.clone(),
                 available_at: sqs::after(now, prepared.delay),
                 invisible_until: None,
+                // Nothing has held it yet, so its availability is its delay elapsing alone.
+                visible_again_at: None,
                 receive_count: 0,
                 queue_receive_count: 0,
                 first_received_at: None,

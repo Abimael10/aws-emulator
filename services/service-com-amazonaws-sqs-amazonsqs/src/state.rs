@@ -1048,6 +1048,16 @@ pub struct StoredMessage {
     /// Set by a receive to `now + effective visibility timeout`; cleared once the clock
     /// passes it.
     pub invisible_until: Option<SystemTime>,
+    /// When the hold a delivery of this message took LAPSED, for a message that has had one
+    /// and is visible again: the instant that delivery hid it until, kept when the clock's own
+    /// bookkeeping clears the hold ([`ComAmazonawsSqsAmazonsqsState::materialise_due`]) so the
+    /// instant the message became available again outlives it. `None` for a message no
+    /// delivery has hidden and come back from.
+    ///
+    /// Every message of one delivery shares it, because one delivery hides its whole batch
+    /// until the same instant — which is what makes a batch that came back available
+    /// together. See [`StoredMessage::available_since`].
+    pub visible_again_at: Option<SystemTime>,
     /// How many times the message has been handed to a consumer without being deleted.
     /// Counted across every queue that has held it — "the number of times a message has
     /// been received across all queues but not deleted" (`ApproximateReceiveCount`) — so
@@ -1097,6 +1107,30 @@ impl StoredMessage {
             .len()
             .saturating_add(message_attribute_bytes(&self.message_attributes))
             .saturating_add(message_system_attribute_bytes(&self.message_system_attributes))
+    }
+
+    /// When this message became AVAILABLE to a consumer: the instant from which a receive
+    /// may hand it over.
+    ///
+    /// Its delay elapsing makes it available ([`available_at`](Self::available_at)), and a
+    /// delivery that hid it makes it available again when the hold that delivery took lapses —
+    /// the instant that hold was set to, whether the clock's bookkeeping has cleared it yet
+    /// ([`invisible_until`](Self::invisible_until)) or already has
+    /// ([`visible_again_at`](Self::visible_again_at)). So the latest of the three is the
+    /// instant from which this message has been continuously available, which is what a
+    /// consumer deciding which messages were available TOGETHER compares.
+    ///
+    /// For a message in flight the hold has not lapsed, so this answers the instant it is held
+    /// until: a message no receive may hand over yet.
+    pub fn available_since(&self) -> SystemTime {
+        let mut since = self.available_at;
+        if let Some(until) = self.invisible_until {
+            since = since.max(until);
+        }
+        if let Some(again) = self.visible_again_at {
+            since = since.max(again);
+        }
+        since
     }
 
     /// Where this message stands at `now`.
@@ -1827,6 +1861,10 @@ impl Queue {
         }
         for message in &mut self.messages {
             if message.invisible_until.is_some_and(|until| now >= until) {
+                // The hold lapsed AT the instant it was set to, which is when the message
+                // became available again: kept so clearing the hold does not lose it
+                // ([`StoredMessage::available_since`]).
+                message.visible_again_at = message.invisible_until;
                 message.invisible_until = None;
             }
         }
@@ -2811,6 +2849,9 @@ impl ComAmazonawsSqsAmazonsqsState {
                     // of that queue can take it: it is deliverable from the move.
                     available_at: now,
                     invisible_until: None,
+                    // It is available from the move, so the hold a delivery by the queue it
+                    // has left took is no part of when it became available here.
+                    visible_again_at: None,
                     // The deliveries it had from the queue it has left are not deliveries
                     // of this one; its cross-queue `receive_count` is untouched.
                     queue_receive_count: 0,
@@ -3007,6 +3048,9 @@ impl ComAmazonawsSqsAmazonsqsState {
                     // it, and a consumer of that queue can take it.
                     available_at: now,
                     invisible_until: None,
+                    // It is available from the move, so a hold the source queue's own
+                    // delivery took is no part of when it became available here.
+                    visible_again_at: None,
                     // Retention in the destination runs from the move, which is when that
                     // queue enqueued it, and so does the per-queue delivery count its own
                     // `RedrivePolicy` bounds: the deliveries the source queue made were
