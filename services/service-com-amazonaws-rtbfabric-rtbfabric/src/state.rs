@@ -137,10 +137,16 @@ pub const GATEWAY_STATUS_DELETED: &str = "DELETED";
 /// The message this service's `ResourceNotFoundException` carries: fixed text
 /// naming neither the resource asked for nor its id.
 ///
-/// Every not-found path of this service answers with it — a gateway of either
-/// kind, a link, a routing rule, a certificate association — so the refusal says
-/// the same thing whichever resource was addressed, and no path echoes an id the
-/// caller supplied back at them.
+/// EVERY not-found path of this service answers with it, for every kind of
+/// resource this store holds — a gateway of either kind, a link between two
+/// gateways, a link with one end outside the fabric (the outbound external links
+/// a requester gateway opens and the inbound external links a responder gateway
+/// takes), a routing rule, a certificate association — and whichever call
+/// addressed it: a read, a create resolving the gateway it is addressed to, an
+/// update or a delete. So the refusal says the same thing whichever resource was
+/// addressed, and no path echoes an id the caller supplied back at them. The rule
+/// is the wording, not the list: a handler added for a resource this store does
+/// not hold yet words its not-found the same way.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The requested resource was not found.";
 
 /// `LinkStatus` member: creation is accepted, the link is not carrying traffic

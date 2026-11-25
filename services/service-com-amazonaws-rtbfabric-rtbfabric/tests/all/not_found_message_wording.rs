@@ -8,14 +8,21 @@
 //! with HTTP 404 and ONE fixed message — it names neither the kind of resource asked
 //! for nor any id, ARN or other value the request carried.
 //!
-//! The table spans what the rule generalises over: every operation of this service
-//! that can answer not-found (gateway reads, deletes, the link surface, the
-//! routing-rule surface and the certificate surface), each addressed with ids that
-//! satisfy the modelled patterns so the existence check is what refuses, and with ids
-//! of several forms — minted-looking, shortest the pattern admits, and one carrying
-//! every character class — so a message built from the request would show up whatever
-//! the request said.
+//! The table spans what the rule generalises over: every implemented operation of
+//! this service that can answer not-found — the gateway surface (reads, updates and
+//! deletes of either kind), the link surface between two gateways (read, create,
+//! accept, reject, update, module flow, delete and the per-gateway listing), the two
+//! external-link surfaces (the outbound links a requester gateway opens and the
+//! inbound links a responder gateway takes), the routing-rule surface and the
+//! certificate surface — so a refusal is pinned for every KIND of resource the store
+//! holds and for every kind of call that resolves one (read, create, update, delete,
+//! list). Each is addressed with ids that satisfy the modelled patterns so the
+//! existence check is what refuses, and with ids of several forms — minted-looking,
+//! shortest the pattern admits, and one carrying every character class — so a message
+//! built from the request would show up whatever the request said. Only the four
+//! operations that are still scaffolded (they answer 501) are absent.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -112,9 +119,17 @@ fn log_settings() -> Value {
     json!({ "applicationLogs": { "sampling": { "errorLog": 100.0, "filterLog": 0.0 } } })
 }
 
-/// Every call of this service that can answer not-found, for one (gateway, link,
-/// rule) triple nothing minted: the operation's name, its method, its path and its
-/// body.
+/// A `ModuleConfigurationList` entry with the one member `ModuleConfiguration`
+/// requires, as `smithy_query(query="shape", shape="ModuleConfiguration")` declares
+/// it: `name` (pattern `^[A-Za-z0-9 -]+$`) required, `version` optional (pattern
+/// `^[a-z0-9-]{1,25}$`).
+fn modules() -> Value {
+    json!([{ "name": "Bid Enrichment", "version": "v1-0" }])
+}
+
+/// Every implemented call of this service that can answer not-found, for one
+/// (gateway, link, rule) triple nothing minted: the operation's name, its method, its
+/// path and its body.
 fn calls(gateway_id: &str, link_id: &str, rule_id: &str) -> Vec<(String, &'static str, String, Option<Value>)> {
     let certificate = format!(
         "/responder-gateway/{gateway_id}/certificate?acmCertificateArn={}",
@@ -204,7 +219,100 @@ fn calls(gateway_id: &str, link_id: &str, rule_id: &str) -> Vec<(String, &'stati
             None,
         ),
         ("DisassociateCertificate".to_string(), "DELETE", certificate, None),
+        (
+            "DeleteLinkRoutingRule".to_string(),
+            "DELETE",
+            format!("/responder-gateway/{gateway_id}/link/{link_id}/routing-rule/{rule_id}"),
+            None,
+        ),
+        (
+            "ListLinks".to_string(),
+            "GET",
+            format!("/gateway/{gateway_id}/links/"),
+            None,
+        ),
+        (
+            "UpdateLink".to_string(),
+            "PATCH",
+            format!("/gateway/{gateway_id}/link/{link_id}"),
+            Some(json!({ "logSettings": log_settings(), "timeoutInMillis": 250 })),
+        ),
+        (
+            "UpdateLinkModuleFlow".to_string(),
+            "POST",
+            format!("/gateway/{gateway_id}/link/{link_id}/module-flow"),
+            Some(json!({ "clientToken": "token-module-flow", "modules": modules() })),
+        ),
+        (
+            "UpdateRequesterGateway".to_string(),
+            "POST",
+            format!("/requester-gateway/{gateway_id}/update"),
+            Some(json!({ "clientToken": "token-requester-update", "description": "a updated gateway" })),
+        ),
+        (
+            "UpdateResponderGateway".to_string(),
+            "POST",
+            format!("/responder-gateway/{gateway_id}/update"),
+            Some(json!({
+                "clientToken": "token-responder-update",
+                "port": 443,
+                "protocol": "HTTPS",
+            })),
+        ),
+        // The two external-link surfaces: an outbound link is opened from a
+        // requester gateway, an inbound link arrives at a responder gateway, and
+        // either pair naming nothing the store holds is this same refusal.
+        (
+            "CreateOutboundExternalLink".to_string(),
+            "POST",
+            format!("/requester-gateway/{gateway_id}/outbound-external-link"),
+            Some(json!({
+                "clientToken": "token-outbound-external-link",
+                "publicEndpoint": "https://bidder.example.com/rtb",
+                "logSettings": log_settings(),
+            })),
+        ),
+        (
+            "GetOutboundExternalLink".to_string(),
+            "GET",
+            format!("/requester-gateway/{gateway_id}/outbound-external-link/{link_id}"),
+            None,
+        ),
+        (
+            "DeleteOutboundExternalLink".to_string(),
+            "DELETE",
+            format!("/requester-gateway/{gateway_id}/outbound-external-link/{link_id}"),
+            None,
+        ),
+        (
+            "CreateInboundExternalLink".to_string(),
+            "POST",
+            format!("/responder-gateway/{gateway_id}/inbound-external-link"),
+            Some(json!({
+                "clientToken": "token-inbound-external-link",
+                "logSettings": log_settings(),
+            })),
+        ),
+        (
+            "GetInboundExternalLink".to_string(),
+            "GET",
+            format!("/responder-gateway/{gateway_id}/inbound-external-link/{link_id}"),
+            None,
+        ),
     ]
+}
+
+#[test]
+fn the_table_names_each_operation_once() {
+    // A row added twice would hide an operation the table forgot behind a
+    // misleading count, so the table's names are distinct.
+    let mut seen: HashSet<String> = HashSet::new();
+    for (operation, _, _, _) in calls("rtb-gw-a", "link-a", "rule-a") {
+        assert!(
+            seen.insert(operation.clone()),
+            "case {operation:?}: expected each operation once in the table, got it twice"
+        );
+    }
 }
 
 #[tokio::test]
