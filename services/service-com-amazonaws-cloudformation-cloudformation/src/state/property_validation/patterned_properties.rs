@@ -117,6 +117,46 @@ pub const PATTERNED_PROPERTIES: &[PatternedProperty] = &[
         property: "Name",
         pattern: r"^[ A-Za-z0-9_-]{1,50}$",
     },
+    // `AWS::BackupGateway::Hypervisor`'s properties, in the order its own property reference
+    // publishes them, each held to the form Backup Gateway publishes for the member of
+    // `ImportHypervisorConfiguration`/`UpdateHypervisor` the property is passed to, which this
+    // type's schema states verbatim, anchors and all.
+    //
+    // `Host` is "the server host of the hypervisor", whose published form is any non-empty line
+    // (`@pattern("^.+$")`).
+    PatternedProperty {
+        resource_type: crate::state::template::BACKUP_GATEWAY_HYPERVISOR,
+        property: "Host",
+        pattern: r"^.+$",
+    },
+    // `KmsKeyArn` is the key the hypervisor's credentials are encrypted with, published as a
+    // KMS key or alias ARN, or a bare alias.
+    PatternedProperty {
+        resource_type: crate::state::template::BACKUP_GATEWAY_HYPERVISOR,
+        property: "KmsKeyArn",
+        pattern: r"^(^arn:(aws|aws-cn|aws-us-gov):kms:([a-zA-Z0-9-]+):([0-9]+):(key|alias)/(\S+)$)|(^alias/(\S+)$)$",
+    },
+    // `LogGroupArn` is the group the hypervisor reports into — the member only
+    // `UpdateHypervisor` carries — published as a CloudWatch Logs log-group ARN or the empty
+    // value that clears it.
+    PatternedProperty {
+        resource_type: crate::state::template::BACKUP_GATEWAY_HYPERVISOR,
+        property: "LogGroupArn",
+        pattern: r"^$|^arn:(aws|aws-cn|aws-us-gov):logs:([a-zA-Z0-9-]+):([0-9]+):log-group:[a-zA-Z0-9_\-\/\.]+:\*$",
+    },
+    // `Name` is the name of the hypervisor, over the alphabet that service publishes for it
+    // (`@pattern("^[a-zA-Z0-9-]*$")` with `@length(1..100)`, the bound being a constraint class
+    // this stage does not judge).
+    PatternedProperty {
+        resource_type: crate::state::template::BACKUP_GATEWAY_HYPERVISOR,
+        property: "Name",
+        pattern: r"^[a-zA-Z0-9-]*$",
+    },
+    // The type's `Username` and `Password` publish a pattern too, and are deliberately NOT
+    // rows: both are `@sensitive` members of the owning API, and what this stage reports for a
+    // value outside its pattern names the property it judged — so a credential outside its own
+    // form is left to the service that owns the resource, which refuses it without this stage
+    // having to carry it.
 ];
 
 /// `Some(failure)` for a resource carrying a property value outside the pattern its type's
@@ -140,7 +180,10 @@ pub(super) fn value_outside_its_pattern(resource: &StoredResource) -> Option<Pro
             Some(PropertyFailure {
                 logical_id: resource.logical_id.clone(),
                 resource_type: resource.resource_type.clone(),
-                reason: pattern_failure_reason(declared, row.pattern),
+                reason: pattern_failure_reason(
+                    super::reported_value(&resource.resource_type, declared),
+                    row.pattern,
+                ),
                 path: property_path(&resource.logical_id, row.property),
             })
         })
@@ -156,12 +199,13 @@ fn declared_text<'a>(resource: &'a StoredResource, property: &str) -> Option<&'a
 }
 
 /// How CloudFormation reports a property value outside the pattern its type's schema states:
-/// fixed text around the VALUE the declaration carried and the pattern it does not match.
+/// fixed text around the value that was judged and the pattern it does not match.
 ///
-/// Both variable parts come from what was judged — the value is the declaration's own, the
-/// pattern the one its property is held to ([`PATTERNED_PROPERTIES`]) — and the value is
-/// quoted back here, unlike the set-membership failure this stage also reports, because a
-/// spelling is only actionable beside the form it had to be in.
+/// Both variable parts come from what was judged — the pattern is the one its property is held
+/// to ([`PATTERNED_PROPERTIES`]) and the value the declaration's own, as far as a failure of
+/// this stage may say it ([`super::reported_value`]) — and the value is named here, unlike the
+/// set-membership failure this stage also reports, because a spelling is only actionable
+/// beside the form it had to be in.
 pub fn pattern_failure_reason(value: &str, pattern: &str) -> String {
     format!("Property value [{value}] does not match pattern: {pattern}")
 }
@@ -346,6 +390,54 @@ mod tests {
                 json!({"HsmType": "hsm1.medium", "SubnetIds": ["subnet-0a1b2c3d"]}),
                 None,
             ),
+            // A type that carries CREDENTIALS among its properties: the same judgement, and
+            // the value reported as far as such a document may say it
+            // ([`super::super::reported_value`], which the expectation below applies too).
+            (
+                "a hypervisor whose name carries a character its alphabet does not admit",
+                crate::state::template::BACKUP_GATEWAY_HYPERVISOR,
+                json!({"Host": "10.0.0.5", "Name": "a_hypervisor"}),
+                Some(("Name", "a_hypervisor")),
+            ),
+            (
+                "a hypervisor whose name is over letters, digits and the hyphen",
+                crate::state::template::BACKUP_GATEWAY_HYPERVISOR,
+                json!({"Host": "10.0.0.5", "Name": "vcenter-01"}),
+                None,
+            ),
+            (
+                "a hypervisor whose host is the empty value its form does not admit",
+                crate::state::template::BACKUP_GATEWAY_HYPERVISOR,
+                json!({"Host": "", "Name": "empty-host"}),
+                Some(("Host", "")),
+            ),
+            (
+                "a hypervisor whose encryption key is no key ARN or alias",
+                crate::state::template::BACKUP_GATEWAY_HYPERVISOR,
+                json!({"Host": "10.0.0.5", "Name": "bad-key",
+                       "KmsKeyArn": "not-a-key-arn"}),
+                Some(("KmsKeyArn", "not-a-key-arn")),
+            ),
+            (
+                "a hypervisor whose encryption key is a bare alias, which its form admits",
+                crate::state::template::BACKUP_GATEWAY_HYPERVISOR,
+                json!({"Host": "10.0.0.5", "Name": "key-alias",
+                       "KmsKeyArn": "alias/backup-gateway"}),
+                None,
+            ),
+            (
+                "a hypervisor whose log group is no log-group ARN",
+                crate::state::template::BACKUP_GATEWAY_HYPERVISOR,
+                json!({"Host": "10.0.0.5", "Name": "bad-log-group",
+                       "LogGroupArn": "not-a-log-group-arn"}),
+                Some(("LogGroupArn", "not-a-log-group-arn")),
+            ),
+            (
+                "a hypervisor whose log group is the empty value its form admits",
+                crate::state::template::BACKUP_GATEWAY_HYPERVISOR,
+                json!({"Host": "10.0.0.5", "Name": "unlogged", "LogGroupArn": ""}),
+                None,
+            ),
         ];
         for (case, resource_type, properties, reported) in rows {
             let resources = vec![declared("R", resource_type, properties.clone())];
@@ -357,7 +449,10 @@ mod tests {
                     .map(|row| row.pattern)
                     .unwrap_or_default();
                 (
-                    pattern_failure_reason(value, pattern),
+                    pattern_failure_reason(
+                        super::super::reported_value(resource_type, value),
+                        pattern,
+                    ),
                     format!("/Resources/R/Properties/{property}"),
                 )
             });

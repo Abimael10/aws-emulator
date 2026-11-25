@@ -20,14 +20,15 @@
 //! template spelling (JSON with long-form intrinsics, YAML with the short-form tags), and how
 //! many hypervisors one stack declares.
 //!
-//! The refusal rows differ along the CLASS of constraint the declaration violates: a `Name`
-//! outside its modelled pattern, a `Name` longer than its modelled maximum, a `Host` shorter
-//! than its modelled minimum, a `KmsKeyArn` that is no key ARN, and a `LogGroupArn` that is no
-//! log-group ARN — the last of which the IMPORT does not carry, so it is the follow-up
-//! `UpdateHypervisor` that refuses it and the hypervisor already minted has to be taken away
-//! again. Each is the owning service's own refusal, reported on the resource that failed —
-//! never the `Template format error: Unrecognized resource types` a type CloudFormation does
-//! not know is refused with, which no row of either table may ever see.
+//! The refusal rows differ along the CLASS of constraint the declaration violates, and along
+//! WHERE that class is decided. A value outside the pattern the type's own schema publishes —
+//! a `Name` over the wrong alphabet, a `KmsKeyArn` that is no key ARN, a `LogGroupArn` that is
+//! no log-group ARN — is refused by the stage that runs BEFORE any provider is invoked, so
+//! nothing is imported at all and the operation's own validation event carries the detail. A
+//! constraint that stage does not judge — a `Name` longer than its modelled maximum, a `Host`
+//! shorter than its modelled minimum — reaches Backup Gateway, whose own refusal fails the
+//! resource. Neither is ever the `Template format error: Unrecognized resource types` a type
+//! CloudFormation does not know is refused with, which no row of any table here may see.
 //!
 //! Every wait here is a wait for a CONDITION — the stack's own status — under a deadline
 //! generous enough that a loaded host cannot decide the outcome; nothing asserts how long a
@@ -39,9 +40,15 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
+use service_com_amazonaws_cloudformation_cloudformation::state::property_validation::patterned_properties::{
+    pattern_failure_reason, PATTERNED_PROPERTIES,
+};
+use service_com_amazonaws_cloudformation_cloudformation::state::property_validation::{
+    PROPERTY_VALIDATION, REDACTED_VALUE,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::query_wire::{elements, form_encode, opt_element, outputs_of};
+use crate::query_wire::{elements, form_encode, members_of, opt_element, outputs_of};
 
 /// The region every request here is signed for, and so the region the stacks and their
 /// hypervisors belong to.
@@ -67,6 +74,10 @@ const HYPERVISOR: &str = "AWS::BackupGateway::Hypervisor";
 /// The fixed text CloudFormation refuses a template declaring a type it does NOT know with,
 /// which is what the defect this suite pins answered for a type AWS publishes.
 const UNRECOGNIZED_TYPES: &str = "Unrecognized resource types";
+
+/// The `EventType` a validation result is reported under, from the model's own `EventType`
+/// enum (`smithy_query(query="shape", shape="EventType")`).
+const VALIDATION_ERROR: &str = "VALIDATION_ERROR";
 
 /// The `HypervisorState` a hypervisor Backup Gateway has reached is in: "The possible states
 /// are `PENDING`, `ONLINE`, `OFFLINE`, or `ERROR`" (`HypervisorDetails$State`).
@@ -761,16 +772,8 @@ fn over_long_name() -> Value {
 }
 
 const REFUSED: &[Refused] = &[
-    // The issue's own refusal: a name carrying a character outside the type's documented
-    // pattern.
-    Refused {
-        case: "a name outside the modelled pattern",
-        stack_name: "backup-gateway-hypervisor-bad-name",
-        properties: || json!({ "Host": "10.0.0.40", "Name": "a hypervisor!" }),
-        clause: "at 'name' failed to satisfy constraint: Member must satisfy regular \
-                 expression pattern: [a-zA-Z0-9-]*",
-    },
-    // The same member, one constraint class over: a name past its modelled maximum length.
+    // A constraint the stage that runs before provisioning does not judge: a name past its
+    // modelled maximum length, which is Backup Gateway's own to refuse.
     Refused {
         case: "a name past the modelled maximum length",
         stack_name: "backup-gateway-hypervisor-long-name",
@@ -785,37 +788,6 @@ const REFUSED: &[Refused] = &[
         properties: || json!({ "Host": "ab", "Name": "short-host-hypervisor" }),
         clause: "at 'host' failed to satisfy constraint: Member must have length greater \
                  than or equal to 3",
-    },
-    // A key reference that is no KMS ARN at all, which is the third member class the import
-    // constrains.
-    Refused {
-        case: "an encryption key that is no KMS key ARN",
-        stack_name: "backup-gateway-hypervisor-bad-key",
-        properties: || {
-            json!({
-                "Host": "10.0.0.42",
-                "Name": "bad-key-hypervisor",
-                "KmsKeyArn": "arn:aws:kms:us-east-1:000000000000:not-a-key/0123456789abcdef",
-            })
-        },
-        clause: "at 'kmsKeyArn' failed to satisfy constraint: Member must satisfy regular \
-                 expression pattern:",
-    },
-    // A log group that is no log-group ARN: the one declared property the IMPORT does not
-    // carry, so this refusal is the follow-up `UpdateHypervisor`'s — the hypervisor the import
-    // had already minted is taken away again, which is what the empty listing below asserts.
-    Refused {
-        case: "a log group that is no log-group ARN",
-        stack_name: "backup-gateway-hypervisor-bad-log-group",
-        properties: || {
-            json!({
-                "Host": "10.0.0.43",
-                "Name": "bad-log-group-hypervisor",
-                "LogGroupArn": "not-a-log-group-arn",
-            })
-        },
-        clause: "at 'logGroupArn' failed to satisfy constraint: Member must satisfy regular \
-                 expression pattern:",
     },
 ];
 
@@ -864,6 +836,145 @@ async fn a_declaration_backup_gateway_refuses_rolls_the_stack_back() {
         );
 
         // And nothing was imported: Backup Gateway holds no hypervisor at all.
+        let listed = list_hypervisors(&router).await;
+        assert!(
+            listed.is_empty(),
+            "case {case:?}: expected Backup Gateway to hold no hypervisor, got {listed:?}"
+        );
+    }
+}
+
+/// One row of the table the stage BEFORE provisioning refuses: a declaration carrying a value
+/// outside the pattern the type's own schema publishes for that property, and the property it
+/// is about.
+struct RefusedBeforeProvisioning {
+    case: &'static str,
+    stack_name: &'static str,
+    properties: fn() -> Value,
+    /// The property the validation must name, whose pattern the value does not match.
+    property: &'static str,
+}
+
+const REFUSED_BEFORE_PROVISIONING: &[RefusedBeforeProvisioning] = &[
+    // The issue's own refusal: a name carrying a character outside the type's documented
+    // alphabet.
+    RefusedBeforeProvisioning {
+        case: "a name outside the published alphabet",
+        stack_name: "backup-gateway-hypervisor-bad-name",
+        properties: || json!({ "Host": "10.0.0.40", "Name": "a hypervisor!" }),
+        property: "Name",
+    },
+    // A key reference that is no KMS ARN at all, which is the second property class the type's
+    // schema publishes a form for.
+    RefusedBeforeProvisioning {
+        case: "an encryption key that is no KMS key ARN",
+        stack_name: "backup-gateway-hypervisor-bad-key",
+        properties: || {
+            json!({
+                "Host": "10.0.0.42",
+                "Name": "bad-key-hypervisor",
+                "KmsKeyArn": "arn:aws:kms:us-east-1:000000000000:not-a-key/0123456789abcdef",
+            })
+        },
+        property: "KmsKeyArn",
+    },
+    // A log group that is no log-group ARN: the one declared property the IMPORT does not
+    // carry, which this stage judges all the same, since it judges the DECLARATION rather than
+    // one call's members.
+    RefusedBeforeProvisioning {
+        case: "a log group that is no log-group ARN",
+        stack_name: "backup-gateway-hypervisor-bad-log-group",
+        properties: || {
+            json!({
+                "Host": "10.0.0.43",
+                "Name": "bad-log-group-hypervisor",
+                "LogGroupArn": "not-a-log-group-arn",
+            })
+        },
+        property: "LogGroupArn",
+    },
+];
+
+/// One element of an answered event, decoded — a reason quoting a value names it as the XML
+/// document escapes it, and what the assertion is about is the text a client reads.
+fn decoded(event: &str, name: &str) -> String {
+    elements(event, name).into_iter().next().unwrap_or_default()
+}
+
+/// A declaration carrying a value outside the pattern its type publishes never reaches Backup
+/// Gateway at all: the stage that runs before any provider is invoked refuses it, the stack
+/// rolls back, and the operation's own events carry the validation result — the resource, the
+/// pattern, the property's own path, and the value as far as a type carrying credentials among
+/// its properties may disclose it.
+#[tokio::test]
+async fn a_value_outside_its_published_pattern_is_refused_before_anything_is_imported() {
+    for row in REFUSED_BEFORE_PROVISIONING {
+        let router = build_router();
+        let case = row.case;
+        let template = json!({
+            "Resources": {
+                "Hypervisor": { "Type": HYPERVISOR, "Properties": (row.properties)() }
+            },
+            "Outputs": {"HypervisorRef": {"Value": {"Ref": "Hypervisor"}}}
+        })
+        .to_string();
+
+        let body = create_and_settle(&router, case, row.stack_name, &template).await;
+        assert_eq!(
+            opt_element(&body, "StackStatus").as_deref(),
+            Some("ROLLBACK_COMPLETE"),
+            "case {case:?}: expected the refused declaration to be rolled back rather than \
+             publish an ARN Backup Gateway never minted, got {body}"
+        );
+        assert!(
+            outputs_of(&body).is_empty(),
+            "case {case:?}: expected no output for a resource nothing created, got {body}"
+        );
+
+        let (_, events) =
+            cloudformation(&router, "DescribeEvents", &[("StackName", row.stack_name)]).await;
+        assert!(
+            !events.contains(UNRECOGNIZED_TYPES),
+            "case {case:?}: expected no template-format error for a type AWS publishes, got \
+             {events}"
+        );
+        let reported: Vec<(String, String, String, String, String, String)> =
+            members_of(&events)
+                .into_iter()
+                .filter(|event| opt_element(event, "EventType").as_deref() == Some(VALIDATION_ERROR))
+                .map(|event| {
+                    (
+                        decoded(event, "LogicalResourceId"),
+                        decoded(event, "ValidationName"),
+                        decoded(event, "ValidationStatus"),
+                        decoded(event, "ValidationFailureMode"),
+                        decoded(event, "ValidationStatusReason"),
+                        decoded(event, "ValidationPath"),
+                    )
+                })
+                .collect();
+        let pattern = PATTERNED_PROPERTIES
+            .iter()
+            .find(|catalogued| {
+                catalogued.resource_type == HYPERVISOR && catalogued.property == row.property
+            })
+            .map(|catalogued| catalogued.pattern)
+            .unwrap_or_else(|| panic!("case {case:?}: the pattern of the property is catalogued"));
+        assert_eq!(
+            reported,
+            vec![(
+                "Hypervisor".to_string(),
+                PROPERTY_VALIDATION.to_string(),
+                "FAILED".to_string(),
+                "FAIL".to_string(),
+                pattern_failure_reason(REDACTED_VALUE, pattern),
+                format!("/Resources/Hypervisor/Properties/{}", row.property),
+            )],
+            "case {case:?}: expected the one validation result the refused value owes, got \
+             {reported:?} in {events}"
+        );
+
+        // And nothing was asked of Backup Gateway: it holds no hypervisor at all.
         let listed = list_hypervisors(&router).await;
         assert!(
             listed.is_empty(),

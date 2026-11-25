@@ -243,7 +243,10 @@ pub(super) fn value_outside_its_enum(resource: &StoredResource) -> Option<Proper
             Some(PropertyFailure {
                 logical_id: resource.logical_id.clone(),
                 resource_type: resource.resource_type.clone(),
-                reason: enum_failure_reason(rejected, row.values),
+                reason: enum_failure_reason(
+                    super::reported_value(&resource.resource_type, rejected),
+                    row.values,
+                ),
                 path: element_path(&resource.logical_id, row.property, at),
             })
         })
@@ -284,12 +287,13 @@ fn judged_values(declared: Option<&Value>) -> Vec<(Option<usize>, &str)> {
 }
 
 /// How the schema validator reports a value outside the set its property's schema states:
-/// fixed text around the VALUE the declaration carried and the values the property admits.
+/// fixed text around the value that was judged and the values the property admits.
 ///
-/// Both variable parts are what was judged — the value is the declaration's own, the set the
-/// one its property is held to ([`ENUM_PROPERTIES`]) — and the value is quoted back, as it is
-/// for a value outside its pattern, because a rejected value is only actionable beside the
-/// set it had to be in.
+/// Both variable parts are what was judged — the set is the one its property is held to
+/// ([`ENUM_PROPERTIES`]) and the value the declaration's own, as far as a failure of this stage
+/// may say it ([`super::reported_value`]) — and the value is named, as it is for a value
+/// outside its pattern, because a rejected value is only actionable beside the set it had to be
+/// in.
 pub fn enum_failure_reason(value: &str, values: &[&str]) -> String {
     format!(
         "{value} is not a valid enum value. Supported values: [{}]",

@@ -33,12 +33,15 @@
 //!
 //! ## What a declaration that service refuses does
 //!
-//! Nothing here checks a declared value: every constraint on the import's members is that
-//! operation's own — the hypervisor's `Name` is `^[a-zA-Z0-9-]*$` with `@length(1..100)`,
-//! its `Host` `^.+$` with `@length(3..128)`, its `KmsKeyArn` the KMS ARN pattern — so a
-//! declaration outside one of them is refused BY Backup Gateway, and that refusal is what
-//! fails the resource and rolls the stack back. One check in one place, worded as that
-//! service words it.
+//! Nothing here checks a declared value. A value outside the FORM one of those members
+//! publishes — the hypervisor's `Name` over `^[a-zA-Z0-9-]*$`, its `Host` over `^.+$`, its
+//! `KmsKeyArn` the KMS ARN pattern, its `LogGroupArn` the log-group one — is a value no handler
+//! of the type could be given, so the stage that runs before any provider is invoked refuses it
+//! and this arm is never reached at all
+//! ([`crate::state::property_validation::patterned_properties`]). Every other constraint on
+//! those members is that operation's own — their lengths among them — so a declaration outside
+//! one of them is refused BY Backup Gateway, and that refusal is what fails the resource and
+//! rolls the stack back. One check in one place, worded as the side that owns it words it.
 
 use super::*;
 

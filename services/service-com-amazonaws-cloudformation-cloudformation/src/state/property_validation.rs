@@ -63,6 +63,13 @@
 //! the order the deployment would have created them — so the failure reported is the one the
 //! operation would have run into first.
 //!
+//! How much of a JUDGED VALUE a failure says is one rule for the whole stage
+//! ([`reported_value`]): the two questions whose answer names the value — the set its property
+//! publishes and the spelling it admits — report the declaration's own value for a type whose
+//! property document is the template's own text, and report it redacted for a type that carries
+//! credentials among its properties ([`CREDENTIAL_PROPERTIES`]), whose document carries
+//! material the template does not state in the clear.
+//!
 //! What the STACK reports for a failure of this stage is not one of those reasons but the
 //! summary over them ([`validation_failure_summary`]): the count of errors, and that the
 //! detail of each is on the operation's own events, which is where each failure is recorded.
@@ -134,6 +141,66 @@ pub mod structured_properties;
 /// own validator reports a value outside them with — including a LIST-valued property, whose
 /// every element is held to the set.
 pub mod enum_properties;
+
+/// One resource type that carries CREDENTIALS among its properties: the members a declaration
+/// supplies and no read of the owning service ever answers, because that service's own model
+/// marks them `@sensitive`.
+#[derive(Debug, Clone, Copy)]
+pub struct CredentialProperties {
+    /// The resource type, as a template declares it.
+    pub resource_type: &'static str,
+    /// Its properties the owning API holds write-only, in the order it publishes them.
+    pub credentials: &'static [&'static str],
+}
+
+/// The types this stage knows to carry credentials among their properties.
+///
+/// Source for each row: the `@sensitive` members of the operation the type's declaration is
+/// carried onto, which the type's registry schema keeps write-only for the same reason — a
+/// value a client writes and nothing reads back.
+///
+/// What the rows decide is how much of a judged value a FAILURE of this stage may say
+/// ([`reported_value`]): the property document of a resource of such a type carries material
+/// the author did not put in the template in the clear (a credential resolved for the
+/// deployment), so a failure on any property of it names the property and the condition and
+/// reports the value itself as [`REDACTED_VALUE`], while a type whose whole document is the
+/// template's own text has its value quoted back.
+pub const CREDENTIAL_PROPERTIES: &[CredentialProperties] = &[
+    // `AWS::BackupGateway::Hypervisor` carries the hypervisor's own sign-in: `Username` and
+    // `Password` are `@sensitive` members of `ImportHypervisorConfiguration` and of
+    // `UpdateHypervisor`, and no read of Backup Gateway reports either back
+    // ([`super::provisioner::backup_gateway_hypervisors`] leaves both out of its drift read
+    // for that reason).
+    CredentialProperties {
+        resource_type: crate::state::template::BACKUP_GATEWAY_HYPERVISOR,
+        credentials: &["Password", "Username"],
+    },
+];
+
+/// What a failure of this stage reports in place of a value it may not disclose.
+pub const REDACTED_VALUE: &str = "<REDACTED>";
+
+/// The value one failure of this stage reports for a declaration of `resource_type`: the
+/// judged value itself, or [`REDACTED_VALUE`] for a type whose properties carry credentials
+/// ([`CREDENTIAL_PROPERTIES`]).
+///
+/// The ONE spelling of that rule for this stage, so the two questions whose answer quotes a
+/// value — the set a property publishes ([`enum_properties`]) and the spelling it admits
+/// ([`patterned_properties`]) — cannot disagree about which values may be said out loud.
+pub fn reported_value<'a>(resource_type: &str, judged: &'a str) -> &'a str {
+    if carries_credentials(resource_type) {
+        return REDACTED_VALUE;
+    }
+    judged
+}
+
+/// Whether `resource_type` carries credentials among its properties
+/// ([`CREDENTIAL_PROPERTIES`]).
+fn carries_credentials(resource_type: &str) -> bool {
+    CREDENTIAL_PROPERTIES
+        .iter()
+        .any(|row| row.resource_type == resource_type)
+}
 
 /// One property whose admitted values its type's contract publishes.
 #[derive(Debug, Clone, Copy)]
@@ -874,5 +941,37 @@ mod tests {
             Some(failure_reason("First", "Type", &["String", "StringList"]).as_str()),
             "case \"two failing resources\": expected the first one's reason, got {failed:?}"
         );
+    }
+
+    /// RULE: how much of a judged value a failure says is the TYPE's to decide — a type
+    /// carrying credentials among its properties has its values reported redacted, and a type
+    /// whose whole property document is the template's own text has them said as declared. The
+    /// rows span both sides, every type the catalogue of credential-carrying types holds, and a
+    /// type it holds no row for at all.
+    #[test]
+    fn a_judged_value_is_said_as_far_as_its_type_may_say_it() {
+        for row in CREDENTIAL_PROPERTIES {
+            assert_eq!(
+                reported_value(row.resource_type, "a judged value"),
+                REDACTED_VALUE,
+                "case {:?}: expected a type carrying credentials to report no value, it reports \
+                 {:?}",
+                row.resource_type,
+                reported_value(row.resource_type, "a judged value")
+            );
+        }
+        for resource_type in [
+            crate::state::template::CLOUDHSM_CLUSTER,
+            crate::state::template::SSM_QUICKSETUP_CONFIGURATION_MANAGER,
+            "AWS::CodePipeline::Pipeline",
+            "AWS::SNS::Topic",
+        ] {
+            assert_eq!(
+                reported_value(resource_type, "a judged value"),
+                "a judged value",
+                "case {resource_type:?}: expected the judged value itself, got {:?}",
+                reported_value(resource_type, "a judged value")
+            );
+        }
     }
 }
