@@ -263,9 +263,16 @@ struct Open {
     /// The SigV4 signing name of the service that opened the listener, which is what a
     /// diagnosis of a connection has to say.
     served_by: String,
+    /// WHICH recording this is ([`DialablePlanes::opening`]), so withdrawing an address can
+    /// tell the record it opened from one another resource has since published there.
+    record: u64,
     /// What a connection to this address is served by.
     plane: Arc<dyn DialablePlane>,
 }
+
+/// How many recordings this process has made, so two of them are never confused for each
+/// other ([`Open::record`]).
+static RECORDINGS: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
 
 /// A handle on one engine's [`DialableDataPlanes`].
 ///
@@ -341,12 +348,14 @@ impl DialablePlanes {
         S: Into<String>,
     {
         let authorities: Vec<String> = authorities.into_iter().map(Into::into).collect();
+        let record = RECORDINGS.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
         let mut held = self.0.lock();
         for authority in &authorities {
             held.open.insert(
                 key(authority),
                 Open {
                     served_by: served_by.to_string(),
+                    record,
                     plane: Arc::clone(plane),
                 },
             );
@@ -355,14 +364,28 @@ impl DialablePlanes {
         OpenedPlanes {
             planes: self.clone(),
             authorities,
+            record,
         }
     }
 
-    /// Forget `authority`: the plane behind it is gone, so nothing answers there any more and
-    /// a client opening a connection to it must be answered as one opened where nothing is
-    /// listening.
-    pub fn closed(&self, authority: &str) {
-        self.0.lock().open.remove(&key(authority));
+    /// Forget `authority` while it still holds the recording `record` made: the plane behind it
+    /// is gone, so nothing answers there any more and a client opening a connection to it must
+    /// be answered as one opened where nothing is listening.
+    ///
+    /// The record is what a RESOURCE's withdrawal is scoped by: an address another resource has
+    /// since published there ([`Self::opening`] replaces the record) belongs to that resource,
+    /// and must keep answering after this one is gone — two resources whose published members
+    /// carry no port share the address their protocol's own port is dialled at, and the one
+    /// that went away is not the one a client reaches now.
+    fn closed_record(&self, authority: &str, record: u64) {
+        let mut held = self.0.lock();
+        if held
+            .open
+            .get(&key(authority))
+            .is_some_and(|open| open.record == record)
+        {
+            held.open.remove(&key(authority));
+        }
     }
 
     /// What answers at `authority`, or `None` for an address this emulator has opened no
@@ -430,6 +453,9 @@ pub struct OpenedPlanes {
     planes: DialablePlanes,
     /// The addresses this record holds open.
     authorities: Vec<String>,
+    /// WHICH recording this is, so dropping it withdraws the addresses it opened and not the
+    /// ones another resource has published since ([`DialablePlanes::closed_record`]).
+    record: u64,
 }
 
 /// Written by hand rather than derived: what is diagnosable here is how many addresses are
@@ -446,7 +472,7 @@ impl std::fmt::Debug for OpenedPlanes {
 impl Drop for OpenedPlanes {
     fn drop(&mut self) {
         for authority in &self.authorities {
-            self.planes.closed(authority);
+            self.planes.closed_record(authority, self.record);
         }
     }
 }
@@ -603,6 +629,46 @@ mod tests {
             "expected the other service's addresses to stay open, got {planes:?}"
         );
         drop(elsewhere);
+        assert!(
+            planes.is_empty(),
+            "expected no address to be left open, got {planes:?}"
+        );
+    }
+
+    /// RULE: an address TWO recordings published belongs to the one that published it LAST, and
+    /// withdrawing an earlier recording leaves it answering — what two resources of one
+    /// protocol share when the member each publishes carries no port, so both are dialled at
+    /// the same port of the one interface this emulator is reached on.
+    #[tokio::test]
+    async fn an_address_two_recordings_published_is_withdrawn_only_by_the_one_holding_it() {
+        let engine = ::engine::InMemoryEngine::new();
+        let planes = DialablePlanes::of(&engine).expect("the engine vends the records");
+        let plane = served_in_process(Arc::new(Answering), None);
+        // Each recording holds the shared address and one of its own.
+        let first = planes.opening(["127.0.0.1:3306", "127.0.0.1:41001"], "rds", &plane);
+        let second = planes.opening(["127.0.0.1:3306", "127.0.0.1:41002"], "rds", &plane);
+
+        drop(first);
+        for (case, port, expected) in [
+            ("the shared address the later recording holds", 3306u16, true),
+            ("the withdrawn recording's own address", 41001, false),
+            ("the later recording's own address", 41002, true),
+        ] {
+            let dialed = planes.dialable("127.0.0.1", port);
+            assert_eq!(
+                dialed.is_some(),
+                expected,
+                "case {case:?}: expected answered={expected}, got {dialed:?}"
+            );
+        }
+
+        drop(second);
+        let dialed = planes.dialable("127.0.0.1", 3306);
+        assert!(
+            dialed.is_none(),
+            "case \"the shared address once both recordings are withdrawn\": expected nothing, \
+             got {dialed:?}"
+        );
         assert!(
             planes.is_empty(),
             "expected no address to be left open, got {planes:?}"

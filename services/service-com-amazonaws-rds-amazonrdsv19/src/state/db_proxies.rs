@@ -758,7 +758,10 @@ impl DbProxyRecord {
     /// endpoint at all. The `DBProxy` shape carries no port member of its own, so the
     /// published address carries the port the listener landed on
     /// (`service_common::data_plane_addressing::host_port_authority`) — the core owns the
-    /// port range, so a client that reads this string has the whole address it needs.
+    /// port range, so a client that reads this string has the whole address it needs — and
+    /// the endpoint answers the port the proxy's engine family is dialled on as well, for the
+    /// client that completes the published HOST with it
+    /// ([`super::data_plane::proxy_endpoint::proxy_engine_port`]).
     pub fn endpoint(&self) -> String {
         if let Some(served) = &self.served_endpoint {
             return ::service_common::data_plane_addressing::host_port_authority(

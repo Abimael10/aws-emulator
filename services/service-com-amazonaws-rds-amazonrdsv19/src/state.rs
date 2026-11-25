@@ -447,8 +447,8 @@ pub use data_plane::{
     cluster_endpoint::cluster_engine_wire,
     engine_wire, open_engine_endpoint,
     proxy_endpoint::{
-        open_proxy_endpoint, proxy_engine_wire, DbProxyEndpoint, ProxyEndpointPlan,
-        PROXY_REQUIRES_TLS_MESSAGE,
+        open_proxy_endpoint, proxy_engine_port, proxy_engine_wire, wire_engine_port,
+        DbProxyEndpoint, ProxyEndpointPlan, PROXY_REQUIRES_TLS_MESSAGE,
     },
     rewind_cluster_storage, wire_session::SessionTarget,
     DbEngineEndpoint, EndpointRole, EngineEndpointPlan, EngineWire, ServedEndpoint,

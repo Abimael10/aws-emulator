@@ -896,9 +896,29 @@ pub(crate) fn dialable_plane<Eng: Send + Sync + 'static>(
     listener: &::emulator_server::ResourceListener,
     plane: &Arc<dyn ::service_common::dialable_data_planes::DialablePlane>,
 ) -> Option<::service_common::dialable_data_planes::OpenedPlanes> {
+    dialable_plane_also_at(engine, listener, Vec::new(), plane)
+}
+
+/// [`dialable_plane`] for an endpoint that is also answered at addresses OTHER than the one
+/// the core bound its listener on: `also` are those addresses, recorded beside it.
+///
+/// What needs them is an endpoint whose published member carries NO PORT — a DB proxy's
+/// ([`proxy_endpoint`]) — so the client completes the address with the engine family's own
+/// port rather than with the one the core assigned. Both addresses answer the SAME handler
+/// over the same session context, and the whole set is withdrawn together when the returned
+/// record is dropped.
+pub(crate) fn dialable_plane_also_at<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    listener: &::emulator_server::ResourceListener,
+    also: impl IntoIterator<Item = String>,
+    plane: &Arc<dyn ::service_common::dialable_data_planes::DialablePlane>,
+) -> Option<::service_common::dialable_data_planes::OpenedPlanes> {
     let planes = ::service_common::dialable_data_planes::DialablePlanes::of(engine)?;
-    let authority = ::service_common::data_plane_addressing::listener_authority(listener);
-    Some(planes.opening([authority], SIGNING_NAME, plane))
+    let mut authorities = vec![::service_common::data_plane_addressing::listener_authority(
+        listener,
+    )];
+    authorities.extend(also);
+    Some(planes.opening(authorities, SIGNING_NAME, plane))
 }
 
 /// The SigV4 signing name of this service, which is what the records above name as the

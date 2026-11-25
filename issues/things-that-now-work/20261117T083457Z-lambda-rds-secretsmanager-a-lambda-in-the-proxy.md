@@ -43,3 +43,22 @@ Expected: that payload returned from the invocation (ok true, value 1, a MySQL v
 2. Replay the behavioral suite (simparity-behavioral-aws-v1).
 3. Run lambda__rds__secretsmanager.lambda-rds-connect-via-proxy-positive: create a MySQL DB instance, a Secrets Manager secret with its credentials, an RDS Proxy targeting it in the same VPC, and a Lambda in that VPC whose handler connects to DescribeDBProxies' published Endpoint on the proxy port with the secret's credentials and runs 'SELECT 1, VERSION(), CURRENT_USER()'.
 4. Invoke the function with {proxy_endpoint, port, user, password}. It never returns the handler's {ok, value, version, current_user} payload; the check re-invokes until the run budget is exhausted.
+
+## Resolution
+
+FIXED — `DBProxy$Endpoint` carries no port member, so a client completes the host it publishes
+with the port of the databases the proxy's `EngineFamily` names (3306 for `MYSQL`, 5432 for
+`POSTGRESQL`, the documented defaults of those engines). The proxy's endpoint now answers that
+port as well as the port the core assigned its listener — one protocol handler at both
+addresses, over the same session context — so a function in the proxy's VPC that reads the
+published endpoint and connects on its engine family's own port opens a session, is admitted
+with the credential the proxy's `Auth` secret holds, and runs its statements against the
+database the proxy's target group holds.
+
+Residual, unchanged: the family's port is one port of the ONE interface the core binds its
+listeners on, so it names no proxy in particular — the proxy that published its endpoint last
+answers there, and each proxy's own published `host:port` keeps reaching that proxy. An address
+per proxy needs a core listener that accepts an address or a port, which
+`vendor/server/src/listeners.rs` does not offer; that is the same core gap already recorded as
+the residual of
+`issues/things-that-now-work/20261109T135215Z-lambda-rds-secretsmanager-db-proxy-endpoints-are-published.md`.

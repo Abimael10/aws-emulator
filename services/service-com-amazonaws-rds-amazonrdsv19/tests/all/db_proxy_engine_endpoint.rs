@@ -9,7 +9,9 @@
 //! opened on it is served by the database the proxy's target group holds, under the
 //! encryption `RequireTLS` demands of connections to the proxy. A proxy of an engine family
 //! this emulator speaks no protocol for gets no listener and keeps the DNS-form endpoint,
-//! because a port that answers nothing would be worse than a name.
+//! because a port that answers nothing would be worse than a name. The OTHER port that
+//! endpoint answers — the one the proxy's engine family is dialled on, which a client
+//! completes the published host with — is the subject of `db_proxy_endpoint_addressing`.
 //!
 //! Every control-plane call goes over the wire through `db_instances::emulator`, and every
 //! database session is written against the protocol itself with the client this test target

@@ -364,7 +364,19 @@ pub(crate) async fn postgres_login(
     password: &str,
     database: Option<&str>,
 ) -> Result<PostgresSession, Refusal> {
-    let mut conn = connect(address, port).await;
+    postgres_login_on(connect(address, port).await, transport, user, password, database).await
+}
+
+/// [`postgres_login`] on a connection that is ALREADY open, for the same reason
+/// [`mysql_login_on`] exists.
+pub(crate) async fn postgres_login_on(
+    conn: Client,
+    transport: Transport,
+    user: &str,
+    password: &str,
+    database: Option<&str>,
+) -> Result<PostgresSession, Refusal> {
+    let mut conn = conn;
     if transport == Transport::Tls {
         let mut request = Vec::new();
         request.extend_from_slice(&8i32.to_be_bytes());
@@ -785,7 +797,22 @@ pub(crate) async fn mysql_login(
     password: &str,
     database: Option<&str>,
 ) -> Result<MySqlSession, Refusal> {
-    let mut conn = connect(address, port).await;
+    mysql_login_on(connect(address, port).await, transport, user, password, database).await
+}
+
+/// [`mysql_login`] on a connection that is ALREADY open, for a client that dialled no socket
+/// to get it: a plane of this emulator opened in process
+/// (`service_common::dialable_data_planes`), which is how an in-VPC client of a VPC-only
+/// endpoint reaches it. What is spoken on it is the same protocol, because the handler at the
+/// other end is the same one the listener hands its connections to.
+pub(crate) async fn mysql_login_on(
+    conn: Client,
+    transport: Transport,
+    user: &str,
+    password: &str,
+    database: Option<&str>,
+) -> Result<MySqlSession, Refusal> {
+    let mut conn = conn;
     let (_, greeting) = mysql_read(&mut conn).await;
     assert_eq!(
         greeting[0], 10,

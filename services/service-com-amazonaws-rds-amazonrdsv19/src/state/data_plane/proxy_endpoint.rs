@@ -7,13 +7,21 @@
 //! CONNECTS TO with its ordinary driver and then speaks the database's own protocol on —
 //! "you can connect to the proxy endpoint the same way you connect to the DB instance
 //! endpoint" — so for every `EngineFamily` whose wire this emulator speaks
-//! ([`proxy_engine_wire`]) `CreateDBProxy` opens a listener through the CORE and the control
-//! plane publishes THAT listener's address, exactly as [`super::open_engine_endpoint`] does
-//! for a DB instance and a DB cluster. An address this emulator does not answer on would be
-//! no endpoint at all: a client connects to exactly the string the control plane hands it.
-//! A proxy of an engine family this emulator serves no wire for keeps the DNS-form endpoint
-//! this service has always reported and gets no listener, for the same reason an instance of
-//! such an engine does.
+//! ([`proxy_engine_wire`]) `CreateDBProxy` opens a listener through the CORE, exactly as
+//! [`super::open_engine_endpoint`] does for a DB instance and a DB cluster. An address this
+//! emulator does not answer on would be no endpoint at all: a client connects to exactly the
+//! string the control plane hands it. A proxy of an engine family this emulator serves no wire
+//! for keeps the DNS-form endpoint this service has always reported and gets no listener, for
+//! the same reason an instance of such an engine does.
+//!
+//! WHERE that endpoint is published, and the addresses it answers at, follow from the one
+//! thing `DBProxy` does not model: a PORT. An instance publishes `Endpoint.Address` beside its
+//! own `Port`, so a client composes the pair from two members; a proxy publishes one member and
+//! the client completes it with the port of the databases its family names
+//! ([`proxy_engine_port`]) — "you include the endpoint value in the connection string for a
+//! database client application". So the endpoint answers that family's own port as well as the
+//! port the core assigned its listener ([`open_proxy_endpoint`] records both addresses, and one
+//! handler serves them both), and a driver handed the published host alone reaches it.
 //!
 //! A proxy runs NO ENGINE and holds no data: "RDS Proxy ... pools and shares database
 //! connections", and the database it pools them to is the one its target group holds
@@ -86,6 +94,42 @@ pub fn proxy_engine_wire(engine_family: &str) -> Option<EngineWire> {
         _ => None,
     }
 }
+
+/// The port a client DIALS a proxy of `engine_family` on, or `None` for a family this
+/// emulator serves no data plane for.
+///
+/// `DBProxy` models no port member at all: `Endpoint` is "the endpoint that you can use to
+/// connect to the DB proxy. You include the endpoint value in the connection string for a
+/// database client application", so what completes that connection string is the port of the
+/// databases the family names — "this value determines which database network protocol the
+/// proxy recognizes", and a proxy speaks that protocol on its own default port.
+#[must_use]
+pub fn proxy_engine_port(engine_family: &str) -> Option<u16> {
+    Some(wire_engine_port(proxy_engine_wire(engine_family)?))
+}
+
+/// The same port, read off the WIRE the family resolved to, which is what the endpoint itself
+/// holds once it is open ([`DbProxyEndpoint::wire`]).
+///
+/// The two values are the documented defaults of the engines each family names, which is the
+/// one reading this crate holds of them ([`crate::state::default_port`]): the test below pins
+/// each against it, so the port a proxy is dialled on and the port the databases behind it
+/// publish for themselves cannot drift.
+#[must_use]
+pub fn wire_engine_port(wire: EngineWire) -> u16 {
+    match wire {
+        EngineWire::MySql => MYSQL_FAMILY_PORT,
+        EngineWire::Postgres => POSTGRESQL_FAMILY_PORT,
+    }
+}
+
+/// `CreateDBInstanceMessage$Port` publishes the default port of the engines
+/// `ENGINE_FAMILY_MYSQL` names: "Default: … RDS for MariaDB — 3306, … RDS for MySQL — 3306".
+const MYSQL_FAMILY_PORT: u16 = 3306;
+
+/// The same member for the other family this emulator speaks the wire of: "Default: … RDS for
+/// PostgreSQL — 5432".
+const POSTGRESQL_FAMILY_PORT: u16 = 5432;
 
 /// One DB proxy's endpoint: the live listener and the handle that severs its sessions.
 ///
@@ -193,7 +237,38 @@ pub async fn open_proxy_endpoint<Eng: Send + Sync + 'static>(
         activity: super::activity_samples::ActivityStore::of(engine),
     };
     let (listener, plane) = super::open_wire_listener(&listeners, wire, context).await?;
-    let dialable = super::dialable_plane(engine, &listener, &plane);
+    // WHERE the endpoint is published, and the addresses it answers at.
+    //
+    // The core owns the socket, the interface and the port it assigned the listener, so what
+    // the control plane publishes is THAT listener's `host:port` — `DBProxy` models no port
+    // member, so the published value carries one. A client puts that value in its connection
+    // string, and the two ways it reads it are the two addresses recorded here: the whole
+    // authority as it stands, and the HOST alone completed with the port of the engine family
+    // the proxy announced ([`wire_engine_port`]) — which is what a driver dials when the member
+    // it was handed carries no port of its own, and the address this endpoint would answer at
+    // on AWS. Both are served by the SAME handler over the same session context as the listener
+    // itself, so a session is served identically whichever of them it arrived on.
+    //
+    // That family port is ONE port of the ONE interface the core binds on, so it names no proxy
+    // in particular: the proxy that published its endpoint last answers there, and once THAT
+    // proxy is gone nothing does, while each proxy's own published authority — which carries the
+    // port the core assigned it — keeps reaching that proxy throughout. Giving each proxy an
+    // address of its own to answer that port at needs a core listener that takes an address or a
+    // port (`vendor/server/src/listeners.rs`, whose `tcp_plaintext` takes neither), which is
+    // recorded in
+    // `issues/things-that-now-work/20261109T135215Z-lambda-rds-secretsmanager-db-proxy-endpoints-are-published.md`.
+    //
+    // The HOST is the one the core says the listener is dialable at
+    // (`data_plane_addressing::listener_authority`, which publishes a WILDCARD bind as
+    // loopback), so the address recorded here is the host the control plane publishes and not
+    // the interface the socket happens to be bound to.
+    let family = ::service_common::data_plane_addressing::host_port_authority(
+        ::service_common::data_plane_addressing::host_only(
+            &::service_common::data_plane_addressing::listener_authority(&listener),
+        ),
+        wire_engine_port(wire),
+    );
+    let dialable = super::dialable_plane_also_at(engine, &listener, [family], &plane);
     Ok(DbProxyEndpoint {
         endpoint: ServedEndpoint {
             host: listener.host(),
@@ -369,4 +444,57 @@ pub(super) fn proxied_session_target(
         region: region.to_string(),
         resource_id: instance.dbi_resource_id.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RULE: the port a proxy of a family is dialled on is the DOCUMENTED DEFAULT PORT of the
+    /// engines that family names, so a client that completes the published host with it reaches
+    /// the proxy on the same port the databases behind it publish for themselves.
+    ///
+    /// The rows are the families `EngineFamily` names, each with the engines it covers
+    /// (`CreateDBProxy$EngineFamily`: "For Aurora MySQL, RDS for MariaDB, and RDS for MySQL
+    /// databases, specify MYSQL. For Aurora PostgreSQL and RDS for PostgreSQL databases,
+    /// specify POSTGRESQL. For RDS for Microsoft SQL Server, specify SQLSERVER"), and the one
+    /// this emulator speaks no wire for.
+    #[test]
+    fn a_familys_port_is_the_documented_default_of_the_engines_it_names() {
+        let rows: &[(&str, &[&str])] = &[
+            (
+                crate::state::ENGINE_FAMILY_MYSQL,
+                &["mysql", "mariadb", "aurora-mysql"],
+            ),
+            (
+                crate::state::ENGINE_FAMILY_POSTGRESQL,
+                &["postgres", "aurora-postgresql"],
+            ),
+        ];
+        for (family, engines) in rows {
+            let port = proxy_engine_port(family);
+            for engine in *engines {
+                let documented = u16::try_from(crate::state::default_port(engine)).ok();
+                assert_eq!(
+                    port, documented,
+                    "case {family:?}: expected the default port of {engine:?} ({documented:?}), \
+                     got {port:?}"
+                );
+            }
+            // The family is read however a request spells it, as the wire is
+            // ([`proxy_engine_wire`]).
+            let spelled = proxy_engine_port(&family.to_ascii_lowercase());
+            assert_eq!(
+                spelled, port,
+                "case {family:?}: the family is read without regard to case, got {spelled:?}"
+            );
+        }
+        let unserved = proxy_engine_port(crate::state::ENGINE_FAMILY_SQLSERVER);
+        assert_eq!(
+            unserved, None,
+            "case {:?}: this emulator speaks no wire for that family, so it is dialled on no \
+             port of this emulator's, got {unserved:?}",
+            crate::state::ENGINE_FAMILY_SQLSERVER
+        );
+    }
 }
