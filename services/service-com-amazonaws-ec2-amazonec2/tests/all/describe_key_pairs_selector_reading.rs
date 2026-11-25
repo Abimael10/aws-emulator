@@ -15,8 +15,8 @@
 //!   `CreateKeyPairRequest$KeyName`) is refused the same way, naming the bound it broke;
 //! * only a WELL-FORMED selector the account holds no key pair under is
 //!   `InvalidKeyPair.NotFound`, worded for the member the request gave it — the id form
-//!   `The key pair ID '<id>' does not exist` or the name form
-//!   `The key pair '<name>' does not exist`.
+//!   `The keyPairId '<id>' does not exist`, which spells the member as the wire carries it,
+//!   or the name form `The key pair '<name>' does not exist`.
 //!
 //! That ordering is what lets a client tell a typo'd or ill-formed id from a valid id whose
 //! key pair was deleted or belongs to another account: the two carry different codes, and SDK
@@ -193,7 +193,7 @@ async fn describe_key_pairs_tells_a_value_that_is_no_key_pair_id_from_one_that_i
             &router,
             &indexed("KeyPairId", &[absent]),
             "InvalidKeyPair.NotFound",
-            &format!("The key pair ID '{absent}' does not exist"),
+            &format!("The keyPairId '{absent}' does not exist"),
         )
         .await;
     }
@@ -405,7 +405,7 @@ async fn key_pair_names_are_case_sensitive_and_a_deleted_key_pair_stops_resolvin
         (
             "KeyPairId",
             indexed("KeyPairId", &[deleted_id.as_str()]),
-            format!("The key pair ID '{deleted_id}' does not exist"),
+            format!("The keyPairId '{deleted_id}' does not exist"),
         ),
     ] {
         assert_refused(

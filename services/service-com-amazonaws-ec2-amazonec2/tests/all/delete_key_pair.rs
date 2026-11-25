@@ -127,7 +127,7 @@ async fn assert_gone(case: &str, router: &MultiServiceRouter, key_name: &str, ke
         (
             "KeyPairId",
             indexed("KeyPairId", &[key_pair_id]),
-            format!("The key pair ID '{key_pair_id}' does not exist"),
+            format!("The keyPairId '{key_pair_id}' does not exist"),
         ),
     ] {
         let (status, body) =

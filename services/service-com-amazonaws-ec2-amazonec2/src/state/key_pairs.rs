@@ -118,15 +118,50 @@ pub fn invalid_key_pair_name_not_found<E>(key_name: &str) -> Scaffolded<E> {
     )
 }
 
-/// Refuse a request naming a key pair ID the account holds no key pair under: HTTP 400
-/// [`INVALID_KEY_PAIR_NOT_FOUND`] — the same code as
+/// Refuse a request whose `keyPairId` PARAMETER named a key pair the account holds no key
+/// pair under: HTTP 400 [`INVALID_KEY_PAIR_NOT_FOUND`] — the same code as
 /// [`invalid_key_pair_name_not_found`], which is the one EC2 answers for either selector,
 /// naming what the request actually gave it.
+///
+/// The sentence spells that member the way the WIRE spells it — `keyPairId`, the `ec2Query`
+/// name of the parameter the value arrived in (`DescribeKeyPairsRequest$KeyPairIds` carries
+/// `xmlName` `KeyPairId`) — rather than in English words, which is also how the recorded
+/// invalid-value refusal of the very same parameter names it
+/// ([`invalid_key_pair_id_value`]'s `… for keyPairId.`). A client that reads the parameter's
+/// name out of the message therefore reads a name EC2's request actually carries.
+///
+/// A call that names the key pair as a RESOURCE rather than through that parameter words the
+/// same code its own way ([`tagged_key_pair_id_not_found`]), the way the two recorded
+/// wordings of one launch-template code are kept apart
+/// ([`specified_launch_template_id_not_found`]).
 pub fn invalid_key_pair_id_not_found<E>(key_pair_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_KEY_PAIR_NOT_FOUND,
         400,
-        format!("The key pair ID '{key_pair_id}' does not exist"),
+        format!(
+            "The keyPairId '{}' does not exist",
+            echoed_resource_id(key_pair_id)
+        ),
+    )
+}
+
+/// The same code for a call that named the key pair as a TAGGABLE RESOURCE rather than
+/// through the `keyPairId` parameter — `CreateTags` and `DeleteTags`, which are told an id
+/// without being told its kind ([`untaggable_resource_id`]): HTTP 400
+/// [`INVALID_KEY_PAIR_NOT_FOUND`], naming the resource KIND instead of a parameter those
+/// requests do not carry.
+///
+/// Split from [`invalid_key_pair_id_not_found`] because WHICH sentence a refusal of this code
+/// carries is a fact of the call that answers it, recorded by its own caller — the same
+/// reading [`specified_launch_template_id_not_found`] gives the launch-template pair.
+pub fn tagged_key_pair_id_not_found<E>(key_pair_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_KEY_PAIR_NOT_FOUND,
+        400,
+        format!(
+            "The key pair ID '{}' does not exist",
+            echoed_resource_id(key_pair_id)
+        ),
     )
 }
 

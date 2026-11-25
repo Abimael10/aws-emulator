@@ -85,7 +85,10 @@ pub fn untaggable_resource_id<E>(resource_id: &str) -> crate::scaffolded::Scaffo
         // carries that other sentence, which names none of them).
         ("lt", specified_launch_template_id_not_found),
         ("ami", invalid_ami_id_not_found),
-        (KEY_PAIR_ID_PREFIX, invalid_key_pair_id_not_found),
+        // The key-pair wording that names the RESOURCE a tagging call was given rather than
+        // the `keyPairId` parameter it does not carry ([`invalid_key_pair_id_not_found`]
+        // carries that other sentence, which names the parameter).
+        (KEY_PAIR_ID_PREFIX, tagged_key_pair_id_not_found),
         (CAPACITY_BLOCK_ID_PREFIX, invalid_capacity_block_id_not_found),
         (
             CAPACITY_MANAGER_DATA_EXPORT_ID_PREFIX,

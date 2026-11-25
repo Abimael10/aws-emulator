@@ -713,7 +713,7 @@ async fn key_pair_requests_outside_the_rules_are_refused() {
             vec![param("KeyPairId.1", "key-00000000000000999")],
             "InvalidKeyPair.NotFound",
             400,
-            Some("The key pair ID 'key-00000000000000999' does not exist".to_string()),
+            Some("The keyPairId 'key-00000000000000999' does not exist".to_string()),
         ),
         (
             "a read naming one resolvable and one unresolvable name",
