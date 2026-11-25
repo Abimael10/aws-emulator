@@ -238,6 +238,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // create: an update that would store code the runtime cannot read is refused with
         // the faults the compiler found, and one whose compile could not be run at all is
         // the server's fault — either way the stored function is left as it was.
+        //
+        // The read is a PARSE and nothing else (`crate::state::code_diagnostics`): the
+        // module is read by the maintained ECMAScript front end this crate already reads a
+        // definition with, in this process, and none of it is evaluated — no host function,
+        // no context and no module body of the caller's is run, no process is spawned and
+        // no socket is opened. It is also BOUNDED on both sides: the text a request may
+        // carry is bounded by the request boundary, which enforces `Code`'s modelled
+        // `@length` of 1..32768 (`skip_validation` on this input names the two mapping
+        // templates and the function's own `name`, and nothing else), and the read happens
+        // on a thread of the evaluation sandbox's own, under the same slot count and the
+        // same caller-wait ceiling an evaluation is held to, so it cannot occupy the
+        // executor serving this request.
         match crate::state::code_definition(input.code.as_deref()).await {
             crate::state::CodeDefinition::Compiled => {}
             crate::state::CodeDefinition::Refused(refusal) => {
@@ -330,6 +342,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let function_configuration = updated.to_function_configuration();
         api.functions.insert(updated.function_id.clone(), updated);
 
+        // What a source API holds is what its next merge carries into the Merged APIs it is
+        // a source of, so this change PROMPTS the merge of every `AUTO_MERGE` association
+        // of it (`crate::state::ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::prompt_auto_merge`).
+        let changed = input.api_id.clone();
+        guard.prompt_auto_merge(&changed, std::time::SystemTime::now());
         Ok(UpdateFunctionOutput {
             function_configuration: Some(function_configuration),
         })

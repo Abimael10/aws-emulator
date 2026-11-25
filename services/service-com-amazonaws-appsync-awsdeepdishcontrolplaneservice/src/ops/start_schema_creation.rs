@@ -273,6 +273,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let status = api.start_schema_creation(definition, outcome, now);
 
+        // What a source API holds is what its next merge carries into the Merged APIs it is
+        // a source of, so this change PROMPTS the merge of every `AUTO_MERGE` association
+        // of it — scheduled to come due only once this creation is
+        // (`crate::state::ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::prompt_auto_merge`).
+        guard.prompt_auto_merge(&api_id, now);
         Ok(StartSchemaCreationOutput {
             status: Some(status),
         })

@@ -77,6 +77,11 @@ pub use introspection_schema::*;
 /// withdrawal of it when the association is deleted.
 mod schema_merge;
 
+/// What RESOLVES a merged field: the resolvers, functions and data sources a performed merge
+/// carried into a Merged API beside the source API's types.
+mod merged_definitions;
+pub use merged_definitions::*;
+
 /// How the type systems of several source APIs COMBINE into the one a Merged API holds.
 mod type_composition;
 pub use type_composition::*;
@@ -1777,6 +1782,11 @@ pub struct SourceApiAssociationRecord {
     /// refuses a second one) and an account holds at most the per-Region quota of GraphQL
     /// APIs, so the snapshots this store keeps cannot grow without limit.
     pub merged_types: BTreeMap<String, TypeRecord>,
+    /// What RESOLVES the types above: the source API's resolvers, functions and data sources
+    /// as they stood when that same merge came due ([`MergedDefinitions`]). Held and
+    /// withdrawn with [`Self::merged_types`], because a schema the Merged API holds and a
+    /// definition that answers it are carried by one merge.
+    pub merged_definitions: MergedDefinitions,
     /// When this association's contribution was recorded, relative to the other
     /// associations of the same Merged API: drawn from the state's own counter by the
     /// merge that recorded it, so a later merge always carries a higher value. Zero while
@@ -2191,8 +2201,10 @@ pub fn create_source_api_association(
         merge_due_at: Some(merge_due_instant(now, source_schema_due)),
         deletion_due_at: None,
         // Nothing has been merged yet, so the association contributes no type to the
-        // Merged API's schema until the merge it scheduled is performed.
+        // Merged API's schema — and nothing that resolves one — until the merge it
+        // scheduled is performed.
         merged_types: BTreeMap::new(),
+        merged_definitions: MergedDefinitions::default(),
         merge_order: 0,
     };
     let association = record.to_source_api_association();
@@ -3140,6 +3152,14 @@ pub const MERGED_API_TYPE: &str = "MERGED";
 /// "Valid merge types are `MANUAL_MERGE` (default) and `AUTO_MERGE`"
 /// (`SourceApiAssociationConfig$mergeType`).
 pub const DEFAULT_MERGE_TYPE: &str = "MANUAL_MERGE";
+
+/// The other `MergeType`: the one whose merged API is kept in step with its source APIs
+/// without a caller asking for each merge — the role a Merged API carries is assumed, among
+/// other things, "to prompt the AUTO_MERGE to update the merged API endpoint with the source
+/// API changes automatically" (`GraphqlApi$mergedApiExecutionRoleArn`), so a change in a
+/// source API schedules the merge that carries it
+/// ([`ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::prompt_auto_merge`]).
+pub const AUTO_MERGE_TYPE: &str = "AUTO_MERGE";
 
 /// The `GraphQLApiIntrospectionConfig` a GraphQL API takes when the request that
 /// created or updated it named none: "If no value is provided, the introspection

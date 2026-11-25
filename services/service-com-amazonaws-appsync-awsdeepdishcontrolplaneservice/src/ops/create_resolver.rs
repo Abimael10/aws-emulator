@@ -279,6 +279,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that could never run is never stored and the field is left without a resolver.
         // A compile that could not be run at all is the server's fault, not the request's,
         // and attaches nothing either.
+        //
+        // The read is a PARSE and nothing else (`crate::state::code_diagnostics`): the
+        // module is read by the maintained ECMAScript front end this crate already reads a
+        // definition with, in this process, and none of it is evaluated — no host function,
+        // no context and no module body of the caller's is run, no process is spawned and
+        // no socket is opened. It is also BOUNDED on both sides: the text a request may
+        // carry is bounded by the request boundary, which enforces `Code`'s modelled
+        // `@length` of 1..32768 (`skip_validation` on this input names the two mapping
+        // templates and nothing else), and the read happens on a thread of the evaluation
+        // sandbox's own, under the same slot count and the same caller-wait ceiling an
+        // evaluation is held to, so it cannot occupy the executor serving this request.
         match crate::state::code_definition(input.code.as_deref()).await {
             crate::state::CodeDefinition::Compiled => {}
             crate::state::CodeDefinition::Refused(refusal) => {
@@ -403,11 +414,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Answer from the STORED record, so this body is the one `GetResolver` and
         // `ListResolvers` answer with later.
-        Ok(CreateResolverOutput {
+        let answered = CreateResolverOutput {
             resolver: api
                 .resolvers
                 .get(&key)
                 .map(crate::state::ResolverRecord::to_resolver),
-        })
+        };
+        // What a source API holds is what its next merge carries into the Merged APIs it is
+        // a source of, so this change PROMPTS the merge of every `AUTO_MERGE` association
+        // of it (`crate::state::ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::prompt_auto_merge`).
+        guard.prompt_auto_merge(&api_id, std::time::SystemTime::now());
+        Ok(answered)
     }
 }

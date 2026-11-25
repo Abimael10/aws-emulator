@@ -306,6 +306,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let data_source = updated.to_data_source();
         api.data_sources.insert(updated.name.clone(), updated);
 
+        // What a source API holds is what its next merge carries into the Merged APIs it is
+        // a source of, so this change PROMPTS the merge of every `AUTO_MERGE` association
+        // of it (`crate::state::ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::prompt_auto_merge`).
+        let changed = input.api_id.clone();
+        guard.prompt_auto_merge(&changed, std::time::SystemTime::now());
         Ok(UpdateDataSourceOutput {
             data_source: Some(data_source),
         })

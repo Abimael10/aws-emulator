@@ -58,7 +58,7 @@ use super::mapping_template::{self, Raised};
 use super::PlaneContext;
 use crate::ops::evaluate_code::appsync_js::{self, Outcome};
 use crate::ops::types::{CachingConfig, SyncConfig};
-use crate::state::{DataSourceRecord, GraphqlApiRecord, ResolverRecord};
+use crate::state::{DataSourceRecord, Definitions, ResolverRecord};
 
 /// The stage that validates one request's document against the schema the API SERVES,
 /// before any field of it is dispatched.
@@ -454,6 +454,17 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
         Err(refusal) => return Answer::refused(refusal),
     };
     let (kind, fields) = (read.kind, read.fields);
+    // The transitions the clock owes this API's ASSOCIATIONS are materialised as they are
+    // read here, exactly as the one it owes a cache instance is ([`api_cache::serving`]): a
+    // merge that came due carries a source API's types and the definitions that resolve them
+    // onto a Merged API, and a disassociation that came due withdraws them again. Each was
+    // owed at this instant whether or not anybody read the control plane, so a request
+    // arriving after either span is answered by the schema a reader of the control plane
+    // sees rather than by the one the last control-plane call left behind.
+    context
+        .state
+        .lock()
+        .settle_associations(SystemTime::now());
     // The type the operation's fields belong to: the type the API's schema binds as that
     // operation's root, which is what says WHICH resolvers the selection addresses — beside
     // the QUERY root, which is the type the introspection system's own two root fields are
@@ -558,6 +569,7 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
         cache,
         now,
         enhanced,
+        withheld: BTreeMap::new(),
     };
     let data = execution
         .resolve_fields(&root_type, &Json::Null, &fields, Vec::new(), 0)
@@ -788,6 +800,12 @@ struct Execution<'a> {
     /// Which of the API's ENHANCED series this request publishes, as its
     /// `enhancedMetricsConfig` asks for them ([`super::enhanced_metrics`]).
     enhanced: Enhanced,
+    /// What the Merged API's execution role withholds, per `(typeName, fieldName)`: the
+    /// refusal a field it may not execute is reported with, and `None` for a field there is
+    /// nothing against ([`Execution::withheld_merged_field`]). Decided once per field of the
+    /// request, so one act on a source API is weighed once however many parents the field is
+    /// resolved over.
+    withheld: BTreeMap<(String, String), Option<String>>,
 }
 
 impl Execution<'_> {
@@ -837,6 +855,14 @@ impl Execution<'_> {
         depth: usize,
     ) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = Vec<Json>> + Send + 'f>> {
         Box::pin(async move {
+            // WHICH of these fields the Merged API's execution role may execute is decided
+            // before any of them is dispatched: a field a MERGE carried onto this API is run
+            // as that role, and one it may not run is reported as an error of its own path
+            // with no resolver of it invoked — including in an invocation gathered for its
+            // siblings below ([`Self::withheld_merged_field`]).
+            for field in fields {
+                self.withheld_merged_field(type_name, field).await;
+            }
             // The resolutions ONE invocation of a batched resolver carries are performed
             // BEFORE the walk, so each member of such a group takes its value from that one
             // answer rather than from an invocation of its own. Only the resolutions a group
@@ -957,6 +983,21 @@ impl Execution<'_> {
                 .await;
         }
         let plan = self.plan(type_name, &field.name);
+        // And so does a field a MERGE carried onto this API that the Merged API's own
+        // execution role may not EXECUTE on the source API it came from: AppSync assumes that
+        // role "to validate access to source APIs at runtime", so a field it is not allowed
+        // `appsync:SourceGraphQL` on resolves to nothing and is reported with that refusal
+        // ([`super::merged_api`]). Decided ahead of the walk, so no resolver of it ran.
+        if plan.as_ref().is_some_and(|plan| plan.source.is_some()) {
+            if let Some(refusal) = self.merged_refusal(type_name, &field.name) {
+                self.fault(json!({
+                    "path": path.to_vec(),
+                    "errorType": super::field_auth::UNAUTHORIZED_FIELD_ERROR_TYPE,
+                    "message": refusal,
+                }));
+                return Json::Null;
+            }
+        }
         let resolver_arn = plan.as_ref().and_then(|plan| plan.arn.clone());
         // The entry this API's cache holds THIS field's result as, where the behavior in
         // force holds one for it ([`super::api_cache`]), and the key it is held under: the
@@ -1226,25 +1267,61 @@ impl Execution<'_> {
     /// Copied out under ONE read of the store, so a resolver, the data source it names and
     /// the functions it invokes cannot be read from records that changed in between — and
     /// so that no guard is held while the engine runs.
+    ///
+    /// A field the API holds no resolver of itself may still be one a MERGE carried onto it:
+    /// what a Merged API serves is the schema of its source APIs, and a merge carries the
+    /// definitions that answer those fields beside the types that declare them
+    /// ([`crate::state::MergedDefinitions`]). Such a field is resolved from the definitions
+    /// that merge carried — the source API's resolver, its functions and its data sources —
+    /// and the plan names the source API it came from, because executing it is an act on THAT
+    /// API ([`Self::withheld_merged_field`]).
     fn plan(&self, type_name: &str, field_name: &str) -> Option<ResolverPlan> {
         let store = self.context.state.lock();
         let api = store.graphql_apis.get(&self.context.api_id)?;
-        let resolver = api.resolver(type_name, field_name)?;
-        Some(ResolverPlan {
-            arn: Some(resolver.arn.clone()),
-            code: resolver.code.clone(),
-            templates: Templates::of(
-                resolver.request_mapping_template.as_deref(),
-                resolver.response_mapping_template.as_deref(),
-            ),
-            data_source: step_data_source(api, resolver.data_source_name.as_deref()),
-            functions: pipeline_steps(api, resolver),
-            sync_config: resolver.sync_config.clone(),
-            caching_config: resolver.caching_config.clone(),
-            metrics_config: resolver.metrics_config.clone(),
-            is_pipeline: resolver.kind == crate::state::PIPELINE_KIND,
-            max_batch_size: resolver.max_batch_size,
-        })
+        if let Some(resolver) = api.resolver(type_name, field_name) {
+            return Some(planned(api.definitions(), resolver, None));
+        }
+        let merged = store.merged_field(&self.context.api_id, type_name, field_name)?;
+        let resolver = merged.definitions.resolver(type_name, field_name)?;
+        let source = super::merged_api::MergedSource {
+            source_api_arn: merged.source_api_arn.to_string(),
+            execution_role_arn: api.merged_api_execution_role_arn.clone(),
+        };
+        Some(planned(merged.definitions, resolver, Some(source)))
+    }
+
+    /// The refusal the Merged API's execution role withholds `field` with, decided ONCE per
+    /// `(typeName, fieldName)` of a request and remembered — a field resolved over many
+    /// parents is one act on the source API, not one per element — or `None` for a field
+    /// there is nothing against.
+    ///
+    /// Decided BEFORE anything of the field is dispatched, including the invocation its
+    /// siblings' resolutions are gathered into ([`Self::batch_groups`]), because a field the
+    /// role may not execute is a field no resolver of runs at all.
+    async fn withheld_merged_field(&mut self, type_name: &str, field: &SelectedField) {
+        let key = (type_name.to_string(), field.name.clone());
+        if self.withheld.contains_key(&key) {
+            return;
+        }
+        let source = self.plan(type_name, &field.name).and_then(|plan| plan.source);
+        let refusal = match source {
+            Some(source) => {
+                super::merged_api::withheld(self.context, &source, type_name, &field.name).await
+            }
+            // Nothing merged to authorize: a field of this API's own resolvers, or none at
+            // all.
+            None => None,
+        };
+        self.withheld.insert(key, refusal);
+    }
+
+    /// The refusal already decided for `field_name` of `type_name`, as the error of that
+    /// field: `None` for a field this request may execute.
+    fn merged_refusal(&self, type_name: &str, field_name: &str) -> Option<String> {
+        self.withheld
+            .get(&(type_name.to_string(), field_name.to_string()))
+            .cloned()
+            .flatten()
     }
 
     /// The entry this API's cache holds `plan`'s result as, or `None` where it holds none —
@@ -2204,6 +2281,11 @@ impl Execution<'_> {
     /// `None` where each resolution is an invocation of its own ([`ResolverPlan::batch_size`]).
     fn batched_plan(&self, type_name: &str, field: &SelectedField) -> Option<ResolverPlan> {
         let plan = self.plan(type_name, &field.name)?;
+        // A field the Merged API's execution role may not execute is not gathered either:
+        // nothing of it is dispatched, so its siblings' invocation does not carry it.
+        if plan.source.is_some() && self.merged_refusal(type_name, &field.name).is_some() {
+            return None;
+        }
         // A resolver whose result this API's cache holds is NOT batched: the cache is
         // consulted per resolution, ahead of any invocation of a data source, so a
         // resolution that may be answered from an entry cannot be merged into an invocation
@@ -2644,6 +2726,10 @@ struct ResolverPlan {
     /// resolutions of this resolver one invocation of its data source may carry, and — since
     /// "the default is 0", which batches nothing — whether it batches at all.
     max_batch_size: i32,
+    /// The source API whose MERGE carried this resolver onto the API being served, for a
+    /// field of a Merged API, and `None` for a field the API holds a resolver of itself.
+    /// What executing the field is weighed against ([`super::merged_api`]).
+    source: Option<super::merged_api::MergedSource>,
 }
 
 impl ResolverPlan {
@@ -3022,13 +3108,43 @@ struct StepDataSource {
     database_region: Option<String>,
 }
 
-/// The data source `name` of `api`, or `None` when the API holds none under that name.
+/// The plan `resolver` is resolved by, over the definitions it is resolved FROM — the API's
+/// own, or the ones a merge carried onto a Merged API, in which case `source` names the
+/// source API the field came from.
+///
+/// One construction for both, so a merged field is resolved by exactly what resolves a field
+/// of a standard API.
+fn planned(
+    definitions: Definitions<'_>,
+    resolver: &ResolverRecord,
+    source: Option<super::merged_api::MergedSource>,
+) -> ResolverPlan {
+    ResolverPlan {
+        arn: Some(resolver.arn.clone()),
+        code: resolver.code.clone(),
+        templates: Templates::of(
+            resolver.request_mapping_template.as_deref(),
+            resolver.response_mapping_template.as_deref(),
+        ),
+        data_source: step_data_source(definitions, resolver.data_source_name.as_deref()),
+        functions: pipeline_steps(definitions, resolver),
+        sync_config: resolver.sync_config.clone(),
+        caching_config: resolver.caching_config.clone(),
+        metrics_config: resolver.metrics_config.clone(),
+        is_pipeline: resolver.kind == crate::state::PIPELINE_KIND,
+        max_batch_size: resolver.max_batch_size,
+        source,
+    }
+}
+
+/// The data source `name` among `definitions`, or `None` when they hold none under that name.
 ///
 /// Copied out of the record as it stands NOW, so a data source an update REPOINTED is called
 /// with the configuration it carries at the moment the step runs.
-fn step_data_source(api: &GraphqlApiRecord, name: Option<&str>) -> Option<StepDataSource> {
+fn step_data_source(definitions: Definitions<'_>, name: Option<&str>) -> Option<StepDataSource> {
     let name = name?;
-    api.data_sources
+    definitions
+        .data_sources
         .get(name)
         .map(|record: &DataSourceRecord| StepDataSource {
             kind: record.r#type.clone(),
@@ -3119,7 +3235,7 @@ fn rds_endpoint(record: &DataSourceRecord) -> Option<&crate::ops::types::RdsHttp
 /// At most one step past [`MAX_PIPELINE_STEPS`] is built, so a stored pipeline naming more of
 /// them than any AppSync pipeline holds costs nothing to read and is reported as the bound it
 /// met ([`Execution::run`]) rather than run with the steps that fit.
-fn pipeline_steps(api: &GraphqlApiRecord, resolver: &ResolverRecord) -> Vec<PipelineStep> {
+fn pipeline_steps(definitions: Definitions<'_>, resolver: &ResolverRecord) -> Vec<PipelineStep> {
     resolver
         .pipeline_config
         .as_ref()
@@ -3127,7 +3243,7 @@ fn pipeline_steps(api: &GraphqlApiRecord, resolver: &ResolverRecord) -> Vec<Pipe
         .unwrap_or_default()
         .iter()
         .take(MAX_PIPELINE_STEPS.saturating_add(1))
-        .map(|function_id| match api.functions.get(function_id) {
+        .map(|function_id| match definitions.functions.get(function_id) {
             Some(function) => PipelineStep {
                 name: function.name.clone(),
                 code: function.code.clone(),
@@ -3135,7 +3251,7 @@ fn pipeline_steps(api: &GraphqlApiRecord, resolver: &ResolverRecord) -> Vec<Pipe
                     function.request_mapping_template.as_deref(),
                     function.response_mapping_template.as_deref(),
                 ),
-                data_source: step_data_source(api, Some(&function.data_source_name)),
+                data_source: step_data_source(definitions, Some(&function.data_source_name)),
                 sync_config: function.sync_config.clone(),
                 max_batch_size: function.max_batch_size,
             },

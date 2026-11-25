@@ -67,6 +67,7 @@ pub mod in_process;
 pub mod introspection;
 pub mod lambda;
 pub mod mapping_template;
+pub mod merged_api;
 pub mod metrics;
 pub mod open_id_connect;
 pub mod query;

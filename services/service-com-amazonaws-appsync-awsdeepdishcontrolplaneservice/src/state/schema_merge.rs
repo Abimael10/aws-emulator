@@ -37,8 +37,8 @@ use std::time::SystemTime;
 
 use super::{
     arn_region, combine_type_definitions, type_resource,
-    ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState, TypeConflict, TypeDefinition,
-    TypeRecord, ARN_SERVICE, DEFAULT_REGION,
+    ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState, MergedDefinitions, TypeConflict,
+    TypeDefinition, TypeRecord, ARN_SERVICE, DEFAULT_REGION,
 };
 
 impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
@@ -64,6 +64,44 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
             .retain(|_, association| !association.deletion_due(now));
         for merged_api_id in merged_apis {
             self.settle_composition(&merged_api_id);
+        }
+    }
+
+    /// Schedule the merge an `AUTO_MERGE` association owes once its SOURCE API has changed.
+    ///
+    /// A Merged API's role is assumed, among other things, "to prompt the AUTO_MERGE to
+    /// update the merged API endpoint with the source API changes automatically"
+    /// (`GraphqlApi$mergedApiExecutionRoleArn`), so a change in a source API is what
+    /// schedules the merge that carries it: an association of that merge type needs no call
+    /// asking for one, while a `MANUAL_MERGE` association keeps what its last performed
+    /// merge carried until `StartSchemaMerge` asks for the next.
+    ///
+    /// Scheduling is all this does, exactly as the call that asks for a merge does
+    /// ([`super::SourceApiAssociationRecord::start_merge`], whose coalescing this shares):
+    /// the merge comes due one span later, carries the source API as it stands at THAT
+    /// instant, and is materialised by the clock — so a change made while a merge is already
+    /// owed is carried by that merge rather than postponing it, however many changes arrive.
+    /// An association whose deletion the clock owes is being destroyed and has no schema left
+    /// to merge, which is the one case nothing is scheduled.
+    ///
+    /// `source_api` names the API that changed in either form a request can name one by, so a
+    /// call that addressed its API by ARN prompts exactly the merges a call that addressed it
+    /// by `apiId` does; a reference this account holds no API under changed nothing to merge.
+    pub fn prompt_auto_merge(&mut self, source_api: &str, now: SystemTime) {
+        let Some(source_api_id) = self.graphql_apis.api_id_of(source_api) else {
+            return;
+        };
+        // What the merge DEPENDS on, read when it is scheduled: a schema creation the source
+        // API still owes installs the types the merge carries
+        // ([`super::merge_due_instant`]).
+        let source_schema_due = self.schema_creation_due(&source_api_id);
+        for association in self.source_api_associations.values_mut() {
+            if association.source_api_id != source_api_id
+                || association.merge_type != super::AUTO_MERGE_TYPE
+            {
+                continue;
+            }
+            let _ = association.start_merge(now, source_schema_due);
         }
     }
 
@@ -117,16 +155,26 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
         let merged_api_id = association.merged_api_id.clone();
         // What this association contributed until now, held onto until the contribution
         // this merge carries is known to compose.
-        let performed = (association.merged_types.clone(), association.merge_order);
-        let source_types = self
-            .graphql_apis
-            .get(&source_api_id)
-            .map(|api| api.types.clone())
-            .unwrap_or_default();
+        let performed = (
+            association.merged_types.clone(),
+            association.merged_definitions.clone(),
+            association.merge_order,
+        );
+        // The source API's type system AND what resolves it, taken together at the due
+        // instant: a merged field is answered by the definition the merge that declared it
+        // carried ([`MergedDefinitions`]).
+        let source = self.graphql_apis.get(&source_api_id).map(|api| {
+            (
+                api.types.clone(),
+                MergedDefinitions::of(api),
+            )
+        });
+        let (source_types, source_definitions) = source.unwrap_or_default();
         let order = self.next_seq();
 
         if let Some(association) = self.source_api_associations.get_mut(association_id) {
             association.merged_types = source_types;
+            association.merged_definitions = source_definitions;
             association.merge_order = order;
             association.merge_due_at = None;
         }
@@ -144,7 +192,8 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
         }
         if let Some(association) = self.source_api_associations.get_mut(association_id) {
             association.merged_types = performed.0;
-            association.merge_order = performed.1;
+            association.merged_definitions = performed.1;
+            association.merge_order = performed.2;
         }
         self.settle_composition(&merged_api_id);
     }
@@ -165,6 +214,8 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
         for (association_id, conflict) in conflicts {
             if let Some(association) = self.source_api_associations.get_mut(&association_id) {
                 association.merged_types.clear();
+                // A contribution that is not installed resolves nothing either.
+                association.merged_definitions = MergedDefinitions::default();
                 association.merge_failed(&conflict.conflict());
             }
         }

@@ -23,8 +23,10 @@ use super::*;
 ///
 /// A selection the schema does not declare is reported as GraphQL's own validation error,
 /// naming the class of the failure, the field and the type that does not declare it, and the
-/// query path it sits at. Empty for an API whose schema declares nothing about the root type
-/// the operation selects on: there is no type system to validate the document against.
+/// query path it sits at. An API whose schema does not declare the ROOT operation type the
+/// operation selects on declares none of its fields either, so every selection of it is
+/// reported — the schema a Merged API serves once the associations that contributed its types
+/// are gone, and the one an API that holds no type system at all serves.
 ///
 /// The walk descends while the type a field resolves to is an OBJECT type the schema
 /// declares. A selection on an INTERFACE or a UNION type is written under a type condition
@@ -43,10 +45,31 @@ pub(super) fn schema_validation_errors(
         .graphql_apis
         .get(&context.api_id)
         .map(|api| &api.types)
-        .filter(|types| types.contains_key(root_type))
     else {
         return Vec::new();
     };
+    // A root operation type the API's schema does not declare holds no field at all, so
+    // EVERY selection of the operation is undefined: that is the schema a Merged API serves
+    // once the associations whose merges carried its types are gone, and what an API that
+    // holds no type system at all serves — a document validated against nothing is not a
+    // document whose every field resolves to nothing.
+    if !types.contains_key(root_type) {
+        return fields
+            .iter()
+            .filter(|field| {
+                !crate::service::graphql_api::introspection::is_introspection_field(&field.name)
+            })
+            .map(|field| {
+                json!({
+                    "message": undefined_field_message(
+                        &field.name,
+                        root_type,
+                        ::std::slice::from_ref(&field.name),
+                    ),
+                })
+            })
+            .collect();
+    }
     let mut errors = Vec::new();
     undefined_fields(types, root_type, fields, &mut Vec::new(), &mut errors);
     errors

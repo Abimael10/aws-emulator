@@ -271,11 +271,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stated none, the one that was already stored); a later read answers the
         // service's own rendering of it. The `Type` an update reports carries no `name`
         // (`crate::state::TypeRecord::to_updated_type`).
-        Ok(UpdateTypeOutput {
+        let answered = UpdateTypeOutput {
             r#type: api
                 .types
                 .get(&input.type_name)
                 .map(|record| record.to_updated_type(&input.format, &api.types)),
-        })
+        };
+        // What a source API holds is what its next merge carries into the Merged APIs it is
+        // a source of, so this change PROMPTS the merge of every `AUTO_MERGE` association
+        // of it (`crate::state::ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::prompt_auto_merge`).
+        let changed = input.api_id.clone();
+        guard.prompt_auto_merge(&changed, now);
+        Ok(answered)
     }
 }

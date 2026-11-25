@@ -213,6 +213,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // room it took in the per-API quota is free again.
         api.data_sources.remove(&input.name);
 
+        // What a source API holds is what its next merge carries into the Merged APIs it is
+        // a source of, so this change PROMPTS the merge of every `AUTO_MERGE` association
+        // of it (`crate::state::ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::prompt_auto_merge`).
+        let changed = input.api_id.clone();
+        guard.prompt_auto_merge(&changed, std::time::SystemTime::now());
         Ok(DeleteDataSourceOutput {})
     }
 }

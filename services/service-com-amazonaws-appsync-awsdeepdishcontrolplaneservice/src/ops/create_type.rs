@@ -252,12 +252,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Answer from the STORED record, with the definition in the format the request
         // asked for — the definition as this request stated it, which is what the create
         // reports back; a later read answers the service's own rendering of it.
-        Ok(CreateTypeOutput {
+        let answered = CreateTypeOutput {
             r#type: api
                 .types
                 .get(&name)
                 .map(|record| record.to_stated_type(&input.format, &api.types)),
-        })
+        };
+        // What a source API holds is what its next merge carries into the Merged APIs it is
+        // a source of, so this change PROMPTS the merge of every `AUTO_MERGE` association
+        // of it (`crate::state::ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::prompt_auto_merge`).
+        guard.prompt_auto_merge(&api_id, now);
+        Ok(answered)
     }
 }
 

@@ -338,12 +338,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Answer from the STORED record, so this body is the one `GetDataSource` and
         // `ListDataSources` answer with later.
-        Ok(CreateDataSourceOutput {
+        let answered = CreateDataSourceOutput {
             data_source: api
                 .data_sources
                 .get(&name)
                 .map(crate::state::DataSourceRecord::to_data_source),
-        })
+        };
+        // What a source API holds is what its next merge carries into the Merged APIs it is
+        // a source of, so this change PROMPTS the merge of every `AUTO_MERGE` association
+        // of it (`crate::state::ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::prompt_auto_merge`).
+        let changed = input.api_id.clone();
+        guard.prompt_auto_merge(&changed, std::time::SystemTime::now());
+        Ok(answered)
     }
 }
 
