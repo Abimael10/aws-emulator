@@ -209,12 +209,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    date_time_millis, service_state, session_url, SessionProtocol, SessionWindow,
-    StreamLookupError, StreamingSession, TimestampOrigin, DEFAULT_LIVE_SESSION_FRAGMENTS,
-    DEFAULT_ON_DEMAND_SESSION_FRAGMENTS, DEFAULT_SESSION_EXPIRES_SECS, NO_DATA_RETENTION_MESSAGE,
-    NO_FRAGMENTS_MESSAGE, TIMESTAMP_RANGE_ORDER_MESSAGE,
+    date_time_millis, service_state, session_parameters, session_url, SelectedTimestampRange,
+    SessionParameters, SessionProtocol, SessionRequest, StreamLookupError, StreamingSession,
+    TimestampOrigin, NO_DATA_RETENTION_MESSAGE, NO_FRAGMENTS_MESSAGE,
 };
 use std::time::SystemTime;
+
+/// The input member this operation carries its fragment selector in, which is
+/// what every refusal naming the selector is worded with.
+const SELECTOR_MEMBER: &str = "HLSFragmentSelector";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -321,24 +324,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into()
         };
 
-        // Documented parameter defaults. The membership checks are
+        // The playback mode, the session-parameter defaults and the mode's
+        // selector requirements, by the one rule both streaming-session
+        // operations use, worded with THIS operation's selector member.
+        let selector = input.hls_fragment_selector.as_ref();
+        let SessionParameters {
+            playback_mode,
+            expires_in_secs,
+            max_fragments,
+            window,
+        } = session_parameters(SessionRequest {
+            selector_member: SELECTOR_MEMBER,
+            playback_mode: input.playback_mode.as_deref(),
+            playback_mode_values: H_L_S_PLAYBACK_MODE_VALUES,
+            expires: input.expires,
+            max_fragment_results: input.max_media_playlist_fragment_results,
+            range: selector.and_then(|s| s.timestamp_range.as_ref()).map(|range| {
+                SelectedTimestampRange {
+                    start_millis: range.start_timestamp.as_ref().map(date_time_millis),
+                    end_millis: range.end_timestamp.as_ref().map(date_time_millis),
+                }
+            }),
+        })
+        .map_err(invalid)?;
+
+        // The members this protocol alone carries. The membership checks are
         // belt-and-braces rather than the authoritative enum check: the
         // framework's walk already refuses a value outside a modelled enum
         // before this handler runs.
-        let playback_mode = input.playback_mode.clone().unwrap_or_else(|| "LIVE".to_string());
-        if !H_L_S_PLAYBACK_MODE_VALUES.contains(&playback_mode.as_str()) {
-            return Err(invalid(format!(
-                "PlaybackMode must be one of [{}]",
-                H_L_S_PLAYBACK_MODE_VALUES.join(", ")
-            )));
-        }
-        let selector = input.hls_fragment_selector.as_ref();
         let origin_value = selector
             .and_then(|s| s.fragment_selector_type.clone())
             .unwrap_or_else(|| TimestampOrigin::Server.as_str().to_string());
         let Some(origin) = TimestampOrigin::parse(&origin_value) else {
             return Err(invalid(format!(
-                "HLSFragmentSelector.FragmentSelectorType must be one of [{}]",
+                "{SELECTOR_MEMBER}.FragmentSelectorType must be one of [{}]",
                 H_L_S_FRAGMENT_SELECTOR_TYPE_VALUES.join(", ")
             )));
         };
@@ -375,76 +394,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 H_L_S_DISPLAY_FRAGMENT_TIMESTAMP_VALUES.join(", ")
             )));
         }
-        let expires_in_secs = input
-            .expires
-            .and_then(|secs| u32::try_from(secs).ok())
-            .unwrap_or(DEFAULT_SESSION_EXPIRES_SECS);
-        let max_fragments = input
-            .max_media_playlist_fragment_results
-            .and_then(|max| usize::try_from(max).ok())
-            .unwrap_or(if playback_mode == "ON_DEMAND" {
-                DEFAULT_ON_DEMAND_SESSION_FRAGMENTS
-            } else {
-                DEFAULT_LIVE_SESSION_FRAGMENTS
-            });
-
-        // The time range the selector asks for, checked against the playback
-        // mode's documented requirements before any state is touched.
-        let range = selector.and_then(|s| s.timestamp_range.as_ref());
-        let live = playback_mode == "LIVE";
-        if live {
-            if range.is_some() {
-                return Err(invalid(
-                    "HLSFragmentSelector.TimestampRange must not be set when PlaybackMode is LIVE"
-                        .to_string(),
-                ));
-            }
-        } else {
-            let Some(range) = range else {
-                return Err(invalid(format!(
-                    "HLSFragmentSelector with a TimestampRange is required when PlaybackMode is \
-                     {playback_mode}"
-                )));
-            };
-            if range.start_timestamp.is_none() {
-                return Err(invalid(
-                    "HLSFragmentSelector.TimestampRange.StartTimestamp is required".to_string(),
-                ));
-            }
-            if playback_mode == "ON_DEMAND" && range.end_timestamp.is_none() {
-                return Err(invalid(
-                    "HLSFragmentSelector.TimestampRange.EndTimestamp is required when PlaybackMode \
-                     is ON_DEMAND"
-                        .to_string(),
-                ));
-            }
-            // STRICTER than the `TimestampRange` of ListFragments and GetClip,
-            // which accept a single-instant range: `HLSTimestampRange`'s own
-            // documentation says the end "must be later than the StartTimestamp
-            // value", wording the other two ranges do not carry. The divergence
-            // is the model's, not an inconsistency here.
-            if let (Some(start), Some(end)) = (&range.start_timestamp, &range.end_timestamp) {
-                if date_time_millis(end) <= date_time_millis(start) {
-                    return Err(invalid(TIMESTAMP_RANGE_ORDER_MESSAGE.to_string()));
-                }
-            }
-        }
-
-        // Which fragments the session serves, as the mode and the selector
-        // describe them; the archive itself is read through this below.
-        let window = match range {
-            Some(range) if !live => SessionWindow::Range {
-                start_millis: range
-                    .start_timestamp
-                    .as_ref()
-                    .map_or(i64::MIN, date_time_millis),
-                end_millis: range
-                    .end_timestamp
-                    .as_ref()
-                    .map_or(i64::MAX, date_time_millis),
-            },
-            _ => SessionWindow::Live,
-        };
 
         let Some(state) = service_state(&*self.engine) else {
             // See the note in `list_fragments`: unreachable in the assembled

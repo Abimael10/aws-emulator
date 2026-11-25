@@ -616,6 +616,164 @@ pub enum SessionWindow {
     },
 }
 
+/// `PlaybackMode` LIVE: the mode that plays the stream head, the only one that
+/// carries no timestamp range, and the value a request naming no mode means
+/// ("The default is LIVE").
+pub const LIVE_PLAYBACK_MODE: &str = "LIVE";
+
+/// `PlaybackMode` ON_DEMAND: the mode that plays a closed range of the archive,
+/// so it is the one whose range must carry both bounds.
+pub const ON_DEMAND_PLAYBACK_MODE: &str = "ON_DEMAND";
+
+/// The bounds one streaming-session request's fragment selector asks for, in
+/// epoch milliseconds, with each bound present only when the request carried it.
+///
+/// The two protocols model that range as two shapes with the same two members
+/// (`HLSTimestampRange` and `DASHTimestampRange`), so each handler reads its own
+/// shape and hands the bounds to [`session_parameters`] in this one form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedTimestampRange {
+    /// `TimestampRange$StartTimestamp`, when the request carried one.
+    pub start_millis: Option<i64>,
+    /// `TimestampRange$EndTimestamp`, when the request carried one.
+    pub end_millis: Option<i64>,
+}
+
+/// One streaming-session request's mode, session parameters and selected range,
+/// as either streaming-session operation presents them to
+/// [`session_parameters`].
+#[derive(Debug, Clone, Copy)]
+pub struct SessionRequest<'a> {
+    /// The input member this protocol carries its fragment selector in
+    /// (`HLSFragmentSelector` / `DASHFragmentSelector`) — the member every
+    /// refusal below names, and the only thing that differs between the two
+    /// operations' refusal sentences.
+    pub selector_member: &'a str,
+    /// `PlaybackMode` as the request carried it, or `None` for the default.
+    pub playback_mode: Option<&'a str>,
+    /// The values this protocol's `PlaybackMode` enum admits.
+    pub playback_mode_values: &'a [&'a str],
+    /// `Expires`, in seconds, as the request carried it.
+    pub expires: Option<i32>,
+    /// The protocol's own maximum-fragment member
+    /// (`MaxMediaPlaylistFragmentResults` / `MaxManifestFragmentResults`).
+    pub max_fragment_results: Option<i64>,
+    /// The selector's `TimestampRange`, when the selector carried one.
+    pub range: Option<SelectedTimestampRange>,
+}
+
+/// What a streaming-session request resolves to: its parameters with the
+/// documented defaults applied, and the window of the archive the session
+/// serves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionParameters {
+    /// `PlaybackMode`, defaulted to [`LIVE_PLAYBACK_MODE`].
+    pub playback_mode: String,
+    /// `Expires`, defaulted to [`DEFAULT_SESSION_EXPIRES_SECS`].
+    pub expires_in_secs: u32,
+    /// How many fragments the manifest or playlist carries, defaulted per mode
+    /// ([`DEFAULT_LIVE_SESSION_FRAGMENTS`] /
+    /// [`DEFAULT_ON_DEMAND_SESSION_FRAGMENTS`]).
+    pub max_fragments: usize,
+    /// Which fragments of the archive the session serves.
+    pub window: SessionWindow,
+}
+
+/// The documented session-parameter defaults and the playback mode's selector
+/// requirements, applied to one streaming-session request.
+///
+/// The one rule both streaming-session operations use, so they cannot drift on
+/// what an unstated parameter means or on which selector a mode admits: the
+/// `PlaybackMode` default, the `Expires` and maximum-fragment defaults, the
+/// `LIVE` session that must carry no `TimestampRange`, the range a non-`LIVE`
+/// session must carry, the `StartTimestamp` every such range must carry, the
+/// `EndTimestamp` `ON_DEMAND` must carry, the end that must be later than the
+/// start, and the window built from those bounds. The two operations differ only
+/// in [`SessionRequest::selector_member`], which every refusal that names the
+/// selector is worded with, and in the per-protocol members each input
+/// additionally carries, which stay in their own handlers.
+///
+/// `Err` carries the refusal's sentence; each caller reports it as its own
+/// operation's `InvalidArgumentException`. The `PlaybackMode` membership check is
+/// belt-and-braces rather than the authoritative enum check: the framework's walk
+/// already refuses a value outside a modelled enum before a handler runs.
+pub fn session_parameters(request: SessionRequest<'_>) -> Result<SessionParameters, String> {
+    let member = request.selector_member;
+    let playback_mode = request
+        .playback_mode
+        .unwrap_or(LIVE_PLAYBACK_MODE)
+        .to_string();
+    if !request.playback_mode_values.contains(&playback_mode.as_str()) {
+        return Err(format!(
+            "PlaybackMode must be one of [{}]",
+            request.playback_mode_values.join(", ")
+        ));
+    }
+    let expires_in_secs = request
+        .expires
+        .and_then(|secs| u32::try_from(secs).ok())
+        .unwrap_or(DEFAULT_SESSION_EXPIRES_SECS);
+    let max_fragments = request
+        .max_fragment_results
+        .and_then(|max| usize::try_from(max).ok())
+        .unwrap_or(if playback_mode == ON_DEMAND_PLAYBACK_MODE {
+            DEFAULT_ON_DEMAND_SESSION_FRAGMENTS
+        } else {
+            DEFAULT_LIVE_SESSION_FRAGMENTS
+        });
+
+    // The range the selector asks for, against the playback mode's documented
+    // requirements.
+    let live = playback_mode == LIVE_PLAYBACK_MODE;
+    let window = if live {
+        if request.range.is_some() {
+            return Err(format!(
+                "{member}.TimestampRange must not be set when PlaybackMode is LIVE"
+            ));
+        }
+        SessionWindow::Live
+    } else {
+        let Some(range) = request.range else {
+            return Err(format!(
+                "{member} with a TimestampRange is required when PlaybackMode is {playback_mode}"
+            ));
+        };
+        let Some(start_millis) = range.start_millis else {
+            return Err(format!(
+                "{member}.TimestampRange.StartTimestamp is required"
+            ));
+        };
+        if playback_mode == ON_DEMAND_PLAYBACK_MODE && range.end_millis.is_none() {
+            return Err(format!(
+                "{member}.TimestampRange.EndTimestamp is required when PlaybackMode is ON_DEMAND"
+            ));
+        }
+        // STRICTER than the `TimestampRange` of `ListFragments`, which accepts a
+        // single-instant range: both streaming ranges' own documentation says the
+        // end "must be later than the StartTimestamp value", wording that range
+        // does not carry. The divergence is the model's, not an inconsistency
+        // here.
+        if let Some(end_millis) = range.end_millis {
+            if end_millis <= start_millis {
+                return Err(TIMESTAMP_RANGE_ORDER_MESSAGE.to_string());
+            }
+        }
+        SessionWindow::Range {
+            start_millis,
+            // An unset bound leaves that end of the range open, which is what a
+            // LIVE_REPLAY session with no `EndTimestamp` asks for.
+            end_millis: range.end_millis.unwrap_or(i64::MAX),
+        }
+    };
+
+    Ok(SessionParameters {
+        playback_mode,
+        expires_in_secs,
+        max_fragments,
+        window,
+    })
+}
+
 /// Which playback protocol a streaming session serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionProtocol {
