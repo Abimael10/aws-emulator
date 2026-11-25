@@ -1057,3 +1057,142 @@ async fn any_accepted_identifier_form_names_the_same_user() {
         "case {case:?}: expected every form to have updated the same record"
     );
 }
+
+/// `ListUsers`' report of `user`: the second reader of a stored user, so a case asserts
+/// what was stored rather than what one response path happens to render.
+async fn listed(router: &MultiServiceRouter, user: &str, case: &str) -> Value {
+    let page = ok(
+        router,
+        "ListUsers",
+        json!({ "IdentityStoreId": STORE }),
+        case,
+    )
+    .await;
+    page["Users"]
+        .as_array()
+        .and_then(|users| users.iter().find(|listed| listed["UserId"] == json!(user)))
+        .cloned()
+        .unwrap_or_else(|| panic!("case {case:?}: expected ListUsers to report {user}, got {page}"))
+}
+
+/// An element of a multi-valued attribute reports exactly the sub-attributes it carries.
+///
+/// A sub-attribute the stored element does not carry is ABSENT from every response that
+/// reports that element — `Primary` included, whose modelled `@default` of `false`
+/// (`smithy_query(query="shape",shape="Email,Address,PhoneNumber,Photo,Role")`) is a
+/// value the service never materialises, so a caller can tell an element that was never
+/// given a `Primary` from one explicitly given `false`.
+///
+/// Each row is driven through BOTH writers of such an element — `CreateUser`, and the
+/// `UpdateUser` whose `AttributeValue` replaces the attribute wholesale — and read back
+/// through both readers, `DescribeUser` and `ListUsers`. The rows differ along which
+/// attribute carries the element, which sub-attributes it supplies, how many entries the
+/// list has, and whether a `Primary` is supplied at all (absent, explicitly `false`,
+/// explicitly `true`).
+#[tokio::test]
+async fn an_element_reports_only_the_sub_attributes_it_carries() {
+    let router = emulator();
+    // (case, AttributePath, the DescribeUser member it lands in, the element(s)
+    // CreateUser seeds, the element(s) the replacing UpdateUser supplies)
+    let rows: Vec<(&str, &str, &str, Value, Value)> = vec![
+        (
+            "an email replaced by its value alone",
+            "emails",
+            "Emails",
+            json!([{ "Value": "ada@example.invalid", "Type": "work", "Primary": false }]),
+            json!([{ "Value": "ada.lovelace@example.invalid" }]),
+        ),
+        (
+            "a phone number replaced by its value alone",
+            "phoneNumbers",
+            "PhoneNumbers",
+            json!([{ "Value": "+1 (555) 0100", "Type": "work", "Primary": false }]),
+            json!([{ "Value": "+1 (555) 0199" }]),
+        ),
+        (
+            "a phone number whose replacement sets Primary false",
+            "phoneNumbers",
+            "PhoneNumbers",
+            json!([{ "Value": "+1 (555) 0101", "Primary": true }]),
+            json!([{ "Value": "+1 (555) 0198", "Primary": false }]),
+        ),
+        (
+            "an email whose replacement sets Primary true",
+            "emails",
+            "Emails",
+            json!([{ "Value": "grace@example.invalid" }]),
+            json!([{ "Value": "grace.hopper@example.invalid", "Primary": true }]),
+        ),
+        (
+            "an address replaced by one of its eight sub-attributes",
+            "addresses",
+            "Addresses",
+            json!([{
+                "StreetAddress": "12 High Street",
+                "Locality": "London",
+                "Region": "England",
+                "PostalCode": "SW1A-1AA",
+                "Country": "GB",
+                "Formatted": "12 High Street, London",
+                "Type": "home",
+                "Primary": true,
+            }]),
+            json!([{ "Locality": "Cambridge" }]),
+        ),
+        (
+            "a role replaced by value and type",
+            "roles",
+            "Roles",
+            json!([{ "Value": "Researcher", "Type": "work", "Primary": true }]),
+            json!([{ "Value": "Analyst", "Type": "work" }]),
+        ),
+        // `User$Photos` is modelled `length 1..3`, so a replacement may differ from the
+        // seeded element in its entry count as well as in its sub-attributes.
+        (
+            "three photos replaced by one carrying only its required value",
+            "photos",
+            "Photos",
+            json!([
+                {
+                    "Value": "https://example.invalid/1.png",
+                    "Type": "jpg",
+                    "Display": "first",
+                    "Primary": false,
+                },
+                { "Value": "https://example.invalid/2.png", "Primary": true },
+                { "Value": "https://example.invalid/3.gif" },
+            ]),
+            json!([{ "Value": "https://example.invalid/4.png" }]),
+        ),
+    ];
+
+    for (index, (case, path, member, seeded, replacement)) in rows.iter().enumerate() {
+        let mut body = json!({ "UserName": user_name(case, index) });
+        body[*member] = seeded.clone();
+        let user = create_user(&router, body, case).await;
+
+        // The create side first: an element carries what it was given, no more and no
+        // less, so an explicit `Primary` survives and an unsupplied one never appears.
+        let described = describe(&router, &user, case).await;
+        assert_eq!(
+            described.get(*member).unwrap_or(&Value::Null),
+            seeded,
+            "case {case:?}: expected CreateUser to store {member} as {seeded}, got {described}"
+        );
+
+        update(&router, &user, set(path, replacement.clone()), case).await;
+        let described = describe(&router, &user, case).await;
+        assert_eq!(
+            described.get(*member).unwrap_or(&Value::Null),
+            replacement,
+            "case {case:?}: expected the replaced {member} to be exactly {replacement}, \
+             got {described}"
+        );
+        let listed = listed(&router, &user, case).await;
+        assert_eq!(
+            listed.get(*member).unwrap_or(&Value::Null),
+            replacement,
+            "case {case:?}: expected ListUsers to report {member} as {replacement}, got {listed}"
+        );
+    }
+}

@@ -126,51 +126,9 @@ pub struct Name {
     pub honorific_suffix: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.identitystore#Email")]
-#[derive(Debug, Clone, Default)]
-pub struct Email {
-    pub value: Option<String>,
-    pub r#type: Option<String>,
-    pub primary: bool,
-}
-
-#[smithy_macros::smithy(shape = "com.amazonaws.identitystore#Address")]
-#[derive(Debug, Clone, Default)]
-pub struct Address {
-    pub street_address: Option<String>,
-    pub locality: Option<String>,
-    pub region: Option<String>,
-    pub postal_code: Option<String>,
-    pub country: Option<String>,
-    pub formatted: Option<String>,
-    pub r#type: Option<String>,
-    pub primary: bool,
-}
-
-#[smithy_macros::smithy(shape = "com.amazonaws.identitystore#PhoneNumber")]
-#[derive(Debug, Clone, Default)]
-pub struct PhoneNumber {
-    pub value: Option<String>,
-    pub r#type: Option<String>,
-    pub primary: bool,
-}
-
-#[smithy_macros::smithy(shape = "com.amazonaws.identitystore#Photo")]
-#[derive(Debug, Clone, Default)]
-pub struct Photo {
-    pub value: String,
-    pub r#type: Option<String>,
-    pub display: Option<String>,
-    pub primary: bool,
-}
-
-#[smithy_macros::smithy(shape = "com.amazonaws.identitystore#Role")]
-#[derive(Debug, Clone, Default)]
-pub struct Role {
-    pub value: Option<String>,
-    pub r#type: Option<String>,
-    pub primary: bool,
-}
+// `Email`, `Address`, `PhoneNumber`, `Photo` and `Role` — the elements of a user's
+// multi-valued attributes — live in `multi_valued_attribute_types`, which keeps each
+// one's `Primary` optional so an element reports the member only when it carries one.
 
 /// The values `ConflictExceptionReason` accepts on the wire.
 pub const CONFLICT_EXCEPTION_REASON_VALUES: &[&str] = &["CONCURRENT_MODIFICATION", "UNIQUENESS_CONSTRAINT_VIOLATION"];

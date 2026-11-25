@@ -33,6 +33,7 @@ pub mod list_group_memberships_types;
 pub mod list_groups_types;
 pub mod list_identity_stores_types;
 pub mod list_users_types;
+pub mod multi_valued_attribute_types;
 pub mod shared_types;
 pub mod update_group_types;
 pub mod update_identity_store_types;
@@ -76,6 +77,8 @@ pub use list_groups_types::*;
 pub use list_identity_stores_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use list_users_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use multi_valued_attribute_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use shared_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

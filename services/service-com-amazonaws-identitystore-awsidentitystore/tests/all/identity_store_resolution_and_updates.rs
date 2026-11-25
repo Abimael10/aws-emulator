@@ -807,7 +807,9 @@ async fn an_update_applies_the_attribute_paths_it_owns() {
             "phoneNumbers",
             json!([{ "Value": "+1 (800) 123-4567", "Type": "mobile" }]),
             "PhoneNumbers",
-            json!([{ "Value": "+1 (800) 123-4567", "Type": "mobile", "Primary": false }]),
+            // The replaced element is what the operation supplied and nothing more: it
+            // named no `Primary`, so the reported element carries none.
+            json!([{ "Value": "+1 (800) 123-4567", "Type": "mobile" }]),
         ),
         (
             "a list at its modelled maximum",
@@ -820,8 +822,8 @@ async fn an_update_applies_the_attribute_paths_it_owns() {
             "Photos",
             json!([
                 { "Value": "https://example.com/1.png", "Primary": true },
-                { "Value": "https://example.com/2.png", "Primary": false },
-                { "Value": "https://example.com/3.png", "Primary": false },
+                { "Value": "https://example.com/2.png" },
+                { "Value": "https://example.com/3.png" },
             ]),
         ),
         (
@@ -833,7 +835,6 @@ async fn an_update_applies_the_attribute_paths_it_owns() {
                 "StreetAddress": "1 Main St",
                 "Locality": "Springfield",
                 "Country": "US",
-                "Primary": false,
             }]),
         ),
         (

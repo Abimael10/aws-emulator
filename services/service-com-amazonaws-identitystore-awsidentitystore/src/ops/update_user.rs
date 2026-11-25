@@ -20,6 +20,11 @@
 //!   add, replace, or remove an attribute"); an EMPTY array is not a removal — every
 //!   multi-valued member is modelled with a minimum length of 1, so it is refused.
 //!
+//! A replaced element is the element the request supplied and nothing more: a
+//! sub-attribute the `AttributeValue` does not name is absent from the stored element,
+//! and so from every later response, rather than being merged in from the element it
+//! replaced or taken from the model's `@default`.
+//!
 //! The operations apply in request order, so a later one naming the same path wins.
 //! Paths and the member names inside an `AttributeValue` are matched without regard to
 //! case (SCIM attribute names are case-insensitive), so `displayName`, `DisplayName`
@@ -431,12 +436,17 @@ fn required_text(
         .ok_or_else(|| format!("every {member} entry of {path} must carry a Value"))
 }
 
-/// One boolean member, defaulting to the model's own `@default: false`.
-fn flag(value: Option<&::aws_smithy_types::Document>, path: &str) -> Result<bool, String> {
+/// The `Primary` sub-attribute an entry carries, or `None` when it carries none.
+///
+/// A replaced element is the element the request supplied and nothing more, so a
+/// `Primary` the request did not name stays ABSENT rather than taking the model's
+/// `@default` — the reported element then says what the caller set, and a caller can
+/// still tell "never set" from an explicit `false`.
+fn flag(value: Option<&::aws_smithy_types::Document>, path: &str) -> Result<Option<bool>, String> {
     use ::aws_smithy_types::Document;
     match value {
-        None | Some(Document::Null) => Ok(false),
-        Some(Document::Bool(flag)) => Ok(*flag),
+        None | Some(Document::Null) => Ok(None),
+        Some(Document::Bool(flag)) => Ok(Some(*flag)),
         Some(other) => Err(format!(
             "Primary inside the AttributeValue for {path} must be a boolean, got {}",
             kind(other)
