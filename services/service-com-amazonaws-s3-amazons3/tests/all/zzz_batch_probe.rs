@@ -12,16 +12,19 @@
 //!
 //! The three rules under test, each asserted over a SET of spellings rather than one request:
 //!
-//! > A boolean element of a request document that states a VALUE the service keeps is read in
-//! > the lexical space the schema S3 publishes for it gives a boolean: `true`, `false`, `1` and
-//! > `0`, with surrounding whitespace allowed — so a document spelling one the NUMERIC way
-//! > states the same value as the word, and text in neither spelling states no boolean at all
-//! > and is refused.
+//! > A boolean element of a request document is read in the lexical space the schema S3
+//! > publishes for it gives a boolean: `true`, `false`, `1` and `0`, with surrounding whitespace
+//! > allowed — so a document spelling one the NUMERIC way states the same value as the word, and
+//! > text in neither spelling states no boolean at all. Where the element states a VALUE the
+//! > service keeps beyond whether it is on, such text is refused.
 //!
-//! > A boolean element whose published rule is that ADDING it with the value `true` turns a MODE
-//! > on states only whether the mode is on: text that states no `true` leaves the mode off — the
-//! > reading the element's own absence has — and never makes the document one that does not
-//! > validate, so the request is carried out and answered whatever that element spells.
+//! > A boolean element whose published rule is that ADDING it with the value `true` turns a
+//! > SWITCH on states only whether that switch is on: text that states no `true` — which is read
+//! > in ANY case, the spelling such a member's own documentation uses — leaves it off, the
+//! > reading the element's own absence has, and never makes the document one that does not
+//! > validate, so the request is carried out and answered whatever that element spells. The
+//! > quiet mode of a batch delete is one such switch, and so is each of the four settings of a
+//! > Block Public Access configuration.
 //!
 //! > The text of an element that carries an OBJECT KEY is the key itself, whitespace and all:
 //! > the key a batch delete names is the key it takes away, and the key a tag set states is
@@ -31,8 +34,9 @@
 //! Their sources: a request document is validated against the published schema, where a boolean
 //! element is an `xsd:boolean`, whose lexical space is exactly `{true, false, 1, 0}` (W3C XML
 //! Schema Part 2: Datatypes, §3.2.2.1) — the "0" and "1" being the numeric spellings of the
-//! other two; `Delete$Quiet` is "element to enable quiet mode for the request. When you add this
-//! element, you must set its value to `true`"
+//! other two, and `service_com_amazonaws_s3_amazons3::state::DOCUMENT_BOOLEAN_SPELLINGS` the one
+//! place this service states that space; `Delete$Quiet` is "element to enable quiet mode for the
+//! request. When you add this element, you must set its value to `true`"
 //! (`smithy_query(query="doc",shape="Delete",member="Quiet")`), switching the two modes
 //! `DeleteObjects` documents ("by default, the operation uses verbose mode in which the response
 //! includes the result of deletion of each key in your request. In quiet mode the response
@@ -40,10 +44,12 @@
 //! names a whitespace key in its own documentation of
 //! `Delete$Objects` ("an object that's composed entirely of whitespace characters is not
 //! supported by the `DeleteObjects` API operation" for a DIRECTORY bucket, which is the bucket
-//! kind that does not support it). The documents driven here are the two kinds that carry a
-//! boolean — `Delete$Quiet` on `DeleteObjects`, the one element that turns a mode on, and the
-//! four `PublicAccessBlockConfiguration` settings on `PutPublicAccessBlock`, which state values
-//! the bucket keeps — each read back through the operation that reports it.
+//! kind that does not support it). The documents driven here are the two that carry a
+//! boolean — `Delete$Quiet` on `DeleteObjects`, which turns the response's quiet mode on, and
+//! the four `PublicAccessBlockConfiguration` settings on `PutPublicAccessBlock`, each of which
+//! is published as "setting this element to TRUE causes the following behavior"
+//! (`smithy_query(query="shape",shape="PublicAccessBlockConfiguration")`) — each read back
+//! through the operation that reports it.
 
 use std::collections::BTreeSet;
 
@@ -52,6 +58,9 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_s3_amazons3::service::wire::{
     XML_BOOLEAN_DOCUMENT_ELEMENTS, XML_MODE_SWITCH_DOCUMENT_ELEMENTS,
     XML_OBJECT_KEY_DOCUMENT_ELEMENTS,
+};
+use service_com_amazonaws_s3_amazons3::state::{
+    document_boolean, document_switch_is_on, DOCUMENT_BOOLEAN_SPELLINGS,
 };
 
 use super::bucket_lifecycle::{router, send, Answer};
@@ -131,28 +140,42 @@ const SETTINGS: [&str; 4] = [
     "RestrictPublicBuckets",
 ];
 
-/// One row of the spelling table: the case, the text the element carries, and the boolean it
-/// states — `None` for text in neither spelling, which states no boolean at all.
-type SpellingRow = (&'static str, &'static str, Option<bool>);
+/// One row of the spelling table: the case, the text the element carries, the boolean the
+/// published lexical space reads it as — `None` for text in neither spelling, which states no
+/// boolean at all — and whether a SWITCH that text was written for is left ON.
+type SpellingRow = (&'static str, &'static str, Option<bool>, bool);
 
 /// Every spelling the published lexical space admits, beside text outside it.
 ///
 /// The rows differ along what the rules generalise over: which of the two words, which of the
 /// two numeric spellings, and the surrounding whitespace the space allows — plus, for the rows
-/// that state no boolean at all, a word in the wrong case, a number outside the space and text
-/// that is no boolean in any reading. A row stating none is refused where the element states a
-/// VALUE the service keeps, and read as the mode's default where it turns a MODE on.
-const SPELLINGS: [SpellingRow; 10] = [
-    ("the word true", "true", Some(true)),
-    ("the word false", "false", Some(false)),
-    ("the numeric spelling of true", "1", Some(true)),
-    ("the numeric spelling of false", "0", Some(false)),
-    ("a word with surrounding whitespace", " true ", Some(true)),
-    ("a numeric spelling with surrounding whitespace", " 0 ", Some(false)),
-    ("a word in another case", "True", None),
-    ("a number outside the space", "2", None),
-    ("a word that is not one of the two", "yes", None),
-    ("no text at all", "", None),
+/// that state no boolean in that space, the word in another case and in upper case (which a
+/// SWITCH still reads as true, the case not being part of what the text states), a number
+/// outside the space, text that is no boolean in any reading and no text at all. A row stating
+/// no true leaves a switch off — the reading the element's own absence has — and a row in
+/// neither spelling of the space is refused where the element states a value the service keeps
+/// beyond whether it is on.
+///
+/// Every row is also checked against the one place this service states that space and that
+/// switch reading ([`the_boolean_spellings_are_the_space_the_service_reads`]), so the table
+/// cannot drift from either.
+const SPELLINGS: [SpellingRow; 11] = [
+    ("the word true", "true", Some(true), true),
+    ("the word false", "false", Some(false), false),
+    ("the numeric spelling of true", "1", Some(true), true),
+    ("the numeric spelling of false", "0", Some(false), false),
+    ("a word with surrounding whitespace", " true ", Some(true), true),
+    (
+        "a numeric spelling with surrounding whitespace",
+        " 0 ",
+        Some(false),
+        false,
+    ),
+    ("the word true in another case", "True", None, true),
+    ("the word true in upper case", "TRUE", None, true),
+    ("a number outside the space", "2", None, false),
+    ("a word that is not one of the two", "yes", None, false),
+    ("no text at all", "", None, false),
 ];
 
 /// This service's Smithy model's shapes, parsed.
@@ -258,8 +281,46 @@ fn document_elements(by_target: &dyn Fn(&str, &serde_json::Value) -> bool) -> BT
 }
 
 #[test]
-fn the_boolean_element_catalog_matches_the_model() {
-    // Every element a request document of this service binds a BOOLEAN member from, read from
+fn the_boolean_spellings_are_the_space_the_service_reads() {
+    // Every row of the table states what the one place this service states that space reads
+    // the same text as, and what a SWITCH written with that text is left in, so the
+    // end-to-end rows above drive those two readings rather than second copies of them.
+    for (case, spelled, states, on) in SPELLINGS {
+        assert_eq!(
+            document_boolean(spelled),
+            states,
+            "case {case:?}: the published space must read {spelled:?} as {states:?}, got {:?}",
+            document_boolean(spelled)
+        );
+        assert_eq!(
+            document_switch_is_on(spelled),
+            on,
+            "case {case:?}: a switch written {spelled:?} must be {}, got {}",
+            match on {
+                true => "on",
+                false => "off",
+            },
+            document_switch_is_on(spelled)
+        );
+    }
+
+    // And every spelling that space admits is a row of the table, so each one is driven
+    // end-to-end rather than only declared.
+    let driven: BTreeSet<&str> = SPELLINGS
+        .iter()
+        .map(|(_, spelled, _, _)| spelled.trim())
+        .collect();
+    for (spelling, states) in DOCUMENT_BOOLEAN_SPELLINGS {
+        assert!(
+            driven.contains(spelling),
+            "case {spelling:?}: the spelling states {states} and must be driven end to end, \
+             the table drives {driven:?}"
+        );
+    }
+}
+
+#[test]
+fn the_boolean_element_catalog_matches_the_model() {    // Every element a request document of this service binds a BOOLEAN member from, read from
     // the model itself rather than from a second hand-written list.
     let derived = document_elements(&|_, targeted| targeted["type"] == "boolean");
     let declared: BTreeSet<String> = XML_BOOLEAN_DOCUMENT_ELEMENTS
@@ -367,13 +428,14 @@ async fn a_batch_delete_addresses_the_key_its_document_spells_whitespace_and_all
 async fn a_batch_delete_is_served_whatever_its_quiet_element_spells() {
     // The element turns a MODE on, so what its text decides is the mode and never whether the
     // request validates: every row is served, and the mode is on only where the text states
-    // `true` in the published lexical space. The rows differ along the TEXT (each of the two
-    // words, each of the two numeric spellings, surrounding whitespace, a word in another case,
-    // a number outside the space, a word that is no boolean at all, no text at all) and along
-    // the FORM the element takes (carrying text, self-closing, absent altogether).
+    // `true`, in any case. The rows differ along the TEXT (each of the two
+    // words, each of the two numeric spellings, surrounding whitespace, the word in another
+    // case and in upper case, a number outside the space, a word that is no boolean at all, no
+    // text at all) and along the FORM the element takes (carrying text, self-closing, absent
+    // altogether).
     let rows = SPELLINGS
         .iter()
-        .map(|(case, spelled, states)| (*case, Spelled::Text(spelled), *states == Some(true)))
+        .map(|(case, spelled, _, on)| (*case, Spelled::Text(spelled), *on))
         .chain([
             ("a self-closing element", Spelled::SelfClosing, false),
             ("no Quiet element at all", Spelled::Absent, false),
@@ -444,7 +506,7 @@ fn every_mode_switch_element_is_one_the_model_binds_a_boolean_from() {
 
 #[tokio::test]
 async fn a_configuration_write_reads_every_setting_in_the_published_boolean_space() {
-    for (case, spelled, states) in SPELLINGS {
+    for (case, spelled, _, on) in SPELLINGS {
         // A fresh store per row: every bucket is created with all four switches on, so a
         // row's own write is the only thing that can have changed them.
         let router = router();
@@ -452,28 +514,20 @@ async fn a_configuration_write_reads_every_setting_in_the_published_boolean_spac
         bucket(&router, name).await;
 
         let answer = put_public_access_block_spelled(&router, name, spelled).await;
-        let Some(setting) = states else {
-            assert_eq!(
-                answer.status,
-                400,
-                "case {case:?}: text in neither spelling states no boolean, so the document is \
-                 refused, got {} with body {:?}",
-                answer.status,
-                text(&answer)
-            );
-            continue;
-        };
         assert_eq!(
             answer.status,
             200,
-            "case {case:?}: a boolean the published space admits is served, got {} with body \
-             {:?}",
+            "case {case:?}: each of the four settings states only whether its switch is on, so \
+             the document is served whatever its text spells, got {} with body {:?}",
             answer.status,
             text(&answer)
         );
 
-        // And the value each setting states is what the bucket reports afterwards, read back
-        // through the operation that reports the stored configuration.
+        // And the state each setting is in afterwards is the one its text stated: on only
+        // where that text states the boolean true, and off for text that states no true at
+        // all — the reading the element's own absence has. Read back through the operation
+        // that reports the stored configuration.
+        let setting = on;
         let read = get_public_access_block(&router, name, &[]).await;
         assert_eq!(
             read.status,

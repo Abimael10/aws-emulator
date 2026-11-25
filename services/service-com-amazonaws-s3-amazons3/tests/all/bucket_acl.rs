@@ -31,7 +31,9 @@
 //! * "If your bucket uses the bucket owner enforced setting for S3 Object Ownership …
 //!   Requests to set ACLs or update ACLs fail and return the AccessControlListNotSupported
 //!   error code. Requests to read ACLs are still supported" — and they "return the
-//!   bucket-owner-full-control ACL".
+//!   bucket-owner-full-control ACL". That precondition is judged AFTER the Block Public
+//!   Access guardrail, so each row of it is sent to a bucket whose switches are off (the
+//!   order itself is pinned by [`super::public_access_block_documents`]).
 //! * An ACL call naming a bucket this emulator does not hold answers the service's
 //!   `NoSuchBucket` (HTTP 404), and one whose `x-amz-expected-bucket-owner` is not the
 //!   bucket's owner answers `AccessDenied` (HTTP 403).
@@ -179,7 +181,11 @@ pub(crate) fn access_control_policy(owner: Option<&str>, grants: &[GrantXml<'_>]
 }
 
 /// `PUT /<bucket>?acl` — `PutBucketAcl`, with whatever headers and body the case names.
-async fn put_acl(
+///
+/// `pub(crate)`: the suite that pins the ORDER the two ACL refusals are judged in
+/// ([`super::public_access_block_documents`]) drives the same write through this one helper
+/// rather than spelling the request a second way.
+pub(crate) async fn put_acl(
     router: &MultiServiceRouter,
     bucket: &str,
     headers: &[(&str, &str)],
@@ -901,6 +907,15 @@ async fn a_bucket_whose_object_ownership_disables_acls_refuses_the_put_and_still
     // The plain create: a bucket is created with the setting that DISABLES ACLs, so no
     // call is needed to put it in that posture.
     create_bucket(&router, bucket, None, None).await;
+    // Block Public Access is lifted — and only that — because a bucket is created with all
+    // four switches on and the guardrail over a PUBLIC ACL is an authorization decision
+    // taken ahead of this precondition ([`super::public_access_block_documents`] pins that
+    // order), so a public grant would be answered about the guardrail instead. Lifting it
+    // leaves the bucket's ACLs disabled, which is what these rows are about.
+    allow_public_access(&router, bucket).await;
+
+    // The grantee a grant header names, in the `type=value` form such a header carries.
+    let all_users = format!("uri={ALL_USERS_GROUP_URI}");
 
     // Every way of naming an ACL is refused the same way while ACLs are disabled.
     for (form, headers, body) in [
@@ -911,7 +926,7 @@ async fn a_bucket_whose_object_ownership_disables_acls_refuses_the_put_and_still
         ),
         (
             "a grant header",
-            vec![("x-amz-grant-read", ALL_USERS_GROUP_URI)],
+            vec![("x-amz-grant-read", all_users.as_str())],
             String::new(),
         ),
         (

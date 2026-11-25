@@ -94,6 +94,13 @@
 //! published spelling ([`filter_rule_names_folded`]) rather than withheld, because S3 accepts
 //! it: it is the spelling a reader of a stored configuration gets back.
 //!
+//! So is the BLOCK PUBLIC ACCESS document
+//! (`crate::state::public_access_block_document_is_malformed`), whose every member is optional:
+//! a document that misspells, misnests or invents an element would otherwise be served as the
+//! weaker posture the codec salvaged from it, so `PutPublicAccessBlock` is handed
+//! [`EMPTY_PUBLIC_ACCESS_BLOCK_CONFIGURATION`] and answers S3's own code for a document that
+//! does not validate.
+//!
 //! ## The TEXT of an element: what the codec trims, and what a boolean may be spelled
 //!
 //! Two more things the codec reads differently from the schema S3 publishes, both about an
@@ -104,14 +111,15 @@
 //! §3.2.2) — the codec reads the two words only, so a document spelling one the numeric way is
 //! refused where the published schema admits it. [`XML_BOOLEAN_DOCUMENT_ELEMENTS`] is the
 //! catalog of the elements a request document binds a boolean from and
-//! [`xsd_boolean_spellings_folded`] re-spells those two values onto the words; text in neither
+//! [`document_booleans_folded`] re-spells those two values onto the words; text in neither
 //! spelling is left exactly as it arrived, for the codec to refuse.
 //!
-//! One kind of boolean element is not refused for such text, because it states no value the
-//! service keeps: one whose published rule is that ADDING it with the value `true` turns a MODE
-//! on ([`XML_MODE_SWITCH_DOCUMENT_ELEMENTS`]). The only thing it can state is whether the mode
-//! is on, so text stating no `true` leaves it off — the reading the element's own absence has —
-//! and [`mode_switch_booleans_folded`] re-spells it onto the word that says so.
+//! A boolean element whose published rule is that ADDING it with the value `true` turns a
+//! SWITCH on is not refused for such text, because it states nothing beyond whether that switch
+//! is on ([`XML_MODE_SWITCH_DOCUMENT_ELEMENTS`]): text stating no `true` — which is read in any
+//! case, the spelling the published documentation of such a member uses — leaves it off, the
+//! reading the element's own absence has, and [`mode_switch_booleans_folded`] re-spells it onto
+//! the word that says so.
 //!
 //! And the codec reads every element's text TRIMMED, which is right for a value whose own
 //! lexical space ignores surrounding whitespace and wrong for one the caller CHOSE: an object
@@ -884,6 +892,32 @@ const EMPTY_ANALYTICS_CONFIGURATION: &[u8] =
     b"<AnalyticsConfiguration><Id></Id><StorageClassAnalysis></StorageClassAnalysis>\
       </AnalyticsConfiguration>";
 
+/// Whether the input's XML document payload is a `PublicAccessBlockConfiguration` — the one
+/// document whose published schema `PutPublicAccessBlock` is the place that states the refusal
+/// for, so the withholding below is scoped to it by the member the codec would bind rather than
+/// by anything the document happens to spell.
+fn carries_public_access_block_document(input_schema: &Schema) -> bool {
+    input_schema
+        .members()
+        .iter()
+        .find(|member| is_xml_document_payload(member))
+        .and_then(|payload| payload.member_name())
+        == Some(PUBLIC_ACCESS_BLOCK_CONFIGURATION_MEMBER)
+}
+
+/// The input member `PutPublicAccessBlock` binds its document as
+/// (`smithy_query(query="operation",operation="PutPublicAccessBlock")` reports
+/// `PublicAccessBlockConfiguration` as the `@httpPayload`).
+const PUBLIC_ACCESS_BLOCK_CONFIGURATION_MEMBER: &str = "PublicAccessBlockConfiguration";
+
+/// The Block Public Access document handed to the codec in place of one the published schema
+/// rejects: the container with no switch in it, which parses to a configuration a refused
+/// request never records anything from. `PutPublicAccessBlock` reads the document the request
+/// actually carried ([`request_document`]) and refuses it from that, so nothing is read from
+/// this stand-in.
+const EMPTY_PUBLIC_ACCESS_BLOCK_CONFIGURATION: &[u8] =
+    b"<PublicAccessBlockConfiguration></PublicAccessBlockConfiguration>";
+
 /// Whether the input's XML document payload is a `NotificationConfiguration` — the one
 /// document whose events and filter rule names Amazon S3 judges itself, so the two rewrites
 /// below are scoped to it by the member the codec would bind rather than by anything the
@@ -1393,19 +1427,6 @@ fn renamed_start(start: &BytesStart<'_>, name: &'static str) -> BytesStart<'stat
     renamed
 }
 
-/// The two values an XML boolean may be spelled with that the framework's codec does not read,
-/// and the value each of them means.
-///
-/// A request document is validated against the schema S3 publishes for it, where a boolean
-/// element is an `xsd:boolean` — whose lexical space is `true`, `false`, `1` and `0` (W3C XML
-/// Schema Part 2, §3.2.2), the last two being the numeric spellings of the first two. The
-/// codec reads the words alone, so a document spelling a boolean the numeric way is refused
-/// where the published schema admits it; [`xsd_boolean_spellings_folded`] re-spells those two
-/// into the words before the codec reads the document, which leaves the value the client
-/// stated unchanged. Any other text is in neither spelling and is left exactly as it arrived,
-/// for the codec to refuse.
-const XSD_BOOLEAN_SPELLINGS: [(&str, &str); 2] = [("1", "true"), ("0", "false")];
-
 /// Every ELEMENT a request document of this service binds a BOOLEAN member from, under the
 /// name restXml writes it with (the member's `@xmlName`, else its own name).
 ///
@@ -1428,54 +1449,70 @@ pub const XML_BOOLEAN_DOCUMENT_ELEMENTS: &[&str] = &[
     "RestrictPublicBuckets",
 ];
 
-/// `document` with every boolean element spelled `1` or `0` re-spelled as `true` or `false`,
-/// or `None` when it spells none that way (in which case nothing is rewritten and the original
-/// bytes are used).
+/// `document` with every boolean element spelled the numeric way re-spelled as the WORD that
+/// spelling states, or `None` when none of them is spelled that way (in which case nothing is
+/// rewritten and the original bytes are used).
+///
+/// The framework's codec reads the two words alone, while the published space a request
+/// document states a boolean in carries the numeric spelling of each as well
+/// (`crate::state::document_boolean`), so each is folded onto the word it states before the
+/// codec reads the document, which leaves the VALUE the client stated unchanged.
 ///
 /// Only the TEXT of an element the model declares a boolean changes
-/// ([`XML_BOOLEAN_DOCUMENT_ELEMENTS`]), and only when that text is one of the two numeric
-/// spellings: every other element, every attribute and every other value is written back
-/// exactly as it arrived.
-fn xsd_boolean_spellings_folded(document: &[u8]) -> Option<Vec<u8>> {
+/// ([`XML_BOOLEAN_DOCUMENT_ELEMENTS`]), and only when that text states a boolean at all: text
+/// in no spelling of one is left exactly as it arrived, every other element, every attribute
+/// and every other value with it.
+fn document_booleans_folded(document: &[u8]) -> Option<Vec<u8>> {
     fold_element_text(document, XML_BOOLEAN_DOCUMENT_ELEMENTS, &|raw| {
         let spelled = ::std::str::from_utf8(raw).ok()?;
-        XSD_BOOLEAN_SPELLINGS
-            .iter()
-            .find(|(numeric, _)| *numeric == spelled.trim())
-            .map(|(_, word)| (*word).to_string())
+        let word = match crate::state::document_boolean(spelled)? {
+            true => crate::state::DOCUMENT_BOOLEAN_TRUE,
+            false => crate::state::DOCUMENT_BOOLEAN_FALSE,
+        };
+        (word != spelled).then(|| word.to_string())
     })
 }
 
 /// Every ELEMENT a request document of this service turns a MODE ON with, under the name
 /// restXml writes it with.
 ///
-/// Such an element states no value the service keeps: its published rule is that ADDING it with
-/// the value `true` turns the mode on, so the only thing it can state is whether the mode is on.
-/// `Delete$Quiet` is the one this service publishes — "Element to enable quiet mode for the
-/// request. When you add this element, you must set its value to `true`"
+/// Such an element states no value the service keeps BEYOND whether it is on: its published
+/// rule is that ADDING it with the value `true` turns the switch on, so the only thing it can
+/// state is that. `Delete$Quiet` is one — "Element to enable quiet mode for the request. When
+/// you add this element, you must set its value to `true`"
 /// (`smithy_query(query="doc",shape="Delete",member="Quiet")`), the mode being the one
 /// `DeleteObjects` documents as "the operation supports two modes for the response: verbose and
-/// quiet. By default, the operation uses verbose mode". Text that states no `true` therefore
-/// leaves the mode OFF — the reading the member's own absence has — rather than making the
+/// quiet. By default, the operation uses verbose mode" — and so is each of the four switches of
+/// a `PublicAccessBlockConfiguration`, every one of which is published as "specifies whether
+/// Amazon S3 should … Setting this element to TRUE causes the following behavior"
+/// (`smithy_query(query="shape",shape="PublicAccessBlockConfiguration")`), with no third state
+/// a reader could report. Text that states no `true` therefore
+/// leaves the switch OFF — the reading the member's own absence has — rather than making the
 /// document one that does not validate, which is why such an element is folded onto a word the
 /// codec reads instead of being left for it to refuse.
 ///
 /// Every entry is also one of [`XML_BOOLEAN_DOCUMENT_ELEMENTS`], the model-derived catalog of
 /// the elements a request document binds a boolean from; `tests/all/zzz_batch_probe.rs`
 /// re-checks that, so an element named here cannot drift away from the member it belongs to.
-pub const XML_MODE_SWITCH_DOCUMENT_ELEMENTS: &[&str] = &["Quiet"];
+pub const XML_MODE_SWITCH_DOCUMENT_ELEMENTS: &[&str] = &[
+    "BlockPublicAcls",
+    "BlockPublicPolicy",
+    "IgnorePublicAcls",
+    "Quiet",
+    "RestrictPublicBuckets",
+];
 
 /// The two words a mode-switch element is folded onto: the mode on, and the mode off.
 ///
-/// The words rather than the numeric spellings, because the codec reads those two alone
-/// ([`XSD_BOOLEAN_SPELLINGS`]).
+/// The words rather than any other spelling of a boolean, because the codec reads those two
+/// alone (`crate::state::DOCUMENT_BOOLEAN_TRUE`).
 const MODE_ON: &str = "true";
 /// The mode off — see [`MODE_ON`].
 const MODE_OFF: &str = "false";
 
 /// `document` with the text of every mode-switch element
-/// ([`XML_MODE_SWITCH_DOCUMENT_ELEMENTS`]) re-spelled as the state it puts the mode in —
-/// [`MODE_ON`] where its text states true in the published lexical space, [`MODE_OFF`] for text
+/// ([`XML_MODE_SWITCH_DOCUMENT_ELEMENTS`]) re-spelled as the state it puts that switch in —
+/// [`MODE_ON`] where its text states true in any case, [`MODE_OFF`] for text
 /// that states no true at all, an element carrying no text included — or `None` when it carries
 /// no such element whose text is not already that word (in which case nothing is rewritten and
 /// the original bytes are used).
@@ -1528,14 +1565,13 @@ fn mode_switch_booleans_folded(document: &[u8]) -> Option<Vec<u8>> {
             }
             Ok(Event::End(end)) if reading.is_some() => {
                 let (start, carried) = reading.take()?;
-                let stated = match XSD_BOOLEAN_SPELLINGS
-                    .iter()
-                    .find(|(numeric, _)| *numeric == carried.trim())
-                    .map(|(_, word)| *word)
-                    .unwrap_or(carried.trim())
-                {
-                    MODE_ON => MODE_ON,
-                    _ => MODE_OFF,
+                // The state the text puts the switch in: ON only where it states the boolean
+                // true, which is read in any case
+                // (`crate::state::document_switch_is_on`) — text stating no true leaves the
+                // switch off, the reading the element's own absence has.
+                let stated = match crate::state::document_switch_is_on(&carried) {
+                    true => MODE_ON,
+                    false => MODE_OFF,
                 };
                 changed |= carried != stated;
                 writer.write_event(Event::Start(start)).ok()?;
@@ -3603,17 +3639,17 @@ impl ServerProtocol for UnwrappedXmlRestXml {
                     normalized = Some(document);
                 }
             }
-            // And a THIRD, for a BOOLEAN the document spells the numeric way: the published
-            // schema admits `1` and `0` for one, and the codec reads only the words, so those
-            // two spellings are folded onto the words the codec binds
-            // ([`xsd_boolean_spellings_folded`]). The byte scan comes first, so only a
-            // document that carries a boolean element at all is walked.
+            // And a THIRD, for a BOOLEAN the document spells in any of the forms this service
+            // reads one in — the numeric forms, the affirmative and negative words, any of
+            // them in any case — where the codec reads the two words alone: each is folded
+            // onto the word it states ([`document_booleans_folded`]). The byte scan comes
+            // first, so only a document that carries a boolean element at all is walked.
             let current: &[u8] = normalized.as_deref().unwrap_or(body);
             if XML_BOOLEAN_DOCUMENT_ELEMENTS
                 .iter()
                 .any(|element| holds(current, format!("<{element}>").as_bytes()))
             {
-                if let Some(document) = xsd_boolean_spellings_folded(current) {
+                if let Some(document) = document_booleans_folded(current) {
                     normalized = Some(document);
                 }
             }
@@ -3704,6 +3740,24 @@ impl ServerProtocol for UnwrappedXmlRestXml {
             // `crate::state::analytics_document_rejection`.
             if withheld_analytics_document {
                 normalized = Some(EMPTY_ANALYTICS_CONFIGURATION.to_vec());
+            }
+            // And a TENTH, for the Block Public Access document, whose own refusal
+            // `PutPublicAccessBlock` is the one place that states it: a document the published
+            // schema rejects — an element it does not declare where it arrived, or bytes no XML
+            // reader can walk — is withheld from the codec in full, replaced by
+            // [`EMPTY_PUBLIC_ACCESS_BLOCK_CONFIGURATION`], so that operation answers S3's own
+            // code for a document that does not validate rather than the boundary reporting it
+            // as a document nobody sent. Every member of that container is OPTIONAL, so the
+            // stand-in parses to a configuration; nothing is read from it, because the operation
+            // refuses the request from the bytes it actually carried ([`request_document`])
+            // before it reads the configuration at all. Judged on the body AS IT ARRIVED, which
+            // is those same bytes, so the two cannot disagree about which documents that
+            // operation is the one to refuse. See
+            // `crate::state::public_access_block_document_is_malformed`.
+            if carries_public_access_block_document(input_schema)
+                && crate::state::public_access_block_document_is_malformed(body)
+            {
+                normalized = Some(EMPTY_PUBLIC_ACCESS_BLOCK_CONFIGURATION.to_vec());
             }
             if let Some(document) = normalized {
                 let uri = request.uri();

@@ -13,7 +13,9 @@
 //! Each document's own schema is a table beside the record it describes
 //! ([`super::WEBSITE_DOCUMENT_SCHEMA`], [`super::ANALYTICS_DOCUMENT_SCHEMA`]), derived from
 //! the payload shape's closure in the model; this module is the walk over one of them, so two
-//! documents cannot drift apart on what "validates" means.
+//! documents cannot drift apart on what "validates" means. The LEXICAL SPACE a document states
+//! a boolean in ([`document_boolean`]) is here for the same reason: it is one question about
+//! every document of this service, not about one of them.
 
 /// The schema one request document is judged against: the elements each container declares,
 /// and the children each container requires.
@@ -162,4 +164,63 @@ fn satisfy(open: &mut [(&'static str, Vec<&'static str>)], element: &'static str
     if let Some((_, owed)) = open.last_mut() {
         owed.retain(|child| *child != element);
     }
+}
+
+/// The two words the lexical space of a boolean is written with, which is also what the codec
+/// reading a request document binds a boolean member from: the numeric spelling of each is
+/// folded onto these before that codec reads it (`crate::service::wire`).
+pub const DOCUMENT_BOOLEAN_TRUE: &str = "true";
+/// See [`DOCUMENT_BOOLEAN_TRUE`].
+pub const DOCUMENT_BOOLEAN_FALSE: &str = "false";
+
+/// Every spelling a request document of this service states a boolean with, and the value each
+/// one states — the TRUE spellings first.
+///
+/// Source: the schema an S3 request document is validated against declares such an element an
+/// `xsd:boolean`, whose lexical space is `true`, `false`, `1` and `0` (W3C XML Schema Part 2,
+/// §3.2.2), the last two being the numeric spellings of the first two.
+///
+/// `pub`: `tests/all/zzz_batch_probe.rs` drives every row of it through the operations whose
+/// documents carry such an element, so a spelling named here is one a request really states.
+pub const DOCUMENT_BOOLEAN_SPELLINGS: &[(&str, bool)] = &[
+    (DOCUMENT_BOOLEAN_TRUE, true),
+    ("1", true),
+    (DOCUMENT_BOOLEAN_FALSE, false),
+    ("0", false),
+];
+
+/// The boolean the TEXT of a request document's boolean element states, or `None` for text that
+/// states none at all.
+///
+/// The text is read TRIMMED, because an element's surrounding whitespace is markup rather than
+/// value, and against [`DOCUMENT_BOOLEAN_SPELLINGS`] and nothing else: text in no spelling of
+/// the published space — an element carrying no text included — states no boolean. What such
+/// text makes of the request is the business of the member it was written for: a member stating
+/// a VALUE the service keeps is one the published schema cannot read, while one whose rule is
+/// that stating `true` turns a switch on states no `true`, so the switch stays off
+/// (`crate::service::wire::XML_MODE_SWITCH_DOCUMENT_ELEMENTS`).
+#[must_use]
+pub fn document_boolean(text: &str) -> Option<bool> {
+    let spelled = text.trim();
+    DOCUMENT_BOOLEAN_SPELLINGS
+        .iter()
+        .find(|(spelling, _)| *spelling == spelled)
+        .map(|(_, stated)| *stated)
+}
+
+/// Whether `text` states the boolean TRUE: the reading the text of a SWITCH is given — an
+/// element whose published rule is that stating `true` turns it on
+/// (`crate::service::wire::XML_MODE_SWITCH_DOCUMENT_ELEMENTS`).
+///
+/// The CASE is not part of what such text states: the published documentation of these members
+/// spells the value `TRUE` ("Setting this element to TRUE causes the following behavior",
+/// `smithy_query(query="shape",shape="PublicAccessBlockConfiguration")`) where the lexical space
+/// spells it lower case, so the word is read in any case. Text stating anything else — the
+/// boolean false, a word that is no boolean at all, a number outside the space, no text whatever
+/// — states no true, so the switch it was written for stays OFF: the reading its own absence
+/// has, which is why such text does not make the document one that fails to validate.
+#[must_use]
+pub fn document_switch_is_on(text: &str) -> bool {
+    let spelled = text.trim();
+    spelled.eq_ignore_ascii_case(DOCUMENT_BOOLEAN_TRUE) || document_boolean(spelled) == Some(true)
 }

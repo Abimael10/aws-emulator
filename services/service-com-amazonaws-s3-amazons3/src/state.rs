@@ -4548,6 +4548,9 @@ mod policy_action_scope;
 // Whether the resources a bucket-policy statement targets are resources this service names
 // at all.
 mod policy_resource_target;
+// The schema a Block Public Access configuration document has to validate against before any
+// of it is read.
+mod public_access_block_document;
 // How a refusal of a policy document says which part of that document it is about.
 mod policy_document_detail;
 // The rendering a bucket policy is stored and reported in: S3 holds the POLICY a submitted
@@ -4601,6 +4604,7 @@ pub use policy_document::*;
 pub use policy_document_detail::*;
 pub use policy_principal_form::*;
 pub use policy_resource_target::*;
+pub use public_access_block_document::*;
 pub use read_encryption_headers::*;
 pub use refusals::*;
 pub use renames::*;

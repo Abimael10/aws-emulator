@@ -1029,7 +1029,8 @@ async fn a_versioned_batch_delete_is_served_whatever_its_quiet_element_spells() 
     // (case, the text the `Quiet` element carries — `None` for no element at all —, whether the
     // mode is on). The rows differ along the text the element carries: each of the two words,
     // each of the two numeric spellings the published lexical space admits, surrounding
-    // whitespace, a word in another case, a number outside the space, a word that is no boolean
+    // whitespace, the word in another case and in upper case (the case is not part of what the
+    // text states), a number outside the space, a word that is no boolean
     // in any reading, no text at all, and no element at all.
     let rows: &[(&str, Option<&str>, bool)] = &[
         ("the word true", Some("true"), true),
@@ -1037,8 +1038,8 @@ async fn a_versioned_batch_delete_is_served_whatever_its_quiet_element_spells() 
         ("the numeric spelling of true", Some("1"), true),
         ("the numeric spelling of false", Some("0"), false),
         ("a word with surrounding whitespace", Some(" true "), true),
-        ("a word in another case", Some("True"), false),
-        ("a word in upper case", Some("TRUE"), false),
+        ("a word in another case", Some("True"), true),
+        ("a word in upper case", Some("TRUE"), true),
         ("a number outside the space", Some("2"), false),
         ("a word that is no boolean at all", Some("yes"), false),
         ("no text at all", Some(""), false),

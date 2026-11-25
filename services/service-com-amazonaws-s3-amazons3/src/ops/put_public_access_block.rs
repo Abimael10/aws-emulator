@@ -2,7 +2,10 @@
 
 //! @op PutPublicAccessBlock
 //! Stores the `PublicAccessBlockConfiguration` a request carries on the bucket it names,
-//! so `GetPublicAccessBlock` reports it and `DeletePublicAccessBlock` removes it.
+//! so `GetPublicAccessBlock` reports it and `DeletePublicAccessBlock` removes it — after
+//! refusing a document the published schema does not validate
+//! (`crate::state::public_access_block_document_is_malformed`), which would otherwise be
+//! recorded as the weaker posture a codec salvaged from it.
 //!
 //! ## Shape of an operation
 //!
@@ -185,8 +188,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A write needs nothing from the request beyond its deserialized input: the
-        // expected owner travels as a member, not as a raw header.
+        // A write needs nothing from the request beyond its deserialized input and the
+        // document that input was read from: the expected owner travels as a member, not as
+        // a raw header.
         let _ = ctx;
 
         // "If the account ID that you provide does not match the actual owner of the
@@ -215,12 +219,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // The DOCUMENT is judged from the bytes the request carried, before anything is read
+        // out of the configuration it parsed to: a codec reads an element it does not know by
+        // ignoring it, and every member of this container is optional, so a document that
+        // misspells, misnests or invents one parses to a posture with that switch left OFF —
+        // indistinguishable, afterwards, from a document that never named it. What S3 answers
+        // such a document is that it did not validate against the published schema
+        // ([`crate::state::public_access_block_document_is_malformed`]), not a 200 recording
+        // the weaker posture it salvaged: a code this service's model declares no shape for,
+        // so it goes out through the unmodelled channel carrying that code's own FIXED
+        // published sentence and nothing of the request. Judged before the bucket lookup,
+        // which is where the boundary's own refusal of this document would have been answered
+        // too — the order `PutBucketWebsite` keeps for its document.
+        if crate::service::wire::request_document()
+            .as_deref()
+            .is_some_and(crate::state::public_access_block_document_is_malformed)
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::MALFORMED_XML_CODE,
+                crate::state::MALFORMED_XML_STATUS,
+                crate::state::MALFORMED_XML_MESSAGE,
+            ));
+        }
+
         // The four switches the payload carried. Each member of
         // `PublicAccessBlockConfiguration` is a boolean whose documentation reads
         // "Specifies whether Amazon S3 should block … Setting this element to TRUE causes
         // …", so a member the request omits names a switch it does not turn on: absent is
-        // the same state as `false`, and the configuration the bucket carries afterwards
-        // names all four.
+        // the same state as `false`, and so is an element whose text states no true at all
+        // (`crate::service::wire::XML_MODE_SWITCH_DOCUMENT_ELEMENTS` folds such text onto the
+        // state it leaves the switch in before the codec reads the document). The
+        // configuration the bucket carries afterwards names all four.
         let configuration = &input.public_access_block_configuration;
         let stored = crate::state::BucketPublicAccessBlock {
             block_public_acls: configuration.block_public_acls.unwrap_or(false),

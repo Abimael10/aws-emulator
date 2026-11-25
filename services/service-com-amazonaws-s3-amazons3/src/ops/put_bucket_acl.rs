@@ -294,14 +294,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "If your bucket uses the bucket owner enforced setting for S3 Object Ownership,
         // ACLs are disabled and no longer affect permissions. … Requests to set ACLs or
         // update ACLs fail and return the AccessControlListNotSupported error code" (this
-        // operation's own documentation).
-        if bucket.acls_disabled() {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::ACL_NOT_SUPPORTED_CODE,
-                ACL_REFUSAL_STATUS,
-                crate::state::ACL_NOT_SUPPORTED_MESSAGE,
-            ));
-        }
+        // operation's own documentation) — a precondition of the BUCKET, judged AFTER the
+        // Block Public Access guardrail below, exactly as `PutObjectAcl` judges it: a public
+        // ACL is denied for being public whether or not ACLs are disabled on the bucket.
+        let acls_disabled = bucket.acls_disabled();
 
         // Both the ACL the request names and the published rules it is judged against are
         // decided BEFORE anything is written, so a refused put leaves the bucket's current
@@ -311,7 +307,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Block Public Access: with `BlockPublicAcls` on, S3 "causes the following
         // behavior: PUT Bucket ACL and PUT Object ACL calls fail if the specified ACL is
-        // public" (`PublicAccessBlockConfiguration$BlockPublicAcls`). The setting is in force
+        // public" (`PublicAccessBlockConfiguration$BlockPublicAcls`). It is a GUARDRAIL over
+        // the ACL the request names — an authorization decision, taken ahead of the bucket's
+        // Object Ownership precondition, so the caller is told what really prevented the call
+        // rather than that the bucket takes no ACLs. The setting is in force
         // when it is on in the BUCKET's own configuration or in the one the owning ACCOUNT
         // carries ([`crate::state::settings_in_force`]). The refusal is
         // `AccessDenied` — the guardrail denies the call, naming the principal, the action,
@@ -329,6 +328,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     PUT_BUCKET_ACL_ACTION,
                     &crate::state::bucket_arn(&input.bucket),
                 ),
+            ));
+        }
+
+        if acls_disabled {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::ACL_NOT_SUPPORTED_CODE,
+                ACL_REFUSAL_STATUS,
+                crate::state::ACL_NOT_SUPPORTED_MESSAGE,
             ));
         }
 
