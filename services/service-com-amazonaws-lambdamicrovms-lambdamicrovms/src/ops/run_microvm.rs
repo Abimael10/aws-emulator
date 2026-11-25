@@ -364,10 +364,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 _ => return Err(duration_out_of_range(maximum_duration_in_seconds)),
             };
 
-            // The MicroVM's own interface address, assigned from the same sequence its id
-            // is minted from, so it is read before the id advances that sequence.
+            // The MicroVM's own interface address, assigned from the creation sequence
+            // its record keeps, so it is read before the mint advances that sequence.
             let link_local_address = store.next_link_local_address();
-            let microvm_id = store.next_microvm_id();
+            let (microvm_id, created_seq) = store.next_microvm_id();
             (
                 image_arn,
                 image_version,
@@ -375,6 +375,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 maximum_duration,
                 link_local_address,
                 microvm_id,
+                created_seq,
             )
         };
         let (
@@ -384,6 +385,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             maximum_duration,
             link_local_address,
             microvm_id,
+            created_seq,
         ) = prepared;
         let microvm_arn = crate::state::microvm_arn(&region, &microvm_id);
         // `endpoint` is "the HTTPS endpoint URL for communicating with the MicroVM", and
@@ -410,6 +412,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &region,
                 Microvm {
                     microvm_id: microvm_id.clone(),
+                    created_seq,
                     microvm_arn,
                     state: crate::state::MICROVM_STATE_PENDING.to_string(),
                     endpoint,

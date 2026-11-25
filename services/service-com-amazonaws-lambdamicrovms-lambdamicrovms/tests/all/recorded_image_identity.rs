@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end tests for the `id` a MicroVM image carries: the identity the service
-//! mints with the record and answers for it from then on.
+//! End-to-end tests for the identities this service MINTS: a MicroVM image's `id`, and
+//! the handles it draws for the resources it names by a prefix (a MicroVM's `microvmId`,
+//! a build request's `buildId`).
 //!
 //! RULE: every response that reports a stored MicroVM IMAGE record carries that
 //! record's own `id` — a lowercase hyphenated 8-4-4-4-12 version-4 UUID, minted once
 //! when the image is created, unique across the images an account holds and
 //! byte-identical in every later answer about that image (the read, every listing row,
 //! an update that mints a further version, and an idempotent repeat of the create).
+//!
+//! RULE: every other identifier this service mints is DRAWN for its resource under that
+//! resource's own prefix rather than rendered from how many the store has minted before
+//! it, so a listing pages in the order the records were created rather than in the order
+//! their identifiers sort.
 //!
 //! The member is RECORDED rather than modelled: `CreateMicrovmImageResponse`,
 //! `GetMicrovmImageOutput`, `UpdateMicrovmImageResponse` and `MicrovmImageSummary`
@@ -24,13 +30,15 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
-    managed_base_image_arn, MANAGED_BASE_IMAGE_IDS,
+    managed_base_image_arn, BUILD_ID_PREFIX, FIRST_IMAGE_VERSION, MANAGED_BASE_IMAGE_IDS,
+    MICROVM_ID_PREFIX,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::microvm_image_and_instance_paths::get_image;
 use crate::microvm_lifecycle::{
-    as_uri_value, call, emulator, expected_image_arn, image_body, PAST_THE_SPAN, REGION,
+    as_uri_value, built_image, call, emulator, expected_image_arn, image_body, run_microvm,
+    PAST_THE_SPAN, REGION,
 };
 
 /// Whether `value` is the id form the service mints: 36 characters in the lowercase
@@ -328,4 +336,218 @@ async fn every_listing_row_of_every_page_carries_its_images_id() {
             "case {case}: every row carries the id its image was created with"
         );
     }
+}
+
+/// Whether `value` is the handle form this service mints for a resource it names by a
+/// short prefix: that prefix, then a drawn UUID in the same lowercase hyphenated
+/// 8-4-4-4-12 form a MicroVM image's own `id` carries ([`is_minted_id`]). The prefixes are
+/// the ones the service publishes (`state::MICROVM_ID_PREFIX`,
+/// `state::BUILD_ID_PREFIX`), read from the service rather than spelled out here.
+fn is_minted_handle(value: &str, prefix: &str) -> bool {
+    value.strip_prefix(prefix).is_some_and(is_minted_id)
+}
+
+/// The drawn half of a minted handle: everything after its prefix.
+fn drawn_half(value: &str, prefix: &str) -> String {
+    value.strip_prefix(prefix).unwrap_or(value).to_string()
+}
+
+/// `GET /2025-09-09/microvm-images/{imageIdentifier}/versions/{imageVersion}/builds`.
+async fn list_builds(router: &MultiServiceRouter, identifier: &str, version: &str) -> (u16, Value) {
+    let uri = format!(
+        "/2025-09-09/microvm-images/{}/versions/{version}/builds",
+        as_uri_value(identifier)
+    );
+    call(router, "GET", &uri, None).await
+}
+
+/// The `buildId`s the build listing of `version` of the image `identifier` serves, in the
+/// order the page carries them.
+async fn listed_build_ids(
+    router: &MultiServiceRouter,
+    identifier: &str,
+    version: &str,
+    case: &str,
+) -> Vec<String> {
+    let (status, body) = list_builds(router, identifier, version).await;
+    assert_eq!(status, 200, "case {case}: the build listing got {status} {body}");
+    body["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case}: items is a list, got {body}"))
+        .iter()
+        .map(|row| {
+            row["buildId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case}: a row carries a buildId, got {row}"))
+                .to_string()
+        })
+        .collect()
+}
+
+/// The `microvmId`s `ListMicrovms` serves, in the order the page carries them.
+async fn listed_microvm_ids(router: &MultiServiceRouter, case: &str) -> Vec<String> {
+    let (status, body) = call(router, "GET", "/2025-09-09/microvms", None).await;
+    assert_eq!(status, 200, "case {case}: the MicroVM listing got {status} {body}");
+    body["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case}: items is a list, got {body}"))
+        .iter()
+        .map(|row| {
+            row["microvmId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case}: a row carries a microvmId, got {row}"))
+                .to_string()
+        })
+        .collect()
+}
+
+/// RULE: every identifier this service MINTS for a resource of its own — a MicroVM's
+/// `microvmId`, a build request's `buildId` — is DRAWN per resource under that resource's
+/// prefix rather than rendered from how many the store has minted before it: the
+/// identifiers of one store are distinct and carry no ordering, so a listing pages in the
+/// order the records were created rather than in the order their identifiers sort.
+#[tokio::test]
+async fn every_minted_handle_is_drawn_rather_than_counted() {
+    let router = emulator();
+    let image_arn = built_image(&router, "drawn-handles").await;
+
+    // Rows: one MicroVM per launch, enough launches that a position a counter would
+    // leave constant shows up as one here, and enough that the creation order and the
+    // identifier order are independent.
+    const LAUNCHES: usize = 8;
+    let mut launched: Vec<String> = Vec::new();
+    for index in 0..LAUNCHES {
+        let case = format!("launch {index}");
+        let (status, body) = run_microvm(&router, json!({"imageIdentifier": image_arn})).await;
+        assert_eq!(status, 200, "case {case}: RunMicrovm got {status} {body}");
+        let microvm_id = body["microvmId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case}: the answer carries a microvmId, got {body}"))
+            .to_string();
+        assert!(
+            is_minted_handle(&microvm_id, MICROVM_ID_PREFIX),
+            "case {case}: expected {MICROVM_ID_PREFIX:?} and a drawn UUID, got {microvm_id:?}"
+        );
+        launched.push(microvm_id);
+    }
+
+    let distinct: BTreeSet<&String> = launched.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        launched.len(),
+        "each MicroVM gets its own id, got {launched:?}"
+    );
+
+    // No DRAWN position of a minted identifier is fixed: a counter-rendered one leaves its
+    // leading characters constant for every resource a store ever mints. The positions the
+    // UUID form itself fixes are not drawn — the group separators, the version nibble that
+    // opens the third group and the variant nibble that opens the fourth — and they are
+    // what `is_minted_id` pins instead.
+    const VERSION_NIBBLE: usize = 14;
+    const VARIANT_NIBBLE: usize = 19;
+    let drawn: Vec<String> = launched
+        .iter()
+        .map(|id| drawn_half(id, MICROVM_ID_PREFIX))
+        .collect();
+    for position in 0..drawn[0].chars().count() {
+        if position == VERSION_NIBBLE || position == VARIANT_NIBBLE {
+            continue;
+        }
+        let seen: BTreeSet<Option<char>> =
+            drawn.iter().map(|id| id.chars().nth(position)).collect();
+        if seen == BTreeSet::from([Some('-')]) {
+            continue;
+        }
+        assert!(
+            seen.len() > 1,
+            "case position {position}: expected the drawn character to vary over \
+             {LAUNCHES} mints, got {seen:?} from {launched:?}"
+        );
+    }
+
+    // The identifiers carry no order, so the listing's own order is the order the
+    // MicroVMs were RUN — which is what a client paging the listing walks.
+    assert_eq!(
+        listed_microvm_ids(&router, "creation order").await,
+        launched,
+        "the listing pages the MicroVMs in the order they were run, got ids {launched:?}"
+    );
+
+    // The same rule on the other identifier this service mints: the build requests one
+    // image version's build fans out into.
+    let builds = listed_build_ids(&router, &image_arn, FIRST_IMAGE_VERSION, "builds").await;
+    assert!(
+        !builds.is_empty(),
+        "the version's build fans out into at least one build request, got {builds:?}"
+    );
+    for build_id in &builds {
+        assert!(
+            is_minted_handle(build_id, BUILD_ID_PREFIX),
+            "case build {build_id:?}: expected {BUILD_ID_PREFIX:?} and a drawn UUID, got \
+             {build_id:?}"
+        );
+        // The drawn identifier is the one handle on that build: the single-build read is
+        // addressed by it and echoes it back unchanged.
+        let uri = format!(
+            "/2025-09-09/microvm-images/{}/versions/{FIRST_IMAGE_VERSION}/builds/{build_id}",
+            as_uri_value(&image_arn)
+        );
+        let (status, body) = call(&router, "GET", &uri, None).await;
+        assert_eq!(
+            status, 200,
+            "case build {build_id:?}: the build read got {status} {body}"
+        );
+        assert_eq!(
+            body["buildId"].as_str(),
+            Some(build_id.as_str()),
+            "case build {build_id:?}: the read echoes the identifier it was addressed by, \
+             got {body}"
+        );
+    }
+    let distinct_builds: BTreeSet<&String> = builds.iter().collect();
+    assert_eq!(
+        distinct_builds.len(),
+        builds.len(),
+        "each build request gets its own id, got {builds:?}"
+    );
+}
+
+/// RULE: a minted identifier is the resource's own rather than its position in a store,
+/// so two INDEPENDENT stores — what a restarted emulator is — mint different identifiers
+/// for the resources they hold: a client that distinguishes two MicroVMs created in
+/// separate runs never sees one identifier for both.
+#[tokio::test]
+async fn two_independent_stores_mint_different_handles() {
+    // Rows: the two identifiers this service mints, each read from the FIRST resource of
+    // its kind in each store — the one a counter would render identically in both.
+    let mut first_microvm: Vec<String> = Vec::new();
+    let mut first_builds: Vec<Vec<String>> = Vec::new();
+
+    for store in 0..2 {
+        let case = format!("store {store}");
+        let router = emulator();
+        let image_arn = built_image(&router, "separate-store").await;
+        let (status, body) = run_microvm(&router, json!({"imageIdentifier": image_arn})).await;
+        assert_eq!(status, 200, "case {case}: RunMicrovm got {status} {body}");
+        first_microvm.push(
+            body["microvmId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case}: the answer carries a microvmId, got {body}"))
+                .to_string(),
+        );
+        first_builds.push(listed_build_ids(&router, &image_arn, FIRST_IMAGE_VERSION, &case).await);
+    }
+
+    assert_ne!(
+        first_microvm[0], first_microvm[1],
+        "two stores mint different MicroVM ids, got {first_microvm:?}"
+    );
+    let shared: Vec<&String> = first_builds[0]
+        .iter()
+        .filter(|build_id| first_builds[1].contains(build_id))
+        .collect();
+    assert!(
+        shared.is_empty(),
+        "two stores mint different build ids, got {shared:?} in both of {first_builds:?}"
+    );
 }

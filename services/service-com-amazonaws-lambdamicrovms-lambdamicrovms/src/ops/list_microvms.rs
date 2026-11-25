@@ -214,16 +214,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .as_deref()
                     .is_none_or(|version| vm.image_version == version)
         });
-        // `microvmId`s sort in creation order, so "after this id" is a stable cursor
-        // even when MicroVMs are added between pages.
-        let mut remaining = matching.filter(|vm| match after.as_deref() {
-            Some(cursor) => vm.microvm_id.as_str() > cursor,
+        // The MicroVMs enumerate in the order they were RUN (`Microvm::created_seq`),
+        // which is the order the store serves them in, so "after this position" is a
+        // stable cursor even when MicroVMs are added or reclaimed between pages. The
+        // cursor is that position rather than the last id's text: an id this service
+        // mints is drawn rather than counted, so it carries no order.
+        let mut remaining = matching.filter(|vm| match after {
+            Some(cursor) => vm.created_seq > cursor,
             None => true,
         });
 
-        let items: Vec<MicrovmItem> = remaining
-            .by_ref()
-            .take(page_size)
+        let page: Vec<&crate::state::Microvm> = remaining.by_ref().take(page_size).collect();
+
+        // A `nextToken` is returned only when the page did not exhaust the matches.
+        let next_token = match (page.last(), remaining.next()) {
+            (Some(last), Some(_)) => Some(encode_token(last.created_seq)),
+            _ => None,
+        };
+
+        let items: Vec<MicrovmItem> = page
+            .into_iter()
             .map(|vm| MicrovmItem {
                 microvm_id: vm.microvm_id.clone(),
                 state: vm.state.clone(),
@@ -233,12 +243,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        // A `nextToken` is returned only when the page did not exhaust the matches.
-        let next_token = match (items.last(), remaining.next()) {
-            (Some(last), Some(_)) => Some(encode_token(&last.microvm_id)),
-            _ => None,
-        };
-
         Ok(ListMicrovmsOutput { next_token, items })
     }
 }
@@ -247,21 +251,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// did not mint is refused rather than silently positioning the listing.
 const TOKEN_MARKER: &str = "ListMicrovms/1:";
 
-/// The opaque `nextToken` for a cursor: the last `microvmId` of the page served.
-fn encode_token(microvm_id: &str) -> String {
-    ::hex::encode(format!("{TOKEN_MARKER}{microvm_id}").as_bytes())
+/// The opaque `nextToken` for a cursor: the CREATION POSITION of the last MicroVM the
+/// page served ([`crate::state::Microvm::created_seq`]).
+fn encode_token(created_seq: u64) -> String {
+    ::hex::encode(format!("{TOKEN_MARKER}{created_seq}").as_bytes())
 }
 
 /// The cursor a `nextToken` carries. A token this service did not mint is refused
 /// with the modelled 400 rather than silently restarting or skipping the listing.
-fn decode_token(token: &str) -> Result<String, ListMicrovmsError> {
+fn decode_token(token: &str) -> Result<u64, ListMicrovmsError> {
     ::hex::decode(token)
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|decoded| {
             decoded
                 .strip_prefix(TOKEN_MARKER)
-                .map(::std::string::ToString::to_string)
+                .and_then(|cursor| cursor.parse().ok())
         })
         .ok_or_else(|| {
             ListMicrovmsErrorModeled::ValidationException(ValidationException {

@@ -1110,3 +1110,65 @@ async fn a_resolved_pedigree_is_a_published_release_and_never_an_addressed_gener
         }
     }
 }
+
+/// RULE: the release an AWS-managed base image publishes is the CATALOGUE's own metadata,
+/// so a build that pins no `baseImageVersion` reports the release the base image it named
+/// publishes and not this service's own INITIAL version for an account's image
+/// (`state::FIRST_IMAGE_VERSION`) — the account's version sequence and the base image's
+/// published releases are unrelated namespaces, which is what makes an unpinned pedigree a
+/// resolution rather than a default.
+#[tokio::test]
+async fn a_managed_base_image_resolves_its_published_release_rather_than_the_initial_version() {
+    let router = emulator();
+    stage_object(&router, ARTIFACT_BUCKET, ARTIFACT_KEY).await;
+
+    // Rows: every base image the AWS-managed catalogue publishes
+    // (`state::MANAGED_BASE_IMAGE_IDS`), read off the catalogue rather than named here.
+    for image_id in MANAGED_BASE_IMAGE_IDS {
+        let case = format!("the managed base image {image_id}");
+        let release = latest_managed_base_image_version_label(image_id)
+            .unwrap_or_else(|| panic!("case {case:?}: the catalogue publishes a generation"))
+            .to_string();
+        assert_ne!(
+            release, FIRST_IMAGE_VERSION,
+            "case {case:?}: the release the catalogue publishes is the base image's own, \
+             not this service's initial version for an account's image"
+        );
+
+        // Over the wire: the create's own 201 and the version read both report the
+        // catalogue's release, so a client auditing the base layer of the image it just
+        // created is told the pedigree the build actually sits on.
+        let name = format!("resolved-{image_id}");
+        let created = create(
+            &router,
+            &name,
+            json!({"baseImageArn": managed_base_image_arn(REGION, image_id)}),
+        )
+        .await;
+        let answered = text(&created, "baseImageVersion");
+        assert_eq!(
+            answered, release,
+            "case {case:?}: expected the create to resolve {release:?}, got {answered:?}"
+        );
+        let image_arn = text(&created, "imageArn");
+        let image_version = text(&created, "imageVersion");
+        let (status, read) = get_version(&router, &image_arn, &image_version).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from the version read, got {status} {read}"
+        );
+        let served = text(&read, "baseImageVersion");
+        assert_eq!(
+            served, release,
+            "case {case:?}: expected the version read to report {release:?}, got {served:?}"
+        );
+
+        // And the version the image itself is addressed by is the account's own sequence,
+        // which the resolution never borrows from.
+        assert_eq!(
+            image_version, FIRST_IMAGE_VERSION,
+            "case {case:?}: a new image is addressed by this service's first version, \
+             got {image_version:?}"
+        );
+    }
+}

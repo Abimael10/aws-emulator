@@ -1001,10 +1001,12 @@ async fn list_microvms_filters_and_pages_over_the_store() {
 
     // Rows span the filter forms and the expected membership of each.
     let filters: Vec<(&str, String, Vec<String>)> = vec![
+        // The listing pages in the order the MicroVMs were RUN, which is the order this
+        // harness ran them in — not the order their ids happen to sort in, because an id
+        // this service mints is drawn rather than counted and carries no order.
         ("no filter", String::new(), {
             let mut all = on_first.clone();
             all.push(on_second.clone());
-            all.sort();
             all
         }),
         (

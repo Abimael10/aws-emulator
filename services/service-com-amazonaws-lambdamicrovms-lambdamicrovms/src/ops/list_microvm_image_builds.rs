@@ -241,34 +241,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Lists builds for a MicroVM image version with optional filtering by
         // architecture and chipset": a filter the request omits selects every build,
         // and the filters compose.
-        let matched = version.builds.values().filter(|build| {
-            input
-                .architecture
-                .as_deref()
-                .is_none_or(|value| value == build.architecture)
-                && input
-                    .chipset
+        let matched = version
+            .builds_in_creation_order()
+            .into_iter()
+            .filter(|build| {
+                input
+                    .architecture
                     .as_deref()
-                    .is_none_or(|value| value == build.chipset)
-                && input
-                    .chipset_generation
-                    .as_deref()
-                    .is_none_or(|value| value == build.chipset_generation)
-        });
+                    .is_none_or(|value| value == build.architecture)
+                    && input
+                        .chipset
+                        .as_deref()
+                        .is_none_or(|value| value == build.chipset)
+                    && input
+                        .chipset_generation
+                        .as_deref()
+                        .is_none_or(|value| value == build.chipset_generation)
+            });
 
-        // The builds enumerate in one stable order (their ids sort in creation order),
-        // so "after this build" is a cursor that stays valid even when another build is
-        // recorded between two pages.
+        // The builds enumerate in the order the fan-out RECORDED them
+        // (`MicrovmImageBuild::created_seq`), so "after this position" is a cursor that
+        // stays valid even when another build is recorded between two pages. The cursor is
+        // that position rather than the last id's text: a build id is drawn rather than
+        // counted, so it carries no order.
         let mut remaining = matched.filter(|build| {
-            after
-                .as_deref()
-                .is_none_or(|cursor| build.build_id.as_str() > cursor)
+            after.is_none_or(|cursor| build.created_seq > cursor)
         });
         let page: Vec<&crate::state::MicrovmImageBuild> = remaining.by_ref().take(page_size).collect();
 
         // A `nextToken` is issued only when the page did not exhaust the builds.
         let next_token = match (page.last(), remaining.next()) {
-            (Some(last), Some(_)) => Some(encode_token(&last.build_id)),
+            (Some(last), Some(_)) => Some(encode_token(last.created_seq)),
             _ => None,
         };
 
@@ -331,21 +334,22 @@ fn empty_page() -> ListMicrovmImageBuildsOutput {
 /// did not mint is refused rather than silently positioning the listing.
 const TOKEN_MARKER: &str = "ListMicrovmImageBuilds/1:";
 
-/// The opaque `nextToken` for a cursor: the id of the last build served.
-fn encode_token(build_id: &str) -> String {
-    ::hex::encode(format!("{TOKEN_MARKER}{build_id}").as_bytes())
+/// The opaque `nextToken` for a cursor: the CREATION POSITION of the last build the page
+/// served ([`crate::state::MicrovmImageBuild::created_seq`]).
+fn encode_token(created_seq: u64) -> String {
+    ::hex::encode(format!("{TOKEN_MARKER}{created_seq}").as_bytes())
 }
 
 /// The cursor a `nextToken` carries. A token this service did not mint is refused
 /// with the modelled 400 rather than silently restarting or skipping the listing.
-fn decode_token(token: &str) -> Result<String, ListMicrovmImageBuildsError> {
+fn decode_token(token: &str) -> Result<u64, ListMicrovmImageBuildsError> {
     ::hex::decode(token)
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|decoded| {
             decoded
                 .strip_prefix(TOKEN_MARKER)
-                .map(::std::string::ToString::to_string)
+                .and_then(|cursor| cursor.parse().ok())
         })
         .ok_or_else(|| {
             ListMicrovmImageBuildsErrorModeled::ValidationException(ValidationException {

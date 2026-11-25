@@ -613,14 +613,18 @@ pub fn managed_base_image_arn(region: &str, image_id: &str) -> String {
 /// anchored on this service's API-version date. They carry the MILLISECOND component AWS
 /// publishes them with, which is the resolution every instant of this service is kept and
 /// reported at ([`millisecond_precision`]), so a client that keys a cache or a rebuild
-/// decision on an entry's `updatedAt` reads the same value AWS gives it. The release
-/// labels are chosen (this emulator does not hold AWS's own release labels).
+/// decision on an entry's `updatedAt` reads the same value AWS gives it. The release each
+/// generation ships is published metadata of the catalogue too, so the newest generation
+/// of the Amazon Linux 2023 base image ships the release AWS publishes it under (recorded
+/// AWS behaviour) rather than a label that happens to equal this service's own first
+/// version for an account's image ([`FIRST_IMAGE_VERSION`]) — the two namespaces are
+/// unrelated, and an unpinned build must report the base image's own pedigree.
 pub const MANAGED_BASE_IMAGE_VERSIONS: &[(&str, &str, &str, i64, &[&str])] = &[
-    // Generation 1, shipping base-image release 1.0, published 2026-09-29T17:29:38.629Z.
-    ("al2023-1", "1", "1.0", 1_790_702_978_629, ARCHITECTURE_VALUES),
-    // Generation 0, shipping the pre-release 0.1 of the same base image, published
+    // Generation 1, shipping base-image release 2.0, published 2026-09-29T17:29:38.629Z.
+    ("al2023-1", "1", "2.0", 1_790_702_978_629, ARCHITECTURE_VALUES),
+    // Generation 0, shipping the earlier release 1.0 of the same base image, published
     // 2026-06-17T17:00:10.862Z.
-    ("al2023-1", "0", "0.1", 1_781_715_610_862, ARCHITECTURE_VALUES),
+    ("al2023-1", "0", "1.0", 1_781_715_610_862, ARCHITECTURE_VALUES),
 ];
 
 /// A `ManagedMicrovmImageVersionStatus` value
@@ -1482,6 +1486,11 @@ pub fn start_microvm_transition(vm: &mut Microvm, transition: MicrovmTransition,
 #[derive(Debug, Clone)]
 pub struct MicrovmImageBuild {
     pub build_id: String,
+    /// Where this build falls in the order the builds of one image version were
+    /// RECORDED: the build's own creation sequence, which is what
+    /// `ListMicrovmImageBuilds` pages in and what orders the reason a version reports.
+    /// The id itself is drawn ([`mint_prefixed_id`]), so it encodes no order at all.
+    pub created_seq: u64,
     /// A `BuildState`.
     pub state: String,
     /// An `Architecture`.
@@ -1603,9 +1612,19 @@ impl MicrovmImageVersion {
     /// builds recorded one has nothing to report. The ONE projection of the stored
     /// reason, so the read of a version and a listing row for it cannot disagree.
     pub fn reported_state_reason(&self) -> Option<String> {
-        self.builds
-            .values()
+        self.builds_in_creation_order()
+            .into_iter()
             .find_map(|build| build.state_reason.clone())
+    }
+
+    /// This version's builds in the order they were RECORDED ([`MicrovmImageBuild::created_seq`]):
+    /// the order the build fan-out minted them in, which is the one order every answer
+    /// about them is read in — a listing page, the cursor it pages by and the reason the
+    /// version reports.
+    pub fn builds_in_creation_order(&self) -> Vec<&MicrovmImageBuild> {
+        let mut builds: Vec<&MicrovmImageBuild> = self.builds.values().collect();
+        builds.sort_by_key(|build| build.created_seq);
+        builds
     }
 
     /// The `versionStateTimeBucket` a response reporting this version answers with: the
@@ -1937,11 +1956,41 @@ fn minted_bytes() -> [u8; 32] {
     digest.finalize().into()
 }
 
+/// The prefix a minted `microvmId` carries.
+pub const MICROVM_ID_PREFIX: &str = "mvm-";
+
+/// The prefix a minted `buildId` carries.
+pub const BUILD_ID_PREFIX: &str = "build-";
+
+/// How many times a mint redraws an identifier a store already holds before it keeps the
+/// last draw: a drawn identifier does not collide in practice, and the bound is what makes
+/// the mint terminate whatever it draws.
+const MINTED_ID_REDRAWS: usize = 8;
+
+/// Mint one identifier under `prefix`: the prefix, then a UUID DRAWN for this resource —
+/// [`mint_microvm_image_id`], the one rendering of opaque bytes as an identity this
+/// service mints through, so every identifier it hands out is drawn the same way.
+///
+/// Drawn rather than COUNTED. An identifier rendered from how many resources the process
+/// has minted before it is derivable from that count, so a client can address a resource
+/// it was never given by incrementing one it holds; it repeats itself in the next process,
+/// so two resources of two runs share an identity; and it makes a record's identity a
+/// function of the unrelated creations that happened to precede it. The creation ORDER a
+/// listing pages by therefore comes from the record's own creation sequence rather than
+/// from the text of its identifier.
+pub fn mint_prefixed_id(prefix: &str) -> String {
+    format!("{prefix}{}", mint_microvm_image_id())
+}
+
 /// A running (or terminated) MicroVM, keyed in
 /// [`ComAmazonawsLambdamicrovmsLambdamicrovmsState::microvms`] by its `microvmId`.
 #[derive(Debug, Clone)]
 pub struct Microvm {
     pub microvm_id: String,
+    /// Where this MicroVM falls in the order the MicroVMs of this store were RUN: the
+    /// record's own creation sequence, which is what `ListMicrovms` pages in. The id
+    /// itself is drawn ([`mint_prefixed_id`]), so it encodes no order at all.
+    pub created_seq: u64,
     /// This MicroVM's own ARN, so a `microvmIdentifier` given as an ARN resolves
     /// against the ARN this service minted rather than against any ARN whose last
     /// segment happens to match a local id.
@@ -2602,12 +2651,31 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
             .collect()
     }
 
-    /// Mint the next `microvmId`. Zero-padded so the ids sort in creation
-    /// order, which is the order `ListMicrovms` must page through.
-    pub fn next_microvm_id(&mut self) -> String {
+    /// Mint the identity of the next MicroVM: its `microvmId` and the CREATION SEQUENCE
+    /// the record keeps.
+    ///
+    /// The id is drawn ([`mint_prefixed_id`]), so nothing about it encodes when the
+    /// MicroVM was run; the sequence does, and it is what `ListMicrovms` pages in. A draw
+    /// this store already holds is redrawn, so no two MicroVMs of one store share an id.
+    pub fn next_microvm_id(&mut self) -> (String, u64) {
         let seq = self.next_microvm_seq;
         self.next_microvm_seq += 1;
-        format!("mvm-{seq:016x}")
+        let mut microvm_id = mint_prefixed_id(MICROVM_ID_PREFIX);
+        for _ in 0..MINTED_ID_REDRAWS {
+            if !self.holds_microvm_id(&microvm_id) {
+                break;
+            }
+            microvm_id = mint_prefixed_id(MICROVM_ID_PREFIX);
+        }
+        (microvm_id, seq)
+    }
+
+    /// Whether ANY region of this store already holds a MicroVM under `microvm_id` — what
+    /// a mint redraws against.
+    fn holds_microvm_id(&self, microvm_id: &str) -> bool {
+        self.regions
+            .values()
+            .any(|regional| regional.microvms.contains_key(microvm_id))
     }
 
     /// The address of the OWN network interface the next MicroVM is started with: one
@@ -2618,13 +2686,13 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
         microvm_network::link_local_address(self.next_microvm_seq)
     }
 
-    /// Mint the next `buildId`. Zero-padded for the same reason as
-    /// [`Self::next_microvm_id`]: the ids sort in creation order, which is the order
-    /// `ListMicrovmImageBuilds` pages through.
-    pub fn next_build_id(&mut self) -> String {
+    /// Mint the identity of the next build: its `buildId` and the CREATION SEQUENCE the
+    /// build record keeps, for the same reason as [`Self::next_microvm_id`] — the id is
+    /// drawn and the sequence is what `ListMicrovmImageBuilds` pages in.
+    pub fn next_build_id(&mut self) -> (String, u64) {
         let seq = self.next_build_seq;
         self.next_build_seq += 1;
-        format!("build-{seq:016x}")
+        (mint_prefixed_id(BUILD_ID_PREFIX), seq)
     }
 
     /// The builds a version's asynchronous build fans out into: one per target of
@@ -2649,11 +2717,20 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
             .copied()
             .collect();
         for target in requested {
-            let build_id = self.next_build_id();
+            // A build id is drawn, so the fan-out redraws one this version already holds
+            // rather than overwriting the build under it.
+            let (mut build_id, created_seq) = self.next_build_id();
+            for _ in 0..MINTED_ID_REDRAWS {
+                if !builds.contains_key(&build_id) {
+                    break;
+                }
+                build_id = mint_prefixed_id(BUILD_ID_PREFIX);
+            }
             builds.insert(
                 build_id.clone(),
                 MicrovmImageBuild {
                     build_id,
+                    created_seq,
                     state: BUILD_STATE_IN_PROGRESS.to_string(),
                     architecture: target.architecture.to_string(),
                     chipset: target.chipset.to_string(),

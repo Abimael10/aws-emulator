@@ -40,8 +40,11 @@ pub struct RegionalStore {
     pub images: BTreeMap<String, MicrovmImage>,
     /// `imageArn` -> image `name`, so an identifier resolves by ARN or by name.
     pub arn_index: BTreeMap<String, String>,
-    /// MicroVMs by `microvmId`. The ids sort in creation order, which is the order
-    /// `ListMicrovms` pages through.
+    /// MicroVMs by `microvmId`. The id is DRAWN rather than counted
+    /// ([`crate::state::mint_prefixed_id`]), so it carries no ordering: the order
+    /// `ListMicrovms` pages through is each record's own creation sequence
+    /// ([`Microvm::created_seq`], what [`ComAmazonawsLambdamicrovmsLambdamicrovmsState::microvms_in`]
+    /// serves them in).
     pub microvms: BTreeMap<String, Microvm>,
     /// MicroVM ARN -> `microvmId`, so an identifier resolves by ARN or by id.
     pub microvm_arn_index: BTreeMap<String, String>,
@@ -293,12 +296,20 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
         self.regions.get_mut(region)?.microvms.get_mut(&id)
     }
 
-    /// The MicroVMs `region` holds, in `microvmId` order — creation order, which is the
+    /// The MicroVMs `region` holds, in CREATION order ([`Microvm::created_seq`]) — the
     /// order `ListMicrovms` pages through.
+    ///
+    /// The order is the record's own creation sequence rather than the text of its
+    /// `microvmId`, because an id this service mints is drawn rather than counted
+    /// ([`crate::state::mint_prefixed_id`]) and so carries no ordering.
     pub fn microvms_in(&self, region: &str) -> impl Iterator<Item = &Microvm> {
-        self.in_region(region)
+        let mut microvms: Vec<&Microvm> = self
+            .in_region(region)
             .into_iter()
             .flat_map(|regional| regional.microvms.values())
+            .collect();
+        microvms.sort_by_key(|vm| vm.created_seq);
+        microvms.into_iter()
     }
 
     /// Persist `vm` in `region`, with the ARN index that resolves its identifier. Stores
