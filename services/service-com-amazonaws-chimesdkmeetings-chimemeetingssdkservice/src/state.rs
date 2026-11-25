@@ -405,6 +405,24 @@ pub fn too_many_tags(resource_arn: &str, requested: usize) -> TooManyTagsExcepti
     }
 }
 
+/// Which operation created a meeting, and so which operation's `ClientRequestToken`
+/// record names it.
+///
+/// `ClientRequestToken` is `@idempotencyToken` on `CreateMeetingRequest` and, separately,
+/// on `CreateMeetingWithAttendeesRequest`: a token is the retry marker of the call it was
+/// sent to, and the two calls do not produce the same thing — `CreateMeeting` creates a
+/// meeting "with no initial attendees", `CreateMeetingWithAttendees` a meeting together
+/// with the 1..20 attendees its `@required` `Attendees` list carries. So one call's record
+/// cannot stand for the other's: replaying it would answer a request for attendees with a
+/// meeting that holds none, creating none of them and reporting no refusal for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MeetingCreateCall {
+    /// `CreateMeeting`.
+    Meeting,
+    /// `CreateMeetingWithAttendees`.
+    MeetingWithAttendees,
+}
+
 /// One Amazon Chime SDK meeting as this service persists it: the modelled [`Meeting`] it
 /// hands back, plus the request members the `Meeting` shape does not carry.
 ///
@@ -435,6 +453,10 @@ pub struct StoredMeeting {
     /// The `ClientRequestToken` that created this meeting, so deleting the meeting can
     /// drop its idempotency record too.
     pub client_request_token: String,
+    /// The create operation that minted this meeting. Together with
+    /// [`Self::client_request_token`] it names this meeting's idempotency record, so
+    /// deleting the meeting drops that record and nothing else's.
+    pub created_by: MeetingCreateCall,
     /// The transcription currently running in this meeting, as the call that started it
     /// configured it, or `None` when none is running — which is what a meeting starts out
     /// with and what stopping leaves behind.
@@ -477,11 +499,14 @@ impl StoredMeeting {
 pub struct ComAmazonawsChimesdkmeetingsChimemeetingssdkserviceState {
     /// Every meeting that currently exists, keyed by its minted `MeetingId`.
     pub meetings: HashMap<String, StoredMeeting>,
-    /// `ClientRequestToken` -> the `MeetingId` it created, so a replayed `CreateMeeting`
-    /// returns the meeting the first call created instead of minting a second one. One
-    /// entry per live meeting: `DeleteMeeting` drops the meeting's entry with it, so this
-    /// map is bounded by [`MAX_MEETINGS`] too.
-    pub meeting_by_client_request_token: HashMap<String, String>,
+    /// (the create operation, the `ClientRequestToken` it was given) -> the `MeetingId`
+    /// that call created, so a replayed create returns the meeting its own first call
+    /// created instead of minting a second one. Keyed by the operation as well as the
+    /// token ([`MeetingCreateCall`]), because a retry marker is a marker for ONE
+    /// operation's answer. Read and written through [`Self::replayed_meeting`] and
+    /// [`Self::remember_meeting_create`]. One entry per live meeting: `DeleteMeeting`
+    /// drops the meeting's entry with it, so this map is bounded by [`MAX_MEETINGS`] too.
+    pub meeting_by_client_request_token: HashMap<(MeetingCreateCall, String), String>,
     /// The `MeetingId`s of meetings that EXISTED and have since been deleted, oldest
     /// first, so a reader can tell a meeting that ended from an id that never named one.
     /// Bounded by [`MAX_ENDED_MEETINGS`]: recording one past the bound drops the oldest.
@@ -491,6 +516,37 @@ pub struct ComAmazonawsChimesdkmeetingsChimemeetingssdkserviceState {
 }
 
 impl ComAmazonawsChimesdkmeetingsChimemeetingssdkserviceState {
+    /// The meeting `call` created with this `ClientRequestToken`, or `None` when that
+    /// operation has created none with it — which is what makes the call a fresh create
+    /// rather than a replay.
+    ///
+    /// The lookup is scoped to the operation that recorded the token: a create answers a
+    /// replay only from its OWN record, never from another create operation's.
+    pub fn replayed_meeting(
+        &self,
+        call: MeetingCreateCall,
+        client_request_token: &str,
+    ) -> Option<&StoredMeeting> {
+        let meeting_id = self
+            .meeting_by_client_request_token
+            .get(&(call, client_request_token.to_string()))?;
+        self.meetings.get(meeting_id)
+    }
+
+    /// Record that `call` created `meeting_id` with `client_request_token`, which is what
+    /// a later call of the SAME operation carrying that token replays.
+    pub fn remember_meeting_create(
+        &mut self,
+        call: MeetingCreateCall,
+        client_request_token: &str,
+        meeting_id: &str,
+    ) {
+        self.meeting_by_client_request_token.insert(
+            (call, client_request_token.to_string()),
+            meeting_id.to_string(),
+        );
+    }
+
     /// Mint a `MeetingId` no stored meeting holds.
     ///
     /// The caller must insert the record under the returned id while still holding the
@@ -557,7 +613,7 @@ impl ComAmazonawsChimesdkmeetingsChimemeetingssdkserviceState {
     pub fn forget_meeting(&mut self, meeting_id: &str) -> Option<StoredMeeting> {
         let removed = self.meetings.remove(meeting_id)?;
         self.meeting_by_client_request_token
-            .remove(&removed.client_request_token);
+            .remove(&(removed.created_by, removed.client_request_token.clone()));
         if !self.has_ended(meeting_id) {
             self.ended_meetings.push_back(meeting_id.to_string());
             while self.ended_meetings.len() > MAX_ENDED_MEETINGS {

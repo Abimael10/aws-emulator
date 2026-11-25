@@ -9,8 +9,9 @@
 //! the meeting cannot admit — capabilities its features forbid, or an attendee past the
 //! meeting's ceiling — is reported in `Errors` rather than failing the whole call, and the
 //! response is projected from the STORED record, so `GetMeeting` / `ListAttendees` read
-//! back exactly what it returned. A replayed `ClientRequestToken` returns the meeting the
-//! first call created, with its attendees, rather than minting a second one.
+//! back exactly what it returned. A replayed `ClientRequestToken` of THIS operation
+//! returns the meeting the first call created, with its attendees, rather than minting a
+//! second one; a token another create operation recorded is no replay of this call.
 //!
 //! ## Shape of an operation
 //!
@@ -228,15 +229,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // them in stored (`AttendeeId`) order: the request order of the FIRST call is not
         // part of the meeting, so it is not something a later call can read back.
         //
-        // `Errors` is empty on a replay for the same reason. A per-item refusal is a fact
-        // about ONE request, not about the meeting — nothing of it is stored, and storing
-        // it would mean keeping a record of attendees that do not exist — so a replay
-        // reports the attendees the meeting HOLDS and refuses nothing. A caller that
-        // needs the first call's refusals reads them from the first call's answer.
+        // The record read is the one THIS operation wrote: a token is the retry marker of
+        // the call it was sent to, and a meeting `CreateMeeting` created — one the model
+        // documents as having no initial attendees — is not an answer to a request for
+        // attendees, so a token recorded by that call is no replay here and this one is a
+        // fresh create, minting its own meeting and every attendee it was asked for.
+        //
+        // `Errors` is empty on a replay because a per-item refusal is a fact about ONE
+        // request, not about the meeting — nothing of it is stored, and storing it would
+        // mean keeping a record of attendees that do not exist — so a replay reports the
+        // attendees the meeting HOLDS and refuses nothing. A caller that needs the first
+        // call's refusals reads them from the first call's answer.
         let replayed = store
-            .meeting_by_client_request_token
-            .get(&input.client_request_token)
-            .and_then(|meeting_id| store.meetings.get(meeting_id))
+            .replayed_meeting(
+                crate::state::MeetingCreateCall::MeetingWithAttendees,
+                &input.client_request_token,
+            )
             .map(|stored| {
                 (
                     stored.announced_meeting(ctx),
@@ -291,9 +299,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tenant_ids: Some(crate::state::tenant_ids(input.tenant_ids)),
         };
 
-        store
-            .meeting_by_client_request_token
-            .insert(input.client_request_token.clone(), meeting_id.clone());
+        store.remember_meeting_create(
+            crate::state::MeetingCreateCall::MeetingWithAttendees,
+            &input.client_request_token,
+            &meeting_id,
+        );
         store.meetings.insert(
             meeting_id.clone(),
             crate::state::StoredMeeting {
@@ -302,6 +312,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 notifications_configuration: input.notifications_configuration,
                 media_placement_network_type: input.media_placement_network_type,
                 client_request_token: input.client_request_token,
+                created_by: crate::state::MeetingCreateCall::MeetingWithAttendees,
                 // A meeting is created with no transcription running; starting one is a
                 // call of its own.
                 transcription: None,

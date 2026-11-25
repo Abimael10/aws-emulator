@@ -4,8 +4,8 @@
 //! Mints a meeting and PERSISTS it: the `MeetingId` is a fresh `GuidString`, the
 //! `MediaPlacement` and the `MeetingArn` are derived from that id (so every later read
 //! reports the same values), and the record the response carries is the one read back out
-//! of the store. A replayed `ClientRequestToken` returns the meeting the first call
-//! created rather than minting a second one.
+//! of the store. A replayed `ClientRequestToken` of THIS operation returns the meeting the
+//! first call created rather than minting a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -213,11 +213,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `ClientRequestToken` is `@idempotencyToken`: a replay returns the meeting the
-        // first call created, so a client that retries does not accumulate meetings.
+        // first call created, so a client that retries does not accumulate meetings. The
+        // record read is the one THIS operation wrote — a token is the retry marker of the
+        // call it was sent to, and `CreateMeetingWithAttendees` records its own.
         let replayed = store
-            .meeting_by_client_request_token
-            .get(&input.client_request_token)
-            .and_then(|meeting_id| store.meetings.get(meeting_id))
+            .replayed_meeting(
+                crate::state::MeetingCreateCall::Meeting,
+                &input.client_request_token,
+            )
             .map(|stored| stored.announced_meeting(ctx));
         if let Some(meeting) = replayed {
             return Ok(CreateMeetingOutput {
@@ -263,9 +266,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tenant_ids: Some(crate::state::tenant_ids(input.tenant_ids)),
         };
 
-        store
-            .meeting_by_client_request_token
-            .insert(input.client_request_token.clone(), meeting_id.clone());
+        store.remember_meeting_create(
+            crate::state::MeetingCreateCall::Meeting,
+            &input.client_request_token,
+            &meeting_id,
+        );
         store.meetings.insert(
             meeting_id.clone(),
             crate::state::StoredMeeting {
@@ -274,6 +279,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 notifications_configuration: input.notifications_configuration,
                 media_placement_network_type: input.media_placement_network_type,
                 client_request_token: input.client_request_token,
+                created_by: crate::state::MeetingCreateCall::Meeting,
                 // A meeting is created with no transcription running; starting one is a
                 // call of its own.
                 transcription: None,
