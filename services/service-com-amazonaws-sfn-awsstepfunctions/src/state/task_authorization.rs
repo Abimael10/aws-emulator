@@ -114,6 +114,12 @@
 //! which is the whole point of hardening a service role that way. Nothing is guessed
 //! for a key the assume does not carry: an undecidable clause is no grant, the
 //! fail-closed reading the shared evaluator takes of every one of them.
+//!
+//! A `Task` state that names a role of its OWN through `Credentials` is a SECOND assume,
+//! and the identity it is made as is the execution role rather than this service: the role
+//! that state named is taken on only where ITS trust policy admits that identity
+//! ([`assume_denied`]), whatever the execution role's own policies grant, because a trust
+//! policy is the one document that can grant an assume of the role it is attached to.
 
 use ::std::sync::Arc;
 
@@ -802,62 +808,101 @@ fn task_signing<Eng: Send + Sync + 'static>(engine: &Arc<Eng>) -> Option<TaskSig
     }))
 }
 
-/// The ARN namespace and the operation of the call this service makes to act as the role a
-/// `Task` state's `Credentials` names, which is the call a refusal of that assume is
-/// reported as.
-const STS_NAMESPACE: &str = "sts";
-/// See [`STS_NAMESPACE`].
-const ASSUME_ROLE_OPERATION: &str = "AssumeRole";
-
 /// Why the execution role `execution_role` may NOT assume `target` to make a `Task`
 /// state's call under it, or `None` where it may and wherever nothing of the kind can be
 /// shown (see the module docs).
 ///
-/// It is the same decision every other call of the walk gets, over the call this service
-/// really makes to take the role on: `sts:AssumeRole` on the target role, as the execution
-/// role's session, with the TARGET role's own trust policy as the resource-based document —
-/// "if an identity-based policy or a resource-based policy grants the request, then AWS
-/// allows the request", and a trust policy is the resource-based policy of a role. So a
-/// role whose trust policy names the execution role is assumable without the execution
-/// role carrying a grant of its own, and one neither document covers is not.
+/// The assume is `sts:AssumeRole` on the target role, made as the execution role's session,
+/// and it is decided in IAM's own order for that one request:
 ///
-/// The failure is the task's own ([`TASK_FAILED_ERROR`]) carrying the token service's
-/// refusal as its SDK reports it, exactly as a refusal of the task's own work is.
+/// 1. the TARGET's trust policy is what says who may take the role on. It is the only
+///    document that can grant an assume of it — "update the role's trust policy to allow
+///    the entity to assume it" — so an assume no statement of that document covers is
+///    refused however much the assuming role's own policies grant, and the identity it is
+///    matched against is every spelling of the caller a `Principal` element can name: the
+///    session this service assumed the execution role under, the execution role itself, and
+///    the account it belongs to ([`::service_common::iam_trust_policy::grants_any_principal`]);
+/// 2. then the documents in force on the execution role, read exactly as every other call
+///    of the walk is ([`withheld`]), with that same trust policy as the resource-based
+///    document — so a trust statement naming the execution role directly is enough on its
+///    own, while one that merely names its ACCOUNT delegates to those documents and needs a
+///    grant among them.
+///
+/// Nothing is refused on evidence this emulator does not have: an account holding no role
+/// under `target`, or holding one whose trust document it cannot read, shows nothing about
+/// the assume and leaves the call to be made.
+///
+/// The failure is the task's own ([`TASK_FAILED_ERROR`]) carrying this service's own
+/// sentence for it ([`unassumable_task_role_cause`]): Step Functions takes the role on
+/// itself, so what a caller reads is how this service words a target role it could not
+/// take on.
 fn assume_denied<Eng: Send + Sync + 'static>(
     engine: &Arc<Eng>,
     execution_role: &str,
     target: &str,
     session_name: &str,
 ) -> Option<Failed> {
-    let call = super::integration::own_call(STS_NAMESPACE, ASSUME_ROLE_OPERATION)?;
     let iam = iam_state(&**engine)?;
+    let acts = Acts {
+        role_arn: execution_role,
+        session_name,
+    };
     let trust = role_trust_policy(&**engine, target);
-    let (code, status) = denied_answer(call.api, None);
-    let cause = refusal(
+    let refused = || Failed {
+        error: TASK_FAILED_ERROR.to_string(),
+        cause: unassumable_task_role_cause(execution_role, target),
+    };
+    if trust
+        .as_deref()
+        .is_some_and(|document| !trust_admits_the_caller(document, acts, target))
+    {
+        return Some(refused());
+    }
+    let because = withheld(
         &iam.lock(),
-        Acts {
-            role_arn: execution_role,
-            session_name,
-        },
-        &call
-            .api
-            .refused_action(::service_common::iam_trust_policy::ASSUME_ROLE_ACTION),
+        acts,
+        ::service_common::iam_trust_policy::ASSUME_ROLE_ACTION,
         target,
         trust.as_deref(),
-        Answered {
-            api: call.api,
-            family: call.family,
-            code,
-            status,
-        },
         // The assume is a call to the token service, which decides the same request
         // itself: the documents are read as that service reads them.
         Evidence::Documents,
-    )?;
-    Some(Failed {
-        error: TASK_FAILED_ERROR.to_string(),
-        cause,
-    })
+    );
+    because.map(|_| refused())
+}
+
+/// Whether the TRUST document `document` of the role `target` names the identity `acts`
+/// makes the assume as, which is what a trust policy has to do for that role to be
+/// assumable by it at all.
+///
+/// Every spelling of that identity is asked about ([`acting_principals`], and the ACCOUNT
+/// it belongs to, which a trust policy may name instead of the role), because each of them
+/// is a name a `Principal` element gives the same caller. `true` for a document that is not
+/// a policy this can be read out of: an unreadable grant is evidence of nothing, so it
+/// cannot be the basis of a refusal (see the module docs).
+fn trust_admits_the_caller(document: &str, acts: Acts<'_>, target: &str) -> bool {
+    let mut principals = acting_principals(acts);
+    principals.extend(iam::account_principals(acts.role_arn));
+    // The assume carries no condition key of its own: it is one role taking another on,
+    // which presents none of the keys a service's own assume does ([`assume_context`]), so
+    // a statement whose `Condition` cannot be decided is no grant — the fail-closed reading
+    // the shared evaluator takes.
+    ::service_common::iam_trust_policy::grants_any_principal(document, &principals, target, &[])
+        != Some(false)
+}
+
+/// The sentence this service fails a `Task` state with when the execution role may not take
+/// on the role the state's `Credentials` named.
+///
+/// Every word of it is fixed: Step Functions assumes the target role ITSELF, as the
+/// execution role, so the refusal a caller reads is this service's own report of a target
+/// role it could not take on rather than the token service's exception — and the only
+/// variable parts are the two roles it names, the `roleArn` of the state machine whose
+/// execution ran and the role that state resolved its `Credentials` to.
+fn unassumable_task_role_cause(execution_role: &str, target: &str) -> String {
+    format!(
+        "The role {execution_role} is not authorized to assume the task state's role, {target}."
+    )
 }
 
 /// The TRUST policy in force on the role `role_arn`, as this account's IAM holds it, or

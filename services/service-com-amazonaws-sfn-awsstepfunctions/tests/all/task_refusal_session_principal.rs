@@ -232,7 +232,7 @@ async fn a_refused_tasks_cause_names_the_assumed_role_session_of_the_execution_r
             resource_arn: function_arn.clone(),
             because: "because no identity-based policy allows the lambda:InvokeFunction action",
             code: ACCESS_DENIED_CODE,
-            service: "AWSLambda",
+            service: "Lambda",
             status: FORBIDDEN,
         },
         Row {
@@ -249,7 +249,7 @@ async fn a_refused_tasks_cause_names_the_assumed_role_session_of_the_execution_r
             resource_arn: function_arn.clone(),
             because: "with an explicit deny in an identity-based policy",
             code: ACCESS_DENIED_CODE,
-            service: "AWSLambda",
+            service: "Lambda",
             status: FORBIDDEN,
         },
         Row {

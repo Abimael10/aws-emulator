@@ -104,27 +104,30 @@ pub(crate) fn masked(cause: &str) -> String {
     format!("{sentence}{NAMES}{REQUEST_ID}{}", &named[id.len()..])
 }
 
-/// The metadata the client a `Task`'s integration family is served by closes a refused
-/// call's message with, with the refused request's id masked ([`masked`]).
+/// The metadata the client a `Task`'s integration is served by closes a refused call's
+/// message with, with the refused request's id masked ([`masked`]).
 ///
 /// Step Functions serves the AWS SDK family (`arn:aws:states:::aws-sdk:<service>:<op>`)
 /// through the current AWS SDK, whose exception message closes with ONE group of
 /// COMMA-separated fields — the service as that SDK's own client names it, the status and
-/// the refused request — and then a second group naming how many attempts the call took;
-/// an optimized `Resource` is served by the earlier generation of client, whose message
-/// closes with SEMICOLON-separated fields: that client's own name, the status, the code
-/// the answer named the class by, the refused request, and the proxy the call went
-/// through — there is none, so `Proxy: null`.
+/// the refused request — and then a second group naming how many attempts the call took.
+/// An OPTIMIZED `Resource` is served by the client that integration carries, and those are
+/// not all of one generation: the Lambda integration — the optimized `lambda:invoke` and a
+/// function's own ARN, which is the same call — is served by that same current SDK, while
+/// every other one here is served by the earlier generation of client, whose message closes
+/// with SEMICOLON-separated fields: that client's own name, the status, the code the answer
+/// named the class by, the refused request, and the proxy the call went through — there is
+/// none, so `Proxy: null`.
 ///
-/// `service` is the name the client of `resource`'s own family gives the invoked
-/// service, which is not the same name for both families.
+/// `service` is the name the client of `resource`'s own integration gives the invoked
+/// service, which is not the same name for both generations.
 pub(crate) fn refusal_metadata(
     resource: &str,
     service: &str,
     code: &str,
     status: u16,
 ) -> String {
-    match resource.contains(":aws-sdk:") {
+    match current_sdk_renders(resource) {
         true => format!(
             " (Service: {service}, Status Code: {status}, Request ID: {REQUEST_ID}) \
              (SDK Attempt Count: 1)"
@@ -134,6 +137,14 @@ pub(crate) fn refusal_metadata(
              Request ID: {REQUEST_ID}; Proxy: null)"
         ),
     }
+}
+
+/// Whether the client the call `resource` names is made with is the CURRENT AWS SDK: the
+/// AWS SDK family is that SDK whichever service it calls, and so is the Lambda
+/// integration — whether the `Resource` names the optimized `lambda:invoke` or the
+/// function's own ARN, both of which carry that service's `lambda` namespace.
+fn current_sdk_renders(resource: &str) -> bool {
+    resource.contains(":aws-sdk:") || resource.contains(":lambda:")
 }
 
 /// A child definition that finishes at once.

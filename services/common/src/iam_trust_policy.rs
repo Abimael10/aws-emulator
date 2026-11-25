@@ -27,7 +27,9 @@
 //! [`grants_service_principal`] instead: the same rule plus the statement's `Condition`,
 //! decided against the keys that request carries. A trust policy is a resource-based policy,
 //! so that reading is [`super::iam_authorization`]'s one evaluation of a policy document
-//! against a request rather than a second one written here.
+//! against a request rather than a second one written here. A service that assumes a role on
+//! a CALLER's behalf asks [`grants_any_principal`], which is that same reading over every
+//! spelling the identity it makes the call as can be named by.
 //!
 //! The two readers this rule is built on — [`parse_policy`], which accepts a document in
 //! either of the forms a store hands one back in, and [`json_strings`], which reads an
@@ -147,15 +149,33 @@ pub fn grants_service_principal(
     role_arn: &str,
     context: &[(String, String)],
 ) -> Option<bool> {
+    grants_any_principal(document, &[principal.to_string()], role_arn, context)
+}
+
+/// Whether `document` grants ANY of the identities `principals` the assume of the role
+/// `role_arn` it is attached to, for the request whose condition keys `context` states.
+///
+/// [`grants_service_principal`] is this asked about ONE principal, which is all a service
+/// that assumes a role AS ITSELF needs. A service that assumes a role on a CALLER's behalf
+/// makes that call as an identity a `Principal` element can name by several spellings — a
+/// session of a role, the role itself, the account the role belongs to
+/// ([`super::iam_authorization::account_principals`]) — so each spelling is asked about
+/// here, and the role grants the assume when any one of them is granted. That is one
+/// request with several names for its caller, not several requests: the evaluation, IAM's
+/// order over the document and what each answer means are [`grants_service_principal`]'s.
+pub fn grants_any_principal(
+    document: &str,
+    principals: &[String],
+    role_arn: &str,
+    context: &[(String, String)],
+) -> Option<bool> {
     // Whether this is a policy AT ALL is the one thing the evaluator does not report back
     // (it holds a document it cannot read as stating nothing), so it is asked here — and the
     // document itself is handed on AS IT STANDS, in whichever of the two forms a store
     // returned it, because the evaluator reads it through this same parse.
     parse_policy(document)?;
-    let principals = [principal.to_string()];
-    let request =
-        super::iam_authorization::Request::new(ASSUME_ROLE_ACTION, role_arn, &principals)
-            .with_context(context);
+    let request = super::iam_authorization::Request::new(ASSUME_ROLE_ACTION, role_arn, principals)
+        .with_context(context);
     Some(
         super::iam_authorization::resource_decision(document, &request)
             == super::iam_authorization::Decision::Allowed,

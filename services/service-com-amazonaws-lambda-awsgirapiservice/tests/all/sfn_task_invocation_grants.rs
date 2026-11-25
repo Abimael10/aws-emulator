@@ -83,13 +83,14 @@ const UNRELATED_ACTION: &str = "logs:PutLogEvents";
 /// exception, which is what a refusal `Invoke` models no error of its own arrives under.
 const REFUSED_ERROR: &str = "Lambda.AWSLambdaException";
 
-/// The name the metadata of that refusal gives the invoked service, as its own client
-/// writes it.
-const REFUSED_SERVICE: &str = "Service: AWSLambda;";
+/// The name the metadata of that refusal gives the invoked service, as the client Step
+/// Functions' Lambda integration is served through — the current AWS SDK — writes it, with
+/// the fields of that rendering separated by commas.
+const REFUSED_SERVICE: &str = "Service: Lambda,";
 
-/// The code the answer to an unauthorized call names the class by, where the invoked
-/// operation models no error of its own for one.
-const REFUSED_CODE: &str = "Error Code: AccessDeniedException";
+/// The status that answer came back with: an authorization refusal of `Invoke` is the
+/// service-common `AccessDeniedException`, served as a Forbidden.
+const REFUSED_STATUS: &str = "Status Code: 403";
 
 /// The handler every row's function carries: it reports what it was handed, so a task
 /// that really invoked it reports the RUN's own answer.
@@ -693,9 +694,9 @@ async fn either_document_in_force_decides_a_task_states_invocation() {
                     "case {case:?}: expected the cause to carry {sentence:?}, got {cause:?}"
                 );
                 assert!(
-                    cause.contains(REFUSED_CODE),
-                    "case {case:?}: expected the cause to name the code the answer carried \
-                     ({REFUSED_CODE}), got {cause:?}"
+                    cause.contains(REFUSED_STATUS),
+                    "case {case:?}: expected the cause to name the status the answer carried \
+                     ({REFUSED_STATUS}), got {cause:?}"
                 );
             }
         }

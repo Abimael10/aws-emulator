@@ -89,11 +89,12 @@ const UNRELATED_ACTION: &str = "logs:PutLogEvents";
 /// under.
 const REFUSED_CLASS: &str = "Lambda.AWSLambdaException";
 
-/// The fixed text of the sentence such a refusal carries, and the code the answer it stands
-/// in for came back under.
+/// The fixed text of the sentence such a refusal carries, and the status the answer it
+/// stands in for came back under — as the client the Lambda integration is served through
+/// renders it (`crate::sfn_task_target_authorization::refusal_metadata`).
 const REFUSAL_SENTENCE: &str = "is not authorized to perform: lambda:InvokeFunction";
 /// See [`REFUSAL_SENTENCE`].
-const REFUSAL_CODE: &str = "Error Code: AccessDeniedException";
+const REFUSAL_STATUS: &str = "Status Code: 403";
 
 /// The `Resource` of the optimized Lambda integration, which names the service and the
 /// action rather than the function; the function is named by a `FunctionName` parameter.
@@ -758,8 +759,8 @@ async fn a_task_is_made_only_where_a_document_in_force_allows_it(
         } else {
             // Nothing ran, so the cause is the refusal the gate answered for Lambda.
             assert!(
-                cause.contains(REFUSAL_SENTENCE) && cause.contains(REFUSAL_CODE),
-                "case {case:?}: expected the refusal to name the action and the code, got \
+                cause.contains(REFUSAL_SENTENCE) && cause.contains(REFUSAL_STATUS),
+                "case {case:?}: expected the refusal to name the action and the status, got \
                  {cause:?}"
             );
         }

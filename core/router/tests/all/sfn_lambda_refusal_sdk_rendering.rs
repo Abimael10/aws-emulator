@@ -41,14 +41,14 @@
 //! nothing here is a second copy of either. (That suite's own reader of a history's causes
 //! signs for the Region ITS harness runs in, so the reading below is this harness's.)
 //!
-//! The metadata a refusal of a Lambda call closes with is the EARLIER generation of
-//! client's — the service as that client's own class names it, the status, the code, the
-//! request and the proxy, separated by semicolons — and the class the task reports is that
-//! client's base exception for the service. The two go together: that client has no class
-//! for a code no shape of the invoked operation's model declares, so it keeps the code in
-//! the MESSAGE and the class falls back to the base exception. A rendering that moved the
-//! code out of the message would therefore have to move the class into the error name, and
-//! the recorded behaviour of this cause names the base exception, so both stay as they are.
+//! The metadata a refusal of a Lambda call closes with is the CURRENT AWS SDK's — the
+//! service as that SDK's own client names it, the status and the refused request in ONE
+//! group of comma-separated fields, then a group naming how many attempts the call took —
+//! because that is the client Step Functions' Lambda integration is served through,
+//! whichever form the `Resource` named the invocation in. It names no error code and no
+//! proxy, and the class the task reports is still the invoked service's base exception for
+//! a code no shape of the invoked operation's model declares: the recorded cause of such a
+//! refusal names that base exception beside this rendering, so the two stand together.
 
 use serde_json::{json, Value};
 
@@ -77,9 +77,9 @@ const NOT_FOUND: u16 = 404;
 const NOT_FOUND_CODE: &str = "ResourceNotFoundException";
 
 /// The error a `Task` reports for a class no shape of `Invoke`'s model declares: Lambda's
-/// base SDK exception, under the name the family that named the call writes for the
-/// service — which is the same name for both families here, the AWS SDK's own name for
-/// Lambda being the one Step Functions' optimized integration writes too.
+/// base SDK exception, under the name the client that made the call writes for the
+/// service — which is the same name whichever form named it, that SDK serving the Lambda
+/// integration and the AWS SDK family alike.
 const LAMBDA_BASE_EXCEPTION: &str = "Lambda.AWSLambdaException";
 
 /// The text an SDK exception names the status of the answer it came back from after.
@@ -179,7 +179,7 @@ async fn a_refused_task_reports_the_invoked_services_own_answer() {
             resource: "arn:aws:states:::lambda:invoke".to_string(),
             parameters: json!({ "FunctionName": denied_function.clone(), "Payload": {} }),
             error: LAMBDA_BASE_EXCEPTION,
-            client: "AWSLambda",
+            client: "Lambda",
             code: REFUSAL_CODE,
             status: FORBIDDEN,
             refused: Some((INVOKE_ACTION, denied_function.clone())),
@@ -191,7 +191,7 @@ async fn a_refused_task_reports_the_invoked_services_own_answer() {
             resource: "arn:aws:states:::lambda:invoke".to_string(),
             parameters: json!({ "FunctionName": "answered-denied" }),
             error: LAMBDA_BASE_EXCEPTION,
-            client: "AWSLambda",
+            client: "Lambda",
             code: REFUSAL_CODE,
             status: FORBIDDEN,
             refused: Some((INVOKE_ACTION, denied_function.clone())),
@@ -202,7 +202,7 @@ async fn a_refused_task_reports_the_invoked_services_own_answer() {
             resource: "arn:aws:states:::lambda:invoke".to_string(),
             parameters: json!({ "FunctionName": format!("{ACCOUNT}:function:answered-denied") }),
             error: LAMBDA_BASE_EXCEPTION,
-            client: "AWSLambda",
+            client: "Lambda",
             code: REFUSAL_CODE,
             status: FORBIDDEN,
             refused: Some((INVOKE_ACTION, denied_function.clone())),
@@ -214,15 +214,15 @@ async fn a_refused_task_reports_the_invoked_services_own_answer() {
             resource: denied_function.clone(),
             parameters: json!({}),
             error: LAMBDA_BASE_EXCEPTION,
-            client: "AWSLambda",
+            client: "Lambda",
             code: REFUSAL_CODE,
             status: FORBIDDEN,
             refused: Some((INVOKE_ACTION, denied_function.clone())),
         },
         Row {
             // The AWS SDK family makes the same call on the same resource, so the answer
-            // it stands in for carries the same status and the same code; only the client
-            // that renders it differs.
+            // it stands in for carries the same status and the same code — and the same
+            // client renders it, that SDK serving the Lambda integration too.
             case: "the same invocation through the AWS SDK integration",
             resource: "arn:aws:states:::aws-sdk:lambda:invoke".to_string(),
             parameters: json!({ "FunctionName": denied_function.clone(), "Payload": {} }),
@@ -265,7 +265,7 @@ async fn a_refused_task_reports_the_invoked_services_own_answer() {
             resource: "arn:aws:states:::lambda:invoke".to_string(),
             parameters: json!({ "FunctionName": granted_function.clone(), "Payload": {} }),
             error: "Lambda.ResourceNotFoundException",
-            client: "AWSLambda",
+            client: "Lambda",
             code: NOT_FOUND_CODE,
             status: NOT_FOUND,
             refused: None,

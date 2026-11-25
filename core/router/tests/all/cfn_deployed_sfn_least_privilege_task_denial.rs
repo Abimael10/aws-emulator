@@ -348,7 +348,9 @@ impl Called {
                 refused_action: "lambda:InvokeFunction",
                 refusal_error: "Lambda.AWSLambdaException",
                 code: REFUSAL_CODE,
-                sdk_client: "AWSLambda",
+                // That integration is served by the current AWS SDK, which names the
+                // service as its own client does.
+                sdk_client: "Lambda",
                 status: FORBIDDEN,
             },
             // Step Functions' own front door answers an authorization failure as a client

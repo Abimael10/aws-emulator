@@ -51,8 +51,10 @@ const INVOKE_ACTION: &str = "lambda:InvokeFunction";
 /// reported under.
 const REFUSED_ERROR: &str = "Lambda.AWSLambdaException";
 
-/// What the cause of that refusal carries: the code the answer came back under.
-const REFUSED_CODE: &str = "Error Code: AccessDeniedException";
+/// What the cause of that refusal carries: the status the invoked service answered an
+/// unauthorized call with, as the client the Lambda integration is served through renders
+/// it ([`crate::task_execution_role::refusal_metadata`]).
+const REFUSED_STATUS: &str = "Status Code: 403";
 
 /// What one row's policy does to the call, and so what the attempt closes with.
 enum Decided {
@@ -239,8 +241,8 @@ async fn the_roles_decision_decides_what_the_attempt_closes_with_not_how_it_is_r
                 );
             }
             Decided::Refused => assert!(
-                cause.contains(REFUSED_CODE) && cause.contains(INVOKE_ACTION),
-                "case {case:?}: expected the refusal to name the code and the action, got \
+                cause.contains(REFUSED_STATUS) && cause.contains(INVOKE_ACTION),
+                "case {case:?}: expected the refusal to name the status and the action, got \
                  {cause:?}"
             ),
         }

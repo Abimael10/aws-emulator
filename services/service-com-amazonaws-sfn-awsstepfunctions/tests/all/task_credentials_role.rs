@@ -10,9 +10,11 @@
 //! RULE: a `Task` state's `Credentials.RoleArn` names the role the state's integration
 //! call is made UNDER. Step Functions resolves the member in the state's own query
 //! language, assumes that role — which the state machine's execution role must be allowed
-//! to do — and makes the call as it, so the call is allowed or refused by THAT role's
-//! policies and not by the execution role's. A role the execution role may not assume
-//! fails the task instead, and no call is made for it.
+//! to do, and whose own trust policy must admit that role
+//! (`tests/all/task_credentials_role_trust.rs` holds what the trust policy decides) — and
+//! makes the call as it, so the call is allowed or refused by THAT role's policies and not
+//! by the execution role's. A role the execution role may not assume fails the task
+//! instead, and no call is made for it.
 //!
 //! The rows differ along what the rule generalises over: the FORM the member is written in
 //! (a literal ARN, a `RoleArn.$` reference path into the state's input, a `RoleArn.$`
@@ -58,28 +60,32 @@ struct Wire {
 ///
 /// Generous: what every loop below waits for is the CONDITION, so no row turns on how fast
 /// this host runs.
-const PATIENCE: Duration = Duration::from_secs(90);
+pub(crate) const PATIENCE: Duration = Duration::from_secs(90);
 
 /// How long one poll pauses between two looks.
 const POLL_PAUSE: Duration = Duration::from_millis(25);
 
 /// The table every row's task writes into.
-const TABLE: &str = "credentialed";
+pub(crate) const TABLE: &str = "credentialed";
 
 /// The ASL error a task whose role could not be assumed reports: the work the state named
 /// is what did not happen.
-const TASK_FAILED_ERROR: &str = "States.TaskFailed";
+pub(crate) const TASK_FAILED_ERROR: &str = "States.TaskFailed";
 
-/// The action the assume the service has to take is subject to, which the refusal names.
-const ASSUME_ACTION: &str = "sts:AssumeRole";
+/// The action the assume the service has to take is subject to, which a trust policy names.
+pub(crate) const ASSUME_ACTION: &str = "sts:AssumeRole";
 
 /// Step Functions, IAM and DynamoDB over ONE engine.
-struct Chain {
+///
+/// `pub(crate)` because `tests/all/task_credentials_role_trust.rs` holds the rest of this
+/// rule — what the TARGET role's trust policy decides — over the same three services:
+/// `tests/all.rs` is one crate root, so the wiring is stated here once.
+pub(crate) struct Chain {
     router: MultiServiceRouter,
 }
 
 impl Chain {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -133,7 +139,6 @@ impl Chain {
     async fn sfn(&self, operation: &str, body: &Value) -> Value {
         self.json(&SFN, operation, body).await
     }
-
     async fn ddb(&self, operation: &str, body: &Value) -> Value {
         self.json(&DYNAMODB, operation, body).await
     }
@@ -173,7 +178,7 @@ impl Chain {
 
     /// An IAM role trusting `trust`, carrying `policy` as its inline policy where one is
     /// given, by the ARN IAM's own `CreateRole` reported for it.
-    async fn role(&self, name: &str, trust: &Value, policy: Option<&Value>) -> String {
+    pub(crate) async fn role(&self, name: &str, trust: &Value, policy: Option<&Value>) -> String {
         let created = self
             .iam(
                 "CreateRole",
@@ -205,7 +210,7 @@ impl Chain {
     /// "You can perform read and write operations only on an ACTIVE table", and a created
     /// one is `CREATING` until the clock makes it active — so the wait is for THAT status
     /// and not for a span.
-    async fn create_table(&self) -> String {
+    pub(crate) async fn create_table(&self) -> String {
         let created = self
             .ddb(
                 "CreateTable",
@@ -246,7 +251,7 @@ impl Chain {
     }
 
     /// The item stored under `pk`, or `None` when the table holds none.
-    async fn item(&self, pk: &str) -> Option<Value> {
+    pub(crate) async fn item(&self, pk: &str) -> Option<Value> {
         let read = self
             .ddb(
                 "GetItem",
@@ -259,7 +264,7 @@ impl Chain {
     /// Create a state machine under `role_arn` running `definition`, start one execution of
     /// it with `input`, and report `(the execution ARN, what it ended as)` — waiting for the
     /// execution to reach a TERMINAL status rather than for a span.
-    async fn ran(
+    pub(crate) async fn ran(
         &self,
         name: &str,
         definition: &Value,
@@ -305,8 +310,9 @@ impl Chain {
     }
 }
 
-/// The trust document that lets THIS service act as a role.
-fn trusts_the_service() -> Value {
+/// The trust document that lets THIS service act as a role, which is what an EXECUTION
+/// role carries.
+pub(crate) fn trusts_the_service() -> Value {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -317,12 +323,38 @@ fn trusts_the_service() -> Value {
     })
 }
 
+/// The trust document that lets the role `principal` take a role on, which is what a role a
+/// `Task` state's `Credentials` names carries: the execution role is the identity the assume
+/// is made as, so it is the principal that role has to trust.
+pub(crate) fn trusts_the_role(principal: &str) -> Value {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": { "AWS": principal },
+            "Action": ASSUME_ACTION
+        }]
+    })
+}
+
 /// A policy granting `actions` on `resource` and nothing else.
-fn grants(actions: &[&str], resource: &str) -> Value {
+pub(crate) fn grants(actions: &[&str], resource: &str) -> Value {
     json!({
         "Version": "2012-10-17",
         "Statement": [{ "Effect": "Allow", "Action": actions, "Resource": resource }]
     })
+}
+
+/// The cause Step Functions fails a `Task` state with when the execution role may not take
+/// on the role that state's `Credentials` named.
+///
+/// Recorded behavior: every word of it is fixed — the service assumes the target role
+/// itself, so what it reports is its own sentence about that assume — and the only variable
+/// parts are the two roles, the state machine's `roleArn` and the role the state resolved.
+pub(crate) fn unassumable_cause(execution_role: &str, target: &str) -> String {
+    format!(
+        "The role {execution_role} is not authorized to assume the task state's role, {target}."
+    )
 }
 
 /// One row: the case, the `Credentials` block the `Task` state carries, and the query
@@ -370,7 +402,7 @@ fn rows() -> Vec<Row> {
 /// table under the role its `Credentials` names.
 ///
 /// `credentials` is `None` for the control, whose task is made as the execution role.
-fn definition(credentials: Option<Value>, jsonata: bool, pk: &str) -> Value {
+pub(crate) fn definition(credentials: Option<Value>, jsonata: bool, pk: &str) -> Value {
     let mut task = match jsonata {
         true => json!({
             "Type": "Task",
@@ -429,11 +461,12 @@ async fn a_task_is_made_under_the_role_its_credentials_names() {
             Some(&grants(&[ASSUME_ACTION], "*")),
         )
         .await;
-    // And the TARGET role may write the table and nothing else.
+    // And the TARGET role may write the table and nothing else. Its own trust policy names
+    // the execution role, which is the identity the assume is made as.
     let target_role = chain
         .role(
             "TargetRole",
-            &trusts_the_service(),
+            &trusts_the_role(&execution_role),
             Some(&grants(&["dynamodb:PutItem"], &table)),
         )
         .await;
@@ -536,8 +569,9 @@ async fn a_role_the_execution_role_may_not_assume_fails_the_task() {
             )),
         )
         .await;
-    // The role the task asks for: it may write the table, but nothing lets this execution
-    // role take it on.
+    // The role the task asks for: it may write the table, but neither document covers the
+    // assume — its trust policy names this service rather than the execution role, and the
+    // execution role carries no grant over it either.
     let stranger = chain
         .role(
             "Stranger",
@@ -546,7 +580,7 @@ async fn a_role_the_execution_role_may_not_assume_fails_the_task() {
         )
         .await;
 
-    let case = "a role the execution role carries no assume grant for";
+    let case = "a role neither the target's trust nor the execution role's grants cover";
     let pk = "never-written";
     let (_execution, described) = chain
         .ran(
@@ -570,9 +604,11 @@ async fn a_role_the_execution_role_may_not_assume_fails_the_task() {
         .get("cause")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    assert!(
-        cause.contains(ASSUME_ACTION) && cause.contains(&stranger),
-        "case {case:?}: expected the cause to name the assume it was refused, got {cause:?}"
+    assert_eq!(
+        cause,
+        unassumable_cause(&execution_role, &stranger),
+        "case {case:?}: expected this service's own sentence for a target role it could not \
+         take on, got {cause:?}"
     );
     assert_eq!(
         chain.item(pk).await,

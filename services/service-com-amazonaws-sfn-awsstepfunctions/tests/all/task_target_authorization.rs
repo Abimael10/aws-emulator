@@ -83,10 +83,10 @@ struct Row {
     /// operation's OWN answer to an unauthorized call carries, which is
     /// [`ACCESS_DENIED_CODE`] for an operation that models no such error.
     refusal_code: &'static str,
-    /// The name the client this row's FAMILY is served by gives the invoked service,
-    /// which is what that client's rendering of the exception names it under: the
-    /// earlier client's own name through an optimized `Resource`, and the current AWS
-    /// SDK's name for the service through the AWS SDK family.
+    /// The name the client this row's INTEGRATION is served by gives the invoked service,
+    /// which is what that client's rendering of the exception names it under: the earlier
+    /// client's own name for a service whose optimized integration it serves, and the
+    /// current AWS SDK's name for the AWS SDK family and for the Lambda integration.
     service: &'static str,
     /// The status the invoked service answers that refusal with.
     status: u16,
@@ -186,7 +186,9 @@ async fn an_integration_call_is_judged_by_its_own_action_and_addressed_resource(
             resource_arn: function_arn.clone(),
             refusal_error: "Lambda.AWSLambdaException",
             refusal_code: ACCESS_DENIED_CODE,
-            service: "AWSLambda",
+            // The Lambda integration is served by the current AWS SDK, which names the
+            // service as its own client does.
+            service: "Lambda",
             status: FORBIDDEN,
         },
         Row {
@@ -211,7 +213,7 @@ async fn an_integration_call_is_judged_by_its_own_action_and_addressed_resource(
             resource_arn: function_arn.clone(),
             refusal_error: "Lambda.AWSLambdaException",
             refusal_code: ACCESS_DENIED_CODE,
-            service: "AWSLambda",
+            service: "Lambda",
             status: FORBIDDEN,
         },
         Row {
@@ -223,7 +225,7 @@ async fn an_integration_call_is_judged_by_its_own_action_and_addressed_resource(
             resource_arn: function_arn,
             refusal_error: "Lambda.AWSLambdaException",
             refusal_code: ACCESS_DENIED_CODE,
-            service: "AWSLambda",
+            service: "Lambda",
             status: FORBIDDEN,
         },
         Row {

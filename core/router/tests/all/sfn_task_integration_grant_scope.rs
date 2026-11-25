@@ -115,9 +115,11 @@ const SEND_OTHER_ACTION: &str = "sqs:ReceiveMessage";
 const INVOKE_REFUSED: &str = "lambda:InvokeFunction";
 const SEND_REFUSED: &str = "sqs:sendmessage";
 
-/// The code the invoked service's answer names an authorization failure by: the AWS-common
-/// one for Lambda, and Amazon SQS's own, whose front door words it differently.
-const INVOKE_DENIED_CODE: &str = "AccessDeniedException";
+/// What the invoked service's answer to an authorization failure reports in the cause: the
+/// client the Lambda integration is served through — the current AWS SDK — names the STATUS
+/// and leaves the class to the error name, while Amazon SQS's optimized integration is
+/// served by the earlier client, whose rendering names the code its front door worded.
+const INVOKE_DENIED_STATUS: &str = "Status Code: 403";
 const SEND_DENIED_CODE: &str = "AccessDenied";
 
 /// The error name a `Task` state reports for a refusal the invoked operation does not model,
@@ -735,7 +737,7 @@ async fn the_grant_scope_decides_a_lambda_task_invocation() {
         let cause = described["cause"].as_str().unwrap_or_else(|| {
             panic!("case {case:?}: a failed execution must carry a cause, got {described}")
         });
-        for named in [INVOKE_DENIED_CODE, INVOKE_REFUSED, function_arn.as_str()] {
+        for named in [INVOKE_DENIED_STATUS, INVOKE_REFUSED, function_arn.as_str()] {
             assert!(
                 cause.contains(named),
                 "case {case:?}: expected the cause to name {named:?}, got {cause:?}"
@@ -753,9 +755,9 @@ async fn the_grant_scope_decides_a_lambda_task_invocation() {
         assert!(
             causes
                 .iter()
-                .any(|carried| carried.contains(INVOKE_DENIED_CODE)
+                .any(|carried| carried.contains(INVOKE_DENIED_STATUS)
                     && carried.contains(INVOKE_REFUSED)),
-            "case {case:?}: expected a history event naming {INVOKE_DENIED_CODE} and \
+            "case {case:?}: expected a history event naming {INVOKE_DENIED_STATUS} and \
              {INVOKE_REFUSED}, got {causes:?}"
         );
     }

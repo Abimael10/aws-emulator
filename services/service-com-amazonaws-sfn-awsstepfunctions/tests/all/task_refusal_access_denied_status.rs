@@ -39,7 +39,7 @@ use service_com_amazonaws_sfn_awsstepfunctions::state::{
 };
 
 use crate::state_machine_lifecycle::{string, ACCOUNT, REGION};
-use crate::task_execution_role::Chain;
+use crate::task_execution_role::{masked, refusal_metadata, Chain};
 use crate::task_refusal_session_principal::{definition, session_principal, unrelated_policy};
 
 /// The code an answer names the class of an unauthorized call by, where the invoked
@@ -65,8 +65,8 @@ struct Row {
     target: String,
     because: String,
     refusal_error: &'static str,
-    /// The name the invoked service's own SDK client carries, which its exception reports
-    /// the service under.
+    /// The name the client the invoked service's integration is served through gives it,
+    /// which its exception reports the service under.
     sdk_client: &'static str,
     /// The code the answer names the class by: the invoked operation's modelled one where
     /// it models the refusal, and [`ACCESS_DENIED_CODE`] where it models none.
@@ -117,7 +117,7 @@ async fn a_refused_task_reports_the_invoked_services_own_status() {
             target: function_arn.clone(),
             because: unstated(invoke_action),
             refusal_error: "Lambda.AWSLambdaException",
-            sdk_client: "AWSLambda",
+            sdk_client: "Lambda",
             code: ACCESS_DENIED_CODE,
             status: FORBIDDEN,
             failure_event: EVENT_TASK_FAILED,
@@ -133,7 +133,7 @@ async fn a_refused_task_reports_the_invoked_services_own_status() {
             target: function_arn,
             because: unstated(invoke_action),
             refusal_error: "Lambda.AWSLambdaException",
-            sdk_client: "AWSLambda",
+            sdk_client: "Lambda",
             code: ACCESS_DENIED_CODE,
             status: FORBIDDEN,
             failure_event: EVENT_LAMBDA_FUNCTION_FAILED,
@@ -210,23 +210,28 @@ async fn a_refused_task_reports_the_invoked_services_own_status() {
             row.refusal_error
         );
 
-        // The message, as the invoked service's own SDK renders its exception: the
-        // sentence — whose principal is the session of the execution role — then the
-        // metadata that answer carried, up to the identifier of the request. That
-        // identifier is one run's own value, so only everything around it is asserted:
-        // the service, the status it answers an unauthorized call with, the code it names
-        // the class by, and the tail an SDK closes such a message with.
+        // The message, as the client the invoked service's integration is served through
+        // renders its exception: the sentence — whose principal is the session of the
+        // execution role — then the metadata that answer carried
+        // ([`refusal_metadata`] states the two renderings), up to the identifier of the
+        // request. That identifier is one run's own value, so it is masked and everything
+        // around it is asserted: the service, the status it answers an unauthorized call
+        // with, the code it names the class by, and the tail that client closes such a
+        // message with.
         let cause = string(&described, "cause");
         let principal = session_principal(&role_arn, &cause);
         let expected = format!(
-            "User: {principal} is not authorized to perform: {} on resource: {} {} (Service: {}; \
-             Status Code: {}; Error Code: {}; ",
-            row.action, row.target, row.because, row.sdk_client, row.status, row.code
+            "User: {principal} is not authorized to perform: {} on resource: {} {}{}",
+            row.action,
+            row.target,
+            row.because,
+            refusal_metadata(&row.resource, row.sdk_client, row.code, row.status)
         );
-        assert!(
-            cause.starts_with(&expected) && cause.ends_with("Proxy: null)"),
-            "case {case:?}: expected the cause to open {expected:?} and close \"Proxy: null)\", \
-             got {cause:?}"
+        assert_eq!(
+            masked(&cause),
+            expected,
+            "case {case:?}: expected the cause {expected:?}, got {:?}",
+            masked(&cause)
         );
 
         // Read back through the history the failed work was reported in: the same message
