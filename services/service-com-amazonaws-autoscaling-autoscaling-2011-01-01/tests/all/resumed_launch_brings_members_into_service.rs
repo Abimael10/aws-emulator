@@ -38,6 +38,13 @@
 //!
 //! Each row drives a store of its OWN (one engine, one router, its own subnets), so what the
 //! clock owes is this row's group and nothing another row left behind.
+//!
+//! Every wait here ends on the CONDITION it is waiting for — the members the resumption brings
+//! into service, and the clock settling on nothing that is already past — looked at again
+//! under a deadline generous enough that only a condition which never holds turns into a
+//! failure. A convergence falls due at the same instant as the announcements it produces, and
+//! the reader retires the one while the service's own clock retires the other, so neither is
+//! read at a single moment.
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -427,13 +434,30 @@ async fn a_resumed_launch_process_brings_the_groups_members_into_service() {
         );
 
         // The group has come to REST: what it reached is a steady state, not a moment in a
-        // transition, so nothing of this group is owed at an instant already past.
-        let waiting = owed(&engine);
-        assert!(
-            waiting.is_none_or(|due| due > SystemTime::now()),
-            "case {:?}: a converged group owes nothing at an instant already past, got \
-             {waiting:?}",
-            row.case
-        );
+        // transition, so nothing of this group is owed at an instant already past. Looked at
+        // AGAIN until that holds, rather than read once: the convergence this row just
+        // observed also queued the announcements of the steps it made, and those are
+        // published — and so taken off what the clock is waiting for — by the service's own
+        // clock with no further call, so the instant read at the moment convergence became
+        // visible is one the service is still retiring. The deadline is the same backstop
+        // the wait above uses: it only turns a debt nothing ever retires into a failure.
+        let settling_deadline = Instant::now() + DEADLINE;
+        loop {
+            // Read the group again first, the way a client watching it does: the read
+            // materialises whatever the clock has since made due, and what the store is then
+            // still waiting on is read after it.
+            let (_, held_states, held_ids, _) = reported(&router, row.case, &group).await;
+            let waiting = owed(&engine);
+            if waiting.is_none_or(|due| due > SystemTime::now()) {
+                break;
+            }
+            assert!(
+                Instant::now() < settling_deadline,
+                "case {:?}: a converged group owes nothing at an instant already past, got \
+                 {waiting:?} with the states {held_states:?} for {held_ids:?}",
+                row.case
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
     }
 }
