@@ -61,8 +61,11 @@ const USER_NOT_FOUND: &str = "UserNotFoundException";
 /// The wire error code of a request whose parameters are refused.
 const INVALID_PARAMETER: &str = "InvalidParameterException";
 
-/// The wire error code a code the user's stored key does not emit is refused with.
-const ENABLE_SOFTWARE_TOKEN_MFA: &str = "EnableSoftwareTokenMFAException";
+/// The wire error code a verification for a user that holds NO software token at
+/// all is refused with: the delete took the private key away, so there is no
+/// factor for a presented code to be checked against rather than a code that
+/// failed to match one.
+const SOFTWARE_TOKEN_MFA_NOT_FOUND: &str = "SoftwareTokenMFANotFoundException";
 
 /// The username every fixture user is created under.
 const USERNAME: &str = "ada";
@@ -413,14 +416,15 @@ async fn deleting_a_software_token_takes_the_whole_totp_factor_away() {
             after.factors
         );
 
-        // The private key is gone with the registration: a code the DELETED key
-        // emits registers nothing any more.
+        // The private key is gone with the registration: the user holds no
+        // software token at all, so a code the DELETED key emits has no factor
+        // to be checked against any more.
         let (status, payload) = verify(&emulator, &fixture.access_token, &secret_code).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (400, ENABLE_SOFTWARE_TOKEN_MFA),
+            (400, SOFTWARE_TOKEN_MFA_NOT_FOUND),
             "case {case:?}: expected a code from the deleted key to be refused with a 400 \
-             {ENABLE_SOFTWARE_TOKEN_MFA}, got {status} with {payload}"
+             {SOFTWARE_TOKEN_MFA_NOT_FOUND}, got {status} with {payload}"
         );
 
         // And with no registration there is no delivery configuration TOTP MFA

@@ -429,8 +429,8 @@ pub enum MfaAnswer {
     /// A code IS there to present and the presented value is not it.
     CodeMismatch,
     /// The presented value is a one-time password this user's software token
-    /// already spent — on a registration or on an earlier sign-in — so it
-    /// authenticates nothing more ([`User::software_token_spent_step`]).
+    /// already spent on an earlier sign-in, so it authenticates nothing more
+    /// ([`User::software_token_spent_step`]).
     CodeAlreadyUsed,
     /// The factor the challenge asked for is not one the user holds any more —
     /// its authenticator or its delivered code is gone — so there is nothing to

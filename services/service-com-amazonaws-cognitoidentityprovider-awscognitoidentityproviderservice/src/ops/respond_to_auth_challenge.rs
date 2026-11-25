@@ -24,6 +24,12 @@
 //! `ConfirmDevice` registered check ([`crate::state::device_auth`]) — and the access token
 //! of a sign-in a device completed states that device.
 //!
+//! A sign-in that named the secure-remote-password flow is answered here as well: the
+//! `PASSWORD_VERIFIER` response carries the claim the exchange that sign-in served
+//! checks against the stored password ([`crate::state::user_srp_auth`]), and a sign-in
+//! that proves it reaches the same challenge — a new password, or the user's second
+//! factor — as one that sent its password directly.
+//!
 //! Answering the challenge is what TERMINATES the sign-in attempt it belongs to, so this
 //! call is also the OBSERVATION of that attempt's outcome, published into the pool's
 //! `AWS/Cognito` sign-in series ([`crate::state::auth_metrics`]).
@@ -754,6 +760,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RespondToAuthChal
                     delivered: delivered.map(|(code, attribute)| (username, code, attribute)),
                 };
             }
+            // The `PASSWORD_VERIFIER` challenge of the secure-remote-password sign-in
+            // is answered with the claim that sign-in's exchange checks: "respond with
+            // `PASSWORD_CLAIM_SIGNATURE`, `PASSWORD_CLAIM_SECRET_BLOCK`, and
+            // `TIMESTAMP`" (`ChallengeResponses` in this service's model), held to the
+            // one rule both response operations ask
+            // ([`crate::state::UserSrpRefusal`]) over the password stored for the
+            // user its session was started for.
+            if session.challenge_name == crate::state::PASSWORD_VERIFIER_CHALLENGE {
+                // The claim is the credential this challenge checks, so it is checked
+                // FIRST: a response that does not prove the password is refused as the
+                // wrong password whatever state the stored user is in, which is what
+                // keeps that refusal from stating anything about the user.
+                guard
+                    .answer_password_verifier(&session_token, &session, &responses)
+                    .map_err(srp_refused)?;
+                // The password is proved, so the stored user's own state decides the
+                // sign-in from here — a disabled, reset or unconfirmed user cannot
+                // sign in whatever credential it proved — exactly as it decides one
+                // that sent the password directly.
+                let username = usable_session_user(guard, &session)?;
+                let owed = guard
+                    .sign_in_after_password(
+                        &session,
+                        responses.get(DEVICE_KEY).map(String::as_str),
+                        now,
+                    )
+                    .ok_or_else(internal_error)?;
+                match owed {
+                    // Nothing stands between this sign-in and its tokens, so the
+                    // challenge is answered and its session is spent: the same claim
+                    // cannot complete a second sign-in.
+                    crate::state::PasswordVerified::Complete => {
+                        guard.end_session(&session_token);
+                        break 'answered Answered::Completed {
+                            user_pool_id,
+                            username,
+                            // "Called after user authentication flows have completed"
+                            // is this generation's own documented trigger source.
+                            generation:
+                                crate::state::lambda_triggers::TokenGeneration::Authentication,
+                            // The password was proved by the user, not by a device.
+                            device_key: None,
+                        };
+                    }
+                    // A further challenge is owed, so it is outstanding on a session of
+                    // its own and this one is spent.
+                    crate::state::PasswordVerified::Challenge {
+                        challenge_name,
+                        challenge_parameters,
+                        code,
+                    } => {
+                        let delivered = code
+                            .as_ref()
+                            .map(|code| (code.code.clone(), code.attribute.clone()));
+                        let validity = guard
+                            .pool(&user_pool_id)
+                            .and_then(|pool| pool.clients.get(&input.client_id))
+                            .map_or(session.expires_at, |client| {
+                                now + client.auth_session_validity()
+                            });
+                        let next = guard.start_session(
+                            now,
+                            crate::state::AuthSession {
+                                user_pool_id: user_pool_id.clone(),
+                                client_id: input.client_id.clone(),
+                                username: username.clone(),
+                                challenge_name: challenge_name.clone(),
+                                expires_at: validity,
+                                // Outstanding: this session has answered nothing yet.
+                                spent: false,
+                                code,
+                                // A response to one of the sign-in's challenges is
+                                // what handed it out.
+                                issued_by: crate::state::SessionIssuer::SignIn,
+                            },
+                        );
+                        guard.end_session(&session_token);
+                        break 'answered Answered::Next {
+                            user_pool_id,
+                            output: Box::new(RespondToAuthChallengeOutput {
+                                challenge_name: Some(challenge_name),
+                                session: Some(next),
+                                challenge_parameters: Some(challenge_parameters),
+                                authentication_result: None,
+                                available_challenges: None,
+                            }),
+                            delivered: delivered
+                                .map(|(code, attribute)| (username, code, attribute)),
+                        };
+                    }
+                }
+            }
             // The two challenges of device authentication: `DEVICE_SRP_AUTH` is
             // answered by starting the device's own exchange, and
             // `DEVICE_PASSWORD_VERIFIER` by the claim that exchange's stored
@@ -1022,6 +1120,25 @@ fn software_token_mfa_not_found() -> RespondToAuthChallengeError {
         },
     )
     .into()
+}
+
+/// What a response that does not answer the `PASSWORD_VERIFIER` challenge is
+/// reported as by THIS operation ([`crate::state::UserSrpRefusal`]).
+///
+/// A claim that does not verify proves no password, so it is refused with the one
+/// sentence a wrong password earns anywhere in this API
+/// ([`crate::state::INCORRECT_CREDENTIALS_MESSAGE`]) — the same answer a sign-in
+/// that sent the wrong password directly gets, which is what keeps the refusal
+/// from stating whether the user exists or what state it is in. An entry the
+/// challenge requires and the response did not carry is a parameter of the
+/// request, reported as the one this service words every absent parameter with.
+fn srp_refused(refusal: crate::state::UserSrpRefusal) -> RespondToAuthChallengeError {
+    match refusal {
+        crate::state::UserSrpRefusal::MissingResponse(entry) => missing_parameter(entry),
+        crate::state::UserSrpRefusal::ClaimNotVerified => {
+            not_authorized(crate::state::INCORRECT_CREDENTIALS_MESSAGE)
+        }
+    }
 }
 
 /// The `ChallengeResponses` entry naming the device a response comes from:

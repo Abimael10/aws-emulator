@@ -88,7 +88,12 @@ const INVALID_PARAMETER: &str = "InvalidParameterException";
 pub(crate) const CLAIM_TIMESTAMP: &str = "Mon Jan 1 00:00:00 UTC 2024";
 
 /// The label this exchange's key schedule expands its shared secret under.
-const DERIVED_KEY_LABEL: &[u8] = b"Caldera Derived Key";
+///
+/// `pub(crate)` with the group and the hash below: the SRP key schedule Amazon
+/// Cognito runs is ONE schedule, which the device leg and the user's own leg of
+/// it share, so a suite that drives either derives it from here rather than
+/// writing the same arithmetic again.
+pub(crate) const DERIVED_KEY_LABEL: &[u8] = b"Caldera Derived Key";
 
 /// The size of the key the claim is signed under.
 pub(crate) const SESSION_KEY_BYTES: usize = 16;
@@ -1233,21 +1238,21 @@ pub(crate) fn claim_signature(
 
 /// The prime of the group this exchange runs over, and the generator Amazon
 /// Cognito pairs with it.
-fn prime() -> &'static BigUint {
+pub(crate) fn prime() -> &'static BigUint {
     &srp::groups::G_3072.n
 }
 
-fn generator() -> BigUint {
+pub(crate) fn generator() -> BigUint {
     BigUint::from(2_u32)
 }
 
 /// `k = H(PAD(N) | PAD(g))`, the multiplier parameter of SRP-6a.
-fn multiplier() -> BigUint {
+pub(crate) fn multiplier() -> BigUint {
     BigUint::from_bytes_be(&hash(&[&padded(prime()), &padded(&generator())]))
 }
 
 /// The SHA-256 digest of `parts` concatenated.
-fn hash(parts: &[&[u8]]) -> [u8; 32] {
+pub(crate) fn hash(parts: &[&[u8]]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     for part in parts {
         hasher.update(part);
@@ -1258,7 +1263,7 @@ fn hash(parts: &[&[u8]]) -> [u8; 32] {
 /// `value` in the big-endian bytes this exchange hashes and reports it as: its
 /// shortest representation, with a leading zero byte where the first byte's top
 /// bit is set.
-fn padded(value: &BigUint) -> Vec<u8> {
+pub(crate) fn padded(value: &BigUint) -> Vec<u8> {
     let bytes = value.to_bytes_be();
     if bytes.first().is_some_and(|first| first & 0x80 != 0) {
         let mut padded = vec![0_u8];
@@ -1272,7 +1277,7 @@ fn padded(value: &BigUint) -> Vec<u8> {
 /// row runs its own exchange and two runs of the suite run the same ones. Nothing
 /// a device's own secret has to be unguessable for depends on this — it stands in
 /// for the randomness a device's client would draw.
-fn pseudo_random(label: &str, bytes: usize) -> Vec<u8> {
+pub(crate) fn pseudo_random(label: &str, bytes: usize) -> Vec<u8> {
     let mut drawn = Vec::with_capacity(bytes);
     let mut block = hash(&[label.as_bytes()]);
     while drawn.len() < bytes {

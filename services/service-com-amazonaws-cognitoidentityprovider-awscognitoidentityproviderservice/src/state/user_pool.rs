@@ -1492,12 +1492,15 @@ impl UserPool {
     /// (`USER_AUTH`) sign-in of this pool, in [`AUTH_FACTOR_ORDER`].
     ///
     /// A factor is reported when the USER is set up to present it as a first
-    /// authentication factor ([`User::configures_auth_factor`]) or has it
+    /// authentication factor ([`User::configures_auth_factor`]), has it
     /// available as an MFA factor ([`UserPool::offers_mfa_auth_factor`]) —
     /// "EMAIL_OTP, SMS_OTP, and WEB_AUTHN can be used as either a first
     /// authentication factor or an MFA factor" (`ConfiguredUserAuthFactors` in
-    /// this service's model). A factor the user is set up for neither way is not
-    /// one it has configured at all, so it is not reported.
+    /// this service's model) — or has SET the factor UP as an MFA factor
+    /// ([`User::sets_up_mfa_auth_factor`]), which is what a registered TOTP
+    /// authenticator is before anything activates it. A factor the user is set
+    /// up for in none of those ways is not one it has configured at all, so it
+    /// is not reported.
     ///
     /// What the POOL admits as a first authentication factor
     /// (`SignInPolicyType.AllowedFirstAuthFactors`,
@@ -1514,7 +1517,9 @@ impl UserPool {
             .iter()
             .copied()
             .filter(|factor| {
-                user.configures_auth_factor(factor) || self.offers_mfa_auth_factor(user, factor)
+                user.configures_auth_factor(factor)
+                    || self.offers_mfa_auth_factor(user, factor)
+                    || user.sets_up_mfa_auth_factor(factor)
             })
             .map(str::to_string)
             .collect()
@@ -2236,4 +2241,98 @@ impl UserPool {
             replica_regions: Some(self.replica_regions(now)),
         }
     }
+}
+
+/// A new user pool with `name` in `region`, with every configuration default
+/// filled in and `signing_keys` as the key pairs its tokens are signed with. The
+/// caller stores it under [`UserPool::id`].
+///
+/// `issuer_endpoint` is the address of THIS emulator the pool publishes its token
+/// issuer on ([`issuer_endpoint_authority`], which reads it off the request being
+/// served): the issuer is a URL a relying party fetches later, so it is settled
+/// once, here, and never re-derived from the endpoint a later read happened to
+/// reach.
+///
+/// The keys are passed IN rather than minted here: generating them is
+/// milliseconds of CPU per key ([`PoolSigningKeys::generate`]), so the caller
+/// runs that on the blocking pool and only after the store's own bound has
+/// admitted the pool.
+///
+/// The pool's SAML signing certificate IS issued here, once its id is settled:
+/// the certificate is issued to the SAML entity id that id implies, over the
+/// pool's own signing key — the RSA key pair its key set publishes — so the
+/// certificate and that document describe one key pair.
+pub fn new_user_pool(
+    name: String,
+    region: &str,
+    now: SystemTime,
+    signing_keys: PoolSigningKeys,
+    issuer_endpoint: Option<String>,
+) -> UserPool {
+    let region = sanitize_region(region);
+    let id = new_pool_id(&region);
+    let arn = ::engine::emulator_arn(SIGNING_NAME, &region, &format!("userpool/{id}"));
+    let mut pool = UserPool {
+        id,
+        name,
+        arn,
+        region,
+        creation_date: now,
+        last_modified_date: now,
+        policies: effective_policies(None),
+        lambda_config: effective_lambda_config(None),
+        mfa_configuration: effective_mfa_configuration(None),
+        deletion_protection: effective_deletion_protection(None),
+        user_pool_tier: DEFAULT_USER_POOL_TIER.to_string(),
+        username_attributes: Vec::new(),
+        alias_attributes: Vec::new(),
+        auto_verified_attributes: Vec::new(),
+        schema: effective_schema(None),
+        admin_create_user_config: effective_admin_create_user_config(None),
+        username_configuration: None,
+        device_configuration: None,
+        email_configuration: effective_email_configuration(None),
+        sms_configuration: None,
+        verification_message_template: effective_verification_message_template(None),
+        account_recovery_setting: None,
+        user_attribute_update_settings: effective_user_attribute_update_settings(None),
+        user_pool_add_ons: None,
+        key_configuration: effective_key_configuration(None),
+        issuer_configuration: effective_issuer_configuration(None),
+        issuer_endpoint,
+        acr_configuration: None,
+        sms_authentication_message: None,
+        software_token_mfa_configuration: None,
+        email_mfa_configuration: None,
+        web_authn_configuration: None,
+        log_configurations: Vec::new(),
+        tags: HashMap::new(),
+        domain: None,
+        custom_domain: None,
+        replicas: BTreeMap::new(),
+        clients: HashMap::new(),
+        users: HashMap::new(),
+        groups: BTreeMap::new(),
+        resource_servers: BTreeMap::new(),
+        identity_providers: BTreeMap::new(),
+        terms: BTreeMap::new(),
+        managed_login_branding: BTreeMap::new(),
+        ui_customizations: BTreeMap::new(),
+        user_import_jobs: BTreeMap::new(),
+        // A pool's token-signing keys exist from the moment the pool does, as on
+        // AWS, so its key set is publishable before anything signs in: one key
+        // pair per token type, minted by the caller before the pool is built and
+        // never again.
+        signing_keys,
+        // Issued below, once the pool's id — the name the certificate is issued
+        // to — is settled.
+        saml_signing_certificate: None,
+        device_group_key: new_device_group_key(),
+        risk_configuration: None,
+    };
+    // A pool's SAML signing certificate exists from the moment the pool does, as
+    // on AWS: `GetSigningCertificate` answers one for a pool nothing has
+    // federated yet, and the pool keeps the certificate it was issued.
+    pool.issue_saml_signing_certificate();
+    pool
 }

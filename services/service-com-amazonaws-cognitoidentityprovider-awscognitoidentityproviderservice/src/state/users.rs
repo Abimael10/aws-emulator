@@ -161,14 +161,14 @@ pub struct User {
     /// One time step's password is good for ONE use: "the verifier MUST NOT
     /// accept the second attempt of the OTP generated for the same time step"
     /// (RFC 6238 §5.2, the resynchronisation rule the drift window comes from),
-    /// so a code presented again after it was accepted proves nothing more.
-    /// Every call that CHECKS a code against this user's authenticator spends
-    /// the step it belongs to — the registration that proves the authenticator
-    /// holds the key
-    /// ([`ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::register_software_token`])
-    /// and the challenge response that signs the user in
-    /// ([`ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::answer_mfa_challenge`])
-    /// — so a code accepted by either is accepted by neither again. Never
+    /// so a code presented again after it AUTHENTICATED proves nothing more.
+    /// What spends a step is the sign-in a code completes
+    /// ([`ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::answer_mfa_challenge`]),
+    /// so a code accepted by one challenge response completes no second one.
+    /// Registering the authenticator spends none
+    /// ([`ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::register_software_token`]):
+    /// it proves possession of the key rather than authenticating anything, and
+    /// the setup it completes is answered by the registration itself. Never
     /// rendered: no modelled member reports it.
     pub software_token_spent_step: Option<u64>,
     /// Whether this user has activated or deactivated passkey MFA for itself
@@ -349,6 +349,25 @@ impl User {
             .any(|setting| mfa_auth_factor_of(setting.as_str()) == Some(factor))
     }
 
+    /// Whether this user has SET `factor` UP as an MFA factor: it holds the
+    /// delivery configuration that factor reaches it through
+    /// ([`User::holds_mfa_delivery_config`]), whether or not it has ACTIVATED
+    /// the setting ([`User::activates_mfa_auth_factor`]).
+    ///
+    /// `ConfiguredUserAuthFactors` reports "the authentication types that are
+    /// available to the user with their current configuration" (this service's
+    /// model), and what a factor is configured WITH is what the user holds for
+    /// it: a registered TOTP authenticator is the software token's configuration
+    /// from the registration on, so it is reported from then on rather than only
+    /// once a preference activates it. A factor whose configuration the user
+    /// does not hold — an unregistered authenticator, an unverified address — is
+    /// set up by nothing.
+    pub fn sets_up_mfa_auth_factor(&self, factor: &str) -> bool {
+        MFA_SETTING_ORDER.iter().any(|setting| {
+            mfa_auth_factor_of(setting) == Some(factor) && self.holds_mfa_delivery_config(setting)
+        })
+    }
+
     /// Whether this user is SET UP to present `factor` as a first authentication
     /// factor of a choice-based (`USER_AUTH`) sign-in.
     ///
@@ -358,8 +377,8 @@ impl User {
     /// passkey factor with a registered passkey. `SOFTWARE_TOKEN` "can only be
     /// used as an MFA factor" (`ConfiguredUserAuthFactors` in this service's
     /// model), so nothing the user configures makes it a first factor; it is
-    /// reported only while activated as an MFA factor
-    /// ([`User::activates_mfa_auth_factor`]).
+    /// reported as the MFA factor it is set up as
+    /// ([`User::sets_up_mfa_auth_factor`]).
     ///
     /// This is what the USER is configured for, not what a sign-in attempt would
     /// be allowed to do with it: whether the pool ADMITS the factor as a first one

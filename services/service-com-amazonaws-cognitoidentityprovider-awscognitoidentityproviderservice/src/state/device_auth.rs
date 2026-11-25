@@ -21,15 +21,13 @@
 //! both sign-in operations and both challenge-response operations ask the SAME
 //! rule.
 //!
-//! The exchange is SRP-6a over the 3072-bit prime of RFC 3526 — the constant
-//! comes from the library that defines the SRP groups rather than from a prime
-//! written out here — with Amazon Cognito's own generator and key schedule: the
-//! stored verifier is derived from the device password under
-//! `<DeviceGroupKey><DeviceKey>`, the session key is the HKDF-SHA256 expansion
-//! of the exchange's shared secret salted with its scrambling parameter, and the
-//! claim is the HMAC-SHA256 of the device group key, the device key, the secret
-//! block the challenge served and the instant the device signed.
+//! The exchange is the one both legs of this protocol run, read from the one
+//! place that defines it ([`super::srp`]): what is DEVICE-specific is that the
+//! verifier is the one `ConfirmDevice` registered — derived from the device
+//! password under `<DeviceGroupKey><DeviceKey>` — and that those two names are
+//! what the device's claim is signed over.
 
+use super::srp::{self, SrpServerHalf, decode_base64, group_prime, padded, zero};
 use super::*;
 use ::num_bigint::BigUint;
 
@@ -52,18 +50,6 @@ pub const DEVICE_KEY_ENTRY: &str = "DEVICE_KEY";
 /// (`ChallengeResponses` in this service's model) is the entry the device leg
 /// carries it in too.
 pub const SRP_A_RESPONSE: &str = "SRP_A";
-
-/// The `ChallengeParameters` entry carrying the server's public value of the
-/// exchange.
-pub const SRP_B_PARAMETER: &str = "SRP_B";
-
-/// The `ChallengeParameters` entry carrying the salt the device's stored
-/// verifier was derived with.
-pub const SALT_PARAMETER: &str = "SALT";
-
-/// The `ChallengeParameters` entry carrying the block the device's password
-/// claim signs.
-pub const SECRET_BLOCK_PARAMETER: &str = "SECRET_BLOCK";
 
 /// The `ChallengeResponses` entry carrying back the block the challenge served.
 pub const PASSWORD_CLAIM_SECRET_BLOCK_RESPONSE: &str = "PASSWORD_CLAIM_SECRET_BLOCK";
@@ -157,14 +143,8 @@ pub fn device_srp_auth_challenge_parameters(
 pub struct DeviceSrpExchange {
     /// The device this exchange asks for a proof of possession of.
     pub device_key: String,
-    /// The private exponent the served public value was computed from.
-    server_secret: Vec<u8>,
-    /// The device's public value, as the `SRP_A` it presented.
-    client_public: Vec<u8>,
-    /// The public value served as `SRP_B`.
-    server_public: Vec<u8>,
-    /// The bytes served as `SECRET_BLOCK`, which the device's claim signs.
-    secret_block: Vec<u8>,
+    /// The exchange itself, as [`super::srp`] serves and checks one.
+    half: SrpServerHalf,
 }
 
 /// Stated rather than derived: the private exponent and the secret block of one
@@ -421,60 +401,26 @@ fn max_material_base64_chars() -> usize {
 /// Serve the `DEVICE_PASSWORD_VERIFIER` challenge of `device` to `username`,
 /// against the public value `client_srp_a` the device presented.
 ///
-/// The server's public value is `B = k·v + g^b (mod N)` over the group below,
-/// with `v` the verifier the device registered and `b` a private exponent minted
-/// for THIS exchange, so the salt and the public value a caller is served carry
-/// no device password and two exchanges of one device share nothing.
-///
-/// `None` when the presented value is not a usable public value — one that is
-/// not hexadecimal, that is spelled in more digits than the group's own prime,
-/// or that is zero modulo that prime, which RFC 5054 §2.5.4 aborts the exchange
-/// on — or when the randomness this needs could not be read.
+/// The exchange itself is the one [`super::srp`] serves, over the verifier the
+/// device registered, so the salt and the public value a caller is served carry
+/// no device password and two exchanges of one device share nothing. `None`
+/// when the device registered no usable material, or when that exchange could
+/// not be served ([`srp::serve`]).
 fn serve_device_srp(
     username: &str,
     device: &Device,
     client_srp_a: &str,
 ) -> Option<ServedDeviceChallenge> {
     let (verifier, salt) = device_srp_material(device)?;
-    let prime = group_prime();
-    // A public value of this group is a number modulo its prime, so one spelled
-    // in more digits than the prime itself is no public value of it — and
-    // reading one at all is work whose size the caller would otherwise choose.
-    if client_srp_a.len() > padded(prime).len().saturating_mul(2) {
-        return None;
-    }
-    let client_public = BigUint::parse_bytes(client_srp_a.as_bytes(), 16)?;
-    if &client_public % prime == zero() {
-        return None;
-    }
-    let server_secret = random_bytes::<SERVER_SECRET_BYTES>()?;
-    let secret_block = random_bytes::<SECRET_BLOCK_BYTES>()?;
-    let exponent = BigUint::from_bytes_be(&server_secret);
-    let server_public =
-        (multiplier() * &verifier + generator().modpow(&exponent, prime)) % prime;
-    if server_public == zero() {
-        return None;
-    }
-
+    let half = srp::serve(&verifier, client_srp_a)?;
     let mut challenge_parameters =
         device_srp_auth_challenge_parameters(username, &device.device_key);
-    challenge_parameters.insert(
-        SRP_B_PARAMETER.to_string(),
-        ::hex::encode(padded(&server_public)),
-    );
-    challenge_parameters.insert(SALT_PARAMETER.to_string(), ::hex::encode(padded(&salt)));
-    challenge_parameters.insert(
-        SECRET_BLOCK_PARAMETER.to_string(),
-        encode_base64(&secret_block),
-    );
+    half.report(&mut challenge_parameters, &padded(&salt));
     Some(ServedDeviceChallenge {
         challenge_parameters,
         exchange: DeviceSrpExchange {
             device_key: device.device_key.clone(),
-            server_secret: server_secret.to_vec(),
-            client_public: padded(&client_public),
-            server_public: padded(&server_public),
-            secret_block: secret_block.to_vec(),
+            half,
         },
     })
 }
@@ -483,10 +429,9 @@ fn serve_device_srp(
 /// `presented_secret_block`, proves that the device holds the device password
 /// the verifier stored for `device` was derived from.
 ///
-/// The device echoes the block the challenge served it, so a response carrying
-/// any other block is answering an exchange this one did not serve; the
-/// signature itself is checked against the HMAC this exchange's own session key
-/// computes, compared in constant time by the library that computes it.
+/// The one check both legs of this protocol run ([`SrpServerHalf::claim_verifies`]),
+/// over the verifier the device registered and the two names a DEVICE signs its
+/// claim over: the device group key and the device key.
 fn device_claim_verifies(
     device_group_key: &str,
     device: &Device,
@@ -495,152 +440,15 @@ fn device_claim_verifies(
     timestamp: &str,
     presented_signature: &str,
 ) -> bool {
-    if presented_secret_block != encode_base64(&exchange.secret_block) {
-        return false;
-    }
-    let Some(signature) = decode_base64(presented_signature) else {
-        return false;
-    };
     let Some((verifier, _salt)) = device_srp_material(device) else {
         return false;
     };
-    let Some(session_key) = exchange.session_key(&verifier) else {
-        return false;
-    };
-    let mut message = Vec::new();
-    message.extend_from_slice(device_group_key.as_bytes());
-    message.extend_from_slice(exchange.device_key.as_bytes());
-    message.extend_from_slice(&exchange.secret_block);
-    message.extend_from_slice(timestamp.as_bytes());
-    ::ring::hmac::verify(
-        &::ring::hmac::Key::new(::ring::hmac::HMAC_SHA256, &session_key),
-        &message,
-        &signature,
+    exchange.half.claim_verifies(
+        &verifier,
+        [device_group_key, &exchange.device_key],
+        presented_secret_block,
+        timestamp,
+        presented_signature,
     )
-    .is_ok()
 }
 
-impl DeviceSrpExchange {
-    /// The key this exchange's claim is signed under, for a device whose
-    /// registered verifier is `verifier`.
-    ///
-    /// The scrambling parameter is `u = H(PAD(A) | PAD(B))` and the shared
-    /// secret is `S = (A · v^u)^b (mod N)`, which is the same secret the device
-    /// computes from its own private exponent and its device password; the key
-    /// is the first [`SESSION_KEY_BYTES`] of the HKDF-SHA256 expansion of that
-    /// secret, salted with the scrambling parameter and labelled
-    /// [`DERIVED_KEY_LABEL`].
-    fn session_key(&self, verifier: &BigUint) -> Option<[u8; SESSION_KEY_BYTES]> {
-        let prime = group_prime();
-        let client_public = BigUint::from_bytes_be(&self.client_public);
-        let server_public = BigUint::from_bytes_be(&self.server_public);
-        let exponent = BigUint::from_bytes_be(&self.server_secret);
-        let scrambler = BigUint::from_bytes_be(&digest(&[
-            &padded(&client_public),
-            &padded(&server_public),
-        ]));
-        if scrambler == zero() {
-            return None;
-        }
-        let shared = (client_public * verifier.modpow(&scrambler, prime) % prime)
-            .modpow(&exponent, prime);
-        let mut session_key = [0_u8; SESSION_KEY_BYTES];
-        ::hkdf::Hkdf::<::sha2::Sha256>::new(Some(&padded(&scrambler)), &padded(&shared))
-            .expand(DERIVED_KEY_LABEL, &mut session_key)
-            .ok()?;
-        Some(session_key)
-    }
-}
-
-/// The prime of the group the exchange runs over: the 3072-bit group of RFC
-/// 3526, read from the library that defines the SRP groups (RFC 5054 takes its
-/// 3072-bit group from there) so the constant has one source rather than a prime
-/// written out here.
-fn group_prime() -> &'static BigUint {
-    &::srp::groups::G_3072.n
-}
-
-/// The generator Amazon Cognito's SRP runs over that prime: 2, which is the
-/// generator every client library of this exchange computes its public value
-/// with, rather than the one RFC 5054 pairs with the 3072-bit prime.
-fn generator() -> BigUint {
-    BigUint::from(2_u32)
-}
-
-/// The multiplier parameter of SRP-6a over that group: `k = H(PAD(N) | PAD(g))`.
-fn multiplier() -> BigUint {
-    BigUint::from_bytes_be(&digest(&[&padded(group_prime()), &padded(&generator())]))
-}
-
-/// Zero, the value a public value of the exchange may not be modulo the group's
-/// prime.
-fn zero() -> BigUint {
-    BigUint::from(0_u32)
-}
-
-/// The SHA-256 digest of `parts` concatenated, the hash of this key schedule.
-fn digest(parts: &[&[u8]]) -> [u8; 32] {
-    use ::sha2::Digest as _;
-    let mut hasher = ::sha2::Sha256::new();
-    for part in parts {
-        hasher.update(part);
-    }
-    hasher.finalize().into()
-}
-
-/// `value` as the big-endian bytes this key schedule hashes and reports it as:
-/// its shortest representation, with a leading zero byte where the first byte's
-/// top bit is set, so every value is read as a positive number by both sides of
-/// the exchange.
-fn padded(value: &BigUint) -> Vec<u8> {
-    let bytes = value.to_bytes_be();
-    if bytes.first().is_some_and(|first| first & 0x80 != 0) {
-        let mut padded = Vec::with_capacity(bytes.len().saturating_add(1));
-        padded.push(0);
-        padded.extend_from_slice(&bytes);
-        return padded;
-    }
-    bytes
-}
-
-/// `N` bytes of the randomness this service mints secrets from
-/// (`ring::rand::SystemRandom`), or `None` when it could not be read.
-fn random_bytes<const N: usize>() -> Option<[u8; N]> {
-    let mut bytes = [0_u8; N];
-    ::ring::rand::SecureRandom::fill(&::ring::rand::SystemRandom::new(), &mut bytes).ok()?;
-    Some(bytes)
-}
-
-/// `bytes` in base64, the encoding the served secret block travels in.
-fn encode_base64(bytes: &[u8]) -> String {
-    use ::base64::Engine as _;
-    ::base64::engine::general_purpose::STANDARD.encode(bytes)
-}
-
-/// The bytes `text` carries as base64, padded or not: a value a caller
-/// registered or signed is read whichever way its library wrote the padding.
-fn decode_base64(text: &str) -> Option<Vec<u8>> {
-    use ::base64::Engine as _;
-    ::base64::engine::general_purpose::STANDARD
-        .decode(text)
-        .ok()
-        .or_else(|| {
-            ::base64::engine::general_purpose::STANDARD_NO_PAD
-                .decode(text)
-                .ok()
-        })
-}
-
-/// The private exponent of one exchange: 256 bits, the floor RFC 5054 §2.5.4
-/// states for the server's private value.
-const SERVER_SECRET_BYTES: usize = 32;
-
-/// The block a device's password claim signs, minted per exchange.
-const SECRET_BLOCK_BYTES: usize = 64;
-
-/// The size of the key the claim is signed under, which is what this key
-/// schedule expands its shared secret to.
-const SESSION_KEY_BYTES: usize = 16;
-
-/// The label this key schedule expands the shared secret under.
-const DERIVED_KEY_LABEL: &[u8] = b"Caldera Derived Key";

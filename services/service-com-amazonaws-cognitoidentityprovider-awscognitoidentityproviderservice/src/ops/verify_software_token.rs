@@ -220,6 +220,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(caller_rejected)?;
         match guard.register_software_token(&caller, &input.user_code, now) {
             crate::state::SoftwareTokenRegistration::Registered => {}
+            // A user that has associated no private key holds no software token
+            // at all, so there is nothing to verify: that is the factor this
+            // operation reports as not found rather than a code that failed to
+            // match the key the setup would have minted.
+            crate::state::SoftwareTokenRegistration::NotAssociated => {
+                return Err(software_token_mfa_not_found());
+            }
             crate::state::SoftwareTokenRegistration::CodeMismatch => {
                 return Err(code_mismatch());
             }
@@ -268,13 +275,26 @@ const VERIFICATION_SUCCEEDED: &str = "SUCCESS";
 /// passed are the same mismatch, so both carry it.
 const CODE_MISMATCH_MESSAGE: &str = "Code mismatch";
 
-/// This operation's answer to a `UserCode` that is none the associated key emits —
-/// a user that has associated no key emits none at all, so a code presented before
-/// any association is the same mismatch.
+/// This operation's answer to a `UserCode` that is none the associated key emits.
 fn code_mismatch() -> VerifySoftwareTokenError {
     VerifySoftwareTokenErrorModeled::EnableSoftwareTokenMFAException(
         EnableSoftwareTokenMFAException {
             message: Some(CODE_MISMATCH_MESSAGE.to_string()),
+        },
+    )
+    .into()
+}
+
+/// This operation's answer to a request for a user that has associated NO private
+/// key: `SoftwareTokenMFANotFoundException` is thrown "when the software token
+/// time-based one-time password (TOTP) multi-factor authentication (MFA) isn't
+/// activated" (this service's model), and a user no `AssociateSoftwareToken`
+/// minted a key for has no such factor for a code to be checked against at all
+/// ([`crate::state::NO_SOFTWARE_TOKEN_MESSAGE`]).
+fn software_token_mfa_not_found() -> VerifySoftwareTokenError {
+    VerifySoftwareTokenErrorModeled::SoftwareTokenMFANotFoundException(
+        SoftwareTokenMFANotFoundException {
+            message: Some(crate::state::NO_SOFTWARE_TOKEN_MESSAGE.to_string()),
         },
     )
     .into()

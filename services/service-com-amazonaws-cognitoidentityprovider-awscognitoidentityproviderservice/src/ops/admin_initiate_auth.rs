@@ -7,7 +7,10 @@
 //! a user that still has to change its password gets the
 //! `NEW_PASSWORD_REQUIRED` challenge with a persisted `Session`.
 //! `AuthFlow=REFRESH_TOKEN_AUTH` (and its `REFRESH_TOKEN` alias) exchanges a refresh
-//! token this pool issued for a fresh id and access token. Every other
+//! token this pool issued for a fresh id and access token. `USER_SRP_AUTH` sends no
+//! password at all: it answers with the `PASSWORD_VERIFIER` challenge of one
+//! secure-remote-password exchange, which the challenge response proves the stored
+//! password through ([`crate::state::user_srp_auth`]). Every other
 //! `AuthFlow` answers 501 until it is implemented.
 //!
 //! An app client that holds a client secret is a CONFIDENTIAL client, so the sign-in first
@@ -464,6 +467,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminInitiateAuth
             return refresh_sign_in(&state, ctx, &input).await;
         }
 
+        // The secure-remote-password flow is one of the flows THIS operation's own
+        // `AuthFlow` documents — "`USER_SRP_AUTH` — Username-password authentication
+        // with the Secure Remote Password (SRP) protocol"
+        // (`AdminInitiateAuth.AuthFlow` in this service's model) — and it sends no
+        // password, so it is served before the password flows below.
+        if input.auth_flow == crate::state::USER_SRP_AUTH_FLOW {
+            return srp_sign_in(&state, &input);
+        }
+
         // Only the admin username-password flows are implemented besides it; the
         // rest say so rather than answering a sign-in nothing performed.
         if !matches!(
@@ -795,18 +807,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminInitiateAuth
                 user_not_found()
             });
         };
-        if !user.enabled {
-            return Err(not_authorized("User is disabled."));
-        }
-        match user.status {
-            crate::state::UserStatus::ResetRequired => {
-                return Err(password_reset_required());
-            }
-            crate::state::UserStatus::Unconfirmed => {
-                return Err(user_not_confirmed());
-            }
-            _ => {}
-        }
+        // The stored user's own state is read FIRST, as the client-side sign-in
+        // reads it, and read in ONE place for both flows of this operation
+        // ([`refuse_unusable_user`]).
+        refuse_unusable_user(user)?;
         // The stored credential, actually checked.
         if user.password.as_deref() != Some(password) {
             return Err(incorrect_credentials());
@@ -982,6 +986,135 @@ async fn refresh_sign_in(
         authentication_result: Some(authentication_result),
         available_challenges: None,
     })
+}
+
+/// `AuthFlow=USER_SRP_AUTH`: "Username-password authentication with the Secure Remote
+/// Password (SRP) protocol" (`AdminInitiateAuth.AuthFlow` in this service's model),
+/// whose `AuthParameters` are `USERNAME` and `SRP_A`.
+///
+/// The password is never sent, so this call checks no credential of the user: it
+/// answers with the `PASSWORD_VERIFIER` challenge the stored password is proved
+/// through ([`crate::state::serve_user_srp`]), and `AdminRespondToAuthChallenge` is
+/// what checks that claim — where the user's own state and the factors it owes are
+/// then decided, exactly as the administrative password flow decides them once the
+/// stored password matched. The one rule both sign-in operations serve this flow by,
+/// so the two cannot serve a different exchange.
+fn srp_sign_in(
+    store: &::engine::ServiceState<
+        crate::state::ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState,
+    >,
+    input: &AdminInitiateAuthInput,
+) -> Result<AdminInitiateAuthOutput, AdminInitiateAuthError> {
+    let now = ::std::time::SystemTime::now();
+    let auth_parameters = input.auth_parameters.clone().unwrap_or_default();
+    let username = auth_parameters
+        .get("USERNAME")
+        .ok_or_else(|| missing_auth_parameter("USERNAME"))?
+        .clone();
+    let presented_public_value = auth_parameters
+        .get(crate::state::SRP_A_PARAMETER)
+        .ok_or_else(|| missing_auth_parameter(crate::state::SRP_A_PARAMETER))?
+        .clone();
+
+    let guard = &mut *store.lock();
+    // Everything the challenge is built from is read under the lock and OWNED before
+    // the session it is served on is started: the stored pool and user are borrowed
+    // from the same store the session is written to.
+    let (served, session_validity) = {
+        let pool = guard
+            .pool(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+        // How an unresolved app-client lookup is worded depends on whether the
+        // `ClientId` names an app client of ANOTHER pool, a question about the whole
+        // store, asked only where the lookup has failed.
+        let Some(client) = pool.clients.get(&input.client_id) else {
+            return Err(client_not_found(guard.app_client_lookup_refusal(
+                &input.user_pool_id,
+                &input.client_id,
+                &crate::state::app_client_not_found_message(&input.client_id),
+            )));
+        };
+        if !client.allows_user_srp_auth() {
+            return Err(invalid_parameter(
+                crate::state::ADMIN_AUTH_FLOW_NOT_ENABLED_MESSAGE.to_string(),
+            ));
+        }
+        // A CONFIDENTIAL app client authenticates a caller acting as it by the secret
+        // it holds ([`SECRET_HASH`]), over the username this sign-in names plus the
+        // app client. Asked before the pool is searched for that username and before
+        // any exchange is served, so the sign-in of an app client whose secret the
+        // request does not hold starts no challenge.
+        if let Some(defect) = client.secret_hash_defect(
+            &username,
+            auth_parameters.get(SECRET_HASH).map(String::as_str),
+        ) {
+            return Err(not_authorized(&defect.message(&input.client_id)));
+        }
+        let hides_user_existence = client.hides_user_existence();
+        let session_validity = client.auth_session_validity();
+        let Some(user) = pool.user(&username) else {
+            // `PreventUserExistenceErrors=ENABLED` "suppresses messages that might
+            // indicate a valid user exists"; `LEGACY` answers `UserNotFoundException`,
+            // as the administrative password flow answers it.
+            return Err(if hides_user_existence {
+                incorrect_credentials()
+            } else {
+                user_not_found()
+            });
+        };
+        // The stored user's own state is read FIRST, as every other sign-in flow of
+        // this service reads it: a user that never confirmed its sign-up, one Amazon
+        // Cognito put in `RESET_REQUIRED` and a disabled one cannot sign in whatever
+        // credential the exchange would go on to prove, so each is reported for what
+        // it is rather than served an exchange that can never complete.
+        refuse_unusable_user(user)?;
+        let served = crate::state::serve_user_srp(pool, user, &presented_public_value)
+            .ok_or_else(|| invalid_parameter(crate::state::INVALID_SRP_A_MESSAGE.to_string()))?;
+        (served, session_validity)
+    };
+
+    let session = guard.start_session(
+        now,
+        crate::state::AuthSession {
+            user_pool_id: input.user_pool_id.clone(),
+            client_id: input.client_id.clone(),
+            username: served.exchange.username.clone(),
+            challenge_name: crate::state::PASSWORD_VERIFIER_CHALLENGE.to_string(),
+            expires_at: now + session_validity,
+            // Outstanding: this session has answered nothing yet.
+            spent: false,
+            // This challenge is answered with a claim the caller signs, not with a
+            // code anything delivered.
+            code: None,
+            // The sign-in is what handed it out.
+            issued_by: crate::state::SessionIssuer::SignIn,
+        },
+    );
+    // The claim is checked against the values THIS exchange served, so the exchange is
+    // bound to the session that carries the challenge it was served with.
+    guard.start_user_srp_exchange(&session, served.exchange);
+    Ok(AdminInitiateAuthOutput {
+        challenge_name: Some(crate::state::PASSWORD_VERIFIER_CHALLENGE.to_string()),
+        session: Some(session),
+        challenge_parameters: Some(served.challenge_parameters),
+        authentication_result: None,
+        available_challenges: None,
+    })
+}
+
+/// The refusals a stored user's own state owes any sign-in flow, whatever the flow
+/// presented: a disabled user, one Amazon Cognito put in `RESET_REQUIRED`, and one
+/// that never confirmed its sign-up. Both flows of this operation read it here, so
+/// neither can report the same stored state differently.
+fn refuse_unusable_user(user: &crate::state::User) -> Result<(), AdminInitiateAuthError> {
+    if !user.enabled {
+        return Err(not_authorized("User is disabled."));
+    }
+    match user.status {
+        crate::state::UserStatus::ResetRequired => Err(password_reset_required()),
+        crate::state::UserStatus::Unconfirmed => Err(user_not_confirmed()),
+        _ => Ok(()),
+    }
 }
 
 /// The refusal a presented `REFRESH_TOKEN` earns, as the store's shared reading of a

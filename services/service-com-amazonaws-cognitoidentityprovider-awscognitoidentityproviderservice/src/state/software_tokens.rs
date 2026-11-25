@@ -249,14 +249,30 @@ pub enum SoftwareTokenRegistration {
     /// The code is one the associated private key emits around now, so the
     /// authenticator is registered and TOTP MFA can be activated for this user.
     Registered,
-    /// The code is none that key emits — and a user that has associated no key
-    /// emits none at all, so a code presented before any association matches
-    /// nothing either.
+    /// The user has associated NO private key, so it holds no software token for
+    /// a presented code to register: there is nothing to verify rather than
+    /// something that did not match
+    /// ([`NO_SOFTWARE_TOKEN_MESSAGE`]).
+    NotAssociated,
+    /// The code is none the associated key emits.
     CodeMismatch,
     /// The user the credential named is no longer held, so nothing was
     /// registered.
     UserGone,
 }
+
+/// The message a software-token call owes a user that has associated no private
+/// key at all.
+///
+/// A setup "begins ... with a unique private key that Amazon Cognito generates
+/// and returns in the API response" (`AssociateSoftwareToken` in this service's
+/// model), so a user no association minted a key for holds no software token:
+/// there is no TOTP factor of that user for a presented code to be checked
+/// against, which is what `SoftwareTokenMFANotFoundException` reports rather
+/// than a code that failed to match. The sentence names no value from the
+/// request: it states the factor that does not exist and the user it does not
+/// exist for, and nothing of either.
+pub const NO_SOFTWARE_TOKEN_MESSAGE: &str = "Software Token MFA does not exist for the user.";
 
 impl User {
     /// The time step whose one-time password `user_code` is, for the
@@ -456,23 +472,24 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
     /// (`VerifySoftwareToken` in this service's model), which is the delivery
     /// configuration TOTP MFA is delivered with
     /// ([`User::holds_mfa_delivery_config`]), so from here the user can activate
-    /// `SOFTWARE_TOKEN_MFA`. The code the registration CONSUMED is spent by it
-    /// ([`User::software_token_spent_step`]): one time step's password is good
-    /// for one use, so the code that registered the authenticator is not one a
-    /// later sign-in can be completed with. Any other code registers nothing and
-    /// leaves the user exactly as it was, so the setup can be completed with the
-    /// next code the authenticator shows.
+    /// `SOFTWARE_TOKEN_MFA`. Any other code registers nothing and leaves the
+    /// user exactly as it was, so the setup can be completed with the next code
+    /// the authenticator shows, and a user that has associated no key at all
+    /// holds no software token to verify ([`SoftwareTokenRegistration`]).
     ///
-    /// A code this user's token has already SPENT still registers the
-    /// authenticator rather than being refused here: this call proves possession
-    /// of the key rather than authenticating a sign-in — it mints no token and
-    /// moves no sign-in forward — and the error a used-up password earns,
-    /// `ExpiredCodeException`, is one this operation's model does not declare
+    /// The presented code is neither refused as SPENT nor spent itself here:
+    /// this call proves possession of the key rather than authenticating a
+    /// sign-in — it mints no token and moves no sign-in forward — so the one use
+    /// a time step's password is good for is the sign-in it completes
+    /// ([`User::software_token_spent_step`], which the challenge responses that
+    /// DO authenticate with a code write), and the authenticator a setup just
+    /// registered can complete the sign-in that asked for the setup. The error a
+    /// used-up password earns, `ExpiredCodeException`, is one this operation's
+    /// model does not declare
     /// (`smithy_query(query="operation",operation="VerifySoftwareToken")` lists
     /// `CodeMismatchException`, `EnableSoftwareTokenMFAException`,
     /// `SoftwareTokenMFANotFoundException` and the rest, and no expired-code
-    /// error), so the refusal belongs to the challenge responses that DO
-    /// authenticate with a code and declare it.
+    /// error), so that refusal belongs to those responses alone.
     pub fn register_software_token(
         &mut self,
         caller: &SoftwareTokenCaller,
@@ -485,14 +502,13 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         else {
             return SoftwareTokenRegistration::UserGone;
         };
-        let Some(step) = user.software_token_step_of(user_code, now) else {
+        if user.software_token_key.is_none() {
+            return SoftwareTokenRegistration::NotAssociated;
+        }
+        if user.software_token_step_of(user_code, now).is_none() {
             return SoftwareTokenRegistration::CodeMismatch;
-        };
+        }
         user.software_token_registered = true;
-        // The presented password is used up: the step it belongs to has now
-        // proved that the authenticator holds the key, and nothing it is
-        // presented to again accepts it.
-        user.spend_software_token_step(step);
         // The registration is a change to the user record itself: what the user
         // holds as an MFA delivery configuration is now one more than before.
         user.user_last_modified_date = now;

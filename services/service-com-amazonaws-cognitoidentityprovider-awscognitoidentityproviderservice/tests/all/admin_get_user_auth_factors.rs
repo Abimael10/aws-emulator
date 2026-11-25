@@ -11,15 +11,16 @@
 //! a choice-based (`USER_AUTH`) sign-in: a factor the user holds what presenting it
 //! needs (a stored password, an address a one-time password is addressed to
 //! whether or not the user has proven it, a registered passkey), or a factor the
-//! user has activated as an MFA factor. What the POOL admits as a first
+//! user has set up or activated as an MFA factor. What the POOL admits as a first
 //! authentication factor does not narrow that report — the sign-in policy is read
 //! where a factor is actually presented — while `SOFTWARE_TOKEN`, an MFA factor
-//! only, is reported just for the user that activated it. A factor the user is set
-//! up for neither way is not reported, the reported list is in the order the model
-//! declares `AuthFactorType`'s values in rather than the order the pool lists them
-//! in, and the whole answer is computed from the STORED pool and the STORED user,
-//! so asking twice answers the same and asking changes nothing a later caller
-//! sees.
+//! only, is reported for the user whose authenticator a verification registered,
+//! whether or not a preference has activated it. A factor the user is set
+//! up for in none of those ways is not reported, the reported list is in the order
+//! the model declares `AuthFactorType`'s values in rather than the order the pool
+//! lists them in, and the whole answer is computed from the STORED pool and the
+//! STORED user, so asking twice answers the same and asking changes nothing a
+//! later caller sees.
 //!
 //! A request naming a pool that does not exist is refused as
 //! `ResourceNotFoundException`, and one naming no user of an existing pool as
@@ -463,10 +464,10 @@ const CASES: &[Case] = &[
         ..BASE
     },
     Case {
-        case: "a registered authenticator the user has activated no MFA factor for reports no \
-               software token factor",
+        case: "a registered authenticator is the software token factor's own \
+               configuration, so it is reported before any preference activates it",
         software_token_registered: true,
-        configured: &[PASSWORD],
+        configured: &[PASSWORD, SOFTWARE_TOKEN],
         ..BASE
     },
     Case {

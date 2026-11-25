@@ -539,10 +539,10 @@ async fn every_modeled_auth_flow_reaches_the_operation_unsigned() {
             expected: refused(400, "InvalidParameterException"),
         },
         Row {
-            case: "USER_SRP_AUTH, which needs the SRP protocol",
+            case: "USER_SRP_AUTH, whose own AuthParameters the password ones are not",
             auth_flow: "USER_SRP_AUTH",
             auth_parameters: &password_parameters,
-            expected: refused(501, "NotImplemented"),
+            expected: refused(400, "InvalidParameterException"),
         },
         Row {
             case: "CUSTOM_AUTH, which needs Lambda triggers",

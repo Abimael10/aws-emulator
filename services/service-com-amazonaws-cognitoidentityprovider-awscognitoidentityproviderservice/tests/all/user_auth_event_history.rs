@@ -1520,8 +1520,8 @@ async fn a_flow_this_emulator_does_not_serve_logs_no_event() {
         let mut body = json!({
             "ClientId": fixture.client_id,
             // A modelled `AuthFlowType` member this emulator has not implemented.
-            "AuthFlow": "USER_SRP_AUTH",
-            "AuthParameters": { "USERNAME": USERNAME, "SRP_A": "00" },
+            "AuthFlow": "CUSTOM_AUTH",
+            "AuthParameters": { "USERNAME": USERNAME },
         });
         if signed {
             body["UserPoolId"] = json!(fixture.user_pool_id);

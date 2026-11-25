@@ -1260,7 +1260,7 @@ async fn an_unmodelled_or_unimplemented_value_is_answered_by_its_own_refusal() {
 
     // A modelled auth flow this slice does not perform says so with a 501 rather
     // than answering a sign-in nothing performed.
-    for auth_flow in ["USER_SRP_AUTH", "USER_PASSWORD_AUTH", "CUSTOM_AUTH", "USER_AUTH"] {
+    for auth_flow in ["USER_PASSWORD_AUTH", "CUSTOM_AUTH", "USER_AUTH"] {
         let (status, payload) = call(
             &router,
             "AdminInitiateAuth",
@@ -1281,7 +1281,30 @@ async fn an_unmodelled_or_unimplemented_value_is_answered_by_its_own_refusal() {
 
     // The refresh-token flow IS performed, so a request for it that carries no
     // `REFRESH_TOKEN` is answered by that flow's own modelled refusal rather than by a
-    // 501: the alias the enum carries for it is the same flow.
+    // 501: the alias the enum carries for it is the same flow. The
+    // secure-remote-password flow IS performed too, and a request for it that carries
+    // no `SRP_A` is answered by its own refusal for the same reason.
+    let (status, payload) = call(
+        &router,
+        "AdminInitiateAuth",
+        &json!({
+            "UserPoolId": user_pool_id,
+            "ClientId": client_id,
+            "AuthFlow": "USER_SRP_AUTH",
+            "AuthParameters": { "USERNAME": "alice" },
+        }),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&payload), payload["message"].as_str()),
+        (
+            400,
+            "InvalidParameterException",
+            Some("Missing required parameter SRP_A")
+        ),
+        "case \"USER_SRP_AUTH\": a flow this emulator performs answers its own refusal, got \
+         {payload}"
+    );
     for auth_flow in ["REFRESH_TOKEN_AUTH", "REFRESH_TOKEN"] {
         let (status, payload) = call(
             &router,

@@ -6,25 +6,28 @@
 //! `.AdminRespondToAuthChallenge` / `.VerifySoftwareToken`).
 //!
 //! The rule under test: **a one-time password of a user's software token is
-//! spent by the call that accepts it, so presenting a code from a time step this
-//! user's authenticator has already had accepted — by the registration that
-//! proved it holds the key, or by a challenge response that signed the user in —
-//! is refused `ExpiredCodeException` with the fixed sentence that code carries,
-//! and the refusal does NOT spend the challenge session: the same session
-//! completes as soon as an unspent code is presented.** `ExpiredCodeException`
+//! spent by the SIGN-IN it completes, so presenting a code from a time step a
+//! challenge response has already signed this user in with is refused
+//! `ExpiredCodeException` with the fixed sentence that code carries, and the
+//! refusal does NOT spend the challenge session: the same session completes as
+//! soon as an unspent code is presented. Registering the authenticator spends
+//! no code: `VerifySoftwareToken` proves the authenticator holds the key rather
+//! than authenticating a sign-in, so the code that registered it still
+//! completes a sign-in.** `ExpiredCodeException`
 //! "is thrown if a code has expired" and is declared by both challenge-response
 //! operations
-//! (`smithy_query(query="operation",operation="AdminRespondToAuthChallenge")`),
-//! and a step's password authenticating once is RFC 6238 §5.2's rule for a TOTP
+//! (`smithy_query(query="operation",operation="AdminRespondToAuthChallenge")`)
+//! and by neither `VerifySoftwareToken`
+//! (`smithy_query(query="operation",operation="VerifySoftwareToken")`), and a
+//! step's password authenticating once is RFC 6238 §5.2's rule for a TOTP
 //! verifier ("the verifier MUST NOT accept the second attempt of the OTP
 //! generated for the same time step"), the same rule the ±1-step
 //! resynchronisation window comes from.
 //!
-//! The rows differ along WHICH call spent the code (the enrolment's
-//! `VerifySoftwareToken` or an earlier completed sign-in), along which pair of
-//! operations presents the replay (the client-side pair and the administrative
-//! pair) and along the time step the presented code belongs to (the spent step,
-//! a step older than it, and the step after it, which is unspent).
+//! The rows differ along which pair of operations presents the replay (the
+//! client-side pair and the administrative pair) and along the time step the
+//! presented code belongs to (the step a sign-in spent, a step older than it,
+//! and the step after it, which is unspent).
 //!
 //! The one-time passwords are computed here from the key the association
 //! answered with — the arithmetic an authenticator app does — so nothing but the
@@ -74,7 +77,8 @@ struct Enrolled {
     client_id: String,
     /// The key the association answered with, which the codes are computed from.
     secret_code: String,
-    /// The time step the enrolment's own code belongs to, which that call spent.
+    /// The time step the enrolment's own code belongs to, which that call leaves
+    /// unspent.
     enrolment_step: u64,
 }
 
@@ -151,8 +155,8 @@ impl Driver {
 }
 
 /// Build [`Enrolled`] in a pool named `name`: the user enrols a software token
-/// with the code of the time step the enrolment runs in, which that call spends,
-/// and makes the factor its preferred one.
+/// with the code of the time step the enrolment runs in — which that call does
+/// NOT spend — and makes the factor its preferred one.
 async fn enrolled(emulator: &Emulator, name: &str) -> Enrolled {
     let user_pool_id = pool(emulator, name, json!({})).await;
     ok(
@@ -282,57 +286,23 @@ async fn respond(
     .await
 }
 
-/// What spent the code a row then replays.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SpentBy {
-    /// The enrolment's own `VerifySoftwareToken`, which consumed the code that
-    /// proved the authenticator holds the key.
-    Registration,
-    /// A completed sign-in: the challenge response that presented the code and
-    /// got tokens back.
-    SignIn,
-}
-
-/// One row of the replay table: which call spent the code and which pair of
-/// operations replays it.
+/// One row of the replay table: which pair of operations drives the sign-in that
+/// spends a code and the replay of that code.
 struct ReplayRow {
     case: &'static str,
-    spent_by: SpentBy,
     driver: Driver,
-    /// Whether this row goes on to prove the refused session is STILL live,
-    /// which needs an unspent code inside the ±1-step resynchronisation window:
-    /// a row whose sign-in already spent the newest step of that window has
-    /// none left, so the rows that spend the enrolment's own code are the ones
-    /// that assert it.
-    proves_the_session_stays_live: bool,
 }
 
-/// The rows differ along which call spent the code and along which pair of
-/// operations the replay is presented through.
+/// The rows differ along which pair of operations the sign-in that spends the
+/// code, and the replay of it, are presented through.
 const REPLAY_ROWS: &[ReplayRow] = &[
     ReplayRow {
-        case: "the enrolment's own code, replayed through the client-side pair",
-        spent_by: SpentBy::Registration,
-        driver: Driver::Client,
-        proves_the_session_stays_live: true,
-    },
-    ReplayRow {
-        case: "the enrolment's own code, replayed through the administrative pair",
-        spent_by: SpentBy::Registration,
-        driver: Driver::Admin,
-        proves_the_session_stays_live: true,
-    },
-    ReplayRow {
         case: "the code a completed sign-in spent, replayed through the client-side pair",
-        spent_by: SpentBy::SignIn,
         driver: Driver::Client,
-        proves_the_session_stays_live: false,
     },
     ReplayRow {
         case: "the code a completed sign-in spent, replayed through the administrative pair",
-        spent_by: SpentBy::SignIn,
         driver: Driver::Admin,
-        proves_the_session_stays_live: false,
     },
 ];
 
@@ -347,27 +317,26 @@ async fn a_spent_software_token_code_is_refused_and_leaves_the_session_live() {
         let case = row.case;
         let fixture = enrolled(&emulator, &format!("single-use-pool-{index}")).await;
 
-        // The step whose password is used up by the time the row replays it.
-        let spent_step = match row.spent_by {
-            SpentBy::Registration => fixture.enrolment_step,
-            SpentBy::SignIn => {
-                let session = challenge(&emulator, row.driver, &fixture, case).await;
-                let step = fixture.enrolment_step + 1;
-                let (status, payload) = respond(
-                    &emulator,
-                    row.driver,
-                    &fixture,
-                    &session,
-                    &one_time_password(&fixture.secret_code, step),
-                )
-                .await;
-                assert_eq!(
-                    status, 200,
-                    "case {case:?}: an unspent code must complete the sign-in, got {status} with \
-                     {payload}"
-                );
-                step
-            }
+        // The step whose password is used up by the time the row replays it: the
+        // one a completed sign-in presented, which is the enrolment's own step
+        // since the registration spent nothing.
+        let spent_step = {
+            let session = challenge(&emulator, row.driver, &fixture, case).await;
+            let step = fixture.enrolment_step;
+            let (status, payload) = respond(
+                &emulator,
+                row.driver,
+                &fixture,
+                &session,
+                &one_time_password(&fixture.secret_code, step),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: an unspent code must complete the sign-in, got {status} with \
+                 {payload}"
+            );
+            step
         };
 
         let session = challenge(&emulator, row.driver, &fixture, case).await;
@@ -391,9 +360,6 @@ async fn a_spent_software_token_code_is_refused_and_leaves_the_session_live() {
 
         // The refusal did not spend the session: the step after the spent one is
         // unspent, and presenting it completes THAT session.
-        if !row.proves_the_session_stays_live {
-            continue;
-        }
         let (status, completed) = respond(
             &emulator,
             row.driver,
@@ -465,6 +431,22 @@ async fn a_used_code_and_a_wrong_code_name_different_errors() {
     let case = "a used code beside a code no authenticator emitted";
     let fixture = enrolled(&emulator, "single-use-classes-pool").await;
 
+    // A completed sign-in is what spends a step's password, so one is completed
+    // first and the code it presented is the used-up one below.
+    let session = challenge(&emulator, Driver::Client, &fixture, case).await;
+    let (status, payload) = respond(
+        &emulator,
+        Driver::Client,
+        &fixture,
+        &session,
+        &one_time_password(&fixture.secret_code, fixture.enrolment_step),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: an unspent code must complete the sign-in, got {status} with {payload}"
+    );
+
     let session = challenge(&emulator, Driver::Client, &fixture, case).await;
     // Six digits of a code this key emits in no step of the window.
     let (status, payload) = respond(&emulator, Driver::Client, &fixture, &session, "000000").await;
@@ -486,8 +468,47 @@ async fn a_used_code_and_a_wrong_code_name_different_errors() {
     assert_eq!(
         (status, error_code(&payload), error_message(&payload)),
         (REFUSED, EXPIRED_CODE, CODE_ALREADY_USED_MESSAGE),
-        "case {case:?}: the code the enrolment spent is used up, got {status} with {payload}"
+        "case {case:?}: the code the earlier sign-in spent is used up, got {status} with {payload}"
     );
+}
+
+/// Registering the authenticator spends NO code: `VerifySoftwareToken` proves
+/// the authenticator holds the key rather than authenticating a sign-in, and it
+/// declares no expired-code error at all
+/// (`smithy_query(query="operation",operation="VerifySoftwareToken")`), so the
+/// very code the enrolment verified still completes the sign-in the setup was
+/// asked for — through either pair of operations.
+#[tokio::test]
+async fn the_code_a_registration_verified_still_signs_the_user_in() {
+    // The rows differ along which pair of operations presents the code.
+    for driver in [Driver::Client, Driver::Admin] {
+        let emulator = emulator();
+        let case = format!("the enrolment's own code presented to {}", driver.respond());
+        let fixture = enrolled(
+            &emulator,
+            &format!("registration-spends-nothing-{}", driver.respond()),
+        )
+        .await;
+
+        let session = challenge(&emulator, driver, &fixture, &case).await;
+        let (status, payload) = respond(
+            &emulator,
+            driver,
+            &fixture,
+            &session,
+            &one_time_password(&fixture.secret_code, fixture.enrolment_step),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the code the registration verified must still sign the user in, got \
+             {status} with {payload}"
+        );
+        assert!(
+            payload["AuthenticationResult"]["AccessToken"].is_string(),
+            "case {case:?}: the completed sign-in issues tokens, got {payload}"
+        );
+    }
 }
 
 /// The spend belongs to the KEY, not to the user: a fresh
