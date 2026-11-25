@@ -1252,6 +1252,138 @@ pub(crate) async fn in_service_instance_ids(
         .collect())
 }
 
+/// What the group `name` holds right now, as the BATCHED replacement of its instances reads it
+/// ([`crate::state::provisioning::rolling_update`]): the desired capacity and the maximum size
+/// that service reports for it, and every instance it reports, each with its own
+/// `Instance$LifecycleState`.
+///
+/// `None` is that service reporting no group of that name at all, which is not the same answer
+/// as a group holding no instance: nothing is replaced in a group that is not there.
+///
+/// One call for both halves, read as [`in_service_instance_ids`] reads the same answer: the
+/// group's scalar members carry its `DesiredCapacity` — "the desired size of the group" — and
+/// its `Instances` are one `<member>` per instance, each read on its own so no entry's id is
+/// paired with another entry's state.
+pub(crate) async fn group_instance_states(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+) -> Result<Option<(usize, usize, Vec<(String, String)>)>, Refusal> {
+    let parameters = vec![(
+        "AutoScalingGroupNames.member.1".to_string(),
+        name.to_string(),
+    )];
+    let answered = call_query(
+        ctx,
+        AUTOSCALING_SIGNING_NAME,
+        region,
+        AUTOSCALING_API_VERSION,
+        "DescribeAutoScalingGroups",
+        &parameters,
+    )
+    .await?;
+    let reported = xml_scalar_children(&answered, "member");
+    if reported.get("AutoScalingGroupName").and_then(Value::as_str) != Some(name) {
+        return Ok(None);
+    }
+    let size = |member: &str| {
+        reported
+            .get(member)
+            .and_then(|capacity| match capacity {
+                Value::Number(number) => number.as_u64(),
+                Value::String(text) => text.trim().parse().ok(),
+                _ => None,
+            })
+            .and_then(|capacity| usize::try_from(capacity).ok())
+            .unwrap_or_default()
+    };
+    let instances = xml_member_structures(&answered, "Instances")
+        .into_iter()
+        .filter_map(|instance| {
+            let instance_id = instance
+                .get("InstanceId")
+                .and_then(Value::as_str)
+                .filter(|instance_id| !instance_id.is_empty())?
+                .to_string();
+            let state = instance
+                .get("LifecycleState")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            Some((instance_id, state))
+        })
+        .collect();
+    Ok(Some((size("DesiredCapacity"), size("MaxSize"), instances)))
+}
+
+/// Take the instances `instance_ids` of the group `name` out of service so the group launches
+/// their REPLACEMENTS, which is the one call a batch of a rolling update makes.
+///
+/// `ShouldDecrementDesiredCapacity` is false because the group keeps its size: "if you do not
+/// specify the option to decrement the desired capacity, Amazon EC2 Auto Scaling launches
+/// instances to replace the ones that are terminated"
+/// (`TerminateInstanceInAutoScalingGroup`) — which is what replaces a batch's instances with
+/// ones launched from the configuration the update put in force.
+pub(crate) async fn terminate_group_instances(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+    instance_ids: &[String],
+) -> Result<(), Refusal> {
+    let mut parameters = vec![
+        ("AutoScalingGroupName".to_string(), name.to_string()),
+        (
+            "ShouldDecrementDesiredCapacity".to_string(),
+            "false".to_string(),
+        ),
+    ];
+    for (index, instance_id) in instance_ids.iter().enumerate() {
+        parameters.push((
+            format!("InstanceIds.member.{}", index + 1),
+            instance_id.clone(),
+        ));
+    }
+    call_query(
+        ctx,
+        AUTOSCALING_SIGNING_NAME,
+        region,
+        AUTOSCALING_API_VERSION,
+        "TerminateInstanceInAutoScalingGroup",
+        &parameters,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Ask the group `name` to hold `capacity` instances, which is what a batch that has to LAUNCH
+/// before it terminates needs — and what puts the declared capacity back once it is through.
+///
+/// `SetDesiredCapacity` "sets the size of the specified Auto Scaling group"; the group's own
+/// cooldown is not honoured, because this is not a scaling activity a policy asked for: it is
+/// the capacity CloudFormation needs the group to hold for the length of the replacement.
+pub(crate) async fn set_group_capacity(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+    capacity: usize,
+) -> Result<(), Refusal> {
+    let parameters = vec![
+        ("AutoScalingGroupName".to_string(), name.to_string()),
+        ("DesiredCapacity".to_string(), capacity.to_string()),
+        ("HonorCooldown".to_string(), "false".to_string()),
+    ];
+    call_query(
+        ctx,
+        AUTOSCALING_SIGNING_NAME,
+        region,
+        AUTOSCALING_API_VERSION,
+        "SetDesiredCapacity",
+        &parameters,
+    )
+    .await
+    .map(|_| ())
+}
+
 /// The Auto Scaling group as that service reports it NOW, or `None` where it reports no such
 /// group: the scalar members of the one entry `DescribeAutoScalingGroups` answers for the
 /// name, in the spellings this TYPE declares them in

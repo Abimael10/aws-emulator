@@ -261,6 +261,16 @@ pub struct StoredStack {
     /// a resource whose declaration waits on resource signals
     /// ([`template::waits_for_resource_signals`]) has an operation that acts on one.
     pub signals: ::std::collections::VecDeque<StoredResourceSignal>,
+    /// The BATCHED instance replacements the operation in flight is working through: one per
+    /// Auto Scaling group whose declaration asks for one and whose launch configuration this
+    /// update changes ([`rolling_update`]).
+    ///
+    /// Opened when the operation opens ([`Self::opening_rolling_updates`]) and carried out by
+    /// the pass that reaches the owning service
+    /// ([`provisioning::rolling_update::settle_rolling_updates`]); the operation's terminal
+    /// status is not owed while one is unfinished ([`Self::settle`]), exactly as it is not
+    /// while a resource-signal wait is unsatisfied. Empty for every other operation.
+    pub rolling_updates: Vec<rolling_update::RollingUpdate>,
     /// The exported output values this stack's deployed template IMPORTS, keyed by export
     /// name: "the value of an output exported by another stack", resolved once where the
     /// template was deployed. A stack that imports an export is what `ListImports` reports
@@ -379,6 +389,7 @@ impl StoredStack {
             cleanup_phase_reported_for: None,
             retained_event_properties_bytes: 0,
             signals: ::std::collections::VecDeque::new(),
+            rolling_updates: Vec::new(),
             imports: BTreeMap::new(),
             stack_outputs: super::stack_outputs::Values::new(),
             adopted: BTreeMap::new(),
@@ -698,6 +709,10 @@ impl StoredStack {
         // is not locked, and charged to the SAME budget as every other evaluation of this
         // deployment, so what one request can ask for stays bounded in total.
         let wait_conditions = wait_conditions::declared(&declared, &resources, &mut budget);
+        // ...and the Auto Scaling groups whose `UpdatePolicy` asks for their instances to be
+        // replaced a batch at a time, read from the same parsed template and for the same
+        // reason ([`rolling_update::declared`]).
+        let rolling_updates = rolling_update::declared(&declared);
         // Which exports this template really IMPORTS, resolved against the same scope its
         // resources and outputs were: only those names belong on the stack, and they are
         // what makes each exporting stack's export in use.
@@ -754,6 +769,7 @@ impl StoredStack {
             stack_outputs: read_stack_outputs,
             unresolved_stack_outputs,
             wait_conditions,
+            rolling_updates,
             // Nothing has been acted on yet: this deployment has not started.
             attempted: BTreeSet::new(),
             dependencies,
@@ -1924,6 +1940,14 @@ impl StoredStack {
             // The operation is still waiting for its signals: nothing is due.
             return;
         }
+        if self.rolling_update_in_flight() {
+            // The update is still replacing the instances of one of its Auto Scaling groups a
+            // batch at a time ([`rolling_update`]): the batch in flight has to come through
+            // before the next one starts, and the update is not complete while any of them is
+            // outstanding. What carries them out is the pass that reaches the owning service
+            // ([`provisioning::rolling_update`]), which a read of the store cannot do.
+            return;
+        }
         if self.waiting_for_stabilisation() {
             // A resource the operation created is not ready in the service that owns it
             // yet, or one it deleted is still held there, so the operation's completion is
@@ -1997,6 +2021,9 @@ impl StoredStack {
         // signal and the completion it makes due.
         self.wait_conditions.clear();
         self.stabilisations.clear();
+        // ...and so do the batched replacements it was working through: whatever is left of
+        // one belongs to an operation that is over ([`rolling_update`]).
+        self.rolling_updates.clear();
         // ...and so does the rollback the operation would have owed had it failed. A
         // rollback that is COMPLETING is one the owning services carried out, so nothing is
         // left unreverted either.
@@ -2344,6 +2371,9 @@ impl StoredStack {
             work_in_flight: false,
         });
         self.wait_conditions = self.opening_barriers(now, in_progress);
+        // ...and the batched instance replacements it has to work through
+        // ([`Self::opening_rolling_updates`]), which hold its completion the same way.
+        self.rolling_updates = self.opening_rolling_updates(now, in_progress);
         // The create-time waits an EARLIER operation opened belong to that operation: this
         // one has not created anything yet, and what it creates opens its own
         // ([`Self::record_stabilisations`]).
@@ -3032,6 +3062,9 @@ impl StoredStack {
     ) {
         self.wait_conditions.clear();
         self.stabilisations.clear();
+        // ...and so do the batched replacements it was working through: whatever is left of
+        // one belongs to an operation that is over ([`rolling_update`]).
+        self.rolling_updates.clear();
         self.held_failure = Some(HeldFailure {
             failed_status: failed_status.to_string(),
             reason,

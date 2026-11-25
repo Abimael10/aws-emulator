@@ -138,16 +138,7 @@ pub(super) fn rename_replacements(
     // The resources this deployment CHANGES, by logical id: a record whose evaluated
     // properties differ from the ones in force. Read once, because every group below is
     // judged against the same set.
-    let changed: Vec<&StoredResource> = resources
-        .iter()
-        .filter(|resource| {
-            in_force.iter().any(|existing| {
-                existing.logical_id == resource.logical_id
-                    && existing.resource_type == resource.resource_type
-                    && existing.properties != resource.properties
-            })
-        })
-        .collect();
+    let changed: Vec<&StoredResource> = changed_records(resources, in_force);
     // Whether each resource is replaced is decided over the records as they stand, before any
     // of them is renamed, so one resource's new name cannot change another's answer.
     let renamed: Vec<(String, String)> = resources
@@ -237,6 +228,56 @@ pub(super) fn rename_replacements(
             }
         }
     }
+}
+
+/// The records of `resources` whose evaluated properties differ from the ones in force: the
+/// resources this deployment CHANGES.
+///
+/// One pass over the deployment's records, read once by each caller, because every group
+/// judged against it is judged against the same set.
+fn changed_records<'records>(
+    resources: &'records [StoredResource],
+    in_force: &[StoredResource],
+) -> Vec<&'records StoredResource> {
+    resources
+        .iter()
+        .filter(|resource| {
+            in_force.iter().any(|existing| {
+                existing.logical_id == resource.logical_id
+                    && existing.resource_type == resource.resource_type
+                    && existing.properties != resource.properties
+            })
+        })
+        .collect()
+}
+
+/// Whether this deployment changes the LAUNCH CONFIGURATION of the resource `logical_id` — the
+/// set of changes AWS documents the two Auto Scaling update policies as applying to.
+///
+/// The one place that question is answered, for both policies: the `AutoScalingReplacingUpdate`
+/// that replaces the GROUP ([`rename_replacements`]) and the `AutoScalingRollingUpdate` that
+/// replaces its INSTANCES ([`super::rolling_update`]) apply to the same changes, so neither can
+/// read them differently.
+///
+/// `resources` are the records this deployment computed and `in_force` the ones the stack has;
+/// a resource either set has no record for is one this deployment does not change in place.
+pub(super) fn changes_the_launch_configuration(
+    resources: &[StoredResource],
+    in_force: &[StoredResource],
+    logical_id: &str,
+) -> bool {
+    let Some(resource) = resources
+        .iter()
+        .find(|resource| resource.logical_id == logical_id)
+    else {
+        return false;
+    };
+    let Some(existing) = in_force.iter().find(|existing| {
+        existing.logical_id == logical_id && existing.resource_type == resource.resource_type
+    }) else {
+        return false;
+    };
+    launch_configuration_changed(resource, existing, &changed_records(resources, in_force))
 }
 
 /// Whether a resource of this type is created under a NAME at all: its type publishes a

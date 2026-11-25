@@ -456,6 +456,9 @@ mod model_validation;
 /// resource-signal wait of a resource whose signals come from the instances it consists of
 /// ([`instance_signals`]).
 mod instance_signals;
+/// Carrying out the BATCHED replacement of an Auto Scaling group's instances an
+/// `UpdatePolicy`'s `AutoScalingRollingUpdate` asks an update for ([`rolling_update`]).
+pub mod rolling_update;
 /// The DEPLOYMENT WALK's own helpers — what a create or an update reads about each
 /// declaration before it asks the service that owns it ([`deployment_walk`]). Their own file
 /// so this module stays inside the length the build holds every file to.
@@ -1675,6 +1678,11 @@ pub async fn advance_stabilisations_in(
     // the stack for it while the walks below run is the pass's own bookkeeping and not another
     // service's request chain.
     instance_signals::settle_instance_signals(ctx, state, region).await;
+    // ...and the BATCHED replacement of an Auto Scaling group's instances an `UpdatePolicy`
+    // asks an update for ([`rolling_update`]): read after the signals a batch waits for have
+    // been recorded, so a batch its replacements have signalled is through in this pass, and
+    // before the waits that have run out are failed.
+    rolling_update::settle_rolling_updates(ctx, state, region).await;
     settle_expired_waits(ctx, state, region).await;
     // ...and the rollback the stack's own ROLLBACK TRIGGERS force: an alarm a monitored
     // operation's configuration names, read in CloudWatch before this handler takes the lock,

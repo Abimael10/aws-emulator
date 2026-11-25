@@ -439,6 +439,10 @@ pub mod wait_conditions;
 /// than changed in place, and the name the replacement is created under.
 mod replacing_update;
 
+/// The `UpdatePolicy` that asks for an Auto Scaling group's INSTANCES to be replaced a BATCH
+/// at a time, and the state one such replacement is carried through in.
+pub mod rolling_update;
+
 /// The REPLACEMENT an update cannot carry out: one that targets a resource whose physical
 /// name the template states itself, which CloudFormation refuses rather than attempts.
 pub mod custom_named_replacement;
@@ -2114,6 +2118,13 @@ pub struct PendingDeployment {
     /// [`StoredStack::begin_transition`] is what opens a barrier for each one the
     /// operation has to wait at.
     pub wait_conditions: Vec<wait_conditions::DeclaredWaitCondition>,
+    /// The Auto Scaling groups of the template being deployed whose declaration asks for a
+    /// BATCHED replacement of their instances ([`rolling_update::declared`]), with what each
+    /// one's policy states. Computed where the template is READ, outside the store lock;
+    /// [`StoredStack::begin_transition`] is what opens the replacement each one the operation
+    /// really has to carry out ([`StoredStack::opening_rolling_updates`]).
+    pub rolling_updates: Vec<rolling_update::DeclaredRollingUpdate>,
+
     /// The logical ids this operation has ACTED ON: every resource it planned a transition
     /// for ([`StoredStack::schedule_resource_events`]).
     ///

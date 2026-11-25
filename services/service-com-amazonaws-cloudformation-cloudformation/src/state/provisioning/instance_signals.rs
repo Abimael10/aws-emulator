@@ -294,6 +294,10 @@ fn asks_for_failure_of(signalled: &[(String, &'static str)]) -> bool {
 /// the resource or REPLACES it, which is what opened the barrier
 /// ([`crate::state::StoredStack::opening_barriers`]). Every other wait — one whose signals a
 /// client sends — is left to that client's own `SignalResource` calls.
+///
+/// A BATCHED replacement whose policy asks the UPDATE to wait on signals is a gate of its own
+/// ([`rolling_update_gates`]): the instances that signal it are the replacements the batch in
+/// flight launched.
 fn open_instance_gates(stack: &crate::state::StoredStack) -> Vec<InstanceGate> {
     if stack.pending.is_none()
         || !matches!(
@@ -323,17 +327,58 @@ fn open_instance_gates(stack: &crate::state::StoredStack) -> Vec<InstanceGate> {
                 needed: barrier
                     .count()
                     .saturating_sub(stack.successful_signals(barrier.logical_id())),
-                signalled_already: stack
-                    .signals
-                    .iter()
-                    .filter(|signal| {
-                        signal.logical_resource_id == barrier.logical_id()
-                            && signal.status == crate::state::resource_signal_status::SUCCESS
-                    })
-                    .map(|signal| signal.unique_id.clone())
-                    .collect(),
+                signalled_already: signalled_already(stack, barrier.logical_id()),
             })
         })
+        .chain(rolling_update_gates(stack))
+        .collect()
+}
+
+/// The gates the BATCHED replacements of the operation in flight are waiting at: one per Auto
+/// Scaling group whose `AutoScalingRollingUpdate` asks the update to wait on signals
+/// (`WaitOnResourceSignals`: "specifies whether the Auto Scaling group waits on signals from
+/// new instances during an update") and whose batch in flight has instances to hear from.
+///
+/// The signals are the REPLACEMENTS' own, sent exactly as the signals of a group's create are
+/// — each instance naming its own id — so they are collected by this one pass and counted by
+/// the replacement itself ([`crate::state::rolling_update::RollingUpdate`]). The instances that
+/// have already signalled are left unread, which is what keeps the instances the update has not
+/// replaced yet — they signalled the operation that created them — from being read again.
+fn rolling_update_gates(stack: &crate::state::StoredStack) -> Vec<InstanceGate> {
+    stack
+        .open_rolling_updates()
+        .into_iter()
+        .filter(|plan| plan.policy.wait_on_resource_signals && !plan.batch.is_empty())
+        .filter_map(|plan| {
+            Some(InstanceGate {
+                signalling: Signalling::of(&plan.resource_type)?,
+                // At most one signal per instance of the batch is outstanding, which is what
+                // one pass of such a gate has to find.
+                needed: plan.batch.len(),
+                signalled_already: signalled_already(stack, &plan.logical_id),
+                logical_id: plan.logical_id,
+                resource_type: plan.resource_type,
+                physical_resource_id: plan.physical_resource_id,
+            })
+        })
+        .collect()
+}
+
+/// The unique ids the stack has already recorded a SUCCESS signal for the resource
+/// `logical_id` under — which, for the signals an instance sends, are those instances' own
+/// ids.
+fn signalled_already(
+    stack: &crate::state::StoredStack,
+    logical_id: &str,
+) -> BTreeSet<String> {
+    stack
+        .signals
+        .iter()
+        .filter(|signal| {
+            signal.logical_resource_id == logical_id
+                && signal.status == crate::state::resource_signal_status::SUCCESS
+        })
+        .map(|signal| signal.unique_id.clone())
         .collect()
 }
 
