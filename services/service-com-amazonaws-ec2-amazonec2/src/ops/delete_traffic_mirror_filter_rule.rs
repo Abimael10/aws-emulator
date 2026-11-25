@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTrafficMirrorFilterRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTrafficMirrorFilterRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTrafficMirrorFilterRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: takes the rule the request names OUT of the filter it lives on through
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::remove_traffic_mirror_filter_rule`], so the
+//! id stops resolving and the filter no longer reports the rule in its direction's set, and
+//! answers the id the store held. A rule id this account holds no rule for is refused
+//! `InvalidTrafficMirrorFilterRuleId.NotFound`, and a `DryRun` probe answers what the real
+//! call would have without writing anything. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -134,18 +132,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTrafficMirrorFilterRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTrafficMirrorFilterRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTrafficMirrorFilterRule"))
+        use crate::state;
+
+        // `ctx` carries request metadata only; this operation reads none of it — a Traffic
+        // Mirror filter rule is named by an id that is unique across this store, and the
+        // modelled shape names neither a Region nor an ARN. The store is reached through the
+        // engine held on `self`.
+        let _ = ctx;
+
+        // "The ID of the Traffic Mirror rule" (`$TrafficMirrorFilterRuleId`) is `@required` but
+        // modelled `clientOptional`, so a request that left it out reaches this handler as an
+        // empty string rather than being refused at the boundary. The sentence is the one this
+        // surface words that refusal with, through the single definition of it.
+        let traffic_mirror_filter_rule_id = input.traffic_mirror_filter_rule_id.as_str();
+        if traffic_mirror_filter_rule_id.is_empty() {
+            return Err(state::missing_parameter(
+                state::missing_required_parameter_message("TrafficMirrorFilterRuleId"),
+            ));
+        }
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+
+        // The id is resolved BEFORE anything else: a delete that named a rule the account does
+        // not hold is not a no-op, because a caller has to be able to tell the deletion it
+        // performed from one it did not — and a repeat of a delete that succeeded is exactly
+        // that case. The refusal is this resource's own `NotFound`.
+        if store
+            .traffic_mirror_filter_rule(traffic_mirror_filter_rule_id)
+            .is_none()
+        {
+            return Err(state::invalid_traffic_mirror_filter_rule_id_not_found(
+                traffic_mirror_filter_rule_id,
+            ));
+        }
+
+        // DryRun sits AFTER the named rule has been resolved and BEFORE the write: the flag
+        // asks whether the request WOULD have succeeded, so one that would have been refused is
+        // refused with that reason instead, and one that would have succeeded leaves the store
+        // untouched.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The record the removal took OUT of the store, so the id reported is the one the store
+        // held rather than the request's own string.
+        let Some(deleted) = store.remove_traffic_mirror_filter_rule(traffic_mirror_filter_rule_id)
+        else {
+            return Err(state::internal_error(format!(
+                "the Traffic Mirror filter rule '{traffic_mirror_filter_rule_id}' resolved a \
+                 moment ago is not in the store any more"
+            )));
+        };
+
+        // "The ID of the deleted Traffic Mirror rule"
+        // (`DeleteTrafficMirrorFilterRuleResult$TrafficMirrorFilterRuleId`).
+        Ok(DeleteTrafficMirrorFilterRuleOutput {
+            traffic_mirror_filter_rule_id: deleted.traffic_mirror_filter_rule_id,
+        })
     }
 }

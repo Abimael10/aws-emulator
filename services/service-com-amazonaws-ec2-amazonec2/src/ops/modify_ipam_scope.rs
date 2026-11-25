@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyIpamScope
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyIpamScope`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyIpamScope::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: writes the members one request changes into the stored [`IpamScope`] record —
+//! its description and the external authority configuration it is linked by — through
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::modify_ipam_scope`], and answers the record
+//! the store then holds, so the next `DescribeIpamScopes` of the same scope reports exactly
+//! what this call answered. A scope id this account holds no scope for is refused
+//! `InvalidIpamScopeId.NotFound`, a scope whose deletion has been asked for is refused
+//! `IncorrectState`, and a request that both sets and removes the external authority link is
+//! refused `InvalidParameterCombination`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +143,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyIpamScope` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyIpamScopeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyIpamScope"))
+        use crate::state;
+
+        // `ctx` carries request metadata only; this operation reads none of it — "the Amazon
+        // Web Services Region of the IPAM scope" (`IpamScope$IpamRegion`) was settled by the
+        // IPAM the scope was created in, and a modification cannot move a scope to another
+        // Region or another IPAM. The store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // The request's own FORM first, before anything is resolved and before the DryRun arm
+        // below: "not an IPAM scope id at all" is a malformed request rather than a scope that
+        // does not exist, which is the order every resource of this crate asks the two
+        // questions in (`crate::state::require_well_formed_id`).
+        let scope_id = input.ipam_scope_id.as_str();
+        state::require_well_formed_id(
+            state::IPAM_SCOPE_ID_PREFIX,
+            scope_id,
+            state::INVALID_IPAM_SCOPE_ID_MALFORMED,
+        )?;
+
+        // "Remove the external authority configuration. true to remove"
+        // (`$RemoveExternalAuthorityConfiguration`) and the configuration itself
+        // (`$ExternalAuthorityConfiguration`) ask two incompatible things of ONE link, so a
+        // request carrying both is refused rather than one of the two silently winning — the
+        // reading `crate::ops::modify_ipam_pool` has of a rule a request both sets and clears.
+        let remove_external_authority = input
+            .remove_external_authority_configuration
+            .unwrap_or(false);
+        if remove_external_authority && input.external_authority_configuration.is_some() {
+            return Err(state::invalid_parameter_combination(
+                "ExternalAuthorityConfiguration cannot be specified together with \
+                 RemoveExternalAuthorityConfiguration",
+            ));
+        }
+
+        // The configuration a request names, read by the ONE reader of such a configuration in
+        // this crate — which `crate::ops::create_ipam_scope` reads the one it stores by — so
+        // the create and this modification cannot admit a different configuration.
+        let external_authority_configuration = state::requested_ipam_scope_external_authority(
+            input.external_authority_configuration.as_ref(),
+        )?;
+
+        let modification = state::IpamScopeModification {
+            ipam_scope_id: scope_id.to_string(),
+            description: input.description.clone(),
+            external_authority_configuration,
+            remove_external_authority_configuration: remove_external_authority,
+        };
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock first, the way every other state-touching handler in this crate starts:
+        // what this modification is applied to is the scope as it ACTUALLY stands rather than
+        // as the call before it left it, and a scope whose deletion has already settled is
+        // GONE. Those moves were owed at this instant whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // "The ID of the scope you want to modify" (`$IpamScopeId`): an id this account holds
+        // no scope for has nothing to modify, which is this resource's own `NotFound` refusal,
+        // worded by the one constructor every reader of an `IpamScopeId` in this crate answers
+        // through.
+        let current = store
+            .ipam_scopes
+            .get(scope_id)
+            .cloned()
+            .ok_or_else(|| state::invalid_ipam_scope_id_not_found(scope_id))?;
+
+        // A scope a delete has already been asked for has nothing left to configure, so a
+        // modification of it is refused rather than written — in EC2's own wording for a
+        // resource refused SOLELY for the state it is in, exactly as
+        // `crate::ops::modify_ipam_pool` refuses a pool a delete has acted on.
+        if state::ipam_scope_is_deleting(&current) {
+            return Err(state::incorrect_state_of(
+                "IPAM scope",
+                scope_id,
+                current.state.as_deref().unwrap_or_default(),
+            ));
+        }
+
+        // The caller-chosen bytes this modification would leave the store holding, by the ONE
+        // definition of that charge, so the figure checked here is exactly the one the write
+        // charges. The budget is asked about the NET change: this call stores no further scope,
+        // so the scope ceiling cannot bound it, while the description and the external resource
+        // identifier it sets are caller-chosen text.
+        let applied = modification.applied_to(&current);
+        let refund = state::ipam_scope_modifiable_bytes(&current);
+        let charge = state::ipam_scope_modifiable_bytes(&applied);
+        if store.would_exceed_stored_bytes_after_refund(charge, refund) {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store this modification's {charge} bytes",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // Every parameter has been read and the scope resolved, and nothing has been written
+        // yet: "A check for whether you have the required permissions for the action without
+        // actually making the request" (`$DryRun`), so a request that WOULD have worked stops
+        // here and one that would have been refused was refused above with its own reason —
+        // the place `crate::ops::modify_ipam_pool` answers the same question in. Every caller
+        // of this emulator is permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // Written through the store's ONE writer of a modified scope, and answered as the
+        // store now holds it, so "the results of the modification" (`$IpamScope`) are what a
+        // later `DescribeIpamScopes` of this scope reports.
+        let Some(ipam_scope) = store.modify_ipam_scope(&modification) else {
+            // Unreachable: the scope was resolved above and the store is locked throughout.
+            return Err(state::internal_error(format!(
+                "the IPAM scope '{scope_id}' could not be read back after its modification"
+            )));
+        };
+        Ok(ModifyIpamScopeOutput {
+            ipam_scope: Some(ipam_scope),
+        })
     }
 }

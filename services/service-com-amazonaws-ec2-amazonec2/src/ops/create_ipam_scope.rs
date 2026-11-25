@@ -193,48 +193,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The configuration that links an Amazon VPC IPAM scope to an external authority
         // system. It specifies the type of external system AND the external resource
         // identifier that identifies your account or instance in that system"
-        // (`ExternalAuthorityConfiguration`): a configuration naming only one of the two
-        // links the scope to nothing, so it is refused rather than stored half-written. The
-        // type itself is the modelled `IpamScopeExternalAuthorityType` enum, so a spelling
-        // outside it was already refused before this handler ran.
-        let external_authority_configuration = match input.external_authority_configuration.as_ref()
-        {
-            None => None,
-            Some(requested) => {
-                let authority_type = requested
-                    .r#type
-                    .as_deref()
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| {
-                        state::missing_parameter(
-                            "An external authority configuration must have a type",
-                        )
-                    })?;
-                let identifier = requested
-                    .external_resource_identifier
-                    .as_deref()
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| {
-                        state::missing_parameter(
-                            "An external authority configuration must have an external \
-                             resource identifier",
-                        )
-                    })?;
-                // The identifier is caller-chosen text the scope keeps for the process's
-                // lifetime and the model publishes no `@length` for it, so it is held to the
-                // bound this crate gives a caller-chosen text member of that kind.
-                if identifier.chars().count() > state::MAX_TAG_VALUE_CHARS {
-                    return Err(state::invalid_parameter_value(format!(
-                        "externalResourceIdentifier accepts at most {max} characters",
-                        max = state::MAX_TAG_VALUE_CHARS,
-                    )));
-                }
-                Some(IpamScopeExternalAuthorityConfiguration {
-                    r#type: Some(authority_type.to_string()),
-                    external_resource_identifier: Some(identifier.to_string()),
-                })
-            }
-        };
+        // (`ExternalAuthorityConfiguration`): read by the ONE reader of such a configuration
+        // in this crate, which `crate::ops::modify_ipam_scope` reads the one it writes by, so
+        // a create and a modification cannot admit a different configuration or word the same
+        // refusal differently.
+        let external_authority_configuration = state::requested_ipam_scope_external_authority(
+            input.external_authority_configuration.as_ref(),
+        )?;
 
         // "The key/value combination of a tag assigned to the resource"
         // (`CreateIpamScopeRequest$TagSpecifications`): the scope is the only resource this

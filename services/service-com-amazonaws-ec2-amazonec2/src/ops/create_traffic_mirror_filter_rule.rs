@@ -83,15 +83,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The lowest `RuleNumber` a Traffic Mirror filter rule may carry.
-///
-/// "The number of the Traffic Mirror rule… The rules are processed in ascending order by rule
-/// number" (`CreateTrafficMirrorFilterRuleRequest$RuleNumber`): the rules of a filter are
-/// NUMBERED, and a numbered rule set starts at one, so nothing below it names a rule. The
-/// model puts no `@range` on the member, so this is the only place that floor can be
-/// enforced. Zero is read as the `@required` member being absent instead — a `clientOptional`
-/// integer the request left out reaches a handler as zero.
-const MIN_RULE_NUMBER: i32 = 1;
+/// The lowest `RuleNumber` a Traffic Mirror filter rule may carry, as the one place this
+/// crate declares that floor ([`crate::state::MIN_TRAFFIC_MIRROR_FILTER_RULE_NUMBER`]) — the
+/// same floor whichever call writes the number. Zero is read as the `@required` member being
+/// absent instead: a `clientOptional` integer the request left out reaches a handler as zero.
+const MIN_RULE_NUMBER: i32 = crate::state::MIN_TRAFFIC_MIRROR_FILTER_RULE_NUMBER;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -446,59 +442,24 @@ fn requested_cidr_block<'a>(
             "The request must contain the parameter {parameter}"
         )));
     }
-    if !crate::state::cidr_block_is_well_formed(requested) {
-        return Err(crate::state::invalid_parameter_value(format!(
-            "Value ({requested}) for parameter {parameter} is invalid. This is not a valid \
-             CIDR block."
-        )));
-    }
+    // The FORM of a block is read by the one reader of it in this crate, which
+    // `crate::ops::modify_traffic_mirror_filter_rule` reads the blocks it writes by, so the
+    // two cannot admit a different value or word the same refusal differently.
+    crate::state::require_traffic_mirror_cidr_block(requested, parameter)?;
     Ok(requested)
 }
 
-/// `requested` as the port range a rule stores, or the refusal the request earns: `None` when
-/// the request named no range at all, which is a rule over every port.
+/// `requested` as the port range a rule stores, or the refusal the request earns, through the
+/// ONE reader of such a range in this crate
+/// ([`crate::state::requested_traffic_mirror_port_range`]) — which
+/// `crate::ops::modify_traffic_mirror_filter_rule` reads the ranges it writes by, so the two
+/// cannot admit a different range or word the same refusal differently.
 ///
-/// A range is BOTH of its ports, so a request that named only one of them has not named a
-/// range: what is missing from such a request is a LEAF of the member, and that leaf is what
-/// the refusal names. A range that is given has to be a range of ports — each within the port
-/// space, the first not above the last. Both of this operation's ranges are read through it,
-/// so neither can be refused for a different fault than the other; `parameter` is the member
-/// as EC2 names it in a message.
+/// Both of this operation's ranges are read through it, so neither can be refused for a
+/// different fault than the other; `parameter` is the member as EC2 names it in a message.
 fn requested_port_range(
     requested: Option<&TrafficMirrorPortRangeRequest>,
     parameter: &str,
 ) -> Result<Option<TrafficMirrorPortRange>, CreateTrafficMirrorFilterRuleError> {
-    let Some(range) = requested.filter(|range| range.from_port.is_some() || range.to_port.is_some())
-    else {
-        return Ok(None);
-    };
-    let (Some(from_port), Some(to_port)) = (range.from_port, range.to_port) else {
-        return Err(crate::state::missing_parameter(format!(
-            "The request must contain the parameter {parameter}.{half}",
-            half = if range.from_port.is_none() {
-                "fromPort"
-            } else {
-                "toPort"
-            },
-        )));
-    };
-    for (member, port) in [("fromPort", from_port), ("toPort", to_port)] {
-        if !(0..=crate::state::MAX_PORT).contains(&port) {
-            return Err(crate::state::invalid_parameter_value(format!(
-                "Value ({port}) for parameter {parameter}.{member} is invalid. A port is \
-                 between 0 and {max}",
-                max = crate::state::MAX_PORT,
-            )));
-        }
-    }
-    if from_port > to_port {
-        return Err(crate::state::invalid_parameter_value(format!(
-            "Value ({from_port}, {to_port}) for parameter {parameter} is invalid. The first \
-             port of the range must not be above the last"
-        )));
-    }
-    Ok(Some(TrafficMirrorPortRange {
-        from_port: Some(from_port),
-        to_port: Some(to_port),
-    }))
+    crate::state::requested_traffic_mirror_port_range(requested, parameter)
 }

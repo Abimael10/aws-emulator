@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyTrafficMirrorFilterRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyTrafficMirrorFilterRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyTrafficMirrorFilterRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: writes the members one request changes into the stored
+//! [`TrafficMirrorFilterRule`] record through
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::modify_traffic_mirror_filter_rule`], takes
+//! each property named in `RemoveFields` back to its default, moves a rule whose direction or
+//! number changed to where that direction and number put it, and answers the rule the store
+//! then holds — so the next read of the filter reports exactly what this call answered. A rule
+//! id this account holds no rule for is refused `InvalidTrafficMirrorFilterRuleId.NotFound`, a
+//! number already taken in the direction the rule would sit in is refused
+//! `TrafficMirrorFilterRuleAlreadyExists`, and a property the request both sets and removes is
+//! refused `InvalidParameterCombination`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +157,308 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyTrafficMirrorFilterRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyTrafficMirrorFilterRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state;
+
+        // `ctx` carries request metadata only; this operation reads none of it — the modelled
+        // `TrafficMirrorFilterRule` names neither a Region nor an ARN, and a rule is named by
+        // an id that is unique across this store. The store is reached through the engine held
+        // on `self`.
+        let _ = ctx;
+
+        // Every member of the REQUEST is read first, in a fixed order, before the store is
+        // asked anything: a request with two faults is refused for the first of them whatever
+        // the store happens to hold.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyTrafficMirrorFilterRule"))
+        // "The ID of the Traffic Mirror rule" (`$TrafficMirrorFilterRuleId`) is `@required` but
+        // modelled `clientOptional`, so a request that left it out reaches this handler as an
+        // empty string rather than being refused at the boundary. The sentence is the one the
+        // Traffic Mirror surface words that refusal with, through the single definition of it,
+        // so the two sides of dispatch cannot disagree.
+        let traffic_mirror_filter_rule_id = input.traffic_mirror_filter_rule_id.as_str();
+        if traffic_mirror_filter_rule_id.is_empty() {
+            return Err(state::missing_parameter(
+                state::missing_required_parameter_message("TrafficMirrorFilterRuleId"),
+            ));
+        }
+
+        // "The properties that you want to remove from the Traffic Mirror filter rule. When you
+        // remove a property from a Traffic Mirror filter rule, the property is set to the
+        // default" (`$RemoveFields`): the list's member targets the modelled
+        // `TrafficMirrorFilterRuleField` enum, so the boundary refuses a spelling outside it;
+        // this is the backstop that keeps a word the store would then act on out of the
+        // removal set, whatever reaches the handler.
+        let removed_fields = input.remove_fields.clone().unwrap_or_default();
+        for field in &removed_fields {
+            if !TRAFFIC_MIRROR_FILTER_RULE_FIELD_VALUES.contains(&field.as_str()) {
+                return Err(state::invalid_parameter_value(format!(
+                    "Invalid value '{field}' for parameter removeFields"
+                )));
+            }
+        }
+
+        // "The type of traffic to assign to the rule" (`$TrafficDirection`) and "the action to
+        // assign to the rule" (`$RuleAction`): both target a modelled enum, so the boundary
+        // refuses a spelling outside it and this reads what reaches the handler — a member the
+        // request did not carry, or carried empty, assigns nothing and leaves the rule as it
+        // stands, while a word the enum does not carry is refused rather than stored.
+        let traffic_direction = requested_enum(
+            input.traffic_direction.as_deref(),
+            "trafficDirection",
+            TRAFFIC_DIRECTION_VALUES,
+        )?;
+        let rule_action = requested_enum(
+            input.rule_action.as_deref(),
+            "ruleAction",
+            TRAFFIC_MIRROR_RULE_ACTION_VALUES,
+        )?;
+
+        // "The number of the Traffic Mirror rule. This number must be unique for each Traffic
+        // Mirror rule in a given direction. The rules are processed in ascending order by rule
+        // number" (`$RuleNumber`): a numbered rule set starts at the floor this crate declares
+        // for it, so a number below that names no rule of the filter and is a value the
+        // parameter cannot take.
+        if let Some(rule_number) = input.rule_number {
+            if rule_number < state::MIN_TRAFFIC_MIRROR_FILTER_RULE_NUMBER {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({rule_number}) for parameter ruleNumber is invalid. A rule number \
+                     must be at least {min}",
+                    min = state::MIN_TRAFFIC_MIRROR_FILTER_RULE_NUMBER,
+                )));
+            }
+        }
+
+        // "The destination CIDR block to assign to the Traffic Mirror rule"
+        // (`$DestinationCidrBlock`) and "the source CIDR block" (`$SourceCidrBlock`): a block
+        // that IS assigned has to be an address prefix, read for its FORM only by the one
+        // reader of a Traffic Mirror rule's blocks — the blocks are stored as the request
+        // spelled them. A member the request did not carry, or carried empty, assigns no block.
+        let destination_cidr_block = assigned_text(input.destination_cidr_block.as_deref());
+        let source_cidr_block = assigned_text(input.source_cidr_block.as_deref());
+        for (parameter, block) in [
+            ("destinationCidrBlock", destination_cidr_block.as_deref()),
+            ("sourceCidrBlock", source_cidr_block.as_deref()),
+        ] {
+            if let Some(block) = block {
+                state::require_traffic_mirror_cidr_block(block, parameter)?;
+            }
+        }
+
+        // "The protocol, for example TCP, to assign to the Traffic Mirror rule" (`$Protocol`) —
+        // a NUMBER, so a value outside the single byte a protocol number occupies is no
+        // protocol at all, and is refused with the sentence EC2 words every unknown IP protocol
+        // with. The same bound the create holds a new rule's protocol to.
+        if let Some(protocol) = input.protocol {
+            if !(0..=state::MAX_PROTOCOL_NUMBER).contains(&protocol) {
+                return Err(state::invalid_parameter_value(format!(
+                    "Invalid value '{protocol}' for IP protocol. Unknown protocol."
+                )));
+            }
+        }
+
+        // "The destination ports that are associated with the Traffic Mirror rule"
+        // (`$DestinationPortRange`) and "the port range to assign to the Traffic Mirror rule"
+        // (`$SourcePortRange`): a range that IS assigned has to be a range of ports, read by
+        // the one reader of such a range — the one the create reads a new rule's ranges by.
+        let destination_port_range = state::requested_traffic_mirror_port_range(
+            input.destination_port_range.as_ref(),
+            "destinationPortRange",
+        )?;
+        let source_port_range = state::requested_traffic_mirror_port_range(
+            input.source_port_range.as_ref(),
+            "sourcePortRange",
+        )?;
+
+        let modification = state::TrafficMirrorFilterRuleModification {
+            traffic_mirror_filter_rule_id: traffic_mirror_filter_rule_id.to_string(),
+            traffic_direction: traffic_direction.map(str::to_string),
+            rule_number: input.rule_number,
+            rule_action: rule_action.map(str::to_string),
+            destination_port_range,
+            source_port_range,
+            protocol: input.protocol,
+            destination_cidr_block,
+            source_cidr_block,
+            description: input.description.clone(),
+            removed_fields,
+        };
+
+        // A property this request both ASSIGNS and REMOVES asks for two incompatible things of
+        // one field — "when you remove a property… the property is set to the default"
+        // (`$RemoveFields`) — so the request is refused rather than one of the two silently
+        // winning, the reading `crate::ops::modify_ipam_pool` has of a rule a request both sets
+        // and clears. Each field is asked about through the one reading of the removal set.
+        for (field, assigned) in [
+            (
+                state::TRAFFIC_MIRROR_FILTER_RULE_FIELD_DESCRIPTION,
+                input.description.is_some(),
+            ),
+            (
+                state::TRAFFIC_MIRROR_FILTER_RULE_FIELD_PROTOCOL,
+                input.protocol.is_some(),
+            ),
+            (
+                state::TRAFFIC_MIRROR_FILTER_RULE_FIELD_DESTINATION_PORT_RANGE,
+                modification.destination_port_range.is_some(),
+            ),
+            (
+                state::TRAFFIC_MIRROR_FILTER_RULE_FIELD_SOURCE_PORT_RANGE,
+                modification.source_port_range.is_some(),
+            ),
+        ] {
+            if assigned && modification.removes(field) {
+                return Err(state::invalid_parameter_combination(format!(
+                    "The field '{field}' cannot be assigned and removed by the same request"
+                )));
+            }
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // "The ID of the Traffic Mirror rule" (`$TrafficMirrorFilterRuleId`): an id this
+        // account holds no rule for has nothing to modify, which is this resource's own
+        // `NotFound` refusal, worded through the one constructor of it.
+        let current = store
+            .traffic_mirror_filter_rule(traffic_mirror_filter_rule_id)
+            .cloned()
+            .ok_or_else(|| {
+                state::invalid_traffic_mirror_filter_rule_id_not_found(
+                    traffic_mirror_filter_rule_id,
+                )
+            })?;
+        let traffic_mirror_filter_id = current
+            .traffic_mirror_filter_id
+            .clone()
+            .unwrap_or_default();
+
+        // What this modification would leave behind, computed by the ONE definition of what a
+        // modification does to a rule, so the rule the questions below are asked about is
+        // exactly the one the write stores.
+        let applied = modification.applied_to(&current);
+
+        // "DestinationCidrBlock and SourceCidrBlock must both be an IPv4 range or an IPv6
+        // range" (`ModifyTrafficMirrorFilterRule`): a rule matches traffic of ONE address
+        // family, so the pair is asked about the RESULT rather than about the request — a
+        // request that assigns one block is answered against the block the rule already holds.
+        // Which family a block belongs to is the one decision this crate makes about that
+        // (`crate::state::AddressFamily::of_cidr`).
+        let family = |block: Option<&str>| {
+            state::AddressFamily::of_cidr(block.unwrap_or_default()).wire_name()
+        };
+        if family(applied.destination_cidr_block.as_deref())
+            != family(applied.source_cidr_block.as_deref())
+        {
+            return Err(state::invalid_parameter_combination(
+                "DestinationCidrBlock and SourceCidrBlock must both be an IPv4 range or an \
+                 IPv6 range",
+            ));
+        }
+
+        // "This number must be unique for each Traffic Mirror rule in a given direction"
+        // (`$RuleNumber`): one number in one direction of one filter names one rule, so a
+        // modification that would take a number another rule of that direction already holds is
+        // refused rather than leaving two rules nothing could tell apart. A rule that keeps its
+        // own number in its own direction is not in its own way.
+        let takes = (
+            applied.traffic_direction.as_deref().unwrap_or_default(),
+            applied.rule_number.unwrap_or_default(),
+        );
+        let held = (
+            current.traffic_direction.as_deref().unwrap_or_default(),
+            current.rule_number.unwrap_or_default(),
+        );
+        if takes != held
+            && store
+                .traffic_mirror_filter_rule_at(&traffic_mirror_filter_id, takes.0, takes.1)
+                .is_some()
+        {
+            return Err(state::traffic_mirror_filter_rule_already_exists(takes.1));
+        }
+
+        // The caller-chosen bytes this modification would leave the store holding, by the ONE
+        // definition of that charge, so the figure checked here is exactly the one the write
+        // charges. The budget is asked about the NET change: this call stores no further rule,
+        // so the rule ceiling cannot bound it, while the description and the two address ranges
+        // it assigns are caller-chosen text.
+        let refund = state::traffic_mirror_filter_rule_payload_bytes(&current, None);
+        let charge = state::traffic_mirror_filter_rule_payload_bytes(&applied, None);
+        if store.would_exceed_stored_bytes_after_refund(charge, refund) {
+            return Err(state::traffic_mirror_filter_rule_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store this modification's {charge} bytes",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every refusal asked, and
+        // BEFORE the first write: the flag asks whether the request WOULD have worked, so one
+        // that would have been refused is refused with that reason instead, and one that would
+        // have succeeded leaves the store untouched.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        // Written through the store's ONE writer of a modified rule, so what this answers is
+        // the record a later read of the filter reports.
+        let Some(stored) = store.modify_traffic_mirror_filter_rule(&modification) else {
+            // Unreachable: the rule was resolved above, its direction was read off the modelled
+            // enum, and the store is locked throughout.
+            return Err(state::internal_error(format!(
+                "the Traffic Mirror filter rule '{traffic_mirror_filter_rule_id}' could not be \
+                 read back after its modification"
+            )));
+        };
+
+        // "Tags are not returned for ModifyTrafficMirrorFilterRule"
+        // (`ModifyTrafficMirrorFilterRuleResult$TrafficMirrorFilterRule`): the rule KEEPS the
+        // tags it was created with — a later read of the filter still reports them — and this
+        // answer alone leaves them out.
+        Ok(ModifyTrafficMirrorFilterRuleOutput {
+            traffic_mirror_filter_rule: Some(TrafficMirrorFilterRule {
+                tags: None,
+                ..stored
+            }),
+        })
     }
+}
+
+/// `requested` as one of the `allowed` members of a modelled enum this request ASSIGNS, or the
+/// refusal it earns: EC2's `InvalidParameterValue` for a word the enum does not carry.
+///
+/// `None` — a member the request did not carry, or carried empty — assigns nothing, because
+/// every enum member of this request is optional: "the type of traffic to assign to the rule"
+/// and "the action to assign to the rule" are modifications, and a request naming neither
+/// leaves the rule filtering what it filtered. Both are read through this, so neither can be
+/// refused for a different fault than the other; `parameter` is the member as EC2 names it in a
+/// message.
+fn requested_enum<'a>(
+    requested: Option<&'a str>,
+    parameter: &str,
+    allowed: &[&str],
+) -> Result<Option<&'a str>, ModifyTrafficMirrorFilterRuleError> {
+    let Some(requested) = assigned(requested) else {
+        return Ok(None);
+    };
+    if !allowed.contains(&requested) {
+        return Err(crate::state::invalid_parameter_value(format!(
+            "Invalid value '{requested}' for parameter {parameter}"
+        )));
+    }
+    Ok(Some(requested))
+}
+
+/// `requested` as the value this request ASSIGNS, or `None` when it assigns none.
+///
+/// Every text member of this request is optional, and an ec2Query request that sent a member
+/// with no value at all reaches a handler as an empty string, which assigns nothing rather than
+/// assigning emptiness — the one reading of "the request did not carry this member" for the
+/// members read here.
+fn assigned(requested: Option<&str>) -> Option<&str> {
+    requested.filter(|value| !value.is_empty())
+}
+
+/// [`assigned`], owned: the same reading, for a member the modification holds as a `String`.
+fn assigned_text(requested: Option<&str>) -> Option<String> {
+    assigned(requested).map(str::to_string)
 }

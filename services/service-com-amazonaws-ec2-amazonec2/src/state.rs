@@ -3104,6 +3104,13 @@ mod ipam;
 mod regional_internet_registries;
 pub use regional_internet_registries::*;
 mod ipam_deletion;
+/// What a `ModifyIpamScope` does to a stored IPAM scope — the one reading of the external
+/// authority configuration a request names, what applying a modification leaves behind, and the
+/// one writer that applies it — in a file of its own rather than as more lines here. Everything
+/// it declares is re-exported below, so a handler reaches these as `crate::state::<item>` like
+/// any primitive of this module.
+mod ipam_scope_modifications;
+pub use ipam_scope_modifications::*;
 mod ipam_policy_enablement;
 mod ipam_prefix_list_resolver_deletion;
 /// The CIDR selection RULES of an IPAM prefix list resolver — the one reading of the rule set a
