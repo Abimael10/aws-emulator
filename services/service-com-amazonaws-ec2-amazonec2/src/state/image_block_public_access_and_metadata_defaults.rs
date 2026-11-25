@@ -240,11 +240,28 @@ pub struct AccountInstanceMetadataDefaults {
     pub http_tokens_enforced: Option<&'static str>,
 }
 
+/// `HttpTokensEnforcedState`'s `enabled`: the account requires IMDSv2 of every instance it
+/// launches — "specifies whether to enforce the requirement of IMDSv2 on an instance at the
+/// time of launch. When enforcement is enabled, the instance can't launch unless IMDSv2
+/// (`HttpTokens`) is set to `required`"
+/// (`ModifyInstanceMetadataDefaultsRequest$HttpTokensEnforced`).
+pub const HTTP_TOKENS_ENFORCED_ENABLED: &str = "enabled";
+
 impl AccountInstanceMetadataDefaults {
     /// Whether this account states no IMDS default at all — a fresh account, or one that
     /// has cleared every setting it had set with `no-preference`.
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// Whether this account enforces IMDSv2 at launch, so an instance may only be launched
+    /// with `HttpTokens` `required` ([`HTTP_TOKENS_ENFORCED_ENABLED`]).
+    ///
+    /// The setting's other states admit every launch: `disabled` enforces nothing, and an
+    /// account that has cleared the setting with `no-preference` holds no default for it at
+    /// all (see this type's own docs).
+    pub fn enforces_imdsv2_at_launch(&self) -> bool {
+        self.http_tokens_enforced == Some(HTTP_TOKENS_ENFORCED_ENABLED)
     }
 
     /// These defaults as the modelled `InstanceMetadataDefaultsResponse`
@@ -275,4 +292,32 @@ impl AccountInstanceMetadataDefaults {
             http_tokens_enforced: self.http_tokens_enforced.map(str::to_string),
         }
     }
+}
+
+/// The sentence EC2 refuses such a launch with: the account has disabled IMDSv1, so an
+/// instance that would still permit it cannot be launched.
+///
+/// The error class's own fact, stated from the account's setting: IMDSv1 is what `optional`
+/// leaves usable ("`optional` - IMDSv2 is optional, which means that you can use either IMDSv2
+/// or IMDSv1", `InstanceMetadataOptionsRequest$HttpTokens`) and what this account's enforcement
+/// has disabled ("`required` - IMDSv2 is required, which means that IMDSv1 is disabled",
+/// the same member).
+///
+/// FIXED text: it names nothing of the request — not the launch's own `HttpTokens`, not the
+/// image, not the instance type — so it is the whole message rather than one run's sample of a
+/// varying one.
+pub const IMDSV2_ENFORCED_LAUNCH_MESSAGE: &str = "IMDSv1 is disabled for this account.";
+
+/// Refuse a launch the account's IMDSv2 enforcement does not admit — one whose instance would
+/// still permit IMDSv1 — through this crate's one `UnsupportedOperation` refusal
+/// ([`unsupported_operation`]): HTTP 400.
+///
+/// "When enforcement is enabled, the instance can't launch unless IMDSv2 (`HttpTokens`) is set
+/// to `required`" (`ModifyInstanceMetadataDefaultsRequest$HttpTokensEnforced`), and what EC2
+/// answers is `UnsupportedOperation` — "the request asked for something this service does not
+/// support for the resource it named" ([`UNSUPPORTED_OPERATION`]) — rather than an
+/// authorization code: the caller's permissions are not in question, the metadata options the
+/// launch would run with are.
+pub fn imdsv2_enforced_launch_not_supported<E>() -> Scaffolded<E> {
+    unsupported_operation(IMDSV2_ENFORCED_LAUNCH_MESSAGE)
 }

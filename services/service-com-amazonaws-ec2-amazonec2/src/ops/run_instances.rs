@@ -1251,6 +1251,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not a burstable performance type.
         let cpu_credits = store.launched_cpu_credits(&region, &instance_type, requested_cpu_credits);
         let image_imds_support = store.image_imds_support(Some(&image_id));
+        // The account's own IMDS defaults, read ONCE: they stand in for what the request left
+        // out below, and the enforcement setting among them decides whether this launch may
+        // happen at all.
+        let account_metadata_defaults = store.instance_metadata_defaults();
         let detail: InstanceDetail = InstanceDetail::launched(InstanceDetailSpec {
             metadata_options: input.metadata_options.as_ref(),
             enclave_options: input.enclave_options.as_ref(),
@@ -1275,9 +1279,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             placement_group_name: placement_group_name.as_deref(),
             partition_number: placement_partition_number,
             host_id: placement_host_id.as_deref(),
-            account_metadata_defaults: store.instance_metadata_defaults(),
+            account_metadata_defaults: account_metadata_defaults.clone(),
             image_imds_support: image_imds_support.as_deref(),
         })?;
+        // "Specifies whether to enforce the requirement of IMDSv2 on an instance at the time
+        // of launch. When enforcement is enabled, the instance can't launch unless IMDSv2
+        // (`HttpTokens`) is set to `required`"
+        // (`ModifyInstanceMetadataDefaultsRequest$HttpTokensEnforced`): an account that
+        // enforces IMDSv2 launches no instance that would leave IMDSv1 usable, so the question
+        // is asked of the `HttpTokens` the instance would REALLY run with — resolved just
+        // above out of the request's own metadata options, the account's defaults and the
+        // AMI's `ImdsSupport` — rather than of the member the request spelled: a launch that
+        // asks for `optional` and one that inherits it are the same launch to this setting,
+        // and one that inherits `required` is admitted. Refused here, before the first write
+        // and before the `DryRun` arm below, because the launch is one this service will not
+        // perform at all.
+        if account_metadata_defaults.enforces_imdsv2_at_launch()
+            && detail.http_tokens != crate::state::HTTP_TOKENS_REQUIRED
+        {
+            return Err(crate::state::imdsv2_enforced_launch_not_supported());
+        }
         // "The IDs of the security groups. You can create a security group using
         // CreateSecurityGroup" (`RunInstancesRequest$SecurityGroupIds`) and "[Default VPC] The
         // names of the security groups" (`$SecurityGroups`): which groups this launch applies

@@ -53,6 +53,27 @@ pub const CONDITION_KEY_BY_PARAMETER: &[(&str, &str)] = &[
     ("Placement.AvailabilityZone", "ec2:AvailabilityZone"),
     // `ec2:Tenancy` — "the tenancy of the VPC or instance" that placement asks for.
     ("Placement.Tenancy", "ec2:Tenancy"),
+    // The metadata-option keys a launch's `MetadataOptions` answers, each named beside the
+    // member of `InstanceMetadataOptionsRequest` that carries its value
+    // (`smithy_query(query="shape",shape="InstanceMetadataOptionsRequest")`):
+    //
+    // `ec2:MetadataHttpTokens` — whether IMDSv2 is required of the instance: "`required` -
+    // IMDSv2 is required, which means that IMDSv1 is disabled" versus "`optional` - IMDSv2 is
+    // optional, which means that you can use either IMDSv2 or IMDSv1"
+    // (`InstanceMetadataOptionsRequest$HttpTokens`) — the key a policy that admits only
+    // IMDSv2-enforced launches is written over.
+    ("MetadataOptions.HttpTokens", "ec2:MetadataHttpTokens"),
+    // `ec2:MetadataHttpEndpoint` — whether the launch leaves the metadata endpoint reachable
+    // at all ("enables or disables the HTTP metadata endpoint on your instances",
+    // `InstanceMetadataOptionsRequest$HttpEndpoint`).
+    ("MetadataOptions.HttpEndpoint", "ec2:MetadataHttpEndpoint"),
+    // `ec2:MetadataHttpPutResponseHopLimit` — "the maximum number of hops that the metadata
+    // token can travel" (`InstanceMetadataOptionsRequest$HttpPutResponseHopLimit`), a key
+    // typed Numeric, which the value travels to the evaluator as the request spelled it for.
+    (
+        "MetadataOptions.HttpPutResponseHopLimit",
+        "ec2:MetadataHttpPutResponseHopLimit",
+    ),
 ];
 
 /// The EC2 condition key each resource a request NAMES BY ID answers with that resource's
@@ -164,10 +185,11 @@ mod tests {
     /// carries.
     ///
     /// The rows span what the rule generalises over: which key the request carries (an
-    /// instance type, a placement's Availability Zone, a placement's tenancy, the subnet a
-    /// launch names, the subnet one of its interfaces names, the VPC a create names, several
-    /// at once, none), the parameter's own casing, a parameter naming one key twice, the same
-    /// resource named twice, and an action that supports no resource-level permissions.
+    /// instance type, a placement's Availability Zone, a placement's tenancy, the metadata
+    /// options a launch asks for, the subnet a launch names, the subnet one of its interfaces
+    /// names, the VPC a create names, several at once, none), the parameter's own casing, a
+    /// parameter naming one key twice, the same resource named twice, and an action that
+    /// supports no resource-level permissions.
     #[test]
     fn a_request_answers_the_keys_its_own_parameters_carry() {
         let subnet = "subnet-0123456789abcdef0";
@@ -200,6 +222,25 @@ mod tests {
                 vec![
                     ("ec2:AvailabilityZone", "us-west-2b".to_string()),
                     ("ec2:Tenancy", "dedicated".to_string()),
+                ],
+            ),
+            (
+                // A launch's metadata options answer their own keys, whichever of them the
+                // request sets: the key a policy that admits only IMDSv2-enforced launches is
+                // written over, and the two beside it.
+                "a launch naming the metadata options it asks for",
+                "RunInstances",
+                &[
+                    ("Action", "RunInstances"),
+                    ("ImageId", "ami-0123456789abcdef0"),
+                    ("MetadataOptions.HttpTokens", "required"),
+                    ("MetadataOptions.HttpEndpoint", "enabled"),
+                    ("MetadataOptions.HttpPutResponseHopLimit", "2"),
+                ],
+                vec![
+                    ("ec2:MetadataHttpTokens", "required".to_string()),
+                    ("ec2:MetadataHttpEndpoint", "enabled".to_string()),
+                    ("ec2:MetadataHttpPutResponseHopLimit", "2".to_string()),
                 ],
             ),
             (
