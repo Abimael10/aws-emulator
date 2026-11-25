@@ -30,20 +30,24 @@
 //! The parts, each in a file of its own: this root carries the group's shapes and its
 //! discovery documents, [`request_attributes`] reads what one request addresses,
 //! [`stored_objects`] holds the objects a caller creates and walks the bindings over
-//! them, and [`published_roles`] carries the roles and access policies every cluster
-//! has without an object of its own.
+//! them, [`published_roles`] carries the roles and access policies every cluster
+//! has without an object of its own, and [`effective_rules`] collects the rules both
+//! sources put in force for one identity — which is what a client is answered when
+//! it asks what it may do rather than whether it may do one thing.
 
 use super::kubernetes_objects::{
     deleted_status_json, manifest_name, new_object_uid, rfc3339_seconds, ApiRefusal, ClusterObjects,
 };
 use ::std::collections::{BTreeMap, BTreeSet};
 use ::std::time::SystemTime;
+mod effective_rules;
 mod published_roles;
 mod request_attributes;
 // `stored_objects` adds methods to `ClusterObjects` and names nothing of its own that
 // another module reads, so it is a module without a re-export: the methods are the
 // type's wherever the type is in scope.
 mod stored_objects;
+pub use effective_rules::*;
 pub use published_roles::*;
 pub use request_attributes::*;
 

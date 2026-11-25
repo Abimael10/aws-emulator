@@ -37,10 +37,10 @@ use serde_json::json;
 use crate::certificate_authority::REGION;
 use crate::kubernetes_api::{dial, emulator_with_pod_identity, provisioned_cluster, PODS_AUDIENCE};
 
-/// The verbs each row of the catalog is probed on: the four the served resource
-/// list advertises across its rows (`create`, `get`, `list`, `update`) and
-/// `delete`, which no row of the core group advertises — so every row is probed
-/// both on verbs it advertises and on verbs it does not.
+/// The verbs each row of the catalog is probed on: the five the served resource
+/// list advertises between its rows (`create`, `get`, `list`, `update` and
+/// `delete`) — no row advertises all of them, so every row is probed both on verbs
+/// it advertises and on verbs it does not.
 const PROBED_VERBS: [&str; 5] = ["create", "get", "list", "update", "delete"];
 
 /// How ONE resource of the served catalog is addressed, verb by verb.
@@ -135,6 +135,19 @@ fn probes() -> Vec<ResourceProbe> {
             }),
             list_path: "/api/v1/namespaces/default/configmaps",
             object_path: "/api/v1/namespaces/default/configmaps/verb-probe-settings",
+        },
+        ResourceProbe {
+            resource: "services",
+            create_path: "/api/v1/namespaces/default/services",
+            manifest: json!({
+                "metadata": { "name": "verb-probe-service" },
+                "spec": {
+                    "selector": { "app": "verb-probe" },
+                    "ports": [{ "port": 80 }],
+                },
+            }),
+            list_path: "/api/v1/namespaces/default/services",
+            object_path: "/api/v1/namespaces/default/services/verb-probe-service",
         },
         ResourceProbe {
             resource: "events",

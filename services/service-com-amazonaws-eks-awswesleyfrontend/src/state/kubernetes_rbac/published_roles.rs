@@ -139,18 +139,27 @@ pub struct AccessPolicyGrant {
 }
 
 impl AccessPolicyGrant {
+    /// Whether this grant reaches `namespace`.
+    ///
+    /// "namespace: the access policy's permissions apply to the namespaces you
+    /// specify" — a namespace-scoped association therefore reaches nothing outside
+    /// them, and nothing that addresses no namespace at all; one scoped to the
+    /// cluster reaches every namespace and the cluster scope alike.
+    #[must_use]
+    pub(super) fn applies_in(&self, namespace: &str) -> bool {
+        match &self.namespaces {
+            Some(namespaces) => {
+                !namespace.is_empty() && namespaces.iter().any(|named| named == namespace)
+            }
+            None => true,
+        }
+    }
+
     /// Whether this grant admits `attributes`.
     #[must_use]
     pub(super) fn admits(&self, attributes: &RequestAttributes) -> bool {
-        // "namespace: the access policy's permissions apply to the namespaces you
-        // specify" — a namespace-scoped association therefore admits nothing outside
-        // them, and nothing that addresses no namespace at all.
-        if let Some(namespaces) = &self.namespaces {
-            if attributes.namespace.is_empty()
-                || !namespaces.contains(&attributes.namespace)
-            {
-                return false;
-            }
+        if !self.applies_in(&attributes.namespace) {
+            return false;
         }
         access_policy_rules(&self.policy_name)
             .is_some_and(|rules| rules.iter().any(|rule| rule.admits(attributes)))

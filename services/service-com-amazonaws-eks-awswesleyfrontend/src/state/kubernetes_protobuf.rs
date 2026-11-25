@@ -113,6 +113,22 @@ fn object_document(
             put_text_map(&mut document, "binaryData", &encoded);
             Ok(document)
         }
+        (CORE_API_VERSION, "Service") => {
+            let object: core_v1::Service = decoded(raw)?;
+            let mut document = metadata_document(object.metadata.as_ref());
+            if let Some(spec) = object.spec {
+                let mut projected = Map::new();
+                put_text(&mut projected, "type", spec.r#type.as_deref());
+                put_text(&mut projected, "clusterIP", spec.cluster_ip.as_deref());
+                put_texts(&mut projected, "clusterIPs", &spec.cluster_ips);
+                put_text(&mut projected, "externalName", spec.external_name.as_deref());
+                put_text_map(&mut projected, "selector", &spec.selector);
+                let ports: Vec<Value> = spec.ports.iter().map(service_port).collect();
+                put_values(&mut projected, "ports", ports);
+                document.insert("spec".to_string(), Value::Object(projected));
+            }
+            Ok(document)
+        }
         (CORE_API_VERSION, "ServiceAccount") => {
             let object: core_v1::ServiceAccount = decoded(raw)?;
             let mut document = metadata_document(object.metadata.as_ref());
@@ -194,6 +210,24 @@ fn object_document(
             "no kind \"{kind}\" is registered for version \"{api_version}\""
         ))),
     }
+}
+
+/// One port of a Service, as the document carries it
+/// ([`super::kubernetes_services`]).
+///
+/// `targetPort` is written either as the NUMBER of a port or as the NAME of a
+/// container port, which is the reading [`super::probe::port_value`] already makes
+/// for the port a health probe addresses.
+fn service_port(port: &core_v1::ServicePort) -> Value {
+    let mut projected = Map::new();
+    put_text(&mut projected, "name", port.name.as_deref());
+    put_text(&mut projected, "protocol", port.protocol.as_deref());
+    put_number(&mut projected, "port", port.port);
+    if let Some(target) = port.target_port.as_ref().map(super::probe::port_value) {
+        projected.insert("targetPort".to_string(), target);
+    }
+    put_number(&mut projected, "nodePort", port.node_port);
+    Value::Object(projected)
 }
 
 /// One message of the Kubernetes schema, decoded out of the envelope's bytes.

@@ -89,7 +89,10 @@ pub(super) fn projected(probe: &core_v1::Probe) -> Value {
 /// A port an action addresses, as the document carries it: the NUMBER of a port,
 /// or the NAME of a container port — the two forms the Kubernetes API takes there,
 /// which the encoding tells apart by the `type` the value carries.
-fn port_value(port: &IntOrString) -> Value {
+///
+/// `pub(super)` because a Service port's `targetPort` is written the same two ways
+/// ([`super::kubernetes_protobuf`]), so there is ONE reading of such a value.
+pub(super) fn port_value(port: &IntOrString) -> Value {
     match port.str_val.as_deref() {
         Some(name) if !name.is_empty() => Value::String(name.to_string()),
         _ => Value::from(i64::from(port.int_val.unwrap_or_default())),

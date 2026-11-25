@@ -37,6 +37,7 @@ use super::kubernetes_metadata::ObjectMetadata;
 use super::kubernetes_pod_addressing::PodAddress;
 use super::kubernetes_pod_spec::admitted_pod_spec;
 use super::kubernetes_resource_versions::ResourceVersions;
+use super::kubernetes_services::ServiceObject;
 use super::*;
 
 use super::kubernetes_rbac::RbacScope;
@@ -159,6 +160,11 @@ pub struct NamespaceObject {
     /// [`MAX_CONFIG_MAPS_PER_NAMESPACE`]; the objects and the answers
     /// about them live in [`super::kubernetes_config_maps`].
     pub config_maps: BTreeMap<String, ConfigMapObject>,
+    /// The Services of this namespace, by name — each with the address the
+    /// cluster allocated it out of its own service CIDR
+    /// ([`super::kubernetes_services`]). Bounded by
+    /// [`super::kubernetes_services::MAX_SERVICES_PER_NAMESPACE`].
+    pub services: BTreeMap<String, ServiceObject>,
     /// The events this namespace holds, by the name the cluster gave each — what
     /// the cluster's own components recorded about the objects above
     /// ([`super::kubernetes_events`]). Bounded by
@@ -197,6 +203,7 @@ impl NamespaceObject {
             .collect(),
             pods: BTreeMap::new(),
             config_maps: BTreeMap::new(),
+            services: BTreeMap::new(),
             events: BTreeMap::new(),
             rbac: RbacScope::new(),
             workloads: WorkloadScope::new(),

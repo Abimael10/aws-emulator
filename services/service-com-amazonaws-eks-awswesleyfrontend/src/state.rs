@@ -4667,6 +4667,7 @@ pub mod kubernetes_protobuf;
 pub mod kubernetes_rbac;
 pub mod kubernetes_resource_versions;
 pub mod kubernetes_self_subject_review;
+pub mod kubernetes_services;
 pub mod kubernetes_subject_access_review;
 pub mod kubernetes_version_info;
 pub mod kubernetes_workloads;
@@ -4713,6 +4714,9 @@ pub use kubernetes_config_maps::{ConfigMapObject, MAX_CONFIG_MAPS_PER_NAMESPACE}
 pub use kubernetes_fargate::{ClusterCapacity, FargateNode};
 pub use kubernetes_metadata::ObjectMetadata;
 pub use kubernetes_nodes::NodeInstance;
+pub use kubernetes_services::{
+    ServiceNetwork, ServiceObject, MAX_PORTS_PER_SERVICE, MAX_SERVICES_PER_NAMESPACE,
+};
 pub use nodegroup_ami_releases::*;
 pub use nodegroup_capacity::*;
 pub use nodegroups::*;

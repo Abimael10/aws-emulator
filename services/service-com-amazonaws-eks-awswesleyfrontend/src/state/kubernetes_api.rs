@@ -104,6 +104,7 @@ use super::kubernetes_pod_addressing;
 use super::kubernetes_protobuf;
 use super::kubernetes_rbac::{self as rbac, RbacResource};
 use super::kubernetes_self_subject_review as self_review;
+use super::kubernetes_services::SERVICE_FIELD_SELECTORS;
 use super::kubernetes_subject_access_review as access_review;
 use super::kubernetes_version_info;
 use super::kubernetes_workloads::{self as workloads, WorkloadResource};
@@ -980,6 +981,41 @@ fn route(
                 ),
             ));
         }
+        // And it asks WHAT it may do in a namespace by creating a self subject
+        // rules review, whose answer is the rules the same two sources of
+        // permissions put in force for it there.
+        ["apis", group, version, resource]
+            if *group == access_review::AUTHORIZATION_API_GROUP
+                && *version == access_review::AUTHORIZATION_GROUP_VERSION
+                && *resource == access_review::SELF_SUBJECT_RULES_REVIEWS_RESOURCE =>
+        {
+            if method != ::http::Method::POST.as_str() {
+                return Err(ApiRefusal::method_not_allowed(method, path));
+            }
+            let review = read_manifest(content_type, body)?;
+            let namespace = access_review::reviewed_namespace(&review)
+                .ok_or_else(|| ApiRefusal::bad_request(access_review::NO_NAMESPACE_MESSAGE))?
+                .to_string();
+            let store = state.lock();
+            // Whether the authorizer Amazon EKS serves this cluster's access
+            // entries by is in its chain, which is what decides whether the
+            // listing can be the whole of what the identity may do.
+            let access_entry_authorizer = store
+                .clusters
+                .get(key)
+                .is_some_and(super::ClusterRecord::serves_access_entries);
+            let objects = &plane(&store, key)?.objects;
+            return Ok((
+                201,
+                access_review::self_subject_rules_review(
+                    objects,
+                    identity,
+                    &review,
+                    &namespace,
+                    access_entry_authorizer,
+                ),
+            ));
+        }
         _ => {}
     }
 
@@ -1081,6 +1117,10 @@ fn route(
     // run it. It is read from the control plane's own records before the objects
     // are borrowed to write them.
     let capacity = settled(&mut store, key, now)?;
+    // The block this cluster allocates its Service addresses out of, read from the
+    // record the create wrote ([`super::kubernetes_services`]) — so an address a
+    // Service reports is one inside the CIDR `DescribeCluster` publishes.
+    let network = store.service_network(&key.0, &key.1);
 
     let objects = &mut plane_mut(&mut store, key)?.objects;
     // The chunk a list asks for, read once: every collection below answers one
@@ -1148,6 +1188,40 @@ fn route(
                 200,
                 objects.replace_config_map(namespace, name, &document)?,
             ))
+        }
+        // The SERVICES of a namespace: the objects that name a workload inside the
+        // cluster, each on an address allocated out of the cluster's own service
+        // CIDR ([`super::kubernetes_services`]).
+        (method, ["namespaces", namespace, "services"])
+            if method == ::http::Method::POST.as_str() =>
+        {
+            let document = read_manifest(content_type, body)?;
+            Ok((
+                201,
+                objects.create_service(namespace, &document, now, &network)?,
+            ))
+        }
+        (method, ["namespaces", namespace, "services"])
+            if method == ::http::Method::GET.as_str() =>
+        {
+            Ok((
+                200,
+                objects.service_list_json(
+                    namespace,
+                    &selected(list_request?, SERVICE_FIELD_SELECTORS)?,
+                    &network,
+                )?,
+            ))
+        }
+        (method, ["namespaces", namespace, "services", name])
+            if method == ::http::Method::GET.as_str() =>
+        {
+            Ok((200, objects.service_json(namespace, name, &network)?))
+        }
+        (method, ["namespaces", namespace, "services", name])
+            if method == ::http::Method::DELETE.as_str() =>
+        {
+            Ok((200, objects.delete_service(namespace, name)?))
         }
         (method, ["namespaces", namespace, "serviceaccounts"])
             if method == ::http::Method::POST.as_str() =>
@@ -1217,10 +1291,15 @@ fn settled(
 ) -> Result<super::kubernetes_fargate::ClusterCapacity, ApiRefusal> {
     let capacity = store.cluster_capacity(&key.0, &key.1);
     let managed = workloads::managed_workloads(store, &key.0, &key.1, now);
+    let network = store.service_network(&key.0, &key.1);
     let objects = &mut plane_mut(store, key)?.objects;
     objects.materialize_due_transitions(now, &capacity);
     objects.materialize_managed_workloads(&managed, now);
     objects.reconcile_workloads(now, &capacity);
+    // The Service the cluster's own API server is reached by inside the cluster,
+    // which every Kubernetes cluster holds from the instant it was created
+    // ([`super::kubernetes_services`]).
+    objects.materialize_api_server_service(&network, now);
     // The capacity is re-read: placing the cluster's pods may have provisioned
     // Fargate capacity for them, which is capacity the cluster now holds.
     Ok(store.cluster_capacity(&key.0, &key.1))
@@ -1397,6 +1476,9 @@ fn core_api_resource_list() -> ::serde_json::Value {
 
     let read = ["get", "list"];
     let read_create = ["create", "get", "list"];
+    // A Service is also DELETED through this server: its address goes back to the
+    // cluster's block when it is ([`super::kubernetes_services`]).
+    let read_create_delete = ["create", "delete", "get", "list"];
     // A ConfigMap is also UPDATED through this server: the mapping a cluster
     // authenticates through is kept in one (`super::kubernetes_aws_auth`), and a
     // client maintains it by replacing the object.
@@ -1410,6 +1492,7 @@ fn core_api_resource_list() -> ::serde_json::Value {
             resource("nodes", "Node", false, &["no"], &read),
             resource("pods", "Pod", true, &["po"], &read_create),
             resource("configmaps", "ConfigMap", true, &["cm"], &read_create_update),
+            resource("services", "Service", true, &["svc"], &read_create_delete),
             // The events the cluster's own components record about its objects:
             // a client READS them, so the row names the verbs this server serves.
             resource("events", "Event", true, &["ev"], &read),

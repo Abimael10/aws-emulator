@@ -439,8 +439,22 @@ impl ClusterObjects {
         namespace: Option<&str>,
         attributes: &RequestAttributes,
     ) -> bool {
+        self.role_ref_rules(binding, namespace).admits(attributes)
+    }
+
+    /// The rules the role a binding's `roleRef` names carries, borrowed from
+    /// wherever that role lives.
+    ///
+    /// The ONE resolution of a `roleRef`, so the decision taken on a request
+    /// ([`Self::role_ref_admits`]) and the rules a review reports
+    /// ([`effective_rules`]) read the same role.
+    pub(super) fn role_ref_rules(
+        &self,
+        binding: &RbacObject,
+        namespace: Option<&str>,
+    ) -> RoleRules<'_> {
         let RbacBody::Binding { role_ref, .. } = &binding.body else {
-            return false;
+            return RoleRules::None;
         };
         if role_ref.kind == RbacResource::Roles.kind() {
             // A `Role` is resolved in the namespace the binding itself is in, and a
@@ -452,32 +466,83 @@ impl ClusterObjects {
                         .get(&(RbacResource::Roles, role_ref.name.clone()))
                 })
             });
-            return matches!(referenced.map(|role| &role.body), Some(RbacBody::Rules(rules))
-                if rules.iter().any(|rule| rule.admits(attributes)));
+            return match referenced.map(|role| &role.body) {
+                Some(RbacBody::Rules(rules)) => RoleRules::Stored(rules),
+                _ => RoleRules::None,
+            };
         }
         match self
             .cluster_rbac
             .get(&(RbacResource::ClusterRoles, role_ref.name.clone()))
             .map(|role| &role.body)
         {
-            Some(RbacBody::Rules(rules)) => rules.iter().any(|rule| rule.admits(attributes)),
+            Some(RbacBody::Rules(rules)) => RoleRules::Stored(rules),
             // A `ClusterRole` no object of this cluster carries is still one of the
             // roles Kubernetes installs on every cluster when it is one of those;
             // anything else is a dangling reference, which grants nothing.
-            _ => published_role_admits(&role_ref.name, attributes),
+            _ => match published_cluster_role(&role_ref.name) {
+                Some(rules) => RoleRules::Published(rules),
+                None => RoleRules::None,
+            },
+        }
+    }
+
+    /// Add the rules the bindings this cluster holds put in force for `identity` in
+    /// `namespace` to `into`: the roles its `ClusterRoleBinding`s bind it to, which
+    /// reach every namespace, and then the ones the `RoleBinding`s of that namespace
+    /// bind it to.
+    pub(super) fn bound_rules(
+        &self,
+        identity: &SubjectIdentity,
+        namespace: &str,
+        into: &mut Vec<EffectiveRule>,
+    ) {
+        self.binding_rules(
+            &self.cluster_rbac,
+            RbacResource::ClusterRoleBindings,
+            None,
+            identity,
+            into,
+        );
+        if let Some(held) = self.namespaces.get(namespace) {
+            self.binding_rules(
+                &held.rbac,
+                RbacResource::RoleBindings,
+                Some(namespace),
+                identity,
+                into,
+            );
+        }
+    }
+
+    /// Add the rules every binding of `resource` in `scope` that binds `identity`
+    /// puts in force to `into` — the collecting form of [`Self::bindings_admit`].
+    fn binding_rules(
+        &self,
+        scope: &RbacScope,
+        resource: RbacResource,
+        namespace: Option<&str>,
+        identity: &SubjectIdentity,
+        into: &mut Vec<EffectiveRule>,
+    ) {
+        for (_, binding) in scope
+            .iter()
+            .filter(|((held, _), _)| *held == resource)
+            .filter(|(_, binding)| binding.binds(identity))
+        {
+            self.role_ref_rules(binding, namespace).collect_into(into);
         }
     }
 }
 
-/// The permissions of a published cluster role a binding may name even though no
-/// object of that name was created: the roles Kubernetes installs on every cluster.
-pub(super) fn published_role_admits(role_name: &str, attributes: &RequestAttributes) -> bool {
-    let rules = match role_name {
-        "cluster-admin" => CLUSTER_ADMIN_RULES,
-        "admin" => ADMIN_RULES,
-        "edit" => EDIT_RULES,
-        "view" => VIEW_RULES,
-        _ => return false,
-    };
-    rules.iter().any(|rule| rule.admits(attributes))
+/// The rules of a published cluster role a binding may name even though no object
+/// of that name was created: the roles Kubernetes installs on every cluster.
+pub(super) fn published_cluster_role(role_name: &str) -> Option<&'static [PublishedRule]> {
+    match role_name {
+        "cluster-admin" => Some(CLUSTER_ADMIN_RULES),
+        "admin" => Some(ADMIN_RULES),
+        "edit" => Some(EDIT_RULES),
+        "view" => Some(VIEW_RULES),
+        _ => None,
+    }
 }

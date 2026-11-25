@@ -410,6 +410,52 @@ fn schemas_of(group: &str, version: &str) -> Vec<(String, ::serde_json::Value)> 
                 &[],
             ));
             schemas.push(entry(group, version, "ServiceAccount", &[], &[]));
+            // The Service a client names a workload by, and the ports it answers
+            // on ([`super::kubernetes_services`]).
+            let service_port = schema_name(group, version, "ServicePort");
+            schemas.push((
+                service_port.clone(),
+                object(
+                    ::serde_json::json!({
+                        "name": { "type": "string" },
+                        "protocol": { "type": "string" },
+                        "port": { "type": "integer" },
+                        // `targetPort` is an `IntOrString`: "if this is a string,
+                        // it will be looked up as a named port in the target Pod's
+                        // container ports".
+                        "targetPort": { "oneOf": [{ "type": "integer" }, { "type": "string" }] },
+                        "nodePort": { "type": "integer" },
+                    }),
+                    // The one member a Service port cannot be read without.
+                    &["port"],
+                ),
+            ));
+            let service_spec = schema_name(group, version, "ServiceSpec");
+            schemas.push((
+                service_spec.clone(),
+                object(
+                    ::serde_json::json!({
+                        "type": { "type": "string" },
+                        "clusterIP": { "type": "string" },
+                        "clusterIPs": { "type": "array", "items": { "type": "string" } },
+                        "externalName": { "type": "string" },
+                        "ports": list_of(&service_port),
+                        "selector": string_map(),
+                        "sessionAffinity": { "type": "string" },
+                    }),
+                    &[],
+                ),
+            ));
+            schemas.push(entry(
+                group,
+                version,
+                "Service",
+                &[
+                    ("spec", reference(&service_spec)),
+                    ("status", open_object()),
+                ],
+                &[],
+            ));
             schemas.push(entry(
                 group,
                 version,

@@ -120,6 +120,7 @@ const KINDS: &[(&str, &str, &str)] = &[
     ),
     ("api/v1", "Event", "io.k8s.api.core.v1.Event"),
     ("api/v1", "Node", "io.k8s.api.core.v1.Node"),
+    ("api/v1", "Service", "io.k8s.api.core.v1.Service"),
     (
         "apis/rbac.authorization.k8s.io/v1",
         "Role",
