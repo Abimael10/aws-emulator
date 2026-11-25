@@ -406,6 +406,112 @@ impl Endpoint {
     }
 }
 
+/// The reserved path segment a data plane is named behind on the emulator's own endpoint
+/// (`service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE`), under which
+/// [`PLANE_LABEL`] names this plane.
+const EMULATOR_NAMESPACE: &str = "_aws";
+
+/// Which addressing a request reaches a function URL by: the three one resolves under
+/// (`crate::state::function_url`). Shared with every suite that drives the endpoint over more
+/// than one of them, so one reading of each addressing serves them all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Addressing {
+    /// The authority the URL was PUBLISHED on, which is what the announced `FunctionUrl`
+    /// carries.
+    PublishedAuthority,
+    /// The reserved local-endpoint path, on the emulator's own endpoint.
+    LocalEndpointPath,
+    /// The url id as the FIRST path segment, on the emulator's own endpoint.
+    PathStyle,
+}
+
+/// The host and request target one addressing of `endpoint` reaches the path `within` the URL
+/// at.
+pub(crate) fn addressed(
+    endpoint: &Endpoint,
+    addressing: Addressing,
+    within: &str,
+) -> (String, String) {
+    match addressing {
+        Addressing::PublishedAuthority => (
+            endpoint.host.clone(),
+            format!(
+                "{base}{within}",
+                base = endpoint.base_path.trim_end_matches('/')
+            ),
+        ),
+        Addressing::LocalEndpointPath => (
+            OWN_ENDPOINT.to_string(),
+            format!(
+                "/{EMULATOR_NAMESPACE}/{PLANE_LABEL}/{url_id}{within}",
+                url_id = endpoint.url_id
+            ),
+        ),
+        Addressing::PathStyle => (
+            OWN_ENDPOINT.to_string(),
+            format!("/{url_id}{within}", url_id = endpoint.url_id),
+        ),
+    }
+}
+
+/// The keys this emulator process publishes, which a caller SIGNS with and the emulator
+/// verifies against.
+pub(crate) fn published_keys() -> (String, String) {
+    let keys = ::emulator_server::request_authentication::SigV4Authenticator::for_this_process();
+    (keys.access_key_id.clone(), keys.secret_access_key.clone())
+}
+
+/// The headers one request SIGNED with those keys travels with, under the credential scope of
+/// `signing_name`: the signature the workspace's own signer computed over that exact request —
+/// the same recipe the emulator's verifier re-signs with — read back off it, beside the headers
+/// `carried` names, which are signed with it as a client's own are.
+///
+/// `host` is not among them: it is the address the request is sent to, which [`send`] writes,
+/// and the signature covers the value it wrote.
+pub(crate) async fn signature_scoped_for(
+    signing_name: &str,
+    host: &str,
+    method: &str,
+    target: &str,
+    body: &[u8],
+    carried: &[(&str, &str)],
+) -> Vec<(String, String)> {
+    let mut builder = http::Request::builder()
+        .method(method)
+        .uri(format!("https://{host}{target}"));
+    for (name, value) in carried {
+        builder = builder.header(*name, *value);
+    }
+    let mut request = builder
+        .body(body.to_vec())
+        .expect("the test request must build");
+    let (key_id, secret) = published_keys();
+    ::service_common::in_process_sigv4::sign_in_process_request_as(
+        &mut request,
+        signing_name,
+        SIGNED_REGION,
+        &key_id,
+        &secret,
+    )
+    .await
+    .expect("the test request must sign");
+    request
+        .headers()
+        .iter()
+        .filter(|(name, _)| name.as_str() != "host")
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                value.to_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The Region a caller's credential scope names, which is the one this service's endpoint
+/// above names.
+pub(crate) const SIGNED_REGION: &str = "us-east-1";
+
 /// One request to the function URL, addressed HOST-STYLE the way AWS publishes it.
 async fn get(router: &MultiServiceRouter, endpoint: &Endpoint, path: &str) -> Answer {
     send(router, "GET", &endpoint.host, path, &[], &[]).await

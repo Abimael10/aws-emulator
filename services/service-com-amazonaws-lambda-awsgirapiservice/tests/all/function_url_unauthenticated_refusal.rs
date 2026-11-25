@@ -44,17 +44,21 @@ const PLANE_LABEL: &str = "lambda-url";
 
 /// The body Lambda's own front door answers a caller it did not AUTHENTICATE with: it names
 /// nothing of the request or of what was wrong with its credential.
-const FORBIDDEN_BODY: &str = r#"{"Message":"Forbidden"}"#;
+///
+/// Shared, like the three wordings and three classes below it, with the suites that drive an
+/// unadmitted caller of a function URL for a reason of their own, so one wording of each
+/// refusal serves them all.
+pub(crate) const FORBIDDEN_BODY: &str = r#"{"Message":"Forbidden"}"#;
 
 /// The body a caller whose credential scope names another service reads: the scope is part
 /// of what a signature is computed over, so AWS names the service the request reached.
-const SCOPED_ELSEWHERE_BODY: &str =
+pub(crate) const SCOPED_ELSEWHERE_BODY: &str =
     r#"{"message":"Credential should be scoped to correct service: 'lambda'. "}"#;
 
 /// The body a caller whose signature does not match the request it travelled with reads.
-const SIGNATURE_MISMATCH_BODY: &str = "{\"message\":\"The request signature we calculated \
-     does not match the signature you provided. Check your AWS Secret Access Key and \
-     signing method. Consult the service documentation for details.\"}";
+pub(crate) const SIGNATURE_MISMATCH_BODY: &str = "{\"message\":\"The request signature we \
+     calculated does not match the signature you provided. Check your AWS Secret Access Key \
+     and signing method. Consult the service documentation for details.\"}";
 
 /// The body a caller signing as an identity this emulator holds no credential for reads.
 /// Shared with the suites that drive such a caller for a reason of their own, so one wording of
@@ -66,13 +70,13 @@ pub(crate) const UNKNOWN_CREDENTIAL_BODY: &str =
 const UNRECOGNIZED_CLIENT: &str = "UnrecognizedClientException";
 
 /// The header a failure names its error class in, which a client branches on.
-const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
+pub(crate) const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
 
 /// The class of a caller that presented no signature this endpoint accepts.
-const ACCESS_DENIED: &str = "AccessDeniedException";
+pub(crate) const ACCESS_DENIED: &str = "AccessDeniedException";
 
 /// The class of a caller whose SIGNATURE is why it was not admitted.
-const INVALID_SIGNATURE: &str = "InvalidSignatureException";
+pub(crate) const INVALID_SIGNATURE: &str = "InvalidSignatureException";
 
 /// The handler every function below runs, which answers a described response so a row that
 /// IS admitted is visibly served by the function.
