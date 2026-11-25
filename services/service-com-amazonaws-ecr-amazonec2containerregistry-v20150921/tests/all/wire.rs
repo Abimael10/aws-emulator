@@ -65,8 +65,9 @@ pub const REGISTRY_ID: &str = "000000000000";
 /// It is the host every repository of that registry is addressed under ON AWS, so it is the
 /// spelling a client's own reference may be written in, which a pull reads back — and never
 /// the authority this registry PUBLISHES for a repository, which is the endpoint this
-/// emulator answers that caller's registry requests at ([`published_registry_authority`]),
-/// because no listener of this emulator answers for a name AWS serves.
+/// emulator answers that caller's registry requests at
+/// ([`published_registry_authority`]), because no listener of this emulator answers for a
+/// name AWS serves.
 pub fn registry_host_in(region: &str) -> String {
     let suffix = match region {
         region if region.starts_with("cn-") => "amazonaws.com.cn",
@@ -80,50 +81,32 @@ pub fn registry_host_in(region: &str) -> String {
     format!("{REGISTRY_ID}.dkr.ecr.{region}.{suffix}")
 }
 
-/// The DNS zone this emulator announces a name of its own in, read off the endpoint it
-/// answers a caller's registry requests at ([`ANNOUNCED_REGISTRY_ENDPOINT`]): that endpoint
-/// is an ADDRESS, which names no zone of its own and names the interface the loopback zone
-/// resolves to — RFC 6761 reserves `localhost` and every name under it for that interface.
-/// Spelled out here rather than imported so a wrong zone in the implementation fails these
-/// tests.
-pub const ANNOUNCED_REGISTRY_ZONE: &str = "localhost";
-
-/// The port that same endpoint is answered on, which a published authority carries whole, so
-/// a client dials the socket this emulator is actually reached at.
-pub const ANNOUNCED_REGISTRY_PORT: &str = "9297";
-
-/// The authority this registry publishes a repository of `region` at, to a call made through
-/// this harness: this registry's own labels — the owning account, the two fixed registry
-/// labels and the Region the repository is held in — in the zone
-/// ([`ANNOUNCED_REGISTRY_ZONE`]) and on the port ([`ANNOUNCED_REGISTRY_PORT`]) of the
-/// endpoint this emulator answers that caller's registry requests at
-/// ([`ANNOUNCED_REGISTRY_ENDPOINT`]).
+/// The authority this registry publishes a repository at, to a call made through this
+/// harness: the endpoint this emulator answers that caller's registry requests at
+/// ([`ANNOUNCED_REGISTRY_ENDPOINT`]), host and port WHOLE.
 ///
 /// `Repository$repositoryUri` is an ADDRESS a container client splits on the first `/` and
-/// DIALS, and a registry host it PARSES the owning account and the Region out of, so both
-/// halves are load-bearing: the labels are the holding registry's, and the zone and the port
-/// are this emulator's, because a name in a zone AWS serves resolves at Amazon ECR rather
-/// than near this emulator ([`registry_host_in`]). Spelled out here rather than imported so a
-/// wrong composition in the implementation fails these tests.
-pub fn published_registry_authority_in(region: &str) -> String {
-    format!(
-        "{REGISTRY_ID}.dkr.ecr.{region}.{ANNOUNCED_REGISTRY_ZONE}:{ANNOUNCED_REGISTRY_PORT}"
-    )
+/// DIALS, so the authority has to be one this process is reached at — the same endpoint the
+/// URL a `docker login` is pointed at carries ([`announced_registry_url`]) — and never a name
+/// in a zone AWS serves, which resolves at Amazon ECR rather than near this emulator
+/// ([`registry_host_in`]), nor a registry host this emulator composes for itself in a zone of
+/// its own, which resolves only where a resolver implements that zone. WHICH registry holds
+/// the repository is reported BESIDE the address, by `registryId` and the ARN. Spelled out
+/// here rather than imported so a wrong composition in the implementation fails these tests.
+pub fn published_registry_authority() -> String {
+    ANNOUNCED_REGISTRY_ENDPOINT.to_string()
 }
 
-/// The URI Amazon ECR reports for the repository `name` of this account's registry in
-/// `region`, to a call made through this harness (`Repository$repositoryUri`: "The URI for
-/// the repository. You can use this URI for container image `push` and `pull` operations"):
-/// the authority that repository is published at ([`published_registry_authority_in`])
-/// followed by the repository's own name as the path.
-pub fn published_repository_uri_in(region: &str, name: &str) -> String {
-    format!("{}/{name}", published_registry_authority_in(region))
-}
-
-/// [`published_repository_uri_in`] for the Region every call made through [`call`] is signed
-/// for ([`REGION`]).
+/// The URI Amazon ECR reports for the repository `name`, to a call made through this harness
+/// (`Repository$repositoryUri`: "The URI for the repository. You can use this URI for
+/// container image `push` and `pull` operations"): the authority that repository is published
+/// at ([`published_registry_authority`]) followed by the repository's own name as the path.
+///
+/// The authority names no registry, so it carries no Region: one endpoint answers for every
+/// Region's registry, and the credential a client presents says which registry a push or a
+/// pull addresses.
 pub fn published_repository_uri(name: &str) -> String {
-    published_repository_uri_in(REGION, name)
+    format!("{}/{name}", published_registry_authority())
 }
 
 /// The `X-Amz-Target` prefix this service routes on (`OPERATIONS.md`, "Wire protocol").
@@ -137,14 +120,28 @@ pub fn emulator() -> MultiServiceRouter {
 /// The same emulator as [`emulator`], plus the engine its handlers read and write — for
 /// a case that has to arrange state no reasonable number of wire calls would.
 pub fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    emulator_served_at_with_engine(SERVED_URL_BASE)
+}
+
+/// The same emulator as [`emulator`], SERVED at `served_base` rather than at this harness's
+/// own address ([`SERVED_URL_BASE`]) — for a suite whose subject is what the address this
+/// emulator is reached at does to the addresses it announces.
+pub fn emulator_served_at(served_base: &str) -> MultiServiceRouter {
+    emulator_served_at_with_engine(served_base).0
+}
+
+/// [`emulator_served_at`], plus the engine its handlers read and write.
+pub fn emulator_served_at_with_engine(
+    served_base: &str,
+) -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
-    // The emulator is SERVED somewhere ([`SERVED_URL_BASE`]), which is the address every
-    // registry address this service announces is built on.
+    // The emulator is SERVED somewhere, which is the address every registry address this
+    // service announces is built on.
     router.set_url_base(
-        ::smithy_server_runtime::EndpointUrl::parse(SERVED_URL_BASE)
-            .unwrap_or_else(|| panic!("the base URL {SERVED_URL_BASE} must parse")),
+        ::smithy_server_runtime::EndpointUrl::parse(served_base)
+            .unwrap_or_else(|| panic!("the base URL {served_base} must parse")),
     );
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
     (router, engine)

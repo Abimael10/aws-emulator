@@ -142,18 +142,76 @@ pub(super) enum RegistryV2Target {
 
 /// Whether this service claims `parts` as a registry request.
 ///
-/// Two things have to hold, and the second is what keeps this claim off another service's
-/// traffic: the path has to address an endpoint of the registry API ([`registry_v2_target`];
-/// the `/v2` space is NOT this registry's alone — a REST service of another family
-/// publishes `/v2/...` paths of its own), and the request has to name NO service, which is
-/// exactly the `UnknownService` case this claim exists to prevent. A registry client is not
-/// an AWS API client: it presents a Basic credential or none, names no `X-Amz-Target`, and
-/// addresses either this registry's endpoint host (whose first label is the account id, so
-/// it names no service) or the emulator's own socket. A request that DOES resolve a route
-/// key is left to the service that key names.
+/// The path has to address an endpoint of the registry API ([`registry_v2_target`]; the `/v2`
+/// space is NOT this registry's alone — a REST service of another family publishes `/v2/...`
+/// paths of its own), and then one of two things has to hold, each of which says the request
+/// is a REGISTRY client's rather than an AWS API client's:
+///
+/// - it names no service ([`smithy_server_runtime::resolve_route_key`]), which is the
+///   `UnknownService` case this claim exists to prevent: a registry client presents no
+///   `X-Amz-Target` and no SigV4 scope, so a request addressed to this registry's own
+///   endpoint host (whose first label is the account id) or to the emulator's own socket
+///   resolves no key at all;
+/// - or it presents a BASIC credential at a host that is not an endpoint AWS publishes
+///   ([`presents_a_registry_client_credential`]): Basic is how a `docker login` credential
+///   travels ("for private registry authentication using `docker login`",
+///   `AuthorizationData$authorizationToken`) and no AWS SDK client sends it, while a host
+///   under a zone AWS publishes its own endpoints in names the service that answers there
+///   and is left to it. That is what makes the address this registry PUBLISHES reachable: a
+///   repository's URI and the URL a `docker login` is pointed at are the endpoint this
+///   emulator is reached at (`crate::state::registry_address`), and the front door reads the
+///   FIRST LABEL of any host as a service name — an operator's own name for this process, or
+///   an IPv6 literal's bracket — so without this half a pull at the very address this
+///   registry handed out is answered by no service.
+///
+/// What it does NOT claim is another service's API traffic: that carries a SigV4 scope or an
+/// `X-Amz-Target`, never a Basic credential, and a registry-shaped path addressed to an AWS
+/// endpoint host of another service is left where it was. A `/v2` path addressed to a host
+/// whose first label names ANOTHER emulated service an operator serves locally, with a Basic
+/// credential, is claimed here as well as by that service, which the router answers as an
+/// ambiguous request — a registry request to such a host reached no registry before either.
 pub(super) fn claims_registry_v2(parts: &::http::request::Parts) -> bool {
     registry_v2_target(parts.uri.path()).is_some()
-        && ::smithy_server_runtime::resolve_route_key(parts).is_none()
+        && (::smithy_server_runtime::resolve_route_key(parts).is_none()
+            || presents_a_registry_client_credential(parts))
+}
+
+/// Whether `parts` is a request a REGISTRY client made at an address this emulator may be
+/// reached at: an `Authorization` header in the BASIC scheme — the scheme a `docker login`
+/// credential travels in, and one no AWS SDK client uses — at a host that is not an endpoint
+/// AWS publishes (`service_common::data_plane_addressing::addresses_an_aws_endpoint`, the
+/// tree's one reading of that question), since such a host names the AWS service that answers
+/// there.
+///
+/// Only the SCHEME of the credential is read: what it has to BE is decided where the request
+/// is served ([`presented_password`], against the issues this registry recorded), so a claim
+/// never depends on the store and a credential this registry did not mint is refused with the
+/// registry API's own 401 rather than handed to another service. The header is a caller's, so
+/// the read is bounded ([`MAX_CREDENTIAL_HEADER_BYTES`]) before anything is split.
+fn presents_a_registry_client_credential(parts: &::http::request::Parts) -> bool {
+    use ::service_common::data_plane_addressing as addressing;
+
+    let basic = parts
+        .headers
+        .get(::http::header::AUTHORIZATION)
+        .and_then(|presented| {
+            (presented.len() <= MAX_CREDENTIAL_HEADER_BYTES)
+                .then(|| presented.to_str().ok())
+                .flatten()
+        })
+        .and_then(|presented| presented.split_once(' '))
+        .is_some_and(|(scheme, _credential)| scheme.eq_ignore_ascii_case(BASIC_SCHEME));
+    if !basic {
+        return false;
+    }
+    addressing::addressed_host(
+        &parts.uri.to_string(),
+        parts
+            .headers
+            .get(::http::header::HOST)
+            .and_then(|value| value.to_str().ok()),
+    )
+    .is_none_or(|reached| !addressing::addresses_an_aws_endpoint(&reached))
 }
 
 /// What a request path addresses in the registry API, or `None` when the path addresses no

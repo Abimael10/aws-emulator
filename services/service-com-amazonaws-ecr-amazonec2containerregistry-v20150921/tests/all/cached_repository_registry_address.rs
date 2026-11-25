@@ -4,17 +4,18 @@
 //! through cache rule creates on the first read under its prefix — driven end to end over the
 //! wire.
 //!
-//! The rule under test: **`Repository$repositoryUri` is a registry HOST of the registry that
-//! HOLDS the repository, followed by `/` and the repository's own name — the owning account,
-//! the two fixed registry labels and that Region, in the zone and on the port this emulator
-//! answers the reading caller's registry requests in.** "The URI for the repository. You can
-//! use this URI for container image `push` and `pull` operations" is a value a client both
-//! DIALS, by splitting it on the first `/`, and PARSES: the labels ahead of the zone are
-//! where a client recovers the registry id and the Region from, which is how it builds the
-//! `ecr:` resource of a grant, obtains a `docker login` for that registry, and writes the
-//! image reference of a task definition or a function. The zone and the port are this
-//! emulator's, because they are the half a client DIALS: a name in a zone AWS serves its own
-//! registries in resolves at Amazon ECR rather than at the machine this emulator runs on.
+//! The rule under test: **`Repository$repositoryUri` is the ADDRESS a client reaches the
+//! repository at — the endpoint this emulator answers the reading caller's registry requests
+//! at, followed by `/` and the repository's own name.** "The URI for the repository. You can
+//! use this URI for container image `push` and `pull` operations" is a value a client DIALS,
+//! by splitting it on the first `/`, so the authority has to be one this process is reached
+//! at: a name in a zone AWS serves its own registries in resolves at Amazon ECR rather than
+//! at the machine this emulator runs on, and a registry host this emulator composes for
+//! itself resolves only where a resolver implements that zone. One endpoint answers for every
+//! registry this emulator serves, so WHICH registry holds the mirror is reported beside the
+//! address — `registryId` and the ARN, off the stored record — which is where a client
+//! recovers the registry id and the Region it builds the `ecr:` resource of a grant, a
+//! `docker login` and an image reference from.
 //!
 //! What this suite adds to its siblings — `crate::repository_registry_uri`, which reads the
 //! rule across the Region and the repository name, and `crate::published_registry_address`,
@@ -37,14 +38,15 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::wire::{
-    at, emulator, ok_in_region, published_registry_authority_in, registry_get, registry_host_in,
+    at, emulator, ok_in_region, published_registry_authority, registry_get, registry_host_in,
     REGISTRY_ID,
 };
 
-/// The label run every Amazon ECR registry HOST carries between the owning account's id and
-/// the Region, as the registry URL format `AuthorizationData$proxyEndpoint` documents spells
-/// it (`https://aws_account_id.dkr.ecr.region.amazonaws.com`). Spelled out here rather than
-/// imported so a published address that stopped naming a registry fails this suite.
+/// The label run every Amazon ECR registry HOST AWS publishes carries between the owning
+/// account's id and the Region, as the registry URL format `AuthorizationData$proxyEndpoint`
+/// documents spells it (`https://aws_account_id.dkr.ecr.region.amazonaws.com`). No address
+/// this registry publishes carries it. Spelled out here rather than imported so a published
+/// address that slipped into that spelling fails this suite.
 const REGISTRY_LABEL_RUN: &str = ".dkr.ecr.";
 
 /// The DNS suffixes AWS publishes its own endpoints under, spelled out here rather than
@@ -182,7 +184,7 @@ async fn token_for(router: &MultiServiceRouter, case: &str, region: &str) -> Str
 }
 
 #[tokio::test]
-async fn a_cached_repositorys_published_uri_names_the_registry_that_holds_it() {
+async fn a_cached_repositorys_published_uri_is_an_address_this_registry_answers_on() {
     for mirror in MIRRORS {
         let router = emulator();
         let case = mirror.case;
@@ -198,18 +200,15 @@ async fn a_cached_repositorys_published_uri_names_the_registry_that_holds_it() {
         )
         .await;
         let uri = reported_uri(case, &described);
-        let expected = format!(
-            "{}/{repository}",
-            published_registry_authority_in(mirror.region)
-        );
+        let expected = format!("{}/{repository}", published_registry_authority());
         assert_eq!(
             uri, expected,
             "case {case:?}: expected the mirror to be published at {expected:?}, got {uri:?}"
         );
 
-        // The two parts a container client splits the value into: the authority it dials and
-        // parses, and the path after the first `/`, which is exactly the repository's own
-        // name — the rule's prefix and the cached path, however many segments each carries.
+        // The two parts a container client splits the value into: the authority it dials,
+        // and the path after the first `/`, which is exactly the repository's own name — the
+        // rule's prefix and the cached path, however many segments each carries.
         let (authority, path) = uri
             .split_once('/')
             .unwrap_or_else(|| panic!("case {case:?}: {uri:?} names no repository path"));
@@ -219,8 +218,8 @@ async fn a_cached_repositorys_published_uri_names_the_registry_that_holds_it() {
              {repository:?}, got {path:?}"
         );
 
-        // What a client PARSES out of the authority: the registry holding the repository,
-        // which must be the identity the same response reports beside the address.
+        // The registry that HOLDS the mirror is what the response reports BESIDE the address,
+        // off the stored record, since the address names no registry of its own.
         let reported_registry = at(&described, "/repositories/0/registryId")
             .as_str()
             .unwrap_or_default()
@@ -242,30 +241,21 @@ async fn a_cached_repositorys_published_uri_names_the_registry_that_holds_it() {
             "case {case:?}: expected the owning account and this Region's ARN beside {uri:?}, \
              got {reported_registry:?} and {reported_arn:?}"
         );
-        let region_label = authority
-            .strip_prefix(&format!("{reported_registry}{REGISTRY_LABEL_RUN}"))
-            .and_then(|rest| rest.split_once('.'))
-            .unwrap_or_else(|| {
-                panic!(
-                    "case {case:?}: expected {authority:?} to be a registry host of the \
-                     account {reported_registry:?}"
-                )
-            })
-            .0;
-        assert_eq!(
-            region_label, mirror.region,
-            "case {case:?}: expected the Region label of {authority:?} to be the Region the \
-             mirror is held in, got {region_label:?}"
-        );
 
-        // The zone and the port are this emulator's, which is what makes the address one a
-        // client on this machine can dial: never the host AWS serves this registry at, and
-        // never any other name in a zone AWS publishes its own endpoints in.
+        // The authority is one this emulator answers on, which is what makes the address one
+        // a client on this machine can dial: never the host AWS serves this registry at,
+        // never a registry host composed in a zone of this emulator's own, and never any
+        // other name in a zone AWS publishes its own endpoints in.
         assert_ne!(
             authority,
             registry_host_in(mirror.region),
             "case {case:?}: {uri:?} names the host AWS publishes for this registry, which \
              resolves nowhere near this process"
+        );
+        assert!(
+            !authority.to_ascii_lowercase().contains(REGISTRY_LABEL_RUN),
+            "case {case:?}: expected an address this emulator answers on, got the registry \
+             host spelling {authority:?}"
         );
         for suffix in AWS_ENDPOINT_DNS_SUFFIXES {
             assert!(
@@ -303,26 +293,15 @@ async fn a_cached_repositorys_published_uri_names_the_registry_that_holds_it() {
     }
 }
 
-/// One endpoint a caller reads a mirror on: the `Host` it addressed, and the zone and the
-/// port the address it is reported is published in — those of the endpoint this emulator
-/// answers THAT caller's registry requests at, which for a caller on a host AWS publishes its
-/// own endpoints at is the address this emulator is served at
-/// (`crate::wire::ANNOUNCED_REGISTRY_ENDPOINT`).
+/// One endpoint a caller reads a mirror on: the `Host` it addressed, and the endpoint this
+/// emulator answers THAT caller's registry requests at — which for a caller on a host AWS
+/// publishes its own endpoints at is the address this emulator is served at
+/// (`crate::wire::ANNOUNCED_REGISTRY_ENDPOINT`), and otherwise the address it is already
+/// talking to.
 struct ReadingEndpoint {
     case: &'static str,
     host: &'static str,
-    zone: &'static str,
-    port: &'static str,
-}
-
-impl ReadingEndpoint {
-    /// The authority a repository of `region` is published at to a read that arrived here.
-    fn published_authority_in(&self, region: &str) -> String {
-        format!(
-            "{REGISTRY_ID}{REGISTRY_LABEL_RUN}{region}.{}:{}",
-            self.zone, self.port
-        )
-    }
+    announced: &'static str,
 }
 
 /// The endpoints the second test reads each mirror on: this service's own regional endpoint
@@ -333,26 +312,22 @@ const READING_ENDPOINTS: &[ReadingEndpoint] = &[
     ReadingEndpoint {
         case: "this service's own regional endpoint host",
         host: "api.ecr.us-west-2.amazonaws.com",
-        zone: "localhost",
-        port: "9297",
+        announced: "127.0.0.1:9297",
     },
     ReadingEndpoint {
         case: "the emulator's own socket",
         host: "127.0.0.1:9297",
-        zone: "localhost",
-        port: "9297",
+        announced: "127.0.0.1:9297",
     },
     ReadingEndpoint {
         case: "a loopback name on another port",
         host: "localhost:39355",
-        zone: "localhost",
-        port: "39355",
+        announced: "localhost:39355",
     },
     ReadingEndpoint {
         case: "a host of this service an operator serves the emulator at",
         host: "ecr.localhost:39355",
-        zone: "ecr.localhost",
-        port: "39355",
+        announced: "ecr.localhost:39355",
     },
 ];
 
@@ -403,12 +378,10 @@ async fn describe_at(
 }
 
 #[tokio::test]
-async fn a_cached_repositorys_registry_labels_do_not_move_with_the_endpoint_that_read_it() {
-    // The two halves of the authority answer to two different things, and this is what keeps
-    // them apart: the LABELS are the stored record's — this account's registry in the Region
-    // holding the mirror — so no reader's endpoint moves them, while the ZONE and the PORT are
-    // the endpoint this emulator answers that reader at, so every reader is handed an address
-    // it can dial.
+async fn a_cached_repositorys_published_uri_names_the_endpoint_that_read_it() {
+    // The address is the reader's endpoint — every reader is handed one it can dial — while
+    // the identity reported beside it is the stored record's, which no reader's endpoint
+    // moves: the mirror's own ARN names the Region holding it whoever read it.
     for mirror in MIRRORS {
         let router = emulator();
         let repository = mirror.repository();
@@ -419,10 +392,7 @@ async fn a_cached_repositorys_registry_labels_do_not_move_with_the_endpoint_that
             let described =
                 describe_at(&router, &case, endpoint.host, mirror.region, &repository).await;
             let uri = reported_uri(&case, &described);
-            let expected = format!(
-                "{}/{repository}",
-                endpoint.published_authority_in(mirror.region)
-            );
+            let expected = format!("{}/{repository}", endpoint.announced);
             assert_eq!(
                 uri, expected,
                 "case {case:?}: expected the mirror to be published at {expected:?}, got \

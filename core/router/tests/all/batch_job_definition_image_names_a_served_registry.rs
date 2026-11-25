@@ -12,8 +12,8 @@
 //! value on the first `/`, dials the authority and asks for the path reaches the very
 //! repository in this emulator.** `Repository$repositoryUri` is "The URI for the repository.
 //! You can use this URI for container image `push` and `pull` operations", so the authority
-//! has to resolve to this process: it is published in the DNS zone this emulator is reached
-//! in and on the port it is served on, never in a zone AWS publishes its own endpoints in,
+//! has to resolve to this process: it is the address this emulator is served at, host and
+//! port whole, never a name in a zone AWS publishes its own endpoints in,
 //! which resolves at genuine AWS infrastructure or nowhere near here. A consumer of
 //! `ContainerProperties$image` ("The image used to start a container") PULLS what it reads, so
 //! an address published there that nothing here answers on takes the pull out of the emulated
@@ -318,32 +318,6 @@ fn served_authority(served_base: &str) -> &str {
         .trim_end_matches('/')
 }
 
-/// The tail every address this emulator publishes for a caller to DIAL has to end in, for a
-/// deployment served at `served_base`: the DNS zone this process is reached in, and the port
-/// it is served on.
-///
-/// A name a service hands a client is a name the client resolves and then dials, so it has to
-/// lead back to this process: the zone is the served host's own name, or the loopback zone
-/// RFC 6761 reserves for an address when that host is an IP literal, which names no zone of
-/// its own but names the interface this process is reached on. An address served on the
-/// default port carries none, exactly as a host does. Derived from the row's own served
-/// address rather than imported, so an address published in anyone else's zone, or on a port
-/// nothing here listens on, fails these rows.
-fn served_zone_and_port(served_base: &str) -> String {
-    let authority = served_authority(served_base);
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port)) if port.chars().all(|digit| digit.is_ascii_digit()) => {
-            (host, format!(":{port}"))
-        }
-        _ => (authority, String::new()),
-    };
-    let zone = match host.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>() {
-        Ok(_address) => "localhost".to_string(),
-        Err(_not_an_address) => host.to_ascii_lowercase(),
-    };
-    format!(".{zone}{port}")
-}
-
 /// The string at `pointer`, or a panic naming the case and the body that carried none.
 fn string_at(case: &str, body: &Value, pointer: &str) -> String {
     body.pointer(pointer)
@@ -362,21 +336,24 @@ fn authority_and_path<'value>(case: &str, value: &'value str) -> (&'value str, &
 }
 
 /// Assert that `address` is published on an authority that leads back to THIS process — the
-/// zone this emulator is reached in and the port it is served on, and no name in a zone AWS
+/// address this emulator is served at, host and port whole, which is no name in a zone AWS
 /// publishes its own endpoints in — and answer that authority.
 ///
-/// Whether the authority carries the registry's own labels ahead of that zone is Amazon ECR's
-/// own rule and its own suites' subject (`src/state/registry_address.rs`,
-/// `tests/all/published_registry_address.rs`); what is read here is the half a consumer of the
-/// address depends on, which is that dialling it arrives at this emulator.
+/// A name a service hands a client is a name the client resolves and then dials, so it has to
+/// be one this process is reached at; whether anything is composed on top of that address is
+/// Amazon ECR's own rule and its own suites' subject (`src/state/registry_address.rs`,
+/// `tests/all/published_registry_address.rs`). What is read here is the half a consumer of the
+/// address depends on, which is that dialling it arrives at this emulator. Taken off the row's
+/// own served address rather than imported, so an address built on anything else fails these
+/// rows.
 fn assert_dialable_authority(case: &str, served_base: &str, address: &str) -> String {
     let (authority, _path) = authority_and_path(case, address);
     let lowered = authority.to_ascii_lowercase();
-    let tail = served_zone_and_port(served_base);
-    assert!(
-        lowered.ends_with(&tail),
-        "case {case:?}: expected {address:?} to be published in the zone and on the port this \
-         emulator is reached at ({tail:?}), got {authority:?}"
+    let served = served_authority(served_base).to_ascii_lowercase();
+    assert_eq!(
+        lowered, served,
+        "case {case:?}: expected {address:?} to be published at the address this emulator is \
+         reached at ({served:?}), got {authority:?}"
     );
     assert_no_aws_endpoint_zone(case, address, &lowered);
     authority.to_string()
