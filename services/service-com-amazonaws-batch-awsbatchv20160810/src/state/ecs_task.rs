@@ -292,7 +292,11 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     /// this module's header.
     pub(super) fn task_placement(&self, id: &str) -> Option<TaskPlacement> {
         let job = self.jobs.get(id)?;
-        let container = job.container.clone()?;
+        // The container the task RUNS: the job's effective container with this job's
+        // parameters substituted into its command and its environment
+        // ([`super::job_parameters`]). The declared properties are what the job REPORTS;
+        // this is what runs.
+        let container = self.job_run_container(id)?;
         let environment = self.placement_environment(id)?;
         if !environment.orchestrated_with_ecs() {
             return None;

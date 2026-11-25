@@ -346,6 +346,37 @@ fn validate_vcpus(resource: &ComputeResource) -> Result<(), String> {
     Ok(())
 }
 
+/// Which of [`crate::state::FARGATE_UNUPDATABLE_PARAMETERS`] this request names, if any:
+/// the members of `computeResources` that belong to Amazon EC2 and Spot compute resources
+/// alone, plus the request's own `updatePolicy`.
+///
+/// `true` as soon as one of them is present — the refusal names the whole set rather than
+/// the member that was named ([`crate::state::fargate_parameters_not_updatable_message`]),
+/// so which one it was changes nothing.
+fn names_fargate_unupdatable_parameter(
+    update: Option<&ComputeResourceUpdate>,
+    update_policy: Option<&UpdatePolicy>,
+) -> bool {
+    if update_policy.is_some() {
+        return true;
+    }
+    let Some(update) = update else {
+        return false;
+    };
+    update.allocation_strategy.is_some()
+        || update.bid_percentage.is_some()
+        || update.ec2_configuration.is_some()
+        || update.ec2_key_pair.is_some()
+        || update.image_id.is_some()
+        || update.instance_role.is_some()
+        || update.instance_types.is_some()
+        || update.launch_template.is_some()
+        || update.placement_group.is_some()
+        || update.tags.is_some()
+        || update.r#type.is_some()
+        || update.update_to_latest_image_version.is_some()
+}
+
 /// This operation's error channel, as the generated `impl Operation` names it
 /// (`crate::ops::update_compute_environment::UpdateComputeEnvironmentError`). Wrapping the modeled enum is what
 /// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
@@ -464,6 +495,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 environment.name,
                 batch::ORCHESTRATION_TYPE_ECS,
             )));
+        }
+
+        // `ComputeResource$instanceRole`: "This parameter isn't applicable to jobs that are
+        // running on Fargate resources. Don't specify it." — the note every member of
+        // [`batch::FARGATE_UNUPDATABLE_PARAMETERS`] carries. An environment whose compute
+        // resources run on Fargate has none of them to configure, so an update naming one is
+        // refused with the sentence that names the whole set
+        // ([`batch::fargate_parameters_not_updatable_message`]) and nothing is written.
+        if environment
+            .compute_resources
+            .as_ref()
+            .is_some_and(|resources| batch::is_fargate_compute_type(&resources.r#type))
+            && names_fargate_unupdatable_parameter(
+                input.compute_resources.as_ref(),
+                input.update_policy.as_ref(),
+            )
+        {
+            return Err(refuse(batch::fargate_parameters_not_updatable_message()));
         }
 
         // The compute resources the update leaves behind, computed before anything is

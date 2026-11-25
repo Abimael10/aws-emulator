@@ -6,7 +6,9 @@
 //! never an overwrite. The ARN is minted once, from the region the request was signed
 //! for, and stored with the record, so every later operation reports the same one. A
 //! MANAGED environment must bring `computeResources` (the model's own doc for that
-//! member), and the environment is returned in the non-terminal `CREATING` status, which
+//! member), whose compute resources must name the subnets they are launched into
+//! (`crate::state::compute_resource_subnets_detail`), and the environment is returned in
+//! the non-terminal `CREATING` status, which
 //! the clock moves to `VALID`.
 //!
 //! An environment this service orchestrates with Amazon ECS — managed or unmanaged — is
@@ -284,6 +286,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 return Err(CreateComputeEnvironmentErrorModeled::ClientException(
                     batch::client_exception_enveloped(batch::UNMANAGED_FARGATE_NOT_CREATABLE),
+                )
+                .into());
+            }
+            // The networking the compute resources are LAUNCHED INTO is required for every
+            // compute type that is launched into subnets, whoever manages it
+            // ([`batch::compute_resource_subnets_detail`]) — a request that names none
+            // describes an environment that could never place a task — so it is refused
+            // before any state is written and no environment is left behind.
+            if let Some(detail) = input
+                .compute_resources
+                .as_ref()
+                .and_then(batch::compute_resource_subnets_detail)
+            {
+                return Err(CreateComputeEnvironmentErrorModeled::ClientException(
+                    batch::client_exception_enveloped(detail),
                 )
                 .into());
             }

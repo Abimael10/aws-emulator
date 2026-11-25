@@ -331,6 +331,19 @@ pub struct JobContainerRun {
 }
 
 impl ComAmazonawsBatchAwsbatchv20160810State {
+    /// Whether `job` is a placed job whose container program has not been performed yet.
+    ///
+    /// The ONE predicate behind both the list of such jobs
+    /// ([`Self::jobs_awaiting_container_run`]) and the question the clock pump asks
+    /// ([`Self::has_pending_container_runs`]), so the two cannot disagree and asking costs
+    /// nothing but a read of the record.
+    fn awaits_a_container_run(job: &Job) -> bool {
+        job.status == JOB_STARTING
+            && job.container_run.is_none()
+            && job.task_arn.is_none()
+            && matches!(job.image_fetch, Some(ImageFetch::Served) | None)
+    }
+
     /// The placed jobs whose container program has not been performed yet.
     ///
     /// A job is one of them from the instant the placement put it into `STARTING` — where the
@@ -347,14 +360,12 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     pub fn jobs_awaiting_container_run(&self) -> Vec<JobContainerRun> {
         self.jobs
             .values()
-            .filter(|job| {
-                job.status == JOB_STARTING
-                    && job.container_run.is_none()
-                    && job.task_arn.is_none()
-                    && matches!(job.image_fetch, Some(ImageFetch::Served) | None)
-            })
+            .filter(|job| Self::awaits_a_container_run(job))
             .filter_map(|job| {
-                let container = job.container.as_ref()?;
+                // The container the job is actually RUN with: the one it declares with this
+                // job's parameters substituted into its command and its environment
+                // ([`super::job_parameters`]).
+                let container = self.job_run_container(&job.job_id)?;
                 let mut environment: Vec<(String, String)> = container
                     .environment
                     .iter()
@@ -393,8 +404,12 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
 
     /// Whether a placed job is still waiting for its container program to be performed, which
     /// is what keeps the clock pump awake until every job can take its next move.
+    ///
+    /// Answers the PREDICATE rather than building the runs: the records are what decide it, so
+    /// a tick of the clock costs one walk of the jobs map and never a substitution
+    /// ([`super::job_parameters`]) or a clone of a container.
     pub(super) fn has_pending_container_runs(&self) -> bool {
-        !self.jobs_awaiting_container_run().is_empty()
+        self.jobs.values().any(Self::awaits_a_container_run)
     }
 
     /// What `id`'s container program did, or `None` while it has not been performed.

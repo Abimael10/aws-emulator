@@ -283,6 +283,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+            // `JobTimeout$attemptDurationSeconds`: "The minimum value for the timeout is 60
+            // seconds." The member targets a plain `Integer`, so the documented bound is
+            // applied here — before any job is created in any status — and the submit's own
+            // timeout "overrides any timeout configuration specified in the job definition",
+            // so the bound binds whichever of the two the job would end up carrying
+            // ([`batch::attempt_duration_below_minimum_message`]).
+            if input
+                .timeout
+                .as_ref()
+                .and_then(|timeout| timeout.attempt_duration_seconds)
+                .is_some_and(|seconds| seconds < batch::MIN_ATTEMPT_DURATION_SECONDS)
+            {
+                return Err(SubmitJobErrorModeled::ClientException(
+                    batch::client_exception_enveloped(
+                        batch::attempt_duration_below_minimum_message(),
+                    ),
+                )
+                .into());
+            }
             if input.node_overrides.is_some() {
                 return Err(crate::scaffolded::Scaffolded::not_implemented(
                     "SubmitJob with nodeOverrides",
@@ -358,6 +377,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     batch::job_queue_not_enabled_message(&queue_arn),
                 ))
                 .into());
+            }
+
+            // `ConsumableResourceRequirement$consumableResource` is "the name or ARN of the
+            // consumable resource", so every entry of the list the job would carry must
+            // resolve to one this service holds: a job admitted holding a quantity of a
+            // resource that does not exist would make the consumable-resource accounting
+            // the scheduler admits jobs by wrong
+            // ([`batch::consumable_resource_does_not_exist_message`]). The list the job
+            // would carry is the submit's override where it names one and the definition's
+            // otherwise, which is the one the job is created with below.
+            let consumable_properties = input
+                .consumable_resource_properties_override
+                .clone()
+                .or_else(|| definition.consumable_resource_properties.clone());
+            for requirement in consumable_properties
+                .as_ref()
+                .and_then(|properties| properties.consumable_resource_list.as_deref())
+                .unwrap_or_default()
+            {
+                let Some(reference) = requirement.consumable_resource.as_deref() else {
+                    continue;
+                };
+                if state.consumable_resource(reference).is_none() {
+                    return Err(SubmitJobErrorModeled::ClientException(
+                        batch::client_exception(
+                            batch::consumable_resource_does_not_exist_message(
+                                &batch::resolved_arn(reference, |name| {
+                                    batch::consumable_resource_arn(&region, name)
+                                }),
+                            ),
+                        ),
+                    )
+                    .into());
+                }
             }
 
             // `RetryStrategy$attempts`: "The number of times to move a job to the RUNNABLE
@@ -470,9 +523,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .or(definition.scheduling_priority),
                 propagate_tags: input.propagate_tags.or(definition.propagate_tags),
                 platform_capabilities: definition.platform_capabilities.clone(),
-                consumable_resource_properties: input
-                    .consumable_resource_properties_override
-                    .or(definition.consumable_resource_properties),
+                consumable_resource_properties: consumable_properties,
                 // And it holds none of what those requirements claim yet: the quantity is
                 // taken when the scheduler ADMITS the job onto capacity
                 // (`state::consumable_claims`).

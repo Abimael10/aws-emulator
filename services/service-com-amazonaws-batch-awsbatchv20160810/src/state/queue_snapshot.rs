@@ -37,6 +37,38 @@ pub struct QueuedEntry {
     pub quota_share_name: Option<String>,
 }
 
+impl Job {
+    /// What capacity this job is HOLDING, per capacity unit: one entry per `ResourceType`
+    /// its container reserves a quantity of.
+    ///
+    /// `ResourceRequirement$type` is "the type of resource to assign to a container" and
+    /// `$value` "the quantity of the specified resource to reserve for the container", so the
+    /// reservation a container job is holding is its own requirement list, one entry per
+    /// resource, reported under the resource's own name as the capacity unit — the unit a
+    /// Batch capacity report of a container job is measured in, as
+    /// [`CAPACITY_UNIT_NUM_INSTANCES`] is for a service job's instances.
+    ///
+    /// A job holding no capacity ([`Job::holds_compute_capacity`]) is holding none of any
+    /// unit, so it reports nothing; the quantities are read off the job's own effective
+    /// container, so nothing here is derived from a request a reader made.
+    pub fn capacity_usage(&self) -> Vec<(String, f64)> {
+        if !self.holds_compute_capacity() {
+            return Vec::new();
+        }
+        let Some(container) = self.container.as_ref() else {
+            return Vec::new();
+        };
+        let mut per_unit: BTreeMap<String, f64> = BTreeMap::new();
+        for requirement in container.resource_requirements.iter().flatten() {
+            let Ok(quantity) = requirement.value.parse::<f64>() else {
+                continue;
+            };
+            *per_unit.entry(requirement.r#type.clone()).or_insert(0.0) += quantity;
+        }
+        per_unit.into_iter().collect()
+    }
+}
+
 impl ComAmazonawsBatchAwsbatchv20160810State {
     /// The entries at the front of the queue `arn`, in the order that queue dispatches them,
     /// capped at [`MAX_FRONT_OF_QUEUE_JOBS`] ("the first 100 RUNNABLE jobs").
@@ -128,10 +160,37 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         dispatched
     }
 
+    /// The CONTAINER jobs of the queue `arn` that are HOLDING capacity right now.
+    ///
+    /// A queue holds whichever kind of job its type takes, so this is the container-job half
+    /// of what "already dispatched jobs" means for a queue — the twin of
+    /// [`Self::dispatched_service_jobs_of_queue`]. A job is dispatched from the instant the
+    /// scheduler admitted it until it reaches a terminal status
+    /// ([`Job::holds_compute_capacity`]).
+    pub fn dispatched_jobs_of_queue(&self, arn: &str) -> Vec<&Job> {
+        self.jobs_by_queue
+            .get(arn)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.jobs.get(id))
+            .filter(|job| job.holds_compute_capacity())
+            .collect()
+    }
+
     /// How much capacity the queue `arn`'s dispatched jobs are using, per unit, summed over
     /// them — the queue's `totalCapacityUsage`.
+    ///
+    /// Over BOTH kinds of job a queue can hold: the container jobs admitted onto its compute
+    /// environments' capacity report the resources their containers reserve
+    /// ([`Job::capacity_usage`]), and the service jobs dispatched against its service
+    /// environments report the instances they were allocated.
     pub fn queue_capacity_usage(&self, arn: &str) -> Vec<(String, f64)> {
         let mut per_unit: BTreeMap<String, f64> = BTreeMap::new();
+        for job in self.dispatched_jobs_of_queue(arn) {
+            for (unit, quantity) in job.capacity_usage() {
+                *per_unit.entry(unit).or_insert(0.0) += quantity;
+            }
+        }
         for job in self.dispatched_service_jobs_of_queue(arn) {
             for (unit, quantity) in job.capacity_usage().unwrap_or_default() {
                 *per_unit.entry(unit).or_insert(0.0) += quantity;
@@ -146,13 +205,26 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     /// `share` picks which of the two share members names the share — `shareIdentifier` on a
     /// fair-share queue, `quotaShareName` on a quota-share one — so the one breakdown serves
     /// both of the reports the operation documents. A job that names no share of that kind is
-    /// in no share, so it is counted in the queue's total and in no breakdown.
+    /// in no share, so it is counted in the queue's total and in no breakdown. Over both
+    /// kinds of job the queue can hold, as the total is: a container job names only a
+    /// `shareIdentifier`, so it is in no quota-share breakdown.
     pub fn queue_capacity_usage_by_share(
         &self,
         arn: &str,
         share: ShareDimension,
     ) -> Vec<(String, Vec<(String, f64)>)> {
         let mut per_share: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
+        if share == ShareDimension::FairShare {
+            for job in self.dispatched_jobs_of_queue(arn) {
+                let Some(name) = job.share_identifier.clone() else {
+                    continue;
+                };
+                let holding = per_share.entry(name).or_default();
+                for (unit, quantity) in job.capacity_usage() {
+                    *holding.entry(unit).or_insert(0.0) += quantity;
+                }
+            }
+        }
         for job in self.dispatched_service_jobs_of_queue(arn) {
             let Some(name) = (match share {
                 ShareDimension::FairShare => job.share_identifier.clone(),

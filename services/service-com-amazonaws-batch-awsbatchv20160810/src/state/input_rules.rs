@@ -199,6 +199,112 @@ pub const QUOTA_SHARE_NAME_REQUIRED: &str = "Job without quotaShareName cannot b
                                              to a job queue with quota share scheduling \
                                              policy.";
 
+/// The `CRType` values whose compute resources are launched into VPC subnets the request
+/// must name.
+///
+/// `ComputeResource$subnets`: "The VPC subnets where the compute resources are launched …
+/// This parameter is required for compute environments using `EC2`, `SPOT`, `FARGATE`, or
+/// `FARGATE_SPOT` compute resources." The remaining member of the model's own `CRType`
+/// enum (`EC2 | SPOT | FARGATE | FARGATE_SPOT | ECS_MANAGED_INSTANCES`) carries its
+/// networking on its `managedInstancesProvider` instead, so it is not held to this rule.
+pub const SUBNET_LAUNCHED_COMPUTE_TYPES: &[&str] = &["EC2", "SPOT", "FARGATE", "FARGATE_SPOT"];
+
+/// What AWS Batch answers a compute environment created over compute resources launched
+/// into subnets ([`SUBNET_LAUNCHED_COMPUTE_TYPES`]) that names none.
+///
+/// The member is a plain `StringList` with no length constraint, so the requirement its own
+/// doc states is applied in the handler. The sentence states the RULE — which resource of
+/// the request is required — and carries no value of it, the form every input-validation
+/// refusal of this service takes, and is answered inside Batch's frontend envelope
+/// ([`super::client_exception_enveloped`]).
+pub const SUBNETS_REQUIRED: &str = "Resource subnets are required.";
+
+/// The detail a `computeResources` is refused with when the compute type it names is
+/// launched into subnets and the request names none, and `None` for every resource that
+/// satisfies the rule.
+///
+/// An empty list names no subnet, so it is refused exactly as an absent member is: the
+/// requirement is on the subnets the resources are launched into, not on the member being
+/// present.
+pub fn compute_resource_subnets_detail(resources: &ComputeResource) -> Option<&'static str> {
+    if !SUBNET_LAUNCHED_COMPUTE_TYPES.contains(&resources.r#type.as_str()) {
+        return None;
+    }
+    resources
+        .subnets
+        .as_ref()
+        .is_none_or(|subnets| subnets.is_empty())
+        .then_some(SUBNETS_REQUIRED)
+}
+
+/// What AWS Batch answers a submit whose `timeout.attemptDurationSeconds` is below the
+/// minimum the member documents.
+///
+/// `JobTimeout$attemptDurationSeconds`: "The minimum value for the timeout is 60 seconds."
+/// The member targets a plain `Integer`, so the bound is applied in the handler, and the
+/// sentence names the member path AWS names it by, with the bound interpolated from the
+/// constant the check reads ([`super::MIN_ATTEMPT_DURATION_SECONDS`]) so the sentence and
+/// the check cannot drift apart.
+pub fn attempt_duration_below_minimum_message() -> String {
+    format!(
+        "AttemptDurationSeconds in Timeout must be at least {MIN_ATTEMPT_DURATION_SECONDS} \
+         seconds."
+    )
+}
+
+/// How AWS Batch words the refusal of a job whose `consumableResourceList` names a
+/// consumable resource this service holds none of.
+///
+/// `ConsumableResourceRequirement$consumableResource` is "the name or ARN of the consumable
+/// resource", so a reference that resolves to nothing names a resource the job could never
+/// be given a quantity of. The sentence names the KIND and then the service's own
+/// not-found sentence for the ARN the reference resolved to
+/// ([`super::does_not_exist_sentence`]), so the one variable part is that ARN.
+pub fn consumable_resource_does_not_exist_message(arn: &str) -> String {
+    format!("Consumable resource {}", does_not_exist_sentence(arn))
+}
+
+/// The `computeResources` members — and the one request member beside them — that belong
+/// to Amazon EC2 and Spot compute resources alone, in the order AWS Batch lists them when
+/// it refuses an update that names one of them for a Fargate compute environment.
+///
+/// Each one's own doc says so: `ComputeResource$instanceRole` — "This parameter isn't
+/// applicable to jobs that are running on Fargate resources. Don't specify it." — and the
+/// same note stands on `allocationStrategy`, `bidPercentage`, `ec2Configuration`,
+/// `ec2KeyPair`, `imageId`, `instanceTypes`, `launchTemplate`, `placementGroup` and `tags`;
+/// `type`, `updatePolicy` and `updateToLatestImageVersion` configure the infrastructure
+/// update of an environment whose capacity is instances.
+pub const FARGATE_UNUPDATABLE_PARAMETERS: &[&str] = &[
+    "allocationStrategy",
+    "bidPercentage",
+    "ec2Configuration",
+    "ec2KeyPair",
+    "imageId",
+    "instanceRole",
+    "instanceTypes",
+    "launchTemplate",
+    "placementGroup",
+    "tags",
+    "type",
+    "updatePolicy",
+    "updateToLatestImageVersion",
+];
+
+/// What `UpdateComputeEnvironment` answers for a request naming any of
+/// [`FARGATE_UNUPDATABLE_PARAMETERS`] on a compute environment whose compute resources run
+/// on Fargate.
+///
+/// The sentence is WHOLLY FIXED: it names the member SET that does not apply — the caller's
+/// only guide to which field was wrong — and nothing of the request, so two callers that
+/// named different members of the set read one sentence. The list is interpolated from the
+/// set the check reads, so the sentence and the check cannot drift apart.
+pub fn fargate_parameters_not_updatable_message() -> String {
+    format!(
+        "The following parameters can't be updated for Fargate compute environment: {}.",
+        FARGATE_UNUPDATABLE_PARAMETERS.join(", ")
+    )
+}
+
 /// The smallest capacity a `capacityLimits` entry may allocate.
 ///
 /// Neither `QuotaShareCapacityLimit$maxCapacity` nor `CapacityLimit$maxCapacity` carries a
