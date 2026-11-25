@@ -8,12 +8,17 @@
 //! was missing.
 //!
 //! A status that FINISHES an act (`SUCCEEDED`, `FAILED`, `TIMED_OUT`) ends its execution,
-//! so a finished act admits only the outcomes a caller reports for one (`SUCCEEDED`,
-//! `FAILED`) and the status it already holds: a request naming any other status names one
-//! the act's current status does not admit, which is a `ValidationException` (400) with
-//! reason `InvalidStatus` whose message names the set the act does admit. Re-sending the
-//! status the act already holds changes nothing and succeeds, which is what this
-//! `@idempotent` operation promises a retry.
+//! and the request passes two independent checks against that. The VALUE check: the only
+//! statuses a caller may submit for a finished act are the outcomes it reports for one
+//! (`SUCCEEDED`, `FAILED`) and the status the act already holds, so a request naming any
+//! other status is a `ValidationException` (400) with reason `InvalidStatus` whose message
+//! names the set the act does admit. The STATE check: a finished act is FROZEN — its
+//! outcome is settled and no status change describes anything it still does — so a request
+//! naming a status DIFFERENT from the one it holds is refused with the same classification
+//! over this service's sentence for a resource whose state the write did not expect, and
+//! the stored act (status, `endedAt` and error information) is left exactly as it was.
+//! Re-sending the status the act already holds changes nothing and succeeds, which is what
+//! this `@idempotent` operation promises a retry.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +93,14 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// How a refusal of this operation names the kind of resource it found in a state the write
+/// did not expect: an act, spelled as the operations that work on one spell it (`CreateAct`,
+/// `UpdateAct`, `ListActs`), not as the hyphenated kind name a `resourceType` member
+/// carries — beside the sibling update's name for a workflow run. The sentence itself lives
+/// with this service's other state-transition refusals, in
+/// `crate::state::status_transition`.
+const ACT_RESOURCE_KIND: &str = "Act";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -221,13 +234,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .map_err(not_found)?;
 
-        // Which statuses the act can still take is a property of the status it holds
+        // Which VALUES a caller may submit is a property of the status the act holds
         // (`crate::state::ActStatus::admits`): a finished act has no execution left for a
-        // status that puts it back under way to describe, so it admits only the outcomes a
-        // caller reports for a finished act and the status it already holds — the retry an
-        // `@idempotent` operation must answer, which changes nothing. A status outside that
-        // set is refused with the set itself, read off the act's current status, so a
-        // caller learns which statuses the update would have taken.
+        // status that puts it back under way to describe, so the values it admits are the
+        // outcomes a caller reports for a finished act and the status it already holds — the
+        // retry an `@idempotent` operation must answer, which changes nothing. A status
+        // outside that set is refused with the set itself, read off the act's current
+        // status, so a caller learns which statuses the update would have taken.
         let current = act.status;
         if !current.admits(requested) {
             let admitted: Vec<&str> = current
@@ -237,6 +250,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect();
             return Err(UpdateActErrorModeled::ValidationException(
                 crate::state::status_transition::invalid_status(&admitted),
+            )
+            .into());
+        }
+
+        // Whether the act's STATE still takes a status change at all is the second, separate
+        // question (`crate::state::ActStatus::freezes_move_to`): an act that has finished has
+        // settled its outcome, so a request naming a different status — an admissible value
+        // included — changes nothing about an act that is already over and is refused before
+        // anything is written. This is what keeps a finished act's outcome authoritative
+        // against a late, retried or duplicated report: the first outcome stands, and the
+        // stale one is told the act was not in a state this write expected.
+        if current.freezes_move_to(requested) {
+            return Err(UpdateActErrorModeled::ValidationException(
+                crate::state::status_transition::in_unexpected_state(ACT_RESOURCE_KIND),
             )
             .into());
         }

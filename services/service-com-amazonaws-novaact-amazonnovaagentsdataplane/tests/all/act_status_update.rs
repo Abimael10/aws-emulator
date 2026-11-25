@@ -5,14 +5,15 @@
 //!
 //! The rule these cases assert is not "this one request answers these bytes": the update
 //! resolves the act by walking the chain the path names (definition -> run -> session ->
-//! act) and refusing the first link the store does not hold with 404, moves the act to
-//! whichever status the act's current status admits, keeps `endedAt` in step with that
+//! act) and refusing the first link the store does not hold with 404, moves an act still
+//! under way to whichever status the request names, keeps `endedAt` in step with that
 //! status (reported exactly when the act has reached a status that finishes it, absent
 //! otherwise), records the error information the request carries, and refuses with 400
-//! `InvalidStatus` a request naming a status the act's current one does not admit — while
+//! `InvalidStatus` a request that would move an act that has already FINISHED — while
 //! re-sending the status the act already holds changes nothing, as an `@idempotent`
-//! operation's retry must. The SENTENCE that refusal carries is asserted by the sibling
-//! suite `act_status_transition_refusal.rs`, which drives the same harness.
+//! operation's retry must. WHICH of the two sentences such a refusal carries is asserted by
+//! the sibling suites `act_status_transition_refusal.rs` (the admissible-set sentence) and
+//! `act_terminal_status_freeze.rs` (the settled-act sentence), which drive this harness.
 //!
 //! So the tables below vary what that rule generalises over: which of the six statuses
 //! `ActStatus` declares is asked for, whether it is a finishing one, the status the act
@@ -40,9 +41,11 @@ const ABSENT_UUID: &str = "00000000-0000-4000-8000-000000000000";
 pub(crate) const FINISHED_STATUSES: [&str; 3] = ["SUCCEEDED", "FAILED", "TIMED_OUT"];
 
 /// The values of `ActStatus` that are an OUTCOME a caller reports for an act it ran — the
-/// set a finished act still admits, as the service's refusal for a finished act names it.
-/// `TIMED_OUT` is not one of them: it is the verdict reached when an act runs out of time,
-/// not an outcome submitted for an act that has already finished.
+/// set a finished act still admits as a VALUE, as the service's admissible-set refusal for
+/// a finished act names it (a finished act's STATE then refuses the move itself, which
+/// `act_terminal_status_freeze.rs` asserts). `TIMED_OUT` is not one of them: it is the
+/// verdict reached when an act runs out of time, not an outcome submitted for an act that
+/// has already finished.
 pub(crate) const REPORTED_OUTCOMES: [&str; 2] = ["SUCCEEDED", "FAILED"];
 
 /// The status `CreateAct` stores a new act in: an act is driven by its client, so one that
@@ -162,7 +165,10 @@ pub(crate) async fn summary(emulator: &Emulator, chain: &Chain, act_id: &str) ->
 
 /// The error information one act holds, read straight out of the store: `ActError` is
 /// reported by no operation this model declares.
-fn stored_error(
+///
+/// `pub(crate)` so the sibling suite that asserts a refused update wrote NOTHING checks the
+/// act's error information through this one reader.
+pub(crate) fn stored_error(
     emulator: &Emulator,
     chain: &Chain,
     act_id: &str,
@@ -262,19 +268,15 @@ async fn an_act_still_under_way_moves_between_unfinished_statuses() {
     }
 }
 
-/// An act that has finished admits only an outcome a caller reports for it and the status
-/// it already holds: a request naming any other status is refused, and the act keeps the
-/// status and the instant it finished with.
+/// An act that has finished takes no further status at all: every status but the one it
+/// already holds is refused, and the act keeps the status and the instant it finished with.
 #[tokio::test]
-async fn a_finished_act_refuses_a_status_it_does_not_admit() {
+async fn a_finished_act_refuses_every_status_but_the_one_it_holds() {
     let emulator = Emulator::new("us-east-1");
     let chain = chain(&emulator, DEFINITION).await;
 
     for finished in FINISHED_STATUSES {
-        for requested in ACT_STATUS_VALUES
-            .iter()
-            .filter(|value| **value != finished && !REPORTED_OUTCOMES.contains(&**value))
-        {
+        for requested in ACT_STATUS_VALUES.iter().filter(|value| **value != finished) {
             let label = format!("{finished} then {requested}");
             let act_id = new_act(&emulator, &chain, &label).await;
             let (status, answer) = move_to(&emulator, &chain, &act_id, finished).await;
@@ -306,41 +308,6 @@ async fn a_finished_act_refuses_a_status_it_does_not_admit() {
             assert_eq!(
                 after, finished_summary,
                 "case {label:?}: the refused update must change nothing, got {after}"
-            );
-        }
-    }
-}
-
-/// The statuses a finished act DOES admit are taken: whichever outcome a caller reports
-/// for an act is stored, and the act stays finished.
-#[tokio::test]
-async fn a_finished_act_takes_an_outcome_it_admits() {
-    let emulator = Emulator::new("eu-central-1");
-    let chain = chain(&emulator, DEFINITION).await;
-
-    for finished in FINISHED_STATUSES {
-        for requested in REPORTED_OUTCOMES {
-            let label = format!("{finished} then {requested}");
-            let act_id = new_act(&emulator, &chain, &label).await;
-            let (status, answer) = move_to(&emulator, &chain, &act_id, finished).await;
-            assert_eq!(
-                status, 200,
-                "case {label:?}: the act must finish first, got {status} {answer}"
-            );
-
-            let (status, answer) = move_to(&emulator, &chain, &act_id, requested).await;
-            assert_eq!(
-                status, 200,
-                "case {label:?}: an admitted status must be taken, got {status} {answer}"
-            );
-            let stored = summary(&emulator, &chain, &act_id).await;
-            assert_eq!(
-                stored["status"], requested,
-                "case {label:?}: expected the listing to report {requested:?}, got {stored}"
-            );
-            assert!(
-                !stored["endedAt"].is_null(),
-                "case {label:?}: a finished act reports endedAt, got {stored}"
             );
         }
     }

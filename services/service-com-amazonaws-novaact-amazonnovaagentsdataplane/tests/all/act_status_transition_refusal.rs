@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! `UpdateAct`: the SENTENCE the refusal of a status the act's current status does not
-//! admit carries.
+//! admit as a VALUE carries.
 //!
-//! The rule: a status write the resource's current status does not admit is HTTP 400
-//! `ValidationException` with reason `InvalidStatus` (the value
+//! The rule: a status write naming a value the resource's current status does not admit is
+//! HTTP 400 `ValidationException` with reason `InvalidStatus` (the value
 //! `smithy_query(query="shape",shape="ValidationExceptionReason")` declares for it) whose
 //! message states the SET of statuses that state DOES admit — `Status must be one of [`,
 //! the values separated by `", "`, then `]` — so a caller can read the admissible values
 //! out of the refusal and pick a legal one. The set is computed from the act's current
 //! status, not written per operation, and the sentence echoes nothing of the request.
+//!
+//! A value the act's state DOES admit is then weighed against that state, which is the
+//! separate refusal the sibling suite `act_terminal_status_freeze.rs` asserts; the rows
+//! below name which sentence each case expects, so the two branches cannot be confused.
 //!
 //! So the table below varies what the rule generalises over: which status the act finished
 //! in (each of the three that finish one), which status is then asked for (each of the six
@@ -22,17 +26,18 @@ use service_com_amazonaws_novaact_amazonnovaagentsdataplane::ops::types::ACT_STA
 use crate::act_status_update::{
     chain, move_to, new_act, summary, Chain, FINISHED_STATUSES, REPORTED_OUTCOMES,
 };
+use crate::act_terminal_status_freeze::ACT_IN_UNEXPECTED_STATE;
 use crate::workflow_lifecycle::{text, Emulator};
 
 /// The definition each case builds its chain under.
 const DEFINITION: &str = "act-status-refusal";
 
-/// The set of statuses an act whose current status is `current` admits, spelled out here
+/// The set of VALUES an act whose current status is `current` admits, spelled out here
 /// rather than taken from the crate so the handler and the expectation cannot be reworded
 /// together: an act still under way admits every status the model declares, and a finished
 /// one admits the outcomes a caller reports for a finished act plus the status it already
 /// holds (which an `@idempotent` retry re-sends, and which moves nothing).
-fn admitted(current: &str) -> Vec<&'static str> {
+pub(crate) fn admitted(current: &str) -> Vec<&'static str> {
     let mut admitted: Vec<&'static str> = ACT_STATUS_VALUES
         .iter()
         .copied()
@@ -48,7 +53,10 @@ fn admitted(current: &str) -> Vec<&'static str> {
 }
 
 /// The sentence this service states for a status the act's current status does not admit.
-fn expected_message(current: &str) -> String {
+///
+/// `pub(crate)` so the sibling suite that owns the OTHER refusal on this member tells the
+/// two sentences apart against this one reading of it.
+pub(crate) fn expected_message(current: &str) -> String {
     format!("Status must be one of [{}]", admitted(current).join(", "))
 }
 
@@ -88,10 +96,11 @@ async fn the_refusal_names_the_statuses_the_act_admits() {
         for requested in ACT_STATUS_VALUES {
             let label = format!("{finished} then {requested}");
             let (status, answer) = refusal(&emulator, &chain, finished, requested).await;
-            if admitted(finished).contains(requested) {
+            if *requested == finished {
                 assert_eq!(
                     status, 200,
-                    "case {label:?}: an admitted status must be taken, got {status} {answer}"
+                    "case {label:?}: re-sending the status the act holds must be accepted, \
+                     got {status} {answer}"
                 );
                 continue;
             }
@@ -99,6 +108,19 @@ async fn the_refusal_names_the_statuses_the_act_admits() {
                 status, 400,
                 "case {label:?}: expected HTTP 400, got {status} {answer}"
             );
+            if admitted(finished).contains(requested) {
+                // The VALUE is admissible for an act in this state, so what refuses the call
+                // is the act's own settled state: the sibling suite owns that sentence, and
+                // the only requirement here is that the admissible-set sentence is NOT the
+                // one answered.
+                let message = text(&answer, "message");
+                assert_eq!(
+                    message, ACT_IN_UNEXPECTED_STATE,
+                    "case {label:?}: an admissible value refused by the act's state carries \
+                     the settled-act sentence, got {message:?}"
+                );
+                continue;
+            }
             assert_eq!(
                 answer["__type"], "ValidationException",
                 "case {label:?}: expected ValidationException, got {answer}"

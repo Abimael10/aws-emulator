@@ -413,20 +413,37 @@ impl ActStatus {
         matches!(self, Self::Succeeded | Self::Failed)
     }
 
-    /// Whether an act whose current status is this one admits a move to `requested`.
+    /// Whether an act whose current status is this one admits a caller SUBMITTING
+    /// `requested` for it at all — the check on the VALUE the request names, independent of
+    /// whether the act's state still takes a status change ([`Self::freezes_move_to`]).
     ///
     /// An act still under way admits every status the model declares: it can keep running,
-    /// wait on an action, finish, fail or run out of time. An act that has FINISHED has no
-    /// execution left for a status that puts it back under way to describe, so it admits
-    /// only the outcomes a caller reports for a finished act — and the status it already
-    /// holds, which an `@idempotent` retry re-sends and which moves nothing.
+    /// wait on an action, finish, fail or run out of time. For an act that has FINISHED
+    /// there is no execution left for a status that puts it back under way to describe, so
+    /// the only values a caller may submit for one are the outcomes it reports for a
+    /// finished act — and the status the act already holds, which an `@idempotent` retry
+    /// re-sends and which moves nothing.
     ///
-    /// The model states no transition rule for the member, so which statuses a finished act
+    /// The model states no transition rule for the member, so which values a finished act
     /// admits is read off the refusal AWS answers for one it does not: that refusal names
     /// the two reported outcomes. Keeping the held status in the set is what the operation's
     /// `@idempotent` contract already requires of a retry.
     pub fn admits(self, requested: Self) -> bool {
         requested == self || !self.is_terminal() || requested.is_reported_outcome()
+    }
+
+    /// Whether an act whose current status is this one is FROZEN against a move to
+    /// `requested`: whether its state takes no status change at all, whichever value the
+    /// request names.
+    ///
+    /// An act that has FINISHED has its outcome recorded and no execution a further status
+    /// could describe, so a request naming a DIFFERENT status is a write against a state
+    /// that takes none — refused, with the stored act left as it is, so a late or duplicated
+    /// report cannot rewrite the outcome the act settled on. Re-sending the status the act
+    /// already holds moves nothing and is the retry this service's `@idempotent` update
+    /// answers, so it is not frozen out.
+    pub fn freezes_move_to(self, requested: Self) -> bool {
+        self.is_terminal() && requested != self
     }
 
     /// Every status an act whose current status is this one admits ([`Self::admits`]), in
