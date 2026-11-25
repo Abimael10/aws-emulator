@@ -420,7 +420,10 @@ pub(super) async fn revoke_lake_formation_permissions(
 
 /// The error code Lake Formation answers for an entity it cannot resolve
 /// (`EntityNotFoundException`, the modelled 400 both calls declare).
-const LAKEFORMATION_ENTITY_NOT_FOUND: &str = "EntityNotFoundException";
+///
+/// Visible to the rest of the provisioner because every arm that calls this service judges a
+/// resource it no longer holds on this one code ([`super::lake_formation_data_cells_filters`]).
+pub(super) const LAKEFORMATION_ENTITY_NOT_FOUND: &str = "EntityNotFoundException";
 
 /// Apply a CHANGED declaration to the grant the stack holds: the revoke of every permission
 /// it no longer carries, and the grant of every one it adds.
@@ -561,7 +564,11 @@ fn reported_grant(answered: &Value, principal: &str) -> Option<Value> {
 
 /// Call one Lake Formation operation on the `restJson1` wire its model declares, naming the
 /// operation so a refusal is reported the way that service's own SDK raises it.
-async fn call_lake_formation(
+///
+/// Visible to the rest of the provisioner because more than one type is provisioned in this
+/// service, and they have to address it the same way
+/// ([`super::lake_formation_data_cells_filters`]).
+pub(super) async fn call_lake_formation(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     operation: &str,

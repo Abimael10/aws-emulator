@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDataCellsFilter
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDataCellsFilter`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDataCellsFilter::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one data cells filter from
+//! [`crate::state::ComAmazonawsLakeformationAwslakeformationState`]'s
+//! `data_cells_filters`, addressed by the (table catalog, database, table, filter name)
+//! tuple [`crate::state::data_cells_filter_key`] renders — the same identity
+//! `CreateDataCellsFilter` stored it under.
+//!
+//! A tuple the store holds no filter under is refused with the modelled
+//! `EntityNotFoundException`, as the reader of the same filter is: the delete of a filter
+//! that is not there removed nothing, so reporting success for it would tell the caller
+//! something that did not happen.
+//!
+//! Unlike this operation's three siblings, every member of its input is modelled OPTIONAL —
+//! so a request that leaves one out addresses no filter at all, which is the empty-string
+//! part of the key it renders: that tuple is one no create can store, because every member
+//! of `DataCellsFilter` is modelled required, so such a request is answered the same
+//! not-found way.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +156,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDataCellsFilter` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDataCellsFilterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDataCellsFilter"))
+        // The caller the audit record below attributes this state change to.
+        let akid = ::engine::extract_akid(&ctx.parts().headers);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteDataCellsFilterErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("LakeFormation state is unavailable".to_string()),
+            })
+        })?;
+
+        // Every member is modelled optional, so a request that names only some of them
+        // addresses the tuple it rendered and no other — one nothing can be stored under.
+        let table_catalog_id = input.table_catalog_id.unwrap_or_default();
+        let database_name = input.database_name.unwrap_or_default();
+        let table_name = input.table_name.unwrap_or_default();
+        let name = input.name.unwrap_or_default();
+        let key = crate::state::data_cells_filter_key(
+            &table_catalog_id,
+            &database_name,
+            &table_name,
+            &name,
+        );
+
+        let mut store = state.lock();
+        if store.data_cells_filters.remove(&key).is_none() {
+            return Err(
+                DeleteDataCellsFilterErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::FILTER_ENTITY_NOT_FOUND.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The audit record for a state change: who, what, where, outcome. No secret and
+        // no credential material — the access key id identifies the caller the way the
+        // real service's trail does.
+        tracing::info!(
+            operation = "DeleteDataCellsFilter",
+            akid = %akid,
+            table_catalog_id = %table_catalog_id,
+            database_name = %database_name,
+            table_name = %table_name,
+            name = %name,
+            outcome = "deleted",
+            "Data cells filter deleted"
+        );
+
+        // `DeleteDataCellsFilterResponse` models no members: the proof of the removal is
+        // what `GetDataCellsFilter` and `ListDataCellsFilter` no longer report.
+        Ok(DeleteDataCellsFilterOutput {})
     }
 }

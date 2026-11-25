@@ -58,6 +58,14 @@ pub const UNSUPPORTED_RESOURCE_ARN: &str = "Un-supported resource arn format";
 /// refusal is this sentence whatever the expression was.
 pub const ROW_FILTER_BOTH_SET: &str = "Filter expression and AllRowsWildcard cannot both be set.";
 
+/// What a create or an update of a data cells filter that states NO `RowFilter` at all
+/// answers.
+///
+/// A data cells filter describes "certain columns on certain rows", so the row predicate is
+/// as much a part of one as the columns are: the member is optional in the shape, and the
+/// service requires it of the filter. Wholly fixed text: nothing of the request is echoed.
+pub const ROW_FILTER_REQUIRED: &str = "Row filter cannot be null";
+
 /// What a call whose `Resource.Table` names BOTH a table `Name` and a `TableWildcard`
 /// answers.
 ///

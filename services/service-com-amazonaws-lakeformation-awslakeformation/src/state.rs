@@ -12,7 +12,7 @@ use std::time::SystemTime;
 use crate::ops::types::{
     AllRowsWildcard, ColumnWildcard, Condition, DataCellsFilter, DataLakePrincipal,
     DataLakeSettings, DatabaseResource, LFTag, PrincipalPermissions, PrincipalResourcePermissions,
-    Resource, RowFilter, TableWithColumnsResource,
+    Resource, RowFilter, TableResource, TableWithColumnsResource,
 };
 
 /// The Glue Data Catalog's own store, in the same shared engine.
@@ -544,9 +544,12 @@ pub fn validate_column_choice(
 ///   data cells filter's own: `TableWithColumnsResource$ColumnNames` documents no nesting
 ///   at all, so it is not held to a depth the model states only for `DataCellsFilter`.
 ///
-/// A `RowFilter` is held to the same "exactly one" rule over its own two alternatives: a
-/// PartiQL predicate is either an expression or the all-rows wildcard, and a predicate
-/// that is neither selects no rows.
+/// A `RowFilter` is REQUIRED of the filter, and held to the same "exactly one" rule over
+/// its own two alternatives: a PartiQL predicate is either an expression or the all-rows
+/// wildcard, and a predicate that is neither selects no rows. The member is optional in the
+/// shape and the service requires it of the filter ([`ROW_FILTER_REQUIRED`]), a filter
+/// describing "certain columns on certain rows" (`smithy_query(query="shape",
+/// shape="DataCellsFilter")`) no more without its rows than without its columns.
 pub fn validate_data_cells_filter(filter: &DataCellsFilter) -> Result<(), String> {
     validate_column_choice(
         "TableData",
@@ -595,6 +598,10 @@ pub fn validate_data_cells_filter(filter: &DataCellsFilter) -> Result<(), String
                     .to_string(),
             );
         }
+    } else {
+        // No predicate at all names no rows, which is the same gap as a predicate naming
+        // neither alternative: the service answers its own sentence for it.
+        return Err(ROW_FILTER_REQUIRED.to_string());
     }
     Ok(())
 }
@@ -1834,6 +1841,66 @@ pub fn decode_permissions_page_token(token: &str) -> Option<String> {
         return None;
     }
     Some(grant_key.to_string())
+}
+
+/// The tag identifying a `ListDataCellsFilter` continuation token this service minted. It
+/// differs from the prefixes above so a token minted for one paginated operation is not
+/// accepted by another.
+const FILTERS_TOKEN_PREFIX: &str = "lffilters";
+
+/// An opaque continuation token standing for "resume strictly after this filter key".
+///
+/// Hex-wrapped and self-describing for the same reasons as [`encode_page_token`].
+pub fn encode_filters_page_token(filter_key: &str) -> String {
+    let plain = format!(
+        "{FILTERS_TOKEN_PREFIX}{TOKEN_SEPARATOR}{TOKEN_VERSION}{TOKEN_SEPARATOR}{filter_key}"
+    );
+    hex::encode(plain)
+}
+
+/// The filter key a token names an exclusive start at, or `None` when the token was not
+/// minted by [`encode_filters_page_token`] (so the caller is refused rather than silently
+/// served page one).
+///
+/// The key is the token's LAST field and is taken whole (`splitn`), for the reason
+/// [`decode_permissions_page_token`] records: it embeds request-supplied text and must
+/// survive the round trip byte for byte.
+pub fn decode_filters_page_token(token: &str) -> Option<String> {
+    let bytes = hex::decode(token).ok()?;
+    let plain = String::from_utf8(bytes).ok()?;
+    let mut fields = plain.splitn(3, TOKEN_SEPARATOR);
+    let prefix = fields.next()?;
+    let version = fields.next()?;
+    let filter_key = fields.next()?;
+    if prefix != FILTERS_TOKEN_PREFIX || version != TOKEN_VERSION {
+        return None;
+    }
+    Some(filter_key.to_string())
+}
+
+/// The largest page `ListDataCellsFilter` answers, and the page size it uses when the
+/// caller names none.
+///
+/// Grounded in the model: `ListDataCellsFilter$MaxResults` is `range 1..1000`, and the
+/// output member `DataCellsFilters` targets `DataCellsFilterList`, which carries no length
+/// constraint of its own — so the request's own published maximum is what bounds a page.
+pub const MAX_DATA_CELLS_FILTERS_PAGE: i32 = 1000;
+
+/// Why the `Table` a listing names cannot name a table, or `Ok(())` when it names one — the
+/// message of the modelled `InvalidInputException` the reader answers with.
+///
+/// `TableResource` carries the same choice `validate_resource` holds a grant's table to:
+/// "At least one of `TableResource$Name` or `TableResource$TableWildcard` is required."
+/// (`smithy_query(query="doc",shape="TableResource",member="TableWildcard")`), and naming
+/// both names no table ([`TABLE_NAME_AND_WILDCARD`]). Stated here as well as there because
+/// a listing names its table OUTSIDE a `Resource`, and the two readings of the one rule are
+/// the same sentences.
+pub fn validate_listed_table(table: &TableResource) -> Result<(), String> {
+    match (table.name.is_some(), table.table_wildcard.is_some()) {
+        (true, true) => Err(TABLE_NAME_AND_WILDCARD.to_string()),
+        (false, false) => Err("Table must name either Name or TableWildcard".to_string()),
+        _ => Ok(()),
+    }
 }
 
 /// The table permissions Lake Formation records at COLUMN scope.

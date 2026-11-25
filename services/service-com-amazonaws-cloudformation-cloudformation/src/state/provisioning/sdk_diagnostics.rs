@@ -300,6 +300,18 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     // emulator provisions over this signing name is that service's (the two cluster types and
     // the configuration).
     ("kafka", "Kafka", SdkDiagnostic::Attempts),
+    // Lake Formation's SDK names it `LakeFormation` — that model's own `sdkId`
+    // (`smithy_query(query="service_info")` on that service's model), which is also the
+    // `cloudFormationName` its resource types are spelled with. The shape is the
+    // ATTEMPT-counting one, as the recorded `ResourceStatusReason` of an
+    // `AWS::LakeFormation::DataCellsFilter` declared without a row predicate carries it (in
+    // the behavioral corpus `simparity-behavioral-aws-v1`, check `cloudformation__glue__\
+    // lakeformation.deploy-cfn-lakeformation-datacellsfilter-missing-row-filter-rolled-back`,
+    // whose reason quotes `<the service's sentence> (Service: LakeFormation, Status Code:
+    // 400, Request ID: …) (SDK Attempt Count: …)`). Every type this emulator provisions over
+    // this signing name is that service's (the two permission types and the data cells
+    // filter).
+    ("lakeformation", "LakeFormation", SdkDiagnostic::Attempts),
     ("lambda", "Lambda", SdkDiagnostic::Attempts),
     // Amazon CloudWatch Logs's SDK names it by that model's own `sdkId` (`CloudWatch Logs`,
     // `smithy_query(query="service_info")` on that service's model) written as one word,

@@ -145,6 +145,17 @@ pub(super) const REQUIRED_PROPERTIES: &[RequiredProperties] = &[
             "Type",
         ],
     },
+    // `AWS::LakeFormation::DataCellsFilter`: a filter is a resource OF a catalog table, so
+    // the four values that address one — the catalog, the database, the table and the
+    // filter's own name — are each published "Required: Yes" and are the members
+    // `GetDataCellsFilter` and `DeleteDataCellsFilter` declare required, and the type
+    // declares no name CloudFormation could generate. Its `RowFilter` is NOT one of them:
+    // the type publishes it "Required: No", so a declaration that omits it reaches Lake
+    // Formation and is refused by that service's own validation of the filter.
+    RequiredProperties {
+        resource_type: crate::state::provisioner::lake_formation_data_cells_filters::LAKEFORMATION_DATA_CELLS_FILTER,
+        required: crate::state::provisioner::lake_formation_data_cells_filters::DATA_CELLS_FILTER_ADDRESS,
+    },
     // `AWS::IoT::Authorizer`: the authorizer IS the function that authorizes, so
     // `AuthorizerFunctionArn` is published "Required: Yes" and is the member
     // `CreateAuthorizer` declares required beside the name.

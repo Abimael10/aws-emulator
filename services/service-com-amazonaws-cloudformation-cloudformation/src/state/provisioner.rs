@@ -1695,6 +1695,13 @@ pub(super) enum Provisioner {
     /// with the variant, the spelling of the declaration being all that differs between them
     /// ([`lake_formation_permissions::Grant`]).
     LakeFormationPermissions(lake_formation_permissions::Grant),
+    /// `AWS::LakeFormation::DataCellsFilter`: ONE cell-level filter on a Data Catalog table,
+    /// which that service's own `CreateDataCellsFilter` records and
+    /// `DeleteDataCellsFilter` removes. A filter is a resource OF the table: every call
+    /// about one addresses it by the catalog, the database, the table and the filter's own
+    /// name, which is what the type's `Ref` returns
+    /// ([`lake_formation_data_cells_filters`]).
+    LakeFormationDataCellsFilter,
     /// `AWS::EC2::ClientVpnEndpoint`: the Client VPN endpoint Amazon EC2's own
     /// `CreateClientVpnEndpoint` makes out of the client address range, the certificates and
     /// the authentication options the declaration states, and `DeleteClientVpnEndpoint`
@@ -2082,6 +2089,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         LAKEFORMATION_PRINCIPAL_PERMISSIONS => Some(Provisioner::LakeFormationPermissions(
             lake_formation_permissions::Grant::Principal,
         )),
+        LAKEFORMATION_DATA_CELLS_FILTER => Some(Provisioner::LakeFormationDataCellsFilter),
         EC2_CLIENT_VPN_ENDPOINT => Some(Provisioner::Ec2ClientVpnEndpoint),
         EC2_CLIENT_VPN_AUTHORIZATION_RULE => Some(Provisioner::Ec2ClientVpnAuthorizationRule),
         REKOGNITION_COLLECTION => Some(Provisioner::RekognitionCollection),
@@ -2341,6 +2349,12 @@ impl Provisioner {
             // rather than the id, and it takes away exactly what the stack granted.
             Self::LakeFormationPermissions(grant) => {
                 revoke_lake_formation_permissions(ctx, region, grant, resource).await
+            }
+            // A data cells filter is addressed by the four values that service keys one by,
+            // which the resource's own declaration carries — so the delete takes the whole
+            // record rather than the id.
+            Self::LakeFormationDataCellsFilter => {
+                Box::pin(delete_lake_formation_data_cells_filter(ctx, region, resource)).await
             }
             // A Client VPN endpoint is addressed by the `cvpn-endpoint-…` id Amazon EC2
             // minted for it, which is this resource's physical id.
@@ -3260,6 +3274,13 @@ mod mediaconvert_certificates;
 /// own NAMES live here, beside the arms that provision them, and the return-value catalogue
 /// computes each type's published identity from the same rules.
 pub(in crate::state) mod lake_formation_permissions;
+/// The LAKE FORMATION DATA CELLS FILTER arms: the cell-level filter an
+/// `AWS::LakeFormation::DataCellsFilter` declares on one of the Data Catalog tables
+/// [`platform_services`] creates, created in the service that owns it so a client's own
+/// `ListDataCellsFilter` on that table reads the filter back. Visible to the rest of this
+/// service's state because the type's own NAME and the properties its identity IS live here,
+/// beside the arms that provision it.
+pub(in crate::state) mod lake_formation_data_cells_filters;
 mod data_and_storage;
 /// The in-place CHANGE of an `AWS::KinesisFirehose::DeliveryStream`, beside the create and
 /// delete arms [`data_and_storage`] holds for the same owning service: applying a changed
@@ -3525,6 +3546,7 @@ use glue_table_optimizers::*;
 use glue_triggers::*;
 use mediaconvert_certificates::*;
 use lake_formation_permissions::*;
+use lake_formation_data_cells_filters::*;
 use iam_identities::*;
 use data_and_storage::*;
 use firehose_delivery_streams::*;

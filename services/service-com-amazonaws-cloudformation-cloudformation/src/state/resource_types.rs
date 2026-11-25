@@ -85,6 +85,7 @@ use super::provisioner::neptune_relational::{
     NEPTUNE_DB_CLUSTER_PARAMETER_GROUP, NEPTUNE_DB_PARAMETER_GROUP, NEPTUNE_DB_SUBNET_GROUP,
     NEPTUNE_GLOBAL_CLUSTER,
 };
+use super::provisioner::lake_formation_data_cells_filters::LAKEFORMATION_DATA_CELLS_FILTER;
 use super::provisioner::redshift_event_subscriptions::REDSHIFT_EVENT_SUBSCRIPTION;
 use super::provisioner::redshift_snapshot_copy_grants::REDSHIFT_SNAPSHOT_COPY_GRANT;
 use super::provisioner::redshift_serverless::{
@@ -768,6 +769,10 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::KinesisFirehose::DeliveryStream",
     // AWS Lake Formation
     "AWS::LakeFormation::DataLakeSettings",
+    // The cell-level filter on a Data Catalog table, created in the owning service
+    // (`super::provisioner`), which keys one by the catalog, the database, the table and the
+    // filter's own name.
+    LAKEFORMATION_DATA_CELLS_FILTER,
     "AWS::LakeFormation::Permissions",
     "AWS::LakeFormation::PrincipalPermissions",
     "AWS::LakeFormation::Resource",

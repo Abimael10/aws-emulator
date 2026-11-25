@@ -1635,6 +1635,14 @@ pub fn composite_identity_properties(resource_type: &str) -> &'static [&'static 
         COGNITO_IDENTITY_POOL_PRINCIPAL_TAG => &["IdentityPoolId", "IdentityProviderName"],
         ACMPCA_PERMISSION => &["CertificateAuthorityArn", "Principal"],
         GLUE_TABLE_OPTIMIZER => &["CatalogId", "DatabaseName", "TableName", "Type"],
+        // An `AWS::LakeFormation::DataCellsFilter` is
+        // `<TableCatalogId>|<DatabaseName>|<TableName>|<Name>`: a filter is a resource OF a
+        // catalog table, which `CreateDataCellsFilter`, `GetDataCellsFilter` and
+        // `DeleteDataCellsFilter` each address by those four together, and Lake Formation
+        // mints no identifier for one.
+        crate::state::provisioner::lake_formation_data_cells_filters::LAKEFORMATION_DATA_CELLS_FILTER => {
+            crate::state::provisioner::lake_formation_data_cells_filters::DATA_CELLS_FILTER_ADDRESS
+        }
         // An `AWS::EC2::ClientVpnAuthorizationRule` is `<ClientVpnEndpointId>|<TargetNetworkCidr>`:
         // Amazon EC2 mints no identifier for an authorization rule, every call on one naming
         // it by the endpoint it is on and the network it grants access to, and the type

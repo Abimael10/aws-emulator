@@ -973,6 +973,12 @@ impl Provisioner {
             Self::LakeFormationPermissions(grant) => {
                 describe_lake_formation_permissions(ctx, region, grant, resource).await
             }
+            // Its own read of the data cells filter, by the four values that address one —
+            // which is also what the delete addresses it by.
+            // Boxed for the reason the create arm is.
+            Self::LakeFormationDataCellsFilter => {
+                Box::pin(describe_lake_formation_data_cells_filter(ctx, region, resource)).await
+            }
             // Amazon EC2's own read of the Client VPN endpoint, by the id it minted for it.
             Self::Ec2ClientVpnEndpoint => {
                 describe_client_vpn_endpoint(ctx, region, physical_resource_id).await

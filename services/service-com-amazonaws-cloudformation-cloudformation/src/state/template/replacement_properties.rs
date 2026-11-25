@@ -100,6 +100,15 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // different group, which CloudFormation replaces. (A subnet group needs no entry:
         // both of its properties beside the name are `UpdateSubnetGroup`'s own members.)
         MEMORYDB_PARAMETER_GROUP => &["Description", "Family"],
+        // An `AWS::LakeFormation::DataCellsFilter` keeps the CELLS it was created selecting:
+        // the resource provider of that type publishes no update handler at all, every
+        // property of it carrying "Update requires: `Replacement`" — so a declaration
+        // restating the row predicate or either way of naming columns asks for a DIFFERENT
+        // filter, which CloudFormation replaces. (The four values that identify one are in
+        // that position by construction, being the parts of its composite identifier.)
+        crate::state::provisioner::lake_formation_data_cells_filters::LAKEFORMATION_DATA_CELLS_FILTER => {
+            crate::state::provisioner::lake_formation_data_cells_filters::DATA_CELLS_FILTER_SELECTION
+        }
         // A BACKUP VAULT keeps the KMS key AWS Backup encrypts it under: `EncryptionKeyArn`
         // is a member of `CreateBackupVault` and of no call that changes a vault — that
         // service publishes no `UpdateBackupVault` at all — so a declaration restating it

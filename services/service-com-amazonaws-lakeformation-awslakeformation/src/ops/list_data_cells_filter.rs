@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDataCellsFilter
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDataCellsFilter`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDataCellsFilter::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over the data cells filters
+//! [`crate::state::ComAmazonawsLakeformationAwslakeformationState`]'s
+//! `data_cells_filters` holds, narrowed to the table the request names — "lists all the
+//! data cell filters on a table".
+//!
+//! What narrows the listing is the `Table` the request states: a filter belongs to the
+//! (catalog, database, table) triple its own identity carries, so a `Table` naming one
+//! table reports that table's filters and one naming `TableWildcard` reports every filter
+//! of the database. A request that names no table at all narrows nothing: every filter the
+//! store holds is reported, in the stable key order the store enumerates in.
+//!
+//! The filters are reported exactly as they are held, so what a listing answers for one is
+//! what `GetDataCellsFilter` answers for it: this reader invents nothing and drops nothing,
+//! and it writes nothing — a listing is a report.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +150,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDataCellsFilter` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDataCellsFilterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDataCellsFilter"))
+        // `ctx` carries request metadata only; this operation reads none of it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListDataCellsFilterErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("LakeFormation state is unavailable".to_string()),
+            })
+        })?;
+
+        // The table a listing names is held to the choice its shape states in prose: one
+        // table, or every table of the database, and never both.
+        if let Some(table) = &input.table {
+            crate::state::validate_listed_table(table).map_err(|message| {
+                ListDataCellsFilterErrorModeled::InvalidInputException(InvalidInputException {
+                    message: Some(message),
+                })
+            })?;
+        }
+
+        // An opaque continuation token is either one this service minted — naming the
+        // filter key the previous page stopped on — or not a token at all.
+        let start_after = match input.next_token.as_deref() {
+            Some(token) => Some(crate::state::decode_filters_page_token(token).ok_or_else(
+                || {
+                    ListDataCellsFilterErrorModeled::InvalidInputException(InvalidInputException {
+                        message: Some(
+                            "NextToken is not a continuation token for ListDataCellsFilter"
+                                .to_string(),
+                        ),
+                    })
+                },
+            )?),
+            None => None,
+        };
+
+        let page_size = input
+            .max_results
+            .unwrap_or(crate::state::MAX_DATA_CELLS_FILTERS_PAGE)
+            .clamp(1, crate::state::MAX_DATA_CELLS_FILTERS_PAGE) as usize;
+
+        // The triple a filter must carry to be ON the table the request named: the catalog
+        // ("by default, it is the account ID of the caller"), the database, and the table
+        // itself — which `TableWildcard` leaves open.
+        let wanted = input.table.as_ref().map(|table| {
+            (
+                crate::state::resolve_catalog_id(table.catalog_id.as_deref()),
+                table.database_name.clone(),
+                table.name.clone(),
+            )
+        });
+
+        let store = state.lock();
+        let mut selected: Vec<(&String, &DataCellsFilter)> = store
+            .data_cells_filters
+            .iter()
+            .filter(|(_, filter)| match &wanted {
+                Some((catalog, database, table)) => {
+                    filter.table_catalog_id == *catalog
+                        && filter.database_name == *database
+                        && table.as_ref().is_none_or(|name| filter.table_name == *name)
+                }
+                None => true,
+            })
+            .filter(|(key, _)| match &start_after {
+                Some(start) => key.as_str() > start.as_str(),
+                None => true,
+            })
+            // One past the page: its presence is what says another page follows.
+            .take(page_size + 1)
+            .collect();
+
+        let has_more = selected.len() > page_size;
+        selected.truncate(page_size);
+
+        let next_token = if has_more {
+            selected
+                .last()
+                .map(|(key, _)| crate::state::encode_filters_page_token(key))
+        } else {
+            None
+        };
+
+        Ok(ListDataCellsFilterOutput {
+            // `DataCellsFilterList` carries no length constraint, so a table with no
+            // filter is reported as the empty list it is rather than as an absent member.
+            data_cells_filters: Some(
+                selected
+                    .into_iter()
+                    .map(|(_, filter)| filter.clone())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

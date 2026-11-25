@@ -282,6 +282,17 @@ impl Provisioner {
             Self::LakeFormationPermissions(grant) => {
                 grant_lake_formation_permissions(ctx, region, grant, resource).await
             }
+            // A data cells filter publishes no `Tags` property either, and
+            // `CreateDataCellsFilter` takes none: it is a resource OF a catalog table rather
+            // than one Lake Formation holds tags on, so no tags are propagated to one and the
+            // declared document IS the `TableData` that create takes
+            // ([`lake_formation_data_cells_filters`]).
+            // Boxed like the arms beside it whose future is one of the larger ones here: a
+            // filter's create carries the whole declared document onto an in-process call, and
+            // the enclosing match's future is as large as its widest arm.
+            Self::LakeFormationDataCellsFilter => {
+                Box::pin(create_lake_formation_data_cells_filter(ctx, region, resource)).await
+            }
             // A Client VPN endpoint's properties ARE `CreateClientVpnEndpoint`'s own members,
             // each carried onto the call under the member of the same name in the spelling
             // Amazon EC2's query protocol gives it; the tags CloudFormation propagates ride

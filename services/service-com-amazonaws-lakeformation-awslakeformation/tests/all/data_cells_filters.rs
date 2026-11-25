@@ -10,7 +10,8 @@
 //!
 //! The tables below span the classes the rules generalise over: how a filter names its
 //! columns (an explicit list, or a wildcard with and without exclusions), how it names
-//! its rows (a PartiQL expression, the all-rows wildcard, or no predicate at all), how
+//! its rows (a PartiQL expression, or the all-rows wildcard, one of which every filter
+//! states), how
 //! many columns it names, how deeply a nested column attribute nests, which part of
 //! the (catalog, database, table, name) identity differs, and what an update changes.
 //!
@@ -106,6 +107,10 @@ fn locator(table_data: &Value) -> Value {
 /// The PartiQL predicate that selects every row, which is what the all-rows wildcard says.
 const ALL_ROWS: &str = "TRUE";
 
+/// This service's own sentence for a filter that states no row predicate at all: fixed
+/// text, with nothing of the request in it.
+const ROW_FILTER_REQUIRED: &str = "Row filter cannot be null";
+
 /// The filter a read reports for a `TableData` stored at `version`.
 ///
 /// Two things the service adds to what the request named: the `VersionId` it assigned (the
@@ -145,7 +150,8 @@ async fn get_filter(router: &MultiServiceRouter, table_data: &Value) -> (u16, Va
 async fn create_then_get_reads_the_stored_filter_back() {
     // Rows differ along what the rule generalises over: the column-naming form (explicit
     // list, bare wildcard, wildcard with exclusions), the number of columns, the
-    // row-predicate form (expression, all-rows wildcard, no predicate), whether the
+    // row-predicate form (an ordinary expression, the all-rows wildcard, the all-rows
+    // predicate written as an expression), whether the
     // caller supplied a `VersionId`, and the modelled nesting depth bound of 5
     // ("Nested attributes within this list may not exceed a depth of 5." —
     // `smithy_query(query="doc",shape="DataCellsFilter",member="ColumnNames")`).
@@ -195,12 +201,15 @@ async fn create_then_get_reads_the_stored_filter_back() {
             }),
         ),
         (
-            "no row predicate at all",
+            // The all-rows predicate written as the EXPRESSION that says what the
+            // wildcard says, which the service reports back carrying both forms.
+            "the all-rows predicate as an expression",
             json!({
                 "TableCatalogId": "111122223333",
                 "DatabaseName": "sales",
                 "TableName": "orders",
                 "Name": "columns-only",
+                "RowFilter": { "FilterExpression": ALL_ROWS },
                 "ColumnNames": ["order_id", "amount", "region"],
             }),
         ),
@@ -236,6 +245,7 @@ async fn create_then_get_reads_the_stored_filter_back() {
                 "DatabaseName": "sales",
                 "TableName": "orders",
                 "Name": "quoted-dot",
+                "RowFilter": { "FilterExpression": "amount > 1" },
                 "ColumnNames": ["\"address.line\".\"zip\""],
             }),
         ),
@@ -302,6 +312,7 @@ async fn a_filter_is_identified_by_catalog_database_table_and_name() {
         "TableName": "orders",
         "Name": "shared-name",
         "ColumnNames": ["order_id"],
+        "RowFilter": { "AllRowsWildcard": {} },
     });
     let mut cases: Vec<(&str, Value)> = vec![("the base identity", base.clone())];
     for (case, member, value) in [
@@ -441,8 +452,11 @@ async fn update_replaces_the_stored_filter_and_advances_its_version() {
             })),
         ),
         (
-            "the bare column wildcard and no predicate at all",
-            filter(json!({ "ColumnWildcard": {} })),
+            "the bare column wildcard and the all-rows predicate",
+            filter(json!({
+                "ColumnWildcard": {},
+                "RowFilter": { "AllRowsWildcard": {} },
+            })),
         ),
         (
             "an explicit list again, with a nested attribute",
@@ -682,6 +696,7 @@ async fn a_filter_the_store_does_not_hold_is_not_found() {
         "TableName": "orders",
         "Name": "us-only",
         "ColumnNames": ["order_id"],
+        "RowFilter": { "FilterExpression": "amount > 0" },
     });
     let (status, payload) =
         call(&router, "CreateDataCellsFilter", &json!({ "TableData": stored })).await;
@@ -821,4 +836,450 @@ async fn a_filter_that_does_not_name_its_cells_is_refused() {
             "case {case:?}: expected EntityNotFoundException after a refusal, got {code:?} {payload:?}"
         );
     }
+}
+
+/// RULE: a data cells filter states its ROW predicate; a request whose `TableData` carries
+/// no `RowFilter` at all names no rows and is refused with this service's own sentence,
+/// whichever call made it and whatever else the filter states — while every request that
+/// does state a predicate is served.
+///
+/// The rows differ along what the rule generalises over: how the columns are named beside
+/// the absent predicate (an explicit list, the bare wildcard, a wildcard with exclusions),
+/// whether the request carries a `VersionId`, and which of the two calls that take a whole
+/// `TableData` is made.
+#[tokio::test]
+async fn a_filter_that_states_no_row_predicate_is_refused() {
+    let identity = json!({
+        "TableCatalogId": "111122223333",
+        "DatabaseName": "sales",
+        "TableName": "orders",
+    });
+    let body = |name: &str, extra: Value| {
+        let mut filter = identity.clone();
+        filter["Name"] = json!(name);
+        if let Value::Object(members) = extra {
+            for (key, value) in members {
+                filter[key] = value;
+            }
+        }
+        filter
+    };
+
+    // (case, the filter the request names) — each naming its cells correctly and its rows
+    // not at all, so the predicate is what every row is judged on.
+    let refused: Vec<(&str, Value)> = vec![
+        (
+            "an explicit column list and no predicate",
+            body("list-no-rows", json!({ "ColumnNames": ["order_id"] })),
+        ),
+        (
+            "the bare column wildcard and no predicate",
+            body("wildcard-no-rows", json!({ "ColumnWildcard": {} })),
+        ),
+        (
+            "a column wildcard with exclusions and no predicate",
+            body(
+                "exclusions-no-rows",
+                json!({ "ColumnWildcard": { "ExcludedColumnNames": ["ssn"] } }),
+            ),
+        ),
+        (
+            "a caller-supplied version and no predicate",
+            body(
+                "versioned-no-rows",
+                json!({ "ColumnNames": ["order_id", "amount"], "VersionId": "3" }),
+            ),
+        ),
+    ];
+
+    let router = emulator();
+    for (case, table_data) in &refused {
+        let (status, payload) =
+            call(&router, "CreateDataCellsFilter", &json!({ "TableData": table_data })).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status} {payload:?}"
+        );
+        let code = error_code(&payload);
+        assert_eq!(
+            code, "InvalidInputException",
+            "case {case:?}: expected InvalidInputException, got {code:?} {payload:?}"
+        );
+        let message = payload
+            .get("Message")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert_eq!(
+            message, ROW_FILTER_REQUIRED,
+            "case {case:?}: expected {ROW_FILTER_REQUIRED:?}, got {message:?} {payload:?}"
+        );
+        // A refused create persists nothing: the filter it named is not in the store.
+        let (status, read) = call(&router, "GetDataCellsFilter", &locator(table_data)).await;
+        assert_eq!(
+            error_code(&read),
+            "EntityNotFoundException",
+            "case {case:?}: expected a refused create to persist nothing, got {status} {read:?}"
+        );
+    }
+
+    // The same rule holds of the UPDATE, which takes the whole filter: a stored filter
+    // whose update states no predicate is refused and keeps the predicate it has.
+    let stored = body(
+        "update-target",
+        json!({
+            "ColumnNames": ["order_id"],
+            "RowFilter": { "FilterExpression": "amount > 0" },
+        }),
+    );
+    let (status, payload) =
+        call(&router, "CreateDataCellsFilter", &json!({ "TableData": stored })).await;
+    assert_eq!(
+        status, 200,
+        "case \"a filter that states a predicate\": expected 200, got {status} {payload:?}"
+    );
+    let mut dropped = stored.clone();
+    dropped
+        .as_object_mut()
+        .expect("an object")
+        .remove("RowFilter");
+    let (status, payload) =
+        call(&router, "UpdateDataCellsFilter", &json!({ "TableData": dropped })).await;
+    assert_eq!(
+        status, 400,
+        "case \"an update dropping the predicate\": expected 400, got {status} {payload:?}"
+    );
+    assert_eq!(
+        payload.get("Message").and_then(Value::as_str),
+        Some(ROW_FILTER_REQUIRED),
+        "case \"an update dropping the predicate\": expected {ROW_FILTER_REQUIRED:?}, got \
+         {payload:?}"
+    );
+    let (status, actual) = get_filter(&router, &stored).await;
+    assert_eq!(
+        (status, &actual),
+        (200, &reported(&stored, "1")),
+        "case \"an update dropping the predicate\": the stored filter must be unchanged, got \
+         {status} {actual:?}"
+    );
+}
+
+/// RULE: a listing reports the filters ON the table it names — the ones whose own
+/// (catalog, database, table) identity is that table's — exactly as a read of each reports
+/// it, and nothing else; a `TableWildcard` widens the listing to every table of the
+/// database, and a request that names no table at all narrows nothing.
+///
+/// The rows differ along what the rule generalises over: which table is named, whether the
+/// catalog is stated or left to its documented default, whether the table is named or
+/// wildcarded, a table that holds no filter at all, a database that holds none, and a
+/// request with no `Table` member.
+#[tokio::test]
+async fn a_listing_reports_the_filters_on_the_table_it_names() {
+    let catalog = "111122223333";
+    let filter = |database: &str, table: &str, name: &str, columns: Value| {
+        json!({
+            "TableCatalogId": catalog,
+            "DatabaseName": database,
+            "TableName": table,
+            "Name": name,
+            "ColumnNames": columns,
+            "RowFilter": { "AllRowsWildcard": {} },
+        })
+    };
+    // Two tables of one database, a second database, and a filter in a DIFFERENT catalog,
+    // so a listing that confused any part of the identity would report the wrong filters.
+    let stored = vec![
+        filter("sales", "orders", "eu-only", json!(["order_id"])),
+        filter("sales", "orders", "us-only", json!(["order_id", "region"])),
+        filter("sales", "returns", "all", json!(["return_id"])),
+        filter("marketing", "leads", "all", json!(["lead_id"])),
+        json!({
+            "TableCatalogId": "444455556666",
+            "DatabaseName": "sales",
+            "TableName": "orders",
+            "Name": "eu-only",
+            "ColumnNames": ["order_id"],
+            "RowFilter": { "AllRowsWildcard": {} },
+        }),
+    ];
+
+    let router = emulator();
+    for table_data in &stored {
+        let (status, payload) =
+            call(&router, "CreateDataCellsFilter", &json!({ "TableData": table_data })).await;
+        assert_eq!(
+            status, 200,
+            "case \"seed\": expected 200 for {table_data:?}, got {status} {payload:?}"
+        );
+    }
+
+    /// The filters one listing request reports, with the continuation token it answered.
+    async fn listed(
+        router: &MultiServiceRouter,
+        request: &Value,
+    ) -> (u16, Vec<Value>, Option<String>) {
+        let (status, payload) = call(router, "ListDataCellsFilter", request).await;
+        let reported = payload
+            .get("DataCellsFilters")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let token = payload
+            .get("NextToken")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        (status, reported, token)
+    }
+
+    // (case, the request, the names of the filters it must report)
+    let cases: Vec<(&str, Value, Vec<&str>)> = vec![
+        (
+            "one table of one catalog",
+            json!({ "Table": { "CatalogId": catalog, "DatabaseName": "sales", "Name": "orders" } }),
+            vec!["eu-only", "us-only"],
+        ),
+        (
+            "the other table of that database",
+            json!({ "Table": { "CatalogId": catalog, "DatabaseName": "sales", "Name": "returns" } }),
+            vec!["all"],
+        ),
+        (
+            "every table of that database, by the wildcard",
+            json!({
+                "Table": {
+                    "CatalogId": catalog,
+                    "DatabaseName": "sales",
+                    "TableWildcard": {},
+                },
+            }),
+            vec!["all", "eu-only", "us-only"],
+        ),
+        (
+            "a table of another database",
+            json!({
+                "Table": {
+                    "CatalogId": catalog,
+                    "DatabaseName": "marketing",
+                    "Name": "leads",
+                },
+            }),
+            vec!["all"],
+        ),
+        (
+            "a table that holds no filter",
+            json!({ "Table": { "CatalogId": catalog, "DatabaseName": "sales", "Name": "nothing" } }),
+            Vec::new(),
+        ),
+        (
+            "a database that holds no filter",
+            json!({
+                "Table": { "CatalogId": catalog, "DatabaseName": "empty", "TableWildcard": {} },
+            }),
+            Vec::new(),
+        ),
+        (
+            // The caller's own account catalog is what an absent `CatalogId` means, and no
+            // seeded filter is in it: every one of them names a catalog of its own.
+            "a table whose catalog is left to its documented default",
+            json!({ "Table": { "DatabaseName": "sales", "Name": "orders" } }),
+            Vec::new(),
+        ),
+    ];
+
+    for (case, request, expected) in &cases {
+        let (status, reported, _) = listed(&router, request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status} {reported:?}"
+        );
+        let mut names: Vec<&str> = reported
+            .iter()
+            .map(|entry| entry.get("Name").and_then(Value::as_str).unwrap_or_default())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            &names, expected,
+            "case {case:?}: expected the filters {expected:?}, got {names:?} in {reported:?}"
+        );
+        // Each reported filter is the whole filter, exactly as a read of it answers.
+        for entry in &reported {
+            let (status, read) = get_filter(&router, entry).await;
+            assert_eq!(
+                (status, &read),
+                (200, entry),
+                "case {case:?}: expected the listing to report what a read answers, got \
+                 {status} {read:?}"
+            );
+        }
+    }
+
+    // A listing with no `Table` at all narrows nothing: every filter the store holds.
+    let (status, reported, _) = listed(&router, &json!({})).await;
+    assert_eq!(
+        (status, reported.len()),
+        (200, stored.len()),
+        "case \"no table named\": expected every stored filter, got {status} {reported:?}"
+    );
+
+    // And the page the caller asks for is the page it gets, with the token that resumes
+    // strictly after it — so walking the pages visits every filter exactly once.
+    let page_size = 2;
+    let mut seen: Vec<Value> = Vec::new();
+    let mut token: Option<String> = None;
+    for _ in 0..stored.len() + 1 {
+        let mut request = json!({ "MaxResults": page_size });
+        if let Some(resume) = &token {
+            request["NextToken"] = json!(resume);
+        }
+        let (status, page, next) = listed(&router, &request).await;
+        assert_eq!(
+            status, 200,
+            "case \"a paged walk\": expected 200, got {status} {page:?}"
+        );
+        assert!(
+            page.len() <= page_size,
+            "case \"a paged walk\": expected at most {page_size} filters a page, got {page:?}"
+        );
+        seen.extend(page);
+        token = next;
+        if token.is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        seen.len(),
+        stored.len(),
+        "case \"a paged walk\": expected the pages to cover every filter once, got {seen:?}"
+    );
+    assert!(
+        token.is_none(),
+        "case \"a paged walk\": expected the walk to end without a token, got {token:?}"
+    );
+}
+
+/// RULE: a delete removes the ONE filter its (catalog, database, table, name) tuple
+/// addresses and nothing else, and a tuple the store holds no filter under is refused with
+/// the service's not-found sentence rather than reported as deleted.
+///
+/// The rows differ along what the rule generalises over: which part of a stored filter's
+/// identity the delete names differently (each of the four in turn), a tuple that names only
+/// part of the identity, and a second delete of a filter already deleted.
+#[tokio::test]
+async fn a_delete_removes_the_one_filter_it_addresses() {
+    let filter = |catalog: &str, database: &str, table: &str, name: &str| {
+        json!({
+            "TableCatalogId": catalog,
+            "DatabaseName": database,
+            "TableName": table,
+            "Name": name,
+            "ColumnNames": ["order_id"],
+            "RowFilter": { "AllRowsWildcard": {} },
+        })
+    };
+    // Five filters differing in exactly one part of the identity each, so a delete that
+    // confused any part of it would take the wrong filter.
+    let stored = vec![
+        filter("111122223333", "sales", "orders", "us-only"),
+        filter("111122223333", "sales", "orders", "eu-only"),
+        filter("111122223333", "sales", "returns", "us-only"),
+        filter("111122223333", "marketing", "orders", "us-only"),
+        filter("444455556666", "sales", "orders", "us-only"),
+    ];
+
+    let router = emulator();
+    for table_data in &stored {
+        let (status, payload) =
+            call(&router, "CreateDataCellsFilter", &json!({ "TableData": table_data })).await;
+        assert_eq!(
+            status, 200,
+            "case \"seed\": expected 200 for {table_data:?}, got {status} {payload:?}"
+        );
+    }
+
+    // The first filter is the one deleted; every other one must survive it.
+    let deleted = &stored[0];
+    let (status, payload) =
+        call(&router, "DeleteDataCellsFilter", &locator(deleted)).await;
+    assert_eq!(
+        status, 200,
+        "case \"the filter the delete addresses\": expected 200, got {status} {payload:?}"
+    );
+    let (status, gone) = call(&router, "GetDataCellsFilter", &locator(deleted)).await;
+    assert_eq!(
+        error_code(&gone),
+        "EntityNotFoundException",
+        "case \"the filter the delete addresses\": expected it to be gone, got {status} \
+         {gone:?}"
+    );
+    for survivor in &stored[1..] {
+        let (status, read) = get_filter(&router, survivor).await;
+        assert_eq!(
+            (status, &read),
+            (200, &reported(survivor, "1")),
+            "case \"a filter the delete did not address\": expected {survivor:?} to survive, \
+             got {status} {read:?}"
+        );
+    }
+
+    // (case, the tuple the delete names) — each addressing no stored filter.
+    let refused: Vec<(&str, Value)> = vec![
+        (
+            "a filter already deleted",
+            locator(deleted),
+        ),
+        (
+            "an unknown catalog",
+            locator(&filter("777788889999", "sales", "orders", "eu-only")),
+        ),
+        (
+            "an unknown database",
+            locator(&filter("111122223333", "nothing", "orders", "eu-only")),
+        ),
+        (
+            "an unknown table",
+            locator(&filter("111122223333", "sales", "nothing", "eu-only")),
+        ),
+        (
+            "an unknown filter name",
+            locator(&filter("111122223333", "sales", "orders", "nothing")),
+        ),
+        (
+            // Every member of this call is modelled optional, so a request naming only
+            // some of them addresses a tuple nothing can be stored under.
+            "a tuple naming only part of the identity",
+            json!({ "DatabaseName": "sales", "Name": "eu-only" }),
+        ),
+    ];
+
+    for (case, request) in &refused {
+        let (status, payload) = call(&router, "DeleteDataCellsFilter", request).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status} {payload:?}"
+        );
+        let code = error_code(&payload);
+        assert_eq!(
+            code, "EntityNotFoundException",
+            "case {case:?}: expected EntityNotFoundException, got {code:?} {payload:?}"
+        );
+        let message = payload.get("Message").and_then(Value::as_str);
+        assert_eq!(
+            message,
+            Some("Entity Not Found"),
+            "case {case:?}: expected the service's not-found sentence, got {payload:?}"
+        );
+    }
+
+    // And a refused delete removed nothing: the four surviving filters are still there.
+    let (status, payload) = call(&router, "ListDataCellsFilter", &json!({})).await;
+    let remaining = payload
+        .get("DataCellsFilters")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        (status, remaining.len()),
+        (200, stored.len() - 1),
+        "case \"after the refused deletes\": expected the survivors to be untouched, got \
+         {status} {remaining:?}"
+    );
 }
