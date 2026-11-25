@@ -135,14 +135,17 @@ pub const STOP_CODE_TASK_FAILED_TO_START: &str = "TaskFailedToStart";
 /// be fetched — and joins it to Amazon EC2's record of that interface, which exists only
 /// while the task does — observes.
 ///
-/// Like every other span this emulator chooses for a transition the clock owes
-/// ([`TRANSITION_SPAN`]), it is a few lifecycle steps rather than the minutes a real connect
-/// timeout and the retries around it take: the OUTCOME is what a client reads, and one that
-/// falls due only after a realistic connect timeout is one no client's poll ever sees, so the
-/// isolation would have no observable effect at all. Non-zero and several transitions long, so
-/// a caller reading straight after the launch still finds such a task coming up with its
-/// interface attached.
-pub const FAILED_IMAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
+/// What the value has to be is OBSERVABLE, which is why it is not one lifecycle span: the
+/// wait IS what a client does with such a task. The client places it, reads it back, reacts
+/// to the statuses it publishes and acts on what it finds — stops it, reads its attachment,
+/// waits on the event bus for its next move — and every one of those steps is a round trip
+/// of that client's own, so a task that had reached its terminal status before the first of
+/// them came back would report a coming-up lifecycle nothing could ever act on, and every
+/// stop asked for during it would arrive at a task that had already stopped. This span is
+/// many client round trips wide and still far below the minutes a real connect timeout and
+/// the retries around it take, so the attempt is one a caller can both observe and interrupt
+/// while the emulator stays quick.
+pub const FAILED_IMAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The destination of the route that carries traffic OFF a VPC: "a route table contains a
 /// set of rules, called routes" and the one for everything not inside the VPC is the

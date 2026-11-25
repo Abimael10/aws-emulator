@@ -128,11 +128,22 @@ const FETCH_ATTEMPT: Duration =
 const TRANSITION_SPAN: Duration =
     service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::TRANSITION_SPAN;
 
-/// How many lifecycle boundaries an attempt nothing answers may be worth and still leave a
-/// polling client a verdict: a client that drives a placement and then polls for its outcome
-/// gives the whole scenario a budget, so an attempt of the scale a real connect timeout takes
-/// is one no such poll ever outlives — the isolation then has no observable effect at all.
-const MOST_TRANSITIONS_PER_ATTEMPT: u32 = 8;
+/// How small a share of a polling client's own budget an attempt nothing answers has to be
+/// to still leave that client a verdict: a client that drives a placement and then polls for
+/// its outcome gives the whole scenario a budget ([`POLL_BUDGET`]), so an attempt of the
+/// scale a real connect timeout takes is one no such poll ever outlives — the isolation then
+/// has no observable effect at all.
+///
+/// Why a share of THAT budget rather than a multiple of a lifecycle span: a lifecycle span is
+/// how long ONE transition of a task takes, and the attempt is not a transition — it is the
+/// wait a whole placement is held open by, which is why it has to be wider than a span (the
+/// bound below is two-sided for exactly that reason) and so cannot be bounded by a small
+/// multiple of one. What the attempt must leave room for is the rest of what the client does
+/// AFTER it: the stop, the release of the interface the task holds and the reads that confirm
+/// them, all inside the one budget the client gives the scenario. A quarter leaves three
+/// quarters of that budget for them, which is why the share is stated here once and every row
+/// of this suite inherits it, instead of each row carrying a deadline of its own.
+const ATTEMPTS_PER_BUDGET: u32 = 4;
 
 /// The sentence a container runtime words for a reference the registry resolves to nothing: the
 /// manifest fetch is retried before the agent gives up, and the reference it could not resolve
@@ -749,13 +760,18 @@ async fn a_launched_tasks_image_fetch_follows_the_repositorys_index_and_its_path
         }
     }
 
-    // And the attempt a fetch nothing answers is waited out stays a few lifecycle boundaries
-    // long, which is what leaves a client polling such a placement a verdict rather than a
-    // task that is permanently coming up.
+    // And the attempt a fetch nothing answers is waited out is bounded on BOTH sides: longer
+    // than one lifecycle boundary, so a client that places such a task still finds it coming
+    // up on the reads it makes next and can act on it — stop it, read the interface it holds —
+    // instead of finding a task that was terminal before its first read came back; and a small
+    // share of a polling client's own budget, so that client still reaches a verdict rather
+    // than watching a task that is permanently coming up.
     assert!(
-        FETCH_ATTEMPT <= TRANSITION_SPAN * MOST_TRANSITIONS_PER_ATTEMPT,
-        "expected an attempt of at most {MOST_TRANSITIONS_PER_ATTEMPT} lifecycle spans \
-         ({TRANSITION_SPAN:?} each), got {FETCH_ATTEMPT:?}"
+        FETCH_ATTEMPT > TRANSITION_SPAN
+            && FETCH_ATTEMPT * ATTEMPTS_PER_BUDGET <= POLL_BUDGET,
+        "expected an attempt longer than one lifecycle span ({TRANSITION_SPAN:?}) and at most \
+         one {ATTEMPTS_PER_BUDGET}th of a polling client's budget ({POLL_BUDGET:?}), got \
+         {FETCH_ATTEMPT:?}"
     );
 }
 
