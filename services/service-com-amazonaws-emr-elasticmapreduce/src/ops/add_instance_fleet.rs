@@ -6,7 +6,9 @@
 //! cluster's ARN. A cluster id no cluster carries, a cluster whose instances are
 //! instance GROUPS rather than fleets, and target capacities needing more instances than
 //! Amazon EMR provisions for one fleet
-//! ([`crate::state::instance_fleet_instance_ceiling_violation`]) are each refused with
+//! ([`crate::state::instance_fleet_instance_ceiling_violation`]), and a list of more
+//! instance types than the fleet's allocation strategy admits
+//! ([`crate::state::instance_fleet_instance_type_count_refusal`]) are each refused with
 //! `InvalidRequestException`.
 //!
 //! ## Shape of an operation
@@ -272,6 +274,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or(&[]),
         ) {
             return Err(AddInstanceFleetErrorModeled::InvalidRequestException(refusal).into());
+        }
+
+        // The instance TYPES the fleet lists are bounded too, by the documented maximum its
+        // own allocation strategy admits
+        // ([`crate::state::instance_fleet_instance_type_count_refusal`]): the bound is a
+        // fact of the fleet, so a fleet added to a running cluster is held to exactly what
+        // a launched one is, and a request past it adds nothing.
+        if let Some(message) = crate::state::instance_fleet_instance_type_count_refusal(
+            &input.instance_fleet,
+            input
+                .instance_fleet
+                .instance_type_configs
+                .as_deref()
+                .unwrap_or(&[])
+                .len(),
+        ) {
+            return Err(AddInstanceFleetErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    error_code: None,
+                    message: Some(message),
+                },
+            )
+            .into());
         }
 
         let fleet_id = store.mint_instance_fleet_id();

@@ -23,7 +23,9 @@
 //! ([`instance_fleet_instance_ceiling_violation`]) and leaves the fleet exactly as it was.
 //! That rule holds wherever a fleet's target capacities are SET — the launch that creates
 //! the fleet, the addition of one to a running cluster, and the modification of one — so
-//! each of those reaches it here.
+//! each of those reaches it here. The instance TYPES a fleet lists are bounded the same way,
+//! by the documented maximum its allocation strategy admits
+//! ([`instance_type_configs_violation`]).
 
 use super::*;
 
@@ -180,18 +182,20 @@ pub fn instance_fleet_instance_ceiling_violation(
     (instances > MAX_INSTANCES_PER_FLEET).then(instance_fleet_ceiling_refusal)
 }
 
-/// How many instance type configurations one instance fleet holds at once.
+/// The most instance type configurations one instance fleet lists when it names an
+/// allocation strategy ([`names_an_allocation_strategy`]).
 ///
-/// CHOSEN, not documented: every submitted configuration is retained on the fleet's
-/// record and reported on every later read of it, and a modification MERGES into what is
-/// already there, so the stored list needs a ceiling of its own — the same reasoning that
-/// bounds an instance group's configuration tree
-/// ([`MAX_INSTANCE_GROUP_CONFIGURATIONS`]).
+/// "When you use an allocation strategy, you can include a maximum of 30 instance type
+/// configurations for a fleet" (`InstanceTypeConfig` doc, Smithy model) — a fleet that names
+/// none is held to the shorter list instead
+/// ([`MAX_INSTANCE_TYPES_PER_UNALLOCATED_FLEET`]), and which of the two a fleet is judged
+/// against is [`max_instance_types_per_fleet`].
 pub const MAX_INSTANCE_TYPES_PER_FLEET: usize = 30;
 
 /// Why this modification's instance type configurations cannot be accepted, if they
-/// cannot: the merge they ask for would leave the fleet holding more than
-/// [`MAX_INSTANCE_TYPES_PER_FLEET`] of them.
+/// cannot: the merge they ask for would leave the fleet listing more instance types than
+/// its allocation strategy admits
+/// ([`instance_fleet_instance_type_count_refusal`]).
 ///
 /// The SIZE the merge would leave behind is computed without copying either list, so a
 /// request past the ceiling is refused before anything is allocated for it and the fleet
@@ -199,10 +203,10 @@ pub const MAX_INSTANCE_TYPES_PER_FLEET: usize = 30;
 /// length, because a configuration for an instance type the fleet already holds replaces
 /// it rather than adding another ([`InstanceFleetRecord::apply_modification`]).
 pub fn instance_type_configs_violation(
-    instance_fleet_id: &str,
-    held: &[InstanceTypeConfig],
+    config: &InstanceFleetConfig,
     submitted: &[InstanceTypeConfig],
 ) -> Option<InvalidRequestException> {
+    let held = config.instance_type_configs.as_deref().unwrap_or_default();
     let carried: HashSet<&str> = held
         .iter()
         .map(|config| config.instance_type.as_str())
@@ -212,16 +216,11 @@ pub fn instance_type_configs_violation(
         .map(|config| config.instance_type.as_str())
         .filter(|instance_type| !carried.contains(instance_type))
         .collect();
-    if held.len() + added.len() <= MAX_INSTANCE_TYPES_PER_FLEET {
-        return None;
-    }
+    let message =
+        instance_fleet_instance_type_count_refusal(config, held.len() + added.len())?;
     Some(InvalidRequestException {
         error_code: None,
-        message: Some(format!(
-            "InstanceTypeConfigs would leave instance fleet '{instance_fleet_id}' holding \
-             more than the {MAX_INSTANCE_TYPES_PER_FLEET} instance type configurations an \
-             instance fleet may hold"
-        )),
+        message: Some(message),
     })
 }
 

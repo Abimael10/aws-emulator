@@ -106,16 +106,16 @@ fn cases() -> Vec<Case> {
             instances_launched: 4,
         },
         Case {
-            label: "two primaries in an instance fleet, protection not mentioned",
+            label: "three primaries in an instance fleet, protection not mentioned",
             instances: json!({
                 "InstanceFleets": [{
                     "InstanceFleetType": "MASTER",
-                    "TargetOnDemandCapacity": 2,
+                    "TargetOnDemandCapacity": 3,
                     "InstanceTypeConfigs": [{ "InstanceType": "m5.xlarge" }],
                 }],
             }),
             locked_by_the_api: false,
-            instances_launched: 2,
+            instances_launched: 3,
         },
     ]
 }

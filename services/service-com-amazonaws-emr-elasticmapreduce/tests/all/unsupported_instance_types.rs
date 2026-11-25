@@ -177,33 +177,43 @@ async fn listed_clusters(emr: &Emr) -> Vec<String> {
 }
 
 /// Every instance type the cluster `cluster_id` reports provisioning from, read back
-/// through the two listings that project its capacity.
+/// through the listing that projects its capacity.
+///
+/// A cluster carries instance fleets or instance groups and never both, so which listing
+/// serves it follows from the collection it reports carrying — the other one is refused for
+/// that collection (`tests/all/instance_collection_exclusion.rs`).
 async fn provisioned_types(emr: &Emr, cluster_id: &str) -> BTreeSet<String> {
-    let fleets = emr
-        .ok("ListInstanceFleets", json!({ "ClusterId": cluster_id }))
-        .await;
+    let described = emr.describe_cluster(cluster_id).await;
+    let carries_fleets =
+        at(&described, &["InstanceCollectionType"]).as_str() == Some("INSTANCE_FLEET");
+    if carries_fleets {
+        let fleets = emr
+            .ok("ListInstanceFleets", json!({ "ClusterId": cluster_id }))
+            .await;
+        return at(&fleets, &["InstanceFleets"])
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|fleet| {
+                at(&fleet, &["InstanceTypeSpecifications"])
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .filter_map(|specification| specification["InstanceType"].as_str().map(str::to_string))
+            .collect();
+    }
     let groups = emr
         .ok("ListInstanceGroups", json!({ "ClusterId": cluster_id }))
         .await;
-    let from_fleets = at(&fleets, &["InstanceFleets"])
+    at(&groups, &["InstanceGroups"])
         .as_array()
         .cloned()
         .unwrap_or_default()
         .into_iter()
-        .flat_map(|fleet| {
-            at(&fleet, &["InstanceTypeSpecifications"])
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-        })
-        .filter_map(|specification| specification["InstanceType"].as_str().map(str::to_string));
-    let from_groups = at(&groups, &["InstanceGroups"])
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|group| group["InstanceType"].as_str().map(str::to_string));
-    from_fleets.chain(from_groups).collect()
+        .filter_map(|group| group["InstanceType"].as_str().map(str::to_string))
+        .collect()
 }
 
 /// The sentence a value that names no instance type of this service earns.

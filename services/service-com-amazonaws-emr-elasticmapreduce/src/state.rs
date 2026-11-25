@@ -173,6 +173,11 @@ pub use modification_refusals::*;
 mod instance_fleet_modification;
 pub use instance_fleet_modification::*;
 
+/// WHICH instance-collection vocabulary a cluster is described in, and how an operation of
+/// the other one is refused on it — split out and re-exported the same way.
+mod instance_collection_plane;
+pub use instance_collection_plane::*;
+
 /// The TARGET of the automatic-scaling policy pair — the instance group a request names,
 /// the cluster that scopes it, and which of the two an unresolvable pair is refused in
 /// terms of — split out and re-exported the same way.

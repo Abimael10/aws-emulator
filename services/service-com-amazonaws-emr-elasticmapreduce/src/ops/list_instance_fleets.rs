@@ -4,7 +4,10 @@
 //! Reports the instance fleets a cluster carries — the ones `RunJobFlow` was given and
 //! every `AddInstanceFleet` since, in that order — paginated on `Marker`. Every fleet is
 //! projected from the [`crate::state::InstanceFleetRecord`] those operations persisted, so
-//! nothing here is built from this request.
+//! nothing here is built from this request. A cluster described in the instance-GROUP
+//! vocabulary carries no instance fleet at all, so it is refused with the mutual-exclusion
+//! sentence and pointed at `ListInstanceGroups`
+//! ([`crate::state::wrong_instance_collection_refusal`]).
 //!
 //! ## Shape of an operation
 //!
@@ -174,6 +177,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // A cluster carries instance fleets or instance groups and never both, so a cluster
+        // described in the GROUP vocabulary has no instance fleet for this listing to
+        // report: it is refused for the collection it really carries and pointed at the
+        // listing that serves it ([`crate::state::wrong_instance_collection_refusal`])
+        // rather than answered with an empty page, which would tell a caller probing the
+        // cluster's topology that it is fleet-based.
+        if let Some(refusal) = crate::state::wrong_instance_collection_refusal(
+            &cluster.instances.instance_collection_type,
+            crate::state::instance_collection_type::INSTANCE_FLEET,
+            Self::NAME,
+            crate::state::LIST_INSTANCE_GROUPS_OPERATION,
+        ) {
+            return Err(ListInstanceFleetsErrorModeled::InvalidRequestException(refusal).into());
+        }
 
         // The marker is the id of the first fleet the previous page did not report, so a
         // page boundary survives fleets being added between calls.

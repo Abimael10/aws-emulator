@@ -595,11 +595,11 @@ async fn a_highly_available_cluster_is_not_offered_unhealthy_node_replacement() 
             false,
         ),
         (
-            "two primaries in an instance fleet",
+            "three primaries in an instance fleet",
             json!({
                 "InstanceFleets": [{
                     "InstanceFleetType": "MASTER",
-                    "TargetOnDemandCapacity": 2,
+                    "TargetOnDemandCapacity": 3,
                     "InstanceTypeConfigs": [{ "InstanceType": "m5.xlarge" }],
                 }],
             }),

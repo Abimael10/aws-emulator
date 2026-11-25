@@ -9,8 +9,12 @@
 //! with the sentence it is refused by, so the launch and any later caller of the same rule
 //! word one refusal the same way:
 //!
-//! * an instance fleet has to target capacity it can provision, and the fleet that runs
-//!   the primary nodes buys it in ONE market ([`instance_fleet_shape_refusal`]);
+//! * an instance fleet has to target capacity it can provision, the fleet that runs the
+//!   primary nodes buys it in ONE market, and that fleet targets the units of a primary
+//!   topology Amazon EMR runs ([`instance_fleet_shape_refusal`]);
+//! * an instance fleet lists the instance types Amazon EMR fulfills its capacities from,
+//!   as many of them as its allocation strategy admits
+//!   ([`instance_fleet_instance_type_count_refusal`]);
 //! * a launch describes its capacity in ONE of the three forms `JobFlowInstancesConfig`
 //!   offers ([`multiple_capacity_forms_refusal`]);
 //! * a placement group is a placement group of the PRIMARY nodes of a multi-primary
@@ -29,6 +33,8 @@
 //! the builder that renders it.
 
 use std::borrow::Cow;
+
+use crate::ops::InstanceFleetProvisioningSpecifications;
 
 use super::*;
 
@@ -168,6 +174,12 @@ pub fn multiple_capacity_forms_refusal(
 /// absent value and the explicit zero as one and the same request — and the emptiness rule
 /// is read first, so a fleet that asks for nothing is told that rather than which market to
 /// choose.
+///
+/// A third rule follows from the same members for the PRIMARY fleet alone: the units it
+/// targets are the primary nodes the cluster comes up with
+/// ([`PRIMARY_FLEET_TARGET_CAPACITIES`]), so a count that is no primary topology Amazon EMR
+/// runs is refused with the sentence that states the two it does. It is read LAST of the
+/// three, because which market the primary buys in is settled before how much of it.
 pub fn instance_fleet_shape_refusal(config: &InstanceFleetConfig) -> Option<String> {
     let on_demand = i64::from(config.target_on_demand_capacity.unwrap_or(0));
     let spot = i64::from(config.target_spot_capacity.unwrap_or(0));
@@ -176,10 +188,142 @@ pub fn instance_fleet_shape_refusal(config: &InstanceFleetConfig) -> Option<Stri
             &config.instance_fleet_type,
         ));
     }
-    if config.instance_fleet_type == instance_group_type::MASTER && on_demand >= 1 && spot >= 1 {
+    if config.instance_fleet_type != instance_group_type::MASTER {
+        return None;
+    }
+    if on_demand >= 1 && spot >= 1 {
         return Some(MASTER_FLEET_SINGLE_MARKET_MESSAGE.to_string());
     }
+    let primary_units = on_demand.saturating_add(spot);
+    if !PRIMARY_FLEET_TARGET_CAPACITIES.contains(&primary_units) {
+        return Some(PRIMARY_FLEET_TARGET_CAPACITY_MESSAGE.to_string());
+    }
     None
+}
+
+/// The target capacities the fleet that runs a cluster's PRIMARY nodes may ask for: the one
+/// unit of a single-primary cluster, or the [`MULTI_PRIMARY_NODES`] units of a multi-primary
+/// one.
+///
+/// A primary fleet's units ARE its primary nodes — "this value is 1 for a master instance
+/// fleet" (`InstanceTypeConfig$WeightedCapacity` doc), so one unit is one node — and Amazon
+/// EMR runs a cluster on one primary node or on the primaries of a multi-primary cluster
+/// ([`MULTI_PRIMARY_NODES`]), and on no other count. The model's own note is narrower still
+/// ("for a master instance fleet, only one of `TargetSpotCapacity` and
+/// `TargetOnDemandCapacity` can be specified, and its value must be 1",
+/// `InstanceFleetConfig$TargetOnDemandCapacity` doc), from before Amazon EMR ran several
+/// primaries at all; the recorded refusal names both counts, so both are served.
+pub const PRIMARY_FLEET_TARGET_CAPACITIES: &[i64] = &[1, MULTI_PRIMARY_NODES];
+
+/// How Amazon EMR refuses a PRIMARY instance fleet targeting a number of units no primary
+/// topology of a cluster has.
+///
+/// Recorded behavior for the text, which is entirely fixed: it states the two counts a
+/// primary fleet may target ([`PRIMARY_FLEET_TARGET_CAPACITIES`]) and echoes neither the
+/// capacity the request asked for nor the fleet it asked it for.
+pub const PRIMARY_FLEET_TARGET_CAPACITY_MESSAGE: &str =
+    "The primary instance fleet can only have a target capacity of 1 or 3. Revise the \
+     configuration and resubmit.";
+
+/// The most instance type configurations one instance fleet lists when it names NO
+/// allocation strategy.
+///
+/// "Without an allocation strategy, you may specify a maximum of five instance type
+/// configurations for a fleet" (`InstanceTypeConfig` doc, Smithy model) — the allocation
+/// strategy is what lets Amazon EMR choose among more of them
+/// ([`MAX_INSTANCE_TYPES_PER_FLEET`]).
+pub const MAX_INSTANCE_TYPES_PER_UNALLOCATED_FLEET: usize = 5;
+
+/// Whether a fleet's launch specification names an allocation strategy.
+///
+/// "Specifies one of the following strategies to launch Spot Instance fleets"
+/// (`SpotProvisioningSpecification$AllocationStrategy` doc) and "specifies the strategy to
+/// use in launching On-Demand instance fleets"
+/// (`OnDemandProvisioningSpecification$AllocationStrategy` doc) are the two places a fleet
+/// names one, for the two markets it buys in, and naming it for EITHER market is what makes
+/// the fleet one Amazon EMR allocates across the wider list of instance types
+/// ([`max_instance_types_per_fleet`]). A specification the request left out, and an
+/// On-Demand strategy carried as the empty string, name no strategy.
+pub fn names_an_allocation_strategy(
+    specifications: Option<&InstanceFleetProvisioningSpecifications>,
+) -> bool {
+    let named = |strategy: Option<&str>| strategy.is_some_and(|strategy| !strategy.is_empty());
+    specifications.is_some_and(|specifications| {
+        named(
+            specifications
+                .spot_specification
+                .as_ref()
+                .and_then(|spot| spot.allocation_strategy.as_deref()),
+        ) || named(
+            specifications
+                .on_demand_specification
+                .as_ref()
+                .map(|on_demand| on_demand.allocation_strategy.as_str()),
+        )
+    })
+}
+
+/// How many instance type configurations the fleet launched by `specifications` may list:
+/// [`MAX_INSTANCE_TYPES_PER_FLEET`] when it names an allocation strategy
+/// ([`names_an_allocation_strategy`]), [`MAX_INSTANCE_TYPES_PER_UNALLOCATED_FLEET`] when it
+/// names none.
+pub fn max_instance_types_per_fleet(
+    specifications: Option<&InstanceFleetProvisioningSpecifications>,
+) -> usize {
+    if names_an_allocation_strategy(specifications) {
+        return MAX_INSTANCE_TYPES_PER_FLEET;
+    }
+    MAX_INSTANCE_TYPES_PER_UNALLOCATED_FLEET
+}
+
+/// How a refusal NAMES one instance fleet: the friendly name the request gave it
+/// (`InstanceFleetConfig$Name`), or the node type it hosts where it gave none
+/// ([`instance_fleet_display_name`]).
+pub fn instance_fleet_refusal_name(config: &InstanceFleetConfig) -> String {
+    config
+        .name
+        .as_deref()
+        .filter(|name| !name.is_empty())
+        .map_or_else(
+            || instance_fleet_display_name(&config.instance_fleet_type),
+            str::to_string,
+        )
+}
+
+/// How Amazon EMR refuses an instance fleet listing more instance types than it may hold.
+///
+/// Recorded behavior for the text. Its fixed parts are the two fragments below; its variable
+/// parts are the fleet the request named ([`instance_fleet_refusal_name`]) and the maximum
+/// THAT fleet is held to, which is the one its own allocation strategy admits
+/// ([`max_instance_types_per_fleet`]) rather than a figure of the sentence.
+pub fn too_many_instance_types_message(fleet: &str, maximum: usize) -> String {
+    format!(
+        "The number of instance types in the instance fleet: {fleet} exceeded the max value \
+         ({maximum}). Revise the configuration and resubmit."
+    )
+}
+
+/// The refusal an instance fleet earns for listing more instance types than its allocation
+/// strategy admits, or `None` when the list is one Amazon EMR fulfills the fleet's
+/// capacities from.
+///
+/// "An instance type configuration for each instance type in an instance fleet, which
+/// determines the Amazon EC2 instances Amazon EMR attempts to provision to fulfill On-Demand
+/// and Spot target capacities. When you use an allocation strategy, you can include a maximum
+/// of 30 instance type configurations for a fleet. … Without an allocation strategy, you may
+/// specify a maximum of five instance type configurations for a fleet." (`InstanceTypeConfig`
+/// doc, Smithy model.) The bound is a fact of the FLEET, so every operation that leaves a
+/// fleet holding a list of them asks it here, and `instance_types` is the count the fleet
+/// would hold once the request had been applied — the list a launch or an addition carries,
+/// the list a modification's merge would leave behind — rather than the one it holds now.
+pub fn instance_fleet_instance_type_count_refusal(
+    config: &InstanceFleetConfig,
+    instance_types: usize,
+) -> Option<String> {
+    let maximum = max_instance_types_per_fleet(config.launch_specifications.as_ref());
+    (instance_types > maximum).then(|| {
+        too_many_instance_types_message(&instance_fleet_refusal_name(config), maximum)
+    })
 }
 
 /// `com.amazonaws.emr#PlacementGroupStrategy`'s "spread across distinct hardware" value,

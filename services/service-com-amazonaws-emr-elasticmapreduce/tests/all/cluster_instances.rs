@@ -440,7 +440,7 @@ async fn list_instances_reports_one_ec2_instance_per_instance_the_cluster_asked_
             instances: json!({
                 "InstanceFleets": [{
                     "InstanceFleetType": "MASTER",
-                    "TargetOnDemandCapacity": 4,
+                    "TargetOnDemandCapacity": 3,
                     "InstanceTypeConfigs": [
                         { "InstanceType": "m5.xlarge", "WeightedCapacity": 2 },
                     ],
@@ -479,7 +479,24 @@ async fn list_instances_reports_one_ec2_instance_per_instance_the_cluster_asked_
 
         let settled =
             instances_in_state(&emulator, label, &cluster_id, case.expected.len(), "RUNNING").await;
-        let collections = groups(&emulator, &cluster_id).await;
+        // A cluster carries instance fleets or instance groups and never both, so the group
+        // listing is asked only of a cluster that reports carrying groups: on a fleet cluster
+        // it is refused for that collection
+        // (`tests/all/instance_collection_exclusion.rs`), and an instance of a fleet names its
+        // fleet rather than a group below.
+        let described = emr(
+            &emulator.router,
+            "DescribeCluster",
+            json!({ "ClusterId": &cluster_id }),
+        )
+        .await;
+        let collections = if described["Cluster"]["InstanceCollectionType"].as_str()
+            == Some("INSTANCE_FLEET")
+        {
+            BTreeMap::new()
+        } else {
+            groups(&emulator, &cluster_id).await
+        };
 
         // What each instance reports: the collection it belongs to, its type and its market.
         let mut reported: Vec<(String, String, String)> = Vec::new();

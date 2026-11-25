@@ -448,13 +448,34 @@ async fn an_omitted_cluster_id_is_refused_by_its_operations_surface() {
 async fn every_listing_refuses_a_marker_it_did_not_mint_with_the_marker_code() {
     let emr = Emr::new();
     let cluster = emr.run_job_flow(kept_alive_request("paged")).await;
+    // A cluster carries instance fleets or instance groups and never both, so the two
+    // cluster-scoped collection listings are asked of the cluster each of them serves: the
+    // other one is refused for the collection the cluster carries, whatever marker it
+    // names (`tests/all/instance_collection_exclusion.rs`).
+    let fleet_cluster = emr
+        .run_job_flow(json!({
+            "Name": "paged fleets",
+            "ReleaseLabel": CATALOGUED_RELEASE,
+            "JobFlowRole": crate::job_flow_lifecycle::INSTANCE_PROFILE,
+            "ServiceRole": crate::job_flow_lifecycle::SERVICE_ROLE,
+            "Instances": {
+                "KeepJobFlowAliveWhenNoSteps": true,
+                "InstanceFleets": [{
+                    "Name": "primary",
+                    "InstanceFleetType": "MASTER",
+                    "TargetOnDemandCapacity": 1,
+                    "InstanceTypeConfigs": [{ "InstanceType": "m5.xlarge" }],
+                }],
+            },
+        }))
+        .await;
     emr.ok("CreateStudio", studio_request("paged")).await;
 
     let listings: Vec<(&str, Value)> = vec![
         ("ListClusters", json!({})),
         ("ListSteps", json!({ "ClusterId": &cluster })),
         ("ListInstanceGroups", json!({ "ClusterId": &cluster })),
-        ("ListInstanceFleets", json!({ "ClusterId": &cluster })),
+        ("ListInstanceFleets", json!({ "ClusterId": &fleet_cluster })),
         ("ListNotebookExecutions", json!({})),
         ("ListStudios", json!({})),
         ("ListSecurityConfigurations", json!({})),
@@ -492,8 +513,8 @@ async fn every_listing_refuses_a_marker_it_did_not_mint_with_the_marker_code() {
         at(&listed, &["Clusters"])
             .as_array()
             .map(|clusters| clusters.len()),
-        Some(1),
-        "the unpaged listing must still report the launched cluster, got {listed}"
+        Some(2),
+        "the unpaged listing must still report the launched clusters, got {listed}"
     );
 }
 

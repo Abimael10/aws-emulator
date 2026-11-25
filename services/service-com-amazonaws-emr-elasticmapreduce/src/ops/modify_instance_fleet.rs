@@ -253,11 +253,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // later read of it reports, so a request that would take the fleet past the
         // ceiling is refused rather than merged.
         if let Some(submitted) = input.instance_fleet.instance_type_configs.as_deref() {
-            if let Some(refusal) = crate::state::instance_type_configs_violation(
-                &fleet_id,
-                fleet.config.instance_type_configs.as_deref().unwrap_or(&[]),
-                submitted,
-            ) {
+            if let Some(refusal) =
+                crate::state::instance_type_configs_violation(&fleet.config, submitted)
+            {
                 return Err(
                     ModifyInstanceFleetErrorModeled::InvalidRequestException(refusal).into(),
                 );

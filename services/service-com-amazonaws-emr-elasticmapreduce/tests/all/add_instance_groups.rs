@@ -157,6 +157,11 @@ async fn listed_group_ids(emr: &Emr, case: &str, cluster_id: &str) -> Vec<String
 
 /// The ids every cluster in `cluster_ids` reports its groups under — the snapshot a refusal
 /// must leave exactly as it was.
+///
+/// A cluster carries instance fleets or instance groups and never both, so the group
+/// listing is asked only of a cluster that reports carrying groups: on a fleet cluster it is
+/// refused for that collection (`tests/all/instance_collection_exclusion.rs`), and that
+/// refusal is itself the evidence the cluster holds no group for an addition to land in.
 async fn group_ids_of_each(
     emr: &Emr,
     case: &str,
@@ -164,6 +169,19 @@ async fn group_ids_of_each(
 ) -> BTreeMap<String, Vec<String>> {
     let mut held = BTreeMap::new();
     for cluster_id in cluster_ids {
+        let described = emr.describe_cluster(cluster_id).await;
+        if at(&described, &["InstanceCollectionType"]).as_str() == Some("INSTANCE_FLEET") {
+            let (status, payload) = emr
+                .call("ListInstanceGroups", json!({ "ClusterId": cluster_id }))
+                .await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: a fleet cluster carries no instance group, so the group \
+                 listing must be refused, got {status} with {payload}"
+            );
+            held.insert(cluster_id.clone(), Vec::new());
+            continue;
+        }
         held.insert(
             cluster_id.clone(),
             listed_group_ids(emr, case, cluster_id).await,

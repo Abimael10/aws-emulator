@@ -374,13 +374,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // An instance fleet has to ask for capacity it can provision, and the fleet that
-        // runs the cluster's PRIMARY nodes buys that capacity in ONE market
-        // ([`crate::state::instance_fleet_shape_refusal`]): a launch whose fleet does
-        // neither describes capacity nothing provisions, so it is refused before any
+        // An instance fleet has to ask for capacity it can provision, the fleet that runs
+        // the cluster's PRIMARY nodes buys that capacity in ONE market, and the units that
+        // fleet asks for are the primary nodes of a topology Amazon EMR runs
+        // ([`crate::state::instance_fleet_shape_refusal`]): a launch whose fleet does none
+        // of the three describes capacity nothing provisions, so it is refused before any
         // cluster state is written.
         for config in input.instances.instance_fleets.iter().flatten() {
             if let Some(message) = crate::state::instance_fleet_shape_refusal(config) {
+                return Err(refuse(message));
+            }
+        }
+
+        // An instance fleet lists the instance types Amazon EMR fulfills its capacities
+        // from, and how many of them it may list is a fact of the fleet's own allocation
+        // strategy ([`crate::state::instance_fleet_instance_type_count_refusal`]) — the same
+        // bound `AddInstanceFleet` and `ModifyInstanceFleet` hold a fleet's list to — so a
+        // launch naming more than that refuses the whole launch and no cluster is stored.
+        for config in input.instances.instance_fleets.iter().flatten() {
+            if let Some(message) = crate::state::instance_fleet_instance_type_count_refusal(
+                config,
+                config.instance_type_configs.as_deref().unwrap_or(&[]).len(),
+            ) {
                 return Err(refuse(message));
             }
         }

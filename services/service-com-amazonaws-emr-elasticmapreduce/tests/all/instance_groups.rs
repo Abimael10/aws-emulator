@@ -342,9 +342,11 @@ fn configured_expectations() -> Vec<Expected> {
 // ---------------------------------------------------------------------------
 
 /// THE RULE above, over the `Instances` forms `RunJobFlow` accepts: an explicit
-/// `InstanceGroups` list of every role, the uniform node-type form at one node, at
-/// several nodes and with no core node type named, and an instance-fleet cluster, which
-/// has no groups at all.
+/// `InstanceGroups` list of every role, and the uniform node-type form at one node, at
+/// several nodes and with no core node type named. An instance-FLEET cluster is no row of
+/// it: it carries no instance group at all, so this listing is refused for that collection
+/// rather than answered — asserted below, and over both directions of the exclusion in
+/// `tests/all/instance_collection_exclusion.rs`.
 #[tokio::test]
 async fn list_instance_groups_reports_every_group_its_cluster_was_launched_with() {
     struct Case {
@@ -390,18 +392,6 @@ async fn list_instance_groups_reports_every_group_its_cluster_was_launched_with(
                 "InstanceGroups": configured_groups(),
             }),
             expected: configured_expectations(),
-        },
-        Case {
-            label: "instance fleets, which carry no instance groups",
-            instances: json!({
-                "KeepJobFlowAliveWhenNoSteps": true,
-                "InstanceFleets": [{
-                    "InstanceFleetType": "MASTER",
-                    "TargetOnDemandCapacity": 1,
-                    "InstanceTypeConfigs": [{ "InstanceType": "m5.xlarge" }],
-                }],
-            }),
-            expected: Vec::new(),
         },
     ];
 
@@ -457,6 +447,28 @@ async fn list_instance_groups_reports_every_group_its_cluster_was_launched_with(
             );
         }
     }
+
+    // A cluster that states its capacity as instance FLEETS carries no instance group at
+    // all, so this listing is refused for the collection that cluster really uses rather
+    // than answered with an empty list, which would say the cluster is group-based.
+    let case = "instance fleets, which carry no instance groups";
+    let fleet_cluster = emr
+        .run_job_flow(launch(
+            case,
+            json!({
+                "KeepJobFlowAliveWhenNoSteps": true,
+                "InstanceFleets": [{
+                    "InstanceFleetType": "MASTER",
+                    "TargetOnDemandCapacity": 1,
+                    "InstanceTypeConfigs": [{ "InstanceType": "m5.xlarge" }],
+                }],
+            }),
+        ))
+        .await;
+    let (status, payload) = emr
+        .call("ListInstanceGroups", json!({ "ClusterId": &fleet_cluster }))
+        .await;
+    assert_refused(case, status, &payload, "InvalidRequestException");
 }
 
 /// THE RULE: a group AWS answers in a non-terminal state reaches its next state once the
