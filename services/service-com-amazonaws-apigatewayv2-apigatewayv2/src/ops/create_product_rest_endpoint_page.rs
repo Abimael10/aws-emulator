@@ -211,6 +211,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // told that first, whatever else it carries.
         let unresolved_endpoint = crate::state::unresolved_rest_endpoint(&*self.engine, parts);
 
+        // And what the GENERATION of the page's content can do, resolved in the same hop and
+        // for the same reason it is made here: the content is generated from the
+        // documentation of the one REST endpoint the identifier names, so a generation with no
+        // such endpoint to read settles the page FAILED with the exception that says why
+        // ([`crate::state::rest_endpoint_generation_failure`]) rather than producing a page.
+        // The write RESOLVES it; it is not asked again on a read.
+        let generation_failure =
+            crate::state::rest_endpoint_generation_failure(&*self.engine, parts);
+
         // `TryItState` is a modelled enum, so the boundary validator refuses a value
         // outside its catalog; a request that names none gets the service's default.
         let try_it_state = input
@@ -281,9 +290,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The page's content is generated from the REST endpoint it documents, which
             // is not done when this call answers, so the record is due to settle one span
             // from now: a transition the CLOCK owes, stored as its due instant rather than
-            // slept for. The endpoint it is generated FROM resolved above.
+            // slept for. What it settles ON is what that generation can do, resolved above.
             settles_at: ::std::time::Instant::now()
                 + crate::state::PRODUCT_REST_ENDPOINT_PAGE_CREATE_SPAN,
+            generation_failure,
         };
 
         // `page_id` comes from the product's own id bijection, so it names no existing

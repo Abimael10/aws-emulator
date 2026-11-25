@@ -7,13 +7,16 @@
 //! configured with this emulator's own endpoint and then exported, and an export asking for
 //! a specification nothing serves):
 //!
-//! > The one Server Object of an exported definition names the api's own PUBLISHED invoke
-//! > address — the value `Api$ApiEndpoint` reports, which is an address the caller dials and
-//! > this emulator answers on — followed by the `{basePath}` template it declares as a server
+//! > The one Server Object of an exported definition names the api's DEFAULT execute-api
+//! > address in the form `Api$ApiEndpoint` documents — `https://{api-id}.execute-api.
+//! > {region}.amazonaws.com`, built from the api's own id and Region, with no port and no
+//! > path of its own — followed by the `{basePath}` template it declares as a server
 //! > variable, so a reader that resolves server variables reaches the configuration the
-//! > document describes. The document and the member state one address, whichever endpoint
-//! > the client that created or exported the api reached this emulator at, and the document
-//! > also declares the import/export algorithm version it was written under.
+//! > document describes. An exported definition is a portable specification artifact: its
+//! > readers parse the api id out of the authority's first label and the Region out of the
+//! > label behind `execute-api`, so the document states that address whichever endpoint the
+//! > client that created or exported the api reached this emulator at. The document also
+//! > declares the import/export algorithm version it was written under.
 //!
 //! > A request naming a `Specification` outside the one value this operation serves is
 //! > refused `400 BadRequestException` with API Gateway's own sentence for that refusal,
@@ -23,12 +26,12 @@
 //! The first table's rows span what that rule generalises over: the endpoint the CREATE was
 //! addressed at and the endpoint the EXPORT was addressed at (an IPv4 loopback literal with a
 //! port, a loopback NAME on another port, a bracketed IPv6 literal, and this service's own
-//! AWS host — the export must follow the api's published address and not the address the
-//! export request itself arrived on), and the Region the api was created in (including the
-//! emulator's own default, so no row passes on a hardcoded Region). The second table's rows
-//! span the SHAPE of the rejected value: a later specification version, the served value in
-//! another case, another specification family, the served value with a suffix, and a long
-//! value — in both output types.
+//! AWS host — the document must state the api's own address and not the authority of either
+//! listener), and the Region the api was created in (including the emulator's own default, so
+//! no row passes on a hardcoded Region). The second table's rows span the SHAPE of the
+//! rejected value: a later specification version, the served value in another case, another
+//! specification family, the served value with a suffix, and a long value — in both output
+//! types.
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -47,8 +50,16 @@ const OAS30: &str = "OAS30";
 const IMPORTEXPORT_VERSION_EXTENSION: &str = "x-amazon-apigateway-importexport-version";
 const IMPORTEXPORT_VERSION: &str = "1.0";
 
+/// The DEFAULT execute-api address of `api_id` in `region`, in the form `Api$ApiEndpoint`
+/// documents: "The URI of the API, of the form `{api-id}.execute-api.{region}.amazonaws.com`".
+/// Written out here rather than taken from the service, so the table asserts the rule rather
+/// than the implementation.
+fn execute_api_url(api_id: &str, region: &str) -> String {
+    format!("https://{api_id}.execute-api.{region}.amazonaws.com")
+}
+
 /// WHERE the client that minted a row's api reached this emulator, which is what the address
-/// the api publishes follows.
+/// the api PUBLISHES follows — and which the exported document's server url does not.
 #[derive(Debug, PartialEq, Eq)]
 enum ReachedAt {
     /// A client configured with one local endpoint URL, which resolves the emulator's own
@@ -204,7 +215,7 @@ async fn created_api(emulator: &MultiServiceRouter, row: &Row) -> (String, Strin
 }
 
 #[tokio::test]
-async fn an_exported_document_publishes_the_apis_own_invoke_address() {
+async fn an_exported_document_states_the_apis_default_execute_api_address() {
     let emulator = emulator();
 
     for row in rows() {
@@ -226,9 +237,9 @@ async fn an_exported_document_publishes_the_apis_own_invoke_address() {
             panic!("case {case:?}: the JSON output type must parse as JSON, got {error}: {text}")
         });
 
-        // One server, naming the address the api publishes with the base path templated —
-        // the address a reader of the document dials, not the endpoint this export request
-        // happened to arrive on.
+        // One server, naming the api's own default execute-api address with the base path
+        // templated — the address the document DESCRIBES the api at, not the authority this
+        // export request or the create happened to arrive on.
         let servers = document
             .get("servers")
             .and_then(Value::as_array)
@@ -239,24 +250,55 @@ async fn an_exported_document_publishes_the_apis_own_invoke_address() {
             1,
             "case {case:?}: an exported document names one server, got {document}"
         );
-        let expected = format!("{published}/{{basePath}}");
+        let expected = format!("{}/{{basePath}}", execute_api_url(&api_id, row.region));
         let url = document
             .pointer("/servers/0/url")
             .and_then(Value::as_str)
             .unwrap_or_default();
         assert_eq!(
             url, expected,
-            "case {case:?}: servers[0].url must be the address the api publishes under the \
-             templated base path, expected {expected:?}, got {url:?}"
+            "case {case:?}: servers[0].url must be the api's default execute-api address under \
+             the templated base path, expected {expected:?}, got {url:?}"
         );
 
-        // A client that resolves nothing but this emulator's own endpoint is given a url it
-        // can dial: the endpoint it reached, with the api behind it.
+        // The api id is the authority's FIRST DNS LABEL and the Region the label behind
+        // `execute-api`, which is what lets a reader of the document recover both; and the
+        // authority carries no port and no path segment ahead of the template.
+        let authority = url
+            .trim_start_matches("https://")
+            .split('/')
+            .next()
+            .unwrap_or_default();
+        let labels: Vec<&str> = authority.split('.').collect();
+        assert_eq!(
+            labels.first().copied(),
+            Some(api_id.as_str()),
+            "case {case:?}: the api id must be the authority's first label, got {authority:?}"
+        );
+        assert_eq!(
+            labels.get(2).copied(),
+            Some(row.region),
+            "case {case:?}: the Region must be the label behind execute-api, got {authority:?}"
+        );
+        assert!(
+            !authority.contains(':'),
+            "case {case:?}: an execute-api address carries no port, got {authority:?}"
+        );
+
+        // So a client configured with nothing but this emulator's own endpoint is given a
+        // document that describes the api's address rather than that client's own listener:
+        // the two differ, and the document never states the listener.
         if row.create_reached == ReachedAt::TheEmulatorsOwnEndpoint {
             assert!(
-                url.starts_with(&format!("https://{}/", row.create_host)),
-                "case {case:?}: a client configured with this emulator's own endpoint must be \
-                 given a server url on that endpoint, got {url:?}"
+                !url.contains(row.create_host) && !url.contains(row.export_host),
+                "case {case:?}: the document must not state the authority a client reached \
+                 this emulator at, got {url:?}"
+            );
+            assert_ne!(
+                published,
+                execute_api_url(&api_id, row.region),
+                "case {case:?}: this row exists to separate the published address from the \
+                 documented one, got {published:?} for both"
             );
         }
 
@@ -282,8 +324,9 @@ async fn an_exported_document_publishes_the_apis_own_invoke_address() {
              {document}"
         );
 
-        // One address, whichever operation states it, before and after the export: a report
-        // changes nothing a later caller sees.
+        // One published address, whichever operation states it, before and after the export:
+        // a report changes nothing a later caller sees, and the document states the api's own
+        // address without moving the one it announces.
         let (status, api) = call_at_host(
             &emulator,
             row.create_host,
@@ -300,7 +343,7 @@ async fn an_exported_document_publishes_the_apis_own_invoke_address() {
         assert_eq!(
             as_str(&api, "apiEndpoint"),
             published,
-            "case {case:?}: GetApi must report the address the document states, got {api}"
+            "case {case:?}: GetApi must report the address the create published, got {api}"
         );
     }
 }

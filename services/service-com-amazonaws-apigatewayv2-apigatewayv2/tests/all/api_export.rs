@@ -25,9 +25,11 @@
 //! The last three tests assert what the document says about the API ITSELF rather than
 //! about its routes:
 //!
-//! > The one Server Object names the api's own endpoint with the base path TEMPLATED as a
+//! > The one Server Object names the api's DEFAULT execute-api address — the
+//! > `{api-id}.execute-api.{region}.amazonaws.com` form `Api$ApiEndpoint` documents, built
+//! > from the api's own id and Region — with the base path TEMPLATED as a
 //! > `basePath` server variable, whose default is the base path the exported configuration
-//! > is served under — a named stage's own name, and nothing for the stage that serves the
+//! > is served under: a named stage's own name, and nothing for the stage that serves the
 //! > api's root and for the api's latest configuration — so substituting the variable
 //! > yields the address that configuration answers on. With API Gateway extensions
 //! > included, the document also states what no standard OpenAPI member can: the
@@ -214,7 +216,6 @@ fn rows() -> Vec<Row> {
 /// What creating a row's api left in the store.
 struct Created {
     api_id: String,
-    api_endpoint: String,
     /// One entry per route created, in the row's order: the route as the service REPORTS
     /// it, and the integration it is wired to as the service reports that. Asserting the
     /// export against these is what pins the document to the STORED configuration rather
@@ -268,7 +269,6 @@ async fn create(emulator: &MultiServiceRouter, row: &Row) -> Created {
     }
 
     Created {
-        api_endpoint: as_str(&api, "apiEndpoint"),
         api_id,
         routes: created_routes,
     }
@@ -333,6 +333,14 @@ fn text_at(document: &Value, path: &[&str]) -> String {
         };
     }
     node.as_str().unwrap_or_default().to_string()
+}
+
+/// The DEFAULT execute-api address of `api_id`, in the form `Api$ApiEndpoint` documents:
+/// "The URI of the API, of the form `{api-id}.execute-api.{region}.amazonaws.com`" — the
+/// address an exported definition states as its one server. Written out here rather than
+/// taken from the service, so the cases assert the rule rather than the implementation.
+fn execute_api_url(api_id: &str) -> String {
+    format!("https://{api_id}.execute-api.{REGION}.amazonaws.com")
 }
 
 /// The url of the document's one Server Object, or the empty string when it has none.
@@ -401,13 +409,14 @@ async fn an_exported_definition_states_the_apis_configuration() {
             );
         }
 
-        // The server the exported configuration is called at is the api's own endpoint,
-        // with the base path it is served under left as a substitutable variable.
+        // The server the exported configuration is called at is the api's own default
+        // execute-api address, with the base path it is served under left as a substitutable
+        // variable.
         assert_eq!(
             served_url(&document),
-            format!("{}/{{basePath}}", created.api_endpoint),
-            "case {case:?}: servers[0].url must be the api's ApiEndpoint under a templated \
-             base path, got {document}"
+            format!("{}/{{basePath}}", execute_api_url(&created.api_id)),
+            "case {case:?}: servers[0].url must be the api's default execute-api address \
+             under a templated base path, got {document}"
         );
         assert_eq!(
             served_base_path(&document).as_deref(),
@@ -1429,12 +1438,13 @@ async fn the_exported_server_templates_the_base_path_it_is_served_under() {
     let emulator = emulator();
 
     let case = "the base path a configuration is served under";
-    let (api_id, api_endpoint) = created_api(
+    let (api_id, _published) = created_api(
         &emulator,
         case,
         json!({ "name": "served-api", "protocolType": "HTTP" }),
     )
     .await;
+    let api_endpoint = execute_api_url(&api_id);
     wire_route(
         &emulator,
         case,
@@ -1494,7 +1504,8 @@ async fn the_exported_server_templates_the_base_path_it_is_served_under() {
         };
         let document = exported(&emulator, case, &api_id, &query).await;
 
-        // One server, naming the api's endpoint with the base path templated.
+        // One server, naming the api's default execute-api address with the base path
+        // templated.
         assert_eq!(
             document
                 .get("servers")
@@ -1506,8 +1517,8 @@ async fn the_exported_server_templates_the_base_path_it_is_served_under() {
         assert_eq!(
             served_url(&document),
             format!("{api_endpoint}/{{basePath}}"),
-            "case {case:?}: servers[0].url must be the api's ApiEndpoint under the \
-             templated base path, got {document}"
+            "case {case:?}: servers[0].url must be the api's default execute-api address \
+             under the templated base path, got {document}"
         );
         assert_eq!(
             served_base_path(&document).as_deref(),
@@ -1516,7 +1527,8 @@ async fn the_exported_server_templates_the_base_path_it_is_served_under() {
              exported configuration is served under, got {document}"
         );
         // And substituting it yields the address that configuration answers on: the api's
-        // endpoint, followed by the stage name when a named stage was asked for.
+        // default execute-api address, followed by the stage name when a named stage was
+        // asked for.
         assert_eq!(
             resolved_url(&document).trim_end_matches('/'),
             if base_path.is_empty() {

@@ -446,9 +446,8 @@ pub const STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 pub const STATUS_AVAILABLE: &str = "AVAILABLE";
 
 /// The `Status` a resource carries when the service could not assemble it, from
-/// `STATUS_VALUES`. It is the status the modelled `StatusException` explains — and no
-/// product REST endpoint page this store holds reaches it, for the reason
-/// [`ProductRestEndpointPage::status`] states.
+/// `STATUS_VALUES`. It is the status the modelled `StatusException` explains, which is why a
+/// record that settles here carries one ([`ProductRestEndpointPage::reported_status`]).
 pub const STATUS_FAILED: &str = "FAILED";
 
 /// How long a product REST endpoint page reports [`STATUS_IN_PROGRESS`] after a write that
@@ -676,10 +675,21 @@ pub struct ProductRestEndpointPage {
     /// named none.
     pub try_it_state: String,
     /// When the generation of this page's content — started by the write that stored this
-    /// record — comes due, after which the page reports [`STATUS_AVAILABLE`]; before it,
-    /// [`STATUS_IN_PROGRESS`]. See [`ProductRestEndpointPage::status`] and
+    /// record — comes due, after which the page reports the value that generation settled
+    /// on; before it, [`STATUS_IN_PROGRESS`]. See
+    /// [`ProductRestEndpointPage::reported_status`] and
     /// [`PRODUCT_REST_ENDPOINT_PAGE_CREATE_SPAN`].
     pub settles_at: Instant,
+    /// Why the generation of this page's content CANNOT succeed, resolved by the write that
+    /// started it ([`rest_endpoint::rest_endpoint_generation_failure`]), or `None` for a
+    /// generation that has the REST endpoint it documents to generate from.
+    ///
+    /// A page carrying one settles [`STATUS_FAILED`] rather than [`STATUS_AVAILABLE`] and
+    /// reports this `StatusException` with it, so a client polling the page learns that its
+    /// endpoint reference did not resolve and why. Resolved at WRITE time and kept, for the
+    /// reason [`rest_endpoint`] gives: the generation reads the endpoint once, so an endpoint
+    /// created or deleted afterwards does not rewrite a page that already settled.
+    pub generation_failure: Option<wire::StatusException>,
 }
 
 /// The members `CreateProductRestEndpointPage`, `GetProductRestEndpointPage` and
@@ -700,36 +710,50 @@ pub struct ProductRestEndpointPageView {
 }
 
 impl ProductRestEndpointPage {
-    /// The `Status` this page reports now.
+    /// The `Status` this page reports now, and the `StatusException` that status carries.
     ///
     /// A page's content is still being generated when the write that started it answers, so
     /// it is reported [`STATUS_IN_PROGRESS`] until
-    /// [`PRODUCT_REST_ENDPOINT_PAGE_CREATE_SPAN`] has passed, and [`STATUS_AVAILABLE`]
-    /// after that. The transition is one the CLOCK owes, materialised from the stored due
-    /// instant rather than by sleeping or by being read, so every reader agrees on it and a
-    /// read changes nothing.
+    /// [`PRODUCT_REST_ENDPOINT_PAGE_CREATE_SPAN`] has passed. The transition is one the CLOCK
+    /// owes, materialised from the stored due instant rather than by sleeping or by being
+    /// read, so every reader agrees on it and a read changes nothing.
     ///
-    /// No page this store holds settles [`STATUS_FAILED`]: the generation is from the REST
-    /// endpoint the page's identifier names, and a write whose identifier names no such
-    /// endpoint is REFUSED ([`rest_endpoint::UNRESOLVED_REST_ENDPOINT_MESSAGE`]) rather than
-    /// stored as a page that then fails — so every stored page was generated from an
-    /// endpoint that resolved.
-    pub fn status(&self) -> &'static str {
+    /// What it settles on is what the generation could DO: the page's content is generated
+    /// from the REST endpoint its identifier names, so a page whose write found no such
+    /// endpoint to generate from settles the terminal [`STATUS_FAILED`] and reports the
+    /// `StatusException` that write resolved ([`Self::generation_failure`]) — "The status
+    /// exception information", which is what tells a client why the page is not serviceable.
+    /// A page generated from an endpoint that resolved settles [`STATUS_AVAILABLE`] and
+    /// reports no exception: there is nothing to explain.
+    ///
+    /// Status and exception are read TOGETHER, in one reading of the clock, so a reader can
+    /// never be told `FAILED` without the exception that explains it.
+    pub fn reported_status(&self) -> (&'static str, Option<wire::StatusException>) {
         if Instant::now() < self.settles_at {
-            STATUS_IN_PROGRESS
-        } else {
-            STATUS_AVAILABLE
+            return (STATUS_IN_PROGRESS, None);
+        }
+        match &self.generation_failure {
+            Some(exception) => (STATUS_FAILED, Some(exception.clone())),
+            None => (STATUS_AVAILABLE, None),
         }
     }
 
+    /// The `Status` this page reports now, for a reader that states the status alone.
+    pub fn status(&self) -> &'static str {
+        self.reported_status().0
+    }
+
     /// Start the generation of this page's content, as of `now`: it comes due one
-    /// [`PRODUCT_REST_ENDPOINT_PAGE_CREATE_SPAN`] from here.
+    /// [`PRODUCT_REST_ENDPOINT_PAGE_CREATE_SPAN`] from here, and settles on what `failure`
+    /// says that generation can do — `None` for one that has its REST endpoint to generate
+    /// from, and the `StatusException` to report for one that does not.
     ///
     /// This is how a write that REWRITES an existing record starts it over (the update);
-    /// the create sets this same field as it constructs the record it stores, since there is
-    /// no earlier generation there to replace.
-    pub fn start_generation(&mut self, now: Instant) {
+    /// the create sets these same fields as it constructs the record it stores, since there
+    /// is no earlier generation there to replace.
+    pub fn start_generation(&mut self, now: Instant, failure: Option<wire::StatusException>) {
         self.settles_at = now + PRODUCT_REST_ENDPOINT_PAGE_CREATE_SPAN;
+        self.generation_failure = failure;
     }
 
     /// The page's content as it was supplied, for the reader that asks for it
@@ -743,18 +767,18 @@ impl ProductRestEndpointPage {
 
     /// Project the record onto the members every page reader reports.
     pub fn to_wire(&self) -> ProductRestEndpointPageView {
+        let (status, status_exception) = self.reported_status();
         ProductRestEndpointPageView {
             display_content: Some(self.display_content.clone()),
             last_modified: Some(to_timestamp(self.last_modified)),
             product_rest_endpoint_page_arn: Some(self.product_rest_endpoint_page_arn.clone()),
             product_rest_endpoint_page_id: Some(self.product_rest_endpoint_page_id.clone()),
             rest_endpoint_identifier: Some(self.rest_endpoint_identifier.clone()),
-            status: Some(self.status().to_string()),
+            status: Some(status.to_string()),
             // "The status exception information" reports what went WRONG with a page the
-            // service could not assemble, and no page this store holds is one: a write whose
-            // `RestEndpointIdentifier` names no REST endpoint is refused rather than stored
-            // (see [`Self::status`]), so there is never anything to explain.
-            status_exception: None,
+            // service could not assemble, so it travels with — and only with — the status
+            // that says it could not be assembled (see [`Self::reported_status`]).
+            status_exception,
             try_it_state: Some(self.try_it_state.clone()),
         }
     }

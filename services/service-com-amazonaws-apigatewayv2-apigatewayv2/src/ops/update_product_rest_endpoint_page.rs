@@ -205,13 +205,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .map(|page| page.rest_endpoint_identifier.clone())
         };
-        let unresolved_endpoint = match identified
+        let identified_parts = identified
             .as_ref()
-            .and_then(|identifier| crate::state::rest_endpoint_identifier_parts(identifier).ok())
-        {
-            Some(parts) => crate::state::unresolved_rest_endpoint(&*self.engine, parts),
-            None => ::std::option::Option::None,
-        };
+            .and_then(|identifier| crate::state::rest_endpoint_identifier_parts(identifier).ok());
+        let unresolved_endpoint = identified_parts
+            .and_then(|parts| crate::state::unresolved_rest_endpoint(&*self.engine, parts));
+        // And what a RE-GENERATION of the page's content can do, asked in the same hop: the
+        // patch starts the generation over, so the page settles on what the endpoint it
+        // documents can be generated from NOW
+        // ([`crate::state::rest_endpoint_generation_failure`]).
+        let generation_failure = identified_parts
+            .and_then(|parts| crate::state::rest_endpoint_generation_failure(&*self.engine, parts));
 
         let mut store = state.lock();
 
@@ -294,11 +298,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // A patch that DID rewrite the record has the page's content generated again from
         // the REST endpoint it documents, so the page reports `IN_PROGRESS` until that
-        // generation comes due and `AVAILABLE` after it: a client that waits for the
-        // re-generation to clear observes it, exactly as it does after the create.
+        // generation comes due and then what that generation could do: a client that waits
+        // for the re-generation to clear observes it, exactly as it does after the create.
         if modified {
             updated.last_modified = ::std::time::SystemTime::now();
-            updated.start_generation(::std::time::Instant::now());
+            updated.start_generation(::std::time::Instant::now(), generation_failure);
         }
 
         // Write the patched record back where it was, then report what the STORE now

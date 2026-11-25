@@ -510,12 +510,18 @@ const EXPORTED_VERSION_ZONE: &str = "UTC";
 /// The document's one Server Object: the address the exported configuration is CALLED at,
 /// templated by the base path it is served under.
 ///
-/// The url is the api's own PUBLISHED endpoint ([`crate::state::Api::api_endpoint`], the one
-/// address this api announces for a caller to invoke it at) followed by the
-/// [`BASE_PATH_VARIABLE`] template. A Server Object's url is an address a reader of the
-/// document DIALS — an OpenAPI client or code generator calls the api there — so it is the
-/// same value `Api$ApiEndpoint` reports rather than a second address written here: whichever
-/// endpoint a caller reaches this emulator at, the document and the member agree.
+/// The url is the api's DEFAULT execute-api address in the form the member that reports it
+/// documents — "The URI of the API, of the form `{api-id}.execute-api.{region}.amazonaws.com`"
+/// (`Api$ApiEndpoint`) — built by [`crate::state::execute_api_endpoint`] from the api's own id
+/// and Region, followed by the [`BASE_PATH_VARIABLE`] template. An exported definition is a
+/// PORTABLE SPECIFICATION ARTIFACT rather than a link minted for the caller that fetched it:
+/// it is handed to codegen, to validators and to importers, which read the api id out of the
+/// authority's first label and the Region out of the label behind `execute-api`, so the
+/// document states the address the api is served at in the form those readers parse — never
+/// the authority of the listener this one export request happened to arrive on, under which
+/// the api id is no DNS label at all. This emulator answers for that same host on every front
+/// door it serves the plane on (`crate::service::invoke`,
+/// `crate::service::invoke_plane_socket`), so a reader that resolves it reaches the api here.
 ///
 /// That variable's default is the base path THIS export is of: "The stage name is typically
 /// appended to this URI to form a complete path to a deployed API stage"
@@ -541,7 +547,7 @@ fn server_object(api: &crate::state::Api, stage_name: Option<&str>) -> Map<Strin
         "url".to_string(),
         Value::String(format!(
             "{}/{{{BASE_PATH_VARIABLE}}}",
-            api.api_endpoint.trim_end_matches('/')
+            crate::state::execute_api_endpoint(&api.api_id, &api.region, &api.protocol_type)
         )),
     );
     server.insert("variables".to_string(), Value::Object(variables));
