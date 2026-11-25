@@ -640,16 +640,23 @@ async fn ready(
 }
 
 /// Write one message: its type byte, its length (counting the length itself)
-/// and its body.
+/// and its body — as ONE write.
+///
+/// A client reads a message's type and length before it reads the body, so a write
+/// that carries only the header leaves it waiting for a second segment the kernel
+/// holds back until the first is acknowledged (Nagle against the client's delayed
+/// acknowledgement), which adds tens of milliseconds to every message.
 async fn send(
     conn: &mut ::emulator_server::ListenerConn,
     kind: u8,
     body: &[u8],
 ) -> std::io::Result<()> {
     let length = i32::try_from(body.len() + 4).unwrap_or(i32::MAX);
-    conn.write_all(&[kind]).await?;
-    conn.write_all(&length.to_be_bytes()).await?;
-    conn.write_all(body).await
+    let mut message = Vec::with_capacity(body.len() + 5);
+    message.push(kind);
+    message.extend_from_slice(&length.to_be_bytes());
+    message.extend_from_slice(body);
+    conn.write_all(&message).await
 }
 
 /// Read the next message: its type byte and its body, or `None` at end of

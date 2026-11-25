@@ -148,6 +148,20 @@ const CURRENT_LEADER_EPOCH: i32 = 0;
 /// `DescribeGroups`).
 const DEAD_GROUP_STATE: &str = "Dead";
 
+/// The `CoordinatorType` a `FindCoordinator` request names a CONSUMER GROUP by (Apache
+/// Kafka protocol, `FindCoordinator`: `0` is a group and `1` a transaction). A request
+/// that names no type at all is asking about a group, which is what the member's default
+/// says.
+const COORDINATOR_TYPE_GROUP: i8 = 0;
+
+/// What a `FindCoordinator` answer carries where there is no coordinator to report: the
+/// node Apache Kafka answers a refused lookup with (`Node.noNode()` — id `-1`, no host and
+/// port `-1`), so a client reads an answer that names no broker rather than one it would
+/// dial.
+const NO_COORDINATOR_NODE: i32 = -1;
+/// See [`NO_COORDINATOR_NODE`].
+const NO_COORDINATOR_PORT: i32 = -1;
+
 /// The APIs this endpoint serves, and the versions of each: what `ApiVersions`
 /// advertises and what every other frame is admitted against, so a client negotiates
 /// exactly what is implemented here.
@@ -490,11 +504,17 @@ impl Broker {
             let Some(response) = answered else {
                 return;
             };
+            // The length and the response it introduces go out as ONE write: a Kafka
+            // response is one frame, and a client reads its length before it reads the
+            // rest of it, so a write that carries only the length leaves the client
+            // waiting for a second segment the kernel holds back until the first is
+            // acknowledged (Nagle against the client's delayed acknowledgement) — tens of
+            // milliseconds added to every request of every client of this endpoint.
             let framed = u32::try_from(response.len()).unwrap_or(u32::MAX);
-            if conn.write_all(&framed.to_be_bytes()).await.is_err()
-                || conn.write_all(&response).await.is_err()
-                || conn.flush().await.is_err()
-            {
+            let mut frame = Vec::with_capacity(response.len() + 4);
+            frame.extend_from_slice(&framed.to_be_bytes());
+            frame.extend_from_slice(&response);
+            if conn.write_all(&frame).await.is_err() || conn.flush().await.is_err() {
                 return;
             }
         }
@@ -617,7 +637,7 @@ impl Broker {
             }
             ApiKey::FindCoordinator => {
                 let request = FindCoordinatorRequest::decode(&mut body, api_version).ok()?;
-                let response = self.find_coordinator(&request, api_version);
+                let response = self.find_coordinator(&request, session, api_version);
                 self.encode(key, api_version, &header, &response)
             }
             ApiKey::InitProducerId => {
@@ -2047,11 +2067,24 @@ impl Broker {
     /// up to version 3 asks about, carried in the response's own members, and from
     /// version 4 on the per-key list, which is the only place those versions carry it —
     /// and there each key is answered with the coordinator of THAT key.
+    ///
+    /// Finding a group's coordinator is a DESCRIBE of that group, so it is decided against
+    /// the group's own scope on an IAM-authenticated connection
+    /// ([`iam_access::ACTION_DESCRIBE_GROUP`]): a client no policy lets describe the group
+    /// is told `GROUP_AUTHORIZATION_FAILED` and no coordinator, rather than sent to a
+    /// broker that then refuses every call it makes about the group. A key that names a
+    /// TRANSACTION is not a group, so the group scope does not decide it.
     fn find_coordinator(
         &self,
         request: &FindCoordinatorRequest,
+        session: &Session,
         api_version: i16,
     ) -> FindCoordinatorResponse {
+        let describes_a_group = request.key_type == COORDINATOR_TYPE_GROUP;
+        let allowed = |key: &str| {
+            !describes_a_group
+                || self.group_allowed(session, key, iam_access::ACTION_DESCRIBE_GROUP)
+        };
         if api_version >= 4 {
             return FindCoordinatorResponse::default().with_coordinators(
                 request
@@ -2059,9 +2092,18 @@ impl Broker {
                     .iter()
                     .take(MAX_REQUEST_ENTRIES)
                     .map(|key| {
+                        use ::kafka_protocol::messages::find_coordinator_response::Coordinator;
+                        if !allowed(key.as_str()) {
+                            return Coordinator::default()
+                                .with_key(key.clone())
+                                .with_error_code(group_authorization_failed())
+                                .with_node_id(BrokerId(NO_COORDINATOR_NODE))
+                                .with_host(StrBytes::from_static_str(""))
+                                .with_port(NO_COORDINATOR_PORT);
+                        }
                         let (node_id, authority) = self.coordinator_of(key.as_str());
                         let (host, port) = split_authority(&authority);
-                        ::kafka_protocol::messages::find_coordinator_response::Coordinator::default()
+                        Coordinator::default()
                             .with_key(key.clone())
                             .with_node_id(BrokerId(node_id))
                             .with_host(StrBytes::from_string(host))
@@ -2069,6 +2111,13 @@ impl Broker {
                     })
                     .collect(),
             );
+        }
+        if !allowed(request.key.as_str()) {
+            return FindCoordinatorResponse::default()
+                .with_error_code(group_authorization_failed())
+                .with_node_id(BrokerId(NO_COORDINATOR_NODE))
+                .with_host(StrBytes::from_static_str(""))
+                .with_port(NO_COORDINATOR_PORT);
         }
         let (node_id, authority) = self.coordinator_of(request.key.as_str());
         let (host, port) = split_authority(&authority);

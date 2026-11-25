@@ -741,7 +741,12 @@ fn status_flags(session: &Session) -> u16 {
     flags
 }
 
-/// Write one packet: its length, its sequence id and its payload.
+/// Write one packet: its length, its sequence id and its payload — as ONE write.
+///
+/// A client reads a packet's four-byte header before it reads the payload, so a write
+/// that carries only the header leaves it waiting for a second segment the kernel holds
+/// back until the first is acknowledged (Nagle against the client's delayed
+/// acknowledgement), which adds tens of milliseconds to every packet.
 async fn write_packet(
     conn: &mut ::emulator_server::ListenerConn,
     sequence: u8,
@@ -754,9 +759,11 @@ async fn write_packet(
         ));
     }
     let length = u32::try_from(length).unwrap_or_default().to_le_bytes();
-    conn.write_all(length.get(..3).unwrap_or_default()).await?;
-    conn.write_all(&[sequence]).await?;
-    conn.write_all(payload).await
+    let mut packet = Vec::with_capacity(payload.len() + 4);
+    packet.extend_from_slice(length.get(..3).unwrap_or_default());
+    packet.push(sequence);
+    packet.extend_from_slice(payload);
+    conn.write_all(&packet).await
 }
 
 /// Read one packet: its sequence id and its payload, or `None` at end of

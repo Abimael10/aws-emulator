@@ -503,11 +503,18 @@ async fn dial(case: &str, authority: &str) -> TcpStream {
         .unwrap_or_else(|_| panic!("case {case:?}: {port:?} is not a port"));
     // The loopback literal is named here rather than through [`LOOPBACK`] so the address
     // this connection goes to is readable on the line that opens it.
-    TcpStream::connect(("127.0.0.1", port))
+    let conn = TcpStream::connect(("127.0.0.1", port))
         .await
         .unwrap_or_else(|error| {
             panic!("case {case:?}: {authority} must accept a connection, got {error}")
-        })
+        });
+    // A Kafka client disables Nagle on its broker connections (it is in the default
+    // socket options of every one of them), so this one does too: a client that left it
+    // on would hold its own request frame back waiting for an acknowledgement, and the
+    // round trip this suite measures the broker by would be the client's own delay.
+    conn.set_nodelay(true)
+        .unwrap_or_else(|error| panic!("case {case:?}: the connection must take TCP_NODELAY: {error}"));
+    conn
 }
 
 /// The verifier a client of the emulator's OWN socket uses: the certificate is the one
