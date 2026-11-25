@@ -25,7 +25,13 @@
 //!   which resources this service holds a forecast FOR is decided by the stored plan, and
 //!   the served side of that rule is pinned in
 //!   [`crate::forecast_resource_triple_consistency`];
-//! * an accepted request answers HTTP 200 with the required `Datapoints` member.
+//! * an accepted request answers HTTP 200 with the required `Datapoints` member;
+//! * a window's answer — refused, or served with the forecast it holds — is decided by the
+//!   two window members ALONE: the same envelope earns the same answer for every
+//!   `ForecastDataType`, for a plan that forecasts the named resource and one that does
+//!   not, and for a name this service does not hold. A served envelope's `Datapoints` list
+//!   is then whatever the window really holds: the forecast of every interval inside the
+//!   span the data exists over, which is empty exactly when the window holds none of them.
 //!
 //! Every plan these tests store configures DYNAMIC scaling only — its instruction carries
 //! no load metric specification, which is what "configur[es] predictive scaling" — so it
@@ -39,8 +45,8 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice::ops::get_scaling_plan_resource_forecast_data::{
-    FORECAST_INTERVAL_SECONDS, FORECAST_SCALABLE_DIMENSION, FORECAST_SERVICE_NAMESPACE,
-    MAX_FORECAST_HISTORY_DAYS, MAX_FORECAST_WINDOW_DAYS,
+    FORECAST_HORIZON_DAYS, FORECAST_INTERVAL_SECONDS, FORECAST_SCALABLE_DIMENSION,
+    FORECAST_SERVICE_NAMESPACE, MAX_FORECAST_HISTORY_DAYS, MAX_FORECAST_WINDOW_DAYS,
 };
 use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice::ops::types::FORECAST_DATA_TYPE_VALUES;
 
@@ -893,4 +899,292 @@ async fn a_forecast_read_leaves_the_stored_plan_as_it_was() {
         "reading the forecast must not change what a later caller sees: {before} became \
          {after}"
     );
+}
+
+/// Which instant an envelope's `StartTime` is measured from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Anchor {
+    /// The start of the clock hour containing now: a forecast period boundary, so a row
+    /// measured from it places both endpoints at a known phase inside a period whatever
+    /// time the test runs at.
+    PeriodBoundary,
+    /// Now itself, for a row whose data content turns on where the window sits relative to
+    /// the span forecast data exists over.
+    Now,
+}
+
+impl Anchor {
+    /// The whole epoch second `offset` seconds from this anchor.
+    fn at(self, offset: i64) -> i64 {
+        match self {
+            Self::PeriodBoundary => current_hour_start() + offset,
+            Self::Now => now_secs() + offset,
+        }
+    }
+}
+
+/// What one window envelope earns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    /// HTTP 200 carrying the required `Datapoints` member: the forecast of every interval
+    /// the window holds inside the span forecast data exists over — at least one of them
+    /// where `points` is true, none of them where it is false.
+    Served { points: bool },
+    /// HTTP 400 `ValidationException`, for the relation the inner verdict names.
+    Refused(Verdict),
+}
+
+/// One window envelope — `[anchor + offset, anchor + offset + width)` — and the answer the
+/// rule gives it.
+#[derive(Debug, Clone, Copy)]
+struct Envelope {
+    label: &'static str,
+    anchor: Anchor,
+    offset: i64,
+    width: i64,
+    answer: Answer,
+}
+
+/// Who a forecast is asked of: one emulator, one plan name, one scalable resource — and
+/// whether that pair has a forecast at all, which is what decides whether a served window
+/// can carry a data point.
+struct Subject<'a> {
+    label: &'static str,
+    emulator: &'a Emulator,
+    plan: &'a str,
+    resource: Resource<'a>,
+    has_forecast: bool,
+}
+
+/// Assert one envelope earns its answer when asked of one subject for one forecast data
+/// type.
+async fn assert_envelope(subject: &Subject<'_>, envelope: &Envelope, data_type: &str) {
+    let start = envelope.anchor.at(envelope.offset);
+    let window = (start, start + envelope.width);
+    let body = forecast_request(
+        subject.plan,
+        ONLY_VERSION,
+        subject.resource,
+        data_type,
+        window,
+    );
+    let shown = format!("[{}, {}) / {data_type}", window.0, window.1);
+    match envelope.answer {
+        Answer::Refused(verdict) => {
+            assert_verdict(
+                subject.emulator,
+                envelope.label,
+                subject.label,
+                &shown,
+                &body,
+                verdict,
+            )
+            .await;
+        }
+        Answer::Served { points } => {
+            let (status, parsed) = subject.emulator.call(OPERATION, &body).await;
+            assert_eq!(
+                status,
+                200,
+                "case {:?} on {} ({shown}): expected HTTP 200, got {status} with {parsed}",
+                envelope.label,
+                subject.label
+            );
+            // A subject with nothing to forecast reports the empty list for every window;
+            // one with a forecast reports the intervals the window really holds.
+            let expected = points && subject.has_forecast;
+            let carried = !datapoints(&parsed).is_empty();
+            assert_eq!(
+                carried,
+                expected,
+                "case {:?} on {} ({shown}): expected {} data point, got {parsed}",
+                envelope.label,
+                subject.label,
+                if expected { "at least one" } else { "no" }
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn one_window_envelope_earns_one_answer_whatever_lies_behind_it() {
+    let week = MAX_FORECAST_WINDOW_DAYS * DAY;
+    let history = MAX_FORECAST_HISTORY_DAYS * DAY;
+    let horizon = FORECAST_HORIZON_DAYS * DAY;
+    // Rows walk the envelope family around every documented boundary, differing along what
+    // the rule generalises over: the WIDTH (a second, a forecast period, inside the
+    // documented maximum, exactly at it, part of a period past it, a whole period past it,
+    // days past it), the ORDER of the two endpoints, the PHASE of the start inside its
+    // forecast period, and WHERE the window sits relative to now — at the far edge of the
+    // span forecast data is available over, before that edge, past the documented forecast
+    // horizon and far ahead of it. Only the first two decide the refusal; the position
+    // decides how much forecast a served window carries, which is the empty list when the
+    // window holds no interval the service has data for.
+    let cases: [Envelope; 16] = [
+        Envelope {
+            label: "a window of one forecast period starting on a period boundary",
+            anchor: Anchor::PeriodBoundary,
+            offset: 0,
+            width: HOUR,
+            answer: Answer::Served { points: true },
+        },
+        Envelope {
+            label: "a one-second window containing a period boundary",
+            anchor: Anchor::PeriodBoundary,
+            offset: 0,
+            width: 1,
+            answer: Answer::Served { points: true },
+        },
+        Envelope {
+            label: "a one-second window containing no period boundary",
+            anchor: Anchor::PeriodBoundary,
+            offset: 600,
+            width: 1,
+            answer: Answer::Served { points: false },
+        },
+        Envelope {
+            label: "a ten-minute window inside a single forecast period",
+            anchor: Anchor::PeriodBoundary,
+            offset: 600,
+            width: 600,
+            answer: Answer::Served { points: false },
+        },
+        Envelope {
+            label: "a window a second inside the documented maximum width",
+            anchor: Anchor::PeriodBoundary,
+            offset: 0,
+            width: week - 1,
+            answer: Answer::Served { points: true },
+        },
+        Envelope {
+            label: "a window exactly at the documented maximum width",
+            anchor: Anchor::PeriodBoundary,
+            offset: 0,
+            width: week,
+            answer: Answer::Served { points: true },
+        },
+        Envelope {
+            label: "a maximum-width window starting mid-period",
+            anchor: Anchor::PeriodBoundary,
+            offset: 1_777,
+            width: week,
+            answer: Answer::Served { points: true },
+        },
+        Envelope {
+            label: "the last second of the forecast period past the maximum width",
+            anchor: Anchor::PeriodBoundary,
+            offset: 0,
+            width: week + HOUR - 1,
+            answer: Answer::Served { points: true },
+        },
+        Envelope {
+            label: "a whole forecast period past the documented maximum width",
+            anchor: Anchor::PeriodBoundary,
+            offset: 0,
+            width: week + HOUR,
+            answer: Answer::Refused(Verdict::RefusedAsTooWide),
+        },
+        Envelope {
+            label: "three days past the documented maximum width",
+            anchor: Anchor::PeriodBoundary,
+            offset: 0,
+            width: week + 3 * DAY,
+            answer: Answer::Refused(Verdict::RefusedAsTooWide),
+        },
+        Envelope {
+            label: "an end time equal to the start time",
+            anchor: Anchor::PeriodBoundary,
+            offset: 600,
+            width: 0,
+            answer: Answer::Refused(Verdict::RefusedAsOutOfOrder),
+        },
+        Envelope {
+            label: "an end time a forecast period before the start time",
+            anchor: Anchor::PeriodBoundary,
+            offset: 600,
+            width: -HOUR,
+            answer: Answer::Refused(Verdict::RefusedAsOutOfOrder),
+        },
+        Envelope {
+            label: "a window starting at the far edge of the documented data span",
+            anchor: Anchor::Now,
+            offset: -history,
+            width: DAY,
+            answer: Answer::Served { points: true },
+        },
+        Envelope {
+            label: "a window starting a forecast period before that edge",
+            anchor: Anchor::Now,
+            offset: -history - HOUR,
+            width: DAY,
+            answer: Answer::Served { points: true },
+        },
+        Envelope {
+            label: "a window starting two hundred days before now, well past that span",
+            anchor: Anchor::Now,
+            offset: -200 * DAY,
+            width: DAY,
+            answer: Answer::Served { points: false },
+        },
+        Envelope {
+            label: "a window starting a day past the documented forecast horizon ahead of now",
+            anchor: Anchor::Now,
+            offset: horizon + DAY,
+            width: DAY,
+            answer: Answer::Served { points: false },
+        },
+    ];
+
+    // Two emulators, so the same envelope is asked of a plan that HAS a forecast and of one
+    // that has none: the predictive plan of `crate::forecast_window_precision` (an
+    // instruction with a load metric specification, with its history published) and the
+    // dynamic-only plan of this suite.
+    let predictive = crate::forecast_window_precision::with_predictive_plan().await;
+    let dynamic = with_stored_plan().await;
+    let other_resource: Resource<'_> = (
+        FORECAST_SERVICE_NAMESPACE,
+        UNCOVERED_RESOURCE,
+        FORECAST_SCALABLE_DIMENSION,
+    );
+    let subjects = [
+        Subject {
+            label: "a plan that forecasts the named resource",
+            emulator: &predictive,
+            plan: crate::forecast_window_precision::STORED_PLAN,
+            resource: ASG_RESOURCE,
+            has_forecast: true,
+        },
+        Subject {
+            label: "a plan that instructs another resource",
+            emulator: &predictive,
+            plan: crate::forecast_window_precision::STORED_PLAN,
+            resource: other_resource,
+            has_forecast: false,
+        },
+        Subject {
+            label: "a plan this service does not hold",
+            emulator: &predictive,
+            plan: ABSENT_PLAN,
+            resource: ASG_RESOURCE,
+            has_forecast: false,
+        },
+        Subject {
+            label: "a plan configuring no predictive scaling",
+            emulator: &dynamic,
+            plan: STORED_PLAN,
+            resource: ASG_RESOURCE,
+            has_forecast: false,
+        },
+    ];
+
+    for subject in &subjects {
+        // Source of the data types: `smithy_query(query="shape",shape="ForecastDataType")`,
+        // mirrored as `FORECAST_DATA_TYPE_VALUES` — the window answer is the same for every
+        // one of them, the two scheduled-action types included.
+        for data_type in FORECAST_DATA_TYPE_VALUES {
+            for envelope in &cases {
+                assert_envelope(subject, envelope, data_type).await;
+            }
+        }
+    }
 }

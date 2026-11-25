@@ -48,7 +48,10 @@ const OPERATION: &str = "GetScalingPlanResourceForecastData";
 const HOUR: i64 = FORECAST_INTERVAL_SECONDS;
 
 /// The plan these tests hold.
-const STORED_PLAN: &str = "forecast plan";
+///
+/// `pub(crate)` so a suite driving [`with_predictive_plan`] names the plan that helper
+/// stored rather than repeating its name beside it.
+pub(crate) const STORED_PLAN: &str = "forecast plan";
 
 /// The Auto Scaling group that plan scales, as `crate::forecast_data` names it.
 const RESOURCE: &str = "autoScalingGroup/my-asg";
@@ -61,7 +64,11 @@ const RESOURCE: &str = "autoScalingGroup/my-asg";
 /// and the instruction leaves `PredictiveScalingMode` and
 /// `PredictiveScalingMaxCapacityBehavior` at their documented defaults, so all four
 /// `ForecastDataType`s report a value.
-async fn with_predictive_plan() -> Emulator {
+///
+/// `pub(crate)` so a suite that needs a plan WITH a forecast — one whose answers are not
+/// empty for every window — reuses this one rather than building a second predictive plan
+/// beside it.
+pub(crate) async fn with_predictive_plan() -> Emulator {
     let mut scaling_instruction = instruction(
         "autoscaling",
         RESOURCE,
