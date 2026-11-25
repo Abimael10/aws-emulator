@@ -39,6 +39,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use quick_xml::events::Event;
+use quick_xml::Reader;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use smithy_server_runtime::MultiServiceRouter;
@@ -1723,6 +1725,326 @@ async fn the_listing_pairs_every_drawn_zone_with_its_own_fallback_posture() {
                     )
                 });
             assert_zone_features(&case, held, block.as_deref());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The listed container as a STRICT structure reader takes it apart
+// ---------------------------------------------------------------------------
+
+/// One `Features` container as an XML reader sees it.
+///
+/// A container a client deserialises against the modelled STRUCTURE is child
+/// elements and nothing else: an element carrying text of its own deserialises as
+/// a string, which is the shape a strict reader refuses where a structure is
+/// declared. Both halves are kept, so the two are told apart by what was read
+/// rather than by looking at the body's text.
+#[derive(Debug, Default)]
+struct ReadFeatures {
+    /// The `(member, value)` of every element the container opens, in document
+    /// order — the structure's members as the reader met them.
+    members: Vec<(String, String)>,
+    /// The text the container carries OUTSIDE those elements, whitespace
+    /// trimmed: empty for a structure, and the whole value for a container
+    /// serialised as a text node.
+    own_text: String,
+}
+
+impl ReadFeatures {
+    /// The value this container reports for one member, and `None` for a member
+    /// it does not carry.
+    fn member(&self, member: &str) -> Option<&str> {
+        self.members
+            .iter()
+            .find(|(name, _)| name == member)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// The local name of an element the reader opened or closed.
+fn local_name(name: quick_xml::name::LocalName<'_>) -> String {
+    String::from_utf8_lossy(name.as_ref()).into_owned()
+}
+
+/// Every hosted zone a restXml body projects, as `(Name, its Features
+/// container)` — `None` for a zone that opens no container at all.
+///
+/// Read with the maintained XML reader this crate reads restXml with, one event
+/// at a time, rather than by looking at the body's text: what this test asks is
+/// what a STRICT structure deserialiser makes of the container, so the container
+/// is taken apart by a reader and each member is placed by where the reader met
+/// it in the document.
+fn read_listed_zones(case: &str, body: &str) -> Vec<(String, Option<ReadFeatures>)> {
+    let mut reader = Reader::from_str(body);
+    // The elements open at this point of the document, outermost first, so a
+    // member is attributed to the container it sits INSIDE.
+    let mut path: Vec<String> = Vec::new();
+    let mut zones: Vec<(String, Option<ReadFeatures>)> = Vec::new();
+    // The zone being read: the `Name` it is reported under and its container.
+    let mut zone: Option<(Option<String>, Option<ReadFeatures>)> = None;
+    loop {
+        // The text the reader just read, whichever way the document spells it;
+        // every other event moves the place the next text belongs to.
+        let value = match reader.read_event() {
+            Ok(Event::Start(start)) => {
+                let name = local_name(start.local_name());
+                if name == "HostedZone" {
+                    zone = Some((None, None));
+                } else if name == "Features" {
+                    if let Some((_, features)) = zone.as_mut() {
+                        *features = Some(ReadFeatures::default());
+                    }
+                }
+                path.push(name);
+                continue;
+            }
+            // A self-closed element carries no text: `<Features/>` is the empty
+            // container, and a self-closed member is a member with no value.
+            Ok(Event::Empty(empty)) => {
+                let name = local_name(empty.local_name());
+                if name == "Features" {
+                    if let Some((_, features)) = zone.as_mut() {
+                        *features = Some(ReadFeatures::default());
+                    }
+                } else if path.last().is_some_and(|open| open == "Features") {
+                    if let Some((_, Some(features))) = zone.as_mut() {
+                        features.members.push((name, String::new()));
+                    }
+                }
+                continue;
+            }
+            Ok(Event::Text(text)) => text
+                .xml10_content()
+                .ok()
+                .and_then(|decoded| {
+                    quick_xml::escape::unescape(&decoded)
+                        .ok()
+                        .map(|value| value.trim().to_string())
+                })
+                .unwrap_or_default(),
+            // Text may be spelled as a CDATA section, whose content is the value
+            // VERBATIM, so it is taken unescaped — and taken at all, because a
+            // container carrying its text that way is still a container carrying
+            // text of its own.
+            Ok(Event::CData(cdata)) => std::str::from_utf8(cdata.as_ref())
+                .map(|text| text.trim().to_string())
+                .unwrap_or_default(),
+            Ok(Event::End(end)) => {
+                path.pop();
+                if local_name(end.local_name()) == "HostedZone" {
+                    let (name, features) = zone.take().unwrap_or_else(|| {
+                        panic!("case {case:?}: a HostedZone ended that never opened; body {body}")
+                    });
+                    let name = name.unwrap_or_else(|| {
+                        panic!(
+                            "case {case:?}: every projected hosted zone carries its Name; \
+                             body {body}"
+                        )
+                    });
+                    zones.push((name, features));
+                }
+                continue;
+            }
+            Ok(Event::Eof) => break,
+            Err(error) => panic!(
+                "case {case:?}: the listing must be XML a reader can read, got {error}; body {body}"
+            ),
+            _ => continue,
+        };
+        if value.is_empty() {
+            continue;
+        }
+        let Some((zone_name, features)) = zone.as_mut() else {
+            continue;
+        };
+        let inside = path.last().map(String::as_str);
+        let parent = path.len().checked_sub(2).map(|at| path[at].as_str());
+        match (parent, inside) {
+            (Some("HostedZone"), Some("Name")) => *zone_name = Some(value),
+            (Some("Features"), Some(member)) => {
+                if let Some(features) = features.as_mut() {
+                    features.members.push((member.to_string(), value));
+                }
+            }
+            (_, Some("Features")) => {
+                if let Some(features) = features.as_mut() {
+                    features.own_text.push_str(&value);
+                }
+            }
+            _ => {}
+        }
+    }
+    zones
+}
+
+/// Assert one listed zone's container is the modelled STRUCTURE carrying that
+/// zone's own statuses: `fallback` for the public-DNS fallback status every
+/// listed zone has, `accelerated` for the other feature's status where the zone
+/// holds one, each as a child element with a value, and no text of the
+/// container's own — the shape the type of the member requires.
+fn assert_read_structure(
+    case: &str,
+    name: &str,
+    read: Option<&ReadFeatures>,
+    fallback: &str,
+    accelerated: Option<&str>,
+) {
+    let read = read.unwrap_or_else(|| {
+        panic!("case {case:?}: zone {name:?} holds a feature status, so the listing projects its Features container")
+    });
+    assert!(
+        read.own_text.is_empty(),
+        "case {case:?}: zone {name:?}: Features targets a structure, so the container carries no \
+         text of its own, got {:?}",
+        read.own_text
+    );
+    assert!(
+        !read.members.is_empty(),
+        "case {case:?}: zone {name:?}: the container must carry the zone's statuses as child \
+         elements, got the empty container"
+    );
+    for (member, value) in &read.members {
+        assert!(
+            FEATURES_MEMBERS.contains(&member.as_str()),
+            "case {case:?}: zone {name:?}: {member:?} is not a HostedZoneFeatures member; \
+             container {:?}",
+            read.members
+        );
+        assert!(
+            !value.is_empty(),
+            "case {case:?}: zone {name:?}: member {member:?} must carry the status it reports, \
+             got an empty value; container {:?}",
+            read.members
+        );
+    }
+    let reported = read.member(PUBLIC_DNS_FALLBACK_STATUS);
+    assert_eq!(
+        reported,
+        Some(fallback),
+        "case {case:?}: zone {name:?}: expected {PUBLIC_DNS_FALLBACK_STATUS} {fallback:?}, got \
+         {reported:?}; container {:?}",
+        read.members
+    );
+    let reported = read.member("AcceleratedRecoveryStatus");
+    assert_eq!(
+        reported,
+        accelerated,
+        "case {case:?}: zone {name:?}: expected AcceleratedRecoveryStatus {accelerated:?}, got \
+         {reported:?}; container {:?}",
+        read.members
+    );
+    // One status per member: a container that opened a member twice reports two
+    // statuses for one feature.
+    let mut seen: Vec<&str> = read.members.iter().map(|(name, _)| name.as_str()).collect();
+    let opened = seen.len();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(
+        seen.len(),
+        opened,
+        "case {case:?}: zone {name:?}: each member is reported once, got {:?}",
+        read.members
+    );
+}
+
+/// How many zones the accounts below hold: the single zone of an account with
+/// one, the two the recorded listing of this rule carried, and every row of the
+/// posture table at once.
+const ACCOUNT_SIZES: [usize; 3] = [1, 2, 6];
+
+#[tokio::test]
+async fn every_listed_zones_features_container_reads_back_as_a_structure() {
+    // The rule as the CLIENT's deserialiser meets it: `HostedZone$Features`
+    // targets a structure, so each zone the account-wide listing projects
+    // carries it as child elements holding THAT zone's own feature statuses —
+    // never as a container with text of its own, which is what an empty element
+    // deserialises as, and never as a member whose value came from another zone.
+    // The rows span the zones of the posture table (public and private, one to
+    // three labels, commented or not, the fallback feature on and off, the other
+    // feature configured and not) and the accounts span how many zones are
+    // listed at once, the two-zone listing the rule was recorded on among them.
+    for zones_held in ACCOUNT_SIZES {
+        let rows = posture_rows();
+        let rows = &rows[..zones_held.min(rows.len())];
+        let case = format!("an account holding {} zone(s)", rows.len());
+        let (router, engine) = router_with_store();
+        // What each zone's own container must report.
+        let mut expected: Vec<(String, Option<&'static str>, &'static str)> = Vec::new();
+        let mut configured: Vec<(&str, String)> = Vec::new();
+
+        for (index, row) in rows.iter().enumerate() {
+            let created =
+                create_zone(&router, row.name, &format!("read-back-{index}"), row.extra).await;
+            assert_eq!(
+                created.status, 201,
+                "case {case:?} / {:?}: expected 201 from CreateHostedZone, got {} with body {}",
+                row.case, created.status, created.body
+            );
+            let zone_id = bare_zone_id(&created);
+            if row.fallback_on {
+                turn_fallback_on(&engine, &zone_id);
+            }
+            if row.configure {
+                let reply = update_features(&router, &zone_id, true).await;
+                assert_eq!(
+                    reply.status, 200,
+                    "case {case:?} / {:?}: expected 200 from UpdateHostedZoneFeatures, got {} \
+                     with body {}",
+                    row.case, reply.status, reply.body
+                );
+                configured.push((row.case, zone_id));
+            }
+            expected.push((
+                canonical_name(row.name),
+                row.configure.then_some(ACCELERATED_RECOVERY_ENABLED),
+                row.listed_fallback()
+                    .expect("every listed zone reports the fallback posture it is in"),
+            ));
+        }
+
+        // Looked for until each configured zone has settled, so the status the
+        // listing must report is one fixed value rather than whatever the
+        // propagation span happens to be showing on this host.
+        for (configured_case, zone_id) in &configured {
+            let (status, body) =
+                poll_until_status(&router, zone_id, ACCELERATED_RECOVERY_ENABLED).await;
+            assert_eq!(
+                status.as_deref(),
+                Some(ACCELERATED_RECOVERY_ENABLED),
+                "case {case:?} / {configured_case:?}: the configured zone must reach \
+                 {ACCELERATED_RECOVERY_ENABLED}, got {status:?}; body {body}"
+            );
+        }
+
+        let listed = call(&router, "GET", "/2013-04-01/hostedzone", "").await;
+        assert_eq!(
+            listed.status, 200,
+            "case {case:?}: expected 200 from ListHostedZones, got {} with body {}",
+            listed.status, listed.body
+        );
+        let read = read_listed_zones(&case, &listed.body);
+        let mut names: Vec<&str> = read.iter().map(|(name, _)| name.as_str()).collect();
+        names.sort_unstable();
+        let mut wanted: Vec<&str> = expected.iter().map(|(name, _, _)| name.as_str()).collect();
+        wanted.sort_unstable();
+        assert_eq!(
+            names, wanted,
+            "case {case:?}: expected the listing to project {wanted:?}, got {names:?}; body {}",
+            listed.body
+        );
+        for (name, features) in &read {
+            let (_, accelerated, fallback) = expected
+                .iter()
+                .find(|(zone_name, _, _)| zone_name == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {case:?}: the listing reported a zone {name:?} nothing created; \
+                         body {}",
+                        listed.body
+                    )
+                });
+            assert_read_structure(&case, name, features.as_ref(), fallback, *accelerated);
         }
     }
 }
