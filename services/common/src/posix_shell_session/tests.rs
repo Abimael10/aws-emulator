@@ -1593,6 +1593,42 @@ fn every_volume_bound_stops_the_work() {
         "case the expansion's own nesting: expected only the bounded expansion's value \
              on the console, got {written:?}"
     );
+
+    // How deeply an ARITHMETIC expansion may be resolved inside another: resolving one
+    // expands the expression's own text as a WORD, and a word is given the word budget
+    // afresh, so what bounds that recursion is the count of expansions being resolved inside
+    // one another — an expression nesting past it has no value rather than driving the
+    // recursion as far as its own text reaches.
+    // (case, how many levels the expression nests, the status the command answers)
+    let nesting = |levels: usize| {
+        let mut expression = "1".to_string();
+        for _ in 0..levels {
+            expression = format!("$(( {expression} + 1 ))");
+        }
+        format!("echo {expression} > /dev/console")
+    };
+    for (case, levels, expected) in [
+        ("inside the depth", 2, statuses.success),
+        ("past the depth", 64, statuses.could_not_run),
+    ] {
+        let mut held = ShellSession::in_volume(
+            BTreeMap::new(),
+            config(Bounds {
+                // Wide enough that the LINE's own nesting count is not what refuses it, which
+                // is the bound a caller handing a whole script states.
+                nesting: 512,
+                word_depth: 4,
+                ..Bounds::default()
+            }),
+            volume(),
+        );
+        assert_eq!(
+            held.run(&nesting(levels)),
+            expected,
+            "case {case:?}: expected the status {expected} for an arithmetic expansion nesting \
+             {levels} level(s)"
+        );
+    }
 }
 
 /// RULE: a program of the tree is RESOLVED the way the shell's own command search resolves

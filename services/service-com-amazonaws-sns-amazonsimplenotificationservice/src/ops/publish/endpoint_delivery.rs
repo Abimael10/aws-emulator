@@ -1064,7 +1064,15 @@ const MAX_CONTINUED_WAIT: Duration = Duration::from_secs(60);
 /// request that finds none left is not continued, which is where a schedule that has run out
 /// leaves one too. The permit is released as soon as the continuation ends, so what this bounds
 /// is what is in flight rather than how many requests may ever be continued.
-const MAX_CONTINUED_REQUESTS: usize = 64;
+///
+/// One of them costs a task and a clone of the request it is about, and it is held for as long
+/// as that request's schedule keeps waiting ([`MAX_CONTINUED_WAIT`]) — so the number has to
+/// cover every subscription this ONE process is serving over such a span, not the few a single
+/// caller makes. A process serving many topics at once would otherwise reach the bound through
+/// unrelated subscriptions and silently drop the rest of a schedule that was owed, which is
+/// indistinguishable to its subscriber from an endpoint that was never retried. Far above the
+/// subscriptions one process holds at once and far below what those tasks would cost it.
+const MAX_CONTINUED_REQUESTS: usize = 4_096;
 
 /// Those permits, one per continuation in flight.
 static CONTINUATIONS: ::tokio::sync::Semaphore =

@@ -185,6 +185,11 @@ pub struct GuestRuntime {
     /// what the agent PUBLISHES depends on the configuration it was handed as well, which is
     /// the agent's own state rather than the init system's.
     pub cloudwatch_agent: super::guest_cloudwatch_agent::AgentRuntime,
+    /// The space the guest's own programs RESERVED on its root filesystem, by the path each
+    /// reservation was taken for ([`super::guest_filesystem`]): a count of bytes the
+    /// filesystem holds against that file, which is what `fallocate` takes and what the
+    /// filesystem reports in use from then on.
+    pub reserved: BTreeMap<String, i64>,
 }
 
 impl GuestRuntime {
@@ -206,6 +211,9 @@ impl GuestRuntime {
                 config: self.cloudwatch_agent.config.clone(),
                 ..super::guest_cloudwatch_agent::AgentRuntime::default()
             },
+            // The space a file holds on the filesystem is on the machine's storage, so it
+            // survives a boot exactly as the file it was reserved for does.
+            reserved: self.reserved.clone(),
         };
         for unit in &self.enabled {
             if let Some(package) = package_named(unit) {
@@ -304,8 +312,31 @@ impl GuestServices {
     /// The shared runtime. A guard another thread panicked while holding still holds this
     /// guest's services, so it is taken back rather than propagated: the records are a plain
     /// map, and nothing of them is left half written by a panic in a program.
-    fn held(&self) -> ::std::sync::MutexGuard<'_, GuestRuntime> {
+    pub(super) fn held(&self) -> ::std::sync::MutexGuard<'_, GuestRuntime> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// How much space this machine's filesystem holds for `path`, or `None` when it holds none
+    /// for it ([`super::guest_filesystem`]).
+    #[must_use]
+    pub fn reserved_at(&self, path: &str) -> Option<i64> {
+        self.held().reserved.get(path).copied()
+    }
+
+    /// Hold `bytes` of this machine's filesystem for `path`, answering whether the filesystem
+    /// now holds them: a reservation this machine already has for that path is REPLACED, and a
+    /// machine already holding `most_paths` reservations for other paths takes no further one.
+    ///
+    /// Whether there is ROOM for it is the filesystem's own question, asked by the program that
+    /// takes the reservation ([`super::guest_filesystem`]); what this answers is whether the
+    /// machine has a record left to keep it in.
+    pub fn reserve(&self, path: &str, bytes: i64, most_paths: usize) -> bool {
+        let mut held = self.held();
+        if !held.reserved.contains_key(path) && held.reserved.len() >= most_paths {
+            return false;
+        }
+        held.reserved.insert(path.to_string(), bytes);
+        true
     }
 
     /// Install the packages `arguments` names, as a package manager invocation.
@@ -774,7 +805,8 @@ impl ::service_common::posix_shell_volume::DatagramSink for GuestServices {
 /// change `services`, the ones that report its CPU layout ([`super::guest_cpu`]), the one
 /// that lists its block devices ([`super::guest_block_devices`]), the ones that perform I/O
 /// THROUGH one ([`super::guest_disk_io`], which change `disks`), the one that reads the clock
-/// ([`super::guest_clock`]) and the ones that report what is MOUNTED into it
+/// ([`super::guest_clock`]), the ones that report its own root FILESYSTEM
+/// ([`super::guest_filesystem`]) and the ones that report what is MOUNTED into it
 /// ([`super::guest_mounts`]).
 ///
 /// The ONE construction of them, so the boot's own user-data program and a command something
@@ -834,9 +866,17 @@ pub fn installed_programs(
     // has, asked after the programs above for the same reason.
     let own =
         ::service_common::posix_shell_session::layered(own, super::guest_clock::clock_programs());
+    // ... and the ones that report its own ROOT FILESYSTEM and RESERVE space on it
+    // ([`super::guest_filesystem`]), for a machine whose root volume size this store holds,
+    // asked after the programs above for the same reason.
+    let own = match super::guest_filesystem::filesystem_programs(machine, services) {
+        Some(filesystem) => ::service_common::posix_shell_session::layered(own, filesystem),
+        None => own,
+    };
     // ... and the ones that report the filesystems mounted into it, which every machine has
     // (what they answer is what the session's own mount table holds), asked last for the same
-    // reason.
+    // reason — which is also what lets the FILESYSTEM form of `stat` reach that module once the
+    // file form above has performed nothing of it.
     ::service_common::posix_shell_session::layered(own, super::guest_mounts::mount_programs())
 }
 

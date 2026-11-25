@@ -35,10 +35,12 @@
 //!   ADJACENT lines, each "prefix[ed] with the number of occurrences" by `-c`, narrowed to the
 //!   runs that repeat by `-d` or to the lines that do not by `-u`, and compared without regard
 //!   to case by `-i`;
-//! * `tr [-d] [-s] SET1 [SET2]` — "translate, squeeze, and/or delete characters from standard
-//!   input": each character SET1 names written as the one at its position in SET2, "delete[d]"
-//!   by `-d` and with repeats of the characters a set names "replace[d] … with a single
-//!   occurrence" by `-s`. A set is written as the utility writes one: its literal characters, a
+//! * `tr [-c] [-d] [-s] SET1 [SET2]` — "translate, squeeze, and/or delete characters from
+//!   standard input": each character SET1 names written as the one at its position in SET2,
+//!   "delete[d]" by `-d` and with repeats of the characters a set names "replace[d] … with a
+//!   single occurrence" by `-s`, and with `-c` matching "the complement of SET1" instead of the
+//!   characters it names — which is how a program keeps only the characters it wants
+//!   (`tr -dc 0-9.`). A set is written as the utility writes one: its literal characters, a
 //!   `a-z` range, the `\n`/`\t`/`\r`/`\\` escapes, and the `[:class:]` character classes;
 //! * `sha256sum` / `sha512sum` — the digest of its input, written as the lowercase hexadecimal
 //!   digest, two spaces and the name of what was read (`-` for standard input);
@@ -79,7 +81,9 @@
 //!   to check an order rather than write one (`-c`) is not performed, nor is one asked for an
 //!   order this module computes nothing for (a human-readable, version or random order): each
 //!   of those is a comparison beyond the line's own bytes and its numeric value;
-//! * a `tr` asked for the COMPLEMENT of a set (`-c`), for a truncated SET2 (`-t`), or carrying
+//! * a `tr` asked for the COMPLEMENT of a set it TRANSLATES into another (`-c` with two sets,
+//!   whose output follows from the whole character repertoire of the locale rather than from
+//!   the sets written), for a truncated SET2 (`-t`), or carrying
 //!   a set this module does not read (an escape or a class outside the ones above, a `[:class:]`
 //!   in SET2 that is not `[:lower:]` or `[:upper:]`, which is the only place the utility itself
 //!   admits one) is not performed either;
@@ -233,6 +237,14 @@ struct TranslateWork {
     delete: Option<Vec<char>>,
     /// `-s SET`: the characters whose repeats are "replace[d] … with a single occurrence".
     squeeze: Option<Vec<char>>,
+    /// `-c`: whether SET1 is matched by "the complement of SET1" rather than by the characters
+    /// it names — so `tr -dc 0-9.` deletes every character that is NOT a digit or a point.
+    ///
+    /// It qualifies SET1 alone, which is [`Self::delete`] for every deleting form and
+    /// [`Self::squeeze`] for the one form that squeezes SET1 itself; a complemented
+    /// TRANSLATION is a form this module does not perform at all (see the module docs), so
+    /// this is never set beside [`Self::translate`].
+    complement: bool,
 }
 
 /// The work one invocation of a text filter performs over ONE input.
@@ -1263,15 +1275,18 @@ const CASE_CLASSES: [&str; 2] = ["lower", "upper"];
 /// WHICH operand is which is the utility's own usage: `tr SET1 SET2` translates, `tr -d SET1`
 /// deletes, `tr -s SET` squeezes, `tr -s SET1 SET2` translates and then squeezes SET2, and
 /// `tr -d SET1 SET2` deletes SET1 and squeezes SET2 — the one form that takes two sets with
-/// `-d`.
+/// `-d`. `-c` qualifies SET1 of whichever of those the invocation asked for, except a
+/// TRANSLATION, which is a form this module performs nothing of under it (see the module docs).
 fn translate_work(options: &[String], operands: &[String]) -> Option<TranslateWork> {
     let mut delete = false;
     let mut squeeze = false;
+    let mut complement = false;
     for option in options {
         if let Some(name) = option.strip_prefix("--") {
             match name {
                 "delete" => delete = true,
                 "squeeze-repeats" => squeeze = true,
+                "complement" => complement = true,
                 _ => return None,
             }
             continue;
@@ -1280,6 +1295,8 @@ fn translate_work(options: &[String], operands: &[String]) -> Option<TranslateWo
             match flag {
                 'd' => delete = true,
                 's' => squeeze = true,
+                // "-c, -C, --complement: use the complement of SET1".
+                'c' | 'C' => complement = true,
                 _ => return None,
             }
         }
@@ -1300,31 +1317,42 @@ fn translate_work(options: &[String], operands: &[String]) -> Option<TranslateWo
             translate: Some(mapping(first, second)?),
             delete: None,
             squeeze: None,
+            complement,
         },
         (false, true, None) => TranslateWork {
             translate: None,
             delete: None,
             squeeze: Some(first),
+            complement,
         },
         (false, true, Some(second)) => TranslateWork {
             translate: Some(mapping(first, second.clone())?),
             delete: None,
             squeeze: Some(second),
+            complement,
         },
         (true, false, None) => TranslateWork {
             translate: None,
             delete: Some(first),
             squeeze: None,
+            complement,
         },
         (true, true, Some(second)) => TranslateWork {
             translate: None,
             delete: Some(first),
             squeeze: Some(second),
+            complement,
         },
         // A translation needs two sets and a deletion alone takes one: every other
         // combination names more or fewer sets than the work it asked for.
         _ => return None,
     };
+    // The complement of a set this module TRANSLATES from would have to be written in the
+    // order of the whole character repertoire the utility's locale holds, which is not the
+    // sets the invocation wrote: that form is performed by nothing here.
+    if work.complement && work.translate.is_some() {
+        return None;
+    }
     Some(work)
 }
 
@@ -1454,6 +1482,10 @@ fn translated(work: &TranslateWork, input: &str) -> String {
         work.delete.iter().flatten().copied().collect();
     let squeezed: ::std::collections::BTreeSet<char> =
         work.squeeze.iter().flatten().copied().collect();
+    // "Use the complement of SET1" qualifies SET1 alone: the deleted set where the invocation
+    // deletes, and the squeezed one where SET1 is itself the set whose repeats are squeezed.
+    let complemented_delete = work.complement && work.delete.is_some();
+    let complemented_squeeze = work.complement && work.delete.is_none();
     // The character each one SET1 names is written as: the one at the same position of SET2,
     // and the character itself where SET2 is shorter. A character SET1 names twice is written
     // as its FIRST position says, which is the position the utility's own left-to-right reading
@@ -1470,13 +1502,16 @@ fn translated(work: &TranslateWork, input: &str) -> String {
     let mut written = String::new();
     let mut last: Option<char> = None;
     for character in input.chars() {
-        if deleted.contains(&character) {
+        if work.delete.is_some() && (deleted.contains(&character) != complemented_delete) {
             continue;
         }
         let character = mapped.get(&character).copied().unwrap_or(character);
         // "Replace each sequence of a repeated character that is listed in the last specified
         // SET with a single occurrence of that character."
-        if last == Some(character) && squeezed.contains(&character) {
+        if last == Some(character)
+            && work.squeeze.is_some()
+            && (squeezed.contains(&character) != complemented_squeeze)
+        {
             continue;
         }
         written.push(character);
@@ -1859,7 +1894,7 @@ mod tests {
             ("tr translating with one set", "tr", words(&["a-z"])),
             ("tr deleting two sets", "tr", words(&["-d", "a", "b"])),
             ("tr with more sets than any form takes", "tr", words(&["a", "b", "c"])),
-            ("tr complementing a set", "tr", words(&["-c", "a-z", "A-Z"])),
+            ("tr complementing a set it translates from", "tr", words(&["-c", "a-z", "A-Z"])),
             ("tr with a reversed range", "tr", words(&["z-a", "A-Z"])),
             ("tr with an escape it does not read", "tr", words(&[r"\d", "x"])),
             (
@@ -2466,6 +2501,28 @@ mod tests {
                 words(&["-d", "-s", "a", "b"]),
                 "aabb\n",
                 "b\n",
+            ),
+            (
+                // The form a program keeps only the characters it wants with.
+                "tr -dc deletes every character its set does NOT name",
+                "tr",
+                words(&["-dc", "0-9."]),
+                " 25.5%\n",
+                "25.5",
+            ),
+            (
+                "tr -d -c written apart complements the same set",
+                "tr",
+                words(&["-d", "-c", "[:digit:]"]),
+                "6144 1M-blocks\n",
+                "61441",
+            ),
+            (
+                "tr -sc squeezes the repeats of every character its set does not name",
+                "tr",
+                words(&["-sc", "0-9"]),
+                "1  2\t\t3\n",
+                "1 2\t3\n",
             ),
             (
                 "tr reads the escape a set is written with",

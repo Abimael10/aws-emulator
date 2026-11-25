@@ -336,8 +336,12 @@ impl ComAmazonawsEc2Amazonec2State {
         // What the program left on the machine's storage is what the machine holds now — the
         // same write the boot's own program makes, and so is what it left RUNNING.
         if let Some(instance) = self.instances.get_mut(instance_id) {
+            let mut runtime = services.taken();
+            // The space a file held on the filesystem is the filesystem's again once the file
+            // is gone ([`super::guest_filesystem::release_removed_files`]).
+            super::guest_filesystem::release_removed_files(&mut runtime, &written);
             instance.guest_files = written;
-            instance.guest_runtime = services.taken();
+            instance.guest_runtime = runtime;
         }
         // ... and what it wrote THROUGH a device goes onto the volume behind that device, which is
         // where the data of a volume lives and what makes it follow the volume across a move

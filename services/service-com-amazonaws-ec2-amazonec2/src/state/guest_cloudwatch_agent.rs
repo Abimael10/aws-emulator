@@ -926,63 +926,11 @@ pub struct GuestMeasurements {
     pub filesystem: Option<GuestFilesystem>,
 }
 
-/// The root FILESYSTEM of one machine: how many bytes it holds and how many are in use.
-///
-/// The size is the root volume's own (`EbsBlockDevice$VolumeSize`, in gibibytes) and what is in
-/// use is what the machine's storage holds, so the guest's own storage and the series the agent
-/// publishes about it are one fact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GuestFilesystem {
-    /// The bytes the filesystem holds.
-    pub total_bytes: i64,
-    /// The bytes of it in use.
-    pub used_bytes: i64,
-}
-
-/// How many bytes one gibibyte is, which is the unit a volume's size is stated in
-/// (`EbsBlockDevice$VolumeSize`).
-const BYTES_PER_GIB: i64 = 1024 * 1024 * 1024;
-
-/// What the IMAGE a machine boots holds on its root filesystem before its own programs write
-/// anything.
-///
-/// CHOSEN: no API reports how much of a root volume an image's own contents take, and a
-/// filesystem reporting nothing in use would report a machine with no operating system on it.
-/// It sits below the smallest root volume a launch can ask for.
-const IMAGE_FILESYSTEM_BYTES: i64 = 2 * BYTES_PER_GIB;
-
-impl GuestFilesystem {
-    /// The root filesystem of a machine whose root volume is `size_gib` and whose own storage
-    /// holds `stored_bytes` — `None` for a machine this store holds no root volume size for.
-    #[must_use]
-    pub fn of(size_gib: Option<i32>, stored_bytes: usize) -> Option<Self> {
-        let total_bytes = i64::from(size_gib.filter(|size| *size > 0)?).saturating_mul(BYTES_PER_GIB);
-        let stored = i64::try_from(stored_bytes).unwrap_or(0);
-        Some(Self {
-            total_bytes,
-            used_bytes: IMAGE_FILESYSTEM_BYTES
-                .saturating_add(stored)
-                .min(total_bytes),
-        })
-    }
-
-    /// The bytes not in use.
-    #[must_use]
-    fn free_bytes(&self) -> i64 {
-        self.total_bytes.saturating_sub(self.used_bytes).max(0)
-    }
-
-    /// The share of the filesystem in use, as the percentage `disk_used_percent` carries.
-    #[must_use]
-    fn used_percent(&self) -> f64 {
-        if self.total_bytes <= 0 {
-            return 0.0;
-        }
-        #[allow(clippy::cast_precision_loss)]
-        let share = self.used_bytes as f64 / self.total_bytes as f64;
-        share * 100.0
-    }
-}
+/// The root FILESYSTEM of one machine, which the `disk` measurements below are taken of
+/// ([`super::guest_filesystem`], which holds it because the guest's own programs report the
+/// same filesystem): re-exported here so a reader of the measurements has the reading they are
+/// taken of to hand.
+pub use super::guest_filesystem::GuestFilesystem;
 
 /// The measurements of a FILESYSTEM the agent takes, as the names it publishes each under with
 /// the unit of each (the CloudWatch agent configuration reference's `disk` section).

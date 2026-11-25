@@ -545,8 +545,14 @@ pub fn boot_console(
     }
     GuestBoot {
         lines,
+        runtime: {
+            let mut runtime = services.taken();
+            // The space a file held on the filesystem is the filesystem's again once the file
+            // is gone ([`super::guest_filesystem::release_removed_files`]).
+            super::guest_filesystem::release_removed_files(&mut runtime, &files);
+            runtime
+        },
         files,
-        runtime: services.taken(),
     }
 }
 

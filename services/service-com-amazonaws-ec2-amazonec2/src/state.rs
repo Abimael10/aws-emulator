@@ -2806,6 +2806,12 @@ pub mod guest_memory;
 pub mod guest_cloudwatch_agent;
 pub use guest_cloudwatch_agent::InstalledGuestPackage;
 
+/// What one instance's GUEST sees of its ROOT FILESYSTEM: how large it is, how much of it its
+/// own storage accounts for, the space a program of it RESERVES, and the programs it reports
+/// both with. A SUBMODULE for the same reason [`image_usage_reports`] is one, and re-exported
+/// the way [`guest_memory`] is and for the same reason.
+pub mod guest_filesystem;
+
 /// What one instance's GUEST sees of its own BLOCK DEVICES: the volumes attached to it, under
 /// the names the kernel inside it gives them, and the program it lists them with. A SUBMODULE
 /// for the same reason [`image_usage_reports`] is one.

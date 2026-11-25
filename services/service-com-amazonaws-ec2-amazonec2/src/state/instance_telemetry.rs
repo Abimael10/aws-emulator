@@ -471,12 +471,16 @@ fn due_agent_samples(
 }
 
 /// What the agent in the guest of `instance` can measure of that machine: its memory
-/// ([`super::guest_memory`]) and its root filesystem, both read off the stored instance.
+/// ([`super::guest_memory`]) and its root filesystem ([`super::guest_filesystem`]), both read
+/// off the stored instance.
 fn guest_measurements(
     store: &ComAmazonawsEc2Amazonec2State,
     instance: &InstanceRecord,
 ) -> super::guest_cloudwatch_agent::GuestMeasurements {
-    let stored_bytes = super::guest_memory::stored_bytes(&instance.guest_files);
+    // What the machine's own storage accounts for: the files it holds and the space its
+    // programs reserved, which is the ONE reading the guest's own `df` reports as well.
+    let stored_bytes =
+        super::guest_filesystem::storage_bytes(&instance.guest_files, &instance.guest_runtime);
     super::guest_cloudwatch_agent::GuestMeasurements {
         memory: super::guest_memory::guest_memory(
             super::instance_type_record(&instance.instance_type).map(|record| record.memory_mib),

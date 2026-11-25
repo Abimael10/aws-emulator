@@ -583,6 +583,18 @@ pub trait ProgramFiles {
         let _ = path;
         None
     }
+
+    /// How many bytes the tree's OWN storage holds now, as one of its files accounts for its
+    /// path and its contents — what a program reporting how FULL the filesystem is reports,
+    /// and `None` for a tree that keeps no account of them.
+    ///
+    /// It counts the files a program may write and not the ones the service SEALED into the
+    /// tree: a published seed is the service's own, not the machine's storage, which is the
+    /// same reading the owner of the tree takes of it when the run is over
+    /// ([`ShellSession::tree_files`]).
+    fn stored_byte_count(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// The commands a session whose tree is a MACHINE's — or its own WORKING tree
@@ -1177,6 +1189,16 @@ pub struct ShellSession {
     /// caller that runs a SCRIPT with arguments hands it. Empty for a program invoked with
     /// none, where every one of them expands to nothing.
     positional: Vec<String>,
+    /// How many ARITHMETIC expansions are being resolved inside one another right now, which is
+    /// what bounds that path's own recursion ([`Self::expand_arithmetic`]).
+    ///
+    /// It is counted here rather than taken from the word's remaining depth because resolving
+    /// one starts a new WORD — the expression's own text, whose expansions are resolved before
+    /// the arithmetic is parsed — and a new word is given the whole word budget again. Without
+    /// this, an expression nesting `$((…))` inside itself would restart the only counter that
+    /// bounds the walk, so the recursion a single program text could drive would be bounded by
+    /// the length of that text alone.
+    arithmetic_depth: usize,
 }
 
 /// What a `break` or a `continue` asked for: which of the two it was, and how many enclosing
@@ -1234,6 +1256,10 @@ impl ProgramFiles for SessionFiles<'_> {
 
     fn file_system_at(&self, path: &str) -> Option<ShellMountFacts> {
         self.session.tree_file_system_at(path)
+    }
+
+    fn stored_byte_count(&self) -> Option<usize> {
+        Some(self.session.tree_stored_bytes())
     }
 }
 
@@ -1359,6 +1385,7 @@ impl ShellSession {
             loop_control: None,
             last_status: 0,
             positional: Vec::new(),
+            arithmetic_depth: 0,
             config,
         };
         for (name, value) in variables {
@@ -1519,8 +1546,18 @@ impl ShellSession {
         }
     }
 
-    /// Forget that a program ended this session with `exit`, so the next line runs.
-    ///
+    /// How many bytes the files above come to, as one of them accounts for its path and its
+    /// contents — what a program of the tree's owner reports as the storage IN USE
+    /// ([`ProgramFiles::stored_byte_count`]).
+    #[must_use]
+    pub fn tree_stored_bytes(&self) -> usize {
+        self.tree_files()
+            .iter()
+            .map(|(path, contents)| path.len().saturating_add(contents.len()))
+            .sum()
+    }
+
+    /// Forget that a program ended this session with `exit`, so the next line runs.    ///
     /// For a caller that hands this session SEVERAL programs over one tree — a phase's
     /// command list and then the block that runs after it — where an `exit` ends the program
     /// that performed it and not the ones the caller runs next.
@@ -3970,19 +4007,40 @@ impl ShellSession {
     ///
     /// `None` is an expansion with no value: a session that was given no machine's tree does
     /// not perform the form, and neither does an expression past the bound a parse is given
-    /// ([`within_parse_bounds`], applied to the text the expansion materialised rather than
-    /// only to the line it came from), one that does not parse, one this module does not
-    /// evaluate, or one whose arithmetic has no answer (a division by zero, an overflow).
+    /// ([`within_parse_bounds`], applied both to the text as written and to the text the
+    /// expansion materialised), one nested past [`Bounds::word_depth`] inside another
+    /// arithmetic expansion ([`Self::arithmetic_depth`]), one that does not parse, one this
+    /// module does not evaluate, or one whose arithmetic has no answer (a division by zero, an
+    /// overflow).
     fn expand_arithmetic(&mut self, text: &str) -> Option<String> {
         if !self.works_over_a_tree() {
             return None;
         }
+        // The text AS WRITTEN is read under the bound a parse is given before anything is
+        // expanded, so an expression that nests past it costs no recursion at all.
+        if !within_parse_bounds(text, &self.config.bounds)
+            || self.arithmetic_depth >= self.config.bounds.word_depth
+        {
+            return None;
+        }
+        // Resolving one is a level of NESTING of its own: the expression's own text is
+        // expanded as a word, and an `$((…))` inside it is resolved here again — which is the
+        // recursion this count bounds, since each of those words is given the word budget
+        // afresh.
+        self.arithmetic_depth = self.arithmetic_depth.saturating_add(1);
+        let value = self.arithmetic_value(text);
+        self.arithmetic_depth = self.arithmetic_depth.saturating_sub(1);
+        value
+    }
+
+    /// [`Self::expand_arithmetic`] once its bounds are spent: the expression's own expansions
+    /// resolved, then parsed and evaluated.
+    fn arithmetic_value(&mut self, text: &str) -> Option<String> {
         let resolved = self.expand_word(text).unwrap_or_else(|| text.to_string());
         // The expansion above can have MATERIALISED text far longer and far more deeply
         // nested than the line itself — a variable's value expands inside the expression —
-        // so the same bound a line is read under is applied to it before it reaches a
-        // grammar: a parser costs a level of recursion per nested group, and that recursion
-        // is what this keeps in range.
+        // so the same bound a line is read under is applied to it as well: a parser costs a
+        // level of recursion per nested group, and that recursion is what this keeps in range.
         if !within_parse_bounds(&resolved, &self.config.bounds) {
             return None;
         }
