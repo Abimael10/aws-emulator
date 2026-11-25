@@ -86,6 +86,16 @@
 //! touched, rather than leaving the group holding an attachment that can never resolve or
 //! never register anything.
 //!
+//! # A registration the target group will not take
+//!
+//! A target group that RESOLVES can still refuse the registration itself: Elastic Load
+//! Balancing v2 takes no target that is not in the VPC its target group is in, and an attach
+//! is answered without reading where the group's instances run, so the refusal can only
+//! appear afterwards. It appears where Amazon EC2 Auto Scaling reports what it did on a
+//! group's behalf — one FAILED scaling activity per refused registration, carrying that
+//! service's own refusal ([`record_refused_registrations`]) — rather than leaving the
+//! attachment silently inert.
+//!
 //! LOCKING. A reconcile reads the wanted set under this service's own lock, RELEASES it,
 //! and only then takes the Elastic Load Balancing v2 store's lock for the one pass that
 //! registers and deregisters; nothing awaits while either is held. A read of that store
@@ -547,6 +557,93 @@ pub fn launch_blocked_message(unresolved: &[String]) -> String {
     )
 }
 
+/// The wire error code and HTTP status Elastic Load Balancing v2 answers a registration of a
+/// target its target group cannot take with: its `InvalidTargetException`'s own
+/// `awsQueryError` code and `httpError`
+/// (`smithy_query(query="shape",shape="InvalidTargetException")`), whose documentation is
+/// "the specified target does not exist, is not in the same VPC as the target group, or has
+/// an unsupported instance type".
+const INVALID_TARGET_CODE: &str = "InvalidTarget";
+const INVALID_TARGET_STATUS: u16 = 400;
+
+/// One registration of a group that Elastic Load Balancing v2 will take no target for: the
+/// instance is not in the VPC the target group is in.
+///
+/// Every field is read off a stored group, one of its stored instances and the target group
+/// that refused it, so a refusal stands for a registration the group really owed and names
+/// the resources a client holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedRegistration {
+    /// The target group the registration was owed in.
+    pub target_group_arn: String,
+    /// The instance of the group the registration was owed for.
+    pub instance_id: String,
+    /// The VPC the target group is in, which is the network its targets have to be in.
+    pub target_group_vpc_id: String,
+}
+
+impl RefusedRegistration {
+    /// How this refusal is remembered on the group that owed it
+    /// ([`crate::state::RefusedRegistrations`]).
+    fn key(&self) -> crate::state::RefusedRegistrationKey {
+        (self.target_group_arn.clone(), self.instance_id.clone())
+    }
+}
+
+/// What the scaling activity of a registration Elastic Load Balancing v2 REFUSED reports as
+/// its `StatusMessage`: the target group the instance could not be put into, and that
+/// service's own refusal for it.
+///
+/// It opens with Amazon EC2 Auto Scaling's own fixed text for a registration that failed
+/// ([`FAILED_TARGET_GROUP_UPDATE`]) and names the target group it could not update, exactly
+/// as the launch a missing attachment blocks does ([`launch_blocked_message`]) — that is the
+/// sentence a client reads off the activity to tell a failure of the group's load balancing
+/// from any other.
+///
+/// What follows is Elastic Load Balancing v2's own refusal: its target-not-in-the-group's-VPC
+/// wording for the target a call names (`elbv2::targets_not_in_target_group_vpc_message`),
+/// with the service, status and code an AWS SDK renders beside the message of a failed call,
+/// so a client reads here exactly what it would read from a `RegisterTargets` of its own.
+/// Nothing about a launch is stated: the instance is in service, and what failed is the
+/// registration alone.
+#[must_use]
+pub fn refused_registration_message(refused: &RefusedRegistration) -> String {
+    format!(
+        "{FAILED_TARGET_GROUP_UPDATE} {}: {} (Service: {ELBV2_SERVICE_NAME}, Status Code: \
+         {INVALID_TARGET_STATUS}, Error Code: {INVALID_TARGET_CODE}).",
+        refused.target_group_arn,
+        elbv2::targets_not_in_target_group_vpc_message(
+            &refused.target_group_vpc_id,
+            [refused.instance_id.as_str()]
+        )
+    )
+}
+
+/// What the activity of a registration that was refused DESCRIBES: the step Amazon EC2 Auto
+/// Scaling set out to make — the process that "adds instances to the attached load balancer
+/// or target group" (`AddToLoadBalancer`,
+/// [`crate::state::suspended_processes::PROCESS_ADD_TO_LOAD_BALANCER`]), for the
+/// instance it was making it for — and the reason it did not, named as the status reason the
+/// way every failed activity of this service states it
+/// ([`crate::state::failed_launch_description`]).
+#[must_use]
+pub fn refused_registration_description(instance_id: &str, status_message: &str) -> String {
+    format!(
+        "Adding instance {instance_id} to the attached load balancer or target group. Status \
+         Reason: {status_message}"
+    )
+}
+
+/// Why the activity of a refused registration BEGAN: the group owed one of its instances a
+/// registration in a target group it is attached to, which is the step that then failed.
+///
+/// One clause, as [`crate::state::AutoScalingState::reason_cause`] states it: the activity is
+/// the step itself rather than a capacity change, so there is no capacity for it to name.
+#[must_use]
+pub fn refused_registration_subject(instance_id: &str) -> String {
+    format!("instance {instance_id} was being registered with the target groups attached to the group")
+}
+
 /// Every registration the group `group_name` owes right now, in attachment order and, within
 /// an attachment, in instance order. Empty for a name this store holds no group for, which is
 /// what a deleted group owes.
@@ -801,14 +898,83 @@ where
 ///
 /// Reconciling is idempotent, so a call that moved nothing writes nothing: the set it reads
 /// is the set already in place.
+///
+/// A registration that service REFUSED is recorded on the group afterwards
+/// ([`record_refused_registrations`]), with the other store released again: the attach
+/// itself is answered, so the activity log is where a client reads that the registration it
+/// asked for could not be made.
 pub fn settle_group<Eng: Send + Sync + 'static>(engine: &Eng, group_name: &str) {
     let Some(state) = crate::state::service_state(engine) else {
         return;
     };
+    let now = SystemTime::now();
     // The guard this statement takes is a TEMPORARY: it is released at the end of the
     // statement, so nothing below holds it.
     let wanted = wanted_of(&state.lock(), group_name);
-    reconcile(engine, group_name, &wanted, SystemTime::now());
+    let refused = reconcile(engine, group_name, &wanted, now);
+    // …and so is the guard this one takes, which is held for the append alone.
+    record_refused_registrations(&mut state.lock(), group_name, &refused, now);
+}
+
+/// Record the scaling activity each registration Elastic Load Balancing v2 refused owes the
+/// group `group_name`, and forget the refusals that no longer stand.
+///
+/// "If an attempt to launch instances failed, the StatusCode value is Failed or Cancelled and
+/// the StatusMessage element in the response indicates the cause of the failure"
+/// (`DescribeScalingActivities`): a registration the attached target group would not take is
+/// a step of the group's history that FAILED, so the group records it with that code and the
+/// refusing service's own sentence ([`refused_registration_message`]) rather than leaving the
+/// attachment silently inert — the activity log is the only place a client learns of it,
+/// because the attach that made the attachment was answered.
+///
+/// ONCE per refusal: the group remembers the refusals it has recorded
+/// ([`crate::state::StoredGroup::refused_registrations`]), so the reconciles that follow —
+/// one per write to the group and one per wake-up of the clock — add nothing. A mark whose
+/// refusal no longer stands (the attachment was detached, the instance left the group, the
+/// target group was moved into the instance's own VPC) is dropped, so a client that makes the
+/// same attachment again reads the refusal again.
+fn record_refused_registrations(
+    store: &mut AutoScalingState,
+    group_name: &str,
+    refused: &[RefusedRegistration],
+    now: SystemTime,
+) {
+    let standing: BTreeSet<crate::state::RefusedRegistrationKey> =
+        refused.iter().map(RefusedRegistration::key).collect();
+    let (group_arn, fresh) = {
+        let Some(group) = store.groups.get_mut(group_name) else {
+            return;
+        };
+        if group.refused_registrations.is_empty() && refused.is_empty() {
+            return;
+        }
+        group
+            .refused_registrations
+            .retain(|key| standing.contains(key));
+        let mut fresh: Vec<RefusedRegistration> = Vec::new();
+        for refusal in refused {
+            if group.refused_registrations.insert(refusal.key()) {
+                fresh.push(refusal.clone());
+            }
+        }
+        (group.arn.clone(), fresh)
+    };
+    for refusal in fresh {
+        let status_message = refused_registration_message(&refusal);
+        let description = refused_registration_description(&refusal.instance_id, &status_message);
+        store.record_failed_activity(
+            group_name,
+            &group_arn,
+            description,
+            status_message,
+            crate::state::ACTIVITY_FAILED,
+            AutoScalingState::reason_cause(
+                now,
+                &refused_registration_subject(&refusal.instance_id),
+            ),
+            now,
+        );
+    }
 }
 
 /// Make the Elastic Load Balancing v2 registrations of the group `group_name` exactly
@@ -828,14 +994,18 @@ pub fn settle_group<Eng: Send + Sync + 'static>(engine: &Eng, group_name: &str) 
 ///
 /// A registration is withheld from a target group of ANOTHER VPC ([`in_another_vpc`]): the
 /// instance could not be registered there by a caller either, so it is not registered here.
+/// Each one withheld is ANSWERED to the caller ([`RefusedRegistration`]) rather than dropped,
+/// so the group can record what the target group would not take. Answering them is the whole
+/// of what this call reports, so dropping them is dropping the refusals.
+#[must_use]
 pub fn reconcile<Eng: Send + Sync + 'static>(
     engine: &Eng,
     group_name: &str,
     wanted: &[TargetRegistration],
     now: SystemTime,
-) {
+) -> Vec<RefusedRegistration> {
     let Some(state) = elbv2::service_state(engine) else {
-        return;
+        return Vec::new();
     };
     // Where each instance of the wanted set RUNS, read from the account's own Amazon EC2
     // store BEFORE the Elastic Load Balancing v2 store is locked, so the two stores are
@@ -862,6 +1032,8 @@ pub fn reconcile<Eng: Send + Sync + 'static>(
     // under: the write that creates a registration owes it its first health check, and
     // nothing else is checked for it.
     let mut added: Vec<(String, elbv2::TargetKey)> = Vec::new();
+    // …and the ones it could not make at all, which the caller records on the group.
+    let mut refused: Vec<RefusedRegistration> = Vec::new();
     for (arn, group) in store.target_groups.iter_mut() {
         // What the clock already owes this group: a registration whose drain is over has
         // left it, so it occupies neither a key nor the group's quota.
@@ -870,25 +1042,39 @@ pub fn reconcile<Eng: Send + Sync + 'static>(
         // store it at — an instance target takes the target group's own port, which is where
         // "the load balancer routes requests to registered targets using the protocol and
         // port for the target group".
-        let keys: Vec<(elbv2::TargetKey, &TargetRegistration)> = by_target_group
+        let mut keys: Vec<(elbv2::TargetKey, &TargetRegistration)> = Vec::new();
+        for registration in by_target_group
             .get(arn.as_str())
             .map(Vec::as_slice)
             .unwrap_or_default()
-            .iter()
-            // A target group of another VPC takes none of this group's instances.
-            .filter(|registration| {
-                !in_another_vpc(
-                    group.vpc_id.as_deref(),
-                    vpcs.get(&registration.instance_id).map(String::as_str),
-                )
-            })
-            .map(|registration| {
-                (
-                    (registration.instance_id.clone(), group.port),
-                    *registration,
-                )
-            })
-            .collect();
+        {
+            // A target group of another VPC takes none of this group's instances — and the
+            // registration it would not take is ANSWERED, for the one target type whose
+            // targets are the instances this service registers: for any other the refusal is
+            // about the target type instead, which is what the attach itself is refused for
+            // ([`invalid_target_type_message`]). The VPC is bound BEFORE the comparison, so
+            // what the refusal names is the value that decided it.
+            let target_group_vpc = group.vpc_id.as_deref();
+            if in_another_vpc(
+                target_group_vpc,
+                vpcs.get(&registration.instance_id).map(String::as_str),
+            ) {
+                if let (TARGET_TYPE_INSTANCE, Some(vpc_id)) =
+                    (group.target_type.as_str(), target_group_vpc)
+                {
+                    refused.push(RefusedRegistration {
+                        target_group_arn: arn.clone(),
+                        instance_id: registration.instance_id.clone(),
+                        target_group_vpc_id: vpc_id.to_string(),
+                    });
+                }
+                continue;
+            }
+            keys.push((
+                (registration.instance_id.clone(), group.port),
+                *registration,
+            ));
+        }
         // Every registration of THIS group that the set above no longer holds.
         for (key, workload) in group.scheduler_registrations() {
             if !scope.claims(&workload) {
@@ -950,4 +1136,5 @@ pub fn reconcile<Eng: Send + Sync + 'static>(
     // RELEASED, so the check takes the store's lock itself.
     drop(store);
     elbv2::check_registrations(engine, &added);
+    refused
 }

@@ -1221,7 +1221,24 @@ pub struct StoredGroup {
     /// group's metrics collection reaches ([`metrics_collection`]), so deleting the group
     /// takes its metrics collection with it.
     pub enabled_metrics: EnabledMetrics,
+    /// The registrations of this group's instances that the load balancing service REFUSED
+    /// and this group has already recorded a failed scaling activity for
+    /// ([`RefusedRegistrations`]).
+    ///
+    /// A refusal is recorded ONCE: the reconcile that owes the registration runs again on
+    /// every write to the group and on every wake-up of the clock, and what a client reads
+    /// off the group is one activity per refusal rather than one per pass. A mark is kept
+    /// only while the refusal it stands for still stands ([`elbv2_targets::settle_group`]),
+    /// so a client that takes the attachment off and makes it again reads the refusal again.
+    pub refused_registrations: RefusedRegistrations,
 }
+
+/// One registration of a group that the load balancing service refused: the target group it
+/// was owed in, and the instance of the group it was owed for.
+pub type RefusedRegistrationKey = (String, String);
+
+/// The registrations of one group that have already been recorded as refused, each once.
+pub type RefusedRegistrations = BTreeSet<RefusedRegistrationKey>;
 
 impl StoredGroup {
     /// The instances that count towards the group's capacity: everything that is

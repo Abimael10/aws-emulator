@@ -978,6 +978,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A new group collects no group metric either: the create carries no metrics
             // member, so the first one comes from `EnableMetricsCollection`.
             enabled_metrics: crate::state::EnabledMetrics::new(),
+            // And nothing has been refused for it yet: the first mark is made by the
+            // reconcile that finds a registration the load balancing service will not take
+            // ([`crate::state::elbv2_targets::settle_group`]).
+            refused_registrations: crate::state::RefusedRegistrations::new(),
         };
         state.groups.insert(name.clone(), group);
 
