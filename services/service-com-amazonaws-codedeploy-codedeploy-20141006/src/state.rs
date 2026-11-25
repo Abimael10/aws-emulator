@@ -134,6 +134,14 @@ pub mod instance_lifecycle;
 /// place the agent's work on a deployment's fleet falls due.
 pub mod agent_deployment;
 
+/// The deployment-configuration names CodeDeploy keeps for itself: the one place
+/// a creating request's name is asked whether it reaches into that space.
+pub mod deployment_config_namespace;
+
+/// The tag set a request applies to a resource: the one place a tag list is asked
+/// whether it determines one.
+pub mod tag_set;
+
 use crate::ops::types::{
     AlarmConfiguration, AutoRollbackConfiguration, BlueGreenDeploymentConfiguration,
     DeploymentStyle, EC2DeploymentOptions, EC2TagFilter, EC2TagSet, ECSService, LoadBalancerInfo,

@@ -378,10 +378,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `deploymentConfigName`'s length and pattern, `computePlatform`'s value
         // set and both healthy-host types' value sets are MODELLED constraints the
         // boundary already refused, in the words `crate::service` picks for
-        // CodeDeploy. What is left here is the part the model cannot state: which
-        // optional member applies to the compute platform the request names, what
-        // each member's value may be, and that the name is not already taken.
+        // CodeDeploy. What is left here is the part the model cannot state: that
+        // the name is not one CodeDeploy keeps for itself, which optional member
+        // applies to the compute platform the request names, what each member's
+        // value may be, and that the name is not already taken.
         let name = input.deployment_config_name;
+        // The reserved name space is asked about FIRST, before anything about the
+        // request's own members or about what the account holds: a name there can
+        // never become a configuration of this caller's, so whether it is taken,
+        // and what the rest of the request says, do not come into it.
+        if crate::state::deployment_config_namespace::is_reserved_deployment_config_name(&name) {
+            return Err(
+                CreateDeploymentConfigErrorModeled::InvalidDeploymentConfigNameException(
+                    InvalidDeploymentConfigNameException {
+                        message: Some(
+                            crate::state::deployment_config_namespace::reserved_deployment_config_prefix_message(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let compute_platform = input
             .compute_platform
             .unwrap_or_else(|| crate::state::DEFAULT_COMPUTE_PLATFORM.to_string());
@@ -460,8 +478,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let minted = crate::state::with_state(&*self.engine, |state| {
-            // The `CodeDeployDefault.*` built-ins are in this same store, so one of
-            // their names is taken too.
+            // Only a name OUTSIDE the reserved space reaches here, so this is a
+            // name of this caller's that some earlier call of theirs took.
             if state.deployment_configs.contains_key(&name) {
                 return Err(
                     CreateDeploymentConfigErrorModeled::DeploymentConfigAlreadyExistsException(

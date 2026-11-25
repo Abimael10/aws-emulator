@@ -331,8 +331,8 @@ async fn deleting_a_name_the_store_does_not_hold_is_a_success() {
 /// RULE: a configuration CodeDeploy itself ships cannot be deleted — the call is
 /// refused with `InvalidOperationException` and the configuration stays readable
 /// — and the refusal keys on that shipped catalog, not on how a name is spelled:
-/// a configuration a client created under a `CodeDeployDefault.*`-shaped name is
-/// a created configuration and is deleted like any other.
+/// a configuration a client created under a name that only resembles a shipped
+/// one is a created configuration and is deleted like any other.
 #[tokio::test]
 async fn a_predefined_configuration_is_refused() {
     let emulator = Emulator::new();
@@ -356,8 +356,11 @@ async fn a_predefined_configuration_is_refused() {
     }
 
     // A name OUTSIDE that catalog is a created configuration, however it is
-    // spelled.
-    let lookalikes = ["CodeDeployDefault.TwoAtATime", "CodeDeployDefault"];
+    // spelled. The names a client can create are the ones outside the reserved
+    // prefix (`CodeDeployDefault.`), which `CreateDeploymentConfig` refuses for
+    // its name space, so a lookalike is one that stops short of the prefix or
+    // spells it differently.
+    let lookalikes = ["CodeDeployDefault", "codedeploydefault.TwoAtATime"];
     for name in lookalikes {
         create_config(&emulator, name, &json!({"computePlatform": "Server"})).await;
         let (status, body) = delete_config(&emulator, name).await;

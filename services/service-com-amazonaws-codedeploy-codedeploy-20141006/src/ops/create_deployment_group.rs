@@ -380,6 +380,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The tags the group would be created with are the same tag set
+        // `TagResource` applies, so the same rule holds, and from the request
+        // alone: a `tags` list naming one key twice determines no tag set, and the
+        // group is not created at all.
+        if let Some(repeated) = input
+            .tags
+            .as_deref()
+            .and_then(crate::state::tag_set::duplicate_tag_key)
+        {
+            return Err(CreateDeploymentGroupErrorModeled::InvalidTagsToAddException(
+                InvalidTagsToAddException {
+                    message: Some(crate::state::tag_set::duplicate_tag_key_message(repeated)),
+                },
+            )
+            .into());
+        }
+
         // A tag FILTER list and a tag SET are two forms of the same selector —
         // the set is the grouped form of the filters — so naming both in one
         // call is what the two combination errors are for. The sentences live in

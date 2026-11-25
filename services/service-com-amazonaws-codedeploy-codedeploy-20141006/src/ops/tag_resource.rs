@@ -11,7 +11,9 @@
 //! is that resource kind's own DoesNotExist error. A tag whose key the resource
 //! already carries REPLACES that key's value rather than adding a second entry
 //! for it, so the tags are merged onto the resource's own record and read back
-//! through `ListTagsForResource`. A request carrying no `Tags` member at all
+//! through `ListTagsForResource`. One request's own `Tags` list has to determine
+//! that merge, so a list naming the same key twice is `InvalidTagsToAddException`
+//! and tags nothing. A request carrying no `Tags` member at all
 //! names no tag, which is `TagRequiredException`; a `Tags` list it DOES carry is
 //! applied as given, so an empty one applies no tag and the call succeeds.
 //!
@@ -231,6 +233,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(invalid_tags(crate::state::TAGS_TO_ADD_MALFORMED.to_string()).into());
             };
             tags.push(pair);
+        }
+        // The list has to determine ONE tag set: a key it names twice carries two
+        // values the resource cannot both hold, so the request is refused naming
+        // that key, before the resource is even looked up.
+        if let Some(repeated) = crate::state::tag_set::duplicate_tag_key(&input.tags) {
+            return Err(
+                invalid_tags(crate::state::tag_set::duplicate_tag_key_message(repeated)).into(),
+            );
         }
 
         crate::state::with_state(&*self.engine, |state| {

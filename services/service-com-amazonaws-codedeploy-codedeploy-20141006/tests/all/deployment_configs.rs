@@ -20,7 +20,7 @@ use crate::codedeploy_lifecycle::{error_code, Emulator};
 /// User Guide's "deployment configurations" pages list them: the EC2/on-premises
 /// ones, the Lambda ones (all-at-once and every time-based canary and linear
 /// variant) and the Amazon ECS ones.
-const PREDEFINED: &[&str] = &[
+pub(crate) const PREDEFINED: &[&str] = &[
     "CodeDeployDefault.OneAtATime",
     "CodeDeployDefault.HalfAtATime",
     "CodeDeployDefault.AllAtOnce",
@@ -218,10 +218,11 @@ async fn two_configs_with_the_same_members_are_separate_records() {
 // Names already taken
 // ---------------------------------------------------------------------------
 
-/// RULE: a deployment configuration name is unique within the account, and the
-/// `CodeDeployDefault.*` built-ins already hold theirs — so creating one under a
-/// name the store already carries is refused with
-/// `DeploymentConfigAlreadyExistsException`, and the stored record is untouched.
+/// RULE: a deployment configuration name is unique within the account, so
+/// creating one under a name the store already carries for this caller is refused
+/// with `DeploymentConfigAlreadyExistsException`, and the stored record is
+/// untouched. (A name CodeDeploy reserves never reaches this rule: it is refused
+/// for its name space first — see `deployment_config_reserved_names`.)
 #[tokio::test]
 async fn a_name_already_in_the_store_is_refused() {
     let emulator = Emulator::new();
@@ -235,11 +236,20 @@ async fn a_name_already_in_the_store_is_refused() {
             }),
         )
         .await;
+    emulator
+        .ok(
+            "CreateDeploymentConfig",
+            json!({
+                "deploymentConfigName": "cfg.taken.too",
+                "computePlatform": "Server",
+                "minimumHealthyHosts": {"type": "FLEET_PERCENT", "value": 50},
+            }),
+        )
+        .await;
 
-    // Rows: a name a client created, and every built-in name — the store carries
-    // both kinds, so both are taken.
-    let mut taken: Vec<&str> = vec!["cfg-taken"];
-    taken.extend_from_slice(PREDEFINED);
+    // Rows: the two names this caller created, which differ in the punctuation
+    // their names carry.
+    let taken: Vec<&str> = vec!["cfg-taken", "cfg.taken.too"];
 
     for name in taken {
         let (status, body) = emulator

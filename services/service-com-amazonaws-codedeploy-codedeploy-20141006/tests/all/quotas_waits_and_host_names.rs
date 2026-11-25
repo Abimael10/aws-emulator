@@ -1123,8 +1123,9 @@ async fn a_refusal_states_the_sentence_its_error_owns() {
                 "deploymentConfigName": "CodeDeployDefault.OneAtATime",
                 "minimumHealthyHosts": {"type": "HOST_COUNT", "value": 1},
             }),
-            "DeploymentConfigAlreadyExistsException",
-            "CodeDeployDefault.OneAtATime already exists.".to_string(),
+            "InvalidDeploymentConfigNameException",
+            "The prefix CodeDeployDefault. is reserved for predefined configuration names"
+                .to_string(),
         ),
         (
             "CreateDeploymentConfig",

@@ -163,6 +163,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .compute_platform
             .unwrap_or_else(|| crate::state::DEFAULT_COMPUTE_PLATFORM.to_string());
         let tags = input.tags.unwrap_or_default();
+        // The tags a create applies are the same tag set `TagResource` applies,
+        // so the same rule holds: a `tags` list naming one key twice determines no
+        // tag set, and the application is not created at all.
+        if let Some(repeated) = crate::state::tag_set::duplicate_tag_key(&tags) {
+            return Err(CreateApplicationErrorModeled::InvalidTagsToAddException(
+                InvalidTagsToAddException {
+                    message: Some(crate::state::tag_set::duplicate_tag_key_message(repeated)),
+                },
+            )
+            .into());
+        }
 
         let minted = crate::state::with_state(&*self.engine, |state| {
             if state.applications.contains_key(&name) {
