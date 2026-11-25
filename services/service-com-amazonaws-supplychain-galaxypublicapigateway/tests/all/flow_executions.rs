@@ -48,11 +48,13 @@ const ACCOUNT: &str = "000000000000";
 /// read from the crate: the wording is the requirement, so a drift in what the handler
 /// answers fails this suite instead of travelling with it. The flow's own not-found names
 /// the flow and its instance, the two `@httpLabel` members of the flow URI; the
-/// execution's is fixed.
+/// execution's names the flow and the run id, the two resource labels of the execution URI.
 fn expected_flow_not_found_sentence(flow_name: &str, instance_id: &str) -> String {
     format!("Flow {flow_name} does not exist in instance {instance_id}")
 }
-const FLOW_EXECUTION_NOT_FOUND_SENTENCE: &str = "Flow execution not found.";
+fn expected_flow_execution_not_found_sentence(flow_name: &str, execution_id: &str) -> String {
+    format!("FlowExecution not found for given flowName: {flow_name} and flowExecutionId: {execution_id}")
+}
 
 /// The emulator under test: one engine, one service, driven through the router.
 struct Emulator {
@@ -482,13 +484,16 @@ async fn a_missing_flow_or_execution_is_the_not_found_of_what_is_missing() {
             "a live flow and an execution it does not hold",
             "orders-flow",
             execution_id(2),
-            FLOW_EXECUTION_NOT_FOUND_SENTENCE.to_string(),
+            expected_flow_execution_not_found_sentence("orders-flow", &execution_id(2)),
         ),
         (
             "a live flow and the lowest execution id the shape admits",
             "orders-flow",
             "00000000-0000-0000-0000-000000000000".to_string(),
-            FLOW_EXECUTION_NOT_FOUND_SENTENCE.to_string(),
+            expected_flow_execution_not_found_sentence(
+                "orders-flow",
+                "00000000-0000-0000-0000-000000000000",
+            ),
         ),
     ];
 
@@ -506,8 +511,9 @@ async fn a_missing_flow_or_execution_is_the_not_found_of_what_is_missing() {
              that is missing, got {body}"
         );
         assert!(
-            !error_message(&body).contains(&id),
-            "case {case:?}: no sentence of this family carries the execution id, got {body}"
+            error_message(&body).contains(flow_name),
+            "case {case:?}: every sentence of this family names the flow the request \
+             addressed, got {body}"
         );
     }
 
@@ -519,6 +525,77 @@ async fn a_missing_flow_or_execution_is_the_not_found_of_what_is_missing() {
         status, 200,
         "case \"the stored run survives\": expected 200, got {status} with {body}"
     );
+}
+
+/// RULE: the execution's not-found sentence is a TEMPLATE whose two variable parts are the
+/// request's own `flowName` and `executionId` labels, so whatever pair a caller addresses
+/// comes back in the sentence verbatim and nothing else of the request or of the store does.
+///
+/// Rows span the forms those two labels take within their modelled constraints
+/// (`smithy_query(query="operation", operation="GetDataIntegrationFlowExecution")`:
+/// `flowName` len 1..256 pattern `^[A-Za-z0-9-]+$`, `executionId` the 36-character `UUID`
+/// pattern) — both published `flowName` length bounds, mixed case and digits, and execution
+/// ids at either end of the hex range as well as an ordinary one.
+#[tokio::test]
+async fn the_execution_not_found_sentence_echoes_the_flow_name_and_the_execution_id() {
+    let emulator = Emulator::new();
+    let instance_id = emulator.given_instance().await;
+
+    // Rows: (case, flowName, executionId). Every flow below is created, so the refusal is
+    // the EXECUTION's and not the flow's.
+    let rows = [
+        ("the shortest flow name the shape admits", "a".to_string(), execution_id(7)),
+        (
+            "the longest flow name the shape admits",
+            "f".repeat(256),
+            execution_id(8),
+        ),
+        (
+            "a mixed-case, digit-bearing, hyphenated name",
+            "Orders-Flow-2026".to_string(),
+            execution_id(9),
+        ),
+        (
+            "the lowest execution id of the hex range",
+            "returns-flow".to_string(),
+            "00000000-0000-0000-0000-000000000000".to_string(),
+        ),
+        (
+            "the highest execution id of the hex range",
+            "returns-flow-2".to_string(),
+            "ffffffff-ffff-ffff-ffff-ffffffffffff".to_string(),
+        ),
+        (
+            "an ordinary version-4 execution id",
+            "returns-flow-3".to_string(),
+            "6f3a1c58-9d2b-4c7e-8a41-2b5d7e9f0c13".to_string(),
+        ),
+    ];
+
+    for (case, flow_name, id) in rows {
+        emulator.given_flow(&instance_id, &flow_name).await;
+        let (status, body) = emulator.get_execution(&instance_id, &flow_name, &id).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: expected 404 ResourceNotFoundException, got {status} with {body}"
+        );
+        let message = error_message(&body);
+        assert_eq!(
+            message,
+            expected_flow_execution_not_found_sentence(&flow_name, &id),
+            "case {case:?}: the refusal must render the flowName-and-flowExecutionId \
+             template, got {message:?}"
+        );
+        assert!(
+            message.contains(&flow_name) && message.contains(&id),
+            "case {case:?}: the sentence must echo both addressed labels, got {message:?}"
+        );
+        assert!(
+            !message.contains(&instance_id),
+            "case {case:?}: the sentence names the flow and the run only, got {message:?}"
+        );
+    }
 }
 
 /// RULE: a run is addressed THROUGH its flow, so it does not outlive the flow whose delete
@@ -594,7 +671,7 @@ async fn a_run_does_not_outlive_the_flow_whose_delete_removed_it() {
         );
         assert_eq!(
             error_message(&body),
-            FLOW_EXECUTION_NOT_FOUND_SENTENCE,
+            expected_flow_execution_not_found_sentence("orders-flow", &execution_id(index)),
             "case \"re-created flow, run {index}\": a run of the removed flow must not come \
              back, got {body}"
         );

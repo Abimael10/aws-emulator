@@ -211,7 +211,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => Err(
                 GetDataIntegrationFlowExecutionErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::FLOW_EXECUTION_NOT_FOUND_MESSAGE.to_string()),
+                        message: Some(crate::state::flow_execution_not_found_message(
+                            &input.flow_name,
+                            &input.execution_id,
+                        )),
                     },
                 )
                 .into(),

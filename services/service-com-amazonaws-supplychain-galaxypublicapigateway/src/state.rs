@@ -1101,14 +1101,23 @@ impl DataIntegrationFlowRecord {
     }
 }
 
-/// How a flow-execution read refuses an `executionId` the addressed flow does not hold
-/// (`ResourceNotFoundException`, HTTP 404).
+/// How a flow-execution read refuses an `executionId` the addressed flow holds no run
+/// under (`ResourceNotFoundException`, HTTP 404).
 ///
-/// No recording fixes this sentence, so its FORM is this service's recorded not-found
-/// family — one fixed sentence naming the resource and echoing nothing from the request,
-/// as the instance read ([`INSTANCE_NOT_FOUND_MESSAGE`]) answers. Stated once, here, and
-/// re-verified against a recording when one covers this read.
-pub const FLOW_EXECUTION_NOT_FOUND_MESSAGE: &str = "Flow execution not found.";
+/// Its SOURCE is the recorded wire response of such a read: the FIXED text is
+/// "FlowExecution not found for given flowName: " and " and flowExecutionId: ", and the
+/// two interpolated parts are the two resource `@httpLabel` members the read's URI carries
+/// — the flow's `flowName` and the run's `executionId`, which the sentence labels
+/// "flowExecutionId". Unlike the instance read's fixed sentence
+/// ([`INSTANCE_NOT_FOUND_MESSAGE`]), this refusal is the only place the service names which
+/// flow and which run it rejected. Stated once, here, beside the service's other refusal
+/// sentences.
+pub fn flow_execution_not_found_message(flow_name: &str, execution_id: &str) -> String {
+    format!(
+        "FlowExecution not found for given flowName: {flow_name} and flowExecutionId: \
+         {execution_id}"
+    )
+}
 
 /// The key one flow execution is stored under: its instance, its flow's name, then its
 /// own `executionId` — the three `@httpLabel` members `GetDataIntegrationFlowExecution`'s
