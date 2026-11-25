@@ -6,8 +6,9 @@
 //!
 //! The listing is scoped by the gateway in the URI: it reports every record of
 //! [`crate::state::ComAmazonawsRtbfabricRtbfabricState::links`] that gateway is an
-//! end of, each rendered from the stored record exactly as `GetLink` renders it, so
-//! the listing and the single-link reader never disagree. Its only write is the
+//! end of, each rendered from the stored record exactly as `GetLink` renders it —
+//! as addressed, reporting the gateway in the URI and that link's other end as its
+//! peer — so the listing and the single-link reader never disagree. Its only write is the
 //! status transition the clock had already made due at the same instant, which is
 //! what `GetLink` materialises too.
 //!
@@ -238,8 +239,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             page_size,
             now,
         );
-        let page: Vec<ListLinksResponseStructure> =
-            reported.iter().copied().map(described).collect();
+        let page: Vec<ListLinksResponseStructure> = reported
+            .iter()
+            .copied()
+            .map(|link| described(link, &input.gateway_id))
+            .collect();
 
         Ok(ListLinksOutput {
             links: Some(page),
@@ -258,15 +262,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// it gets off the operation.
 pub use crate::state::DEFAULT_PAGE_SIZE;
 
-/// One stored link as the listing describes it.
+/// One stored link as the listing describes it, addressed from `gateway_id`.
 ///
 /// Every member is read back out of the record, exactly as `GetLink` reads it, so
 /// a listed entry and that link's own reading report one resource rather than two
-/// renderings of it.
-fn described(link: &crate::state::Link) -> ListLinksResponseStructure {
+/// renderings of it — including the orientation: the gateway the listing is
+/// addressed to, and that link's other end as its peer.
+fn described(link: &crate::state::Link, gateway_id: &str) -> ListLinksResponseStructure {
     ListLinksResponseStructure {
-        gateway_id: link.gateway_id.clone(),
-        peer_gateway_id: link.peer_gateway_id.clone(),
+        gateway_id: gateway_id.to_string(),
+        peer_gateway_id: link.other_end(gateway_id).to_string(),
         status: link.status.clone(),
         created_at: crate::state::timestamp(link.created_at),
         updated_at: crate::state::timestamp(link.updated_at),

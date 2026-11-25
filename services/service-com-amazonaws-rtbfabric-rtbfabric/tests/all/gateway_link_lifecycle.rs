@@ -704,7 +704,9 @@ async fn the_gateway_pair_and_link_lifecycle_round_trips_through_state() {
         );
 
         // The link is addressable from its other end too: both gateways are ends
-        // of the one stored record.
+        // of the one stored record, and each reading describes it as addressed —
+        // the gateway in the URI, and the link's other end as its peer. The
+        // orientation of the record is covered row by row in `link_orientation`.
         let (status, from_peer) = fabric
             .send(
                 "GET",
@@ -717,9 +719,15 @@ async fn the_gateway_pair_and_link_lifecycle_round_trips_through_state() {
             "case {case:?}: expected GetLink from the peer end to answer 200, got {status} {from_peer:?}"
         );
         assert_eq!(
-            from_peer["peerGatewayId"], read_link["peerGatewayId"],
-            "case {case:?}: expected the stored orientation from either end, got {:?}",
+            from_peer["peerGatewayId"], read_link["gatewayId"],
+            "case {case:?}: expected the reading from the peer end to report the other end {:?} as its peer, got {:?}",
+            read_link["gatewayId"],
             from_peer["peerGatewayId"]
+        );
+        assert_eq!(
+            from_peer["gatewayId"], json!(responder_id),
+            "case {case:?}: expected the reading from the peer end to report the addressed gateway {responder_id:?}, got {:?}",
+            from_peer["gatewayId"]
         );
 
         // Both gateways now count the one link.

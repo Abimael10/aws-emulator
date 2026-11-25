@@ -7,6 +7,10 @@
 //! response shape does not carry, so they can only come from state. An unknown
 //! gateway or link -> `ResourceNotFoundException` (404).
 //!
+//! The reading describes the link AS ADDRESSED: `gatewayId` is the gateway in the
+//! URI and `peerGatewayId` is that link's other end, which is how `AcceptLink`,
+//! `RejectLink` and `ListLinks` describe the same record too.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -196,8 +200,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(GetLinkOutput {
-            gateway_id: link.gateway_id.clone(),
-            peer_gateway_id: link.peer_gateway_id.clone(),
+            // The response describes the link as addressed: the gateway in the
+            // URI, and the link's other end as its peer. A link is one record
+            // with two ends and either end reads it, so the orientation comes
+            // from the request rather than from which end opened it.
+            gateway_id: input.gateway_id.clone(),
+            peer_gateway_id: link.other_end(&input.gateway_id).to_string(),
             status: link.status.clone(),
             created_at: crate::state::timestamp(link.created_at),
             updated_at: crate::state::timestamp(link.updated_at),
