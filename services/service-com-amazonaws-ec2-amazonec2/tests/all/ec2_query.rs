@@ -518,6 +518,24 @@ pub fn reported_instance_type_member(case: &str, body: &str, path: &[&str]) -> O
     super::wire::child_text(node, member)
 }
 
+/// The same member, or a panic naming the case when the reported type carries none.
+///
+/// Beside [`reported_instance_type_member`], which answers `None` for an absent member: a suite
+/// that asserts what a published catalog row serves needs the ABSENCE to fail the case rather
+/// than to read as an empty string, and needs the case named when it does. Here rather than in
+/// one suite because every suite that reads a published row needs this reading of it.
+pub fn required_instance_type_member(case: &str, body: &str, path: &[&str]) -> String {
+    reported_instance_type_member(case, body, path)
+        .unwrap_or_else(|| panic!("case {case:?}: no {path:?} reported, got {body}"))
+}
+
+/// The same member read as a number, so a figure a suite compares is never compared as text.
+pub fn instance_type_member_number(case: &str, body: &str, path: &[&str]) -> f64 {
+    let text = required_instance_type_member(case, body, path);
+    text.parse()
+        .unwrap_or_else(|_| panic!("case {case:?}: {path:?} must be a number, got {text:?}"))
+}
+
 /// The entries of the list member at `path` of the one reported instance type, in the order
 /// the type reported them.
 pub fn reported_instance_type_list(case: &str, body: &str, path: &[&str]) -> Vec<String> {

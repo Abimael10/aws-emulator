@@ -47,6 +47,7 @@ mod neuron_accelerated_rows;
 mod newest_generation_graviton_rows;
 mod previous_generation_rows;
 mod seventh_generation_graphics_rows;
+mod sixth_generation_graviton_rows;
 mod storage_optimized_graviton_rows;
 mod xen_high_memory_rows;
 mod xen_storage_optimized_rows;
@@ -1035,6 +1036,11 @@ const UEFI_BOOT_MODE: &[&str] = &["uefi"];
 /// generation's whole-host sizes are offered: its adapter carries many more of them than the
 /// single one an earlier generation's largest size publishes.
 const NEWEST_GENERATION_EFA_INTERFACES: i32 = 16;
+
+/// The sustained all-core frequency, in GHz, of the AWS Graviton2 processor the sixth
+/// generation Graviton families are built on — shared by the burstable and the general purpose
+/// families built on it, which is why it is here rather than in one of their tables.
+const GRAVITON2_SUSTAINED_GHZ: f64 = 2.5;
 
 /// The sustained all-core frequency, in GHz, of the Intel Xeon 6 processor the eighth
 /// generation Intel families are built on — shared by the burstable and the compute families
@@ -2056,49 +2062,49 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .network("Up to 10 Gigabit")
         .interfaces(2)
         .ipv4_per_interface(4)
-        .processor("AWS", 2.5)
+        .processor("AWS", GRAVITON2_SUSTAINED_GHZ)
         .ena_srd(false),
     PublishedInstanceTypeFacts::of("c6g.large")
         .ebs(630, 3_600, 4_750, 20_000)
         .network("Up to 10 Gigabit")
-        .processor("AWS", 2.5)
+        .processor("AWS", GRAVITON2_SUSTAINED_GHZ)
         .ena_srd(false)
         .nitro_enclaves(true),
     PublishedInstanceTypeFacts::of("c6g.xlarge")
         .ebs(1_188, 6_000, 4_750, 20_000)
         .network("Up to 10 Gigabit")
-        .processor("AWS", 2.5)
+        .processor("AWS", GRAVITON2_SUSTAINED_GHZ)
         .ena_srd(false),
     PublishedInstanceTypeFacts::of("c6g.2xlarge")
         .ebs(2_375, 12_000, 4_750, 20_000)
         .network("Up to 10 Gigabit")
-        .processor("AWS", 2.5)
+        .processor("AWS", GRAVITON2_SUSTAINED_GHZ)
         .ena_srd(false),
     PublishedInstanceTypeFacts::of("c6g.4xlarge")
         .ebs(4_750, 20_000, 4_750, 20_000)
         .network("Up to 10 Gigabit")
-        .processor("AWS", 2.5)
+        .processor("AWS", GRAVITON2_SUSTAINED_GHZ)
         .ena_srd(false),
     PublishedInstanceTypeFacts::of("c6g.8xlarge")
         .ebs(9_500, 40_000, 9_500, 40_000)
         .network("12 Gigabit")
-        .processor("AWS", 2.5)
+        .processor("AWS", GRAVITON2_SUSTAINED_GHZ)
         .ena_srd(false),
     PublishedInstanceTypeFacts::of("c6g.12xlarge")
         .ebs(14_250, 50_000, 14_250, 50_000)
         .network("20 Gigabit")
-        .processor("AWS", 2.5)
+        .processor("AWS", GRAVITON2_SUSTAINED_GHZ)
         .ena_srd(false),
     PublishedInstanceTypeFacts::of("c6g.16xlarge")
         .ebs(19_000, 80_000, 19_000, 80_000)
         .network("25 Gigabit")
-        .processor("AWS", 2.5)
+        .processor("AWS", GRAVITON2_SUSTAINED_GHZ)
         .ena_srd(false),
     PublishedInstanceTypeFacts::of("c6g.metal")
         .ebs(19_000, 80_000, 19_000, 80_000)
         .ebs_attachments(31)
         .network("25 Gigabit")
-        .processor("AWS", 2.5)
+        .processor("AWS", GRAVITON2_SUSTAINED_GHZ)
         .ena_srd(false)
         .auto_recovery(true)
         .host_features(true, false)
@@ -3286,7 +3292,7 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .ebs(625, 2_500, 10_000, 40_000)
         .instance_store(1, 468)
         .network("Up to 10 Gigabit")
-        .processor("AWS", 2.5)
+        .processor("AWS", GRAVITON2_SUSTAINED_GHZ)
         .hibernation(true)
         .nitro_enclaves(true)
         .nitro_tpm(false)
@@ -3296,7 +3302,7 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .ebs(1_250, 5_000, 10_000, 40_000)
         .instance_store(1, 937)
         .network("Up to 10 Gigabit")
-        .processor("AWS", 2.5)
+        .processor("AWS", GRAVITON2_SUSTAINED_GHZ)
         .hibernation(true)
         .nitro_tpm(false)
         .host_features(false, false)
@@ -3305,7 +3311,7 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .ebs(2_500, 10_000, 10_000, 40_000)
         .instance_store(1, 1_875)
         .network("Up to 12 Gigabit")
-        .processor("AWS", 2.5)
+        .processor("AWS", GRAVITON2_SUSTAINED_GHZ)
         .hibernation(true)
         .nitro_tpm(false)
         .host_features(false, false)
@@ -3314,7 +3320,7 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .ebs(5_000, 20_000, 10_000, 40_000)
         .instance_store(1, 3_750)
         .network("Up to 25 Gigabit")
-        .processor("AWS", 2.5)
+        .processor("AWS", GRAVITON2_SUSTAINED_GHZ)
         .ena_srd(true)
         .hibernation(true)
         .nitro_tpm(false)
@@ -3324,7 +3330,7 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .ebs(10_000, 40_000, 10_000, 40_000)
         .instance_store(2, 3_750)
         .network("18.75 Gigabit")
-        .processor("AWS", 2.5)
+        .processor("AWS", GRAVITON2_SUSTAINED_GHZ)
         .ena_srd(true)
         .nitro_tpm(false)
         .host_features(false, false)
@@ -3334,7 +3340,7 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .instance_store(4, 3_750)
         .network("37.5 Gigabit")
         .efa(1)
-        .processor("AWS", 2.5)
+        .processor("AWS", GRAVITON2_SUSTAINED_GHZ)
         .ena_srd(true)
         .nitro_tpm(false)
         .host_features(false, false)
@@ -4798,8 +4804,9 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
 /// fourth generation families on the Xen hypervisor and the memory optimized ones with local
 /// NVMe devices, the seventh generation graphics family, the block storage optimized memory
 /// one on the newest AWS Graviton hardware, the two storage optimized families on the Xen
-/// hypervisor, the two Intel storage optimized ones and the two high-memory families on the
-/// Xen hypervisor. A row is reached by its instance type
+/// hypervisor, the two Intel storage optimized ones, the two high-memory families on the
+/// Xen hypervisor and the sixth generation AWS Graviton general purpose one. A row is reached
+/// by its instance type
 /// alone, so which table it is written in is nothing but where the figures of one group of
 /// families are kept together.
 fn published_rows() -> impl Iterator<Item = &'static PublishedInstanceTypeFacts> {
@@ -4835,6 +4842,7 @@ fn published_rows() -> impl Iterator<Item = &'static PublishedInstanceTypeFacts>
         .chain(xen_storage_optimized_rows::XEN_STORAGE_OPTIMIZED_INSTANCE_TYPE_FACTS)
         .chain(intel_storage_optimized_rows::INTEL_STORAGE_OPTIMIZED_INSTANCE_TYPE_FACTS)
         .chain(xen_high_memory_rows::XEN_HIGH_MEMORY_INSTANCE_TYPE_FACTS)
+        .chain(sixth_generation_graviton_rows::SIXTH_GENERATION_GRAVITON_INSTANCE_TYPE_FACTS)
 }
 
 /// The published facts of `instance_type`, or `None` where the catalog holds no row for it

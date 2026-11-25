@@ -129,10 +129,6 @@ const BURSTABLE_GRAVITON_NETWORK_PERFORMANCE: &str = "Up to 5 Gigabit";
 /// hardware generation's compute sizes carry.
 const BURSTABLE_INTEL_NETWORK_PERFORMANCE: &str = "Up to 12.5 Gigabit";
 
-/// The sustained all-core frequency, in GHz, of the AWS Graviton2 processor the fourth
-/// generation Graviton families are built on.
-const GRAVITON2_SUSTAINED_GHZ: f64 = 2.5;
-
 /// The private IPv4 addresses one interface of a burstable `large` size takes
 /// (`NetworkInfo$Ipv4AddressesPerInterface`): the T ladder's own figure for that step, which
 /// is above the one the generic ladder publishes for a `large`.
