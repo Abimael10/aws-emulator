@@ -8,11 +8,16 @@
 //! ([`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::tagged_resource_tags`]).
 //!
 //! A `ResourceArn` that is not an ARN is a bad parameter value
-//! ([`crate::state::rejected_arn`]); one that names no taggable resource of
-//! this account is the one not-found refusal
-//! ([`crate::state::tagged_resource_not_found`]). A page is `MaxResults` pairs
-//! plus a cursor to the next one, keyed by tag key — the order the stored set
-//! keeps — so a cursor resolves to the same position on every request.
+//! ([`crate::state::rejected_arn`]). An ARN this account holds no taggable
+//! resource under is refused by the step that resolves it
+//! ([`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::tag_read_tags`]):
+//! a vault's ARN decides access before existence, so one whose vault this
+//! account does not hold is refused for lack of privileges and discloses
+//! nothing about whether that vault exists, while any other unplaceable ARN is
+//! the one not-found refusal ([`crate::state::tagged_resource_not_found`]). A
+//! page is `MaxResults` pairs plus a cursor to the next one, keyed by tag key —
+//! the order the stored set keeps — so a cursor resolves to the same position on
+//! every request.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -163,9 +168,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_vaults(now);
         store.settle_recovery_points(now);
 
+        // A tag read is authorized against the resource its ARN names, so an
+        // ARN naming a vault is a vault-scoped read reached through the ARN:
+        // the decision every vault-scoped call shares answers for it, and only
+        // an ARN of another kind this account holds nothing under is reported as
+        // not found. Both refusals come from `state::tag_read_tags`, so the
+        // resolution and the refusal it states can never drift apart.
         let tags = store
-            .tagged_resource_tags(&input.resource_arn)
-            .map_err(ListTagsErrorModeled::ResourceNotFoundException)?;
+            .tag_read_tags(&input.resource_arn)
+            .map_err(|refusal| match refusal {
+                crate::state::UnresolvedTagRead::Denied(denied) => ListTagsError::from(denied),
+                crate::state::UnresolvedTagRead::NotFound(missing) => {
+                    ListTagsErrorModeled::ResourceNotFoundException(missing).into()
+                }
+            })?;
         let pairs: Vec<(&String, &String)> = tags.iter().collect();
 
         let start = match input.next_token.as_deref() {

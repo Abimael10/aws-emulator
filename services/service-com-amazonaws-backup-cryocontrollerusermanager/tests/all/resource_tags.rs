@@ -12,7 +12,9 @@
 //!   sent, a new key is added, and a key the request does not name is left
 //!   alone;
 //! * an ARN that is not an ARN is a bad parameter value, and one that names no
-//!   resource of this account is the one not-found refusal — for both calls;
+//!   resource of this account is the one not-found refusal for the tag WRITE,
+//!   while the tag READ answers for it the way the ARN's own resource is
+//!   authorized (`tag_read_access_before_existence.rs` is that rule's suite);
 //! * a page is `MaxResults` pairs plus a cursor to the next one.
 //!
 //! Every case drives real HTTP through the router; the harness is the shared one
@@ -24,6 +26,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::recovery_point_deletion::{router_with_engine, start_point};
+use crate::vault_read_visibility::DENIED_MESSAGE;
 use crate::vault_and_backup_job::{
     call, create_vault, error_code, reported_tags, string_at, ACCOUNT, PAST_SETTLE, REGION,
 };
@@ -187,8 +190,13 @@ async fn a_written_tag_joins_the_tags_the_resource_was_created_with() {
     );
 }
 
-/// An ARN that names no resource of this account is ONE condition for both
-/// calls, and a value that is not an ARN is a bad parameter value.
+/// An ARN that names no resource of this account is refused by both calls, and a
+/// value that is not an ARN is a bad parameter value for both.
+///
+/// The tag WRITE states the not-found condition for every such ARN. The tag READ
+/// is authorized against the resource the ARN names, so a vault's ARN is
+/// answered by the decision every vault-scoped read shares — see
+/// `tag_read_access_before_existence.rs`, which spans that rule.
 #[tokio::test]
 async fn an_arn_that_names_no_resource_is_one_refusal_for_both_calls() {
     let (router, _engine) = router_with_engine();
@@ -198,18 +206,26 @@ async fn an_arn_that_names_no_resource_is_one_refusal_for_both_calls() {
         "setup: CreateBackupVault should succeed, got {status} {created:?}"
     );
 
-    let absent: Vec<(&str, String)> = vec![
+    // What the tag READ answers for an ARN it cannot place: a vault's ARN is
+    // judged by the vault-visibility decision, every other kind by the modelled
+    // not-found condition.
+    let denied = (403, "AccessDeniedException", DENIED_MESSAGE);
+    let missing = (400, "ResourceNotFoundException", NOT_FOUND);
+    let absent: Vec<(&str, String, (u16, &str, &str))> = vec![
         (
             "a vault that was never created",
             format!("arn:aws:backup:{REGION}:{ACCOUNT}:backup-vault:never-created"),
+            denied,
         ),
         (
             "a recovery point nothing answers to",
             format!("arn:aws:backup:{REGION}:{ACCOUNT}:recovery-point:does-not-exist"),
+            missing,
         ),
         (
             "a vault of another account",
             format!("arn:aws:backup:{REGION}:111122223333:backup-vault:tagged-vault"),
+            denied,
         ),
         (
             // An ARN of another service, with no `/` in its resource field:
@@ -217,28 +233,31 @@ async fn an_arn_that_names_no_resource_is_one_refusal_for_both_calls() {
             // tagging one, which this suite is not about.
             "a resource of another service",
             format!("arn:aws:sns:{REGION}:{ACCOUNT}:backup-notifications"),
+            missing,
         ),
     ];
-    for (case, resource_arn) in absent {
-        for (call_name, answer) in [
+    for (case, resource_arn, expected_read) in absent {
+        let (status, refused) = tag_resource(&router, &resource_arn, json!({"owner": "ops"})).await;
+        assert_eq!(
             (
-                "TagResource",
-                tag_resource(&router, &resource_arn, json!({"owner": "ops"})).await,
+                status,
+                error_code(&refused).as_str(),
+                string_at(&refused, "Message").as_str()
             ),
-            ("ListTags", list_tags(&router, &resource_arn, "").await),
-        ] {
-            let (status, refused) = answer;
-            assert_eq!(
-                (
-                    status,
-                    error_code(&refused).as_str(),
-                    string_at(&refused, "Message").as_str()
-                ),
-                (400, "ResourceNotFoundException", NOT_FOUND),
-                "case {case:?} on {call_name}: expected the not-found refusal, got {status} \
-                 {refused:?}"
-            );
-        }
+            missing,
+            "case {case:?} on TagResource: expected the not-found refusal, got {status} \
+             {refused:?}"
+        );
+        let (status, read) = list_tags(&router, &resource_arn, "").await;
+        assert_eq!(
+            (
+                status,
+                error_code(&read).as_str(),
+                string_at(&read, "Message").as_str()
+            ),
+            expected_read,
+            "case {case:?} on ListTags: expected {expected_read:?}, got {status} {read:?}"
+        );
     }
 
     let malformed = ["not-an-arn", "arn:aws:backup"];
