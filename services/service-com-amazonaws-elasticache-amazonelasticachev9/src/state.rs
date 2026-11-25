@@ -794,6 +794,56 @@ pub fn reboot_state_refusal(cache_cluster_id: &str, status: &str) -> String {
     )
 }
 
+/// The `CacheClusterStatus` of a cluster whose provisioning or last change did
+/// not succeed. No operation of this emulator puts a cluster in it — the writers
+/// refuse what they cannot carry out — but it is one of the states a DELETE is
+/// accepted in ([`DELETABLE_CLUSTER_STATES`]), so the refusal that names them
+/// names it too. See [`STATUS_CREATING`].
+pub const STATUS_FAILED: &str = "failed";
+/// The `CacheClusterStatus` of a cluster whose subnets or security groups no
+/// longer admit it, from `CacheCluster$CacheClusterStatus`'s own value list. Not
+/// reached by any operation of this emulator, and named for the reason
+/// [`STATUS_FAILED`] gives.
+pub const STATUS_INCOMPATIBLE_NETWORK: &str = "incompatible-network";
+/// The `CacheClusterStatus` of a cluster whose restore from a snapshot did not
+/// succeed, from `CacheCluster$CacheClusterStatus`'s own value list. Not reached
+/// by any operation of this emulator, and named for the reason [`STATUS_FAILED`]
+/// gives.
+pub const STATUS_RESTORE_FAILED: &str = "restore-failed";
+/// The `CacheClusterStatus` of a cluster ElastiCache is recovering after a node
+/// failure. Not reached by any operation of this emulator, and named for the
+/// reason [`STATUS_FAILED`] gives.
+pub const STATUS_RECOVERING: &str = "recovering";
+
+/// The `CacheClusterStatus` values `DeleteCacheCluster` accepts.
+///
+/// A delete is not gated on `available` alone: the service states the states it
+/// accepts in the refusal itself (see [`delete_state_refusal`]), and a cluster
+/// whose provisioning, network or restore left it unusable can still be deleted
+/// — which is how a client gets rid of one — while a cluster whose work is still
+/// in flight (`creating`, `modifying`, `snapshotting`, rebooting, already
+/// `deleting`) is refused.
+pub const DELETABLE_CLUSTER_STATES: [&str; 6] = [
+    STATUS_AVAILABLE,
+    STATUS_FAILED,
+    STATUS_INCOMPATIBLE_PARAMETERS,
+    STATUS_INCOMPATIBLE_NETWORK,
+    STATUS_RESTORE_FAILED,
+    STATUS_RECOVERING,
+];
+
+/// How ElastiCache refuses a delete of a cluster that is in none of
+/// [`DELETABLE_CLUSTER_STATES`]: the same shape as [`reboot_state_refusal`] —
+/// the states a delete IS accepted in, then the cluster the request named and
+/// the state that cluster is actually in.
+pub fn delete_state_refusal(cache_cluster_id: &str, status: &str) -> String {
+    format!(
+        "Can only delete cache clusters with state in: {}. Cluster {cache_cluster_id} has state: \
+         {status}.",
+        DELETABLE_CLUSTER_STATES.join(", ")
+    )
+}
+
 /// How ElastiCache refuses a MODIFICATION of a replication group that is not
 /// `available`: the message states the requirement — the state the group has to
 /// be in and the action it gates — and names neither the group nor the state it

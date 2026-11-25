@@ -7,10 +7,10 @@
 //!
 //! * "Async API to test connection between source and target replication group" — the call
 //!   decides whether there is a migration to test at all: the group has to be one this
-//!   account holds, provisioned and idle, carrying no migration of its own, and the list has
-//!   to name endpoints a migration could read from ("List should have only one element"). A
-//!   call that passes those reports the group it tested and changes NOTHING about it, so a
-//!   `StartMigration` right after one is accepted;
+//!   account holds, provisioned and idle, with no data sync of its own running, and the
+//!   list has to name endpoints a migration could read from ("List should have only one
+//!   element"). A call that passes those reports the group it tested and changes NOTHING
+//!   about it, so a `StartMigration` right after one is accepted;
 //! * a refusal is the modelled fault of the thing that is wrong — the group's own not-found
 //!   fault (404), its state fault, its already-under-migration fault, and the parameter
 //!   refusal for a value no group could carry or a list no test could read — and each states
@@ -238,18 +238,24 @@ type TestRefusal = (
 async fn a_test_that_has_no_migration_to_test_is_refused_with_its_own_fault() {
     let emulator = Emulator::new();
     create_settled_group(&emulator, "the refusal table's group", "test-refusals", 1).await;
-    // A second group, left carrying an open migration, so the already-under-migration row
-    // has one to collide with.
+    // A second group, left carrying an open data sync while reporting `available`, so the
+    // already-under-migration row has one to collide with. A start of its own leaves the
+    // group applying the migration, and the sync is closed when that work settles, so the
+    // row seeds the record on the store the handlers read and then asserts over the wire
+    // that the refusal is computed FROM it.
     create_settled_group(&emulator, "the migrating group", "test-migrating", 1).await;
-    let started = start_migration(&emulator, "test-migrating").await;
-    assert_eq!(
-        started.status, 200,
-        "the migration the table collides with must start, got {} {}",
-        started.status, started.body
-    );
-    // The start leaves the group transiently `modifying`; the row that collides with its
-    // open migration needs the group settled, so the suite waits for THAT.
-    await_available_group(&emulator, "the migrating group", "test-migrating").await;
+    emulator.with_state(|store| {
+        let group = store
+            .replication_groups
+            .get_mut("test-migrating")
+            .expect("the group just created must be stored");
+        let mut migration = state::MigrationRecord::prepared(vec![state::SourceEndpointRecord {
+            address: "10.0.0.9".to_string(),
+            port: 6379,
+        }]);
+        migration.status = state::MIGRATION_STATUS_SYNCING.to_string();
+        group.migration = Some(migration);
+    });
     // A third group held in the status a just-created one has, for the state row.
     create_settled_group(&emulator, "the group the state row names", "test-creating", 1).await;
     hold_group_status(&emulator, "test-creating", state::STATUS_CREATING);

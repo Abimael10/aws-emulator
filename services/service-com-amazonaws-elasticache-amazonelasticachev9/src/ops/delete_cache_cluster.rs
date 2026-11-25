@@ -187,14 +187,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "This operation is not valid for … a cluster that is not in the
-        // available state": one still `creating`, or `modifying` from an
-        // immediate change, is refused with the modelled state fault.
-        if cluster.status != crate::state::STATUS_AVAILABLE {
+        // available state": the states a delete IS accepted in are the ones the
+        // refusal names (`crate::state::DELETABLE_CLUSTER_STATES`), so a cluster
+        // whose work is still in flight — one `creating`, `modifying` from an
+        // immediate change, being snapshotted, rebooting or already `deleting` —
+        // is refused with the modelled state fault, while one whose
+        // provisioning, network or restore left it unusable can still be taken
+        // away.
+        if !crate::state::DELETABLE_CLUSTER_STATES.contains(&cluster.status.as_str()) {
             return Err(DeleteCacheClusterErrorModeled::InvalidCacheClusterStateFault(
                 InvalidCacheClusterStateFault {
-                    message: Some(format!(
-                        "Cache cluster {cache_cluster_id} is in {} state, not available.",
-                        cluster.status
+                    message: Some(crate::state::delete_state_refusal(
+                        &cache_cluster_id,
+                        &cluster.status,
                     )),
                 },
             )
@@ -251,10 +256,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The cluster is leaving: the snapshot the caller is handed back reports
-        // it `deleting`, with its nodes in the same state, and the record is
-        // removed so a following describe answers `CacheClusterNotFoundFault`.
-        // Taken in hand again here, because reading the group above gave the
-        // store back.
+        // it `deleting`, with its nodes in the same state. The RECORD stays
+        // while the teardown runs — "ElastiCache immediately begins deleting the
+        // cluster", so a describe reports that transient status, the same way it
+        // reports `creating` — and is dropped by whichever later call finds its
+        // removal due
+        // (`crate::state::ComAmazonawsElasticacheAmazonelasticachev9State::purge_deleted_cache_clusters`),
+        // after which a describe answers `CacheClusterNotFoundFault`. Taken in
+        // hand again here, because reading the group above gave the store back.
         let Some(cluster) = store.cache_clusters.get_mut(&cache_cluster_id) else {
             return Err(DeleteCacheClusterErrorModeled::CacheClusterNotFoundFault(
                 CacheClusterNotFoundFault {
@@ -268,27 +277,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         cluster.status = crate::state::STATUS_DELETING.to_string();
         cluster.pending_status = None;
         cluster.pending_event = None;
+        cluster.pending_removal = Some(now + crate::state::CLUSTER_TRANSITION);
         cluster.set_node_status(crate::state::STATUS_DELETING);
+        let deleted = Some(cluster.to_modeled(true));
         // Deleting a cluster is one of the events this service records; see
         // `crate::state::EventRecord`. The log outlives the record, so the
         // events of a deleted cluster are still reported — and the notification
         // the cluster's topic is owed is queued while the record that names that
-        // topic is still here, which is why this precedes the removal below.
+        // topic is still here.
         store.record_cluster_event(
             &cache_cluster_id,
             Some(crate::state::EVENT_DELETE_CACHE_CLUSTER_COMPLETE),
             "Cache cluster deleted",
             now,
         );
-        let deleted = store
-            .cache_clusters
-            .remove(&cache_cluster_id)
-            .map(|cluster| cluster.to_modeled(true));
         // A replica this delete took is no longer a member of its group: the
         // membership `DescribeReplicationGroups` reports is the clusters the
         // account HAS, so the shard it belonged to loses it here rather than
-        // keeping a member nothing resolves to. (The primary is never here —
-        // deleting it is refused above.)
+        // keeping a member whose teardown has begun. (The primary is never here
+        // — deleting it is refused above.)
         if let Some(group) = replication_group_id
             .as_deref()
             .and_then(|group_id| store.replication_groups.get_mut(group_id))

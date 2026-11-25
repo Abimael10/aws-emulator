@@ -301,9 +301,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // the stored group, and the group answers `modifying` until the
                 // clock settles it — the data sync is work ElastiCache carries
                 // out after the call, so a caller reading the group straight
-                // after this one still sees the transient status.
+                // after this one still sees the transient status. ESTABLISHING
+                // that sync is work of its own
+                // (`crate::state::MIGRATION_SYNC_ESTABLISHMENT`): until it is,
+                // the migration is open but not in flight, which is what a
+                // cutover asked for too early is refused for.
                 let mut migration = crate::state::MigrationRecord::prepared(endpoints);
-                migration.begin_sync(crate::state::CUTOVER_MODE_MANUAL, now);
+                migration.begin_sync_over(
+                    crate::state::CUTOVER_MODE_MANUAL,
+                    now,
+                    crate::state::MIGRATION_SYNC_ESTABLISHMENT,
+                );
                 group.migration = Some(migration);
                 group.begin_transition(crate::state::STATUS_MODIFYING, now);
                 store.record_event(

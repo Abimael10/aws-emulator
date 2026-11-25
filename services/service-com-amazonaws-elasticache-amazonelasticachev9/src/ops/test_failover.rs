@@ -253,12 +253,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A test of automatic failover on this SHARD that is still being
+        // carried out is this operation's own conflict, consulted before the
+        // group's status: "the node replacement must complete before a
+        // subsequent call can be made" for that shard, and
+        // `TestFailoverNotAvailableFault` ("the TestFailover action is not
+        // available") is what says so. The refusal changes nothing — the roles
+        // the accepted test moved stand — and it is answered for as long as the
+        // work runs, including once the group has settled back to `available`,
+        // so a caller waits the conflict out by retrying the call itself rather
+        // than by watching a status.
+        if group.test_failover_in_flight(&node_group_id, now) {
+            return Err(TestFailoverErrorModeled::TestFailoverNotAvailableFault(
+                TestFailoverNotAvailableFault {
+                    message: Some(crate::state::TEST_FAILOVER_IN_PROGRESS_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
         // `InvalidReplicationGroupStateFault` is "the requested replication
         // group is not in the available state": a group still `creating`, or
-        // `modifying` from an earlier change — including the node replacement an
-        // earlier `TestFailover` started, which "must complete before a
+        // `modifying` from an earlier change — the node replacement an earlier
+        // `TestFailover` on ANOTHER shard started among them, since "if calling
+        // this operation multiple times on different shards in the same …
+        // replication group, the first node replacement must complete before a
         // subsequent call can be made" — is refused rather than failed over
-        // twice.
+        // while that change is in flight.
         if status != crate::state::STATUS_AVAILABLE {
             return Err(TestFailoverErrorModeled::InvalidReplicationGroupStateFault(
                 InvalidReplicationGroupStateFault {
@@ -340,6 +361,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::STORE_UNAVAILABLE,
             ));
         };
+        group.begin_test_failover(&node_group_id, now);
         group.begin_transition(crate::state::STATUS_MODIFYING, now);
         store.record_test_failover(now);
 

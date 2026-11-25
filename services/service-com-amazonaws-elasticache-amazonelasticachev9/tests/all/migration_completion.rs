@@ -72,6 +72,25 @@ async fn complete(emulator: &Emulator, extra: &[(&str, &str)]) -> Reply {
     emulator.call("CompleteMigration", &params(extra)).await
 }
 
+/// Ask for the cutover until it is SERVED, and answer with that reply.
+///
+/// Establishing the data sync a start began is work the service carries out
+/// after the call ([`state::MIGRATION_SYNC_ESTABLISHMENT`]), and the refusal
+/// until then says to retry later — which is what this does, looking again
+/// until the cutover goes through rather than waiting a fixed time.
+async fn poll_completed(emulator: &Emulator, case: &str, id: &str) -> Reply {
+    poll_until(
+        emulator,
+        REGION,
+        case,
+        &format!("the data sync into {id} being established so the cutover is served"),
+        "CompleteMigration",
+        &params(&[("ReplicationGroupId", id)]),
+        |reply| reply.status == 200,
+    )
+    .await
+}
+
 /// `StartMigration` of one source endpoint into the replication group `id`.
 async fn start_migration(emulator: &Emulator, id: &str) -> Reply {
     emulator
@@ -185,13 +204,27 @@ async fn a_migrating_group_is_completed_once_its_data_sync_is_in_flight() {
         "StartMigration must answer 200, got {} {}",
         started.status, started.body
     );
-    // The cutover is of the migration the start began, and the transient status the start
-    // left is the service's own work on that same migration — so a completion asked for
-    // inside that span is SERVED rather than refused.
-    let completed = complete(&emulator, &[("ReplicationGroupId", "migrated-group")]).await;
+    // The sync that start began is not established yet, so there is nothing to cut over and
+    // the refusal says to retry later.
+    let too_early = complete(&emulator, &[("ReplicationGroupId", "migrated-group")]).await;
+    assert_eq!(
+        (too_early.status, too_early.error_code()),
+        (400, "InvalidParameterValue"),
+        "a cutover before the sync is established must be refused, got {} {}",
+        too_early.status,
+        too_early.body
+    );
+    assert_eq!(
+        too_early.error_message(),
+        state::MIGRATION_NOT_MIGRATING_MESSAGE,
+        "expected the migrating-state sentence, got {:?}",
+        too_early.error_message()
+    );
+    // Retried, it is served once the service has established that sync.
+    let completed = poll_completed(&emulator, "the migrated group", "migrated-group").await;
     assert_eq!(
         completed.status, 200,
-        "a completion inside the start's span must be served, got {} {}",
+        "a retried completion must be served, got {} {}",
         completed.status, completed.body
     );
     assert_eq!(
@@ -422,8 +455,9 @@ async fn a_completion_is_recorded_as_an_event() {
         "StartMigration must answer 200, got {} {}",
         started.status, started.body
     );
-    std::thread::sleep(PAST_TRANSITION);
-    let completed = complete(&emulator, &[("ReplicationGroupId", "logged-migration")]).await;
+    // The cutover is of the migration that start began, and it is served once the service
+    // has established that sync — which is what retrying the call waits for.
+    let completed = poll_completed(&emulator, "the logged group", "logged-migration").await;
     assert_eq!(
         completed.status, 200,
         "the completion must answer 200, got {} {}",

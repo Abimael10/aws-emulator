@@ -220,9 +220,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        // A group that already carries an open migration has nothing left to test:
-        // the migration this call would test is the one already running into it.
-        if group.migration.is_some() {
+        // A group whose data sync is already IN FLIGHT has nothing left to test:
+        // the connection this call would test is the one that migration is
+        // already reading through. A migration the service has not established
+        // yet, or one that has been cut over, leaves the connection testable,
+        // which is what this operation answers for — it opens no sync of its own
+        // and changes nothing.
+        if group
+            .migration
+            .as_ref()
+            .is_some_and(|migration| migration.is_migrating_at(now))
+        {
             return Err(
                 TestMigrationErrorModeled::ReplicationGroupAlreadyUnderMigrationFault(
                     ReplicationGroupAlreadyUnderMigrationFault {

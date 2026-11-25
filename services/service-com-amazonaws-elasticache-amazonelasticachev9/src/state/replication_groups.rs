@@ -94,6 +94,29 @@ pub const MAX_TEST_FAILOVERS_PER_WINDOW: usize = 15;
 /// sentence: "any rolling 24-hour period".
 pub const TEST_FAILOVER_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// How long a test of automatic failover on one shard is still being carried out
+/// after the call that asked for it, which is the window a second test of the
+/// SAME shard is refused in.
+///
+/// `TestFailover`'s own documented sequence is the work: the primary role moves,
+/// the old primary's node is replaced, and "the node replacement must complete
+/// before a subsequent call can be made". The SPAN is this emulator's chosen one
+/// — the same [`CLUSTER_TRANSITION`] every transient phase of this service is
+/// held for, long enough that a caller acting straight after the accepted call
+/// meets the refusal — and nothing sleeps for it: the instant it falls due is
+/// stored on the group ([`ReplicationGroupRecord::test_failovers_in_flight`]).
+/// Being that same span, the shard stops refusing a test exactly as the group
+/// settles back out of the status the replacement runs in, so a caller retrying
+/// the call is answered either the shard's own conflict or the acceptance,
+/// never the group's state refusal for work of its own shard.
+pub const TEST_FAILOVER_WORK: Duration = CLUSTER_TRANSITION;
+
+/// How ElastiCache refuses a `TestFailover` on a shard it is already testing
+/// failover on: the sentence states that the work is under way and names
+/// neither the group, the shard nor a status — the conflict belongs to the shard
+/// rather than to the group a caller would be polling.
+pub const TEST_FAILOVER_IN_PROGRESS_MESSAGE: &str = "Test failover already in progress";
+
 /// `AuthToken`'s documented length bounds: "Must be at least 16 characters and
 /// no more than 128 characters in length."
 pub const AUTH_TOKEN_MIN_LEN: usize = 16;
@@ -777,6 +800,12 @@ pub struct ReplicationGroupRecord {
     /// [`MigrationRecord`]. `ReplicationGroup` models no member for it, so it is
     /// state only. `None` until a migration is opened on it.
     pub migration: Option<MigrationRecord>,
+    /// The shards of this group a `TestFailover` is still being carried out on,
+    /// each with the instant that work falls due ([`TEST_FAILOVER_WORK`]): what
+    /// refuses a second test of the same shard while the first one runs, with
+    /// [`TEST_FAILOVER_IN_PROGRESS_MESSAGE`]. Keyed by `NodeGroupId`, so it
+    /// holds at most one entry per shard the group has.
+    pub test_failovers_in_flight: BTreeMap<String, SystemTime>,
     /// The Global datastore this group is a member of, and its role in it,
     /// which is what `ReplicationGroup$GlobalReplicationGroupInfo` reports.
     /// `CreateGlobalReplicationGroup` writes them for the primary it builds a
@@ -866,6 +895,27 @@ impl ReplicationGroupRecord {
             shard.status = self.status.clone();
         }
         Some(settled)
+    }
+
+    /// Whether a `TestFailover` already accepted on the shard `node_group_id`
+    /// is still being carried out at `now` — the per-shard conflict
+    /// [`TEST_FAILOVER_IN_PROGRESS_MESSAGE`] refuses a second test with.
+    pub fn test_failover_in_flight(&self, node_group_id: &str, now: SystemTime) -> bool {
+        self.test_failovers_in_flight
+            .get(node_group_id)
+            .is_some_and(|due| now < *due)
+    }
+
+    /// Record that a test of automatic failover on the shard `node_group_id` is
+    /// being carried out from `now`, over [`TEST_FAILOVER_WORK`].
+    ///
+    /// The tests the clock has already carried through are dropped as this one
+    /// is recorded: such a test stops running at a fixed instant whether or not
+    /// anybody calls again, so nothing is kept for a shard that is idle.
+    pub fn begin_test_failover(&mut self, node_group_id: &str, now: SystemTime) {
+        self.test_failovers_in_flight.retain(|_, due| now < *due);
+        self.test_failovers_in_flight
+            .insert(node_group_id.to_string(), now + TEST_FAILOVER_WORK);
     }
 
     /// How many replicas the shard `node_group_id` has: every member of it that

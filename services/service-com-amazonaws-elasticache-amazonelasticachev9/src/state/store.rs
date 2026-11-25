@@ -189,6 +189,8 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
                 due: new.now + CLUSTER_TRANSITION,
                 status: STATUS_AVAILABLE.to_string(),
             }),
+            // A created cluster is on its way IN: nothing has asked to delete it.
+            pending_removal: None,
             // The completion of provisioning is the event this cluster's
             // configured topic is owed once the clock owes it `available`.
             pending_event: Some(EVENT_CACHE_CLUSTER_PROVISIONING_COMPLETE),
@@ -448,6 +450,10 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
         id: &str,
         now: SystemTime,
     ) -> Option<&mut CacheClusterRecord> {
+        // A cluster whose teardown the clock has already carried through is
+        // gone, so it resolves to nothing rather than to a record reporting
+        // `deleting` for ever.
+        self.purge_deleted_cache_clusters(now);
         // Deliberately two lookups: the first settles the record and ends its
         // borrow so the event the transition records can be written to the log
         // beside it, the second hands the caller the settled record back.
@@ -461,6 +467,42 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
             self.record_settled_cluster_transition(&cache_cluster_id, &settled);
         }
         self.cache_clusters.get_mut(id)
+    }
+
+    /// Drop every cache cluster whose removal the clock already owes — the
+    /// clusters a `DeleteCacheCluster` put into [`STATUS_DELETING`] at least
+    /// [`CLUSTER_TRANSITION`] ago.
+    ///
+    /// Owed by the clock alone (due at this instant whether or not anybody
+    /// called), so a reporting operation materialises it too, the same way it
+    /// materialises a status change — see
+    /// [`Self::purge_deleted_replication_groups`], the same rule for the other
+    /// resource a delete only begins. A shard of a replication group loses the
+    /// member with it: the membership a group reports is the clusters the
+    /// account HAS.
+    pub fn purge_deleted_cache_clusters(&mut self, now: SystemTime) {
+        let due: Vec<String> = self
+            .cache_clusters
+            .values()
+            .filter(|cluster| cluster.pending_removal.is_some_and(|at| now >= at))
+            .map(|cluster| cluster.cache_cluster_id.clone())
+            .collect();
+        for cache_cluster_id in due {
+            let Some(cluster) = self.cache_clusters.remove(&cache_cluster_id) else {
+                continue;
+            };
+            if let Some(group) = cluster
+                .replication_group_id
+                .as_deref()
+                .and_then(|group_id| self.replication_groups.get_mut(group_id))
+            {
+                for shard in &mut group.node_groups {
+                    shard
+                        .members
+                        .retain(|member| member.cache_cluster_id != cache_cluster_id);
+                }
+            }
+        }
     }
 
     /// Record the event a cluster's materialised transition is, and queue the
@@ -601,6 +643,7 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
         self.purge_deleted_snapshots(now);
         self.purge_deleted_serverless_cache_snapshots(now);
         self.purge_deleted_replication_groups(now);
+        self.purge_deleted_cache_clusters(now);
         let mut settled: Vec<(String, SettledClusterTransition)> = Vec::new();
         for cluster in self.cache_clusters.values_mut() {
             if let Some(transition) = cluster.settle(now) {
@@ -1582,6 +1625,8 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
             // A created group is under no migration: `StartMigration` is what
             // opens one on it.
             migration: None,
+            // Nothing has tested failover on a shard of a group this new.
+            test_failovers_in_flight: BTreeMap::new(),
             // A created group belongs to no Global datastore: the Global
             // datastore operations are what make a group a member, and
             // `CreateReplicationGroup` does not create the secondary of one.

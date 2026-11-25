@@ -27,6 +27,7 @@ use std::time::SystemTime;
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
+use crate::cache_cluster_lifecycle::poll_cluster_gone;
 use crate::harness::{
     hold_pending_changes, is_own_host, params, release_pending_changes, Emulator, RefusalCase,
     Reply, PAST_TRANSITION, REGION,
@@ -2321,7 +2322,9 @@ async fn a_cluster_is_rebooted_only_from_a_status_the_service_reboots_from() {
             .await;
         assert_refused(id, &unknown_node, 400, "ValidationException");
 
-        // And after deletion the cluster is gone, not unavailable.
+        // And a reboot of a cluster whose teardown has BEGUN is refused for the
+        // state it is in, until the clock has removed it — from when the
+        // cluster is gone rather than unavailable.
         let deleted = emulator
             .call("DeleteCacheCluster", &params(&[("CacheClusterId", id)]))
             .await;
@@ -2330,6 +2333,9 @@ async fn a_cluster_is_rebooted_only_from_a_status_the_service_reboots_from() {
             "case {id:?}: the cluster must be deletable, got {}",
             deleted.body
         );
+        let tearing_down = emulator.call("RebootCacheCluster", &reboot).await;
+        assert_refused(id, &tearing_down, 400, "InvalidCacheClusterState");
+        poll_cluster_gone(&emulator, id, id).await;
         let gone = emulator.call("RebootCacheCluster", &reboot).await;
         assert_refused(id, &gone, 404, "CacheClusterNotFound");
     }

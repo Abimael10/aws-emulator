@@ -75,6 +75,15 @@ pub fn every_pending_change_due_in(emulator: &Emulator, due_in: Duration) {
             if group.pending_removal.is_some() {
                 group.pending_removal = Some(due);
             }
+            // The data sync a `StartMigration` opened carries a due instant of
+            // its own — when the service has ESTABLISHED it — so a suite about
+            // what a cutover is answered before then holds that instant out of
+            // reach too.
+            if let Some(migration) = group.migration.as_mut() {
+                if migration.established_due.is_some() {
+                    migration.established_due = Some(due);
+                }
+            }
         }
         for group in store.global_replication_groups.values_mut() {
             if let Some(pending) = group.pending_status.as_mut() {

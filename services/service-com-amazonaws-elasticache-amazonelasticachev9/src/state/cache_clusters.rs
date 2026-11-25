@@ -162,6 +162,17 @@ pub struct CacheClusterRecord {
     pub status: String,
     /// The status change the clock owes this cluster, if any.
     pub pending_status: Option<PendingTransition>,
+    /// When the teardown a `DeleteCacheCluster` began completes, after which the
+    /// cluster stops resolving at all; see
+    /// [`ComAmazonawsElasticacheAmazonelasticachev9State::purge_deleted_cache_clusters`].
+    /// `None` for a cluster nothing has asked to delete.
+    ///
+    /// A delete does not take the record at the call: "when you receive a
+    /// successful response from this operation, Amazon ElastiCache immediately
+    /// BEGINS deleting the cluster", so the cluster answers [`STATUS_DELETING`]
+    /// while that teardown runs — the same transient phase a created one is in
+    /// while it is provisioned — and the removal is what the clock owes.
+    pub pending_removal: Option<SystemTime>,
     /// The published ElastiCache event the completion of that change raises, as
     /// the call that began it named it; see [`SettledClusterTransition`].
     pub pending_event: Option<&'static str>,

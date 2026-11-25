@@ -64,6 +64,27 @@ pub const MIGRATION_ONE_SOURCE_MESSAGE: &str = "List should have only one elemen
 /// established".
 pub const CUTOVER_MODE_AUTOMATIC: &str = "automatic";
 
+/// How long after a `StartMigration` the data sync it began is ESTABLISHED —
+/// the instant from which the migration is in flight and a cutover can be
+/// completed.
+///
+/// `StartMigration$AutoCutover` states the phase this span is: ElastiCache
+/// completes a migration "after data sync is established", so establishing the
+/// sync is work the service carries out after the call that started it, and the
+/// cutover a caller asks for before it is established is refused with
+/// [`MIGRATION_NOT_MIGRATING_MESSAGE`], which says to retry later.
+///
+/// The SPAN is this emulator's OWN choice, and deliberately LONGER than the
+/// [`CLUSTER_TRANSITION`] a status change is held for: a cutover's precondition
+/// is the one this service tells a client to RETRY for, so the window has to
+/// out-last a client's first retries to be observable at all — a client that
+/// polls the cutover has to meet the refusal, retry, and then be served. It is
+/// stated as a multiple of that span so the two move together, and nothing
+/// sleeps for it: the instant it falls due is stored on the record
+/// ([`MigrationRecord::established_due`]).
+pub const MIGRATION_SYNC_ESTABLISHMENT: Duration =
+    Duration::from_millis(CLUSTER_TRANSITION.as_millis() as u64 * 5);
+
 /// `MigrationSummary$CutoverMode` when the caller cuts over itself, with
 /// `CompleteMigration`.
 pub const CUTOVER_MODE_MANUAL: &str = "manual";
@@ -113,6 +134,11 @@ pub struct MigrationRecord {
     /// When the data sync last started, which is what makes an open migration
     /// datable in the event log.
     pub started_at: Option<SystemTime>,
+    /// When the data sync this migration opened is ESTABLISHED, after which it
+    /// is in flight and a cutover can be completed; see
+    /// [`MIGRATION_SYNC_ESTABLISHMENT`]. `None` for a sync that is in flight
+    /// already.
+    pub established_due: Option<SystemTime>,
 }
 
 impl MigrationRecord {
@@ -124,15 +150,26 @@ impl MigrationRecord {
             source_endpoints,
             cutover_mode: None,
             started_at: None,
+            established_due: None,
         }
     }
 
     /// Start (or restart) the data sync, recording which side carries out the
-    /// cutover.
+    /// cutover. The sync is in flight from here.
     pub fn begin_sync(&mut self, cutover_mode: &str, now: SystemTime) {
         self.status = MIGRATION_STATUS_SYNCING.to_string();
         self.cutover_mode = Some(cutover_mode.to_string());
         self.started_at = Some(now);
+        self.established_due = None;
+    }
+
+    /// Start the data sync as work the service still has to ESTABLISH: the sync
+    /// is in flight only once `span` has passed
+    /// ([`MIGRATION_SYNC_ESTABLISHMENT`]), so a cutover asked for before then is
+    /// refused with the sentence that says to retry later.
+    pub fn begin_sync_over(&mut self, cutover_mode: &str, now: SystemTime, span: Duration) {
+        self.begin_sync(cutover_mode, now);
+        self.established_due = Some(now + span);
     }
 
     /// Whether a data sync can be started from this phase: a prepared migration
@@ -151,6 +188,17 @@ impl MigrationRecord {
     /// [`MIGRATION_NOT_MIGRATING_MESSAGE`].
     pub fn is_migrating(&self) -> bool {
         self.status == MIGRATION_STATUS_SYNCING || self.status == MIGRATION_STATUS_CUTOVER
+    }
+
+    /// Whether this migration is migrating AT `now`: its phase admits a cutover
+    /// ([`Self::is_migrating`]) and the sync it opened has been established by
+    /// this instant ([`Self::established_due`]).
+    ///
+    /// The question every gate on an IN-FLIGHT data sync asks, so the operation
+    /// that cuts one over and the one that tests a connection cannot disagree
+    /// about when a sync is running.
+    pub fn is_migrating_at(&self, now: SystemTime) -> bool {
+        self.is_migrating() && self.established_due.is_none_or(|due| now >= due)
     }
 
     /// This record as the modelled `MigrationSummary`.

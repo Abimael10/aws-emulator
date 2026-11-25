@@ -103,6 +103,22 @@ pub(crate) async fn describe_cluster(emulator: &Emulator, id: &str) -> Reply {
         .await
 }
 
+/// Read the cluster `id` back until it stops resolving, and answer with that
+/// reply: a delete BEGINS the teardown, and the removal is what the clock owes,
+/// so it is reached by looking again rather than by waiting a fixed time.
+pub(crate) async fn poll_cluster_gone(emulator: &Emulator, case: &str, id: &str) -> Reply {
+    poll_until(
+        emulator,
+        REGION,
+        case,
+        &format!("the cluster {id} being removed by the clock"),
+        "DescribeCacheClusters",
+        &params(&[("CacheClusterId", id)]),
+        |reply| reply.status == 404,
+    )
+    .await
+}
+
 /// Read the cluster `id` back until it reports `status`, and answer with that
 /// reply.
 ///
@@ -1061,7 +1077,18 @@ async fn delete_reports_the_cluster_deleting_and_removes_it() {
         deleted.body
     );
 
-    let gone = describe_cluster(&emulator, "doomed").await;
+    // The delete BEGINS the teardown: the cluster is reported `deleting` while
+    // it runs, and the removal is what the clock owes — reached by looking
+    // again rather than by waiting a fixed time.
+    let tearing_down = describe_cluster(&emulator, "doomed").await;
+    assert_eq!(
+        tearing_down.text("CacheCluster/CacheClusterStatus"),
+        Some("deleting"),
+        "case delete: a read while the teardown runs reports it, got {} {}",
+        tearing_down.status,
+        tearing_down.body
+    );
+    let gone = poll_cluster_gone(&emulator, "delete", "doomed").await;
     assert_eq!(
         gone.status, 404,
         "case delete: the cluster is gone, got {} {}",

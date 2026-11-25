@@ -237,21 +237,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into());
                 };
-                // A cutover exists only inside a migration that is MIGRATING: the
-                // group has to carry an open one whose data sync is in flight. The
-                // group's own status is NOT a second gate on it — the transient
-                // status it answers while the service works that same migration
-                // through (the one `StartMigration` began) is part of the migration,
-                // so a caller that cuts over straight after starting the sync is
-                // served rather than refused. Any other state is the one modelled
-                // parameter refusal, which says exactly that and says to retry once
-                // the service has got there.
+                // A cutover exists only inside a migration whose data sync is IN
+                // FLIGHT at this instant: the group has to carry an open one that
+                // the service has already established
+                // (`crate::state::MIGRATION_SYNC_ESTABLISHMENT`). The group's own
+                // status is NOT a second gate on it — the transient status it
+                // answers while the service works that same migration through (the
+                // one `StartMigration` began) is part of the migration. Any other
+                // state is the one modelled parameter refusal, which says exactly
+                // that and says to retry once the service has got there, which is
+                // what a client driving a cutover does.
                 let migrating = (group.status == crate::state::STATUS_AVAILABLE
                     || group.status == crate::state::STATUS_MODIFYING)
                     && group
                         .migration
                         .as_ref()
-                        .is_some_and(crate::state::MigrationRecord::is_migrating);
+                        .is_some_and(|migration| migration.is_migrating_at(now));
                 if !migrating {
                     return Err(invalid_value(
                         crate::state::MIGRATION_NOT_MIGRATING_MESSAGE,
@@ -320,7 +321,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // One that carries a migration which is not migrating is the same
                 // refusal the replication group gets, for the same reason: there is
                 // no data sync in flight to complete.
-                if !migration.is_migrating() {
+                if !migration.is_migrating_at(now) {
                     return Err(invalid_value(
                         crate::state::MIGRATION_NOT_MIGRATING_MESSAGE,
                     ));
