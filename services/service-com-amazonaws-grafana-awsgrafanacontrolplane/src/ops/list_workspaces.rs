@@ -192,6 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .expect("a page size clamped into 1..=100 fits in usize");
 
         let now = ::std::time::SystemTime::now();
+        let authority = crate::state::announced_authority(ctx);
         let mut store = state.lock();
         store.settle_all(now);
 
@@ -211,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 next_token = Some(id.clone());
                 break;
             }
-            workspaces.push(workspace.to_summary());
+            workspaces.push(workspace.to_summary(&authority));
         }
 
         Ok(ListWorkspacesOutput {

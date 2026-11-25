@@ -167,10 +167,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        let authority = crate::state::announced_authority(ctx);
         let mut store = state.lock();
         match store.settled_mut(&input.workspace_id, now) {
             Some(workspace) => Ok(DescribeWorkspaceOutput {
-                workspace: workspace.to_description(),
+                workspace: workspace.to_description(&authority),
             }),
             None => Err(DescribeWorkspaceErrorModeled::ResourceNotFoundException(
                 crate::state::workspace_not_found(&input.workspace_id),

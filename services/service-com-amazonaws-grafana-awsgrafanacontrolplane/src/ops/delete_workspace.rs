@@ -173,6 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        let authority = crate::state::announced_authority(ctx);
         let mut store = state.lock();
         let Some(workspace) = store.settled_mut(&input.workspace_id, now) else {
             return Err(DeleteWorkspaceErrorModeled::ResourceNotFoundException(
@@ -195,7 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
             workspace.modified = now;
         }
-        let description = workspace.to_description();
+        let description = workspace.to_description(&authority);
 
         Ok(DeleteWorkspaceOutput {
             workspace: description,

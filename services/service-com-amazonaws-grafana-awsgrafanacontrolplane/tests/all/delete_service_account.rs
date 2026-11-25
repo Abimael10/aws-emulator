@@ -581,13 +581,19 @@ async fn the_released_accounts_token_keys_stop_authorizing() {
 }
 
 /// Present `key` as a bearer token to the workspace's own Grafana HTTP API, at the
-/// `endpoint` host the control plane announced for it.
+/// `endpoint` the control plane announced for it: the announced endpoint is the address this
+/// emulator is reached at with the workspace's own path beneath it, so the route a client
+/// appends to it continues that path.
 async fn authorize(emulator: &Emulator, endpoint: &str, key: &str) -> Answer {
+    let (host, path) = match endpoint.split_once('/') {
+        Some((host, prefix)) => (host.to_string(), format!("/{prefix}/api/org")),
+        None => (endpoint.to_string(), "/api/org".to_string()),
+    };
     request(
         emulator,
         "GET",
-        "/api/org",
-        endpoint,
+        &path,
+        &host,
         Some(&format!("Bearer {key}")),
         None,
     )

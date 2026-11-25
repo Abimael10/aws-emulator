@@ -50,7 +50,8 @@
 //! Grafana console in the workspace", so it is a promise that a caller can follow it:
 //! reading the field and calling Grafana's own REST API under it is what a client that
 //! minted a workspace API key or a service-account token does with it. That API is not
-//! in the Smithy model, so it is claimed by the HOST the request addresses and served
+//! in the Smithy model, so it is claimed by the ADDRESS the request names — the announced
+//! endpoint's path, or the host the real service publishes for a workspace — and served
 //! from the two seams below; [`workspace_api`] is the module that answers it.
 
 use smithy_server_runtime::{
@@ -217,13 +218,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             return true;
         }
         // And a request to a workspace's own Grafana HTTP API, which is claimed by
-        // the HOST it addresses because that is the only thing that identifies it:
+        // the ADDRESS it names because that is the only thing that identifies it:
         // a client holding a workspace API key or a service-account token presents
         // it as a bearer token, with no SigV4 credential and no `X-Amz-Target`, and
-        // addresses the endpoint host the control plane announced for the workspace
-        // (`<workspaceId>.grafana-workspace.<region>.amazonaws.com`). Without this
-        // the router answers `UnknownService` for an endpoint this service handed
-        // out.
+        // addresses the endpoint the control plane announced for the workspace (this
+        // emulator's own authority with the workspace's path beneath it) or the host
+        // the real service publishes for it. Without this the router answers
+        // `UnknownService` for an endpoint this service handed out.
         let host = workspace_api::addressed_host(
             parts
                 .headers

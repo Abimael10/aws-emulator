@@ -11,15 +11,21 @@
 //! exactly as `service-com-amazonaws-codecommit-codecommit-20150413` serves git's
 //! smart-HTTP transport.
 //!
-//! The address it answers on is the one [`crate::state::workspace_endpoint`]
-//! announces: the bare host `<workspaceId>.grafana-workspace.<region>.amazonaws.com`
-//! the control plane reports as `WorkspaceDescription$endpoint`. A client that reads
-//! `endpoint`, resolves it to this emulator and appends a Grafana route reaches this
-//! module:
+//! The address it answers on is the one [`crate::state::announced_endpoint`] announces: the
+//! `host[:port]` a control-plane request reached this emulator at, with the workspace's own
+//! path beneath it (`/_aws/grafana/<workspaceId>`), which the control plane reports as
+//! `WorkspaceDescription$endpoint`. A client that reads `endpoint` and appends a Grafana
+//! route to it reaches this module:
 //!
 //! | request | meaning |
 //! |---|---|
 //! | `GET https://<endpoint>/api/org` | the workspace's organization: its `id` and `name` |
+//!
+//! A request whose `Host` is the host Amazon Managed Grafana itself publishes for a
+//! workspace addresses the same workspace
+//! ([`crate::state::workspace_id_at_endpoint_host`]), for a client whose own resolver points
+//! that name at this process; there the whole path is the Grafana route, because such a host
+//! carries no path.
 //!
 //! Every other route under the endpoint is answered with **501**, never an empty
 //! 200: a client cannot tell an unimplemented route from an implemented one that
@@ -87,29 +93,48 @@ pub struct Response {
 pub const CONTENT_TYPE: &str = "application/json";
 
 /// The request a `method`, `host` and `path` name, or `None` when the request is
-/// not addressed to a workspace endpoint this service announces.
+/// not addressed to a workspace endpoint this service serves.
 ///
-/// A request is this data plane's when its `Host` is the endpoint host of a
-/// workspace ([`crate::state::workspace_id_at_endpoint_host`]) — the address the
-/// control plane announced for it. The host is the one thing that identifies such
-/// a request: a Grafana client sends no SigV4 credential and no `X-Amz-Target`, so
-/// it is also what [`crate::service::EmulatedService::can_handle`] claims on. The
-/// whole path is then the Grafana route, because the endpoint is a host and
-/// carries no path of its own.
+/// A request is this data plane's when it addresses a workspace
+/// ([`addressed_workspace`]) — the address the control plane announced for it. That is the
+/// one thing that identifies such a request: a Grafana client sends no SigV4 credential and
+/// no `X-Amz-Target`, so it is also what
+/// [`crate::service::EmulatedService::can_handle`] claims on.
 pub fn route(method: &str, host: Option<&str>, path: &str) -> Option<Request> {
-    let workspace_id = crate::state::workspace_id_at_endpoint_host(host?)?;
-    let route = if method.eq_ignore_ascii_case("GET") && path == "/api/org" {
+    let (workspace_id, route_path) = addressed_workspace(host, path)?;
+    let route = if method.eq_ignore_ascii_case("GET") && route_path == "/api/org" {
         Route::Org
     } else {
         Route::Unserved {
             method: method.to_string(),
-            path: path.to_string(),
+            path: route_path,
         }
     };
     Some(Request {
         workspace_id,
         route,
     })
+}
+
+/// WHICH workspace a request addresses, and the Grafana route beneath its endpoint — and
+/// `None` for a request that addresses no workspace of this service.
+///
+/// Two addressings reach one workspace, because a client reaches this emulator either at
+/// the address the control plane announced or at the name the real service publishes:
+///
+/// * the announced endpoint, whose PATH carries the workspace
+///   ([`crate::state::workspace_at_announced_path`]), with the Grafana route beneath it —
+///   the address every projection of a workspace reports, and the only one a client on this
+///   machine can dial;
+/// * the host the real service publishes for the workspace
+///   ([`crate::state::workspace_id_at_endpoint_host`]), for a client whose own resolver
+///   points that name here; such a host carries no path, so the whole path is the route.
+fn addressed_workspace(host: Option<&str>, path: &str) -> Option<(String, String)> {
+    if let Some(addressed) = crate::state::workspace_at_announced_path(path) {
+        return Some(addressed);
+    }
+    let workspace_id = crate::state::workspace_id_at_endpoint_host(host?)?;
+    Some((workspace_id, path.to_string()))
 }
 
 /// The authority a request addresses: its `Host` header, or — on HTTP/2 and an

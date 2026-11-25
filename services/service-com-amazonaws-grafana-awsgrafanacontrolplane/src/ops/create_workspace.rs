@@ -274,10 +274,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
-        // The endpoint a workspace announces is a host composed from its own id and
-        // the region it lives in, which is the region this request is served in
-        // (see `crate::state::workspace_endpoint`).
-        let region = crate::state::request_region(ctx.parts());
+        // The endpoint a workspace announces is an address THIS emulator answers on, read
+        // off the request being served (see `crate::state::announced_endpoint`).
+        let authority = crate::state::announced_authority(ctx);
         let mut store = state.lock();
         // Release every workspace whose accepted deletion has fallen due: the instant it
         // fell due is when that workspace stopped occupying the store, whether or not
@@ -293,7 +292,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(id) = replayed {
             if let Some(workspace) = store.settled_mut(&id, now) {
                 return Ok(CreateWorkspaceOutput {
-                    workspace: workspace.to_description(),
+                    workspace: workspace.to_description(&authority),
                 });
             }
         }
@@ -324,7 +323,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let id = store.mint_workspace_id();
         let workspace = crate::state::Workspace {
-            endpoint: crate::state::workspace_endpoint(&id, &region),
             id: id.clone(),
             name: input.workspace_name,
             description: input.workspace_description,
@@ -382,7 +380,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             modified: now,
         };
 
-        let description = workspace.to_description();
+        let description = workspace.to_description(&authority);
         store.workspaces.insert(id.clone(), workspace);
         if let Some(token) = input.client_token {
             store.idempotency_tokens.insert(token, id);

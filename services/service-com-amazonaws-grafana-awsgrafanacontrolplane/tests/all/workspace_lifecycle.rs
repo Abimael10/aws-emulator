@@ -54,15 +54,11 @@ const SIGNED_FOR_EU_WEST_1: &str = "AWS4-HMAC-SHA256 \
 /// The endpoint host every request below reaches this emulator on.
 const EMULATOR_HOST: &str = "127.0.0.1:9297";
 
-/// The region the requests below are signed for ([`SIGNED_FOR_EU_WEST_1`]), which is the
-/// region the workspaces they create live in — and so the region label of the endpoint
-/// host each workspace announces.
-const REGION: &str = "eu-west-1";
-
-/// The endpoint host the workspace `id` announces: a bare host whose first label is the
-/// workspace id, spelled out here independently of the crate's own constants.
+/// The endpoint the workspace `id` is announced at: the address every request below reaches
+/// this emulator on, with the workspace's own path beneath it, spelled out here
+/// independently of the crate's own constants.
 fn expected_endpoint(id: &str) -> String {
-    format!("{id}.grafana-workspace.{REGION}.amazonaws.com")
+    format!("{EMULATOR_HOST}/_aws/grafana/{id}")
 }
 
 /// A create request with only the three required members, for a case that is about
@@ -323,8 +319,8 @@ async fn a_created_workspace_is_described_from_what_was_stored() {
         assert_eq!(
             at(created.workspace(), "/endpoint"),
             json!(expected_endpoint(&id)),
-            "case {case:?}: the endpoint must be the bare host naming this workspace and \
-             its region, got {:?}",
+            "case {case:?}: the endpoint must be an address this emulator is reached at, \
+             naming this workspace, got {:?}",
             at(created.workspace(), "/endpoint")
         );
         assert_eq!(

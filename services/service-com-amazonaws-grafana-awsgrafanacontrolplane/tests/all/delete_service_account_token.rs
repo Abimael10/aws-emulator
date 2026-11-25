@@ -526,15 +526,7 @@ async fn the_released_tokens_key_stops_authorizing() {
         await_active(&emulator, &workspace_id).await;
 
         for (index, (id, key)) in tokens.iter().enumerate() {
-            let answered = request(
-                &emulator,
-                "GET",
-                "/api/org",
-                &endpoint,
-                Some(&format!("Bearer {key}")),
-                None,
-            )
-            .await;
+            let answered = authorize(&emulator, &endpoint, key).await;
             assert_eq!(
                 answered.status, 200,
                 "case {case:?}: token {index} ({id}) must authorize before any delete, got {} \
@@ -551,15 +543,7 @@ async fn the_released_tokens_key_stops_authorizing() {
             deleted.status, deleted.body
         );
 
-        let revoked = request(
-            &emulator,
-            "GET",
-            "/api/org",
-            &endpoint,
-            Some(&format!("Bearer {target_key}")),
-            None,
-        )
-        .await;
+        let revoked = authorize(&emulator, &endpoint, &target_key).await;
         assert_eq!(
             revoked.status, 401,
             "case {case:?}: the released token's key must authorize nothing, got {} with {:?}",
@@ -570,15 +554,7 @@ async fn the_released_tokens_key_stops_authorizing() {
             if index == deleted_index {
                 continue;
             }
-            let answered = request(
-                &emulator,
-                "GET",
-                "/api/org",
-                &endpoint,
-                Some(&format!("Bearer {key}")),
-                None,
-            )
-            .await;
+            let answered = authorize(&emulator, &endpoint, key).await;
             assert_eq!(
                 answered.status, 200,
                 "case {case:?}: token {index} ({id}) must keep authorizing after another is \
@@ -587,6 +563,26 @@ async fn the_released_tokens_key_stops_authorizing() {
             );
         }
     }
+}
+
+/// Present `key` as a bearer token to the workspace's own Grafana HTTP API, at the
+/// `endpoint` the control plane announced for it: the announced endpoint is the address this
+/// emulator is reached at with the workspace's own path beneath it, so the route a client
+/// appends to it continues that path.
+async fn authorize(emulator: &Emulator, endpoint: &str, key: &str) -> Answer {
+    let (host, path) = match endpoint.split_once('/') {
+        Some((host, prefix)) => (host.to_string(), format!("/{prefix}/api/org")),
+        None => (endpoint.to_string(), "/api/org".to_string()),
+    };
+    request(
+        emulator,
+        "GET",
+        &path,
+        &host,
+        Some(&format!("Bearer {key}")),
+        None,
+    )
+    .await
 }
 
 /// Look again at the workspace `id` until it is ACTIVE, or the deadline passes.

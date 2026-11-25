@@ -7,9 +7,10 @@
 //! takes.
 //!
 //! The rule under test: the `endpoint` the control plane reports for a workspace
-//! is the bare host `<workspaceId>.grafana-workspace.<region>.amazonaws.com`, and
-//! this emulator serves that workspace's Grafana HTTP API at that host — a request
-//! addressed to it carrying `Authorization: Bearer <credential the control plane
+//! is an address THIS emulator is reached at — the `host[:port]` the control-plane
+//! request arrived on, with the workspace's own path beneath it — and this emulator
+//! serves that workspace's Grafana HTTP API there: a request spliced onto the
+//! announced endpoint carrying `Authorization: Bearer <credential the control plane
 //! minted for that workspace>` is answered from the workspace record, and a
 //! credential the workspace no longer holds (deleted, expired, or belonging to a
 //! deleted workspace) authenticates nothing.
@@ -28,10 +29,30 @@ use smithy_server_runtime::MultiServiceRouter;
 /// announces.
 const REGION: &str = "eu-west-1";
 
-/// The endpoint host the workspace `id` announces, spelled out here independently of
-/// the crate's own constants so a wrong composition in `src/state.rs` fails.
-fn expected_endpoint(id: &str) -> String {
+/// The endpoint the workspace `id` is announced at for a client that reached this emulator
+/// at `authority`, spelled out here independently of the crate's own constants so a wrong
+/// composition in `src/state/` fails.
+fn expected_endpoint(authority: &str, id: &str) -> String {
+    format!("{authority}/_aws/grafana/{id}")
+}
+
+/// The host Amazon Managed Grafana itself publishes for the workspace `id`: not the
+/// announced endpoint (nothing resolves that name to this process), but an address this
+/// emulator still ANSWERS for a client whose own resolver points it here.
+fn aws_published_host(id: &str) -> String {
     format!("{id}.grafana-workspace.{REGION}.amazonaws.com")
+}
+
+/// The `Host` header and the request path a client builds to reach `route` under the
+/// `endpoint` the control plane announced — the splice `https://<endpoint><route>` performed
+/// on the parts an HTTP request carries them in. A bare host carries no path, so there the
+/// route is the whole path.
+fn addressed(endpoint: &str, route: &str) -> (String, String) {
+    match endpoint.split_once('/') {
+        Some((host, path)) => (host.to_string(), format!("/{path}{route}")),
+        None if route.is_empty() => (endpoint.to_string(), "/".to_string()),
+        None => (endpoint.to_string(), route.to_string()),
+    }
 }
 
 /// How long a case waits for something the clock owes (a status, a key's expiry)
@@ -148,19 +169,17 @@ async fn control(
     .await
 }
 
-/// A call to the workspace's own Grafana HTTP API: `route` under the `endpoint` host
-/// the control plane announced, reached the way a Grafana client reaches it — that
-/// host in the request, no SigV4 credential, only the bearer `authorization` given.
+/// A call to the workspace's own Grafana HTTP API: `route` spliced onto the
+/// `endpoint` the control plane announced, reached the way a Grafana client reaches
+/// it — no SigV4 credential, only the bearer `authorization` given.
 async fn native(
     emulator: &Emulator,
     endpoint: &str,
     route: &str,
     authorization: Option<&str>,
 ) -> Answer {
-    // The endpoint is a host and carries no path, so a route the client appends to it
-    // is the whole request path; the Grafana API's own root is `/`.
-    let path = if route.is_empty() { "/" } else { route };
-    request(emulator, "GET", path, endpoint, authorization, None).await
+    let (host, path) = addressed(endpoint, route);
+    request(emulator, "GET", &path, &host, authorization, None).await
 }
 
 /// Look again at `route` under `endpoint` until it answers `want`, or the deadline
@@ -290,44 +309,55 @@ fn bearer(token: &str) -> String {
     format!("Bearer {token}")
 }
 
-/// The endpoint a workspace announces is the bare host composed from its own id and
-/// its region, whatever address the asking client reached this emulator on — and it
-/// is a host this emulator answers that workspace's Grafana API at.
+/// Both addressings of a workspace reach its Grafana API: the endpoint the control plane
+/// ANNOUNCES — the address this emulator is reached at, with the workspace's own path
+/// beneath it — and the host Amazon Managed Grafana itself publishes for the workspace,
+/// which this emulator also answers for a client whose own resolver points it here.
 ///
-/// The rows differ along the endpoint forms a client reaches an emulator through:
-/// loopback by address with the default port and another, loopback by name, an
-/// IPv6 literal, a routable private address, and no `Host` at all (an in-process
-/// caller with an origin-form URI). None of them is part of the announced endpoint,
-/// which is what the first assertion pins.
+/// The rows differ along the addressing, and each is exercised both with a credential the
+/// control plane minted for that workspace and with none at all, so an address that reached
+/// the router's own refusal instead of the Grafana API fails here.
 #[tokio::test]
-async fn the_announced_endpoint_is_the_workspaces_own_host_and_serves_its_grafana_api() {
-    let cases: [(&str, &str); 6] = [
-        ("loopback by address, default port", EMULATOR_HOST),
-        ("loopback by address, another port", "127.0.0.1:34567"),
-        ("loopback by name", "localhost:9297"),
-        ("an IPv6 loopback literal", "[::1]:9297"),
-        ("a routable private address", "10.1.2.3:8443"),
-        ("no Host header at all", ""),
-    ];
+async fn both_addressings_of_a_workspace_reach_its_grafana_api() {
+    let emulator = emulator();
+    let (id, endpoint) = active_workspace(&emulator, EMULATOR_HOST, Some("addressing"), None).await;
+    let expected = expected_endpoint(EMULATOR_HOST, &id);
+    assert_eq!(
+        endpoint, expected,
+        "the announced endpoint must be the address this emulator was reached at with the \
+         workspace's own path, expected {expected:?}, got {endpoint:?}"
+    );
+    let key = api_key(&emulator, EMULATOR_HOST, &id, "addressing", "ADMIN", 3_600).await;
 
-    for (case, host) in cases {
-        let emulator = emulator();
-        let (id, endpoint) = active_workspace(&emulator, host, None, None).await;
-        let expected = expected_endpoint(&id);
+    for (case, address) in [
+        ("the announced endpoint", endpoint.clone()),
+        (
+            "the host Amazon Managed Grafana publishes",
+            aws_published_host(&id),
+        ),
+    ] {
+        let org = native(&emulator, &address, "/api/org", Some(&bearer(&key))).await;
         assert_eq!(
-            endpoint, expected,
-            "case {case:?}: the endpoint must be the workspace's own host, expected \
-             {expected:?}, got {endpoint:?}"
+            org.status, 200,
+            "case {case:?}: {address} must serve the workspace's Grafana API, got {} with \
+             {:?}",
+            org.status, org.body
+        );
+        assert_eq!(
+            org.body["id"],
+            json!(1),
+            "case {case:?}: the organization must report its id, got {:?}",
+            org.body
         );
 
-        // And it is an address this emulator answers on: a request addressed to that
-        // host reaches the workspace's Grafana API rather than the router's
-        // UnknownService refusal.
-        let answered = native(&emulator, &endpoint, "/api/org", None).await;
+        // And an unauthenticated request is refused by the workspace's Grafana API rather
+        // than by the router, which is what an address naming nothing this emulator serves
+        // would answer.
+        let answered = native(&emulator, &address, "/api/org", None).await;
         assert_eq!(
             answered.status, 401,
-            "case {case:?}: an unauthenticated request to the announced endpoint must be \
-             refused by the workspace's Grafana API, got {} with {:?}",
+            "case {case:?}: an unauthenticated request must be refused by the workspace's \
+             Grafana API, got {} with {:?}",
             answered.status, answered.body
         );
         assert_eq!(
@@ -753,9 +783,9 @@ async fn the_endpoint_answers_only_for_a_live_active_workspace() {
         serving.status, serving.body
     );
 
-    // An endpoint host whose workspace id names no workspace, and the endpoint of a
+    // An endpoint whose workspace id names no workspace, and the endpoint of a
     // workspace that has been deleted: neither is served.
-    let unknown = expected_endpoint("g-0123456789");
+    let unknown = expected_endpoint(EMULATOR_HOST, "g-0123456789");
     let absent = native(&emulator, &unknown, "/api/org", Some(&bearer(&key))).await;
     assert_eq!(
         absent.status, 404,
@@ -835,29 +865,49 @@ async fn a_route_the_emulator_does_not_serve_answers_501() {
         );
     }
 
-    // And a host that only looks like a workspace endpoint: the first label must
-    // satisfy `WorkspaceId`'s ^g-[0-9a-f]{10}$ and the labels after it must be the
-    // ones a workspace endpoint carries, or this service claims nothing and the
-    // router answers its own refusal.
-    for host in [
-        format!("not-a-workspace.grafana-workspace.{REGION}.amazonaws.com"),
-        format!("g-0123456789abc.grafana-workspace.{REGION}.amazonaws.com"),
-        format!("{id}.grafana.{REGION}.amazonaws.com"),
-        format!("{id}.grafana-workspace.{REGION}.amazonaws.com.example.test"),
-        format!("{id}.grafana-workspace.amazonaws.com"),
-    ] {
-        let answered = request(
-            &emulator,
-            "GET",
-            "/api/org",
-            &host,
-            Some(&bearer(&key)),
-            None,
-        )
-        .await;
+    // And an address that only looks like one of the workspace's: a host whose first label
+    // must satisfy `WorkspaceId`'s ^g-[0-9a-f]{10}$ with the labels a published workspace
+    // host carries after it, and a path under another plane or naming no workspace id — or
+    // this service claims nothing and the router answers its own refusal.
+    let unclaimed: Vec<(String, String)> = vec![
+        (
+            format!("not-a-workspace.grafana-workspace.{REGION}.amazonaws.com"),
+            "/api/org".to_string(),
+        ),
+        (
+            format!("g-0123456789abc.grafana-workspace.{REGION}.amazonaws.com"),
+            "/api/org".to_string(),
+        ),
+        (
+            format!("{id}.grafana.{REGION}.amazonaws.com"),
+            "/api/org".to_string(),
+        ),
+        (
+            format!("{id}.grafana-workspace.{REGION}.amazonaws.com.example.test"),
+            "/api/org".to_string(),
+        ),
+        (
+            format!("{id}.grafana-workspace.amazonaws.com"),
+            "/api/org".to_string(),
+        ),
+        (
+            EMULATOR_HOST.to_string(),
+            format!("/_aws/athena/{id}/api/org"),
+        ),
+        (
+            EMULATOR_HOST.to_string(),
+            "/_aws/grafana/not-a-workspace/api/org".to_string(),
+        ),
+        (
+            EMULATOR_HOST.to_string(),
+            format!("/grafana/{id}/api/org"),
+        ),
+    ];
+    for (host, path) in unclaimed {
+        let answered = request(&emulator, "GET", &path, &host, Some(&bearer(&key)), None).await;
         assert_ne!(
             answered.status, 200,
-            "host {host:?} is no workspace endpoint, so this service must not serve the \
+            "{host}{path} is no workspace endpoint, so this service must not serve the \
              Grafana API there, got {} with {:?}",
             answered.status, answered.body
         );
@@ -865,24 +915,24 @@ async fn a_route_the_emulator_does_not_serve_answers_501() {
             answered.body["message"].as_str().is_none_or(|message| {
                 !message.contains("not implemented in this emulator")
             }),
-            "host {host:?} is no workspace endpoint, so no Grafana route may answer for it, \
+            "{host}{path} is no workspace endpoint, so no Grafana route may answer for it, \
              got {:?}",
             answered.body
         );
     }
 
-    // A DNS name is case-insensitive, so the announced host in another casing
-    // addresses the same workspace.
+    // A DNS name is case-insensitive, so the host Amazon Managed Grafana publishes for the
+    // workspace addresses it in any casing.
     let shouted = native(
         &emulator,
-        &endpoint.to_ascii_uppercase(),
+        &aws_published_host(&id).to_ascii_uppercase(),
         "/api/org",
         Some(&bearer(&key)),
     )
     .await;
     assert_eq!(
         shouted.status, 200,
-        "the announced endpoint in upper case names the same workspace, got {} with {:?}",
+        "the published host in upper case names the same workspace, got {} with {:?}",
         shouted.status, shouted.body
     );
 }

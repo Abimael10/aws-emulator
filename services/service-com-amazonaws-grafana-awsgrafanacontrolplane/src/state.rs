@@ -19,6 +19,14 @@ use crate::ops::types::{
     ValidationExceptionField, VpcConfiguration, WorkspaceDescription, WorkspaceSummary,
 };
 
+/// WHERE a workspace's Grafana console and HTTP API are announced — the address every
+/// projection of a workspace reports, and the addressing it is read back by.
+pub mod announced_endpoint;
+pub use announced_endpoint::{
+    announced_authority, workspace_at_announced_path, workspace_endpoint, workspace_endpoint_path,
+    ENDPOINT_PLANE_SEGMENT,
+};
+
 /// The Grafana versions this emulator supports, OLDEST FIRST.
 ///
 /// This is the emulator's single statement of the supported set: the catalogue
@@ -54,17 +62,13 @@ pub const DEFAULT_GRAFANA_VERSION: &str =
 /// an empty object is the document that overrides nothing.
 pub const DEFAULT_WORKSPACE_CONFIGURATION: &str = "{}";
 
-/// The labels every workspace endpoint host carries after the workspace's own id:
-/// `<workspaceId>.grafana-workspace.<region>.amazonaws.com`.
+/// The labels the host AMAZON MANAGED GRAFANA publishes for a workspace carries after the
+/// workspace's own id: `<workspaceId>.grafana-workspace.<region>.amazonaws.com`.
 ///
-/// `WorkspaceDescription$endpoint` is "The URL that users can use to access the
-/// Grafana console in the workspace", and the value Amazon Managed Grafana
-/// announces there is a bare HOST — no scheme, no port and no path — whose first
-/// DNS label is the workspace id and whose remaining labels are these, with the
-/// region the workspace lives in between them. A client splices it into an
-/// address itself (`https://<endpoint>/api/...`) or uses it as a host name (DNS,
-/// SNI, a `Host` header, an allow-list), which is why the stored value is the
-/// host and not a URL.
+/// That host resolves nowhere near this process, so it is NOT what this emulator announces
+/// ([`announced_endpoint`] is): it is kept because this emulator also ANSWERS it, for a
+/// client whose own resolver points the name here — the second addressing
+/// [`crate::service::workspace_api`] serves ([`workspace_id_at_endpoint_host`]).
 pub const WORKSPACE_ENDPOINT_LABEL: &str = "grafana-workspace";
 
 /// The DNS suffix an AWS endpoint host ends in, after the region label.
@@ -325,13 +329,6 @@ pub struct Workspace {
     pub status: String,
     /// The status change the clock owes this workspace, if any.
     pub pending: Option<PendingTransition>,
-    /// The host this workspace's Grafana console and HTTP API answer on, as
-    /// `WorkspaceDescription$endpoint` / `WorkspaceSummary$endpoint` report it:
-    /// the bare host [`workspace_endpoint`] composes from this workspace's id and
-    /// the region it was created in. It is stored because it is the address
-    /// announced for the workspace's whole life, so every later read reports the
-    /// one a client was first handed.
-    pub endpoint: String,
     pub grafana_version: String,
     pub data_sources: Vec<String>,
     pub notification_destinations: Vec<String>,
@@ -574,14 +571,18 @@ impl Workspace {
     }
 
     /// The `WorkspaceDescription` the create / describe / update / delete
-    /// operations return.
-    pub fn to_description(&self) -> WorkspaceDescription {
+    /// operations return, announced on an emulator reached at `authority`.
+    ///
+    /// The endpoint is composed per read rather than stored, because what it has to name is
+    /// an address the client READING it can dial ([`announced_endpoint`]); the workspace's
+    /// own identity in it is the stored part.
+    pub fn to_description(&self, authority: &str) -> WorkspaceDescription {
         WorkspaceDescription {
             account_access_type: Some(self.account_access_type.clone()),
             created: ::aws_smithy_types::DateTime::from(self.created),
             data_sources: self.data_sources.clone(),
             description: self.description.clone(),
-            endpoint: self.endpoint.clone(),
+            endpoint: workspace_endpoint(authority, &self.id),
             grafana_version: self.grafana_version.clone(),
             id: self.id.clone(),
             modified: ::aws_smithy_types::DateTime::from(self.modified),
@@ -614,12 +615,13 @@ impl Workspace {
         }
     }
 
-    /// The `WorkspaceSummary` projection `ListWorkspaces` returns.
-    pub fn to_summary(&self) -> WorkspaceSummary {
+    /// The `WorkspaceSummary` projection `ListWorkspaces` returns, announced on an emulator
+    /// reached at `authority` (see [`Workspace::to_description`]).
+    pub fn to_summary(&self, authority: &str) -> WorkspaceSummary {
         WorkspaceSummary {
             created: ::aws_smithy_types::DateTime::from(self.created),
             description: self.description.clone(),
-            endpoint: self.endpoint.clone(),
+            endpoint: workspace_endpoint(authority, &self.id),
             grafana_version: self.grafana_version.clone(),
             id: self.id.clone(),
             modified: ::aws_smithy_types::DateTime::from(self.modified),
@@ -832,32 +834,20 @@ impl ComAmazonawsGrafanaAwsgrafanacontrolplaneState {
     }
 }
 
-/// The endpoint a workspace announces: the bare host
-/// `<workspaceId>.grafana-workspace.<region>.amazonaws.com`.
-///
-/// It is a host name and nothing else — no scheme, no port, no path — because that
-/// is what `WorkspaceDescription$endpoint` carries: a client splices it into an
-/// address of its own (`https://<endpoint>/api/...`) or uses it where only a host
-/// name will do. Its variable parts are the workspace's own id, which is its first
-/// DNS label, and the region the workspace lives in; the rest is
-/// [`WORKSPACE_ENDPOINT_LABEL`] and [`AWS_ENDPOINT_SUFFIX`].
-///
-/// This emulator answers that host too: a request whose `Host` is a workspace
-/// endpoint is claimed by [`crate::service::workspace_api`], so a client that
-/// resolves the announced name to this emulator reaches the workspace's own
-/// Grafana HTTP API at the address the control plane gave it.
-pub fn workspace_endpoint(id: &str, region: &str) -> String {
-    format!("{id}.{WORKSPACE_ENDPOINT_LABEL}.{region}.{AWS_ENDPOINT_SUFFIX}")
-}
-
 /// The workspace id the endpoint host `host` names, or `None` when `host` is not a
-/// workspace endpoint of this service at all.
+/// workspace endpoint host of this service at all.
 ///
-/// The inverse of [`workspace_endpoint`]: the first label must be a `WorkspaceId`,
-/// the next must be [`WORKSPACE_ENDPOINT_LABEL`], and the host must end in
-/// [`AWS_ENDPOINT_SUFFIX`] with a region label between them. Any `:port` a client
+/// The host Amazon Managed Grafana itself publishes for a workspace,
+/// `<workspaceId>.grafana-workspace.<region>.amazonaws.com`, read back: the first label must
+/// be a `WorkspaceId`, the next must be [`WORKSPACE_ENDPOINT_LABEL`], and the host must end
+/// in [`AWS_ENDPOINT_SUFFIX`] with a region label between them. Any `:port` a client
 /// carried in its `Host` header is cut off first, and the comparison is
 /// case-insensitive because a DNS name is.
+///
+/// That host is NOT what this emulator ANNOUNCES ([`announced_endpoint`] is): nothing here
+/// answers for a name in a zone Amazon Web Services publishes its own endpoints in, so a
+/// client handed one would leave this emulator entirely. It is read because this emulator
+/// still ANSWERS it, for a client whose own resolver points the name at this process.
 pub fn workspace_id_at_endpoint_host(host: &str) -> Option<String> {
     let host = host.rsplit('@').next().unwrap_or(host);
     let host = host.split(':').next().unwrap_or(host);

@@ -1,20 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The address a workspace's Grafana console and HTTP API are announced at, across EVERY
-//! projection of the workspace that carries it.
+//! projection of the workspace that carries it — and that the announced address is one this
+//! emulator answers that workspace's Grafana HTTP API on.
 //!
-//! The rule under test: `WorkspaceDescription$endpoint` and `WorkspaceSummary$endpoint` are
-//! a BARE HOST — no scheme, no port, no path — whose first DNS label is the workspace's own
-//! id and whose remaining labels are `grafana-workspace.<region>.amazonaws.com` for the
-//! region the workspace lives in. Every operation that reports a workspace reports that one
-//! value for it, so a client that read the endpoint from any one of them holds the same host
-//! (`workspace_grafana_api` covers what answers there), and two workspaces never share one.
+//! The rule under test: `WorkspaceDescription$endpoint` and `WorkspaceSummary$endpoint`
+//! carry an ADDRESS this emulator is reached at — the `host[:port]` the request arrived on,
+//! port included — with the addressed workspace's own path beneath it, and never a host in
+//! a zone Amazon Web Services publishes its own endpoints in, which nothing here answers
+//! for. Every operation that reports a workspace reports that one value for it, two
+//! workspaces never share one, and a client that splices a Grafana route onto the value
+//! (`https://<endpoint>/api/org`, the splice the member's own documentation invites) reaches
+//! that workspace's Grafana HTTP API rather than leaving this emulator.
 //!
-//! The rows differ along the projection the endpoint was read from: `CreateWorkspace`,
-//! `DescribeWorkspace`, `UpdateWorkspace`, the `ListWorkspaces` summary and
-//! `DeleteWorkspace`; along the workspace, of which there are two, so a projection that
-//! reported a constant or another record's address fails here; and along the region the
-//! create was signed for, which is the one part of the host beside the id that varies.
+//! The rows differ along the address the control-plane call reached this emulator at
+//! (loopback by address on two ports, loopback by name, an IPv6 literal, a routable private
+//! address, a host naming the real service's own endpoint, and no `Host` at all), along the
+//! projection the endpoint was read from (`CreateWorkspace`, `DescribeWorkspace`,
+//! `UpdateWorkspace`, the `ListWorkspaces` summary and `DeleteWorkspace`), along the
+//! workspace, of which there are two per row, and along the region the create was signed
+//! for — which the announced address does not depend on.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,10 +30,11 @@ use service_com_amazonaws_grafana_awsgrafanacontrolplane::state::LIFECYCLE_TRANS
 use service_com_amazonaws_grafana_awsgrafanacontrolplane::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The endpoint every request below reaches this emulator on. It is deliberately NOT the
-/// host a workspace announces: the announced endpoint is composed from the workspace and
-/// its region, not from the address the asking client happened to use.
-const EMULATOR_HOST: &str = "127.0.0.1:9297";
+/// The base URL an emulator that is served on no port at all reports for itself
+/// ([`smithy_server_runtime::UNSERVED_URL_BASE`] without its scheme): the address announced
+/// to a client that reached this process without naming an address of it, which is the truth
+/// about a router no port is bound for rather than a name of the real service's.
+const UNSERVED_AUTHORITY: &str = "emulator.invalid";
 
 /// How long a case waits for a status the clock owes a workspace before giving up. Far
 /// above the transition span, so a loaded host still reaches it; nothing asserts on how
@@ -53,7 +59,7 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// A SigV4 credential scope naming this service in `region`: it is what routes a
-/// control-plane request here, and it is where the region a workspace lives in comes from.
+/// control-plane request here, and the region the workspace's ARNs belong to.
 fn signed_for(region: &str) -> String {
     format!(
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/grafana/aws4_request, \
@@ -61,26 +67,42 @@ fn signed_for(region: &str) -> String {
     )
 }
 
-/// The endpoint host a workspace `id` in `region` announces, spelled out here independently
-/// of the crate's own constants.
-fn expected_endpoint(id: &str, region: &str) -> String {
-    format!("{id}.grafana-workspace.{region}.amazonaws.com")
+/// The endpoint a workspace `id` is announced at by an emulator reached at `authority`,
+/// spelled out here independently of the crate's own constants: the authority the request
+/// arrived on, and the workspace's own path beneath the reserved namespace segment.
+fn expected_endpoint(authority: &str, id: &str) -> String {
+    format!("{authority}/_aws/grafana/{id}")
 }
 
-/// One control-plane call in `region`, reaching the emulator at [`EMULATOR_HOST`].
-async fn call(
+/// The `Host` header and the request path a client builds to reach `route` under the
+/// announced `endpoint` — the splice `https://<endpoint><route>` performed on the parts an
+/// HTTP request carries them in.
+fn addressed(endpoint: &str, route: &str) -> (String, String) {
+    match endpoint.split_once('/') {
+        Some((host, path)) => (host.to_string(), format!("/{path}{route}")),
+        None if route.is_empty() => (endpoint.to_string(), "/".to_string()),
+        None => (endpoint.to_string(), route.to_string()),
+    }
+}
+
+/// One request through the router, with an explicit `Host` (omitted when empty) and an
+/// optional `Authorization` header.
+async fn send(
     router: &MultiServiceRouter,
-    region: &str,
     method: &str,
     uri: &str,
+    host: &str,
+    authorization: Option<&str>,
     body: Option<Value>,
 ) -> Answer {
     let payload = body.map(|value| value.to_string()).unwrap_or_default();
-    let mut builder = ::http::Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("host", EMULATOR_HOST)
-        .header("authorization", signed_for(region));
+    let mut builder = ::http::Request::builder().method(method).uri(uri);
+    if !host.is_empty() {
+        builder = builder.header("host", host);
+    }
+    if let Some(authorization) = authorization {
+        builder = builder.header("authorization", authorization);
+    }
     if !payload.is_empty() {
         builder = builder.header("content-type", "application/json");
     }
@@ -98,16 +120,43 @@ async fn call(
     Answer { status, body }
 }
 
+/// One control-plane call in `region`, reaching the emulator at `host`.
+async fn call(
+    router: &MultiServiceRouter,
+    region: &str,
+    host: &str,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> Answer {
+    send(router, method, uri, host, Some(&signed_for(region)), body).await
+}
+
+/// A call to the workspace's own Grafana HTTP API at the address the control plane announced
+/// for it: the `route` spliced onto `endpoint`, with no SigV4 credential — a Grafana client
+/// has none — and only the bearer `authorization` given.
+async fn native(
+    router: &MultiServiceRouter,
+    endpoint: &str,
+    route: &str,
+    authorization: Option<&str>,
+) -> Answer {
+    let (host, path) = addressed(endpoint, route);
+    send(router, "GET", &path, &host, authorization, None).await
+}
+
 /// Create one workspace named `name` in `region`: its id, and the endpoint the create
 /// announced.
 async fn create_workspace(
     router: &MultiServiceRouter,
     region: &str,
+    host: &str,
     name: &str,
 ) -> (String, String) {
     let created = call(
         router,
         region,
+        host,
         "POST",
         "/workspaces",
         Some(json!({
@@ -138,10 +187,23 @@ async fn create_workspace(
 /// Look again until the workspace `id` is ACTIVE — the status the clock owes a new
 /// workspace — or the deadline passes. Nothing waits for a fixed time and nothing asserts
 /// on elapsed time.
-async fn await_active(router: &MultiServiceRouter, region: &str, id: &str) -> Answer {
+async fn await_active(
+    router: &MultiServiceRouter,
+    region: &str,
+    host: &str,
+    id: &str,
+) -> Answer {
     let deadline = Instant::now() + STATUS_DEADLINE;
     loop {
-        let described = call(router, region, "GET", &format!("/workspaces/{id}"), None).await;
+        let described = call(
+            router,
+            region,
+            host,
+            "GET",
+            &format!("/workspaces/{id}"),
+            None,
+        )
+        .await;
         if described.body["workspace"]["status"] == json!("ACTIVE") {
             return described;
         }
@@ -155,79 +217,129 @@ async fn await_active(router: &MultiServiceRouter, region: &str, id: &str) -> An
     }
 }
 
+/// The addresses a client reaches this emulator at, and the authority each one is announced
+/// as: the address itself, except where the request named no address of this emulator — no
+/// `Host` at all, or the real service's own endpoint host, which names a service and not
+/// this process — where the base of an emulator served on no port is announced.
+fn client_addresses() -> [(&'static str, &'static str, &'static str); 7] {
+    [
+        (
+            "loopback by address, the default port",
+            "127.0.0.1:9297",
+            "127.0.0.1:9297",
+        ),
+        (
+            "loopback by address, another port",
+            "127.0.0.1:34567",
+            "127.0.0.1:34567",
+        ),
+        ("loopback by name", "localhost:9297", "localhost:9297"),
+        ("an IPv6 loopback literal", "[::1]:9297", "[::1]:9297"),
+        (
+            "a routable private address",
+            "10.1.2.3:8443",
+            "10.1.2.3:8443",
+        ),
+        (
+            "the real service's own endpoint host",
+            "grafana.us-west-2.amazonaws.com",
+            UNSERVED_AUTHORITY,
+        ),
+        ("no Host header at all", "", UNSERVED_AUTHORITY),
+    ]
+}
+
 #[tokio::test]
-async fn every_projection_reports_the_one_endpoint_host_the_workspace_is_announced_at() {
-    // The regions the creates are signed for: the region label is the one part of the
-    // endpoint host beside the workspace id that varies.
-    for region in ["eu-west-1", "us-west-2", "ap-southeast-3"] {
+async fn every_projection_reports_the_one_endpoint_the_workspace_is_announced_at() {
+    // The regions the creates are signed for: the announced address must not depend on the
+    // region, so consecutive rows are read in different ones.
+    let regions = ["eu-west-1", "us-west-2", "ap-southeast-3"];
+    for (index, (case, host, authority)) in client_addresses().into_iter().enumerate() {
+        let region = regions[index % regions.len()];
         let router = emulator();
 
         // Two workspaces, so a projection reporting a constant or the other record's
         // address cannot pass.
         let (first_id, first_created_endpoint) =
-            create_workspace(&router, region, "monitoring").await;
+            create_workspace(&router, region, host, "monitoring").await;
         let (second_id, second_created_endpoint) =
-            create_workspace(&router, region, "reporting").await;
+            create_workspace(&router, region, host, "reporting").await;
         assert_ne!(
             first_created_endpoint, second_created_endpoint,
-            "region {region:?}: each workspace must announce its own endpoint, both got \
-             {first_created_endpoint:?}"
+            "case {case:?} in {region:?}: each workspace must announce its own endpoint, \
+             both got {first_created_endpoint:?}"
         );
 
-        for (case, id, created_endpoint) in [
+        for (which, id, created_endpoint) in [
             ("the first workspace", &first_id, &first_created_endpoint),
             ("the second workspace", &second_id, &second_created_endpoint),
         ] {
-            let want = expected_endpoint(id, region);
+            let want = expected_endpoint(authority, id);
             assert_eq!(
                 created_endpoint, &want,
-                "case {case:?} in {region:?}: CreateWorkspace must announce the workspace's \
-                 own endpoint host, expected {want:?}, got {created_endpoint:?}"
+                "case {case:?}/{which:?} in {region:?}: CreateWorkspace must announce an \
+                 address this emulator is reached at, expected {want:?}, got \
+                 {created_endpoint:?}"
             );
-            // A host and nothing else: a client that splices it into an address of its own
-            // would otherwise build a double-scheme, double-path URL.
-            for forbidden in ["://", ":", "/", "?"] {
+            // No name in a zone Amazon Web Services publishes its own endpoints in: a
+            // client handed one leaves this emulator entirely.
+            for forbidden in [".amazonaws.com", ".api.aws", ".on.aws"] {
                 assert!(
                     !created_endpoint.contains(forbidden),
-                    "case {case:?} in {region:?}: an endpoint is a bare host, so it carries \
-                     no {forbidden:?}, got {created_endpoint:?}"
+                    "case {case:?}/{which:?} in {region:?}: an announced endpoint carries no \
+                     {forbidden:?}, got {created_endpoint:?}"
                 );
             }
-            assert_eq!(
-                created_endpoint.split('.').next().unwrap_or_default(),
-                id.as_str(),
-                "case {case:?} in {region:?}: the first DNS label of the endpoint is the \
-                 workspace id, got {created_endpoint:?}"
+            // No scheme, exactly as the value the real service announces carries none, so
+            // the splice a client performs on it stays a well-formed URL.
+            assert!(
+                !created_endpoint.contains("://"),
+                "case {case:?}/{which:?} in {region:?}: an announced endpoint carries no \
+                 scheme, got {created_endpoint:?}"
             );
 
             // An update is accepted only once the workspace is up, so wait for the status
             // the clock owes it rather than for a span of time.
-            let described = await_active(&router, region, id).await;
+            let described = await_active(&router, region, host, id).await;
             assert_eq!(
                 described.status, 200,
-                "case {case:?} in {region:?}: DescribeWorkspace must answer 200, got {} with \
-                 {:?}",
+                "case {case:?}/{which:?} in {region:?}: DescribeWorkspace must answer 200, \
+                 got {} with {:?}",
                 described.status, described.body
+            );
+
+            // And the announced address is one this emulator answers that workspace's
+            // Grafana HTTP API on: the request is refused by the Grafana API for want of a
+            // credential, not by the router for naming nothing it serves.
+            let unauthenticated = native(&router, created_endpoint, "/api/org", None).await;
+            assert_eq!(
+                unauthenticated.status, 401,
+                "case {case:?}/{which:?} in {region:?}: the announced endpoint must serve the \
+                 workspace's Grafana API, got {} with {:?}",
+                unauthenticated.status, unauthenticated.body
             );
 
             let updated = call(
                 &router,
                 region,
+                host,
                 "PUT",
                 &format!("/workspaces/{id}"),
-                Some(json!({"workspaceDescription": format!("{case} updated")})),
+                Some(json!({"workspaceDescription": format!("{which} updated")})),
             )
             .await;
             assert_eq!(
                 updated.status, 202,
-                "case {case:?} in {region:?}: UpdateWorkspace must answer 202, got {} with {:?}",
+                "case {case:?}/{which:?} in {region:?}: UpdateWorkspace must answer 202, got \
+                 {} with {:?}",
                 updated.status, updated.body
             );
 
-            let listed = call(&router, region, "GET", "/workspaces", None).await;
+            let listed = call(&router, region, host, "GET", "/workspaces", None).await;
             assert_eq!(
                 listed.status, 200,
-                "case {case:?} in {region:?}: ListWorkspaces must answer 200, got {} with {:?}",
+                "case {case:?}/{which:?} in {region:?}: ListWorkspaces must answer 200, got \
+                 {} with {:?}",
                 listed.status, listed.body
             );
             let summary = listed.body["workspaces"]
@@ -240,10 +352,19 @@ async fn every_projection_reports_the_one_endpoint_host_the_workspace_is_announc
                 })
                 .unwrap_or(Value::Null);
 
-            let deleted = call(&router, region, "DELETE", &format!("/workspaces/{id}"), None).await;
+            let deleted = call(
+                &router,
+                region,
+                host,
+                "DELETE",
+                &format!("/workspaces/{id}"),
+                None,
+            )
+            .await;
             assert_eq!(
                 deleted.status, 202,
-                "case {case:?} in {region:?}: DeleteWorkspace must answer 202, got {} with {:?}",
+                "case {case:?}/{which:?} in {region:?}: DeleteWorkspace must answer 202, got \
+                 {} with {:?}",
                 deleted.status, deleted.body
             );
 
@@ -257,10 +378,75 @@ async fn every_projection_reports_the_one_endpoint_host_the_workspace_is_announc
                 assert_eq!(
                     *reported,
                     json!(want),
-                    "case {case:?} in {region:?} read from {projection}: expected the endpoint \
-                     {want:?}, got {reported:?}"
+                    "case {case:?}/{which:?} in {region:?} read from {projection}: expected \
+                     the endpoint {want:?}, got {reported:?}"
                 );
             }
         }
+    }
+}
+
+/// The announced endpoint serves the workspace's Grafana HTTP API end to end: a credential
+/// the control plane minted for that workspace, presented at the announced address, is
+/// answered from the workspace record.
+///
+/// This is the flow a client that reads `endpoint` performs, and the rows differ along the
+/// address the client reached this emulator at — every one of which must lead back here.
+#[tokio::test]
+async fn a_client_following_the_announced_endpoint_reaches_the_workspaces_grafana_api() {
+    for (case, host, authority) in client_addresses() {
+        let router = emulator();
+        let region = "us-west-2";
+        let (id, endpoint) = create_workspace(&router, region, host, "observability").await;
+        assert_eq!(
+            endpoint,
+            expected_endpoint(authority, &id),
+            "case {case:?}: the create must announce an address of this emulator, got \
+             {endpoint:?}"
+        );
+        await_active(&router, region, host, &id).await;
+
+        let key = call(
+            &router,
+            region,
+            host,
+            "POST",
+            &format!("/workspaces/{id}/apikeys"),
+            Some(json!({"keyName": "dashboards", "keyRole": "ADMIN", "secondsToLive": 3_600})),
+        )
+        .await;
+        assert_eq!(
+            key.status, 200,
+            "case {case:?}: CreateWorkspaceApiKey must mint the key, got {} with {:?}",
+            key.status, key.body
+        );
+        let secret = key.body["key"].as_str().unwrap_or_default().to_string();
+
+        let org = native(
+            &router,
+            &endpoint,
+            "/api/org",
+            Some(&format!("Bearer {secret}")),
+        )
+        .await;
+        assert_eq!(
+            org.status, 200,
+            "case {case:?}: the minted key must authenticate at the announced endpoint \
+             {endpoint:?}, got {} with {:?}",
+            org.status, org.body
+        );
+        assert_eq!(
+            org.body["id"],
+            json!(1),
+            "case {case:?}: the organization must report its id, got {:?}",
+            org.body
+        );
+        assert_eq!(
+            org.body["name"],
+            json!("observability"),
+            "case {case:?}: the organization name must be read off the workspace record, got \
+             {:?}",
+            org.body
+        );
     }
 }
