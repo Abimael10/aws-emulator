@@ -626,9 +626,32 @@ pub struct OpenedSqlPlane {
     database: Arc<DatabaseEngine>,
     /// The listener the core opened. Held, because dropping it closes the port.
     _listener: ResourceListener,
-    /// The record that makes the published address dialable by an IN-PROCESS
-    /// client of this emulator, withdrawn with this plane.
-    _dialable: Option<OpenedPlanes>,
+    /// The addresses an IN-PROCESS client of this emulator reaches this plane at,
+    /// and the records that hold them open. Withdrawn with this plane.
+    published: Published,
+}
+
+/// What makes the addresses this plane answers at reachable by an in-process client
+/// of this emulator, and what it takes to record them again when the resource
+/// publishes another port ([`OpenedSqlPlane::publish_on`]).
+struct Published {
+    /// The register of the shared engine, or `None` for an engine that vends none.
+    planes: Option<dialable_data_planes::DialablePlanes>,
+    /// What a connection to any of those addresses is served by: the listener's own
+    /// protocol handler.
+    plane: Arc<dyn dialable_data_planes::DialablePlane>,
+    /// The signing name of the service that opened the listener.
+    signing_name: String,
+    /// The `host:port` the core bound the listener on, which answers whatever the
+    /// resource publishes.
+    listener_authority: String,
+    /// The host that listener is bound on, which a published port completes.
+    listener_host: String,
+    /// The port the core assigned, which needs no second record of its own.
+    listener_port: u16,
+    /// The records held NOW. Dropping them withdraws their addresses, exactly as
+    /// dropping the listener closes the port.
+    held: std::sync::Mutex<Option<OpenedPlanes>>,
 }
 
 /// Written by hand rather than derived: a listener and a live engine carry no
@@ -644,7 +667,10 @@ impl std::fmt::Debug for OpenedSqlPlane {
 }
 
 impl OpenedSqlPlane {
-    /// Where this plane answers, which is what the control plane publishes.
+    /// Where the core bound this plane's listener: the host a client reaches it at,
+    /// and the port the core assigned. What a control plane publishes as the
+    /// resource's endpoint, unless its resource publishes a port of its OWN
+    /// ([`Self::publish_on`]), in which case the host here is the address half of it.
     #[must_use]
     pub fn endpoint(&self) -> &ServedEndpoint {
         &self.endpoint
@@ -660,6 +686,40 @@ impl OpenedSqlPlane {
     #[must_use]
     pub fn database(&self) -> &Arc<DatabaseEngine> {
         &self.database
+    }
+
+    /// Record the address the resource PUBLISHES now as one this plane answers at:
+    /// the host the core bound its listener on, completed with `published_port`.
+    ///
+    /// Called again by a control plane that CHANGES the port its resource reports
+    /// (a modify that moves the engine's port), so what a client dials is what
+    /// answers: the addresses recorded before are withdrawn, and the one the core
+    /// assigned keeps answering either way. `None` records that address alone, which
+    /// is a resource that publishes the core's own port.
+    pub fn publish_on(&self, published_port: Option<u16>) {
+        let Some(planes) = self.published.planes.as_ref() else {
+            return;
+        };
+        let mut authorities = vec![self.published.listener_authority.clone()];
+        if let Some(port) = published_port.filter(|port| *port != self.published.listener_port) {
+            authorities.push(crate::data_plane_addressing::host_port_authority(
+                &self.published.listener_host,
+                port,
+            ));
+        }
+        // The records this plane holds are swapped under this guard, so recording the new
+        // addresses and withdrawing the ones they replace is ONE step however many callers
+        // publish at once: the newer recording owns an address both name, which is the
+        // register's own withdrawal rule, and the older record is dropped after it.
+        let mut held = match self.published.held.lock() {
+            Ok(held) => held,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *held = Some(planes.opening(
+            authorities,
+            &self.published.signing_name,
+            &self.published.plane,
+        ));
     }
 }
 
@@ -682,6 +742,28 @@ pub async fn open_sql_wire_plane<Eng: Send + Sync + 'static>(
     wire: EngineWire,
     served: Arc<dyn ServedDatabase>,
     signing_name: &str,
+) -> Result<OpenedSqlPlane, String> {
+    open_sql_wire_plane_published_on(engine, wire, served, signing_name, None).await
+}
+
+/// [`open_sql_wire_plane`] for a resource that PUBLISHES a port of its own rather
+/// than the one the core assigned: `published_port` is that port, and the address
+/// made of the listener's host and it is recorded as a second address this plane
+/// answers at ([`crate::dialable_data_planes`]).
+///
+/// What needs it is a resource whose endpoint reports the port its engine is
+/// CONFIGURED to listen on — a value its own control plane owns and a client
+/// completes the published host with — while the core owns the port range its
+/// listeners are bound in and assigns one per listener. Both addresses are served
+/// by the SAME handler over the same resource state, and the whole set is withdrawn
+/// together when the plane is dropped. Recording an address another resource has
+/// published there replaces it, which is what one host and one port can hold.
+pub async fn open_sql_wire_plane_published_on<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    wire: EngineWire,
+    served: Arc<dyn ServedDatabase>,
+    signing_name: &str,
+    published_port: Option<u16>,
 ) -> Result<OpenedSqlPlane, String> {
     let listeners = shared_engine(engine)
         .ok_or_else(|| "this emulator's engine has no listener surface".to_string())?
@@ -725,20 +807,28 @@ pub async fn open_sql_wire_plane<Eng: Send + Sync + 'static>(
             )
         }
     };
-    let dialable = dialable_data_planes::DialablePlanes::of(engine).map(|planes| {
-        let authority = crate::data_plane_addressing::listener_authority(&listener);
-        planes.opening([authority], signing_name, &plane)
-    });
-    Ok(OpenedSqlPlane {
+    let opened = OpenedSqlPlane {
         endpoint: ServedEndpoint {
             address: listener.host(),
             port: i32::from(listener.port()),
         },
         wire,
         database,
+        published: Published {
+            planes: dialable_data_planes::DialablePlanes::of(engine),
+            plane,
+            signing_name: signing_name.to_string(),
+            listener_authority: crate::data_plane_addressing::listener_authority(&listener),
+            listener_host: listener.host(),
+            listener_port: listener.port(),
+            held: std::sync::Mutex::new(None),
+        },
         _listener: listener,
-        _dialable: dialable,
-    })
+    };
+    // The addresses this plane answers at for an in-process client: the one the core
+    // assigned, and the one the resource's control plane publishes.
+    opened.publish_on(published_port);
+    Ok(opened)
 }
 
 /// The SHARED engine the service is mounted on, which owns the listener

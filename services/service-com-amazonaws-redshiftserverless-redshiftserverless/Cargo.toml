@@ -58,6 +58,18 @@ emulator-core-build-support = { workspace = true }
 # new file and nothing lists it.
 automod = { workspace = true }
 sha2 = { workspace = true }
+# The socket and byte-stream helpers the workgroup-endpoint suite drives the PostgreSQL wire a
+# workgroup publishes with, from a client of its own in this same process, and the timer the
+# suites that poll for a clock-owed status use. The crate's regular dependency on tokio keeps
+# the workspace feature set; features are additive and are not recorded in Cargo.lock, so this
+# adds no locked package.
+tokio = { workspace = true, features = ["io-util", "net", "time"] }
+# The client side of the in-band TLS upgrade a `sslmode=require` session negotiates on a
+# workgroup's endpoint, which `tests/all/workgroup_sql_endpoint.rs` runs against the core's own
+# listener. Both are already in this repository's Cargo.lock (the same pair the provisioned
+# Amazon Redshift engine-endpoint suite uses), so naming them here adds no locked package.
+tokio-rustls = "0.26"
+rustls = { workspace = true }
 # The workgroup-endpoint suite mounts Amazon EC2 beside Redshift Serverless on one engine,
 # because the VPC, the subnets and the endpoint network interfaces a workgroup's managed VPC
 # endpoint is made of are ITS resources: the suite builds the network through that service's

@@ -118,6 +118,25 @@ pub(crate) fn at<'a>(value: &'a Value, path: &str) -> &'a Value {
     current
 }
 
+/// The address a workgroup publishes in its endpoint, asserted to be one this emulator
+/// SERVES that workgroup on rather than a public AWS DNS name it does not answer at.
+///
+/// Which host that is belongs to the core (it owns the bind interface), so no case names
+/// it; `tests/all/workgroup_sql_endpoint.rs` is where the published pair is dialled and the
+/// session on it driven.
+pub(crate) fn endpoint_address_served_here(case: &str, workgroup: &Value) -> String {
+    let address = at(workgroup, "endpoint.address")
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !address.is_empty() && !address.ends_with(".amazonaws.com"),
+        "case {case}: the endpoint must name a host this emulator serves the workgroup on, got \
+         {address:?}"
+    );
+    address
+}
+
 /// Create a namespace with `name`, asserting it succeeded.
 pub(crate) async fn create_namespace(router: &MultiServiceRouter, name: &str) -> Value {
     let (status, body) = call(router, "CreateNamespace", json!({ "namespaceName": name })).await;
@@ -294,13 +313,15 @@ async fn the_namespace_and_workgroup_lifecycle_is_served_from_state() {
         "CreateWorkgroup: port defaults to 5439, got {:?}",
         created_workgroup["port"]
     );
+    // The endpoint names the host this emulator SERVES the workgroup on, and the port the
+    // workgroup listens on.
+    let created_address = endpoint_address_served_here("CreateWorkgroup", &created_workgroup);
     assert_eq!(
-        at(&created_workgroup, "endpoint.address"),
-        &json!(format!(
-            "bootstrap-wg.{ACCOUNT}.us-east-1.redshift-serverless.amazonaws.com"
-        )),
-        "CreateWorkgroup: endpoint.address is derived, got {:?}",
-        at(&created_workgroup, "endpoint.address")
+        at(&created_workgroup, "endpoint.port"),
+        &created_workgroup["port"],
+        "CreateWorkgroup: endpoint.port is the port the workgroup listens on {:?}, got {:?}",
+        created_workgroup["port"],
+        at(&created_workgroup, "endpoint.port")
     );
 
     // GetWorkgroup reports the stored record. `status` is excluded only because the
@@ -365,10 +386,24 @@ async fn the_namespace_and_workgroup_lifecycle_is_served_from_state() {
         body["workgroup"]["baseCapacity"]
     );
     assert_eq!(
+        body["workgroup"]["port"],
+        json!(8191),
+        "GetWorkgroup after update: port is the request's, got {:?}",
+        body["workgroup"]["port"]
+    );
+    assert_eq!(
         at(&body["workgroup"], "endpoint.port"),
         &json!(8191),
         "GetWorkgroup after update: the endpoint follows the port, got {:?}",
         at(&body["workgroup"], "endpoint.port")
+    );
+    // The address is unchanged: this emulator serves the workgroup where it did.
+    assert_eq!(
+        at(&body["workgroup"], "endpoint.address"),
+        &json!(created_address),
+        "GetWorkgroup after update: the endpoint stays on the host serving the workgroup, got \
+         {:?}",
+        at(&body["workgroup"], "endpoint.address")
     );
     assert_eq!(
         body["workgroup"]["workgroupId"], created_workgroup["workgroupId"],
@@ -683,7 +718,8 @@ async fn a_created_workgroup_stores_each_members_value_and_the_documented_defaul
                 "case {case:?}: {member} expected {want:?}, got {:?}", created[*member]
             );
         }
-        // The endpoint is derived from the name and the effective port, never supplied.
+        // The endpoint is derived, never supplied: the host this emulator serves the
+        // workgroup on, and the effective port.
         assert_eq!(
             at(&created, "endpoint.port"),
             &created["port"],
@@ -691,14 +727,7 @@ async fn a_created_workgroup_stores_each_members_value_and_the_documented_defaul
             created["port"],
             at(&created, "endpoint.port")
         );
-        assert_eq!(
-            at(&created, "endpoint.address"),
-            &json!(format!(
-                "{name}.{ACCOUNT}.us-east-1.redshift-serverless.amazonaws.com"
-            )),
-            "case {case:?}: got {:?}",
-            at(&created, "endpoint.address")
-        );
+        let _ = endpoint_address_served_here(case, &created);
 
         let (status, body) = call(&router, "GetWorkgroup", json!({ "workgroupName": name })).await;
         assert_eq!(
@@ -716,7 +745,7 @@ async fn a_created_workgroup_stores_each_members_value_and_the_documented_defaul
 }
 
 #[tokio::test]
-async fn an_arn_and_an_endpoint_carry_the_region_the_request_is_signed_for() {
+async fn an_arn_carries_the_region_the_request_is_signed_for_and_the_endpoint_is_served_here() {
     // The rule generalises over region: nothing about it is specific to us-east-1.
     for region in ["us-east-1", "eu-west-1", "ap-southeast-2"] {
         let router = emulator();
@@ -753,13 +782,14 @@ async fn an_arn_and_an_endpoint_carry_the_region_the_request_is_signed_for() {
             status, 200,
             "region {region}: CreateWorkgroup expected 200, got {status} with {body}"
         );
-        assert_eq!(
-            at(&body["workgroup"], "endpoint.address"),
-            &json!(format!(
-                "region-wg.{ACCOUNT}.{region}.redshift-serverless.amazonaws.com"
-            )),
-            "region {region}: got {:?}",
-            at(&body["workgroup"], "endpoint.address")
+        // The ARN carries the Region the request was signed for; the ENDPOINT carries the
+        // host this emulator serves the workgroup on, which names no Region — the core owns
+        // the bind interface.
+        let address = endpoint_address_served_here(region, &body["workgroup"]);
+        assert!(
+            !address.contains(region),
+            "region {region}: the endpoint names the host serving the workgroup, not the \
+             Region, got {address:?}"
         );
     }
 }

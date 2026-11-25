@@ -330,9 +330,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                     if let Some(port) = input.port {
                         record.workgroup.port = Some(port);
-                        // The endpoint listens on the workgroup's port, so it moves with it.
+                        // The endpoint reports the port the workgroup listens on, so it
+                        // moves with it — and the plane serving that workgroup's wire
+                        // records the published address again, so what a client dials after
+                        // the change is what answers.
                         if let Some(endpoint) = record.workgroup.endpoint.as_mut() {
                             endpoint.port = Some(port);
+                        }
+                        if let Some(plane) = record.endpoint_plane.as_ref() {
+                            plane.publish_on(u16::try_from(port).ok());
                         }
                     }
                     // The endpoint the subnets named now stand behind, when they moved: the

@@ -34,6 +34,12 @@ pub mod managed_vpc_endpoint;
 /// it, live in their own module beside this one.
 pub mod managed_admin_secret;
 
+/// The DATA plane one workgroup publishes — the endpoint a client of the workgroup dials
+/// and the SQL engine that answers there — which is a listener the CORE owns rather than
+/// anything this store mints, so the deriving and the serving of it live in their own
+/// module beside this one.
+pub mod workgroup_data_plane;
+
 /// The identity the calls above are made as: a secret this service manages is created and
 /// deleted as this service's OWN principal, never as the caller.
 mod service_principal_call;
@@ -594,32 +600,31 @@ pub fn usage_limit_amount_not_positive(amount: i64) -> String {
     format!("amount {amount} must be a positive number")
 }
 
-/// The DNS address of the endpoint a workgroup serves:
-/// `<workgroupName>.<account>.<region>.redshift-serverless.amazonaws.com`.
-pub fn endpoint_address(workgroup_name: &str, region: &str) -> String {
-    format!(
-        "{workgroup_name}.{}.{region}.{ARN_NAMESPACE}.amazonaws.com",
-        ::engine::emulator_account_id()
-    )
-}
-
 /// The whole endpoint a workgroup reports — `Workgroup$endpoint`, "the endpoint that is
 /// created from the workgroup" — which is DERIVED rather than supplied.
 ///
-/// Three parts: the DNS address of the workgroup's own name ([`endpoint_address`]), the port
-/// the workgroup listens on, and "an array of `VpcEndpoint` objects" (`Endpoint$vpcEndpoints`)
-/// — the managed VPC endpoint the service created for the workgroup in the VPC its subnets
-/// belong to, which is asked for through [`managed_vpc_endpoint`]. The list is EMPTY for a
-/// workgroup no such endpoint stands behind, which is what a workgroup created with no subnet
-/// has.
+/// Three parts: the address the workgroup is SERVED at, the port it reports it listens on,
+/// and "an array of
+/// `VpcEndpoint` objects" (`Endpoint$vpcEndpoints`) — the managed VPC endpoint the service
+/// created for the workgroup in the VPC its subnets belong to, which is asked for through
+/// [`managed_vpc_endpoint`]. The list is EMPTY for a workgroup no such endpoint stands
+/// behind, which is what a workgroup created with no subnet has.
+///
+/// `Endpoint$address` is "the DNS address of the VPC endpoint" and `Endpoint$port` "the port
+/// that Amazon Redshift Serverless listens on". The ADDRESS is therefore the host this
+/// emulator serves that workgroup's SQL wire on ([`workgroup_data_plane`]) — the one address a
+/// client reaching this machine can use — and never a host name derived from the workgroup's
+/// own name, which this emulator does not answer at. The PORT is the port the workgroup
+/// listens on, which is the workgroup's own `port` ("the custom port to use when connecting to
+/// a workgroup", default 5439): the port a client completes the published host with, and the
+/// address the plane records as a second one it answers at.
 pub fn workgroup_endpoint(
-    workgroup_name: &str,
-    region: &str,
+    served: &workgroup_data_plane::ServedEndpoint,
     port: i32,
     managed: Option<VpcEndpoint>,
 ) -> Endpoint {
     Endpoint {
-        address: Some(endpoint_address(workgroup_name, region)),
+        address: Some(served.address.clone()),
         port: Some(port),
         vpc_endpoints: Some(reported_vpc_endpoints(managed)),
     }
@@ -746,6 +751,11 @@ pub struct WorkgroupRecord {
     pub tags: Vec<Tag>,
     /// The transition the clock owes this workgroup, while one is outstanding.
     pub pending_status: Option<PendingStatus>,
+    /// The listener the workgroup's `endpoint` is SERVED on, and the SQL engine behind
+    /// it ([`workgroup_data_plane`]). Held here because holding it is what keeps the port
+    /// open: dropping this record — which is what `DeleteWorkgroup` does — closes the
+    /// port and severs every session on it.
+    pub endpoint_plane: Option<::std::sync::Arc<workgroup_data_plane::WorkgroupDataPlane>>,
 }
 
 impl WorkgroupRecord {

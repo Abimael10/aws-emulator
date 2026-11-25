@@ -28,7 +28,8 @@
 //! the store without limit.
 //!
 //! What the record carries beyond the request is DERIVED here, because the service owns those
-//! facts rather than the caller: the id and the ARN, the endpoint address and port, the
+//! facts rather than the caller: the id and the ARN, the endpoint this emulator serves the
+//! workgroup's SQL wire on ([`crate::state::workgroup_data_plane`]), the
 //! release the workgroup runs and its patch level ([`crate::state::WORKGROUP_VERSION`],
 //! [`crate::state::WORKGROUP_PATCH_VERSION`]), the track it is assigned to when the request
 //! names none ([`crate::state::CURRENT_TRACK`]), the price-performance target's explicit
@@ -280,6 +281,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let workgroup_id = crate::state::new_resource_id();
         let port = input.port.unwrap_or(crate::state::DEFAULT_PORT);
         let subnet_ids = input.subnet_ids.unwrap_or_default();
+        // The endpoint the workgroup publishes is one this emulator SERVES: the core opens a
+        // listener for the workgroup's SQL wire on this emulator's own interface, and the
+        // address reported below is that listener's host — with the port the workgroup itself
+        // listens on, which the plane records as a second address it answers at. Opened with
+        // NO store guard held, because binding is asynchronous, and before the insert, so what
+        // the create stores is where the workgroup actually answers. A workgroup whose endpoint
+        // could not be opened is not created at all: an announced address nothing answers at is
+        // worse than a refusal.
+        let endpoint_plane = match crate::state::workgroup_data_plane::open_workgroup_data_plane(
+            &*self.engine,
+            &input.workgroup_name,
+            port,
+        )
+        .await
+        {
+            Ok(plane) => ::std::sync::Arc::new(plane),
+            Err(message) => {
+                return Err(CreateWorkgroupErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: format!(
+                            "the endpoint of the workgroup {} could not be opened: {message}",
+                            input.workgroup_name
+                        ),
+                    },
+                )
+                .into());
+            }
+        };
         // The managed VPC endpoint the workgroup is reached through is a resource of the
         // service that owns VPC endpoints and network interfaces, so it is created THERE and
         // reported from what that service answered; see
@@ -305,11 +334,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             config_parameters: Some(input.config_parameters.unwrap_or_default()),
             security_group_ids: Some(input.security_group_ids.unwrap_or_default()),
             subnet_ids: Some(subnet_ids),
-            // The endpoint is DERIVED from the workgroup's name and port and from the managed
-            // VPC endpoint above, not supplied.
+            // The endpoint is DERIVED from where this emulator serves the workgroup and from
+            // the managed VPC endpoint above, not supplied.
             endpoint: Some(crate::state::workgroup_endpoint(
-                &input.workgroup_name,
-                &region,
+                endpoint_plane.endpoint(),
                 port,
                 managed_endpoint,
             )),
@@ -345,6 +373,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             workgroup,
             tags: input.tags.unwrap_or_default(),
             pending_status: None,
+            // Held on the record, so the port stays open for exactly as long as the
+            // workgroup exists.
+            endpoint_plane: Some(endpoint_plane),
         };
         record.begin_transition(
             crate::state::WORKGROUP_CREATING,

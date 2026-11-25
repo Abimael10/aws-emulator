@@ -19997,6 +19997,7 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "rustls",
  "serde_json",
  "service-com-amazonaws-ec2-amazonec2",
  "service-com-amazonaws-redshiftdata-redshiftdata",
@@ -20004,6 +20005,7 @@ dependencies = [
  "service-common",
  "sha2 0.10.9",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "uuid",
 ]
