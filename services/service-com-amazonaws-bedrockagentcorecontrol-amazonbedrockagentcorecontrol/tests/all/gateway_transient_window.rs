@@ -10,14 +10,15 @@
 //! instant. The window the store arms is chosen against what a client can OBSERVE of it,
 //! which bounds it from both sides:
 //!
-//! * it outlives the call that starts the transition, so a caller acting in the same breath
-//!   as its own create still observes the transient status and the state refusal that goes
-//!   with it;
-//! * it does NOT outlive that caller's next calls: a client that creates a gateway and then
-//!   goes on working — spending a round trip or more elsewhere before it comes back to the
-//!   gateway, as the ordinary create-then-configure or create-then-tear-down script does —
-//!   finds the transition already materialised instead of being refused for a wait this
-//!   emulator invented and that nothing in the gateway representation tells it about.
+//! * it outlives the call that starts the transition AND the calls that caller makes next,
+//!   so the transient status, and every state refusal keyed on it, is observable to a client
+//!   that goes on working instead of depending on how fast its calls happen to be
+//!   dispatched. Which refusal a workflow hears is then the same on a fast host and on a
+//!   slow one. That half is pinned where it is observable, through the wire:
+//!   `tests/all/gateway_target_status_precedes_the_target_lookup.rs`;
+//! * it stays a transition a client waits out by POLLING the resource — bounded by
+//!   [`MAX_TRANSIENT_WINDOW`] — rather than an open-ended wait, so a caller that waits for
+//!   the status it needs gets there.
 //!
 //! The tests below pin all three halves of that rule: the status a stored due instant
 //! implies (and that reads never move it), the SIZE of the window every gateway-family
@@ -44,13 +45,13 @@ const REGION: &str = "us-east-1";
 /// The longest window a gateway-family transition may still have to run when the call that
 /// armed it answers — so, the longest span the service may arm.
 ///
-/// What bounds it is the client, not a figure AWS publishes: a caller that comes back to the
-/// gateway after spending a handful of calls elsewhere — creating an IAM role, assuming it,
-/// being refused once — is served, so a window it cannot get past without sleeping is a
-/// window this service invented. One round trip to this endpoint is the order of magnitude;
-/// this is that order with room to spare, and it is deliberately far below the half second
-/// this service used to arm, which no such caller could outlast.
-const MAX_TRANSIENT_WINDOW: Duration = Duration::from_millis(50);
+/// What bounds it is the client, not a figure AWS publishes: a transition a client can poll
+/// out, so that a caller which waits for the status it needs reaches it inside one ordinary
+/// request's patience. It is NOT bounded by one round trip to this endpoint: the recorded
+/// service keeps a new gateway in `CREATING` across the calls a caller makes right after the
+/// create, and a window of that order would make which refusal a workflow hears depend on
+/// how fast its calls are dispatched.
+const MAX_TRANSIENT_WINDOW: Duration = Duration::from_secs(5);
 
 /// How long the clock-driven round trip keeps looking for the condition it waits on. The
 /// transition is the clock's, so the wait is for the CONDITION; the deadline is generous
@@ -391,10 +392,10 @@ async fn a_gateway_serves_a_delete_only_from_the_status_its_due_instant_implies(
     }
 }
 
-/// RULE: every transition of the gateway family arms a window a client's own next calls
-/// outlast — still open when the call that armed it answers (so the transient status is
-/// observable to that caller) and no longer than [`MAX_TRANSIENT_WINDOW`] beyond that answer
-/// (so the caller is not refused for a wait it has to sleep out).
+/// RULE: every transition of the gateway family arms a window that is open when the call
+/// that armed it answers (so the transient status is observable to that caller and to the
+/// calls it makes next) and no longer than [`MAX_TRANSIENT_WINDOW`] beyond that answer (so
+/// the caller reaches the status it is waiting for by polling for it).
 ///
 /// Both bounds are measured so that neither depends on how fast this host is: the lower one
 /// against the instant the arming call was ISSUED (the window must still be open by then,
@@ -405,7 +406,7 @@ async fn a_gateway_serves_a_delete_only_from_the_status_its_due_instant_implies(
 /// its delete owes, plus one child of each kind that hangs off a gateway — a target, a rate
 /// limit and a rule — because the whole family shares the one span.
 #[tokio::test]
-async fn every_gateway_family_transition_arms_a_window_a_callers_next_calls_outlast() {
+async fn every_gateway_family_transition_arms_a_bounded_window_a_caller_can_observe() {
     let (router, engine) = router();
 
     // (case, the instant the call that armed the window was ISSUED, the instant it was
@@ -562,8 +563,8 @@ async fn every_gateway_family_transition_arms_a_window_a_callers_next_calls_outl
         let bound = answered + MAX_TRANSIENT_WINDOW;
         assert!(
             due <= bound,
-            "case {case:?}: the window must not outlive the caller's next calls, so it is at \
-             most {MAX_TRANSIENT_WINDOW:?}; the due instant {due:?} is past {bound:?}"
+            "case {case:?}: the window must stay one a caller can poll out, so it is at most \
+             {MAX_TRANSIENT_WINDOW:?}; the due instant {due:?} is past {bound:?}"
         );
     }
 }

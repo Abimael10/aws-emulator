@@ -218,13 +218,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The GATEWAY the path label names is resolved before the body is judged,
         // the way every operation addressed by a `{gatewayIdentifier}` resolves
         // it; the CHILD the path names under it is resolved only once the body
-        // this operation can decide on its own has passed. So the refusal a
+        // this operation can decide on its own has passed AND the gateway is in
+        // a status that can serve a change to its targets. So the refusal a
         // caller hears first is the one that is decidable without reaching for
         // the child: a body that has to define `credentialProviderConfigurations`
         // and does not is the modelled 400 even when the `targetId` beside it
-        // names no target, and a `targetId` naming nothing is the modelled 404
-        // for every body this operation could otherwise render into its
-        // response.
+        // names no target, a gateway the clock still owes a transition is the
+        // modelled 400 for any `targetId` at all, and a `targetId` naming
+        // nothing is the modelled 404 for every body this operation could
+        // otherwise render into its response.
         //
         // Everything that can be decided from stored state alone is decided
         // here, and the store guard is DROPPED before the cross-service call
@@ -251,8 +253,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // nothing of its own keeps the configuration the stored target
             // already carries (`crate::state::gateway_target_credentials`). The
             // refusal needs nothing but the request, so it is reported ahead of
-            // resolving the target the request would reconfigure, and ahead of
-            // the gateway's own status.
+            // the gateway's own status and ahead of resolving the target the
+            // request would reconfigure.
             let defined = crate::state::defined_credential_provider_configurations(
                 input.credential_provider_configurations.clone(),
             );
@@ -269,6 +271,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
 
+            // A target is served BY the gateway, so the gateway has to be ready
+            // to serve it: while the gateway is still in the transient status the
+            // clock owes a transition for (`CREATING`, `UPDATING`), or on its way
+            // out in `DELETING`, its targets cannot be reconfigured, and the
+            // caller is told which status it found. The refusal is worded by
+            // the ONE helper every operation on a gateway's TARGETS shares, so
+            // they cannot drift.
+            //
+            // It is decided BEFORE the target the request names is resolved: a
+            // gateway that cannot serve a change to its targets cannot serve a
+            // lookup of one either, so the caller hears the precondition it can
+            // resolve by waiting rather than a 404 that tells it the target is
+            // gone — the same order every operation on a gateway's targets
+            // applies.
+            let status = gateway.status_at(now);
+            if status != crate::state::STATUS_READY {
+                return Err(UpdateGatewayTargetErrorModeled::ValidationException(
+                    crate::state::gateway_target_status_conflict(Self::NAME, status),
+                )
+                .into());
+            }
+
             // A target id naming no target OF THIS GATEWAY is the modelled 404:
             // an update reconfigures a stored target, it does not mint one. A
             // target whose deletion `DeleteGatewayTarget` has already accepted is
@@ -281,21 +305,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !target_present {
                 return Err(UpdateGatewayTargetErrorModeled::ResourceNotFoundException(
                     crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY_TARGET),
-                )
-                .into());
-            }
-
-            // A target is served BY the gateway, so the gateway has to be ready
-            // to serve it: while the gateway is still in the transient status the
-            // clock owes a transition for (`CREATING`, `UPDATING`), or on its way
-            // out in `DELETING`, its targets cannot be reconfigured, and the
-            // caller is told which status it found. The refusal is worded by
-            // the ONE helper every operation on a gateway's TARGETS shares, so
-            // they cannot drift.
-            let status = gateway.status_at(now);
-            if status != crate::state::STATUS_READY {
-                return Err(UpdateGatewayTargetErrorModeled::ValidationException(
-                    crate::state::gateway_target_status_conflict(Self::NAME, status),
                 )
                 .into());
             }

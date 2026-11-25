@@ -54,3 +54,27 @@ Model grounding (services/service-com-amazonaws-bedrockagentcorecontrol-amazonbe
 1. Replay the wire corpus simparity-wire-aws-v1 against the emulator.
 2. Fixture bedrock-agentcore-control-gateway-target-workflow: CreateGateway (setup#1, gateway is returned in CREATING status), CreateGatewayTarget against that gateway, then at task#4 call DeleteGatewayTarget with that gatewayIdentifier and the created targetId while the gateway has not yet reached READY.
 3. Observe the response: the emulator answers 404 ResourceNotFoundException ("Failed to retrieve target because it doesn't exist..."); AWS answers 400 ValidationException with x-amzn-errortype: ValidationException and 'Cannot perform operation DeleteGatewayTarget when gateway is in CREATING status'.
+
+## Resolution
+
+Cause 1 is FIXED, and the precondition the issue asks for was not what was missing. `DeleteGatewayTarget`
+already resolves the parent gateway and refuses a non-terminal status with the recorded sentence BEFORE it
+looks the target up, and the targets it reads are the ones `CreateGatewayTarget` writes (one map on the
+gateway record). What made that refusal unreachable was the gateway family's transient window: it was armed
+for a span of the order of one round trip to this endpoint, so the gateway reported `CREATING` to the
+caller's second call and `READY` to its fourth, and which refusal a workflow heard depended on how fast its
+calls were dispatched. The window is now sized a long way above a round trip, the span the sibling resource
+families of this service already use, so every state precondition keyed on a gateway's status is decided the
+same way on a fast host and on a slow one.
+
+Applied where the rule holds: `UpdateGatewayTarget` resolved the target before consulting the gateway's
+status, so it answered the lookup failure where the family answers the precondition; the two are now in the
+family's order. `CreateGatewayTarget`, `DeleteGatewayTarget` and `SynchronizeGatewayTargets` already had it.
+
+Conflicting unit, kept on the record: the behavioural unit of
+`20261120T051930Z-bedrock-agentcore-control-a-gateway-s-creating-ready.md` issues a SERVED `DeleteGateway`
+five calls after the create, while this fixture's refusals are recorded two and four calls after it.
+Replayed in process both sequences complete in the same handful of milliseconds, so no wall-clock span
+separates them as the recordings' own latencies did. The window follows the recorded refusals, because a
+span of the order of one call makes the emulator's answer a race rather than a rule; a caller that waits for
+the status it needs by polling the gateway reaches it.

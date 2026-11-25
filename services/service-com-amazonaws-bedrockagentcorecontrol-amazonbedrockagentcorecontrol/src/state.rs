@@ -4123,24 +4123,25 @@ pub fn inline_tool_definitions(configuration: &TargetConfiguration) -> Option<&[
 /// terminal one, and how long a gateway whose deletion was accepted stays
 /// readable in `DELETING` before the clock owes its removal.
 ///
-/// AWS documents no duration for any of these transitions, so the span is chosen
-/// — and what it is chosen against is what a CLIENT can observe of it, which
-/// bounds it from both sides:
+/// AWS documents no duration for any of these transitions, so the span is
+/// chosen. What it is chosen against is OBSERVABILITY: a status a caller can
+/// still see when its next call arrives, so every precondition keyed on that
+/// status ([`gateway_status_conflict`], [`gateway_target_status_conflict`]) is
+/// decided the same way on a fast host and on a slow one.
 ///
-/// * it must outlive the call that starts the transition, so a caller acting in
-///   the same breath as its own create still observes the transient status and
-///   the state refusals that go with it ([`gateway_status_conflict`]);
-/// * it must NOT outlive that caller's next calls: a client that creates a
-///   gateway and then goes on working — the ordinary create-then-configure or
-///   create-then-tear-down script, which spends a round trip or more elsewhere
-///   before it comes back to the gateway — finds the transition already
-///   materialised rather than being refused for a wait this emulator invented
-///   and nothing in the gateway representation tells it about.
+/// So the span is sized a long way ABOVE one call's round trip to this endpoint
+/// — not of the order of one, which is what makes a workflow's answers depend on
+/// how fast its calls happen to be dispatched: a caller that creates a gateway
+/// and then mutates it, or its targets, a call or two later meets the transient
+/// status and the state refusal that goes with it, and so does a caller whose
+/// calls are slower. It stays a fraction of a second rather than a wait a client
+/// has to sleep out, which is also the span the sibling resource families of
+/// this service give their own transitions ([`RUNTIME_SETTLE_DELAY`],
+/// [`MEMORY_SETTLE_DELAY`]).
 ///
-/// So the span is of the ORDER of one round trip to this endpoint, not of a wait
-/// a caller has to sleep out. It is stored as a due instant and never slept on
+/// It is stored as a due instant and never slept on
 /// ([`GatewayRecord::status_at`]), so no handler blocks on it.
-pub const GATEWAY_SETTLE_DELAY: Duration = Duration::from_millis(25);
+pub const GATEWAY_SETTLE_DELAY: Duration = Duration::from_millis(500);
 
 /// The ARN resource type of a capacity provider: `CapacityProviderArn` is
 /// `arn:aws…:bedrock-agentcore:…:capacity-provider/{capacityProviderId}`
