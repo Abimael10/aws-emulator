@@ -452,14 +452,17 @@ async fn the_library_publishes_exactly_the_permissions_aws_publishes_for_the_typ
     // a permission the library publishes is enumerated and resolves, and a name it
     // publishes no permission under is neither. Source: the managed permissions the RAM
     // permission library publishes for `acm-pca:CertificateAuthority` — the type's default
-    // permission, the two blank end-entity issuance permissions, one subordinate-CA
-    // issuance permission per published certificate template (the path lengths zero
-    // through three), and the revocation permission — which is what a `ListPermissions`
-    // scoped to that type enumerates in any account.
+    // permission, the two blank end-entity issuance permissions, the client- and
+    // server-auth end-entity issuance permissions, one subordinate-CA issuance permission
+    // per published certificate template (the path lengths zero through three), and the
+    // revocation permission — which is what a `ListPermissions` scoped to that type
+    // enumerates in any account.
     let mut published: Vec<String> = [
         "AWSRAMBlankEndEntityCertificateAPICSRPassthroughIssuanceCertificateAuthority",
         "AWSRAMBlankEndEntityCertificateAPIPassthroughIssuanceCertificateAuthority",
         "AWSRAMDefaultPermissionCertificateAuthority",
+        "AWSRAMEndEntityClientAuthCertificateIssuanceCertificateAuthority",
+        "AWSRAMEndEntityServerAuthCertificateIssuanceCertificateAuthority",
         "AWSRAMRevokeCertificateCertificateAuthority",
         "AWSRAMSubordinateCACertificatePathLen0IssuanceCertificateAuthority",
         "AWSRAMSubordinateCACertificatePathLen1IssuanceCertificateAuthority",

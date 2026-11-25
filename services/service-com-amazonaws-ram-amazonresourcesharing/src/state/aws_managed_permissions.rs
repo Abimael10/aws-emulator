@@ -82,11 +82,21 @@ pub struct AwsManagedPermission {
     /// published is published at the revision, and a read of it reports that number
     /// (`ResourceSharePermissionSummary$version`). Counting from
     /// [`FIRST_PERMISSION_VERSION`], the version every permission starts at.
+    ///
+    /// An entry states a revision ([`entry_at_version`]) only where the number the library
+    /// publishes it at is known; every other entry carries
+    /// [`FIRST_PERMISSION_VERSION`], which is where a permission is published until the
+    /// library revises it. So a plain [`entry`] records "not known to have been revised"
+    /// rather than "confirmed at the first version", and the number to correct, when the
+    /// revision of one becomes known, is that entry's alone.
     pub version: i32,
 }
 
 /// Whether a permission the catalog publishes for any resource share, which is what
-/// every entry below is, is confined to service-linked shares: it is not.
+/// every entry below is, is confined to service-linked shares: it is not. Every
+/// permission the library publishes today is one a caller may attach to a share of their
+/// own, so both constructors below carry this value; a published service-linked-only
+/// permission would be recorded with its own constructor rather than by widening these.
 const ATTACHABLE_TO_ANY_SHARE: bool = false;
 
 /// The resource type a private certificate authority's ARN names, spelled as
@@ -123,6 +133,203 @@ const CERTIFICATE_AUTHORITY_REVOCATION_ACTIONS: &[&str] = &[
     "acm-pca:ListPermissions",
     "acm-pca:ListTags",
     "acm-pca:RevokeCertificate",
+];
+
+/// The actions the managed permissions for an IP Address Manager pool allow: the reads
+/// a receiving account makes about the shared pool, plus the allocation the share exists
+/// to grant. Named once because the library publishes a family for the type.
+const IPAM_POOL_ACTIONS: &[&str] = &[
+    "ec2:AllocateIpamPoolCidr",
+    "ec2:DescribeIpamPools",
+    "ec2:GetIpamPoolAllocations",
+    "ec2:GetIpamPoolCidrs",
+];
+
+/// The actions the managed permissions for a Network Firewall firewall policy allow.
+const FIREWALL_POLICY_ACTIONS: &[&str] = &[
+    "network-firewall:AssociateFirewallPolicy",
+    "network-firewall:DescribeFirewallPolicy",
+    "network-firewall:ListFirewallPolicies",
+];
+
+/// The actions a Network Firewall rule-group permission allows without the describe of
+/// the rule group's own rules: the library publishes a rule-group permission in this
+/// form and in the `WithDescribe` form below.
+const RULE_GROUP_ACTIONS: &[&str] = &["network-firewall:ListRuleGroups"];
+
+/// The actions a Network Firewall rule-group permission of the `WithDescribe` form
+/// allows: the listing above plus the describe of the shared rule group itself.
+const RULE_GROUP_WITH_DESCRIBE_ACTIONS: &[&str] = &[
+    "network-firewall:DescribeRuleGroup",
+    "network-firewall:ListRuleGroups",
+];
+
+/// The actions an agent-registry permission allows a reader of a shared registry.
+const AGENT_REGISTRY_READ_ACTIONS: &[&str] = &[
+    "agent-registry:GetAgent",
+    "agent-registry:GetRegistry",
+    "agent-registry:ListAgents",
+];
+
+/// The actions the agent-registry permissions for an account that maintains agents in a
+/// shared registry allow: the reads above plus the agents' own lifecycle.
+const AGENT_REGISTRY_PUBLISH_ACTIONS: &[&str] = &[
+    "agent-registry:CreateAgent",
+    "agent-registry:GetAgent",
+    "agent-registry:GetRegistry",
+    "agent-registry:ListAgents",
+    "agent-registry:UpdateAgent",
+];
+
+/// The actions a Glue data-catalog permission allows a reader of the shared catalog.
+const GLUE_CATALOG_READ_ACTIONS: &[&str] = &[
+    "glue:GetCatalog",
+    "glue:GetDatabase",
+    "glue:GetDatabases",
+    "glue:GetTable",
+    "glue:GetTables",
+];
+
+/// The actions the Glue catalog permissions that grant a receiving account the DATABASES
+/// of a shared catalog allow: the catalog's own reads plus the database lifecycle inside
+/// it.
+const GLUE_CATALOG_DATABASE_ACTIONS: &[&str] = &[
+    "glue:CreateDatabase",
+    "glue:DeleteDatabase",
+    "glue:GetCatalog",
+    "glue:GetDatabase",
+    "glue:GetDatabases",
+    "glue:UpdateDatabase",
+];
+
+/// The actions the Glue catalog permissions that grant a receiving account the TABLES of
+/// a shared catalog allow.
+const GLUE_CATALOG_TABLE_ACTIONS: &[&str] = &[
+    "glue:CreateTable",
+    "glue:DeleteTable",
+    "glue:GetCatalog",
+    "glue:GetDatabase",
+    "glue:GetTable",
+    "glue:GetTables",
+    "glue:UpdateTable",
+];
+
+/// The actions the Glue database permissions that grant a receiving account the TABLES of
+/// a shared database allow.
+const GLUE_DATABASE_TABLE_ACTIONS: &[&str] = &[
+    "glue:CreateTable",
+    "glue:DeleteTable",
+    "glue:GetDatabase",
+    "glue:GetTable",
+    "glue:GetTables",
+    "glue:UpdateTable",
+];
+
+/// The actions the Glue table permissions that grant a receiving account the PARTITIONS
+/// of a shared table allow.
+const GLUE_TABLE_PARTITION_ACTIONS: &[&str] = &[
+    "glue:BatchCreatePartition",
+    "glue:CreatePartition",
+    "glue:DeletePartition",
+    "glue:GetPartition",
+    "glue:GetPartitions",
+    "glue:GetTable",
+    "glue:UpdatePartition",
+];
+
+/// The actions a DataZone domain permission allows a reader of the shared domain.
+const DATAZONE_DOMAIN_READ_ACTIONS: &[&str] = &[
+    "datazone:GetDomain",
+    "datazone:GetProject",
+    "datazone:ListDomains",
+    "datazone:ListProjects",
+];
+
+/// The actions the DataZone domain permissions that extend a shared domain to another
+/// service's environments allow.
+const DATAZONE_DOMAIN_SERVICE_ACTIONS: &[&str] = &[
+    "datazone:GetDomain",
+    "datazone:GetEnvironment",
+    "datazone:ListEnvironments",
+];
+
+/// The actions the managed permissions for an Outpost allow.
+const OUTPOST_ACTIONS: &[&str] = &[
+    "outposts:GetOutpost",
+    "outposts:GetOutpostInstanceTypes",
+    "outposts:ListOutposts",
+];
+
+/// The actions the managed permissions for an Outposts site allow.
+const OUTPOSTS_SITE_ACTIONS: &[&str] = &["outposts:GetSite", "outposts:ListSites"];
+
+/// The actions a SageMaker feature-group permission allows a reader of the shared group.
+const FEATURE_GROUP_READ_ACTIONS: &[&str] = &[
+    "sagemaker:BatchGetRecord",
+    "sagemaker:DescribeFeatureGroup",
+    "sagemaker:GetRecord",
+];
+
+/// The actions the SageMaker feature-group permissions that grant a receiving account the
+/// records of a shared group allow.
+const FEATURE_GROUP_WRITE_ACTIONS: &[&str] = &[
+    "sagemaker:BatchGetRecord",
+    "sagemaker:DeleteRecord",
+    "sagemaker:DescribeFeatureGroup",
+    "sagemaker:GetRecord",
+    "sagemaker:PutRecord",
+];
+
+/// The actions a SageMaker model-package-group permission allows a reader of the shared
+/// group.
+const MODEL_PACKAGE_GROUP_READ_ACTIONS: &[&str] = &[
+    "sagemaker:DescribeModelPackage",
+    "sagemaker:DescribeModelPackageGroup",
+    "sagemaker:ListModelPackages",
+];
+
+/// The actions a SageMaker hub permission allows a reader of the shared hub.
+const HUB_READ_ACTIONS: &[&str] = &[
+    "sagemaker:DescribeHub",
+    "sagemaker:DescribeHubContent",
+    "sagemaker:ListHubContents",
+];
+
+/// The actions a Cloud Map namespace permission allows a reader of the shared namespace.
+const SERVICE_DISCOVERY_READ_ACTIONS: &[&str] = &[
+    "servicediscovery:DiscoverInstances",
+    "servicediscovery:GetNamespace",
+    "servicediscovery:ListServices",
+];
+
+/// The actions an AWS Systems Manager parameter permission allows a reader of the shared
+/// parameter.
+const SSM_PARAMETER_READ_ACTIONS: &[&str] = &[
+    "ssm:DescribeParameters",
+    "ssm:GetParameter",
+    "ssm:GetParameters",
+];
+
+/// The actions an Amazon S3 Access Grants instance permission allows a reader of the
+/// shared instance.
+const ACCESS_GRANTS_READ_ACTIONS: &[&str] = &[
+    "s3:GetAccessGrantsInstance",
+    "s3:GetDataAccess",
+    "s3:ListAccessGrants",
+];
+
+/// The actions a managed prefix list permission allows: the library publishes more than
+/// one permission for the type.
+const PREFIX_LIST_ACTIONS: &[&str] = &[
+    "ec2:DescribeManagedPrefixLists",
+    "ec2:GetManagedPrefixListEntries",
+];
+
+/// The actions an Amazon EBS volume permission allows a reader of the shared volume.
+const EBS_VOLUME_READ_ACTIONS: &[&str] = &[
+    "ec2:AttachVolume",
+    "ec2:DescribeVolumes",
+    "ec2:DetachVolume",
 ];
 
 /// The AWS managed permissions this service serves, one entry per published
@@ -227,24 +434,18 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
         &["ec2:DescribeHosts", "ec2:RunInstances"],
         true,
     ),
+    // The library publishes two managed permissions for an IPAM pool, and the one it
+    // publishes as the pool's default is `AWSRAMDefaultPermissionsIpamPool` below.
     entry(
         "AWSRAMDefaultPermissionIpamPool",
         "ec2:IpamPool",
-        &[
-            "ec2:AllocateIpamPoolCidr",
-            "ec2:DescribeIpamPools",
-            "ec2:GetIpamPoolAllocations",
-            "ec2:GetIpamPoolCidrs",
-        ],
-        true,
+        IPAM_POOL_ACTIONS,
+        false,
     ),
     entry(
         "AWSRAMDefaultPermissionPrefixList",
         "ec2:PrefixList",
-        &[
-            "ec2:DescribeManagedPrefixLists",
-            "ec2:GetManagedPrefixListEntries",
-        ],
+        PREFIX_LIST_ACTIONS,
         true,
     ),
     entry(
@@ -353,40 +554,40 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
         ],
         true,
     ),
+    // The library publishes two managed permissions for a firewall policy, and the one
+    // it publishes as the policy's default is `AWSRAMDefaultPermissionNetworkFirewallPolicy`
+    // below.
     entry(
         "AWSRAMDefaultPermissionNetworkFirewallFirewallPolicy",
         "network-firewall:FirewallPolicy",
-        &[
-            "network-firewall:AssociateFirewallPolicy",
-            "network-firewall:DescribeFirewallPolicy",
-            "network-firewall:ListFirewallPolicies",
-        ],
-        true,
+        FIREWALL_POLICY_ACTIONS,
+        false,
     ),
+    // The library publishes the stateful rule group's default under the
+    // `AWSRAMDefaultPermissionNetworkFirewallStatefulRuleGroup` name above.
     entry(
         "AWSRAMDefaultPermissionStatefulRuleGroup",
-        "network-firewall:StatefulRuleGroup",
+        "network-firewall:StatefulRulegroup",
         &[
             "network-firewall:DescribeRuleGroup",
             "network-firewall:ListRuleGroups",
         ],
-        true,
+        false,
     ),
+    // The library publishes the Outpost's and the site's defaults under the
+    // `AWSRAMDefaultPermissionOutpostsOutpost` and `AWSRAMDefaultPermissionOutpostsSite`
+    // names below.
     entry(
         "AWSRAMDefaultPermissionOutpost",
         "outposts:Outpost",
-        &[
-            "outposts:GetOutpost",
-            "outposts:GetOutpostInstanceTypes",
-            "outposts:ListOutposts",
-        ],
-        true,
+        OUTPOST_ACTIONS,
+        false,
     ),
     entry(
         "AWSRAMDefaultPermissionSite",
         "outposts:Site",
-        &["outposts:GetSite", "outposts:ListSites"],
-        true,
+        OUTPOSTS_SITE_ACTIONS,
+        false,
     ),
     entry(
         "AWSRAMDefaultPermissionResourceGroup",
@@ -409,6 +610,8 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
         ],
         true,
     ),
+    // The library publishes the service network's default under the
+    // `AWSRAMPermissionVpcLatticeServiceNetworkReadWrite` name below.
     entry(
         "AWSRAMDefaultPermissionVpcLatticeServiceNetwork",
         "vpc-lattice:ServiceNetwork",
@@ -417,17 +620,1036 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
             "vpc-lattice:GetServiceNetwork",
             "vpc-lattice:ListServiceNetworks",
         ],
+        false,
+    ),
+    // The rest of the private-CA issuance family: one published permission per
+    // certificate template the shared certificate authority may issue under.
+    entry(
+        "AWSRAMEndEntityClientAuthCertificateIssuanceCertificateAuthority",
+        CERTIFICATE_AUTHORITY_RESOURCE_TYPE,
+        CERTIFICATE_AUTHORITY_ISSUANCE_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMEndEntityServerAuthCertificateIssuanceCertificateAuthority",
+        CERTIFICATE_AUTHORITY_RESOURCE_TYPE,
+        CERTIFICATE_AUTHORITY_ISSUANCE_ACTIONS,
+        false,
+    ),
+    // An agent registry: the read-only permission is the type's default and the three
+    // role-shaped ones are published beside it.
+    entry_at_version(
+        "AWSRAMDefaultPermissionAgentRegistryReadOnly",
+        "agent-registry:Registry",
+        AGENT_REGISTRY_READ_ACTIONS,
+        true,
+        2,
+    ),
+    entry_at_version(
+        "AWSRAMPermissionAgentRegistryForAdmin",
+        "agent-registry:Registry",
+        &[
+            "agent-registry:CreateAgent",
+            "agent-registry:DeleteAgent",
+            "agent-registry:GetAgent",
+            "agent-registry:GetRegistry",
+            "agent-registry:ListAgents",
+            "agent-registry:UpdateAgent",
+        ],
+        false,
+        2,
+    ),
+    entry_at_version(
+        "AWSRAMPermissionAgentRegistryForConsumer",
+        "agent-registry:Registry",
+        AGENT_REGISTRY_READ_ACTIONS,
+        false,
+        2,
+    ),
+    entry_at_version(
+        "AWSRAMPermissionAgentRegistryForPublisher",
+        "agent-registry:Registry",
+        AGENT_REGISTRY_PUBLISH_ACTIONS,
+        false,
+        2,
+    ),
+    // An API Gateway developer-portal product.
+    entry(
+        "AWSRAMDefaultPermissionAPIGatewayDeveloperPortalProduct",
+        "apigateway:Portalproducts",
+        &[
+            "apigateway:GetPortalProduct",
+            "apigateway:GetPortalProducts",
+        ],
+        true,
+    ),
+    // An App Mesh Preview service mesh, published beside the App Mesh one above.
+    entry_at_version(
+        "AWSRAMDefaultPermissionAppMeshPreview",
+        "appmesh-preview:Mesh",
+        &[
+            "appmesh-preview:CreateVirtualNode",
+            "appmesh-preview:DescribeMesh",
+            "appmesh-preview:DescribeVirtualNode",
+            "appmesh-preview:ListVirtualNodes",
+        ],
+        true,
+        3,
+    ),
+    // An AWS AppSync API: a source API shared with a merged API, and the invoke paths
+    // published for it.
+    entry(
+        "AWSRAMPermissionAppSyncSourceApiOperationAccess",
+        "appsync:Apis",
+        &[
+            "appsync:AssociateMergedGraphqlApi",
+            "appsync:GetGraphqlApi",
+            "appsync:ListGraphqlApis",
+        ],
+        true,
+    ),
+    entry(
+        "AWSRAMPermissionAppSyncMergedApiOperationAccess",
+        "appsync:Apis",
+        &[
+            "appsync:AssociateSourceGraphqlApi",
+            "appsync:GetGraphqlApi",
+            "appsync:ListGraphqlApis",
+        ],
+        false,
+    ),
+    entry(
+        "AWSRAMPermissionAppSyncAllowSourceGraphQLAccess",
+        "appsync:Apis",
+        &["appsync:GetGraphqlApi", "appsync:SourceGraphQL"],
+        false,
+    ),
+    entry(
+        "AWSRAMPermissionAppSyncGraphQLApiInvokeAccess",
+        "appsync:Apis",
+        &["appsync:GetGraphqlApi", "appsync:GraphQL"],
+        false,
+    ),
+    // An AWS Backup vault.
+    entry(
+        "AWSRAMPermissionBackupVaultReadOnly",
+        "backup:BackupVault",
+        &[
+            "backup:DescribeBackupVault",
+            "backup:DescribeRecoveryPoint",
+            "backup:ListRecoveryPointsByBackupVault",
+        ],
+        true,
+    ),
+    // An Amazon Bedrock custom model.
+    entry(
+        "AWSRAMPermissionBedrockCustomModel",
+        "bedrock:CustomModel",
+        &[
+            "bedrock:GetCustomModel",
+            "bedrock:InvokeModel",
+            "bedrock:ListCustomModels",
+        ],
+        true,
+    ),
+    // An AWS CloudHSM backup.
+    entry(
+        "AWSRAMPermissionCloudHsmBackup",
+        "cloudhsm:Backup",
+        &["cloudhsm:DescribeBackups", "cloudhsm:ListTags"],
+        true,
+    ),
+    // An AWS CodeConnections connection.
+    entry(
+        "AWSRAMPermissionCodeConnectionsConnection",
+        "codeconnections:Connection",
+        &[
+            "codeconnections:GetConnection",
+            "codeconnections:ListConnections",
+            "codeconnections:UseConnection",
+        ],
+        true,
+    ),
+    // An Amazon DataZone domain: the domain's own default, the portal-access variants,
+    // and the permissions another service's principal uses against a shared domain.
+    entry(
+        "AWSRAMDefaultPermissionAmazonDataZoneDomain",
+        "datazone:Domain",
+        DATAZONE_DOMAIN_READ_ACTIONS,
+        true,
+    ),
+    entry(
+        "AWSRAMPermissionAmazonDataZoneDomainFullAccessWithPortalAccess",
+        "datazone:Domain",
+        &[
+            "datazone:GetDomain",
+            "datazone:GetIamPortalLoginUrl",
+            "datazone:GetProject",
+            "datazone:ListProjects",
+        ],
+        false,
+    ),
+    entry(
+        "AWSRAMPermissionsAmazonDatazoneDomainExtendedServiceAccess",
+        "datazone:Domain",
+        DATAZONE_DOMAIN_SERVICE_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMPermissionsAmazonDatazoneDomainExtendedServiceWithPortalAccess",
+        "datazone:Domain",
+        &[
+            "datazone:GetDomain",
+            "datazone:GetEnvironment",
+            "datazone:GetIamPortalLoginUrl",
+            "datazone:ListEnvironments",
+        ],
+        false,
+    ),
+    entry(
+        "AWSRAMSageMakerServicePrincipalPermissionAmazonDataZoneDomain",
+        "datazone:Domain",
+        DATAZONE_DOMAIN_SERVICE_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMPermissionSageMakerDataZoneProjectMembershipAccess",
+        "datazone:Domain",
+        &[
+            "datazone:GetDomain",
+            "datazone:GetProject",
+            "datazone:ListProjectMemberships",
+        ],
+        false,
+    ),
+    entry(
+        "AWSRAMPermissionSageMakerCatalogResourceSearch",
+        "datazone:Domain",
+        &[
+            "datazone:GetDomain",
+            "datazone:Search",
+            "datazone:SearchListings",
+        ],
+        false,
+    ),
+    // Amazon EC2 and Amazon VPC resources the library publishes a permission for beside
+    // the ones above.
+    entry(
+        "AWSRAMDefaultPermissionCoipPool",
+        "ec2:CoipPool",
+        &["ec2:DescribeCoipPools", "ec2:GetCoipPoolUsage"],
+        true,
+    ),
+    entry(
+        "AWSRAMDefaultPermissionEBSVolume",
+        "ec2:Volume",
+        EBS_VOLUME_READ_ACTIONS,
+        true,
+    ),
+    entry(
+        "AWSRAMPermissionEBSVolumeCopyAccess",
+        "ec2:Volume",
+        &[
+            "ec2:CreateSnapshot",
+            "ec2:DescribeSnapshots",
+            "ec2:DescribeVolumes",
+        ],
+        false,
+    ),
+    entry(
+        "AWSRAMDefaultPermissionLocalGateway",
+        "ec2:LocalGatewayRouteTable",
+        &[
+            "ec2:CreateLocalGatewayRouteTableVpcAssociation",
+            "ec2:DescribeLocalGatewayRouteTables",
+            "ec2:DescribeLocalGateways",
+        ],
+        true,
+    ),
+    entry(
+        "AWSRAMDefaultPermissionsIpamPool",
+        "ec2:IpamPool",
+        IPAM_POOL_ACTIONS,
+        true,
+    ),
+    entry(
+        "AWSRAMPermissionIpamPoolByoipCidrImport",
+        "ec2:IpamPool",
+        &["ec2:DescribeIpamPools", "ec2:ProvisionPublicIpv4PoolCidr"],
+        false,
+    ),
+    entry(
+        "AWSRAMPermissionIpamResourceDiscovery",
+        "ec2:IpamResourceDiscovery",
+        &[
+            "ec2:DescribeIpamResourceDiscoveries",
+            "ec2:GetIpamDiscoveredAccounts",
+            "ec2:GetIpamDiscoveredResourceCidrs",
+        ],
+        true,
+    ),
+    entry(
+        "AWSRAMDefaultPermissionsPlacementGroup",
+        "ec2:PlacementGroup",
+        &["ec2:DescribePlacementGroups", "ec2:RunInstances"],
+        true,
+    ),
+    entry(
+        "AWSRAMDefaultPermissionsSecurityGroup",
+        "ec2:SecurityGroup",
+        &[
+            "ec2:DescribeSecurityGroupRules",
+            "ec2:DescribeSecurityGroups",
+        ],
+        true,
+    ),
+    entry(
+        "AWSRAMDefaultPermissionTrafficMirror",
+        "ec2:TrafficMirrorTarget",
+        &[
+            "ec2:CreateTrafficMirrorSession",
+            "ec2:DescribeTrafficMirrorTargets",
+        ],
+        true,
+    ),
+    entry(
+        "AWSRAMDefaultPermissionTransitGatewayMulticastDomain",
+        "ec2:TransitGatewayMulticastDomain",
+        &[
+            "ec2:AssociateTransitGatewayMulticastDomain",
+            "ec2:DescribeTransitGatewayMulticastDomains",
+            "ec2:RegisterTransitGatewayMulticastGroupMembers",
+        ],
+        true,
+    ),
+    entry(
+        "AWSRAMPermissionVerifiedAccessGroup",
+        "ec2:VerifiedAccessGroup",
+        &[
+            "ec2:CreateVerifiedAccessEndpoint",
+            "ec2:DescribeVerifiedAccessGroups",
+        ],
+        true,
+    ),
+    entry(
+        "AWSRAMFSxRosettaPermissionPrefixList",
+        "ec2:PrefixList",
+        PREFIX_LIST_ACTIONS,
+        false,
+    ),
+    // An Elastic Load Balancing trust store.
+    entry(
+        "AWSRAMPermissionElasticLoadBalancingTrustStore",
+        "elasticloadbalancing:TrustStore",
+        &[
+            "elasticloadbalancing:DescribeTrustStores",
+            "elasticloadbalancing:GetTrustStoreCaCertificatesBundle",
+        ],
+        true,
+    ),
+    // An Amazon EventBridge event bus, one permission per access shape the library
+    // publishes for it.
+    entry(
+        "AWSRAMEventBridgeEventBusV2FullAccess",
+        "events:EventBus",
+        &[
+            "events:DeleteRule",
+            "events:DescribeEventBus",
+            "events:ListRules",
+            "events:PutEvents",
+            "events:PutRule",
+            "events:PutTargets",
+        ],
+        true,
+    ),
+    entry(
+        "AWSRAMEventBridgeEventBusV2EventSourceAccess",
+        "events:EventBus",
+        &["events:DescribeEventBus", "events:PutEvents"],
+        false,
+    ),
+    entry(
+        "AWSRAMEventBridgeEventBusV2PublishOnly",
+        "events:EventBus",
+        &["events:DescribeEventBus", "events:PutEvents"],
+        false,
+    ),
+    entry(
+        "AWSRAMEventBridgeEventBusV2SubscribeOnly",
+        "events:EventBus",
+        &[
+            "events:DescribeEventBus",
+            "events:ListRules",
+            "events:PutRule",
+            "events:PutTargets",
+        ],
+        false,
+    ),
+    // An Amazon FSx volume.
+    entry(
+        "AWSRAMDefaultPermissionFsx",
+        "fsx:Volume",
+        &["fsx:DescribeFileSystems", "fsx:DescribeVolumes"],
+        true,
+    ),
+    // The AWS Glue and Lake Formation families: one default per Glue resource type, and
+    // the read-write and LF-tag variants the library publishes beside them, each named
+    // for the resource type it is attached to.
+    entry(
+        "AWSRAMDefaultPermissionGlueCatalog",
+        "glue:Catalog",
+        GLUE_CATALOG_READ_ACTIONS,
+        true,
+    ),
+    entry(
+        "AWSRAMPermissionGlueAllTablesReadWriteForCatalog",
+        "glue:Catalog",
+        GLUE_CATALOG_TABLE_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMPermissionGlueDatabaseReadWriteForCatalog",
+        "glue:Catalog",
+        GLUE_CATALOG_DATABASE_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMPermissionGlueTableReadWriteForCatalog",
+        "glue:Catalog",
+        GLUE_CATALOG_TABLE_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMPermissionLFTagGlueDatabaseReadWriteForCatalog",
+        "glue:Catalog",
+        GLUE_CATALOG_DATABASE_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMPermissionLFTagGlueTableReadWriteForCatalog",
+        "glue:Catalog",
+        GLUE_CATALOG_TABLE_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMPermissionGlueAllTablesReadWriteForDatabase",
+        "glue:Database",
+        GLUE_DATABASE_TABLE_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMPermissionGlueTableReadWriteForDatabase",
+        "glue:Database",
+        GLUE_DATABASE_TABLE_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMLFEnabledGlueAllTablesReadWriteForDatabase",
+        "glue:Database",
+        GLUE_DATABASE_TABLE_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMLFEnabledGlueDatabaseReadWrite",
+        "glue:Database",
+        GLUE_DATABASE_TABLE_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMPermissionLFTagGlueDatabaseReadWrite",
+        "glue:Database",
+        GLUE_DATABASE_TABLE_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMPermissionLFTagGlueTableReadWriteForDatabase",
+        "glue:Database",
+        GLUE_DATABASE_TABLE_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMPermissionGlueTableReadWrite",
+        "glue:Table",
+        GLUE_TABLE_PARTITION_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMPermissionGlueDatabaseReadWriteForTable",
+        "glue:Table",
+        GLUE_TABLE_PARTITION_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMLFEnabledGlueDatabaseReadWriteForTable",
+        "glue:Table",
+        GLUE_TABLE_PARTITION_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMLFEnabledGlueTableReadWrite",
+        "glue:Table",
+        GLUE_TABLE_PARTITION_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMPermissionLFTagGlueDatabaseReadWriteForTable",
+        "glue:Table",
+        GLUE_TABLE_PARTITION_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMPermissionLFTagGlueTableReadWrite",
+        "glue:Table",
+        GLUE_TABLE_PARTITION_ACTIONS,
+        false,
+    ),
+    // AWS Network Firewall: the firewall policy's own default, the rule-group variants
+    // published with and without the describe of the shared rule group, the firewall
+    // itself and the container association.
+    entry(
+        "AWSRAMDefaultPermissionNetworkFirewallPolicy",
+        "network-firewall:FirewallPolicy",
+        FIREWALL_POLICY_ACTIONS,
+        true,
+    ),
+    entry(
+        "AWSRAMDefaultPermissionNetworkFirewallStatefulRuleGroup",
+        "network-firewall:StatefulRulegroup",
+        RULE_GROUP_ACTIONS,
+        true,
+    ),
+    entry(
+        "AWSRAMDefaultPermissionNetworkFirewallStatefulRuleGroupWithDescribe",
+        "network-firewall:StatefulRulegroup",
+        RULE_GROUP_WITH_DESCRIBE_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMDefaultPermissionNetworkFirewallStatelessRuleGroup",
+        "network-firewall:StatelessRulegroup",
+        RULE_GROUP_ACTIONS,
+        true,
+    ),
+    entry(
+        "AWSRAMDefaultPermissionNetworkFirewallStatelessRuleGroupWithDescribe",
+        "network-firewall:StatelessRulegroup",
+        RULE_GROUP_WITH_DESCRIBE_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMPermissionNetworkFirewallFirewall",
+        "network-firewall:Firewall",
+        &[
+            "network-firewall:AssociateSubnets",
+            "network-firewall:DescribeFirewall",
+            "network-firewall:ListFirewalls",
+        ],
+        true,
+    ),
+    entry(
+        "AWSRAMDefaultPermissionNetworkFirewallContainerAssociation",
+        "network-firewall:ContainerAssociation",
+        &[
+            "network-firewall:DescribeFirewall",
+            "network-firewall:ListFirewalls",
+        ],
+        true,
+    ),
+    // Oracle Database@AWS resources.
+    entry(
+        "AWSRAMDefaultPermissionODBCloudExadataInfrastructure",
+        "odb:CloudExadataInfrastructure",
+        &[
+            "odb:GetCloudExadataInfrastructure",
+            "odb:ListCloudExadataInfrastructures",
+            "odb:ListDbServers",
+        ],
+        true,
+    ),
+    entry(
+        "AWSRAMDefaultPermissionODBExascaleDbStorageVault",
+        "odb:ExascaleDbStorageVault",
+        &[
+            "odb:GetExascaleDbStorageVault",
+            "odb:ListExascaleDbStorageVaults",
+        ],
+        true,
+    ),
+    entry_at_version(
+        "AWSRAMDefaultPermissionODBNetwork",
+        "odb:OdbNetwork",
+        &["odb:GetOdbNetwork", "odb:ListOdbNetworks"],
+        true,
+        2,
+    ),
+    // AWS Outposts: the permissions published beside the Outpost and site defaults
+    // above, including the one that shares an Outpost's Amazon S3 capacity.
+    entry(
+        "AWSRAMDefaultPermissionOutpostsOutpost",
+        "outposts:Outpost",
+        OUTPOST_ACTIONS,
+        true,
+    ),
+    // The S3 on Outposts capacity of a shared Outpost is governed by its own published
+    // permission, which is that resource type's default.
+    entry_at_version(
+        "AWSRAMDefaultPermissionS3Outposts",
+        "s3-outposts:Outpost",
+        &["s3-outposts:CreateEndpoint", "s3-outposts:ListEndpoints"],
+        true,
+        2,
+    ),
+    entry(
+        "AWSRAMDefaultPermissionOutpostsSite",
+        "outposts:Site",
+        OUTPOSTS_SITE_ACTIONS,
+        true,
+    ),
+    // An Amazon Aurora DB cluster.
+    entry(
+        "AWSRAMDefaultPermissionRDSCluster",
+        "rds:Cluster",
+        &[
+            "rds:DescribeDBClusters",
+            "rds:DescribeDBInstances",
+            "rds:DescribeDBSubnetGroups",
+        ],
+        true,
+    ),
+    // An AWS Migration Hub Refactor Spaces environment.
+    entry_at_version(
+        "AWSRAMDefaultPermissionRefactorSpacesEnvironment",
+        "refactor-spaces:Environment",
+        &[
+            "refactor-spaces:CreateApplication",
+            "refactor-spaces:GetApplication",
+            "refactor-spaces:GetEnvironment",
+            "refactor-spaces:ListApplications",
+        ],
+        true,
+        2,
+    ),
+    // An AWS Resource Explorer view.
+    entry(
+        "AWSRAMPermissionResourceExplorerViews",
+        "resource-explorer-2:View",
+        &[
+            "resource-explorer-2:GetView",
+            "resource-explorer-2:ListViews",
+            "resource-explorer-2:Search",
+        ],
+        true,
+    ),
+    // An Amazon Route 53 profile.
+    entry(
+        "AWSRAMPermissionRoute53ProfileAllowAssociation",
+        "route53profiles:Profile",
+        &[
+            "route53profiles:AssociateProfile",
+            "route53profiles:DisassociateProfile",
+            "route53profiles:GetProfile",
+            "route53profiles:ListProfiles",
+        ],
+        true,
+    ),
+    // The Route 53 Resolver resources the library publishes a permission for beside the
+    // resolver rule above.
+    entry(
+        "AWSRAMDefaultPermissionResolverFirewallRuleGroup",
+        "route53resolver:FirewallRuleGroup",
+        &[
+            "route53resolver:AssociateFirewallRuleGroup",
+            "route53resolver:DisassociateFirewallRuleGroup",
+            "route53resolver:GetFirewallRuleGroup",
+            "route53resolver:ListFirewallRuleGroups",
+        ],
+        true,
+    ),
+    entry(
+        "AWSRAMDefaultPermissionResolverQueryLogConfig",
+        "route53resolver:ResolverQueryLogConfig",
+        &[
+            "route53resolver:AssociateResolverQueryLogConfig",
+            "route53resolver:DisassociateResolverQueryLogConfig",
+            "route53resolver:GetResolverQueryLogConfig",
+            "route53resolver:ListResolverQueryLogConfigs",
+        ],
+        true,
+    ),
+    // An Amazon S3 Access Grants instance.
+    entry(
+        "AWSRAMPermissionAccessGrantsReadAccess",
+        "s3:AccessGrantsInstance",
+        ACCESS_GRANTS_READ_ACTIONS,
+        true,
+    ),
+    entry(
+        "AWSRAMPermissionAccessGrantsControl",
+        "s3:AccessGrantsInstance",
+        &[
+            "s3:CreateAccessGrant",
+            "s3:DeleteAccessGrant",
+            "s3:GetAccessGrantsInstance",
+            "s3:ListAccessGrants",
+        ],
+        false,
+    ),
+    entry(
+        "AWSRAMPermissionAccessGrantsData",
+        "s3:AccessGrantsInstance",
+        &["s3:GetAccessGrantsInstance", "s3:GetDataAccess"],
+        false,
+    ),
+    // Amazon SageMaker AI resources, one default per shareable type and the variants the
+    // library publishes beside each.
+    entry(
+        "AWSRAMPermissionSageMakerFeatureGroupReadOnly",
+        "sagemaker:FeatureGroup",
+        FEATURE_GROUP_READ_ACTIONS,
+        true,
+    ),
+    entry(
+        "AWSRAMPermissionSageMakerFeatureGroupReadWrite",
+        "sagemaker:FeatureGroup",
+        FEATURE_GROUP_WRITE_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMPermissionSageMakerFeatureGroupAdmin",
+        "sagemaker:FeatureGroup",
+        FEATURE_GROUP_WRITE_ACTIONS,
+        false,
+    ),
+    entry(
+        "AWSRAMPermissionSagemakerHubReadOnly",
+        "sagemaker:Hub",
+        HUB_READ_ACTIONS,
+        true,
+    ),
+    entry(
+        "AWSRAMPermissionSagemakerHubReadAndUse",
+        "sagemaker:Hub",
+        &[
+            "sagemaker:DescribeHub",
+            "sagemaker:DescribeHubContent",
+            "sagemaker:ImportHubContent",
+            "sagemaker:ListHubContents",
+        ],
+        false,
+    ),
+    entry(
+        "AWSRAMPermissionSagemakerHubFullAccess",
+        "sagemaker:Hub",
+        &[
+            "sagemaker:DeleteHubContent",
+            "sagemaker:DescribeHub",
+            "sagemaker:DescribeHubContent",
+            "sagemaker:ImportHubContent",
+            "sagemaker:ListHubContents",
+        ],
+        false,
+    ),
+    entry(
+        "AWSRAMDefaultPermissionsSageMakerLineageGroup",
+        "sagemaker:LineageGroup",
+        &[
+            "sagemaker:DescribeLineageGroup",
+            "sagemaker:ListLineageGroups",
+            "sagemaker:QueryLineage",
+        ],
+        true,
+    ),
+    entry(
+        "AWSRAMPermissionMlflowDefaultPolicy",
+        "sagemaker:MlflowTrackingServer",
+        &[
+            "sagemaker:DescribeMlflowTrackingServer",
+            "sagemaker:ListMlflowTrackingServers",
+        ],
+        true,
+    ),
+    entry(
+        "AWSRAMPermissionSageMakerModelCards",
+        "sagemaker:ModelCard",
+        &[
+            "sagemaker:DescribeModelCard",
+            "sagemaker:ListModelCardVersions",
+        ],
+        true,
+    ),
+    entry(
+        "AWSRAMPermissionSageMakerModelCardsAllowExport",
+        "sagemaker:ModelCard",
+        &[
+            "sagemaker:CreateModelCardExportJob",
+            "sagemaker:DescribeModelCard",
+            "sagemaker:DescribeModelCardExportJob",
+        ],
+        false,
+    ),
+    entry(
+        "AWSRAMDefaultPermissionSageMakerModelPackageGroup",
+        "sagemaker:ModelPackageGroup",
+        MODEL_PACKAGE_GROUP_READ_ACTIONS,
+        true,
+    ),
+    entry(
+        "AWSRAMPermissionSageMakerModelPackageGroupAllowDeploy",
+        "sagemaker:ModelPackageGroup",
+        &[
+            "sagemaker:CreateModel",
+            "sagemaker:DescribeModelPackage",
+            "sagemaker:DescribeModelPackageGroup",
+            "sagemaker:ListModelPackages",
+        ],
+        false,
+    ),
+    entry(
+        "AWSRAMPermissionSageMakerModelPackageGroupAllowRegister",
+        "sagemaker:ModelPackageGroup",
+        &[
+            "sagemaker:CreateModelPackage",
+            "sagemaker:DescribeModelPackage",
+            "sagemaker:DescribeModelPackageGroup",
+            "sagemaker:ListModelPackages",
+        ],
+        false,
+    ),
+    entry(
+        "AWSRAMPermissionPartnerAppDefaultPolicy",
+        "sagemaker:PartnerApp",
+        &[
+            "sagemaker:CallPartnerAppApi",
+            "sagemaker:DescribePartnerApp",
+            "sagemaker:ListPartnerApps",
+        ],
+        true,
+    ),
+    entry(
+        "AWSRAMDefaultPermissionSageMakerPipeline",
+        "sagemaker:Pipeline",
+        &[
+            "sagemaker:DescribePipeline",
+            "sagemaker:ListPipelineExecutions",
+        ],
+        true,
+    ),
+    entry(
+        "AWSRAMPermissionSageMakerPipelineAllowExecution",
+        "sagemaker:Pipeline",
+        &[
+            "sagemaker:DescribePipeline",
+            "sagemaker:ListPipelineExecutions",
+            "sagemaker:StartPipelineExecution",
+        ],
+        false,
+    ),
+    // AWS Service Catalog AppRegistry applications and attribute groups.
+    entry(
+        "AWSRAMPermissionServiceCatalogAppRegistryApplicationAllowAssociation",
+        "servicecatalog:Application",
+        &[
+            "servicecatalog:AssociateResource",
+            "servicecatalog:DisassociateResource",
+            "servicecatalog:GetApplication",
+            "servicecatalog:ListAssociatedResources",
+        ],
+        true,
+    ),
+    entry(
+        "AWSRAMPermissionServiceCatalogAppRegistryApplicationReadOnly",
+        "servicecatalog:Application",
+        &[
+            "servicecatalog:GetApplication",
+            "servicecatalog:ListAssociatedResources",
+        ],
+        false,
+    ),
+    entry(
+        "AWSRAMPermissionServiceCatalogAppRegistryAttributeGroupAllowAssociation",
+        "servicecatalog:AttributeGroup",
+        &[
+            "servicecatalog:AssociateAttributeGroup",
+            "servicecatalog:DisassociateAttributeGroup",
+            "servicecatalog:GetAttributeGroup",
+        ],
+        true,
+    ),
+    entry(
+        "AWSRAMPermissionServiceCatalogAppRegistryAttributeGroupReadOnly",
+        "servicecatalog:AttributeGroup",
+        &[
+            "servicecatalog:GetAttributeGroup",
+            "servicecatalog:ListAttributeGroups",
+        ],
+        false,
+    ),
+    // An AWS Cloud Map namespace.
+    entry(
+        "AWSRAMDefaultPermissionServiceDiscoveryNamespace",
+        "servicediscovery:Namespace",
+        SERVICE_DISCOVERY_READ_ACTIONS,
+        true,
+    ),
+    entry(
+        "AWSRAMPermissionCloudMapECSFullPermission",
+        "servicediscovery:Namespace",
+        &[
+            "servicediscovery:CreateService",
+            "servicediscovery:DeleteService",
+            "servicediscovery:DeregisterInstance",
+            "servicediscovery:DiscoverInstances",
+            "servicediscovery:GetNamespace",
+            "servicediscovery:ListServices",
+            "servicediscovery:RegisterInstance",
+        ],
+        false,
+    ),
+    // AWS End User Messaging resources: one published permission per shareable type.
+    entry(
+        "AWSRAMPermissionSMSVoiceOptOutList",
+        "sms-voice:OptOutList",
+        &[
+            "sms-voice:DescribeOptOutLists",
+            "sms-voice:ListOptedOutNumbers",
+            "sms-voice:PutOptedOutNumber",
+        ],
+        true,
+    ),
+    entry(
+        "AWSRAMPermissionSMSVoicePhoneNumber",
+        "sms-voice:PhoneNumber",
+        &[
+            "sms-voice:DescribePhoneNumbers",
+            "sms-voice:SendTextMessage",
+            "sms-voice:SendVoiceMessage",
+        ],
+        true,
+    ),
+    entry(
+        "AWSRAMPermissionSMSVoicePool",
+        "sms-voice:Pool",
+        &["sms-voice:DescribePools", "sms-voice:SendTextMessage"],
+        true,
+    ),
+    entry(
+        "AWSRAMPermissionSMSVoiceRCSAgent",
+        "sms-voice:RcsAgent",
+        &["sms-voice:SendMediaMessage", "sms-voice:SendTextMessage"],
+        true,
+    ),
+    entry(
+        "AWSRAMPermissionSMSVoiceSenderId",
+        "sms-voice:SenderId",
+        &["sms-voice:DescribeSenderIds", "sms-voice:SendTextMessage"],
+        true,
+    ),
+    // AWS Systems Manager resources.
+    entry(
+        "AWSRAMPermissionSsmDocument",
+        "ssm:Document",
+        &[
+            "ssm:DescribeDocument",
+            "ssm:GetDocument",
+            "ssm:ListDocuments",
+            "ssm:SendCommand",
+            "ssm:StartAutomationExecution",
+        ],
+        true,
+    ),
+    entry(
+        "AWSRAMDefaultPermissionSSMParameterReadOnly",
+        "ssm:Parameter",
+        SSM_PARAMETER_READ_ACTIONS,
+        true,
+    ),
+    entry(
+        "AWSRAMPermissionSSMParameterReadOnlyWithHistory",
+        "ssm:Parameter",
+        &[
+            "ssm:GetParameter",
+            "ssm:GetParameterHistory",
+            "ssm:GetParameters",
+        ],
+        false,
+    ),
+    entry(
+        "AWSRAMDefaultPermissionServerManageability",
+        "ssm:ManagedInstance",
+        &[
+            "ssm:DescribeInstanceInformation",
+            "ssm:SendCommand",
+            "ssm:StartSession",
+        ],
+        true,
+    ),
+    entry(
+        "AWSRAMDefaultPermissionSSMContactsContact",
+        "ssm-contacts:Contact",
+        &[
+            "ssm-contacts:GetContact",
+            "ssm-contacts:ListContacts",
+            "ssm-contacts:StartEngagement",
+        ],
+        true,
+    ),
+    entry_at_version(
+        "AWSRAMDefaultPermissionSSMIncidentsResponsePlan",
+        "ssm-incidents:ResponsePlan",
+        &[
+            "ssm-incidents:GetResponsePlan",
+            "ssm-incidents:ListResponsePlans",
+            "ssm-incidents:StartIncident",
+        ],
+        true,
+        2,
+    ),
+    // Amazon VPC Lattice resources beside the service network default above.
+    entry(
+        "AWSRAMPermissionVpcLatticeServiceNetworkReadWrite",
+        "vpc-lattice:ServiceNetwork",
+        &[
+            "vpc-lattice:CreateServiceNetworkServiceAssociation",
+            "vpc-lattice:CreateServiceNetworkVpcAssociation",
+            "vpc-lattice:GetServiceNetwork",
+            "vpc-lattice:ListServiceNetworks",
+        ],
+        true,
+    ),
+    entry(
+        "AWSRAMPermissionVpcLatticeServiceReadWrite",
+        "vpc-lattice:Service",
+        &[
+            "vpc-lattice:CreateServiceNetworkServiceAssociation",
+            "vpc-lattice:GetService",
+            "vpc-lattice:ListServices",
+        ],
+        true,
+    ),
+    entry(
+        "AWSRAMPermissionVpcLatticeResourceConfiguration",
+        "vpc-lattice:ResourceConfiguration",
+        &[
+            "vpc-lattice:CreateResourceEndpointAssociation",
+            "vpc-lattice:GetResourceConfiguration",
+            "vpc-lattice:ListResourceConfigurations",
+        ],
         true,
     ),
 ];
 
-/// One catalog entry, so [`AWS_MANAGED_PERMISSIONS`] reads as the table it is.
+/// One catalog entry, at the version a permission is first published at.
 ///
 /// Every entry the catalog publishes is one a caller may attach to a share of their own
-/// ([`ATTACHABLE_TO_ANY_SHARE`]); the restriction is a per-permission property of the
-/// record ([`super::PermissionRecord::restrict_to_service_linked_shares`]) rather than
-/// of the catalog, so a permission that carries it reports it without the table having
-/// to.
+/// ([`ATTACHABLE_TO_ANY_SHARE`]), which is why neither constructor takes that flag: the
+/// restriction is a per-permission property of the record
+/// ([`super::PermissionRecord::restrict_to_service_linked_shares`]), reported from there
+/// on every summary, and no permission the library publishes today carries it.
+///
+/// An entry written this way records that the library is not known to have revised the
+/// permission ([`AwsManagedPermission::version`]), not that it was checked and found at
+/// the first version; one whose published revision IS known is written with
+/// [`entry_at_version`].
 const fn entry(
     name: &'static str,
     resource_type: &'static str,

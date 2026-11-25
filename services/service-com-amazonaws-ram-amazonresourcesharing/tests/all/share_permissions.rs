@@ -49,9 +49,10 @@ const LICENSE_CONFIGURATION: &str =
     "arn:aws:license-manager:us-west-2:000000000000:license-configuration/lic-0a1b2c3d";
 /// A CodeBuild project: the resource type the customer managed permission below is for.
 const CODEBUILD_PROJECT: &str = "arn:aws:codebuild:us-west-2:000000000000:project/builder";
-/// A customer-owned IP pool: a resource type `ListResourceTypes` reports
+/// A Network Insights access scope: a resource type `ListResourceTypes` reports
 /// (`RESOURCE_TYPES`) that the AWS managed catalog publishes no permission for.
-const COIP_POOL: &str = "arn:aws:ec2:us-west-2:000000000000:coip-pool/ipv4pool-coip-0a1b2c3d";
+const NETWORK_INSIGHTS_ACCESS_SCOPE: &str =
+    "arn:aws:ec2:us-west-2:000000000000:network-insights-access-scope/nis-0a1b2c3d4e5f60718";
 /// An ARN whose resource field carries no separator, so it names no resource type at
 /// all (`Resource$type`) — a Glue data catalog, one of the resource types this service
 /// can share (`RESOURCE_TYPES`).
@@ -235,7 +236,7 @@ async fn a_share_reports_the_permissions_it_was_created_with_and_the_defaults_of
         AttachCase {
             case: "a resource type the catalog publishes no permission for",
             permission_arns: vec![],
-            resource_arns: vec![COIP_POOL],
+            resource_arns: vec![NETWORK_INSIGHTS_ACCESS_SCOPE],
             expected: vec![],
         },
         AttachCase {
