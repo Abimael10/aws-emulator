@@ -216,9 +216,8 @@ async fn described_counts(
 }
 
 /// One Capacity Reservation written straight into the store, for the states and the clocks
-/// no implemented operation puts a reservation in: nothing cancels a reservation yet
-/// (`CancelCapacityReservation` is still a scaffold) and a create refuses an end date in
-/// the past, so a row that needs one seeds it here. Every other row goes over the wire.
+/// no implemented operation puts a reservation in: a create refuses an end date in the past,
+/// so a row that needs one seeds it here. Every other row goes over the wire.
 fn seed_side(
     engine: &engine::InMemoryEngine,
     state: &'static str,

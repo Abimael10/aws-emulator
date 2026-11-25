@@ -2,9 +2,10 @@
 
 //! @op CancelCapacityReservation
 //! IMPLEMENTED: cancels the Capacity Reservation the request names — the reservation
-//! [`crate::state`] holds moves to `cancelled` and the interruptible allocation it is
-//! either side of is released, its capacity going back to the source reservation. This is
-//! the ONLY file to touch for this operation.
+//! [`crate::state`] holds moves to `cancelled`, through the `cancelling` the charges of a
+//! cancellation inside a commitment duration are applied in, and the interruptible
+//! allocation it is either side of is released, its capacity going back to the source
+//! reservation. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -216,6 +217,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|end_date| ::std::time::SystemTime::try_from(end_date).ok())
             .is_some_and(|end_date| end_date > now);
 
+        // Whether the cancel has a charge to apply, which is what a quote pays for and what
+        // the reservation then winds the commitment down through: a live commitment is
+        // charged for, EXCEPT where the state the reservation is in waives it — "`delayed` —
+        // the commitment duration is waived, so no cancellation charge applies" (this
+        // operation's own doc), so a delayed reservation is cancelled with no quote and
+        // nothing to wind down, exactly like one whose commitment has elapsed.
+        let charges_apply = within_commitment
+            && reservation_state != state::CAPACITY_RESERVATION_STATE_DELAYED;
+
         // "The ID of the cancellation quote to use for the cancellation … The cancellation
         // quote must be in an active state" (`$QuoteId`): a quote generated for another
         // reservation, or one that is not usable, cannot pay for this cancellation. The id's
@@ -254,14 +264,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Use CreateCapacityReservationCancellationQuote to generate a quote, then pass the
         // quote ID with ApplyCancellationCharges set to `commitment-wind-down`" — both of
-        // them, for a reservation still inside its commitment.
-        if within_commitment && input.quote_id.is_none() {
+        // them, for a reservation whose cancellation is charged for.
+        if charges_apply && input.quote_id.is_none() {
             return Err(state::missing_parameter(format!(
                 "The request must contain the parameter quoteId: the Capacity Reservation \
                  '{reservation_id}' is within its commitment duration"
             )));
         }
-        if within_commitment
+        if charges_apply
             && input.apply_cancellation_charges.as_deref()
                 != Some(state::APPLY_CANCELLATION_CHARGES_COMMITMENT_WIND_DOWN)
         {
@@ -285,8 +295,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Cancels the specified Capacity Reservation, releases the reserved capacity, and
         // changes the Capacity Reservation's state to `cancelled`", through the ONE place
         // this crate writes that transition — which is also what releases the interruptible
-        // allocation this reservation is either side of.
-        if !store.cancel_capacity_reservation(&reservation_id) {
+        // allocation this reservation is either side of. A cancel that applies charges gets
+        // there through `cancelling`: "The Capacity Reservation transitions to `cancelling`
+        // while charges are applied" (this operation's own doc), so the caller sees the state
+        // the charges are applied in and the clock moves the reservation on from it.
+        let cancelled = if charges_apply {
+            store.wind_down_capacity_reservation(&reservation_id)
+        } else {
+            store.cancel_capacity_reservation(&reservation_id)
+        };
+        if !cancelled {
             return Err(Scaffolded::internal_error(format!(
                 "the Capacity Reservation '{reservation_id}' could not be read back to \
                  cancel it"

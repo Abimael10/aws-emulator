@@ -2390,6 +2390,16 @@ pub enum CapacityReservationMove {
     /// allocated to it — the completion of the `canceling` move a cancellation starts on the
     /// SOURCE reservation, after which the capacity is the source's again.
     AllocationCanceled,
+    /// `cancelling` -> `cancelled`: the cancellation charges of a reservation cancelled inside
+    /// its commitment duration have been applied, so the reservation reaches the terminal
+    /// state of a cancel — "The Capacity Reservation transitions to `cancelling` while charges
+    /// are applied" (`CancelCapacityReservation`), and it is `cancelled` once they are.
+    ///
+    /// Carries [`Self::AllocationCanceled`] with it: a cancel of a source reservation releases
+    /// the interruptible allocation it carries in the same call, so that allocation's terminal
+    /// status falls due at the same instant as the reservation's own terminal state, and one
+    /// move owes both rather than the record's single slot having to hold two.
+    Cancelled,
 }
 
 /// The move the clock owes one Capacity Reservation: a [`ClockTransition`] to the next
@@ -2432,6 +2442,10 @@ impl CapacityReservationRecord {
     ///   fell due at the WALL-clock instant its [`CapacityReservationTransition`] names
     ///   ([`ClockTransition::at`], which is what `now` is compared against here), whether or
     ///   not anybody called again.
+    /// * The end of a cancellation that applies charges: a reservation cancelled inside its
+    ///   commitment duration "transitions to `cancelling` while charges are applied"
+    ///   (`CancelCapacityReservation`) and is `cancelled` from the instant that move fell due,
+    ///   again whether or not anybody called again.
     /// * The delivery of a reservation held for a date: one that is `scheduled` is
     ///   "scheduled for delivery on the requested start date" (`CapacityReservation$State`),
     ///   so it is `active` from that date on. Those are the future-dated reservations, which
@@ -2454,8 +2468,14 @@ impl CapacityReservationRecord {
             && self.pending.as_ref().is_some_and(|pending| {
                 matches!(pending.to, CapacityReservationMove::Scheduled) && now >= pending.at
             });
+        let charges_applied = stored == CAPACITY_RESERVATION_STATE_CANCELLING
+            && self.pending.as_ref().is_some_and(|pending| {
+                matches!(pending.to, CapacityReservationMove::Cancelled) && now >= pending.at
+            });
         let stored = if assessed {
             CAPACITY_RESERVATION_STATE_SCHEDULED
+        } else if charges_applied {
+            CAPACITY_RESERVATION_STATE_CANCELLED
         } else {
             stored
         };
@@ -2520,6 +2540,19 @@ impl CapacityReservationRecord {
                 allocation.instance_count = allocation.target_instance_count;
             }
             Some(CapacityReservationMove::AllocationCanceled) => {
+                allocation.status = Some(INTERRUPTIBLE_ALLOCATION_STATUS_CANCELED.to_string());
+                allocation.instance_count = Some(0);
+            }
+            // A cancel that applied charges released the allocation this reservation carried
+            // in the same call, so the allocation is in its terminal status from the instant
+            // the reservation's own terminal state falls due
+            // ([`CapacityReservationMove::Cancelled`]). An allocation already past that is
+            // left where it is: a release is written once, however many times either side of
+            // it is cancelled.
+            Some(CapacityReservationMove::Cancelled)
+                if allocation.status.as_deref()
+                    == Some(INTERRUPTIBLE_ALLOCATION_STATUS_CANCELING) =>
+            {
                 allocation.status = Some(INTERRUPTIBLE_ALLOCATION_STATUS_CANCELED.to_string());
                 allocation.instance_count = Some(0);
             }

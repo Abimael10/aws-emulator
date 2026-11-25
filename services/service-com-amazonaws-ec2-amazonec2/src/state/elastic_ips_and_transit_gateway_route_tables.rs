@@ -274,15 +274,19 @@ impl ComAmazonawsEc2Amazonec2State {
         record.view.available_instance_count = Some(instance_count.saturating_sub(used).max(0));
     }
 
-    /// Cancel the Capacity Reservation `capacity_reservation_id` names, and answer whether
-    /// the store held one.
+    /// Cancel the Capacity Reservation `capacity_reservation_id` names with NO cancellation
+    /// charge to apply, and answer whether the store held one.
     ///
     /// "Cancels the specified Capacity Reservation, releases the reserved capacity, and
     /// changes the Capacity Reservation's state to `cancelled`"
-    /// (`CancelCapacityReservation`): the ONE place that transition is written, so the
-    /// operation that cancels and every reader of a cancelled reservation agree on what it
-    /// holds. The reserved capacity stays the reservation's own count — "the total number of
-    /// instances for which the Capacity Reservation reserves capacity"
+    /// (`CancelCapacityReservation`): the state a cancel ends in, reached in this call for a
+    /// reservation with nothing to charge for — one that committed to nothing, one whose
+    /// "commitment duration has elapsed" and one whose commitment is waived (same doc). A
+    /// cancel that winds a live commitment down goes through
+    /// [`Self::wind_down_capacity_reservation`] instead, and both share the one writer below,
+    /// so the operation that cancels and every reader of a cancelled reservation agree on
+    /// what it holds. The reserved capacity stays the reservation's own count — "the total
+    /// number of instances for which the Capacity Reservation reserves capacity"
     /// (`CapacityReservation$TotalInstanceCount`) is what was reserved, whatever state the
     /// reservation ends in.
     ///
@@ -294,6 +298,30 @@ impl ComAmazonawsEc2Amazonec2State {
     /// allocated capacity is the source's again and the allocation reaches its terminal
     /// status on the clock.
     pub fn cancel_capacity_reservation(&mut self, capacity_reservation_id: &str) -> bool {
+        self.write_capacity_reservation_cancellation(capacity_reservation_id, false)
+    }
+
+    /// Cancel the Capacity Reservation `capacity_reservation_id` names with its cancellation
+    /// CHARGES applied, and answer whether the store held one.
+    ///
+    /// The same cancellation [`Self::cancel_capacity_reservation`] writes, reached by a
+    /// cancel that winds a commitment down: "The Capacity Reservation transitions to
+    /// `cancelling` while charges are applied" (`CancelCapacityReservation`), so the
+    /// reservation is reported in that state until the move to `cancelled` the clock owes it
+    /// falls due ([`CapacityReservationMove::Cancelled`]) rather than reaching the terminal
+    /// state in the same instant the charges start being applied.
+    pub fn wind_down_capacity_reservation(&mut self, capacity_reservation_id: &str) -> bool {
+        self.write_capacity_reservation_cancellation(capacity_reservation_id, true)
+    }
+
+    /// The ONE writer behind [`Self::cancel_capacity_reservation`] and
+    /// [`Self::wind_down_capacity_reservation`]: `charges_applied` says whether the cancel
+    /// winds a commitment down, which is the only thing the two differ in.
+    fn write_capacity_reservation_cancellation(
+        &mut self,
+        capacity_reservation_id: &str,
+        charges_applied: bool,
+    ) -> bool {
         let Some(record) = self.capacity_reservations.get(capacity_reservation_id) else {
             return false;
         };
@@ -312,6 +340,20 @@ impl ComAmazonawsEc2Amazonec2State {
         }
         if carries_allocation {
             self.release_interruptible_allocation(capacity_reservation_id);
+        }
+        // A cancel that applies charges spends the record's one `pending` slot on the move to
+        // `cancelled` those charges end in, whatever it held: a source whose allocation was
+        // just released above is owed that allocation's terminal status at the same instant,
+        // and [`CapacityReservationMove::Cancelled`] carries BOTH — the state the charges end
+        // in and the terminal status of the allocation this very call released — so neither
+        // move is dropped and no reservation is parked in a state nothing moves it out of.
+        if charges_applied {
+            if let Some(record) = self.capacity_reservations.get_mut(capacity_reservation_id) {
+                record.view.state = Some(CAPACITY_RESERVATION_STATE_CANCELLING.to_string());
+                record.pending = Some(ClockTransition::starting_now(
+                    CapacityReservationMove::Cancelled,
+                ));
+            }
         }
         true
     }

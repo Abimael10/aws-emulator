@@ -2052,6 +2052,27 @@ impl ComAmazonawsEc2Amazonec2State {
                 CapacityReservationMove::Scheduled => {
                     record.view.state = Some(CAPACITY_RESERVATION_STATE_SCHEDULED.to_string());
                 }
+                CapacityReservationMove::Cancelled => {
+                    // The end of a cancellation that applied charges: the reservation left
+                    // the states it was billing in through `cancelling`, and the charges have
+                    // now been applied, so it is in the terminal state a cancel ends in —
+                    // with the allocation that same cancel released in its own terminal
+                    // status, which fell due at this instant too.
+                    record.view.state = Some(CAPACITY_RESERVATION_STATE_CANCELLED.to_string());
+                    if let Some(allocation) = record
+                        .view
+                        .interruptible_capacity_allocation
+                        .as_mut()
+                        .filter(|allocation| {
+                            allocation.status.as_deref()
+                                == Some(INTERRUPTIBLE_ALLOCATION_STATUS_CANCELING)
+                        })
+                    {
+                        allocation.status =
+                            Some(INTERRUPTIBLE_ALLOCATION_STATUS_CANCELED.to_string());
+                        allocation.instance_count = Some(0);
+                    }
+                }
                 CapacityReservationMove::AllocationActive => {
                     if let Some(allocation) = record.view.interruptible_capacity_allocation.as_mut()
                     {
