@@ -188,7 +188,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(over_tag_limit());
         }
         // The documented key rule ("Tag key names cannot start with \"aws\"") is the one
-        // the create path applies to the same map, so it is applied by the same helper.
+        // the create path applies to the same map, so it is applied — and worded — by the
+        // same helper.
         let supplied = st::rule_tags_from(Some(&input.tags)).map_err(invalid)?;
 
         let Some(state) = st::service_state(&*self.engine) else {

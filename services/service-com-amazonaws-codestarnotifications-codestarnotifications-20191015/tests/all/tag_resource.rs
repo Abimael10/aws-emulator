@@ -316,57 +316,248 @@ async fn tagging_an_absent_rule_is_a_404_over_the_submitted_arn() {
     );
 }
 
-/// RULE: a tag key name may not start with `aws` — the rule the API documents for this
-/// member ("Tag key names cannot start with \"aws\"") — and a refused call tags nothing.
+/// The refusal text the service states for submitted keys carrying the reserved prefix:
+/// one fixed sentence, whose ONLY variable part is the bracketed list of those keys. The
+/// list here is written out literally rather than taken from the service, so the wording
+/// is asserted and not merely echoed.
+fn reserved_message(keys: &[&str]) -> String {
+    format!(
+        "One or more of the following tag keys is reserved: [{}]. Tag keys cannot begin \
+         with the characters \"aws:\". For more information, see the AWS CodeStar \
+         Notifications API Reference.",
+        keys.join(", ")
+    )
+}
+
+/// One row of the reserved-key table: the case, the tags the call supplies, and the keys
+/// the refusal must list.
+type ReservedRow<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
+
+/// RULE: a tag key that begins with the reserved prefix `aws:` is refused with HTTP 400
+/// `ValidationException` stating the service's one text for the class, naming EVERY
+/// submitted key that carries the prefix, and a refused call tags nothing.
 ///
-/// The rows differ in the casing of the prefix and in what follows it, plus the keys that
-/// merely CONTAIN the prefix, which are accepted.
+/// The rows differ in how many submitted keys carry the prefix, how many ordinary keys
+/// travel beside them, what follows the prefix, and the casing of the prefix — the
+/// dimensions the refusal generalises over; the expected list is the submitted keys as
+/// submitted, in key order.
 #[tokio::test]
-async fn a_tag_key_starting_with_aws_is_refused() {
+async fn a_tag_key_carrying_the_reserved_prefix_is_refused_in_the_services_words() {
+    // (case, tags supplied, the keys the refusal must list)
+    let rows: &[ReservedRow] = &[
+        (
+            "one reserved key",
+            &[("aws:reserved", "nope")],
+            &["aws:reserved"],
+        ),
+        (
+            "a reserved key naming an AWS-managed namespace",
+            &[("aws:cloudformation:stack-name", "stack")],
+            &["aws:cloudformation:stack-name"],
+        ),
+        (
+            "a reserved key beside an ordinary one",
+            &[("aws:owner", "x"), ("team", "dev")],
+            &["aws:owner"],
+        ),
+        (
+            "two reserved keys, listed in key order",
+            &[("aws:second", "2"), ("aws:first", "1")],
+            &["aws:first", "aws:second"],
+        ),
+        (
+            "every submitted key reserved, beside two ordinary ones",
+            &[
+                ("aws:c", "3"),
+                ("aws:a", "1"),
+                ("env", "prod"),
+                ("aws:b", "2"),
+                ("owner", "platform"),
+            ],
+            &["aws:a", "aws:b", "aws:c"],
+        ),
+        (
+            "the prefix spelled in upper case",
+            &[("AWS:Owner", "x")],
+            &["AWS:Owner"],
+        ),
+        (
+            "the prefix with nothing after it",
+            &[("aws:", "x")],
+            &["aws:"],
+        ),
+    ];
+
     let emulator = Emulator::new();
     let created = emulator
         .ok("reserved", "/createNotificationRule", &create_body("reserved", &[]))
         .await;
     let arn = string(&created, "Arn");
 
-    for key in ["aws", "aws:cloudformation:stack-name", "AWS-owned", "AwsTeam"] {
+    for (case, supplied, listed) in rows {
         let (status, body) = emulator
             .post(
                 "/tagResource",
-                &json!({ "Arn": arn, "Tags": { key: "x" } }),
+                &json!({
+                    "Arn": arn,
+                    "Tags": Value::Object(
+                        supplied
+                            .iter()
+                            .map(|(key, value)| ((*key).to_string(), json!(value)))
+                            .collect(),
+                    ),
+                }),
             )
             .await;
         assert_eq!(
             status, 400,
-            "case {key:?}: expected 400, got {status} with {body}"
+            "case {case:?}: expected 400, got {status} with {body}"
         );
-        assert_eq!(error_code(&body), "ValidationException", "case {key:?}: got {body}");
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: got {body}"
+        );
+        let stated = message(&body);
+        let expected = reserved_message(listed);
+        assert_eq!(
+            stated, expected,
+            "case {case:?}: expected {expected:?}, got {stated:?}"
+        );
     }
 
-    for key in ["team-aws", "lawsuit", "my-aws-thing"] {
+    // A refused call tags NOTHING: not the reserved key, and not the ordinary keys that
+    // travelled beside it.
+    let described = emulator
+        .ok("reserved", "/describeNotificationRule", &json!({ "Arn": arn }))
+        .await;
+    assert_eq!(
+        tags_of(&described),
+        BTreeMap::new(),
+        "a refused tagging must have stored nothing, got {described}"
+    );
+}
+
+/// RULE: only the four characters `aws:` are reserved, so a key that begins with the
+/// letters `aws` without the colon — or carries the prefix anywhere but at the start — is
+/// an ordinary key: it is accepted, stored, and read back through
+/// `ListTagsForResource`.
+///
+/// The rows differ in where the letters sit in the key and in their casing. Each key
+/// stays inside `TagKey` (`@length(min: 1, max: 128)`, pattern
+/// `^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`).
+#[tokio::test]
+async fn a_tag_key_that_only_resembles_the_reserved_prefix_is_accepted() {
+    let keys = [
+        "aws",
+        "awsome",
+        "AWSteam",
+        "awsome-team",
+        "aws-owner",
+        "aws.account",
+        "aws/team",
+        "team-aws",
+        "lawsuit",
+        "my-aws-thing",
+        "team:aws:owner",
+    ];
+
+    let emulator = Emulator::new();
+    let created = emulator
+        .ok("accepted", "/createNotificationRule", &create_body("accepted", &[]))
+        .await;
+    let arn = string(&created, "Arn");
+
+    let mut expected = BTreeMap::new();
+    for key in keys {
         let tagged = emulator
             .ok(
                 key,
                 "/tagResource",
-                &json!({ "Arn": arn, "Tags": { key: "x" } }),
+                &json!({ "Arn": arn, "Tags": { key: "ok" } }),
             )
             .await;
-        assert!(
-            tags_of(&tagged).contains_key(key),
-            "case {key:?}: a key that merely contains the prefix is accepted, got {tagged}"
+        expected.insert(key.to_string(), "ok".to_string());
+        assert_eq!(
+            tags_of(&tagged),
+            expected,
+            "case {key:?}: a key outside the reserved prefix is accepted, got {tagged}"
         );
     }
 
-    // None of the refused keys reached the rule.
-    let described = emulator
-        .ok("reserved", "/describeNotificationRule", &json!({ "Arn": arn }))
+    // Round trip: the rule holds every accepted key, as the tag listing reports it.
+    let listed = emulator
+        .ok("accepted", "/listTagsForResource", &json!({ "Arn": arn }))
         .await;
-    for key in tags_of(&described).keys() {
-        assert!(
-            !key.to_ascii_lowercase().starts_with("aws"),
-            "a refused key must not have been stored, got {described}"
+    assert_eq!(
+        tags_of(&listed),
+        expected,
+        "the listing must report every accepted key, got {listed}"
+    );
+}
+
+/// RULE: the reserved-prefix test and its wording belong to the tag map, not to one
+/// operation, so the CREATE path refuses the same keys with the same sentence and accepts
+/// the same ordinary ones.
+#[tokio::test]
+async fn the_create_path_states_the_same_reserved_key_refusal() {
+    let emulator = Emulator::new();
+
+    for (index, (case, supplied, listed)) in [
+        (
+            "one reserved key",
+            &[("aws:created-by", "cfn")][..],
+            &["aws:created-by"][..],
+        ),
+        (
+            "two reserved keys beside an ordinary one",
+            &[("aws:b", "2"), ("team", "dev"), ("aws:a", "1")][..],
+            &["aws:a", "aws:b"][..],
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let (status, body) = emulator
+            .post(
+                "/createNotificationRule",
+                &create_body(&format!("create-reserved-{index}"), supplied),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status} with {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: got {body}"
+        );
+        let stated = message(&body);
+        let expected = reserved_message(listed);
+        assert_eq!(
+            stated, expected,
+            "case {case:?}: expected {expected:?}, got {stated:?}"
         );
     }
+
+    // The same create, with keys that only resemble the prefix, carries its tags.
+    let created = emulator
+        .ok(
+            "create accepted",
+            "/createNotificationRule",
+            &create_body("create-accepted", &[("awsome", "yes"), ("AWSteam", "yes")]),
+        )
+        .await;
+    let arn = string(&created, "Arn");
+    let listed = emulator
+        .ok("create accepted", "/listTagsForResource", &json!({ "Arn": arn }))
+        .await;
+    assert_eq!(
+        tags_of(&listed),
+        tag_map(&[("AWSteam", "yes"), ("awsome", "yes")]),
+        "the created rule must hold the accepted keys, got {listed}"
+    );
 }
 
 /// RULE: a rule holds a bounded number of tags, so a caller cannot grow one without

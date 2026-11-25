@@ -761,19 +761,58 @@ pub fn rule_targets_from(
     Ok(normalized)
 }
 
+/// The character sequence a tag key may not begin with, because the service keeps the
+/// keys carrying it for itself.
+///
+/// `Tags` documents the condition as "Key names cannot start with \"aws\"", and the
+/// service's own refusal names the characters it reserves: the four characters `aws:`.
+/// A key that merely begins with the letters `aws` and no colon (`awsome`) is an ordinary
+/// caller key, so only the colon-terminated prefix is reserved.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether a submitted tag key carries [`RESERVED_TAG_KEY_PREFIX`] — the one test every
+/// tagging path applies to a key.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.to_ascii_lowercase()
+        .starts_with(RESERVED_TAG_KEY_PREFIX)
+}
+
+/// How this service states that a request named tag keys it keeps for itself: ONE text
+/// for the class, so every tagging path words the refusal the same way. The only variable
+/// part is the list of submitted keys that carry the reserved prefix, in key order.
+pub fn reserved_tag_keys(keys: &[String]) -> String {
+    format!(
+        "One or more of the following tag keys is reserved: [{}]. \
+         Tag keys cannot begin with the characters \"{RESERVED_TAG_KEY_PREFIX}\". \
+         For more information, see the AWS CodeStar Notifications API Reference.",
+        keys.join(", ")
+    )
+}
+
 /// The tags a rule stores, refusing the key names the API documents as reserved.
 ///
 /// `CreateNotificationRule$Tags`: "A list of tags to apply to this notification rule.
-/// Key names cannot start with \"aws\"."
+/// Key names cannot start with \"aws\"." — the keys the service keeps for itself are the
+/// ones carrying [`RESERVED_TAG_KEY_PREFIX`], and the refusal names EVERY submitted key
+/// that carries it rather than stopping at the first.
+///
+/// `Err` carries the reason, which each handler words in its own modelled error.
 pub fn rule_tags_from(
     tags: Option<&HashMap<String, String>>,
 ) -> Result<BTreeMap<String, String>, String> {
     let mut stored = BTreeMap::new();
     for (key, value) in tags.into_iter().flatten() {
-        if key.to_ascii_lowercase().starts_with("aws") {
-            return Err(format!("Tags key names cannot start with \"aws\": {key}"));
-        }
         stored.insert(key.clone(), value.clone());
+    }
+    // `stored` is key-ordered, so which keys the refusal lists — and in which order — does
+    // not depend on the order the request's map happened to iterate in.
+    let reserved: Vec<String> = stored
+        .keys()
+        .filter(|key| is_reserved_tag_key(key))
+        .cloned()
+        .collect();
+    if !reserved.is_empty() {
+        return Err(reserved_tag_keys(&reserved));
     }
     Ok(stored)
 }

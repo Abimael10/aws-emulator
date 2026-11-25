@@ -616,7 +616,9 @@ async fn a_second_rule_with_a_taken_name_is_a_conflict() {
     }
 }
 
-/// `Tags` key names cannot start with "aws" (`CreateNotificationRule$Tags`).
+/// `Tags` key names cannot start with the characters "aws:", which the service keeps for
+/// itself (`CreateNotificationRule$Tags`) — a key that merely begins with the letters
+/// `aws` is an ordinary key.
 #[tokio::test]
 async fn a_reserved_tag_key_is_refused_and_an_allowed_one_is_kept() {
     let emulator = Emulator::new();
@@ -624,9 +626,10 @@ async fn a_reserved_tag_key_is_refused_and_an_allowed_one_is_kept() {
     for (index, (key, allowed)) in [
         ("Team", true),
         ("env", true),
-        ("awsome", false),
+        ("awsome", true),
+        ("AWS", true),
         ("aws:created-by", false),
-        ("AWS", false),
+        ("AWS:Managed", false),
     ]
     .iter()
     .enumerate()
@@ -648,7 +651,7 @@ async fn a_reserved_tag_key_is_refused_and_an_allowed_one_is_kept() {
         } else {
             assert_eq!(
                 status, 400,
-                "case {key:?}: a key starting with \"aws\" is refused, got {status} with {parsed}"
+                "case {key:?}: a key starting with \"aws:\" is refused, got {status} with {parsed}"
             );
             assert_eq!(
                 error_code(&parsed),
