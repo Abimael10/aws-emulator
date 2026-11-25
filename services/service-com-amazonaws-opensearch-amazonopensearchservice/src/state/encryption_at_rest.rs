@@ -10,9 +10,9 @@
 //! "the KMS key ID" (`…,member="KmsKeyId"`). A domain whose encryption at rest is enabled
 //! is provisioned THROUGH that key, so the service ACCESSES the key before the
 //! configuration is accepted: it asks KMS for the key the container names, and a key KMS
-//! does not answer for, or answers for in any key state but `Enabled`, encrypts nothing —
-//! so the request is refused with the operation's `ValidationException` (HTTP 400) and
-//! nothing is stored.
+//! does not answer for, answers for as a key that does not encrypt data, or answers for in
+//! any key state but `Enabled`, encrypts nothing — so the request is refused with the
+//! operation's `ValidationException` (HTTP 400) and nothing is stored.
 //!
 //! What the model cannot say, and this module does, is that `KmsKeyId` is a REFERENCE to
 //! another service's resource rather than a free string. A KMS key is a regional resource:
@@ -20,9 +20,17 @@
 //! names no key the domain's own endpoint can reach — which is why the Region is not a case
 //! of its own here but the ordinary outcome of asking KMS at the domain's Region.
 //!
-//! The two refusals a caller sees are the two things that can go wrong with accessing the
-//! key, and both are reported under the one sentence this service states them in — "Error
-//! in Accessing KmsKeyID with details:" followed by the detail:
+//! A key KMS DOES answer for encrypts the domain's data only if it is a key that encrypts
+//! data at all: encryption at rest is symmetric encryption of the domain's own storage, so
+//! the key has to be a symmetric encryption KMS key — a key whose material is a symmetric
+//! key and whose usage is encryption and decryption. A key pair encrypts under a public half
+//! outside KMS and a key of any other usage performs another operation altogether, so
+//! neither can be the key a domain's storage is encrypted under, whatever key state it is in
+//! ([`not_symmetric`]).
+//!
+//! The refusals a caller sees are the things that can go wrong with accessing the key, and
+//! all of them are reported under the one sentence this service states them in — "Error in
+//! Accessing KmsKeyID with details:" followed by the detail:
 //!
 //! * the KMS call FAILED, and the detail is what KMS answered: its own message, closed by
 //!   the exception trailer an Amazon Web Services SDK appends to a service exception — the
@@ -30,10 +38,13 @@
 //!   error code are KMS's own ([`kms_store`]), so a caller is told the same thing by
 //!   whichever service it asked, and the id is minted per call because it identifies THAT
 //!   attempt to access the key.
-//! * the KMS call SUCCEEDED and the key it answered for is not in the one key state the
-//!   domain can be encrypted with, which is this service's own statement about the key it
-//!   resolved ([`not_in_enabled_state`]) rather than anything KMS refused — so it carries
-//!   no exception trailer.
+//! * the KMS call SUCCEEDED and the key it answered for is not a key the domain's data can
+//!   be encrypted under at all ([`not_symmetric`]), or is such a key but not in the one key
+//!   state the domain can be encrypted with ([`not_in_enabled_state`]). Both are this
+//!   service's own statement about the key it resolved rather than anything KMS refused — so
+//!   neither carries an exception trailer. What the key IS comes before what state it
+//!   happens to be in: a key of the wrong kind could never encrypt the domain, whichever
+//!   state its owner moves it to.
 //!
 //! The key is resolved in the KMS service's own store, reached through the SAME shared
 //! engine this service's handlers reach their own store through — the store
@@ -115,6 +126,14 @@ pub fn kms_key_refusal<Eng: Send + Sync + 'static>(
     let store = kms_store::service_state(engine)?;
     let keys = store.lock();
     let detail = match keys.resolve(region, requested) {
+        // The key EXISTS and is not a symmetric encryption KMS key: a key pair, or a key
+        // whose usage is some operation other than encryption and decryption. No such key
+        // encrypts a domain's storage, so it is refused before its key state is weighed at
+        // all. KMS refused nothing, so the caller is told this service's own statement about
+        // the key it accessed, named by the ARN KMS answered for it.
+        kms_store::KeyRef::Found(key) if !key.is_symmetric_encryption() => {
+            not_symmetric(&key.arn)
+        }
         // The key KMS answered for, in the key state the domain can be encrypted with:
         // the configuration the request asks for is one the service can provision.
         kms_store::KeyRef::Found(key)
@@ -212,6 +231,16 @@ fn aws_managed_key_arn<Eng: Send + Sync + 'static>(engine: &Eng, region: &str) -
     let mut keys = state.lock();
     keys.associate_predefined_aws_alias(region, AWS_MANAGED_KEY_ALIAS)
         .map(|key| key.arn.clone())
+}
+
+/// The detail for a key KMS answered for that is not a key a domain's data can be encrypted
+/// under: the key, by the ARN KMS named it, and what a key used for encryption at rest has to
+/// be — so every kind of key outside that one is stated the same way.
+fn not_symmetric(arn: &str) -> String {
+    format!(
+        "KmsKeyID:{arn} is not a Symmetric CMK. Only Symmetric CMKs may be used for \
+         encryption at rest."
+    )
 }
 
 /// The detail for a key KMS answered for whose key state is not the one a domain's
