@@ -1254,8 +1254,9 @@ async fn a_call_against_an_absent_group_is_refused() {
 // the instance id) is passed back through `CompleteLifecycleAction`, with
 // `RecordLifecycleActionHeartbeat` keeping it waiting, or until the hook's heartbeat runs
 // out and the hook's own `DefaultResult` is applied. A launch that carries on then comes
-// into service, a launch that is abandoned leaves the group, and a termination resumes
-// either way.
+// came into service, a launch that is abandoned leaves the group — and the group, still
+// configured for the capacity it was launched for, launches another instance in its place,
+// which the hook holds in turn — and a termination resumes either way.
 //
 // The rows span what that rule generalises over: WHICH transition is held, HOW the hold
 // ends (the instance id, the token, a heartbeat and then the token, or the hook's own
@@ -1287,8 +1288,14 @@ const HOLD_TEMPLATE: &str = "lt-hold";
 const HOLD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 const HOLD_POLL: std::time::Duration = std::time::Duration::from_millis(25);
 
-/// The one instance the group holds and the `LifecycleState` it is reported in, or `None`
-/// when the group holds none.
+/// The one instance the group holds that counts towards its capacity, and the
+/// `LifecycleState` it is reported in — or the one on its way out when that is all it holds,
+/// and `None` when it holds none at all.
+///
+/// A member on its way OUT does not count against that ONE: a launch the hook abandoned is
+/// reported `Terminating` until it has left the group, and the instance the group launches
+/// in its place is the one it goes on holding, so the two are reported side by side for the
+/// span the first takes to leave.
 async fn held_instance(router: &MultiServiceRouter, group: &str) -> Option<(String, String)> {
     let (status, body) = query(
         router,
@@ -1300,14 +1307,24 @@ async fn held_instance(router: &MultiServiceRouter, group: &str) -> Option<(Stri
         status, 200,
         "the group {group:?} must be readable, got {status} with {body:?}"
     );
-    let ids = tag_values(&body, "InstanceId");
+    let members: Vec<(String, String)> = tag_values(&body, "InstanceId")
+        .into_iter()
+        .zip(tag_values(&body, "LifecycleState"))
+        .collect();
+    let staying: Vec<(String, String)> = members
+        .iter()
+        .filter(|(_, state)| !state.starts_with("Terminating") && !state.starts_with("Detach"))
+        .cloned()
+        .collect();
     assert!(
-        ids.len() <= 1,
-        "every group of this table holds at most one instance, got {ids:?}"
+        staying.len() <= 1,
+        "every group of this table holds at most one instance that is not on its way out, \
+         got {members:?}"
     );
-    ids.into_iter()
+    staying
+        .into_iter()
         .next()
-        .map(|id| (id, tag_value(&body, "LifecycleState")))
+        .or_else(|| members.into_iter().next())
 }
 
 /// Look at the group until it reports `expected` for the one instance it holds — `None`
@@ -1407,6 +1424,10 @@ struct HoldRow {
     /// What the group must report for the instance once the hold has ended and settled:
     /// `None` for an instance that left the group.
     settles_at: Option<&'static str>,
+    /// Whether what it then reports is ANOTHER instance: a launch the hook abandoned is
+    /// replaced, because the capacity it was launched for is still the capacity the group
+    /// is configured for.
+    replaced: bool,
 }
 
 /// THE RULE: a hook holds the transition it names until the action it minted is resolved.
@@ -1421,6 +1442,7 @@ async fn a_hook_holds_the_transition_it_is_configured_for() {
             callback: Some(RESULTS[0]),
             by_token: false,
             settles_at: Some(IN_SERVICE),
+            replaced: false,
         },
         HoldRow {
             case: "a launch heartbeated and then continued by its token",
@@ -1430,6 +1452,7 @@ async fn a_hook_holds_the_transition_it_is_configured_for() {
             callback: Some(RESULTS[0]),
             by_token: true,
             settles_at: Some(IN_SERVICE),
+            replaced: false,
         },
         HoldRow {
             case: "a launch abandoned by its token",
@@ -1438,7 +1461,10 @@ async fn a_hook_holds_the_transition_it_is_configured_for() {
             default_result: RESULTS[0],
             callback: Some(RESULTS[1]),
             by_token: true,
-            settles_at: None,
+            // The abandoned instance leaves the group, and the launch the group then owes
+            // for the capacity it is still configured for is held by the same hook.
+            settles_at: Some(PENDING_WAIT),
+            replaced: true,
         },
         HoldRow {
             case: "a launch left to its own deadline, defaulting to CONTINUE",
@@ -1448,6 +1474,7 @@ async fn a_hook_holds_the_transition_it_is_configured_for() {
             callback: None,
             by_token: false,
             settles_at: Some(IN_SERVICE),
+            replaced: false,
         },
         HoldRow {
             case: "a launch left to its own deadline, defaulting to ABANDON",
@@ -1456,7 +1483,8 @@ async fn a_hook_holds_the_transition_it_is_configured_for() {
             default_result: RESULTS[1],
             callback: None,
             by_token: false,
-            settles_at: None,
+            settles_at: Some(PENDING_WAIT),
+            replaced: true,
         },
         HoldRow {
             case: "a termination continued by the instance id",
@@ -1466,6 +1494,7 @@ async fn a_hook_holds_the_transition_it_is_configured_for() {
             callback: Some(RESULTS[0]),
             by_token: false,
             settles_at: None,
+            replaced: false,
         },
         HoldRow {
             case: "a termination abandoned by its token",
@@ -1475,6 +1504,7 @@ async fn a_hook_holds_the_transition_it_is_configured_for() {
             callback: Some(RESULTS[1]),
             by_token: true,
             settles_at: None,
+            replaced: false,
         },
         HoldRow {
             case: "a termination left to its own deadline",
@@ -1484,6 +1514,7 @@ async fn a_hook_holds_the_transition_it_is_configured_for() {
             callback: None,
             by_token: false,
             settles_at: None,
+            replaced: false,
         },
     ];
 
@@ -1617,12 +1648,38 @@ async fn a_hook_holds_the_transition_it_is_configured_for() {
             }
         }
 
-        poll_state(&router, case, &group, row.settles_at).await;
+        let settled = poll_state(&router, case, &group, row.settles_at).await;
+        // What the group goes on holding: the instance the hold was taken against, unless
+        // the hook ABANDONED its launch — the group then launches another for the capacity
+        // it is still configured for, and that is the instance it reports.
+        match (&settled, row.replaced) {
+            (Some(id), true) => assert_ne!(
+                *id, instance_id,
+                "case {case:?}: an abandoned launch is replaced, so the instance the group \
+                 reports is not {instance_id}"
+            ),
+            (Some(id), false) => assert_eq!(
+                *id, instance_id,
+                "case {case:?}: the group goes on reporting the instance the hold was taken \
+                 against, got {id}"
+            ),
+            (None, _) => {}
+        }
+        // The hold the row resolved is gone, whatever hold the group has since taken
+        // against the instance it launched in its place.
+        let holds = held_actions(&engine, &group);
         assert!(
-            held_actions(&engine, &group).is_empty(),
-            "case {case:?}: a resolved hold is no longer held, got {:?}",
-            held_actions(&engine, &group)
+            !holds
+                .iter()
+                .any(|(held_id, _, held_token)| *held_token == token || *held_id == instance_id),
+            "case {case:?}: a resolved hold is no longer held, got {holds:?}"
         );
+        if !row.replaced {
+            assert!(
+                holds.is_empty(),
+                "case {case:?}: the group holds nothing else either, got {holds:?}"
+            );
+        }
     }
 }
 

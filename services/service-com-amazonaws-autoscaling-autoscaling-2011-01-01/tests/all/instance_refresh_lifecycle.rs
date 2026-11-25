@@ -60,6 +60,16 @@ pub(crate) async fn past_refresh_steps(steps: u32) {
     tokio::time::sleep(span * (steps + 2) + Duration::from_millis(250)).await;
 }
 
+/// Wait until the clock has certainly brought every step of a refresh that replaces
+/// `instances` instances due: each replacement takes
+/// `autoscaling::state::STEPS_PER_REPLACEMENT` of the refresh's steps, and one more step
+/// brings the refresh itself to a terminal status.
+///
+/// `pub(crate)` for the same reason as [`past_refresh_steps`].
+pub(crate) async fn past_refresh_replacements(instances: u32) {
+    past_refresh_steps(instances * autoscaling::state::STEPS_PER_REPLACEMENT + 1).await;
+}
+
 /// One row of the refresh table.
 struct Row {
     case: &'static str,
@@ -349,8 +359,8 @@ async fn an_instance_refresh_replaces_the_groups_instances() {
 
         // Once every replacement the clock owed has come due, the refresh has
         // succeeded and reports no instance left to update.
-        let steps = u32::try_from(row.expected_to_update).expect("a count of instances") + 1;
-        past_refresh_steps(steps).await;
+        let instances = u32::try_from(row.expected_to_update).expect("a count of instances");
+        past_refresh_replacements(instances).await;
         let (_, finished) = newest_refresh(&router, &name).await;
         assert_eq!(
             finished.status, "Successful",

@@ -436,8 +436,10 @@ async fn rolling_back_a_refresh_replaces_its_replacements_back() {
         );
 
         // Once every replacement the rollback owed has come due, it has succeeded and
-        // nothing of the refresh's progress is left.
-        past_spans(u32::try_from(row.capacity).expect("a capacity is a count") + 3).await;
+        // nothing of the refresh's progress is left. Each replacement the rollback makes
+        // takes as many of its steps as one of the refresh's own.
+        let replacements = u32::try_from(row.capacity).expect("a capacity is a count");
+        past_spans(replacements * autoscaling::state::STEPS_PER_REPLACEMENT + 3).await;
         let rolled_back = newest_refresh(&router, &name).await;
         assert_eq!(
             rolled_back.status, "RollbackSuccessful",

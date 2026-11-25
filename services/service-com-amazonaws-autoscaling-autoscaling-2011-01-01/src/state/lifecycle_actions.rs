@@ -560,6 +560,24 @@ pub fn abandoned_launch_cause(at: SystemTime, hook_name: &str) -> String {
     )
 }
 
+/// What asked for the capacity the group then launches: the instance the hook abandoned
+/// never came into service, so the group is short of the capacity it is configured for and
+/// has to launch another instance for it.
+///
+/// A DIFFERENT sentence from [`abandoned_launch_cause`], because it records a different
+/// thing: one activity says why an instance left the group, the other why a new one was
+/// launched into it. One variable part, the hook that abandoned the launch.
+#[must_use]
+pub fn abandoned_launch_replacement_cause(at: SystemTime, hook_name: &str) -> String {
+    AutoScalingState::reason_cause(
+        at,
+        &format!(
+            "an instance was launched because the lifecycle hook {hook_name} abandoned the \
+             instance the group had launched for this capacity"
+        ),
+    )
+}
+
 impl AutoScalingState {
     /// Mint the `LifecycleActionToken` of one hold.
     ///
@@ -627,7 +645,7 @@ impl AutoScalingState {
             let mut actions = Vec::with_capacity(hooks.len());
             for (hook_name, hook) in &hooks {
                 let token = self.mint_lifecycle_action_token();
-                let heartbeat = seconds(hook.heartbeat_timeout);
+                let heartbeat = hold_timeout(hook.heartbeat_timeout);
                 actions.push(StoredLifecycleAction {
                     token: token.clone(),
                     hook_name: hook_name.clone(),
@@ -635,7 +653,9 @@ impl AutoScalingState {
                     default_result: hook.default_result.clone(),
                     heartbeat_timeout: heartbeat,
                     heartbeat_due: now + heartbeat,
-                    global_due: now + seconds(hook.global_timeout()),
+                    // The whole of the hold is at least as long as one of its heartbeats,
+                    // so the floor below reaches this deadline too.
+                    global_due: now + hold_timeout(hook.global_timeout()),
                 });
                 events.push(PendingLifecycleActionEvent {
                     transition,
@@ -1046,6 +1066,29 @@ impl AutoScalingState {
                     due,
                 },
             );
+            // And the group is then SHORT of the capacity it is configured for: the instance
+            // that capacity was launched for never came into service. "Amazon EC2 Auto
+            // Scaling launches instances until the desired capacity is totally fulfilled"
+            // (`LaunchTemplateOverrides$WeightedCapacity`), so the group launches another in
+            // its place — the same convergence every other way of losing a member goes
+            // through ([`AutoScalingState::apply_capacity`], as a termination a caller asked
+            // for and a replacement a failed health check owes both reach it) — recorded
+            // under its OWN cause, since what it did was launch an instance rather than take
+            // one out.
+            let Some(desired_capacity) = self
+                .groups
+                .get(group_name)
+                .map(|group| group.desired_capacity)
+            else {
+                return;
+            };
+            self.apply_capacity(
+                engine,
+                group_name,
+                desired_capacity,
+                &abandoned_launch_replacement_cause(now, &action.hook_name),
+                now,
+            );
         }
     }
 
@@ -1384,6 +1427,25 @@ impl AutoScalingState {
 /// `seconds` as a duration, for a value the model carries as a count of seconds.
 fn seconds(value: i32) -> Duration {
     Duration::from_secs(u64::from(value.max(0).unsigned_abs()))
+}
+
+/// How long a hold started NOW lasts, for a hook stating `value` seconds: the span it
+/// states, and never less than the shortest one this service accepts
+/// ([`super::lifecycle_hooks::MIN_HEARTBEAT_TIMEOUT`]).
+///
+/// The floor is what makes "a hold the clock has not timed out yet" true at the instant one
+/// is taken, whatever wrote the hook. Every writer of the collection already holds
+/// `HeartbeatTimeout` to the documented range
+/// ([`super::lifecycle_hooks::validate_lifecycle_hook_members`], applied by
+/// `PutLifecycleHook` and by the specifications a create carries alike), so this changes no
+/// hold any request can produce; it is here because the consequence of a hold that was
+/// already over when it started is not a wrong answer but a clock with no quiescent point —
+/// a hold that times out, resolves to a `DefaultResult` of `ABANDON`, and has the group
+/// launch the instance the capacity is still owed, which the same hook holds in turn. With
+/// the floor, each turn of that cycle costs at least this span, so the store always settles
+/// between two of them.
+fn hold_timeout(value: i32) -> Duration {
+    seconds(value.max(super::lifecycle_hooks::MIN_HEARTBEAT_TIMEOUT))
 }
 
 /// The `detail` of a lifecycle-action event: the hold, as the store holds it.

@@ -441,6 +441,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 instances_to_update: instances_at_start,
                 // Nobody has asked to roll this refresh back.
                 rollback: None,
+                // And nothing is in flight: the first move of the first replacement is
+                // what the clock owes next.
+                in_flight: None,
                 next_step_due: Some(now + crate::state::INSTANCE_REFRESH_REPLACEMENT),
             });
 

@@ -36,7 +36,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_autoscaling_autoscaling_2011_01_01 as autoscaling;
 use service_com_amazonaws_ec2_amazonec2 as ec2_service;
 
-use crate::instance_refresh_lifecycle::past_refresh_steps;
+use crate::instance_refresh_lifecycle::{past_refresh_replacements, past_refresh_steps};
 use crate::support::{borrowed, ec2_query, p, query, tag_value, tag_values};
 
 /// The image and instance type every launch template in this suite carries, beside a second
@@ -451,8 +451,8 @@ async fn skip_matching_leaves_every_instance_that_already_runs_the_target_versio
 
         // Once every replacement the clock owed has come due, the refresh has succeeded
         // whether it replaced anything or not.
-        let steps = u32::try_from(row.expected_to_update).expect("a count of instances") + 1;
-        past_refresh_steps(steps).await;
+        let instances = u32::try_from(row.expected_to_update).expect("a count of instances");
+        past_refresh_replacements(instances).await;
         let (status, percentage, to_update, end_time) = newest_refresh(&router, &group).await;
         assert_eq!(
             status, "Successful",

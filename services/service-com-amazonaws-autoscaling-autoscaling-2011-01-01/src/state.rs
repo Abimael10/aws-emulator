@@ -21,8 +21,12 @@
 //!   group ([`LIFECYCLE_TRANSITION`], the span every move OUT of service takes);
 //! * a capacity change that asked to honour the group's cooldown waits for that
 //!   cooldown to elapse before it is applied (`HonorCooldown`);
-//! * a running instance refresh replaces one instance of its group per
-//!   [`INSTANCE_REFRESH_REPLACEMENT`], waits the warmup it runs under after each
+//! * a running instance refresh replaces the instances of its group ONE at a time, each
+//!   replacement made in two moves a span apart — the window it runs under deciding
+//!   whether the replacement is launched before the instance it replaces goes out of
+//!   service or after, and the refresh waiting for the instance each move started to
+//!   settle before it makes the next ([`refresh_plan`]) — waits the
+//!   warmup it runs under after each
 //!   replacement comes into service ([`StoredInstanceRefresh::instance_warmup`]), holds at
 //!   each checkpoint threshold its progress reaches for the delay it runs under
 //!   ([`StoredInstanceRefresh::checkpoint_hold`]) and,
@@ -31,8 +35,8 @@
 //!   ([`StoredInstanceRefresh`]);
 //! * a refresh a caller cancelled is reported `Cancelling` and becomes `Cancelled`
 //!   ([`INSTANCE_REFRESH_CANCELLATION`]);
-//! * a refresh a caller rolled back replaces its OWN replacements back, one per
-//!   [`INSTANCE_REFRESH_REPLACEMENT`], and is reported `RollbackSuccessful` once it
+//! * a refresh a caller rolled back replaces its OWN replacements back, one at a time and
+//!   in the same two moves per replacement, and is reported `RollbackSuccessful` once it
 //!   has replaced them all ([`AutoScalingState::roll_back_instance_refresh`]);
 //! * the warm pool of a group holds the instances it maintains, so the difference
 //!   between its size and that target is launched or taken out as the clock makes it
@@ -324,6 +328,15 @@ pub mod refresh_preferences;
 /// The CloudWatch monitors a refresh's `AlarmSpecification` names, read from the account's
 /// own CloudWatch store: a refresh cannot START while one of them is sounding.
 pub mod refresh_alarms;
+
+/// The window an instance refresh replaces a group's instances INSIDE — whether it surges
+/// a replacement above the group's desired capacity or replaces in place — and the moves
+/// one replacement is made of.
+pub mod refresh_plan;
+
+pub use refresh_plan::{
+    RefreshReplacement, RefreshStop, ReplacementPhase, ReplacementWindow, STEPS_PER_REPLACEMENT,
+};
 
 /// The scaling policies a CloudWatch ALARM drives: the notifications this service receives
 /// from the alarms whose actions name its policies, and what receiving one performs.
@@ -1580,8 +1593,8 @@ impl StoredActivity {
 /// creates and `DescribeInstanceRefreshes` reports.
 ///
 /// A refresh replaces the instances of ONE group, one at a time: the instances it has
-/// still to replace are [`Self::pending_instance_ids`], and the clock brings the next
-/// replacement due at [`Self::next_step_due`]
+/// still to replace are [`Self::pending_instance_ids`], the one it is part way through is
+/// [`Self::in_flight`], and the clock brings the next move due at [`Self::next_step_due`]
 /// ([`AutoScalingState::advance_instance_refreshes`]). The progress a reader sees is
 /// what those replacements have actually done.
 #[derive(Debug, Clone)]
@@ -1613,7 +1626,12 @@ pub struct StoredInstanceRefresh {
     pub instances_to_update: i32,
     /// The rollback of this refresh, once one has been asked for: `RollbackDetails`.
     pub rollback: Option<StoredRollback>,
-    /// When the next replacement — or the refresh's own completion — comes due;
+    /// The replacement it is part way through, and the phase that replacement has reached:
+    /// a refresh makes each replacement in two moves, with the window it runs under
+    /// deciding their order ([`refresh_plan`]).
+    pub in_flight: Option<RefreshReplacement>,
+    /// When the next MOVE — the next half of a replacement, the first move of the next
+    /// one, or the refresh's own completion — comes due;
     /// `None` once it has reached a terminal status.
     pub next_step_due: Option<SystemTime>,
 }
@@ -1952,16 +1970,31 @@ impl AutoScalingState {
     ///
     /// A cancellation starts no further replacement and rolls none back, so the
     /// progress the refresh had already made stands: it moves to `Cancelling` and the
-    /// clock brings it to `Cancelled` ([`INSTANCE_REFRESH_CANCELLATION`]). With
-    /// `wait_for_transitioning_instances`, that is owed only once the group's in-flight
-    /// launches and terminations have themselves settled; without it, the cancellation
-    /// does not wait for them.
-    pub fn cancel_instance_refresh(
+    /// clock brings it to `Cancelled` ([`INSTANCE_REFRESH_CANCELLATION`]). The replacement
+    /// it was part way through is FINISHED rather than abandoned, so the group is left
+    /// holding the capacity it is configured for ([`refresh_plan`]) — and a cancellation of
+    /// a ROLLBACK finishes the replacement that rollback was part way through, from the
+    /// launch source the rollback was restoring. With
+    /// `wait_for_transitioning_instances`, the cancellation is owed only once the group's
+    /// in-flight launches and terminations have themselves settled; without it, the
+    /// cancellation does not wait for them.
+    pub fn cancel_instance_refresh<Eng: Send + Sync + 'static>(
         &mut self,
+        engine: &Eng,
         group_name: &str,
         wait_for_transitioning_instances: bool,
         now: SystemTime,
     ) -> Option<String> {
+        let index = self.instance_refreshes.iter().position(|refresh| {
+            refresh.auto_scaling_group_name == group_name && refresh.is_cancellable()
+        })?;
+        // Before the in-flight launches and terminations are counted below, so the
+        // cancellation of a refresh that waits for them waits for this one too. The refresh
+        // being cancelled may itself be a ROLLBACK — "cancels an instance refresh or
+        // rollback that is in progress" ([`StoredInstanceRefresh::is_cancellable`]) — which
+        // the settling reads off the refresh's own status, so the replacement it finishes is
+        // made from the launch source that refresh was replacing from.
+        self.settle_stopped_replacement(engine, index, RefreshStop::Cancellation, now);
         // The in-flight launches and terminations of the group: the instances whose
         // transient lifecycle state has not come due yet.
         let in_flight_settled = if wait_for_transitioning_instances {
@@ -1976,12 +2009,7 @@ impl AutoScalingState {
         } else {
             now
         };
-        let refresh = self
-            .instance_refreshes
-            .iter_mut()
-            .find(|refresh| {
-                refresh.auto_scaling_group_name == group_name && refresh.is_cancellable()
-            })?;
+        let refresh = self.instance_refreshes.get_mut(index)?;
         refresh.status = REFRESH_CANCELLING.to_string();
         refresh.next_step_due = Some(in_flight_settled + INSTANCE_REFRESH_CANCELLATION);
         Some(refresh.instance_refresh_id.clone())
@@ -2032,6 +2060,13 @@ impl AutoScalingState {
         if let Some(reason) = self.irreversible_reason(engine, group_name, index) {
             return Err(RollbackRefusal::Irreversible(reason));
         }
+
+        // The replacement the refresh was part way through when the rollback arrived is
+        // settled FIRST, so what the rollback then has to replace back is read off a group
+        // holding exactly the capacity it is configured for: the gap an in-place replacement
+        // had opened is filled, and the surge another had launched is taken back out and is
+        // no longer one of the refresh's own replacements ([`refresh_plan`]).
+        self.settle_stopped_replacement(engine, index, RefreshStop::Rollback, now);
 
         // What the rollback has to replace back: the replacements the refresh made that
         // the group still holds. One the group has since lost is not replaced again —
@@ -3260,11 +3295,12 @@ impl AutoScalingState {
     /// Materialise every instance-refresh replacement the clock has made due at
     /// `now`, and finish each refresh that has none left.
     ///
-    /// A refresh replaces ONE instance per [`INSTANCE_REFRESH_REPLACEMENT`], so a
-    /// refresh nobody has read for a while catches up over the steps it was owed,
+    /// A refresh makes one MOVE per [`INSTANCE_REFRESH_REPLACEMENT`] ([`refresh_plan`]), so
+    /// a refresh nobody has read for a while catches up over the moves it was owed,
     /// each anchored at the instant it came due rather than at the instant somebody
-    /// looked. The loop therefore terminates: every pass either retires a pending
-    /// replacement, moves a refresh that has replaced them all into the wait it owes at
+    /// looked. The loop therefore terminates: every pass either retires a move of the
+    /// replacement in flight, starts the next one, moves a refresh that has replaced them
+    /// all into the wait it owes at
     /// the end — which comes due strictly later — or brings a refresh to a terminal
     /// status, which clears its due instant.
     pub fn advance_instance_refreshes<Eng: Send + Sync + 'static>(
@@ -3293,10 +3329,10 @@ impl AutoScalingState {
         }
     }
 
-    /// Retire the one step the refresh at `index` owes at `due`: complete its
-    /// cancellation, replace its next instance, start or end the wait it owes at the end
-    /// — or, while it is being rolled back, replace one of its own replacements back —
-    /// or, with none left and nothing left to wait, finish it.
+    /// Retire the one move the refresh at `index` owes at `due`: complete its
+    /// cancellation, make the next move of the replacement it is part way through
+    /// ([`refresh_plan`]) — or of the replacement a rollback is putting back — or, with
+    /// none left and nothing left to wait, finish it.
     fn advance_one_instance_refresh<Eng: Send + Sync + 'static>(
         &mut self,
         engine: &Eng,
@@ -3307,10 +3343,7 @@ impl AutoScalingState {
             return;
         };
         let group_name = refresh.auto_scaling_group_name.clone();
-        let instance_refresh_id = refresh.instance_refresh_id.clone();
         let desired_configuration = refresh.desired_configuration.clone();
-        let next_instance_id = refresh.pending_instance_ids.first().cloned();
-        let percentage_before = refresh.percentage_complete;
         let cancelling = refresh.status == REFRESH_CANCELLING;
         let rolling_back = refresh.is_rolling_back();
         let baking = refresh.is_baking();
@@ -3349,257 +3382,73 @@ impl AutoScalingState {
             return;
         }
 
-        let Some(instance_id) = next_instance_id else {
-            if rolling_back {
-                // Every replacement the refresh had made has been replaced back, so the
-                // rollback has restored the group to the configuration it was using
-                // before the refresh started. "PercentageComplete does not include
-                // instances that are replaced during a rollback. This value gradually
-                // goes back down to zero during a rollback"
-                // (smithy_query(query="doc",shape="InstanceRefresh",
-                // member="PercentageComplete")), so it has reached zero here.
-                if let Some(refresh) = self.instance_refreshes.get_mut(index) {
-                    refresh.status = REFRESH_ROLLBACK_SUCCESSFUL.to_string();
-                    refresh.percentage_complete = 0;
-                    refresh.end_time = Some(due);
-                    refresh.next_step_due = None;
-                }
-                return;
-            }
-            // "Baking - Waiting the specified bake time after an instance refresh has
-            // finished updating instances" (smithy_query(query="doc",
-            // shape="InstanceRefresh",member="Status")), so a refresh that has replaced
-            // every instance it set out to is NOT complete while the wait it runs under is
-            // still owed ([`StoredInstanceRefresh::bake_time`]): it reports every instance
-            // updated and bakes, and the end of that wait is what completes it. A refresh
-            // asked to wait nothing has nothing to wait and finishes here.
-            if !baking && !bake_time.is_zero() {
-                if let Some(refresh) = self.instance_refreshes.get_mut(index) {
-                    refresh.status = REFRESH_BAKING.to_string();
-                    refresh.percentage_complete = 100;
-                    refresh.instances_to_update = 0;
-                    refresh.next_step_due = Some(due + bake_time);
-                }
-                return;
-            }
-            // Every instance the refresh set out to replace has been replaced, so the
-            // refresh has succeeded — and the model documents that the group's own
-            // settings then reflect the desired configuration it ran with.
-            if let Some(desired) = desired_configuration {
-                if let Some(group) = self.groups.get_mut(&group_name) {
-                    if desired.launch_template.is_some() {
-                        group.launch_template = desired.launch_template.clone();
-                        group.launch_configuration_name = None;
-                    }
-                    if desired.mixed_instances_policy.is_some() {
-                        // The group spreads its capacity under the distribution the
-                        // refresh's policy states, each member it left out at the default
-                        // the group's own writers fill in ([`group_defaults`]).
-                        group.mixed_instances_policy = group_defaults::mixed_instances_policy(
-                            desired.mixed_instances_policy.clone(),
-                        );
-                        group.launch_configuration_name = None;
-                    }
-                }
-            }
+        // The move the replacement it is part way through owes, or the one that starts the
+        // next instance's: a refresh makes each replacement in two moves, with the window it
+        // runs under deciding their order ([`refresh_plan`]). `false` says it has none left,
+        // which is what the rest of this call brings to a terminal status.
+        if self.advance_refresh_replacement(engine, index, due) {
+            return;
+        }
+
+        if rolling_back {
+            // Every replacement the refresh had made has been replaced back, so the
+            // rollback has restored the group to the configuration it was using
+            // before the refresh started. "PercentageComplete does not include
+            // instances that are replaced during a rollback. This value gradually
+            // goes back down to zero during a rollback"
+            // (smithy_query(query="doc",shape="InstanceRefresh",
+            // member="PercentageComplete")), so it has reached zero here.
             if let Some(refresh) = self.instance_refreshes.get_mut(index) {
-                refresh.status = REFRESH_SUCCESSFUL.to_string();
-                refresh.percentage_complete = 100;
-                refresh.instances_to_update = 0;
+                refresh.status = REFRESH_ROLLBACK_SUCCESSFUL.to_string();
+                refresh.percentage_complete = 0;
                 refresh.end_time = Some(due);
                 refresh.next_step_due = None;
             }
             return;
-        };
-
-        // A rollback launches from the group's OWN launch source — the configuration it
-        // was using before the refresh started, since a desired configuration reaches
-        // the group's settings only once the refresh has succeeded — while the refresh's
-        // own replacements launch from the configuration it is moving the group to.
-        let launched_instance_id = self.replace_group_instance(
-            engine,
-            &group_name,
-            &instance_id,
-            if rolling_back {
-                None
-            } else {
-                desired_configuration.as_ref()
-            },
-            &if rolling_back {
-                Self::instance_refresh_rollback_cause(due, &instance_refresh_id)
-            } else {
-                Self::instance_refresh_cause(due, &instance_refresh_id)
-            },
-            due,
-        );
-
-        let Some(refresh) = self.instance_refreshes.get_mut(index) else {
-            return;
-        };
-        // A replacement Amazon EC2 could not place is a launch failure, and the model
-        // documents that "an instance refresh might fail for several reasons, such as
-        // EC2 launch failures": the instance stays pending, unreplaced, and the
-        // refresh fails rather than reporting progress nothing made.
-        let Some(launched_instance_id) = launched_instance_id else {
-            if rolling_back {
-                refresh.status = REFRESH_ROLLBACK_FAILED.to_string();
-                refresh.status_reason = Some(
-                    "The instance refresh rollback failed because a replacement instance could \
-                     not be launched."
-                        .to_string(),
-                );
-            } else {
-                refresh.status = REFRESH_FAILED.to_string();
-                refresh.status_reason = Some(
-                    "The instance refresh failed because a replacement instance could not be \
-                     launched."
-                        .to_string(),
-                );
+        }
+        // "Baking - Waiting the specified bake time after an instance refresh has
+        // finished updating instances" (smithy_query(query="doc",
+        // shape="InstanceRefresh",member="Status")), so a refresh that has replaced
+        // every instance it set out to is NOT complete while the wait it runs under is
+        // still owed ([`StoredInstanceRefresh::bake_time`]): it reports every instance
+        // updated and bakes, and the end of that wait is what completes it. A refresh
+        // asked to wait nothing has nothing to wait and finishes here.
+        if !baking && !bake_time.is_zero() {
+            if let Some(refresh) = self.instance_refreshes.get_mut(index) {
+                refresh.status = REFRESH_BAKING.to_string();
+                refresh.percentage_complete = 100;
+                refresh.instances_to_update = 0;
+                refresh.next_step_due = Some(due + bake_time);
             }
+            return;
+        }
+        // Every instance the refresh set out to replace has been replaced, so the
+        // refresh has succeeded — and the model documents that the group's own
+        // settings then reflect the desired configuration it ran with.
+        if let Some(desired) = desired_configuration {
+            if let Some(group) = self.groups.get_mut(&group_name) {
+                if desired.launch_template.is_some() {
+                    group.launch_template = desired.launch_template.clone();
+                    group.launch_configuration_name = None;
+                }
+                if desired.mixed_instances_policy.is_some() {
+                    // The group spreads its capacity under the distribution the
+                    // refresh's policy states, each member it left out at the default
+                    // the group's own writers fill in ([`group_defaults`]).
+                    group.mixed_instances_policy = group_defaults::mixed_instances_policy(
+                        desired.mixed_instances_policy.clone(),
+                    );
+                    group.launch_configuration_name = None;
+                }
+            }
+        }
+        if let Some(refresh) = self.instance_refreshes.get_mut(index) {
+            refresh.status = REFRESH_SUCCESSFUL.to_string();
+            refresh.percentage_complete = 100;
+            refresh.instances_to_update = 0;
             refresh.end_time = Some(due);
             refresh.next_step_due = None;
-            return;
-        };
-        if !refresh.pending_instance_ids.is_empty() {
-            refresh.pending_instance_ids.remove(0);
         }
-        let outstanding = i32::try_from(refresh.pending_instance_ids.len()).unwrap_or(i32::MAX);
-        if rolling_back {
-            // The instances the refresh never got to "don't need to be replaced as part
-            // of the rollback" (smithy_query(query="doc",shape="InstanceRefresh",
-            // member="InstancesToUpdate")), so what is left to update is what it was
-            // when the rollback started; what comes down is the progress the refresh had
-            // made, one replaced-back instance at a time.
-            refresh.percentage_complete = if refresh.instances_at_start > 0 {
-                (outstanding.saturating_mul(100) / refresh.instances_at_start).clamp(0, 100)
-            } else {
-                0
-            };
-        } else {
-            refresh.replaced_instance_ids.push(launched_instance_id);
-            refresh.status = REFRESH_IN_PROGRESS.to_string();
-            refresh.instances_to_update = outstanding;
-            let replaced = (refresh.instances_at_start - outstanding).max(0);
-            refresh.percentage_complete = if refresh.instances_at_start > 0 {
-                (replaced.saturating_mul(100) / refresh.instances_at_start).clamp(0, 100)
-            } else {
-                100
-            };
-        }
-        // The replacement this step launched comes into service over the refresh's own span,
-        // and only once it is in service does the refresh's warmup start running: "a time
-        // period, in seconds, during which an instance refresh waits before moving on to
-        // replacing the next instance after a new instance enters the `InService` state"
-        // ([`StoredInstanceRefresh::instance_warmup`]). So the next step — the next
-        // replacement, or this refresh's own completion once none is left — comes due at the
-        // end of that wait, plus the delay the refresh holds for where this step's progress
-        // reached a checkpoint it runs under
-        // ([`StoredInstanceRefresh::checkpoint_hold`]); a rollback replaces the refresh's
-        // own replacements back rather than making progress through it, so it passes no
-        // checkpoint.
-        let warmup = refresh.instance_warmup();
-        let checkpoint_hold = if rolling_back {
-            Duration::ZERO
-        } else {
-            refresh.checkpoint_hold(percentage_before, refresh.percentage_complete)
-        };
-        refresh.next_step_due = Some(due + INSTANCE_REFRESH_REPLACEMENT + warmup + checkpoint_hold);
-    }
-
-    /// Replace ONE instance of a group: launch its replacement from the configuration
-    /// `desired_configuration` names (or the group's own launch source) and terminate
-    /// the instance it replaces, recording the scaling activity each of those changes
-    /// produces under `cause`.
-    ///
-    /// The instance being replaced is taken out only once its replacement exists, so
-    /// a replacement Amazon EC2 could not place leaves the group's instances alone and
-    /// records the failed launch instead. Answers the id of the replacement that was
-    /// launched, which is what the caller reports progress from — and, for a refresh,
-    /// what a later rollback has to replace back.
-    fn replace_group_instance<Eng: Send + Sync + 'static>(
-        &mut self,
-        engine: &Eng,
-        group_name: &str,
-        instance_id: &str,
-        desired_configuration: Option<&DesiredConfiguration>,
-        cause: &str,
-        now: SystemTime,
-    ) -> Option<String> {
-        let arn = self.groups.get(group_name).map(|group| group.arn.clone())?;
-        let due = now + LIFECYCLE_TRANSITION;
-        // The replacement is an instance coming INTO service, so it settles at the launch
-        // span ([`LAUNCH_TRANSITION`]); the instance it replaces leaves over the span a move
-        // out of service takes.
-        let launch_due = now + LAUNCH_TRANSITION;
-        let launch = self.launch_into_group(
-            engine,
-            &GroupLaunch {
-                group_name,
-                count: 1,
-                launched_at: now,
-                due: launch_due,
-                desired_configuration,
-                destination: LaunchDestination::Group,
-                // A replacement places across the whole of the group's own configuration.
-                placement: None,
-            },
-        );
-        let launched_ids = launch.launched_ids.clone();
-        let unplaced_message = launch.unplaced_message(UNPLACED_INSTANCE_MESSAGE);
-        let unplaced_status_code = launch.unplaced_status_code();
-        let unplaced_steps = launch.unplaced_steps(&unplaced_message);
-        let replaced = if launched_ids.is_empty() {
-            Vec::new()
-        } else {
-            vec![instance_id.to_string()]
-        };
-        self.terminate_group_instances(engine, group_name, &replaced, now, due);
-
-        for launched_id in &launched_ids {
-            self.record_instance_lifecycle_change(
-                engine,
-                &InstanceLifecycleChange {
-                    kind: InstanceLifecycle::Launched,
-                    group_name,
-                    group_arn: &arn,
-                    instance_id: launched_id,
-                    cause,
-                    start_time: now,
-                    due: launch_due,
-                },
-            );
-        }
-        for replaced_id in &replaced {
-            self.record_instance_lifecycle_change(
-                engine,
-                &InstanceLifecycleChange {
-                    kind: InstanceLifecycle::Terminated,
-                    group_name,
-                    group_arn: &arn,
-                    instance_id: replaced_id,
-                    cause,
-                    start_time: now,
-                    due,
-                },
-            );
-        }
-        for (instance_id, description) in unplaced_steps {
-            self.record_failed_lifecycle_step(
-                engine,
-                &FailedLifecycleStep {
-                    kind: InstanceLifecycle::Launched,
-                    group_name,
-                    group_arn: &arn,
-                    instance_id: instance_id.as_deref(),
-                    description,
-                    status_message: unplaced_message.clone(),
-                    status_code: unplaced_status_code,
-                    cause,
-                    at: now,
-                },
-            );
-        }
-        launched_ids.first().cloned()
     }
 
     /// The cause the replacements of an instance refresh record: when the replacement was

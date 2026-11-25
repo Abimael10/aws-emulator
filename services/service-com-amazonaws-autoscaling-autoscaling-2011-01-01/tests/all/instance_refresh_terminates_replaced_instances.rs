@@ -88,10 +88,16 @@ impl Watched {
     fn look_again(self, capacity: i32) -> Duration {
         match self {
             Self::Closely => LOOK_AGAIN,
-            // One span per instance the refresh replaces, one for the refresh's own
-            // completion and one more so the poll lands past it however slowly the host
+            // Three spans per instance the refresh replaces — the steps one replacement
+            // takes (`autoscaling::state::STEPS_PER_REPLACEMENT`) — one for the refresh's
+            // own completion and one more so the poll lands past it however slowly the host
             // runs.
-            Self::Late => refresh_step() * (u32::try_from(capacity).unwrap_or(1) + 2),
+            Self::Late => {
+                refresh_step()
+                    * (u32::try_from(capacity).unwrap_or(1)
+                        * autoscaling::state::STEPS_PER_REPLACEMENT
+                        + 2)
+            }
         }
     }
 }
@@ -392,7 +398,8 @@ async fn a_refresh_whose_steps_are_all_retired_in_one_pass_terminates_what_it_re
     );
 
     // Every step of the refresh was owed before this instant, so ONE pass retires them all.
-    let behind = refresh_step() * (u32::try_from(capacity).unwrap_or(1) + 2);
+    let behind = refresh_step()
+        * (u32::try_from(capacity).unwrap_or(1) * autoscaling::state::STEPS_PER_REPLACEMENT + 2);
     let moved = fall_behind(&engine, group, behind);
     assert_eq!(
         moved, 1,

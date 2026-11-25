@@ -189,9 +189,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "If an instance refresh or rollback is not in progress, an
         // ActiveInstanceRefreshNotFound error occurs"
         // (smithy_query(query="operation",operation="CancelInstanceRefresh")).
-        let Some(instance_refresh_id) =
-            state.cancel_instance_refresh(&name, wait_for_transitioning_instances, now)
-        else {
+        let Some(instance_refresh_id) = state.cancel_instance_refresh(
+            &*self.engine,
+            &name,
+            wait_for_transitioning_instances,
+            now,
+        ) else {
             return Err(
                 CancelInstanceRefreshErrorModeled::ActiveInstanceRefreshNotFoundFault(
                     ActiveInstanceRefreshNotFoundFault {
