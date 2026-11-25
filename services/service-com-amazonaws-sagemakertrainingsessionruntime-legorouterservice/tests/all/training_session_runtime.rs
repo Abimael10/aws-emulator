@@ -33,6 +33,9 @@
 //!    `ValidationException`.
 //! 9. `SampleTrainingSession` resolves the session's checkpoint from stored state and
 //!    answers a body that is not the request's own payload.
+//! 10. `SampleTrainingSessionWithResponseStream` resolves and refuses exactly as the
+//!     synchronous call does, and frames what it serves as Server-Sent Events terminated
+//!     by `data: [DONE]`.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -1342,6 +1345,14 @@ async fn sample_training_session_answers_from_the_sessions_checkpoint() {
         absent.status,
         String::from_utf8_lossy(&absent.body)
     );
+    // Both inference operations resolve a session through the same lookup, so both
+    // report the identity it failed on the same way.
+    assert_eq!(
+        absent.text("message"),
+        format!("Session not found: absent-session-{ACCOUNT}-{REGION}"),
+        "case unknown session: expected the session identity the lookup failed on, got {}",
+        String::from_utf8_lossy(&absent.body)
+    );
 
     // A session that exists but holds no checkpoint: there is no model to sample.
     submit_training_ok(&router, session, 1, forward_backward("ppo")).await;
@@ -1487,27 +1498,263 @@ async fn sample_training_session_answers_from_the_sessions_checkpoint() {
     }
 }
 
-/// `SampleTrainingSessionWithResponseStream` is still a stub, and a stub answers HTTP 501
-/// rather than an empty success. It is filed as its own gap.
-#[tokio::test]
-async fn the_streaming_inference_variant_is_still_a_stub() {
-    let router = emulator();
-    let answer = call_in_region(
-        &router,
+// ---------------------------------------------------------------------------
+// Rule 10: the streaming inference call
+// ---------------------------------------------------------------------------
+
+/// The `data:` payloads of a Server-Sent Events body, in the order they arrive.
+///
+/// `SampleResponseStream`: "Each event is a `data: {JSON}` line containing a chat
+/// completion chunk, and the stream is terminated by `data: [DONE]`."
+fn sse_events(body: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(body).to_string();
+    text.split("\n\n")
+        .map(str::trim_end)
+        .filter(|frame| !frame.is_empty())
+        .map(|frame| {
+            frame
+                .strip_prefix("data: ")
+                .unwrap_or_else(|| {
+                    panic!("every event of a text/event-stream body is a `data: ` line, got {frame:?}")
+                })
+                .to_string()
+        })
+        .collect()
+}
+
+/// Send one streaming inference request.
+async fn sample_with_response_stream(
+    router: &MultiServiceRouter,
+    session: &str,
+    payload: bytes::Bytes,
+    headers: &[(&str, String)],
+) -> Answer {
+    call_in_region(
+        router,
         "POST",
-        "/training-sessions/streaming/sample-with-response-stream",
-        bytes::Bytes::from_static(b"{}"),
+        &format!("/training-sessions/{session}/sample-with-response-stream"),
+        payload,
         REGION,
-        &[],
+        headers,
     )
-    .await;
+    .await
+}
+
+/// `SampleTrainingSessionWithResponseStream` frames its answer as Server-Sent Events —
+/// one `data:` chunk and the `data: [DONE]` terminator — whatever the caller's `Accept`
+/// names and whatever size the payload is, and the chunk reports what was served from
+/// stored session state rather than the request's own payload.
+#[tokio::test]
+async fn the_streaming_inference_call_frames_server_sent_events() {
+    let router = emulator();
+    let session = "streaming";
+    let checkpoint = write_checkpoint(&router, session, 1, true).await;
+
+    // Payloads of several sizes: the chunk reports the size that arrived and the body is
+    // never the payload re-framed as if a model had generated it.
+    for payload in [
+        bytes::Bytes::new(),
+        bytes::Bytes::from_static(b"{\"prompt\":\"hi\"}"),
+        bytes::Bytes::from(vec![b'x'; 4096]),
+    ] {
+        let size = payload.len();
+        let answer = sample_with_response_stream(&router, session, payload.clone(), &[]).await;
+        assert_eq!(
+            answer.status,
+            200,
+            "case {size}-byte payload: expected HTTP 200, got {} {}",
+            answer.status,
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert_eq!(
+            answer.content_type.as_deref(),
+            Some("text/event-stream"),
+            "case {size}-byte payload: expected the streamed media type, got {:?}",
+            answer.content_type
+        );
+        assert_ne!(
+            answer.body, payload,
+            "case {size}-byte payload: the stream must not be the request body echoed back"
+        );
+
+        let events = sse_events(&answer.body);
+        assert!(
+            events.len() >= 2,
+            "case {size}-byte payload: expected a chunk event and a terminator, got {events:?}"
+        );
+        assert_eq!(
+            events.last().map(String::as_str),
+            Some("[DONE]"),
+            "case {size}-byte payload: the stream must end with the [DONE] marker, got {events:?}"
+        );
+        for (index, event) in events.iter().take(events.len() - 1).enumerate() {
+            let chunk: Value = serde_json::from_str(event).unwrap_or_else(|e| {
+                panic!("case {size}-byte payload: event {index} is not JSON ({e}): {event:?}")
+            });
+            assert_eq!(
+                chunk["trainingSessionName"].as_str(),
+                Some(session),
+                "case {size}-byte payload: expected the session named, got {chunk}"
+            );
+            assert_eq!(
+                chunk["modelPackageArn"].as_str(),
+                Some(checkpoint.as_str()),
+                "case {size}-byte payload: expected the session's checkpoint, got {chunk}"
+            );
+            assert_eq!(
+                chunk["requestBodyBytes"].as_u64(),
+                Some(size as u64),
+                "case {size}-byte payload: expected the served payload size, got {chunk}"
+            );
+            assert!(
+                chunk["message"].as_str().is_some_and(|m| !m.is_empty()),
+                "case {size}-byte payload: the chunk must say what it is, got {chunk}"
+            );
+        }
+    }
+
+    // The stream's media type is the one the model puts on `SampleResponseStream`,
+    // whatever the caller's `Accept` names: the operation declares no error for a content
+    // type it cannot serve.
+    for (case, accept) in [
+        ("any type", "*/*"),
+        ("the type served", "text/event-stream"),
+        ("the type with parameters", "text/event-stream; charset=utf-8"),
+        ("one of several types", "application/json, text/event-stream"),
+        ("a type the emulator does not produce", "application/cbor"),
+    ] {
+        let answer = sample_with_response_stream(
+            &router,
+            session,
+            bytes::Bytes::from_static(b"{}"),
+            &[("accept", accept.to_string())],
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?} (accept {accept:?}): expected HTTP 200, got {} {}",
+            answer.status,
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert_eq!(
+            answer.content_type.as_deref(),
+            Some("text/event-stream"),
+            "case {case:?}: the Content-Type must describe the body served, got {:?}",
+            answer.content_type
+        );
+    }
+}
+
+/// The streaming call resolves its target, and refuses, exactly as the synchronous one
+/// does: "Errors that occur before streaming starts are returned as the operation's
+/// errors", so each refusal is the modelled error and carries no `data:` frame.
+#[tokio::test]
+async fn the_streaming_inference_call_refuses_what_the_synchronous_one_refuses() {
+    let router = emulator();
+    let session = "streaming-refusals";
+
+    // A session this emulator has never seen is not materialised by an inference call,
+    // and the refusal reports the whole identity the lookup failed on: the session name,
+    // the account that would own it and the region it would live in.
+    for (case, name, region) in [
+        ("a name never submitted", "absent-session", REGION),
+        ("another absent name", "absent-session-2", REGION),
+        ("the same name in another region", "absent-session", "eu-west-1"),
+    ] {
+        let absent = call_in_region(
+            &router,
+            "POST",
+            &format!("/training-sessions/{name}/sample-with-response-stream"),
+            bytes::Bytes::from_static(b"{}"),
+            region,
+            &[],
+        )
+        .await;
+        assert_eq!(
+            (absent.status, absent.error_code().as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: expected a 404 ResourceNotFoundException, got {} {} {}",
+            absent.status,
+            absent.error_code(),
+            String::from_utf8_lossy(&absent.body)
+        );
+        assert_eq!(
+            absent.text("message"),
+            format!("Session not found: {name}-{ACCOUNT}-{region}"),
+            "case {case:?}: expected the session identity the lookup failed on, got {}",
+            String::from_utf8_lossy(&absent.body)
+        );
+    }
+
+    // A session that exists but holds no checkpoint: there is no model to sample.
+    submit_training_ok(&router, session, 1, forward_backward("ppo")).await;
+    let no_model =
+        sample_with_response_stream(&router, session, bytes::Bytes::from_static(b"{}"), &[]).await;
     assert_eq!(
-        answer.status,
-        501,
-        "case streaming variant: a scaffolded operation answers HTTP 501, got {} {}",
-        answer.status,
-        String::from_utf8_lossy(&answer.body)
+        (no_model.status, no_model.error_code().as_str()),
+        (409, "ConflictException"),
+        "case no checkpoint: expected a 409 ConflictException, got {} {} {}",
+        no_model.status,
+        no_model.error_code(),
+        String::from_utf8_lossy(&no_model.body)
     );
+
+    // The model package header names which checkpoint serves the request.
+    let checkpoint = write_checkpoint(&router, session, 2, false).await;
+    for (case, arn, expected_status, expected_code) in [
+        (
+            "a checkpoint the session holds",
+            checkpoint.clone(),
+            200u16,
+            "",
+        ),
+        (
+            "a well-formed ARN the session never wrote",
+            format!("arn:aws:sagemaker:{REGION}:{ACCOUNT}:model-package/elsewhere/1"),
+            404,
+            "ResourceNotFoundException",
+        ),
+        (
+            "an ARN that is not one",
+            "checkpoint-1".to_string(),
+            400,
+            "ValidationException",
+        ),
+    ] {
+        let answer = sample_with_response_stream(
+            &router,
+            session,
+            bytes::Bytes::from_static(b"{}"),
+            &[("x-amzn-sagemaker-model-package", arn.clone())],
+        )
+        .await;
+        assert_eq!(
+            answer.status, expected_status,
+            "case {case:?} ({arn}): expected HTTP {expected_status}, got {} {}",
+            answer.status,
+            String::from_utf8_lossy(&answer.body)
+        );
+        if expected_status == 200 {
+            assert_eq!(
+                sse_events(&answer.body).last().map(String::as_str),
+                Some("[DONE]"),
+                "case {case:?}: a served stream ends with the [DONE] marker, got {}",
+                String::from_utf8_lossy(&answer.body)
+            );
+        } else {
+            assert_eq!(
+                answer.error_code(),
+                expected_code,
+                "case {case:?} ({arn}): expected {expected_code}, got {}",
+                String::from_utf8_lossy(&answer.body)
+            );
+            assert!(
+                !String::from_utf8_lossy(&answer.body).contains("data: "),
+                "case {case:?}: a refusal before the stream starts carries no event, got {}",
+                String::from_utf8_lossy(&answer.body)
+            );
+        }
+    }
 }
 
 /// The session store is bounded AND always makes room: past its bound the oldest

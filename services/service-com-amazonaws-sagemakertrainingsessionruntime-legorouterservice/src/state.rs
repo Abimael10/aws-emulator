@@ -12,7 +12,8 @@
 //! * each session's **training queue** (`sequence_index` + `next_sequence_number`),
 //!   which is what makes operations execute in sequence-number order;
 //! * each session's **checkpoints**, written by `saveWeights` / `saveState` and read by
-//!   `loadState`, `loadWeightsForSampling` and `SampleTrainingSession`;
+//!   `loadState`, `loadWeightsForSampling` and both inference operations, which resolve
+//!   the one they run against through [`resolve_sample_checkpoint`];
 //! * the **clock-owed transition** that moves a submitted operation out of its
 //!   non-terminal status (see [`EXECUTION_SPAN`] and [`Session::advance`]);
 //! * the **validation rules the model states in prose** rather than in a trait, which
@@ -23,7 +24,8 @@
 //! step or a generated sample: an operation whose execution needs one ends in the
 //! service's own `Failed` status with `errorDetails` that say so (see
 //! [`no_model_runtime`]), and the synchronous `SampleTrainingSession` answers a body
-//! that says the same in plain terms. Everything around that — session and operation
+//! that says the same in plain terms, as does the one chunk the streaming variant frames
+//! ([`sample_response_stream_body`]). Everything around that — session and operation
 //! records, sequence ordering, idempotency, checkpoints and their ARNs, status
 //! progression, validation and the 404s — is real and computed from persisted state.
 
@@ -87,6 +89,11 @@ pub const SAMPLING_NAMESPACE: &str = "sampling";
 
 /// The content type `SampleTrainingSession` answers with, and the only one it can serve.
 pub const SAMPLE_RESPONSE_CONTENT_TYPE: &str = "application/json";
+
+/// The content type `SampleTrainingSessionWithResponseStream` answers with: the
+/// `@mediaType` the model puts on `SampleResponseStream`, whose events
+/// [`sample_response_stream_body`] frames.
+pub const SAMPLE_RESPONSE_STREAM_CONTENT_TYPE: &str = "text/event-stream";
 
 /// How deep a caller-supplied `Document` is walked when it is rendered for a request
 /// fingerprint, keeping the recursion bound LOCAL to this crate rather than inherited
@@ -1021,6 +1028,115 @@ pub fn sample_response_body(session: &str, model_package_arn: &str, request_byte
         "requestBodyBytes": request_bytes,
     });
     serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec())
+}
+
+/// The Server-Sent Events body `SampleTrainingSessionWithResponseStream` answers with.
+///
+/// "The streaming response body, delivered as Server-Sent Events (`text/event-stream`).
+/// Each event is a `data: {JSON}` line containing a chat completion chunk, and the stream
+/// is terminated by `data: [DONE]`." — `SampleResponseStream`. No model runs in this
+/// emulator, so the one chunk carries exactly what the synchronous call answers
+/// ([`sample_response_body`]) rather than invented tokens, and the stream is framed and
+/// terminated as the model documents.
+pub fn sample_response_stream_body(
+    session: &str,
+    model_package_arn: &str,
+    request_bytes: usize,
+) -> Vec<u8> {
+    let chunk = sample_response_body(session, model_package_arn, request_bytes);
+    let mut body = Vec::with_capacity(chunk.len() + SSE_FRAMING_OVERHEAD);
+    body.extend_from_slice(b"data: ");
+    body.extend_from_slice(&chunk);
+    body.extend_from_slice(b"\n\n");
+    body.extend_from_slice(b"data: [DONE]\n\n");
+    body
+}
+
+/// How many bytes of Server-Sent Events framing [`sample_response_stream_body`] adds
+/// around its one chunk: the `data: ` prefixes and the blank-line separators.
+const SSE_FRAMING_OVERHEAD: usize = 24;
+
+/// The identity a training session is resolved by: its name, the account that owns it and
+/// the region it lives in, joined by `-`.
+///
+/// A session name is scoped to one account and one region, so the name alone does not name
+/// a session; this is the whole identity a lookup failed on, and it is what a refusal
+/// reports.
+pub fn session_identity(training_session_name: &str, region: &str) -> String {
+    format!(
+        "{training_session_name}-{}-{region}",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// How a data-plane call reports a training session it cannot resolve: the fixed text
+/// `Session not found: ` followed by the session identity it looked for
+/// ([`session_identity`]).
+pub fn session_not_found(training_session_name: &str, region: &str) -> String {
+    format!(
+        "Session not found: {}",
+        session_identity(training_session_name, region)
+    )
+}
+
+/// Why an inference call cannot be served, in the three classes this service's inference
+/// operations model for it.
+#[derive(Debug, Clone)]
+pub enum SampleRefusal {
+    /// A request the model's prose rules out: a 400 `ValidationException`.
+    Validation(String),
+    /// A session, or a checkpoint of it, this emulator does not hold: a 404
+    /// `ResourceNotFoundException`.
+    NotFound(String),
+    /// A session that holds no model to sample: a 409 `ConflictException`.
+    Conflict(String),
+}
+
+/// The checkpoint an inference call runs against, resolved from persisted session state.
+///
+/// Both inference operations take the same input members and model the same errors, so
+/// they resolve their target through this one function: a session this emulator has never
+/// seen is NOT materialised by an inference call (only a submit brings a session's runtime
+/// record into existence), a named model package must be one of the session's own
+/// checkpoints, and a caller that names none gets the checkpoint the session currently
+/// resolves to ([`Session::current_checkpoint`]).
+pub fn resolve_sample_checkpoint(
+    store: &mut ComAmazonawsSagemakertrainingsessionruntimeLegorouterserviceState,
+    training_session_name: &str,
+    region: &str,
+    model_package_arn: Option<&str>,
+    now: SystemTime,
+) -> Result<String, SampleRefusal> {
+    if let Some(arn) = model_package_arn {
+        if let Err(reason) = validate_model_package_arn("modelPackageArn", arn) {
+            return Err(SampleRefusal::Validation(reason));
+        }
+    }
+
+    let Some(session) = store.advance_session(training_session_name, now) else {
+        return Err(SampleRefusal::NotFound(session_not_found(
+            training_session_name,
+            region,
+        )));
+    };
+
+    match model_package_arn {
+        Some(arn) if !session.checkpoints.contains_key(arn) => {
+            Err(SampleRefusal::NotFound(format!(
+                "Model package {arn} is not a checkpoint of training session \
+                 {training_session_name}."
+            )))
+        }
+        Some(arn) => Ok(arn.to_string()),
+        None => match session.current_checkpoint() {
+            Some(checkpoint) => Ok(checkpoint.model_package_arn.clone()),
+            None => Err(SampleRefusal::Conflict(format!(
+                "Training session {training_session_name} has no model checkpoint to sample \
+                 from: write one with a saveWeights or saveState operation, or name a model \
+                 package on the X-Amzn-SageMaker-Model-Package header."
+            ))),
+        },
+    }
 }
 
 /// The fingerprint of an `ExecuteTrainingOperation` request's parameters: a SHA-256

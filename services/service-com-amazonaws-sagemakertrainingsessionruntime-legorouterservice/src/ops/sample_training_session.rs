@@ -158,7 +158,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(SampleTrainingSessionErrorModeled::InternalServerException(
                 InternalServerException {
@@ -171,70 +170,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The response body is this emulator's own JSON envelope, whatever the caller's
         // `Accept` names: the model's own response type is not knowable without the
         // model, and the operation declares no error for a content type it cannot serve.
-        if let Some(arn) = input.model_package_arn.as_deref() {
-            if let Err(reason) = crate::state::validate_model_package_arn("modelPackageArn", arn) {
-                return Err(SampleTrainingSessionErrorModeled::ValidationException(
-                    ValidationException { message: reason },
-                )
-                .into());
-            }
-        }
-
         let now = ::std::time::SystemTime::now();
         let request_bytes = input.body.as_ref().map_or(0, Vec::len);
-        let mut store = state.lock();
-        // A session this emulator has never seen is NOT materialised by an inference
-        // call: only a submit brings a session's runtime record into existence.
-        let Some(session) = store.advance_session(&input.training_session_name, now) else {
-            return Err(SampleTrainingSessionErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!(
-                        "Training session {} does not exist.",
-                        input.training_session_name
-                    ),
-                },
-            )
-            .into());
-        };
+        // A session name is scoped to an account and a region, so resolving one needs the
+        // region the request signed for.
+        let region = crate::state::request_region(ctx.parts());
 
-        // Which model serves the request: the checkpoint the caller named, else the one
-        // the session currently resolves to.
-        let model_package_arn = match input.model_package_arn.as_deref() {
-            Some(arn) if !session.checkpoints.contains_key(arn) => {
-                return Err(SampleTrainingSessionErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!(
-                            "Model package {arn} is not a checkpoint of training session {}.",
-                            input.training_session_name
-                        ),
-                    },
+        // Which model serves the request — the checkpoint the caller named, else the one
+        // the session currently resolves to — and every refusal around it, come from the
+        // one resolver both inference operations share.
+        let model_package_arn = {
+            let mut store = state.lock();
+            crate::state::resolve_sample_checkpoint(
+                &mut store,
+                &input.training_session_name,
+                &region,
+                input.model_package_arn.as_deref(),
+                now,
+            )
+        };
+        let model_package_arn = match model_package_arn {
+            Ok(arn) => arn,
+            Err(crate::state::SampleRefusal::Validation(message)) => {
+                return Err(SampleTrainingSessionErrorModeled::ValidationException(
+                    ValidationException { message },
                 )
-                .into());
+                .into())
             }
-            Some(arn) => arn.to_string(),
-            None => match session.current_checkpoint() {
-                Some(checkpoint) => checkpoint.model_package_arn.clone(),
-                None => {
-                    return Err(SampleTrainingSessionErrorModeled::ConflictException(
-                        ConflictException {
-                            message: format!(
-                                "Training session {} has no model checkpoint to sample \
-                                 from: write one with a saveWeights or saveState \
-                                 operation, or name a model package on the \
-                                 X-Amzn-SageMaker-Model-Package header.",
-                                input.training_session_name
-                            ),
-                        },
-                    )
-                    .into());
-                }
-            },
+            Err(crate::state::SampleRefusal::NotFound(message)) => {
+                return Err(SampleTrainingSessionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException { message },
+                )
+                .into())
+            }
+            Err(crate::state::SampleRefusal::Conflict(message)) => {
+                return Err(SampleTrainingSessionErrorModeled::ConflictException(
+                    ConflictException { message },
+                )
+                .into())
+            }
         };
 
         Ok(SampleTrainingSessionOutput {
             content_type: Some(crate::state::SAMPLE_RESPONSE_CONTENT_TYPE.to_string()),
             body: crate::state::sample_response_body(
-                &session.name,
+                &input.training_session_name,
                 &model_package_arn,
                 request_bytes,
             ),

@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SampleTrainingSessionWithResponseStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SampleTrainingSessionWithResponseStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Serves the STREAMING inference request against the checkpoint a training session
+//! resolves to.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SampleTrainingSessionWithResponseStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Which checkpoint the request resolves to, and every refusal around it, are exactly the
+//! synchronous operation's: both take the same input members and model the same errors,
+//! so both go through [`crate::state::resolve_sample_checkpoint`] — a session this
+//! emulator has never seen is a 404, a named model package that is not one of the
+//! session's own checkpoints is a 404, a malformed one is a 400, and a session that holds
+//! no checkpoint at all is a 409.
+//!
+//! What differs is the FRAMING of the answer. `SampleResponseStream` is "delivered as
+//! Server-Sent Events (`text/event-stream`). Each event is a `data: {JSON}` line
+//! containing a chat completion chunk, and the stream is terminated by `data: [DONE]`",
+//! so that is what this operation answers, framed by
+//! [`crate::state::sample_response_stream_body`]. No model runs inside this emulator, so
+//! the one chunk it carries says exactly that, together with the facts about what was
+//! served: the session, the checkpoint the request resolved to and the size of the
+//! payload that arrived. It is never the request body re-framed as if a model had
+//! generated it token by token.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +167,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SampleTrainingSessionWithResponseStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SampleTrainingSessionWithResponseStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SampleTrainingSessionWithResponseStream"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                SampleTrainingSessionWithResponseStreamErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the training session runtime store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let request_bytes = input.body.as_ref().map_or(0, Vec::len);
+        // A session name is scoped to an account and a region, so resolving one needs the
+        // region the request signed for.
+        let region = crate::state::request_region(ctx.parts());
+
+        // The same resolution, and the same refusals, as the synchronous call: this
+        // operation differs only in how it frames what it serves.
+        let resolved = {
+            let mut store = state.lock();
+            crate::state::resolve_sample_checkpoint(
+                &mut store,
+                &input.training_session_name,
+                &region,
+                input.model_package_arn.as_deref(),
+                now,
+            )
+        };
+        let model_package_arn = match resolved {
+            Ok(arn) => arn,
+            Err(crate::state::SampleRefusal::Validation(message)) => {
+                return Err(
+                    SampleTrainingSessionWithResponseStreamErrorModeled::ValidationException(
+                        ValidationException { message },
+                    )
+                    .into(),
+                )
+            }
+            Err(crate::state::SampleRefusal::NotFound(message)) => {
+                return Err(
+                    SampleTrainingSessionWithResponseStreamErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException { message },
+                    )
+                    .into(),
+                )
+            }
+            Err(crate::state::SampleRefusal::Conflict(message)) => {
+                return Err(
+                    SampleTrainingSessionWithResponseStreamErrorModeled::ConflictException(
+                        ConflictException { message },
+                    )
+                    .into(),
+                )
+            }
+        };
+
+        // "Errors that occur before streaming starts are returned as the operation's
+        // errors" — every refusal above is one of those, so a stream that starts here is
+        // one that runs to its `[DONE]` terminator.
+        Ok(SampleTrainingSessionWithResponseStreamOutput {
+            content_type: Some(crate::state::SAMPLE_RESPONSE_STREAM_CONTENT_TYPE.to_string()),
+            body: crate::state::sample_response_stream_body(
+                &input.training_session_name,
+                &model_package_arn,
+                request_bytes,
+            ),
+        })
     }
 }
