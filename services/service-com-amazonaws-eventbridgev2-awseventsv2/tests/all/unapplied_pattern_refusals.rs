@@ -52,11 +52,6 @@ use crate::modelled_input_refusal::{
 const INVALID_INPUT_STATUS: u16 = 400;
 const NOT_FOUND_STATUS: u16 = 404;
 
-/// The status an operation of this service that is still scaffolded answers with: a request
-/// that passed this door and reached `UntagResource`, which nobody has written yet, is told
-/// so rather than refused.
-const NOT_IMPLEMENTED_STATUS: u16 = 501;
-
 /// The error shape a lookup of a resource that is not there answers with.
 const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
 
@@ -296,15 +291,20 @@ async fn a_tag_key_is_held_to_its_whole_modelled_grammar() {
             })
             .await;
         if admitted {
-            // The key passed this door, so what answers is the operation itself — which for
-            // `UntagResource` is still the scaffold's "nobody has written this yet", not a
-            // refusal of the request.
+            // The key passed this door, so what answers is the operation itself — which
+            // resolves the ARN and, for one naming no stored resource, answers its own
+            // lookup refusal rather than a refusal of the request.
             assert_eq!(
                 status,
-                NOT_IMPLEMENTED_STATUS,
+                NOT_FOUND_STATUS,
                 "case {case:?}: a key the grammar admits must pass this door and reach the \
-                 operation, got {status} with {:?}",
+                 operation's lookup, got {status} with {:?}",
                 rendered(&body)
+            );
+            let (code, _) = refusal(case, &body);
+            assert_eq!(
+                code, RESOURCE_NOT_FOUND_EXCEPTION,
+                "case {case:?}: the answer must be the lookup's own error shape"
             );
             continue;
         }

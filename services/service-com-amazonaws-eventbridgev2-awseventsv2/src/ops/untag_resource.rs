@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: removes the keys the request names from the tag set stored on the one
+//! taggable resource its ARN addresses. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -81,10 +75,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eventbridgev2-awsevents
 // here — hence the `UntagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eventbridgev2#UntagResource")]
+// `InternalException` is widened in with `extra_errors`: this service declares it
+// as a common error for every operation, so it is the modelled answer when the
+// engine cannot hand back this service's store, but the scaffold generated the
+// enum from the OPERATION's own `errors` list only.
+#[smithy_macros::operation_error(
+    "com.amazonaws.eventbridgev2#UntagResource",
+    extra_errors = ["InternalException"]
+)]
 #[derive(Debug)]
 pub enum UntagResourceErrorModeled {
     ConcurrentModificationException(ConcurrentModificationException),
+    InternalException(InternalException),
     InvalidStateException(InvalidStateException),
     ResourceNotFoundException(ResourceNotFoundException),
 }
@@ -140,18 +142,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // The resource is addressed by ARN, which carries its own region and
+        // account, so nothing here is read from the request's credential scope.
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalException(InternalException {
+                message: Some("the event bus store is unavailable on this engine".to_string()),
+            })
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = store.lock();
+        // The lifecycle transitions the clock has already made due, which is also
+        // what decides whether the resource addressed is still there to untag.
+        state.settle_lifecycles(now);
+
+        // The ONE resolution every tag-addressed operation shares: a
+        // `TaggableResourceArn` names an event bus, a subscriber or an event
+        // source, and at most one of the three registries holds the resource it
+        // addresses.
+        if state.taggable_tags(&input.resource_arn).is_none() {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                state.taggable_resource_refusal(&input.resource_arn),
+            )
+            .into());
+        }
+
+        // A resource whose revocation the model documents as refusing every
+        // mutating operation takes no tag change either.
+        if let Some(reason) = state.taggable_change_fault(&input.resource_arn) {
+            return Err(
+                UntagResourceErrorModeled::InvalidStateException(InvalidStateException {
+                    message: Some(reason),
+                })
+                .into(),
+            );
+        }
+
+        // "Removes tags": every key the request names is dropped from the set of
+        // the ONE resource the ARN addresses, and a key it does not name is left
+        // exactly as it stands — so no other resource's tags move, its bus's and
+        // its subscribers' included. A key the resource does not hold leaves the
+        // set as it stands: the operation is modelled `@idempotent`, so removing
+        // what is already gone is served rather than refused.
+        let Some(stored) = state.taggable_tags_mut(&input.resource_arn) else {
+            // Unreachable: the resolution above found this resource under the
+            // very lock still held here, so nothing can have removed it. Stated
+            // as the modelled server error rather than by panicking, and never
+            // as a success, because no tag was removed.
+            return Err(UntagResourceErrorModeled::InternalException(InternalException {
+                message: Some("the untagged resource is no longer in the store".to_string()),
+            })
+            .into());
+        };
+        for key in &input.tag_keys {
+            stored.remove(key);
+        }
+
+        // `UntagResourceResponse` models no members at all: what the call
+        // removed is read back through `ListTagsForResource`.
+        Ok(UntagResourceOutput {})
     }
 }
