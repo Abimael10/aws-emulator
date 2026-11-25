@@ -36,12 +36,22 @@ use crate::wire::emulator;
 /// client negotiates an encoding for, and the harness every other case here uses
 /// states none.
 ///
+/// The answer is handed back as the BYTES the client was given, beside the content
+/// type the answer states it wrote them with, because a published document may be
+/// written in an encoding that is not text at all
+/// ([`crate::kubernetes_openapi_protobuf`]).
+///
 /// The address answers both a TLS client and one that verifies nothing (the first
 /// byte of the connection says which), so this reaches the same server the TLS
 /// cases do. It presents the account's own credential, because an API server
 /// authenticates every request before it negotiates anything
 /// ([`crate::kubernetes_anonymous_requests`]).
-async fn dial_accepting(config: &Kubeconfig, case: &str, path: &str, accept: &str) -> (u16, Value) {
+pub(crate) async fn dial_accepting_bytes(
+    config: &Kubeconfig,
+    case: &str,
+    path: &str,
+    accept: &str,
+) -> (u16, String, Vec<u8>) {
     let authority = config
         .endpoint
         .strip_prefix("https://")
@@ -70,17 +80,39 @@ async fn dial_accepting(config: &Kubeconfig, case: &str, path: &str, accept: &st
         .read_to_end(&mut raw)
         .await
         .unwrap_or_else(|error| panic!("case {case:?}: the answer must be read: {error}"));
-    let text = String::from_utf8_lossy(&raw).to_string();
-    let (head, body) = text
-        .split_once("\r\n\r\n")
-        .unwrap_or_else(|| panic!("case {case:?}: expected an HTTP answer, got {text:?}"));
+    let separator = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected an HTTP answer, got {:?}",
+                String::from_utf8_lossy(&raw)
+            )
+        });
+    let head = String::from_utf8_lossy(&raw[..separator]).to_string();
     let status = head
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse::<u16>().ok())
         .unwrap_or_else(|| panic!("case {case:?}: expected a status line, got {head:?}"));
-    (status, serde_json::from_str(body).unwrap_or(Value::Null))
+    let content_type = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-type")
+                .then(|| value.trim().to_string())
+        })
+        .unwrap_or_default();
+    (status, content_type, raw[separator + 4..].to_vec())
+}
+
+/// The same request, with the answer read as the JSON document a client that takes
+/// JSON is handed.
+async fn dial_accepting(config: &Kubeconfig, case: &str, path: &str, accept: &str) -> (u16, Value) {
+    let (status, _, body) = dial_accepting_bytes(config, case, path, accept).await;
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
 }
 
 /// The group versions this server serves, as the index names each: the path under
@@ -89,7 +121,7 @@ async fn dial_accepting(config: &Kubeconfig, case: &str, path: &str, accept: &st
 /// SOURCE: the discovery documents this server serves — `/api` names the core
 /// version and `/apis` names every group beside it — so the table is the surface
 /// a client can address rather than a list written beside it.
-const GROUP_VERSIONS: &[(&str, &str, &str)] = &[
+pub(crate) const GROUP_VERSIONS: &[(&str, &str, &str)] = &[
     ("api/v1", "", "v1"),
     ("apis/apps/v1", "apps", "v1"),
     (
@@ -115,7 +147,7 @@ const GROUP_VERSIONS: &[(&str, &str, &str)] = &[
 /// SOURCE: the resources the API server serves — the core group's resource list, the
 /// RBAC group's and the authentication group's — one row per kind a client sends or
 /// reads.
-const KINDS: &[(&str, &str, &str)] = &[
+pub(crate) const KINDS: &[(&str, &str, &str)] = &[
     ("api/v1", "Pod", "io.k8s.api.core.v1.Pod"),
     ("api/v1", "Namespace", "io.k8s.api.core.v1.Namespace"),
     ("api/v1", "ConfigMap", "io.k8s.api.core.v1.ConfigMap"),
@@ -172,7 +204,7 @@ const KINDS: &[(&str, &str, &str)] = &[
 
 /// The relative URL the v3 index publishes one group version's document at, read out
 /// of the index the way a client does.
-fn served_url(index: &Value, path: &str) -> String {
+pub(crate) fn served_url(index: &Value, path: &str) -> String {
     index["paths"][path]["serverRelativeURL"]
         .as_str()
         .unwrap_or_else(|| panic!("case {path:?}: the index must publish a document, got {index}"))
@@ -180,7 +212,7 @@ fn served_url(index: &Value, path: &str) -> String {
 }
 
 /// One published document, read over the cluster's own address.
-async fn document(config: &Kubeconfig, case: &str, path: &str) -> Value {
+pub(crate) async fn document(config: &Kubeconfig, case: &str, path: &str) -> Value {
     let answered = dial(config, case, "GET", path, None).await;
     assert_eq!(
         answered.status, 200,
@@ -280,21 +312,18 @@ async fn every_group_version_this_server_serves_publishes_an_openapi_document() 
     );
 
     // AN ENCODING THIS SERVER DOES NOT WRITE: the documents are the one surface a
-    // client negotiates an encoding for, so an `Accept` naming only an encoding this
-    // server does not produce is refused as unacceptable rather than answered with a
-    // body the client cannot decode — while every `Accept` that admits JSON is served.
-    let negotiations: [(&str, &str, u16); 7] = [
+    // client negotiates an encoding for, so an `Accept` naming only an encoding a
+    // document is not published in is refused as unacceptable rather than answered
+    // with a body the client cannot decode — while every `Accept` that admits JSON is
+    // served it. Which encoding an answer IS written in is the client's choice
+    // ([`crate::kubernetes_openapi_protobuf`]).
+    let negotiations: [(&str, &str, u16); 6] = [
         (
-            "an Accept naming only another encoding",
-            "application/com.github.proto-openapi.spec.v2@v1.0+protobuf",
+            "an Accept naming only an encoding no document is published in",
+            "application/x-tar",
             406,
         ),
         ("an Accept naming JSON", "application/json", 200),
-        (
-            "an Accept naming another encoding and JSON",
-            "application/com.github.proto-openapi.spec.v2@v1.0+protobuf, application/json",
-            200,
-        ),
         ("an Accept taking anything", "*/*", 200),
         (
             "an Accept naming JSON with parameters",
@@ -321,7 +350,10 @@ async fn every_group_version_this_server_serves_publishes_an_openapi_document() 
         if expected == 406 {
             assert_eq!(
                 body["message"],
-                json!("only the following media types are accepted: application/json"),
+                json!(
+                    "only the following media types are accepted: application/json, \
+                     application/com.github.proto-openapi.spec.v2@v1.0+protobuf"
+                ),
                 "case {case:?}: the refusal names what is accepted, got {body}"
             );
         } else {

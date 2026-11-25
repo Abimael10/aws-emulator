@@ -584,7 +584,12 @@ async fn answer(
         if let Some(delivery) = served.delivery {
             delivery.deliver().await;
         }
-        json_response(served.status, &served.document)
+        match served.body {
+            Some(negotiated) => {
+                media_response(served.status, negotiated.content_type, negotiated.bytes)
+            }
+            None => json_response(served.status, &served.document),
+        }
     })
     .await;
     served.unwrap_or_else(|_| {
@@ -619,7 +624,7 @@ pub struct ApiRequest<'request> {
     pub query: Option<&'request str>,
     /// The `Accept` header: the encodings the client can read, which is what the
     /// published OpenAPI documents are negotiated by
-    /// ([`super::kubernetes_openapi::admits_json`]).
+    /// ([`super::kubernetes_openapi::negotiated`]).
     pub accept: Option<&'request str>,
     /// The media type the client wrote its body in, which is what says how the body is
     /// read.
@@ -633,9 +638,22 @@ pub struct ApiRequest<'request> {
 pub struct Served {
     pub status: u16,
     pub document: ::serde_json::Value,
+    /// The same answer written in the encoding the client NEGOTIATED, for the one
+    /// surface of this API that is negotiated — the published OpenAPI documents
+    /// ([`kubernetes_openapi::negotiated_body`]) — and `None` for every answer
+    /// written in the JSON a Kubernetes client reads an object in.
+    pub body: Option<NegotiatedBody>,
     /// The audit record to deliver once this service's store is released, and `None`
     /// for a cluster that does not have the `audit` log type enabled.
     pub delivery: Option<AuditDelivery>,
+}
+
+/// One answer written in an encoding the client chose: the content type it is
+/// written with, and the bytes of it.
+#[derive(Debug)]
+pub struct NegotiatedBody {
+    pub content_type: &'static str,
+    pub bytes: Vec<u8>,
 }
 
 /// Serve one Kubernetes API request against the cluster keyed `key`.
@@ -697,6 +715,7 @@ pub fn serve(
         return Served {
             status: refusal.status,
             document: refusal.to_status_json(),
+            body: None,
             delivery: None,
         };
     };
@@ -797,9 +816,18 @@ pub fn serve(
             },
         )
     });
+    // The one surface of this API whose encoding the client chooses: a published
+    // OpenAPI document the request asked for in another encoding is written in that
+    // encoding rather than in JSON.
+    let body = kubernetes_openapi::negotiated_body(request.path, request.accept, status, &document)
+        .map(|(content_type, bytes)| NegotiatedBody {
+            content_type,
+            bytes,
+        });
     Served {
         status,
         document,
+        body,
         delivery,
     }
 }
@@ -867,7 +895,12 @@ fn route(
             if method != ::http::Method::GET.as_str() {
                 return Err(ApiRefusal::method_not_allowed(method, path));
             }
-            unacceptable(request.accept)?;
+            // A path under the OpenAPI segment that addresses no published document
+            // is not found, whatever the client can read.
+            let Some(published) = kubernetes_openapi::published_at(path) else {
+                return Err(ApiRefusal::no_such_path(path));
+            };
+            unacceptable(published, request.accept)?;
             let kubernetes_version = cluster_kubernetes_version(state, key);
             return match *version {
                 kubernetes_openapi::OPENAPI_V3_VERSION => {
@@ -876,6 +909,9 @@ fn route(
                 kubernetes_openapi::OPENAPI_V2_VERSION => {
                     Ok((200, kubernetes_openapi::v2_document(&kubernetes_version)))
                 }
+                // A version `published_at` publishes a document for and this
+                // routing has none for is not found rather than answered with
+                // another version's document.
                 _ => Err(ApiRefusal::no_such_path(path)),
             };
         }
@@ -886,7 +922,7 @@ fn route(
             if method != ::http::Method::GET.as_str() {
                 return Err(ApiRefusal::method_not_allowed(method, path));
             }
-            unacceptable(request.accept)?;
+            unacceptable(kubernetes_openapi::V3_MEDIA_TYPES, request.accept)?;
             let kubernetes_version = cluster_kubernetes_version(state, key);
             return kubernetes_openapi::v3_document(&kubernetes_version, &document.join("/"))
                 .map(|document| (200, document))
@@ -1700,19 +1736,22 @@ fn version_document(
     kubernetes_version_info::version_document(&version, &patch_version, released_at)
 }
 
-/// `Ok(())` when `accept` admits the encoding the published documents are written
-/// in, else the `Status` the API server refuses an unacceptable `Accept` with: a
-/// client that can read only an encoding this server does not produce is told so
-/// rather than handed a body it cannot decode
-/// ([`kubernetes_openapi::admits_json`]).
-fn unacceptable(accept: Option<&str>) -> Result<(), ApiRefusal> {
-    if kubernetes_openapi::admits_json(accept) {
+/// `Ok(())` when `accept` admits one of the encodings the document the request
+/// addresses is `published` in, else the `Status` the API server refuses an
+/// unacceptable `Accept` with: a client that can read only an encoding this server
+/// does not write is told so, naming the encodings that document IS published in,
+/// rather than handed a body it cannot decode ([`kubernetes_openapi::negotiated`]).
+fn unacceptable(
+    published: &'static [&'static str],
+    accept: Option<&str>,
+) -> Result<(), ApiRefusal> {
+    if kubernetes_openapi::negotiated(accept, published).is_some() {
         return Ok(());
     }
     Err(ApiRefusal {
         status: 406,
         reason: "NotAcceptable",
-        message: kubernetes_openapi::unacceptable_message(),
+        message: kubernetes_openapi::unacceptable_message(published),
         resource: None,
     })
 }
@@ -1746,10 +1785,25 @@ fn cluster_kubernetes_version(
 
 /// One object document as the HTTP answer a Kubernetes client reads.
 fn json_response(status: u16, document: &::serde_json::Value) -> ::http::Response<Full<Bytes>> {
-    let body = Bytes::from(document.to_string().into_bytes());
+    media_response(
+        status,
+        kubernetes_openapi::DOCUMENT_MEDIA_TYPE,
+        document.to_string().into_bytes(),
+    )
+}
+
+/// One answer as the HTTP response a client reads it from, stating the media type it
+/// is written in — which is what tells a client that negotiated an encoding that it
+/// got the one it asked for.
+fn media_response(
+    status: u16,
+    media_type: &str,
+    bytes: Vec<u8>,
+) -> ::http::Response<Full<Bytes>> {
+    let body = Bytes::from(bytes);
     ::http::Response::builder()
         .status(status)
-        .header(::http::header::CONTENT_TYPE, "application/json")
+        .header(::http::header::CONTENT_TYPE, media_type)
         .body(Full::new(body.clone()))
         .unwrap_or_else(|_| ::http::Response::new(Full::new(body)))
 }

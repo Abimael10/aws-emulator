@@ -4661,6 +4661,7 @@ pub mod kubernetes_metadata;
 pub mod kubernetes_nodes;
 pub mod kubernetes_objects;
 pub mod kubernetes_openapi;
+pub mod kubernetes_openapi_protobuf;
 pub mod kubernetes_pod_addressing;
 pub mod kubernetes_pod_spec;
 pub mod kubernetes_protobuf;

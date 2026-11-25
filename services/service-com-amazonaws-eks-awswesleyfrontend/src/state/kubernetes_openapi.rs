@@ -22,15 +22,31 @@
 //! * `GET /openapi/v2` is the single Swagger 2.0 document an older client reads,
 //!   carrying the SAME schemas under `definitions`.
 //!
-//! What the schemas STATE is what this API server does with an object, and
-//! nothing more: the members it requires of a kind are `required` (a Pod's
-//! container list, and the name and image of each container —
-//! [`super::kubernetes_pod_spec`] refuses a manifest without them), and every
-//! object it stores as it was submitted carries
-//! `x-kubernetes-preserve-unknown-fields`, because this server keeps the members
-//! it was sent rather than dropping the ones it does not read. So a manifest this
-//! server would accept validates, and one it would refuse does not — the document
-//! and the admission are one rule.
+//! Each document is published in every encoding this server writes it in, and the
+//! request's `Accept` chooses: JSON, and — for the Swagger 2.0 document — the
+//! Protocol Buffers encoding the Go client a stock command line is built on asks for
+//! it in ([`super::kubernetes_openapi_protobuf`]). An `Accept` that admits none of
+//! the encodings a document is published in is refused as unacceptable rather than
+//! answered with a body the client cannot decode.
+//!
+//! # What a published schema declares
+//!
+//! A client validates the WHOLE manifest, not only the members this server reads:
+//! it walks the manifest against the schema of its kind and reports a member no
+//! schema declares, and then sends nothing. So the schema of a kind declares the
+//! members that KIND HAS — read off the Kubernetes type, not off this server's own
+//! reading of it — because a manifest that is valid for the kind is one this server
+//! accepts and keeps as it was sent.
+//!
+//! What the schemas CONSTRAIN is what this API server does with an object: the
+//! members it requires of a kind are `required` (a Pod's container list, and the
+//! name and image of each container — [`super::kubernetes_pod_spec`] refuses a
+//! manifest without them) and the ones it reads carry their type, while a member it
+//! only keeps is declared without being narrowed. Every object it stores as it was
+//! submitted carries `x-kubernetes-preserve-unknown-fields` as well, because this
+//! server keeps the members it was sent rather than dropping the ones it does not
+//! read. So a manifest this server would accept validates, and one it would refuse
+//! does not — the document and the admission are one rule.
 //!
 //! That makes the published document THIS SERVER's admission surface rather than a
 //! copy of upstream Kubernetes': where this server requires a member upstream
@@ -41,6 +57,7 @@
 //! manifest rather than what another server would.
 
 use super::kubernetes_objects::CORE_API_VERSION;
+use super::kubernetes_openapi_protobuf::PROTOBUF_MEDIA_TYPE;
 use super::kubernetes_rbac::{RBAC_API_GROUP, RBAC_GROUP_VERSION};
 use super::kubernetes_self_subject_review::{
     AUTHENTICATION_API_GROUP, AUTHENTICATION_GROUP_VERSION,
@@ -320,56 +337,279 @@ fn list_of(name: &str) -> ::serde_json::Value {
     ::serde_json::json!({ "type": "array", "items": reference(name) })
 }
 
-/// The media type the published documents are written in, and the `Status` the API
-/// server refuses an `Accept` it cannot satisfy with.
-///
-/// The OpenAPI documents are the one surface of this API a client NEGOTIATES an
-/// encoding for — the Swagger 2.0 document is published in a Protocol Buffers
-/// encoding as well as in JSON, and a client that asks for that encoding cannot read
-/// the other one. This server writes JSON, so an `Accept` naming only an encoding it
-/// does not produce is refused as unacceptable rather than answered `200` with a body
-/// the client cannot decode.
+/// The JSON encoding every published document is written in, which is also the one
+/// this server writes when the client states no preference.
 pub const DOCUMENT_MEDIA_TYPE: &str = "application/json";
 
-/// Whether `accept` admits the encoding these documents are written in: a request
-/// that states no preference, one that takes anything, one that takes any
-/// `application/*`, and one that names JSON itself.
+/// The encodings the Swagger 2.0 document is published in, in the order this server
+/// prefers them — JSON first, because that is what a client that states no
+/// preference reads.
+///
+/// The documents are the one surface of this API a client NEGOTIATES an encoding
+/// for, and the Go client a stock Kubernetes command line is built on asks for this
+/// document in the Protocol Buffers encoding ALONE, so a server that publishes it
+/// only in JSON cannot be driven by that client at all
+/// ([`super::kubernetes_openapi_protobuf`]).
+pub const V2_MEDIA_TYPES: &[&str] = &[DOCUMENT_MEDIA_TYPE, PROTOBUF_MEDIA_TYPE];
+
+/// The encodings the v3 index and the v3 group-version documents are published in.
+pub const V3_MEDIA_TYPES: &[&str] = &[DOCUMENT_MEDIA_TYPE];
+
+/// The encodings the document `path` addresses is published in, and `None` for a
+/// path that addresses no published document.
+///
+/// The ONE reading of a request path as a published document, so what the routing
+/// negotiates and what the answer is written in are decided alike.
+#[must_use]
+pub fn published_at(path: &str) -> Option<&'static [&'static str]> {
+    let mut segments = path.split('/').filter(|segment| !segment.is_empty());
+    if segments.next()? != OPENAPI_V3_SEGMENT {
+        return None;
+    }
+    match segments.next()? {
+        OPENAPI_V2_VERSION => segments.next().is_none().then_some(V2_MEDIA_TYPES),
+        OPENAPI_V3_VERSION => Some(V3_MEDIA_TYPES),
+        _ => None,
+    }
+}
+
+/// The encoding `accept` chooses out of the ones a document is `published` in, and
+/// `None` when it admits none of them — the request this server answers as
+/// unacceptable rather than with a body the client cannot decode.
+///
+/// A client states what it can read as a list of offers, each with the quality it
+/// takes that one at, so the choice is the published encoding offered at the highest
+/// quality, and the one the client offered first among equals. An offer of `*/*` or
+/// of `application/*` leaves the choice to this server, which is the first encoding
+/// the document is published in; a request that states no preference reads that same
+/// encoding.
 ///
 /// A media type offered with `q=0` is one the client states it does NOT accept ("a
-/// quality value of 0 means 'not acceptable'", RFC 9110), so it admits nothing.
+/// quality value of 0 means 'not acceptable'", RFC 9110), so it chooses nothing.
+///
+/// The offers are read against the FIXED list of encodings a document is published
+/// in rather than parsed into media types of their own: the name this server's
+/// Protocol Buffers encoding is published under is not a well-formed media type —
+/// its subtype carries a character a media-type parser does not admit
+/// ([`super::kubernetes_openapi_protobuf::PROTOBUF_MEDIA_TYPE`]) — so a conforming
+/// parser cannot hold the one name a stock client asks this document for.
 #[must_use]
-pub fn admits_json(accept: Option<&str>) -> bool {
+pub fn negotiated(accept: Option<&str>, published: &[&'static str]) -> Option<&'static str> {
+    let preferred = published.first().copied();
     let Some(accept) = accept.map(str::trim).filter(|accept| !accept.is_empty()) else {
-        return true;
+        return preferred;
     };
-    accept.split(',').any(|offered| {
+    let mut chosen: Option<(f32, &'static str)> = None;
+    for offered in accept.split(',') {
         let mut parameters = offered.split(';');
-        let media_type = parameters
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
-        let refused = parameters.any(|parameter| {
-            let (name, value) = parameter.split_once('=').unwrap_or_default();
-            name.trim().eq_ignore_ascii_case("q")
-                && value
-                    .trim()
-                    .parse::<f32>()
-                    .is_ok_and(|quality| quality <= 0.0)
-        });
-        !refused
-            && matches!(
-                media_type.as_str(),
-                "*/*" | "application/*" | DOCUMENT_MEDIA_TYPE
-            )
-    })
+        let media_type = parameters.next().unwrap_or_default().trim();
+        // The quality the client takes this offer at, which is the last `q` it stated
+        // on it; an offer states none at full quality.
+        let quality = parameters
+            .filter_map(|parameter| {
+                let (name, value) = parameter.split_once('=')?;
+                name.trim()
+                    .eq_ignore_ascii_case("q")
+                    .then(|| value.trim().parse::<f32>().ok())
+                    .flatten()
+            })
+            .next_back()
+            .unwrap_or(1.0);
+        if quality <= 0.0 {
+            continue;
+        }
+        let offer = if media_type == "*/*" || media_type.eq_ignore_ascii_case("application/*") {
+            preferred
+        } else {
+            published
+                .iter()
+                .find(|published| published.eq_ignore_ascii_case(media_type))
+                .copied()
+        };
+        let Some(offer) = offer else {
+            continue;
+        };
+        // Strictly higher, so the order the client wrote its offers in decides among
+        // offers it takes at the same quality.
+        if chosen.is_none_or(|(taken, _)| quality > taken) {
+            chosen = Some((quality, offer));
+        }
+    }
+    chosen.map(|(_, offer)| offer)
 }
 
 /// The sentence the API server refuses an unacceptable `Accept` with, naming the
-/// media types it does accept.
+/// media types the document it addresses is published in.
 #[must_use]
-pub fn unacceptable_message() -> String {
-    format!("only the following media types are accepted: {DOCUMENT_MEDIA_TYPE}")
+pub fn unacceptable_message(published: &[&str]) -> String {
+    format!(
+        "only the following media types are accepted: {}",
+        published.join(", ")
+    )
+}
+
+/// The published `document` as the bytes of the encoding the request's `accept`
+/// chose, and the content type to write them with — `None` when that encoding is the
+/// JSON every other answer of this API server is written in.
+#[must_use]
+pub fn negotiated_body(
+    path: &str,
+    accept: Option<&str>,
+    status: u16,
+    document: &::serde_json::Value,
+) -> Option<(&'static str, Vec<u8>)> {
+    // Only a published document is negotiated: a refusal is the `Status` object
+    // every other refusal of this API server is.
+    if status != 200 {
+        return None;
+    }
+    let media_type = negotiated(accept, published_at(path)?)?;
+    (media_type == PROTOBUF_MEDIA_TYPE).then(|| {
+        (
+            kubernetes_openapi_protobuf::PROTOBUF_CONTENT_TYPE,
+            kubernetes_openapi_protobuf::encoded(document),
+        )
+    })
+}
+
+/// A member a published schema DECLARES without narrowing what may be in it: any
+/// value validates.
+///
+/// Every kind this server serves has members beside the ones this server itself
+/// reads, and a client validates the whole manifest against the published schema
+/// before it sends it — so a member the kind has is declared even where nothing here
+/// constrains it, because a manifest carrying it is one this server accepts and
+/// keeps as it was sent.
+fn any_value() -> ::serde_json::Value {
+    ::serde_json::json!({})
+}
+
+/// A member whose value is text, a whole number, a flag, or a list of texts.
+fn text_value() -> ::serde_json::Value {
+    ::serde_json::json!({ "type": "string" })
+}
+
+fn number_value() -> ::serde_json::Value {
+    ::serde_json::json!({ "type": "integer" })
+}
+
+fn flag_value() -> ::serde_json::Value {
+    ::serde_json::json!({ "type": "boolean" })
+}
+
+fn text_list_value() -> ::serde_json::Value {
+    ::serde_json::json!({ "type": "array", "items": { "type": "string" } })
+}
+
+/// The members of the object metadata every Kubernetes object carries.
+///
+/// SOURCE: the members the `ObjectMeta` type of the Kubernetes API machinery
+/// declares. The ones this server reads and reports are typed; the rest are declared
+/// as members of the kind without being narrowed ([`any_value`]).
+fn object_meta_members() -> ::serde_json::Value {
+    ::serde_json::json!({
+        "name": text_value(),
+        "generateName": text_value(),
+        "namespace": text_value(),
+        "selfLink": text_value(),
+        "uid": text_value(),
+        "resourceVersion": text_value(),
+        "generation": number_value(),
+        "creationTimestamp": text_value(),
+        "deletionTimestamp": text_value(),
+        "deletionGracePeriodSeconds": number_value(),
+        "labels": string_map(),
+        "annotations": string_map(),
+        "ownerReferences": any_value(),
+        "finalizers": text_list_value(),
+        "managedFields": any_value(),
+    })
+}
+
+/// The members of one container of a pod.
+///
+/// SOURCE: the members the core `Container` type declares. `name` and `image` are
+/// the two this server reads and requires ([`super::kubernetes_pod_spec`]); the rest
+/// are the container's own members, declared because a manifest that carries them is
+/// one this server accepts.
+fn container_members() -> ::serde_json::Value {
+    ::serde_json::json!({
+        "name": text_value(),
+        "image": text_value(),
+        "command": text_list_value(),
+        "args": text_list_value(),
+        "workingDir": text_value(),
+        "ports": any_value(),
+        "envFrom": any_value(),
+        "env": any_value(),
+        "resources": any_value(),
+        "resizePolicy": any_value(),
+        "restartPolicy": text_value(),
+        "volumeMounts": any_value(),
+        "volumeDevices": any_value(),
+        "livenessProbe": any_value(),
+        "readinessProbe": any_value(),
+        "startupProbe": any_value(),
+        "lifecycle": any_value(),
+        "terminationMessagePath": text_value(),
+        "terminationMessagePolicy": text_value(),
+        "imagePullPolicy": text_value(),
+        "securityContext": any_value(),
+        "stdin": flag_value(),
+        "stdinOnce": flag_value(),
+        "tty": flag_value(),
+    })
+}
+
+/// The members of a pod's specification, with the container list referencing the
+/// container schema `container`.
+///
+/// SOURCE: the members the core `PodSpec` type declares. `containers`,
+/// `serviceAccountName`, `serviceAccount` and `nodeName` are the ones this server
+/// reads; the rest are the specification's own members.
+fn pod_spec_members(container: &str) -> ::serde_json::Value {
+    ::serde_json::json!({
+        "containers": list_of(container),
+        "initContainers": list_of(container),
+        "ephemeralContainers": any_value(),
+        "volumes": any_value(),
+        "restartPolicy": text_value(),
+        "terminationGracePeriodSeconds": number_value(),
+        "activeDeadlineSeconds": number_value(),
+        "dnsPolicy": text_value(),
+        "dnsConfig": any_value(),
+        "nodeSelector": string_map(),
+        "serviceAccountName": text_value(),
+        "serviceAccount": text_value(),
+        "automountServiceAccountToken": flag_value(),
+        "nodeName": text_value(),
+        "hostNetwork": flag_value(),
+        "hostPID": flag_value(),
+        "hostIPC": flag_value(),
+        "shareProcessNamespace": flag_value(),
+        "securityContext": any_value(),
+        "imagePullSecrets": any_value(),
+        "hostname": text_value(),
+        "subdomain": text_value(),
+        "affinity": any_value(),
+        "schedulerName": text_value(),
+        "tolerations": any_value(),
+        "hostAliases": any_value(),
+        "priorityClassName": text_value(),
+        "priority": number_value(),
+        "preemptionPolicy": text_value(),
+        "readinessGates": any_value(),
+        "runtimeClassName": text_value(),
+        "enableServiceLinks": flag_value(),
+        "overhead": any_value(),
+        "topologySpreadConstraints": any_value(),
+        "setHostnameAsFQDN": flag_value(),
+        "os": any_value(),
+        "hostUsers": flag_value(),
+        "schedulingGates": any_value(),
+        "resourceClaims": any_value(),
+        "resources": any_value(),
+    })
 }
 
 /// The schemas of one group version: one per kind this server serves there, plus
@@ -377,19 +617,7 @@ pub fn unacceptable_message() -> String {
 fn schemas_of(group: &str, version: &str) -> Vec<(String, ::serde_json::Value)> {
     let mut schemas = vec![(
         meta_schema_name("ObjectMeta"),
-        object(
-            ::serde_json::json!({
-                "name": { "type": "string" },
-                "generateName": { "type": "string" },
-                "namespace": { "type": "string" },
-                "uid": { "type": "string" },
-                "resourceVersion": { "type": "string" },
-                "creationTimestamp": { "type": "string" },
-                "labels": string_map(),
-                "annotations": string_map(),
-            }),
-            &[],
-        ),
+        object(object_meta_members(), &[]),
     )];
     match (group, version) {
         ("", _) => {
@@ -409,10 +637,24 @@ fn schemas_of(group: &str, version: &str) -> Vec<(String, ::serde_json::Value)> 
                 group,
                 version,
                 "ConfigMap",
-                &[("data", string_map()), ("binaryData", string_map())],
+                &[
+                    ("data", string_map()),
+                    ("binaryData", string_map()),
+                    ("immutable", flag_value()),
+                ],
                 &[],
             ));
-            schemas.push(entry(group, version, "ServiceAccount", &[], &[]));
+            schemas.push(entry(
+                group,
+                version,
+                "ServiceAccount",
+                &[
+                    ("secrets", any_value()),
+                    ("imagePullSecrets", any_value()),
+                    ("automountServiceAccountToken", flag_value()),
+                ],
+                &[],
+            ));
             // The Service a client names a workload by, and the ports it answers
             // on ([`super::kubernetes_services`]).
             let service_port = schema_name(group, version, "ServicePort");
@@ -420,14 +662,19 @@ fn schemas_of(group: &str, version: &str) -> Vec<(String, ::serde_json::Value)> 
                 service_port.clone(),
                 object(
                     ::serde_json::json!({
-                        "name": { "type": "string" },
-                        "protocol": { "type": "string" },
-                        "port": { "type": "integer" },
+                        "name": text_value(),
+                        "protocol": text_value(),
+                        "port": number_value(),
                         // `targetPort` is an `IntOrString`: "if this is a string,
                         // it will be looked up as a named port in the target Pod's
-                        // container ports".
-                        "targetPort": { "oneOf": [{ "type": "integer" }, { "type": "string" }] },
-                        "nodePort": { "type": "integer" },
+                        // container ports". The Kubernetes schema declares such a
+                        // member as a string carrying the `int-or-string` format,
+                        // which is the form a client reads a member written either
+                        // way by — and the one a Swagger 2.0 document can carry at
+                        // all, since that specification has no alternative-schema
+                        // keyword.
+                        "targetPort": { "type": "string", "format": "int-or-string" },
+                        "nodePort": number_value(),
                     }),
                     // The one member a Service port cannot be read without.
                     &["port"],
@@ -438,13 +685,13 @@ fn schemas_of(group: &str, version: &str) -> Vec<(String, ::serde_json::Value)> 
                 service_spec.clone(),
                 object(
                     ::serde_json::json!({
-                        "type": { "type": "string" },
-                        "clusterIP": { "type": "string" },
-                        "clusterIPs": { "type": "array", "items": { "type": "string" } },
-                        "externalName": { "type": "string" },
+                        "type": text_value(),
+                        "clusterIP": text_value(),
+                        "clusterIPs": text_list_value(),
+                        "externalName": text_value(),
                         "ports": list_of(&service_port),
                         "selector": string_map(),
-                        "sessionAffinity": { "type": "string" },
+                        "sessionAffinity": text_value(),
                     }),
                     &[],
                 ),
@@ -463,15 +710,22 @@ fn schemas_of(group: &str, version: &str) -> Vec<(String, ::serde_json::Value)> 
                 group,
                 version,
                 "Event",
+                // SOURCE: the members the core `Event` type declares.
                 &[
                     ("involvedObject", open_object()),
-                    ("reason", ::serde_json::json!({ "type": "string" })),
-                    ("message", ::serde_json::json!({ "type": "string" })),
-                    ("type", ::serde_json::json!({ "type": "string" })),
+                    ("reason", text_value()),
+                    ("message", text_value()),
+                    ("type", text_value()),
                     ("source", open_object()),
-                    ("count", ::serde_json::json!({ "type": "integer" })),
-                    ("firstTimestamp", ::serde_json::json!({ "type": "string" })),
-                    ("lastTimestamp", ::serde_json::json!({ "type": "string" })),
+                    ("count", number_value()),
+                    ("firstTimestamp", text_value()),
+                    ("lastTimestamp", text_value()),
+                    ("eventTime", text_value()),
+                    ("action", text_value()),
+                    ("reportingComponent", text_value()),
+                    ("reportingInstance", text_value()),
+                    ("related", any_value()),
+                    ("series", any_value()),
                 ],
                 &[],
             ));
@@ -530,9 +784,19 @@ fn schemas_of(group: &str, version: &str) -> Vec<(String, ::serde_json::Value)> 
                     &["apiGroup", "kind", "name"],
                 ),
             ));
-            for kind in ["Role", "ClusterRole"] {
-                schemas.push(entry(group, version, kind, &[("rules", list_of(&rule))], &[]));
-            }
+            schemas.push(entry(group, version, "Role", &[("rules", list_of(&rule))], &[]));
+            schemas.push(entry(
+                group,
+                version,
+                "ClusterRole",
+                // SOURCE: the members the `ClusterRole` type declares — a cluster
+                // role aggregates other roles' rules, which a role does not.
+                &[
+                    ("rules", list_of(&rule)),
+                    ("aggregationRule", any_value()),
+                ],
+                &[],
+            ));
             for kind in ["RoleBinding", "ClusterRoleBinding"] {
                 schemas.push(entry(
                     group,
@@ -653,10 +917,7 @@ fn push_pod_spec_schemas(schemas: &mut Vec<(String, ::serde_json::Value)>) -> St
     schemas.push((
         container.clone(),
         object(
-            ::serde_json::json!({
-                "name": { "type": "string" },
-                "image": { "type": "string" },
-            }),
+            container_members(),
             // The two members this server requires of a container: a pod
             // whose container names neither has no workload to run
             // ([`super::kubernetes_pod_spec`]).
@@ -667,12 +928,7 @@ fn push_pod_spec_schemas(schemas: &mut Vec<(String, ::serde_json::Value)>) -> St
     schemas.push((
         pod_spec.clone(),
         object(
-            ::serde_json::json!({
-                "containers": list_of(&container),
-                "serviceAccountName": { "type": "string" },
-                "serviceAccount": { "type": "string" },
-                "nodeName": { "type": "string" },
-            }),
+            pod_spec_members(&container),
             // "There must be at least one container in a Pod".
             &["containers"],
         ),
