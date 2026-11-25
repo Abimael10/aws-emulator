@@ -5,15 +5,15 @@
 //! RULE: `Id` is a plain `string` path label on every operation addressed by one
 //! (`smithy_query(query="operation",operation="GetAnycastIpList,UpdateAnycastIpList")` — no
 //! `@pattern`, no `@length`), so the only values such an operation may refuse unread are the
-//! ones written in NO form CloudFront writes an identifier in. A value written under a
-//! namespace label (`ipl-…`, whatever label, body width, body alphabet or separator it
-//! carries) or in the alphabet CloudFront writes an ENTITY identifier in (ASCII digits and
-//! upper-case letters) could have been issued, so it is resolved against the STORE and one no
-//! list answers to is the list reported ABSENT — `EntityNotFound` (404) with its fixed
-//! sentence. A value written in neither form — around no separator in lower case, as a UUID,
-//! as a word, as a name, or in that alphabet with one character outside it — was never an
-//! identifier at all and is the argument the operation cannot read, `InvalidArgument` (400)
-//! with the sentence naming the member it arrived in.
+//! ones carrying NO namespace a CloudFront identifier of a namespaced resource is written
+//! under. A value written under a namespace label (`ipl-…`, whatever label, body width, body
+//! alphabet or separator it carries) could have been issued, so it is resolved against the
+//! STORE and one no list answers to is the list reported ABSENT — `EntityNotFound` (404) with
+//! its fixed sentence. A value carrying no namespace at all — a bare word, a name, a UUID, a
+//! label with its separator dropped, or a run of the alphabet an ENTITY identifier of another
+//! CloudFront family is written in — was never an identifier of this resource and is the
+//! argument the operation cannot read, `InvalidArgument` (400) with the sentence naming the
+//! member it arrived in.
 //!
 //! Because the TARGET is resolved before anything the body submits is read, every row drives
 //! the update twice — once with a body the update can apply and once with a body carrying an
@@ -21,9 +21,11 @@
 //! the list cannot change what the service says about an identifier that addresses nothing.
 //!
 //! The rows span what the rule generalises over: the namespace label and separator, the body's
-//! width and alphabet, the two forms an identifier takes at all, the alphabet broken in each
-//! way a value breaks it, and the two operations addressed by such an identifier. The list
-//! that really EXISTS is driven through both operations as well, so the reading is shown not to
+//! width and alphabet, and then every way a value carries no namespace at all — the label with
+//! its separator dropped, the entity-identifier alphabet at several widths and compositions
+//! (another CloudFront family's own minted identifier among them), a UUID, a word, a name and a
+//! lone separator — across the two operations addressed by such an identifier. The list that
+//! really EXISTS is driven through both operations as well, so the reading is shown not to
 //! refuse the calls it must serve.
 //!
 //! The wire harness is [`crate::distribution_lifecycle`]'s, the create and read
@@ -65,11 +67,11 @@ struct Row {
 /// Every identifier the rule is asserted over.
 ///
 /// The readable rows vary the parts nothing in the model constrains — the namespace label, the
-/// separator, and the body's width and alphabet — and then the OTHER form an identifier takes,
-/// the entity-identifier alphabet, at several widths and compositions, including another
-/// resource kind's own minted identifier (that alphabet is shared, and which identifier of it
-/// was issued for what is a property of the store alone). The unreadable rows break that
-/// alphabet in each way a value breaks it.
+/// separator, and the body's width and alphabet — since none of them can refuse an identifier:
+/// only the store knows which were issued. The unreadable rows carry no namespace at all, in
+/// each way a value carries none, including a run of the alphabet CloudFront writes an ENTITY
+/// identifier in: an identifier of that family names a distribution or an origin access
+/// control, never a list of this one.
 fn rows() -> Vec<Row> {
     let readable = [
         (
@@ -89,6 +91,20 @@ fn rows() -> Vec<Row> {
             "a_0".to_string(),
         ),
         (
+            "a body carrying both separators",
+            "ipl-not_a-minted-id".to_string(),
+        ),
+        (
+            "a label this service never mints, over a body of 32 digits",
+            "zz_99999999999999999999999999999999".to_string(),
+        ),
+    ];
+    let unreadable = [
+        (
+            "the minted label with its separator dropped",
+            "ipl0123456789abcdef0".to_string(),
+        ),
+        (
             "the entity-identifier alphabet, letters over digits",
             "IAL1A2B3C4D5E6".to_string(),
         ),
@@ -102,17 +118,11 @@ fn rows() -> Vec<Row> {
         ),
         (
             "the entity-identifier alphabet, far wider than any id this service mints",
-            "Q".repeat(64),
+            "Q".repeat(512),
         ),
         (
-            "another resource kind's minted identifier, of that shared alphabet",
+            "another CloudFront family's minted identifier",
             "EDFDVBD6EXAMPLE".to_string(),
-        ),
-    ];
-    let unreadable = [
-        (
-            "the minted label with its separator dropped",
-            "ipl0123456789abcdef0".to_string(),
         ),
         (
             "the entity-identifier alphabet with one lower-case character",

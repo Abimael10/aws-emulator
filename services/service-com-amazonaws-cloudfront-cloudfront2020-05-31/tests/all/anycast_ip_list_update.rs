@@ -498,8 +498,8 @@ async fn an_update_is_refused_on_an_absent_list_and_on_a_version_that_is_not_cur
             "aip_1A2B3C4D5E6F7G8H9J0K1L".to_string(),
         ),
         (
-            "an id written in the entity-identifier alphabet",
-            "IAL1A2B3C4D5E6".to_string(),
+            "a label this service never mints, over a one-character body",
+            "z_0".to_string(),
         ),
         (
             "a value of another namespace entirely",

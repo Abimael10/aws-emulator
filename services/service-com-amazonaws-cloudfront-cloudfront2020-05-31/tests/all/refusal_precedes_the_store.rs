@@ -24,7 +24,8 @@
 //!
 //! The rows differ along what the rule generalises over: for the identifier, the form that
 //! makes a value unreadable (an upper-cased namespace, a label too long to be one, a label
-//! with no separator, another resource kind's id, a lone separator) crossed with every
+//! with no separator, another resource kind's id, the alphabet an entity identifier of another
+//! CloudFront family is written in, a lone separator) crossed with every
 //! `If-Match` the mutation can carry (the list's current version, a token of no version shape
 //! and a well-formed token never minted), and the parts of a readable identifier nothing
 //! constrains (the namespace label, the body's width, its alphabet and the separator); for
@@ -80,8 +81,8 @@ async fn live_list(router: &MultiServiceRouter, name: &str) -> (String, String) 
     )
 }
 
-/// The forms a value takes that are no identifier CloudFront writes at all — neither a
-/// namespaced one nor one of the entity-identifier alphabet: `(case, value)`.
+/// The forms a value takes that carry NO namespace a CloudFront identifier of a namespaced
+/// resource is written under: `(case, value)`.
 ///
 /// `minted` is the id a create really handed out and `name` the list's own name, so the rows
 /// are built from this run's record rather than from literals.
@@ -102,6 +103,10 @@ fn unreadable(minted: &str, name: &str) -> Vec<(String, String)> {
             "a namespace label longer than any this service writes".to_string(),
             "anycastiplist-0123456789".to_string(),
         ),
+        (
+            "the alphabet an entity identifier of another family is written in".to_string(),
+            "IAL1A2B3C4D5E6".to_string(),
+        ),
     ]
 }
 
@@ -110,9 +115,7 @@ fn unreadable(minted: &str, name: &str) -> Vec<(String, String)> {
 ///
 /// `Id` is a plain `string` in the model — no pattern and no length — so the namespace label,
 /// the body's width, the body's alphabet and the separator are all parts nothing may refuse a
-/// value on, and each row varies one of them; the last row carries no namespace at all and is
-/// written in the alphabet CloudFront writes an entity identifier in, which is the other form
-/// an identifier it issued takes.
+/// value on, and each row varies one of them.
 fn readable_but_absent() -> Vec<(String, String)> {
     vec![
         (
@@ -136,8 +139,8 @@ fn readable_but_absent() -> Vec<(String, String)> {
             "ipl_0123456789abcdef0".to_string(),
         ),
         (
-            "an id written in the entity-identifier alphabet".to_string(),
-            "IAL1A2B3C4D5E6".to_string(),
+            "a label this service never mints, over a body of 32 digits".to_string(),
+            "zz_99999999999999999999999999999999".to_string(),
         ),
     ]
 }

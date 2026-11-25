@@ -4,8 +4,8 @@
 //!
 //! Reports the Anycast static IP list `Id` names, read from the one record
 //! `CreateAnycastIpList` stored, together with the version token of that record. An `Id`
-//! written in no form CloudFront writes an identifier in is `InvalidArgument`, decided
-//! before the store is consulted; an id it CAN read that no stored list carries is
+//! carrying no namespace a CloudFront identifier is written under is `InvalidArgument`,
+//! decided before the store is consulted; an id it CAN read that no stored list carries is
 //! `EntityNotFound`.
 //!
 //! A REPORTING operation: it writes nothing of its own, and materialises only the
@@ -152,14 +152,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
 
         // What the REQUEST alone decides about the id is whether it could be an identifier
-        // CloudFront issued at all: `Id` carries no pattern in the model, so neither the
-        // namespace label nor the width or alphabet of the body is a constraint to refuse a
-        // value on — the `ipl-` + hex form this service MINTS is one namespace an Anycast
-        // static IP list id is written under and the entity-identifier alphabet is another,
-        // not the only ones ([`crate::state::addresses_an_anycast_ip_list`]). A value of
-        // either form is resolved against the store below, so one that was never issued is a
-        // list that is ABSENT rather than an argument this operation cannot read.
-        if !crate::state::addresses_an_anycast_ip_list(&input.id) {
+        // CloudFront issued for a namespaced resource at all: `Id` carries no pattern in the
+        // model, so neither the namespace label nor the width or alphabet of the body is a
+        // constraint to refuse a value on — the `ipl-` + hex form this service MINTS is one
+        // namespace an Anycast static IP list id is written under, never the only one
+        // ([`crate::state::is_namespaced_resource_id`], the one reading every operation of
+        // the namespaced family addresses its resource by). A value of that form is resolved
+        // against the store below, so one that was never issued is a list that is ABSENT,
+        // while a value carrying no namespace at all is an identifier this operation cannot
+        // read.
+        if !crate::state::is_namespaced_resource_id(&input.id) {
             return Err(GetAnycastIpListErrorModeled::InvalidArgument(
                 crate::state::invalid_id_format("Id"),
             )

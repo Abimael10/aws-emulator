@@ -332,16 +332,27 @@ pub fn malformed_arn() -> crate::ops::types::InvalidArgument {
     }
 }
 
-/// The sentence the OWNED-RESOURCE listing refuses a `ResourceArn` that is no ARN at all
-/// with: the fixed text says the value's SYNTAX could not be read, and the one variable part
-/// is the value the request carried, echoed verbatim at the end so a caller submitting
-/// several ARNs learns WHICH one it has to fix.
+/// The sentence family the OWNED-RESOURCE listing refuses a `ResourceArn` it cannot READ
+/// with: the fixed opening says the value's SYNTAX could not be read, `reason` names the part
+/// of the value that could not be read, and the one variable part is the value the request
+/// carried, echoed verbatim at the end so a caller submitting several ARNs learns WHICH one it
+/// has to fix.
 ///
-/// The form condition itself is the service-wide one ([`MALFORMED_ARN_MESSAGE`]) — the value
-/// does not open with [`ARN_PREFIX`] — so this sentence states it, wrapped in this surface's
-/// own words rather than restated. Recorded behaviour.
+/// TWO readings of such a value fail this way, so ONE sentence family states both: the value
+/// does not open with [`ARN_PREFIX`] and is no ARN at all
+/// ([`invalid_resource_arn_syntax_message`]), or it is an ARN of this service whose resource
+/// part names a resource type CloudFront writes nothing under
+/// ([`invalid_arn_resource_type_syntax_message`]), so there is no CloudFront resource in it to
+/// resolve. Recorded behaviour.
+pub fn invalid_resource_syntax_message(reason: &str, resource_arn: &str) -> String {
+    format!("Resource has invalid syntax: {reason}: {resource_arn}")
+}
+
+/// The sentence the OWNED-RESOURCE listing refuses a `ResourceArn` that is no ARN at all
+/// with — the [`invalid_resource_syntax_message`] family under the service-wide form
+/// condition ([`MALFORMED_ARN_MESSAGE`]): the value does not open with [`ARN_PREFIX`].
 pub fn invalid_resource_arn_syntax_message(resource_arn: &str) -> String {
-    format!("Resource has invalid syntax: {MALFORMED_ARN_MESSAGE}: {resource_arn}")
+    invalid_resource_syntax_message(MALFORMED_ARN_MESSAGE, resource_arn)
 }
 
 /// The modelled `InvalidArgument` (HTTP 400) the owned-resource listing refuses a
@@ -353,6 +364,121 @@ pub fn invalid_resource_arn_syntax(resource_arn: &str) -> crate::ops::types::Inv
     crate::ops::types::InvalidArgument {
         message: Some(invalid_resource_arn_syntax_message(resource_arn)),
     }
+}
+
+/// What the [`invalid_resource_syntax_message`] family names as the part it could not read,
+/// for an ARN of this service whose resource part spells a resource type CloudFront writes no
+/// resource under: the type is the one part of such an ARN that is read before the resource it
+/// names can be, and a word no type of this service is spelled with leaves nothing to read.
+/// Recorded behaviour.
+pub const INVALID_ARN_RESOURCE_TYPE_REASON: &str = "invalid resource type";
+
+/// The sentence the OWNED-RESOURCE listing refuses a `ResourceArn` of this service whose
+/// resource part names NO resource type CloudFront writes with: the
+/// [`invalid_resource_syntax_message`] family under [`INVALID_ARN_RESOURCE_TYPE_REASON`], so
+/// the submitted value is echoed as it is for a value that is no ARN at all.
+pub fn invalid_arn_resource_type_syntax_message(resource_arn: &str) -> String {
+    invalid_resource_syntax_message(INVALID_ARN_RESOURCE_TYPE_REASON, resource_arn)
+}
+
+/// The modelled `InvalidArgument` (HTTP 400) the owned-resource listing refuses a
+/// `ResourceArn` whose resource type cannot be read as one of this service's with — "An
+/// argument is invalid."
+///
+/// Decided from the REQUEST alone: whether the value spells a type this service writes is a
+/// property of the value, so nothing is resolved against the store for it.
+pub fn invalid_arn_resource_type_syntax(
+    resource_arn: &str,
+) -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(invalid_arn_resource_type_syntax_message(resource_arn)),
+    }
+}
+
+/// The resource TYPES CloudFront's ARN namespace writes a resource under, as the resource part
+/// of an ARN spells each of them.
+///
+/// Every kind of resource this service's API addresses, spelled the way that resource's ARN
+/// spells its type rather than the way its route does — a VPC origin's ARN carries
+/// [`RESOURCE_POLICY_RESOURCE_TYPE`] where its route carries `vpc-origin`. The types this
+/// service MINTS an ARN under are the ones with an ARN constructor beside this
+/// ([`distribution_arn`], [`anycast_ip_list_arn`], [`vpc_origin_arn`],
+/// [`distribution_tenant_arn`], [`connection_group_arn`], [`key_value_store_arn`],
+/// [`streaming_distribution_arn`], the function, connection-function, real-time log
+/// configuration and trust store ones); the rest are the kinds its other routes create and
+/// address (`/cache-policy`, `/origin-request-policy`, `/response-headers-policy`,
+/// `/continuous-deployment-policy`, `/origin-access-control`, `/origin-access-identity`,
+/// `/public-key`, `/key-group`, `/field-level-encryption`, `/field-level-encryption-profile`,
+/// `/monitoring-subscription`), which carry an ARN of this namespace too.
+///
+/// What this decides is whether a submitted ARN can be READ as naming a CloudFront resource at
+/// all ([`arn_resource_type_is_readable`]) — which is a property of the VALUE — never whether
+/// an operation accepts that type, which is each operation's own question
+/// ([`resource_policy_resource`], [`TAGGABLE_RESOURCE_TYPES`]).
+///
+/// Sorted, so the list reads as the SET it is.
+pub const CLOUDFRONT_ARN_RESOURCE_TYPES: [&str; 22] = [
+    "anycast-ip-list",
+    "cache-policy",
+    "connection-function",
+    "connection-group",
+    "continuous-deployment-policy",
+    "distribution",
+    "distribution-tenant",
+    "field-level-encryption-config",
+    "field-level-encryption-profile",
+    "function",
+    "key-group",
+    "key-value-store",
+    "monitoring-subscription",
+    "origin-access-control",
+    "origin-access-identity",
+    "origin-request-policy",
+    "public-key",
+    "realtime-log-config",
+    "response-headers-policy",
+    "streaming-distribution",
+    "trust-store",
+    RESOURCE_POLICY_RESOURCE_TYPE,
+];
+
+/// Whether the resource TYPE `arn` names can be READ at all — the first thing an operation
+/// taking the ARN of a resource of this service reads of the value after its form
+/// ([`is_readable_arn`]).
+///
+/// An ARN of THIS service claims to name a CloudFront resource, so its resource part has to
+/// spell one of the types this service's namespace writes
+/// ([`CLOUDFRONT_ARN_RESOURCE_TYPES`]): a word no kind of CloudFront resource is written under
+/// names nothing there is to resolve, which is a value that cannot be READ rather than a
+/// resource type an operation declines to cover.
+///
+/// Everything else is left to whoever resolves the ARN. An ARN of ANOTHER service names a
+/// resource of that service's namespace, which this one has no spelling to check it against,
+/// and an ARN carrying no type token at all ([`arn_resource_type`]) names no type for this
+/// reading to judge — so both are carried through to the operation's own question about WHICH
+/// type it covers.
+pub fn arn_resource_type_is_readable(arn: &str) -> bool {
+    if arn_service(arn) != Some(CLOUDFRONT_ARN_SERVICE) {
+        return true;
+    }
+    arn_resource_type(arn).is_none_or(|kind| CLOUDFRONT_ARN_RESOURCE_TYPES.contains(&kind))
+}
+
+/// The `service` segment an ARN of THIS service carries — the model's `arnNamespace`, which is
+/// the namespace every ARN [`cloudfront_arn_resource`] reads is written in.
+pub const CLOUDFRONT_ARN_SERVICE: &str = "cloudfront";
+
+/// The service an ARN names — its third segment — or `None` where the value carries no such
+/// segment.
+///
+/// An ARN is `arn:<partition>:<service>:<region>:<account>:<resource>`, so this is the one
+/// segment that says WHOSE namespace the rest of the value is written in, read without
+/// demanding anything of the resource part ([`cloudfront_arn_resource`] demands a `<type>/<id>`
+/// pair and so cannot answer this for a degenerate ARN).
+pub fn arn_service(arn: &str) -> Option<&str> {
+    let mut segments = arn.splitn(6, ':');
+    (segments.next()? == "arn").then_some(())?;
+    segments.nth(1)
 }
 
 /// The sentence the OWNED-RESOURCE listing refuses a well-formed `ResourceArn` naming a
@@ -494,15 +620,20 @@ pub fn associable_web_acl_arn(web_acl_arn: &str) -> bool {
 /// * [`ResourceArnRefusal::Malformed`] — a value that is no ARN at all cannot be read as
 ///   one, so it is refused on its FORM. What "no ARN at all" is, is the condition the
 ///   sentence for it states ([`MALFORMED_ARN_MESSAGE`]): the value does not OPEN with
-///   [`ARN_PREFIX`]. A value that does open with it is read for the resource it names, so a
-///   degenerate one — an ARN carrying no resource part, or none this service's namespace
-///   spells — names no accepted type and is the type refusal below rather than a second form
-///   refusal this service has no recorded sentence for;
+///   [`ARN_PREFIX`];
+/// * [`ResourceArnRefusal::UnreadableType`] — a value that DOES open with it is read for the
+///   resource it names, and an ARN of this service whose resource part spells a type
+///   CloudFront writes no resource under ([`arn_resource_type_is_readable`]) names nothing
+///   there is to resolve: the type is a property of the value, so this too is a value that
+///   cannot be READ rather than a type an operation declines to cover;
 /// * [`ResourceArnRefusal::WrongType`] — an ARN whose resource part names anything other
 ///   than [`RESOURCE_POLICY_RESOURCE_TYPE`] ([`resource_policy_resource`]) is refused on the
 ///   resource TYPE it names, whether or not this service holds anything for it: the surface
 ///   attaches policies to ONE resource type, so what a caller has to fix is the type its
-///   parameter named, which the parsed ARN alone decides;
+///   parameter named, which the parsed ARN alone decides. A degenerate ARN — one carrying no
+///   resource part, or none this service's namespace spells — names no accepted type and is
+///   this refusal rather than a second form refusal this service has no recorded sentence
+///   for;
 /// * [`ResourceArnRefusal::AbsentResource`] — an ARN of the accepted type naming no resource
 ///   this service holds ([`ComAmazonawsCloudfrontCloudfront20200531State::holds_resource`])
 ///   is reported ABSENT: a policy is attached TO a resource, so the resource has to exist
@@ -513,17 +644,20 @@ pub fn associable_web_acl_arn(web_acl_arn: &str) -> bool {
 /// none reads as the empty document ([`EMPTY_RESOURCE_POLICY_DOCUMENT`]) and its removal is
 /// a no-op — there is no absent POLICY to report once the resource is there.
 ///
-/// ONE rule for every operation of the surface, which all take the one `ResourceArn`, so no
-/// two of them can disagree about which values they accept. The SENTENCE each puts on the
+/// ONE rule for every operation that takes the one `ResourceArn`, so no two of them can
+/// disagree about which values they accept. The SENTENCE each puts on the
 /// wire is the service's own per operation: see [`malformed_arn`],
-/// [`invalid_resource_policy_resource_type`], [`invalid_resource_policy_arn`] and
-/// [`resource_policy_resource_absent`].
+/// [`invalid_resource_policy_resource_type`], [`invalid_resource_policy_arn`],
+/// [`invalid_arn_resource_type_syntax`] and [`resource_policy_resource_absent`].
 pub fn resource_policy_arn_refusal(
     store: &ComAmazonawsCloudfrontCloudfront20200531State,
     arn: &str,
 ) -> Option<ResourceArnRefusal> {
     if !arn.starts_with(ARN_PREFIX) {
         return Some(ResourceArnRefusal::Malformed);
+    }
+    if !arn_resource_type_is_readable(arn) {
+        return Some(ResourceArnRefusal::UnreadableType);
     }
     if resource_policy_resource(arn).is_none() {
         return Some(ResourceArnRefusal::WrongType);
@@ -539,6 +673,10 @@ pub fn resource_policy_arn_refusal(
 pub enum ResourceArnRefusal {
     /// The value is no ARN at all: it does not open with [`ARN_PREFIX`].
     Malformed,
+    /// The value is an ARN of this service whose resource part spells a resource type
+    /// CloudFront writes no resource under ([`CLOUDFRONT_ARN_RESOURCE_TYPES`]), so the type
+    /// it names cannot be read at all — a property of the value, like [`Self::Malformed`].
+    UnreadableType,
     /// The value is an ARN whose resource part names a type other than
     /// [`RESOURCE_POLICY_RESOURCE_TYPE`] — a property of the ARN alone, so this is the answer
     /// whether or not this service holds a resource of that type.
@@ -978,16 +1116,20 @@ pub(super) const MAX_ID_NAMESPACE_LABEL_LEN: usize = 3;
 /// a separator (`_` or `-`), and a non-empty body of identifier characters (ASCII
 /// alphanumerics and those same separators).
 ///
-/// This is ALL a request alone decides about such an identifier, and it is what the
-/// operations that address one by a path member (`GetAnycastIpList$Id`,
-/// `DeleteDistributionTenant$Id`, …) read it with. Those members are plain `string` in the
+/// This is ALL a request alone decides about such an identifier, and it is what EVERY
+/// operation that addresses one by a path member reads it with — the Anycast static IP list's
+/// (`GetAnycastIpList$Id`, `UpdateAnycastIpList$Id`) as much as the distribution tenant's
+/// (`DeleteDistributionTenant$Id`, …), so no two routes of the family disagree about what an
+/// identifier IS. Those members are plain `string` in the
 /// model — no `@pattern`, no `@length` — so neither the label, nor the width of the body,
 /// nor its alphabet is a constraint this service may refuse a value on: the ids it MINTS are
 /// one form of a namespace, never the only form CloudFront writes one in. Whether an
 /// identifier of this form was ever ISSUED, and to which resource, is a property of the
 /// STORE — so a value of this form that nothing answers to is a resource that is ABSENT (the
-/// operation's not-found code, status and fixed sentence), while a value of no such form is
-/// the identifier that cannot be read at all ([`invalid_id_format`]).
+/// operation's not-found code, status and fixed sentence), while a value carrying NO namespace
+/// at all — a bare word, a run of characters around no separator, a UUID, an identifier of a
+/// kind whose ids are not namespaced — was never an identifier of such a resource and is the
+/// identifier that cannot be read at all ([`invalid_id_format`]).
 pub fn is_namespaced_resource_id(value: &str) -> bool {
     let Some(separator) = value.find(['_', '-']) else {
         return false;
@@ -1001,27 +1143,6 @@ pub fn is_namespaced_resource_id(value: &str) -> bool {
         && body
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
-/// Whether `value` could ADDRESS an Anycast static IP list: it is written in one of the forms
-/// CloudFront writes an identifier in at all — a namespace-labelled opaque identifier
-/// ([`is_namespaced_resource_id`]) or the alphabet an ENTITY identifier is written in
-/// ([`is_entity_id_form`]).
-///
-/// What the operations addressed by one read of the value, and ALL they read: `Id` is a plain
-/// `string` `@httpLabel` on both of them
-/// (`smithy_query(query="operation",operation="GetAnycastIpList,UpdateAnycastIpList")`) — no
-/// `@pattern`, no `@length` — so neither a namespace label, nor the width or alphabet of a
-/// body, nor the presence of a separator at all is a property these routes may refuse a value
-/// on. The `ipl-` + hex form this emulator MINTS is one namespace such an identifier is
-/// written under and the uppercase-and-digit alphabet is another, and WHICH identifier of
-/// either was ever issued is a property of the STORE: a value of either form that no list
-/// answers to is the list reported ABSENT (the recorded contract of these routes), while a
-/// value written in NEITHER — in lower case around no separator, as a UUID, as a word or as a
-/// name — was never an identifier at all and is the identifier a route reports it cannot READ
-/// ([`invalid_id_format`]).
-pub fn addresses_an_anycast_ip_list(value: &str) -> bool {
-    is_namespaced_resource_id(value) || is_entity_id_form(value)
 }
 
 /// Whether `value` is written in the characters CloudFront writes an ENTITY IDENTIFIER in:

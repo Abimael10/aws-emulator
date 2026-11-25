@@ -201,7 +201,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::malformed_arn(),
                     )
                 }
-                crate::state::ResourceArnRefusal::WrongType => {
+                // One recorded sentence for a `ResourceArn` naming no resource type this
+                // surface attaches policies to, so the unreadable type and the readable type
+                // it does not accept are worded alike — see `get_resource_policy`.
+                crate::state::ResourceArnRefusal::UnreadableType
+                | crate::state::ResourceArnRefusal::WrongType => {
                     DeleteResourcePolicyErrorModeled::InvalidArgument(
                         crate::state::invalid_resource_policy_resource_type(),
                     )

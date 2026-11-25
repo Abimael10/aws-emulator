@@ -28,13 +28,14 @@
 //! different shapes (an Anycast static IP list's `ipl-` + lowercase hex, a distribution
 //! tenant's `dt_` + the minted token alphabet, a key group's UUID), every operation the
 //! recorded behaviour puts under each rule, both member names those identifiers arrive in
-//! (`Id` and `DistributionTenantId`), and six forms an identifier can take that is no
+//! (`Id` and `DistributionTenantId`), and seven forms an identifier can take that is no
 //! identifier at all — an id of a kind drawn from another form, a namespace label with no
-//! separator, the right characters in the wrong case, the resource's NAME, a bare word and a
-//! lone separator. Each kind also carries identifiers the store holds nothing for — including,
-//! for the Anycast static IP list, other labels, other body widths and other body alphabets
-//! than the one this service mints, and a value of the alphabet CloudFront writes an entity
-//! identifier in — and each operation is exercised against the resource that
+//! separator, the right characters in the wrong case, the resource's NAME, a bare word, a
+//! lone separator and, for the namespaced kinds, a run of the alphabet CloudFront writes an
+//! ENTITY identifier of another family in. Each kind also carries identifiers the store holds
+//! nothing for — including, for the Anycast static IP list, other labels, other body widths
+//! and other body alphabets than the one this service mints — and each operation is exercised
+//! against the resource that
 //! really exists, so the precheck is shown not to refuse the calls it must serve. How wide
 //! each OPERATION reads a tenant identifier is its own recorded contract, so the identifiers
 //! that only the siblings of `GetInvalidationForDistributionTenant` resolve live in
@@ -272,8 +273,9 @@ async fn call_op(router: &MultiServiceRouter, op: Op, id: &str, version: &str) -
 ///
 /// One row per form such a value takes — another namespace's id, the namespace label with no
 /// separator at all, the right characters in the wrong case, the resource's own NAME, a bare
-/// word, and a lone separator — so the rule is asserted over the class rather than over the
-/// recorded token.
+/// word, a lone separator, and — for the kinds whose ids are namespaced — a run of the alphabet
+/// CloudFront writes an ENTITY identifier of another family in, which carries no namespace
+/// label either — so the rule is asserted over the class rather than over the recorded token.
 fn malformed(kind: Kind, name: &str, minted: &str) -> Vec<(String, String)> {
     let foreign = match kind {
         // A key group id, which is a UUID: a kind drawn from a form that carries neither a
@@ -293,7 +295,7 @@ fn malformed(kind: Kind, name: &str, minted: &str) -> Vec<(String, String)> {
         Kind::DistributionTenant => "dtNEVERMINTED12".to_string(),
         Kind::KeyGroup => "f9a6a0b4-8d39-4a1e-9f67-1b0f7f5d2c".to_string(),
     };
-    vec![
+    let mut rows = vec![
         ("another resource kind's id".to_string(), foreign),
         (
             "the namespace label with no separator, or a UUID at the wrong length".to_string(),
@@ -303,7 +305,18 @@ fn malformed(kind: Kind, name: &str, minted: &str) -> Vec<(String, String)> {
         ("the resource's name".to_string(), name.to_string()),
         ("a bare word".to_string(), "nope".to_string()),
         ("a lone separator".to_string(), "-".to_string()),
-    ]
+    ];
+    // A distribution's id, written in the alphabet CloudFront writes an ENTITY identifier in:
+    // it carries no namespace label, so for a kind whose ids ARE namespaced it is no
+    // identifier of that kind at all. The key group's own `foreign` row is already of that
+    // alphabet.
+    if kind != Kind::KeyGroup {
+        rows.push((
+            "the entity-identifier alphabet, which carries no namespace".to_string(),
+            "EDFDVBD6EXAMPLE".to_string(),
+        ));
+    }
+    rows
 }
 
 /// The identifiers of each kind that COULD be one of its resource's identifiers but name no
@@ -334,10 +347,6 @@ fn well_formed_but_absent(kind: Kind) -> Vec<(String, String)> {
             (
                 "the same label under the other separator".to_string(),
                 "ipl_0123456789abcdef0".to_string(),
-            ),
-            (
-                "an id written in the entity-identifier alphabet".to_string(),
-                "IAL1A2B3C4D5E6".to_string(),
             ),
         ],
         Kind::DistributionTenant => vec![
