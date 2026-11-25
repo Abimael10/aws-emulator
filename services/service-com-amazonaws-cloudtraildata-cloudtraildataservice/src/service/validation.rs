@@ -30,10 +30,8 @@
 //! requests they answer: the record is emitted once per answered request, by whichever
 //! layer answered it.
 
-use super::refuses_channel_arn;
-use crate::ops::put_audit_events::{
-    record_access, INVALID_CHANNEL_ARN_CODE, INVALID_CHANNEL_ARN_MESSAGE,
-};
+use super::channel_arn_refusal;
+use crate::ops::put_audit_events::record_access;
 use service_common::validation::SubmittedEcho;
 use service_common::validation_message::quoting_the_submitted_collection;
 use smithy_server_runtime::{ErasedOperation, Operation, Refused, Service, Violation};
@@ -181,8 +179,11 @@ struct PreHandlerRefusal {
 /// A channel reference comes FIRST, whatever else the request carried: this service
 /// resolves every call against the channel the request names before it reads the payload,
 /// so a value that is not a channel reference is answered under the error its model
-/// declares for that fault rather than as one constraint violation among several (see
-/// [`super::refuses_channel_arn`]).
+/// declares for that fault rather than as one constraint violation among several. That
+/// decision, and the answer it carries, are taken by [`super::channel_arn_refusal`] —
+/// the one place this service builds that refusal, shared with the
+/// [`Service::override_refusal`] seam, so a refusal of the same fault cannot be stated
+/// two ways.
 ///
 /// Everything else is the constraint envelope AWS states on this service's JSON protocol,
 /// with the two renderings it differs from the framework in — a `@pattern` requirement
@@ -195,15 +196,9 @@ fn refusal_of(collected: &[(Violation, SubmittedEcho)]) -> Option<PreHandlerRefu
     if collected.is_empty() {
         return None;
     }
-    if collected
-        .iter()
-        .any(|(violation, _)| refuses_channel_arn(violation))
-    {
+    if let Some(refused) = channel_arn_refusal(collected.iter().map(|(violation, _)| violation)) {
         return Some(PreHandlerRefusal {
-            refused: Refused {
-                code: INVALID_CHANNEL_ARN_CODE.to_string(),
-                message: INVALID_CHANNEL_ARN_MESSAGE.to_string(),
-            },
+            refused,
             detail: INVALID_CHANNEL_ARN_DETAIL,
         });
     }

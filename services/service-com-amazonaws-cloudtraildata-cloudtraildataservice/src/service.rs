@@ -69,18 +69,33 @@ use crate::ops::put_audit_events::{
 ///
 /// Keyed to that expression rather than to a member path, so the rule holds for whichever
 /// member of whichever operation carried the value.
-pub(crate) fn refuses_channel_arn(violation: &Violation) -> bool {
+fn refuses_channel_arn(violation: &Violation) -> bool {
     matches!(&violation.kind, ViolationKind::Pattern(pattern) if pattern == CHANNEL_ARN_PATTERN)
 }
 
-/// Whether a boundary refusal is ABOUT a channel reference: one of its violations is
-/// [`refuses_channel_arn`].
+/// The answer a pre-handler refusal ABOUT a channel reference takes — the error this
+/// service's model declares for that fault and the sentence it documents — or `None` when
+/// no violation in `violations` is [`refuses_channel_arn`].
+///
+/// The ONE place that decision is taken and that answer is built. Both paths a refusal of
+/// this service can arrive on reach the same fault: the wrapper that serves its operation
+/// ([`validation`]) and the [`Service::override_refusal`] seam below. They ask here rather
+/// than each scanning the violations and naming the code and the sentence again, so the
+/// two cannot answer one fault two ways.
 ///
 /// A refusal that ALSO carries other violations is still answered as the channel-ARN
 /// fault: the channel reference is what this service resolves the call against before it
 /// reads anything else, so that is the fault it reports.
-fn refused_channel_arn(violations: &[Violation]) -> bool {
-    violations.iter().any(refuses_channel_arn)
+pub(crate) fn channel_arn_refusal<'v>(
+    violations: impl IntoIterator<Item = &'v Violation>,
+) -> Option<Refused> {
+    violations
+        .into_iter()
+        .any(refuses_channel_arn)
+        .then(|| Refused {
+            code: INVALID_CHANNEL_ARN_CODE.to_string(),
+            message: INVALID_CHANNEL_ARN_MESSAGE.to_string(),
+        })
 }
 
 /// The `com-amazonaws-cloudtraildata-cloudtraildataservice` emulated service: the generated [`ServiceDefinition`] plus
@@ -168,7 +183,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // that takes a channel reference declares — so a value the member's modelled
         // `@pattern` rejects is answered under that code and its documented sentence,
         // the same answer the handler gives a value that passes the pattern but names no
-        // channel. `ValidationException` is not modelled anywhere in this service, so a
+        // channel. That decision, and the answer it carries, are
+        // [`channel_arn_refusal`]'s: the wrapper in [`validation`] takes the same one
+        // through the same function, so the two paths cannot state one fault two ways.
+        // `ValidationException` is not modelled anywhere in this service, so a
         // generated client has no handler for it at all.
         //
         // Every OTHER constraint refusal of this service is stated by the wrapper in
@@ -181,10 +199,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // keeps the framework's wording for a refusal that somehow arrives without
         // passing the wrapper.
         match refusal {
-            Refusal::Invalid(violations) if refused_channel_arn(violations) => Some(Refused {
-                code: INVALID_CHANNEL_ARN_CODE.to_string(),
-                message: INVALID_CHANNEL_ARN_MESSAGE.to_string(),
-            }),
+            Refusal::Invalid(violations) => channel_arn_refusal(violations),
             _ => None,
         }
     }

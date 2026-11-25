@@ -3,9 +3,9 @@
 //! How `PutAuditEvents` refuses a call it cannot serve, driven over HTTP through the
 //! same `MultiServiceRouter` the emulator serves with.
 //!
-//! Three rules, each asserted over a TABLE whose rows differ along what the rule
-//! generalises over — the form of the channel reference, the account it names, and
-//! whether the channel it names is registered here:
+//! Four rules, each asserted over a TABLE whose rows differ along what the rule
+//! generalises over — the form of the channel reference, the account it names, whether
+//! the channel it names is registered here, and what else the same request got wrong:
 //!
 //! 1. A refusal states the message AWS words for its class: the sentence the model
 //!    documents, with nothing interpolated where that wording leaves no slot for a
@@ -16,11 +16,20 @@
 //! 3. A channel ARN in another account is refused by authorization, with HTTP 403 and
 //!    the common `AccessDeniedException` code, before the channel is looked up — so the
 //!    answer is the same whether or not such a channel is registered here.
+//! 4. Both ways this service can state a refusal found before its handler ran — the
+//!    wrapper that serves the operation, and the service's own refusal seam — take ONE
+//!    decision about a channel reference, so the same violation set is answered the same
+//!    way whichever of them answers it.
 //!
 //! The client is this crate's one test harness, reached from the suite that owns it.
 
-use crate::put_audit_events::{channel_arn, ev, Harness, Reply, REGION};
+use std::sync::Arc;
+
+use crate::put_audit_events::{channel_arn, ev, Ev, Harness, Reply, REGION};
+use service_com_amazonaws_cloudtraildata_cloudtraildataservice::ops::put_audit_events::CHANNEL_ARN_PATTERN;
 use service_com_amazonaws_cloudtraildata_cloudtraildataservice::state::Channel;
+use service_com_amazonaws_cloudtraildata_cloudtraildataservice::EmulatedService;
+use smithy_server_runtime::{Refusal, Service, Violation, ViolationKind};
 
 /// The sentence `InvalidChannelARN` carries, as the model documents the shape
 /// (`smithy_query(query="shape", shape="InvalidChannelARN")`).
@@ -383,4 +392,259 @@ async fn a_channel_arn_in_another_account_is_denied_without_disclosing_existence
         reply.status,
         reply.body
     );
+}
+
+/// The code the framework's own default names a constraint refusal with on this service's
+/// JSON protocol, which is what a pre-handler refusal about anything BUT a channel
+/// reference is answered under.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// What one call of the wrapper path answered with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WireAnswer {
+    status: u16,
+    code: String,
+    message: String,
+}
+
+/// One row of the refusal seam's table: the refusal it is handed, and the answer it has
+/// to take for it.
+struct SeamRow {
+    case: &'static str,
+    refusal: Refusal,
+    /// The code and the sentence the seam must answer with, or `None` when stating this
+    /// refusal is not its decision to take.
+    answer: Option<(String, String)>,
+}
+
+/// One violation as the framework's validating walk hands it to a refusal renderer: the
+/// member it was found at, what the value failed, and the value it held.
+fn violation(path: &str, kind: ViolationKind, value: &str) -> Violation {
+    Violation {
+        path: path.to_string(),
+        kind,
+        value: Some(value.to_string()),
+        sensitive: false,
+    }
+}
+
+/// A pre-handler refusal of this service can be stated on either of two paths — the
+/// wrapper that serves the operation (which re-reads the request) and the service's own
+/// refusal seam (which is handed the violations alone) — and both take the SAME decision
+/// about a channel reference: a violation set carrying a `ChannelArn` `@pattern` fault is
+/// answered under this service's own `InvalidChannelARN` with the sentence its model
+/// documents, and a set carrying none is left to the constraint envelope.
+///
+/// Driven through the operation on one path and through the seam on the other, over a
+/// table whose rows differ along what ELSE the violation set carries and in which order,
+/// so a decision taken in only one of the two places shows up as the two paths answering
+/// one fault differently.
+#[tokio::test]
+async fn one_decision_answers_a_channel_reference_fault_on_both_refusal_paths() {
+    let harness = Harness::new();
+    let registered = channel_arn("3c4d5e6f-7081-4293-a4b5-c6d7e8f9a0b1");
+    harness.register(Channel::from_arn(&registered, "Custom").expect("a channel ARN"));
+
+    // Path one: the wrapper that serves this operation. (case, channelArn, externalId,
+    // the batch) — every row carries a reference outside `ChannelArn`'s expression, and
+    // the rows differ along what else the same request broke.
+    let through_the_operation: Vec<(&str, &str, Option<&str>, Vec<Ev>)> = vec![
+        (
+            "a reference outside the expression, nothing else wrong",
+            "probe-value",
+            None,
+            vec![ev("evt-1", GOOD_EVENT)],
+        ),
+        (
+            "and a batch under the member's length minimum",
+            "not-an-arn",
+            None,
+            Vec::new(),
+        ),
+        (
+            // `ExternalId` is `len 2..1224`
+            // (`smithy_query(query="shape", shape="ExternalId")`).
+            "and an external id under its length minimum",
+            "channel-reference-that-is-no-arn",
+            Some("x"),
+            vec![ev("evt-1", GOOD_EVENT)],
+        ),
+        (
+            // `ExternalId`'s own expression is `^[\w+=,.@:\/-]*$`, from the same shape.
+            "and an external id outside its own expression",
+            "",
+            Some("bad~id"),
+            vec![ev("evt-1", GOOD_EVENT)],
+        ),
+        (
+            // `AuditEvent$id` is `pattern ^[-_A-Za-z0-9]+$`
+            // (`smithy_query(query="shape", shape="AuditEvent")`).
+            "and an event id outside its own expression",
+            "3c4d5e6f-7081-4293-a4b5-c6d7e8f9a0b1",
+            None,
+            vec![ev("bad id!", GOOD_EVENT)],
+        ),
+        (
+            // `AuditEvents` is `len 1..100`, from the same model.
+            "and a batch past the member's length maximum",
+            "https://cloudtrail.us-east-1.amazonaws.com/channel",
+            None,
+            (0..101)
+                .map(|i| ev(format!("evt-{i}"), GOOD_EVENT))
+                .collect(),
+        ),
+    ];
+
+    let mut on_the_wire: Vec<(&str, WireAnswer)> = Vec::new();
+    for (case, channel, external_id, events) in &through_the_operation {
+        let reply = harness.put(channel, *external_id, events).await;
+        assert_eq!(
+            (reply.status, reply.error_code().as_str()),
+            (400, "InvalidChannelARN"),
+            "case {case:?}: a channel reference fault is answered under this service's \
+             own error, got {} with body {}",
+            reply.status,
+            reply.body
+        );
+        let stated = message_of(&reply);
+        assert_eq!(
+            stated, INVALID_CHANNEL_ARN,
+            "case {case:?}: expected the documented sentence {INVALID_CHANNEL_ARN:?}, \
+             got {stated:?}"
+        );
+        on_the_wire.push((
+            case,
+            WireAnswer {
+                status: reply.status,
+                code: reply.error_code(),
+                message: stated,
+            },
+        ));
+    }
+
+    // Every row carried the SAME answer: the decision does not depend on what else the
+    // request broke, so the rows are compared to one another and not only to the
+    // expectation each was asserted against.
+    let (first_case, first_answer) = on_the_wire
+        .first()
+        .cloned()
+        .expect("the wrapper path answered at least one row");
+    for (case, answered) in &on_the_wire[1..] {
+        assert_eq!(
+            *answered, first_answer,
+            "case {case:?}: expected the answer case {first_case:?} took \
+             ({first_answer:?}), got {answered:?}"
+        );
+    }
+
+    // The same wrapper, on requests whose only faults are elsewhere: the decision is
+    // keyed to the expression a channel reference is modelled with, not to any
+    // `@pattern` fault, so these are the constraint envelope instead.
+    let elsewhere: Vec<(&str, Option<&str>, Vec<Ev>)> = vec![
+        ("an external id outside its own expression", Some("bad~id"), vec![ev("evt-1", GOOD_EVENT)]),
+        ("an event id outside its own expression", None, vec![ev("bad id!", GOOD_EVENT)]),
+        ("a batch under the member's length minimum", None, Vec::new()),
+    ];
+    for (case, external_id, events) in &elsewhere {
+        let reply = harness.put(&registered, *external_id, events).await;
+        assert_eq!(
+            (reply.status, reply.error_code().as_str()),
+            (400, VALIDATION_EXCEPTION),
+            "case {case:?}: a request with no channel reference fault is the constraint \
+             envelope, got {} with body {}",
+            reply.status,
+            reply.body
+        );
+    }
+
+    // Path two: the service's own refusal seam, which answers a refusal that reaches it
+    // without passing the wrapper. It is handed the violations alone, so it is driven
+    // with violation sets built the way the validating walk builds them.
+    let channel_fault = violation(
+        "channelArn",
+        ViolationKind::Pattern(CHANNEL_ARN_PATTERN.to_string()),
+        "probe-value",
+    );
+    let short_batch = violation("auditEvents", ViolationKind::MinLength(1), "0 items");
+    let long_batch = violation("auditEvents", ViolationKind::MaxLength(100), "101 items");
+    let external_id_fault = violation(
+        "externalId",
+        ViolationKind::Pattern(r"^[\w+=,.@:\/-]*$".to_string()),
+        "bad~id",
+    );
+    let absent_reference = Violation {
+        path: "channelArn".to_string(),
+        kind: ViolationKind::MissingRequiredMember,
+        value: None,
+        sensitive: false,
+    };
+
+    // The seam's answer must be the answer the wire carried above, so take it from there
+    // rather than restating it.
+    let on_the_wire_answer = Some((first_answer.code, first_answer.message));
+    let through_the_seam: Vec<SeamRow> = vec![
+        SeamRow {
+            case: "the channel reference fault alone",
+            refusal: Refusal::Invalid(vec![channel_fault.clone()]),
+            answer: on_the_wire_answer.clone(),
+        },
+        SeamRow {
+            case: "another fault listed before it",
+            refusal: Refusal::Invalid(vec![short_batch.clone(), channel_fault.clone()]),
+            answer: on_the_wire_answer.clone(),
+        },
+        SeamRow {
+            case: "another fault listed after it",
+            refusal: Refusal::Invalid(vec![channel_fault.clone(), external_id_fault.clone()]),
+            answer: on_the_wire_answer.clone(),
+        },
+        SeamRow {
+            case: "several other faults around it",
+            refusal: Refusal::Invalid(vec![
+                long_batch.clone(),
+                channel_fault,
+                external_id_fault.clone(),
+            ]),
+            answer: on_the_wire_answer,
+        },
+        SeamRow {
+            case: "another member's expression fault only",
+            refusal: Refusal::Invalid(vec![external_id_fault]),
+            answer: None,
+        },
+        SeamRow {
+            case: "a length fault only",
+            refusal: Refusal::Invalid(vec![short_batch, long_batch]),
+            answer: None,
+        },
+        SeamRow {
+            case: "the same member absent rather than outside its expression",
+            refusal: Refusal::Invalid(vec![absent_reference]),
+            answer: None,
+        },
+        SeamRow {
+            case: "no violations at all",
+            refusal: Refusal::Invalid(Vec::new()),
+            answer: None,
+        },
+        SeamRow {
+            case: "a caller the request authentication refused",
+            refusal: Refusal::Unauthenticated,
+            answer: None,
+        },
+    ];
+
+    let service = EmulatedService::new(Arc::clone(harness.engine()));
+    for row in &through_the_seam {
+        let answered = service.override_refusal(&row.refusal);
+        let stated = answered
+            .as_ref()
+            .map(|refused| (refused.code.clone(), refused.message.clone()));
+        let case = row.case;
+        assert_eq!(
+            stated, row.answer,
+            "case {case:?}: the seam must take the same decision the wrapper takes, got \
+             {answered:?}"
+        );
+    }
 }
