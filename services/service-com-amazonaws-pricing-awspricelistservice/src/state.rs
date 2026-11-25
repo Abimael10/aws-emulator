@@ -1249,15 +1249,39 @@ fn scale(rate_e10: u64, percent: u64) -> u64 {
     rate_e10.saturating_mul(percent) / 100
 }
 
-/// A deterministic, catalog-unique SKU built from the parts that identify a product.
+/// How many characters a published SKU is written in: the Price List API publishes every
+/// product's SKU as a fixed-width identifier of this length, whatever service, Region or
+/// product family the offer belongs to.
+const SKU_LENGTH: usize = 16;
+
+/// The alphabet a published SKU is written in, as a radix: the ten digits and the
+/// twenty-six uppercase letters.
+const SKU_RADIX: u32 = 36;
+
+/// The catalog's SKU for the product `parts` identify: an OPAQUE identifier in the form
+/// the Price List API publishes a SKU in — exactly [`SKU_LENGTH`] characters of uppercase
+/// letters and digits.
 ///
-/// A Price List SKU is opaque, so what matters is that it is STABLE across reads and
-/// names exactly one product.
+/// A SKU names exactly one product and is STABLE across reads, so it is derived from the
+/// parts that identify the product. It is derived through a DIGEST of them rather than by
+/// spelling them out, so the identifier carries none of the product's own attribute
+/// values: a catalog identifier is opaque, so a client can neither read a product's
+/// platform, Region or size out of its SKU nor assemble the SKU of a product it has not
+/// read.
 fn sku(parts: &[&str]) -> String {
-    parts
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        // A separator, so ["a", "bc"] and ["ab", "c"] do not name the same product.
+        hasher.update([0u8]);
+    }
+    hasher
+        .finalize()
         .iter()
-        .flat_map(|part| part.chars())
-        .filter(char::is_ascii_alphanumeric)
+        .take(SKU_LENGTH)
+        // A digest byte reduced into the alphabet is always one of its digits, so this
+        // writes one character per byte taken.
+        .filter_map(|byte| char::from_digit(u32::from(*byte) % SKU_RADIX, SKU_RADIX))
         .map(|character| character.to_ascii_uppercase())
         .collect()
 }

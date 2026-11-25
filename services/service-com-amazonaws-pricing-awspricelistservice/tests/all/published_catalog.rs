@@ -1460,3 +1460,325 @@ async fn a_price_query_s_next_token_continues_that_same_filtered_set() {
          {parsed}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The IDENTIFIER a product is published under: the catalog's SKU.
+// ---------------------------------------------------------------------------
+
+/// How many characters a published Price List SKU is written in: the API publishes every
+/// product's SKU as a fixed-width identifier of this length, whatever service, Region or
+/// product family the offer belongs to.
+const PUBLISHED_SKU_LENGTH: usize = 16;
+
+/// The shortest value whose presence in a SKU says the SKU SPELLS it. A shorter string
+/// can land in a fixed-width identifier of uppercase letters and digits by chance, so the
+/// "an identifier carries none of the product's values" rule is asserted over the values
+/// long enough to be telltale.
+const TELLTALE_VALUE_LENGTH: usize = 6;
+
+/// A product value as a SKU that spelled it would carry it: its letters and digits,
+/// uppercased (`us-east-1` reads `USEAST1`, `m5.large` reads `M5LARGE`).
+fn shouted(value: &str) -> String {
+    value
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|character| character.to_ascii_uppercase())
+        .collect()
+}
+
+/// One named `GetProducts` query: a service's catalog filtered by an exact value per
+/// product metadata field.
+struct FilteredQuery {
+    /// What the row stands for, named in every assertion of it.
+    case: &'static str,
+    service_code: &'static str,
+    /// The `(field, value)` pairs the query pins, each as a `TERM_MATCH` filter — the
+    /// comparison `Filter$Type` documents for an exact value.
+    filters: &'static [(&'static str, &'static str)],
+}
+
+impl FilteredQuery {
+    /// The `GetProducts` request body this query is made with.
+    fn body(&self) -> Value {
+        json!({
+            "ServiceCode": self.service_code,
+            "Filters": self
+                .filters
+                .iter()
+                .map(|(field, value)| {
+                    json!({ "Type": "TERM_MATCH", "Field": field, "Value": value })
+                })
+                .collect::<Vec<Value>>(),
+        })
+    }
+}
+
+/// One published product family, with a filter set that selects its products: the compute
+/// instances and the per-family dedicated host the EC2 catalog prices, an EBS volume's
+/// storage and the IOPS it provisions as a product of its own, an S3 storage class, and a
+/// service the API prices with one usage type per Region. Every field is an attribute name
+/// its service publishes (`Filter$Field` is "The product metadata field that you want to
+/// filter on") and every value one `GetAttributeValues` enumerates for that field — rows
+/// differ in the service, the product family and the dimension that identifies the
+/// product, none of which is the row the recording cited.
+const PUBLISHED_FAMILY_QUERIES: &[FilteredQuery] = &[
+    FilteredQuery {
+        case: "compute instance",
+        service_code: "AmazonEC2",
+        filters: &[
+            ("productFamily", "Compute Instance"),
+            ("instanceType", "m5.large"),
+            ("regionCode", "us-east-1"),
+        ],
+    },
+    FilteredQuery {
+        case: "dedicated host",
+        service_code: "AmazonEC2",
+        filters: &[
+            ("productFamily", "Dedicated Host"),
+            ("regionCode", "us-east-1"),
+        ],
+    },
+    FilteredQuery {
+        case: "volume storage",
+        service_code: "AmazonEC2",
+        filters: &[("productFamily", "Storage"), ("volumeApiName", "gp3")],
+    },
+    FilteredQuery {
+        case: "provisioned iops",
+        service_code: "AmazonEC2",
+        filters: &[
+            ("productFamily", "System Operation"),
+            ("volumeApiName", "io2"),
+        ],
+    },
+    FilteredQuery {
+        case: "object storage",
+        service_code: "AmazonS3",
+        filters: &[("storageClass", "General Purpose")],
+    },
+    FilteredQuery {
+        case: "usage-type service",
+        service_code: "AmazonRDS",
+        filters: &[],
+    },
+];
+
+#[tokio::test]
+async fn every_published_sku_is_an_opaque_fixed_width_catalog_identifier() {
+    let router = router();
+    // sku -> the case and usage type it was published for, so a SKU that named two
+    // products names which two.
+    let mut published: BTreeMap<String, String> = BTreeMap::new();
+
+    for row in PUBLISHED_FAMILY_QUERIES {
+        let case = row.case;
+        let query = row.body();
+        let documents = all_offer_documents(&router, &query).await;
+        assert!(
+            !documents.is_empty(),
+            "case {case}: the filter set must select the products of that family"
+        );
+
+        for document in &documents {
+            let sku = product_sku(document);
+            let usagetype = offer_attribute(document, "usagetype").unwrap_or_default();
+
+            assert_eq!(
+                sku.chars().count(),
+                PUBLISHED_SKU_LENGTH,
+                "case {case}/{usagetype}: a published SKU is {PUBLISHED_SKU_LENGTH} \
+                 characters, got {} in {sku:?}",
+                sku.chars().count()
+            );
+            assert!(
+                sku.chars()
+                    .all(|character| character.is_ascii_uppercase()
+                        || character.is_ascii_digit()),
+                "case {case}/{usagetype}: a published SKU is written in uppercase letters \
+                 and digits, got {sku:?}"
+            );
+
+            // Opaque: the identifier spells none of the values the product publishes, so a
+            // client can neither read the product out of its SKU nor assemble the SKU of a
+            // product it has not read.
+            for (name, value) in document
+                .pointer("/product/attributes")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+            {
+                let spelled = shouted(value.as_str().unwrap_or_default());
+                if spelled.chars().count() < TELLTALE_VALUE_LENGTH {
+                    continue;
+                }
+                assert!(
+                    !sku.contains(&spelled),
+                    "case {case}/{usagetype}: SKU {sku} must not spell {name}={value}, but \
+                     carries {spelled}"
+                );
+            }
+
+            // It names exactly one product of the catalog.
+            let owner = format!("{case}/{usagetype}");
+            if let Some(previous) = published.insert(sku.clone(), owner.clone()) {
+                assert_eq!(
+                    previous, owner,
+                    "case {owner}: SKU {sku} must name one product, but {previous} was \
+                     published under it too"
+                );
+            }
+
+            // Every price of the product is published under that same identifier: a term
+            // is keyed by it and states it, so a client that holds a SKU can tell which
+            // prices are this product's.
+            let terms = document
+                .get("terms")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                !terms.is_empty(),
+                "case {owner}: a published offer prices its product under at least one \
+                 term type, got {document}"
+            );
+            for (term_type, by_code) in &terms {
+                for (code, term) in by_code.as_object().into_iter().flatten() {
+                    assert!(
+                        code.starts_with(&format!("{sku}.")),
+                        "case {owner}/{term_type}: a term is keyed by the product's SKU, \
+                         got {code}"
+                    );
+                    assert_eq!(
+                        term.get("sku").and_then(Value::as_str),
+                        Some(sku.as_str()),
+                        "case {owner}/{term_type}: term {code} must state the SKU it \
+                         prices, got {term}"
+                    );
+                }
+            }
+        }
+
+        // Stable across reads: the same query publishes the same identifiers again, in the
+        // same order, so a client that cached a SKU still resolves the same product.
+        let first: Vec<String> = documents.iter().map(product_sku).collect();
+        let again: Vec<String> = all_offer_documents(&router, &query)
+            .await
+            .iter()
+            .map(product_sku)
+            .collect();
+        assert_eq!(
+            again, first,
+            "case {case}: a product's SKU must be the same on every read"
+        );
+    }
+}
+
+/// Filter sets whose matched set outruns a bounded page, differing in the dimension the
+/// set spans and in the service and family it spans it for: one instance type's capacity
+/// statuses in one Region, one volume type across every Region it is published in, and one
+/// S3 storage class across the Regions it is priced in.
+const PAGED_FILTER_SETS: &[FilteredQuery] = &[
+    FilteredQuery {
+        case: "one instance type's capacity statuses",
+        service_code: "AmazonEC2",
+        filters: &[
+            ("instanceType", "m5.large"),
+            ("operatingSystem", "Linux"),
+            ("regionCode", "us-east-1"),
+        ],
+    },
+    FilteredQuery {
+        case: "one volume type's Regions",
+        service_code: "AmazonEC2",
+        filters: &[("productFamily", "Storage"), ("volumeApiName", "gp3")],
+    },
+    FilteredQuery {
+        case: "one storage class's Regions",
+        service_code: "AmazonS3",
+        filters: &[("storageClass", "General Purpose")],
+    },
+];
+
+#[tokio::test]
+async fn a_bounded_page_of_any_filtered_set_continues_on_a_token_for_that_set() {
+    let router = router();
+
+    for row in PAGED_FILTER_SETS {
+        let case = row.case;
+        let query = row.body();
+        let whole: Vec<String> = all_offer_documents(&router, &query)
+            .await
+            .iter()
+            .map(product_sku)
+            .collect();
+        assert!(
+            whole.len() > 3,
+            "case {case}: the filter set must select more products than a bounded page, \
+             got {}",
+            whole.len()
+        );
+
+        for page_size in [1_i64, 2, 5] {
+            let limit = usize::try_from(page_size).expect("a small page size");
+            let mut walked: Vec<String> = Vec::new();
+            let mut body = query.clone();
+            body["MaxResults"] = json!(page_size);
+            loop {
+                let page = ok(&router, "GetProducts", &body).await;
+                let skus: Vec<String> = offer_documents(&page).iter().map(product_sku).collect();
+                assert!(
+                    skus.len() <= limit,
+                    "case {case}/MaxResults={page_size}: a page must hold at most the page \
+                     size, got {}",
+                    skus.len()
+                );
+                walked.extend(skus);
+                let token = page
+                    .get("NextToken")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                assert_eq!(
+                    token.is_some(),
+                    walked.len() < whole.len(),
+                    "case {case}/MaxResults={page_size}: expected a token while {} of {} \
+                     products remain, got {page}",
+                    whole.len().saturating_sub(walked.len()),
+                    whole.len()
+                );
+                match token {
+                    Some(token) => body["NextToken"] = json!(token),
+                    None => break,
+                }
+                assert!(
+                    walked.len() <= whole.len(),
+                    "case {case}/MaxResults={page_size}: paging must terminate, got {} of {}",
+                    walked.len(),
+                    whole.len()
+                );
+            }
+            assert_eq!(
+                walked, whole,
+                "case {case}/MaxResults={page_size}: the token must continue that same \
+                 filtered set, once and in one order"
+            );
+        }
+
+        // The token of a page is the page's, not a per-call value: reading the same page of
+        // the same query again continues at the same boundary.
+        let mut bounded = query.clone();
+        bounded["MaxResults"] = json!(1);
+        let once = ok(&router, "GetProducts", &bounded).await;
+        let twice = ok(&router, "GetProducts", &bounded).await;
+        assert!(
+            once.get("NextToken").and_then(Value::as_str).is_some(),
+            "case {case}: a bounded first page of a longer set carries a token, got {once}"
+        );
+        assert_eq!(
+            once.get("NextToken"),
+            twice.get("NextToken"),
+            "case {case}: the token for one page of one query must be the same on every \
+             read, got {once} then {twice}"
+        );
+    }
+}
