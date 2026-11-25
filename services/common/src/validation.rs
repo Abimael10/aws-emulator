@@ -525,6 +525,43 @@ pub fn refusing_violations_with_declared_echoes_rendering_up_to<O: Operation>(
         .collect()
 }
 
+/// As [`refusing_violations_with_declared_echoes_rendering_up_to`], with the failure the
+/// request's own CODEC answered with handed back instead of dropped: `Err` for a body it
+/// could not build the input from at all.
+///
+/// For a layer that ANSWERS the requests it refuses and must therefore answer every request
+/// it cannot hand on. The walk above reports an EMPTY violation list for such a body — a
+/// member sent as another type, a document the codec's grammar cannot hold — because no
+/// member of it was built and none can be named; a layer that reads that list as "nothing
+/// refuses this request" passes the request to the layers behind it, where the same read
+/// fails again and the framework's own renderer answers it, in an envelope the service never
+/// chose and without the layer in front knowing the request was answered at all. With the
+/// failure in hand that layer answers it where it was found, states the refusal its own
+/// rules state for the request, and records the answer once like every other it gives.
+///
+/// Everything else is [`refusing_violations_with_declared_echoes_rendering_up_to`]'s: the
+/// same single collecting walk, the same violations — an absent `@required` member and a
+/// refusal the protocol made while reading the request are violations, and stay in the `Ok`
+/// list — the same structure form and the same bounds.
+pub fn refusing_violations_with_declared_echoes_rendering_up_to_or_unreadable<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+    max_positions: usize,
+    max_render: usize,
+) -> Result<Vec<(Violation, SubmittedEcho)>, SerdeError> {
+    let refusing = refusing_or_unreadable::<O::Input>(
+        protocol,
+        req,
+        O::INPUT_SCHEMA,
+        Echoes::DeclaredRenderingsRenderingUpTo(max_positions, max_render),
+    )?;
+    Ok(refusing
+        .violations
+        .into_iter()
+        .zip(refusing.echoes)
+        .collect())
+}
+
 /// As [`refusing_violations_with_declared_echoes_over`], with the members a structure is
 /// printed over stated by the CALLER for the shapes `printed` names, instead of read off
 /// the model.
@@ -798,6 +835,36 @@ fn violations_of_input<T: DeserializableStruct + SerializableStruct>(
     schema: &Schema,
     echoes: Echoes,
 ) -> Refusing {
+    // A body the CODEC could not read at all states no violation of any member, so a caller
+    // reading violations alone is handed the empty list it would have been handed before
+    // this walk could report that failure separately.
+    refusing_or_unreadable::<T>(protocol, req, schema, echoes).unwrap_or_default()
+}
+
+/// [`violations_of_input`], with the failure the request's own CODEC answered with — for a
+/// body it could not build the input from at all — handed back instead of dropped.
+///
+/// The same one walk, the same deserializer and the same `constraints::validate`: only a
+/// failure NEITHER of them can state as a violation travels differently. A member sent as
+/// another type, or a document the codec's grammar cannot hold, leaves no built input to
+/// validate and names no member to report, so the violation list of such a request is EMPTY
+/// — and a caller that reads an empty list as "nothing refuses this request" hands it to the
+/// layers behind it, where it fails the same read again and is answered by the framework's
+/// own renderer, in an envelope the service never chose and with no layer of the service
+/// aware the request was answered. `Err` is that failure, so the caller can answer it where
+/// it was found.
+///
+/// An absent `@required` member and a refusal the PROTOCOL made while reading the request
+/// are NOT this: both are violations, and both stay in the list above. A failure of the
+/// protocol rather than of the codec — a body the transport could not hand over as bytes —
+/// has no violation form either and keeps this walk's own treatment, an empty list, since
+/// nothing about one is a statement about a value the caller sent.
+fn refusing_or_unreadable<T: DeserializableStruct + SerializableStruct>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+    schema: &Schema,
+    echoes: Echoes,
+) -> Result<Refusing, SerdeError> {
     let mut deserializer = match protocol.deserialize_input(req, schema) {
         Ok(deserializer) => deserializer,
         // A refusal the PROTOCOL itself made while reading the request states the same
@@ -816,20 +883,20 @@ fn violations_of_input<T: DeserializableStruct + SerializableStruct>(
         // the violation itself carries.
         Err(::aws_smithy_schema_server::ProtocolError::Invalid(violations)) => {
             let echoes = vec![SubmittedEcho::Unrendered; violations.len()];
-            return Refusing {
+            return Ok(Refusing {
                 violations,
                 lists: HashMap::new(),
                 echoes,
-            };
+            });
         }
-        Err(_) => return Refusing::default(),
+        Err(_) => return Ok(Refusing::default()),
     };
     let read = <T as DeserializableStruct>::deserialize(&mut *deserializer);
     drop(deserializer);
     match read {
         Ok(input) => {
             let violations = constraints::validate(&input, schema);
-            match echoes {
+            Ok(match echoes {
                 Echoes::Submitted => Refusing {
                     violations: with_submitted_values(violations, &input, schema),
                     lists: HashMap::new(),
@@ -1040,14 +1107,14 @@ fn violations_of_input<T: DeserializableStruct + SerializableStruct>(
                         echoes: Vec::new(),
                     }
                 }
-            }
+            })
         }
         // Absence is found while READING the request and a bad value while walking what
         // was read; to a caller they are one refusal, so they are one here. `member_name`
         // is already a violation path in the spelling the constraint walk uses
         // (`aws_smithy_schema_server::missing_member` applies `path::member`, and each
         // enclosing member prepends its own segment), so it places identically.
-        Err(SerdeError::MissingMember { member_name }) => Refusing {
+        Err(SerdeError::MissingMember { member_name }) => Ok(Refusing {
             violations: vec![Violation {
                 path: member_name,
                 kind: ViolationKind::MissingRequiredMember,
@@ -1060,8 +1127,8 @@ fn violations_of_input<T: DeserializableStruct + SerializableStruct>(
             // An absent member has no submitted value, whichever echo the caller asked
             // for, so this stays in step with `violations` for every mode.
             echoes: vec![SubmittedEcho::Absent],
-        },
-        Err(_) => Refusing::default(),
+        }),
+        Err(unreadable) => Err(unreadable),
     }
 }
 

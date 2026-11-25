@@ -17,7 +17,8 @@
 //! 2. A channel reference that is not a channel reference is answered first, under the
 //!    error this service's model declares for that fault, whatever else the same request
 //!    broke — the service resolves every call against the channel before it reads the
-//!    payload.
+//!    payload, so that holds for a body the codec cannot read at all as well, which is
+//!    also a request this service answers and therefore records.
 //!
 //! The client is this crate's one test harness, reached from the suite that owns it.
 
@@ -321,11 +322,16 @@ async fn a_channel_reference_is_answered_before_the_payloads_own_violations() {
         );
         let stated = message_of(&reply);
         assert_eq!(
-            stated, "The specified channel ARN is not a valid channel ARN.",
+            stated, INVALID_CHANNEL_ARN,
             "case {case:?}: expected the sentence the model documents, got {stated:?}"
         );
     }
 }
+
+/// The sentence `InvalidChannelARN` carries, as the model documents the shape
+/// (`smithy_query(query="shape", shape="InvalidChannelARN")`): a fixed sentence with no
+/// slot for a caller value.
+const INVALID_CHANNEL_ARN: &str = "The specified channel ARN is not a valid channel ARN.";
 
 /// The operation every access record of this service names, as the model declares it
 /// (`smithy_query(query="list_operations")`).
@@ -680,4 +686,206 @@ async fn a_request_the_authorization_layer_refuses_is_recorded_too() {
         reply.body
     );
     assert_one_record(&records, &row, SESSION_KEY_ID);
+}
+
+/// The forms a body this service's codec cannot build the operation's input from takes:
+/// one position of that input carrying a value of a type the model does not declare there,
+/// and a document the JSON grammar cannot hold at all.
+///
+/// Read off the model's own input (`smithy_query(query="operation",
+/// operation="PutAuditEvents")`: `auditEvents` is a list of `AuditEvent`, whose `id` and
+/// `eventData` are strings), so the rows span the POSITIONS of that input rather than one
+/// body a caller happened to send.
+fn unreadable_bodies() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("the batch sent as a string", r#"{"auditEvents":"evt-1"}"#),
+        ("the batch sent as a number", r#"{"auditEvents":7}"#),
+        (
+            "the batch sent as one object",
+            r#"{"auditEvents":{"id":"evt-1","eventData":"{}"}}"#,
+        ),
+        ("a batch element sent as a string", r#"{"auditEvents":["evt-1"]}"#),
+        (
+            "an element id sent as a number",
+            r#"{"auditEvents":[{"id":7,"eventData":"{}"}]}"#,
+        ),
+        (
+            "an element id sent as a list",
+            r#"{"auditEvents":[{"id":["evt-1"],"eventData":"{}"}]}"#,
+        ),
+        (
+            "an element eventData sent as an object",
+            r#"{"auditEvents":[{"id":"evt-1","eventData":{"eventName":"Login"}}]}"#,
+        ),
+        (
+            "an element eventData sent as a boolean",
+            r#"{"auditEvents":[{"id":"evt-1","eventData":true}]}"#,
+        ),
+        (
+            "a document the JSON grammar cannot hold",
+            r#"{"auditEvents":[{"id":"evt-1","#,
+        ),
+        ("a body that is no JSON at all", "events, please"),
+        (
+            "a body that is a JSON list",
+            r#"[{"id":"evt-1","eventData":"{}"}]"#,
+        ),
+    ]
+}
+
+/// RULE: a channel reference outside the member's modelled expression is answered under the
+/// error this service's model declares for that fault — HTTP 400 `InvalidChannelARN` with
+/// the sentence the model documents — whatever else the request carried, whether or not its
+/// body is one the codec can build the input from: the call is resolved against the channel
+/// the request names before the payload is read at all.
+///
+/// The table above spans payloads the codec CAN read; these rows are every form of a body it
+/// cannot (`unreadable_bodies`) against every form of a reference the expression does not
+/// admit — a word, a bare channel id, a mis-cased prefix, a URL, the prefix alone and one
+/// bound with no value — so neither the body's shape nor the reference's spelling decides
+/// the answer.
+#[tokio::test]
+async fn a_channel_reference_is_answered_first_even_when_the_body_cannot_be_read() {
+    let harness = Harness::new();
+
+    // (case, the value bound to `channelArn`)
+    let references: Vec<(&str, &str)> = vec![
+        ("a bare word", "not-an-arn"),
+        (
+            "a bare channel id (the ARN suffix the doc also names)",
+            "1a2b3c4d-5e6f-7081-92a3-b4c5d6e7f809",
+        ),
+        (
+            "an upper-case ARN prefix",
+            "ARN:aws:cloudtrail:us-east-1:000000000000:channel/abc",
+        ),
+        ("a URL", "https://cloudtrail.us-east-1.amazonaws.com/channel"),
+        ("the prefix without its colon", "arn"),
+        ("a reference bound with no value", ""),
+    ];
+
+    for (body_case, body) in unreadable_bodies() {
+        for (reference_case, reference) in &references {
+            let case = format!("{body_case}, with {reference_case}");
+            let reply = harness.put_body(reference, body).await;
+            assert_eq!(
+                (reply.status, reply.error_code().as_str()),
+                (400, "InvalidChannelARN"),
+                "case {case:?}: the channel reference is answered first, got {} with body {}",
+                reply.status,
+                reply.body
+            );
+            let stated = message_of(&reply);
+            assert_eq!(
+                stated, INVALID_CHANNEL_ARN,
+                "case {case:?}: expected the sentence the model documents, got {stated:?}"
+            );
+        }
+    }
+}
+
+/// RULE: every request this service ANSWERS emits exactly one structured access record
+/// naming the code the caller was answered under — including a request whose body no codec
+/// can build the input from, which the layers behind this service's pre-handler refusal
+/// layer can neither classify nor record.
+///
+/// Both halves of the table are the same bodies (`unreadable_bodies`): under a REGISTERED
+/// channel ARN of this account, where the answer is the one the framework words for a body
+/// its codec cannot read, and under a reference outside the member's expression, where it is
+/// this service's own channel fault. A request whose body was never read persists nothing
+/// either way.
+#[tokio::test]
+async fn a_request_whose_body_cannot_be_read_is_answered_and_recorded_once() {
+    let records = access_records();
+    let harness = Harness::new();
+
+    for (index, (body_case, body)) in unreadable_bodies().into_iter().enumerate() {
+        // A channel of this account, registered first, so nothing but the body decides the
+        // answer — and named uniquely, so the records this case left are its own.
+        let arn = channel_arn(&format!("cc0000{index:02}-0000-4000-8000-0000000000{index:02}"));
+        harness.register(Channel::from_arn(&arn, "Custom").expect("a channel ARN"));
+
+        let reply = harness.put_body(&arn, body).await;
+        assert_eq!(
+            reply.status, 400,
+            "case {body_case:?}: expected HTTP 400, got {} with body {}",
+            reply.status, reply.body
+        );
+        let code = reply.error_code();
+        assert_ne!(
+            code, "InvalidChannelARN",
+            "case {body_case:?}: this request bound a channel ARN the member's expression \
+             admits, so the channel fault is not its answer, got body {}",
+            reply.body
+        );
+        assert!(
+            !code.is_empty() && !message_of(&reply).is_empty(),
+            "case {body_case:?}: a refusal states a code and a sentence, got body {}",
+            reply.body
+        );
+        assert_recorded_once(&records, body_case, &arn, &code);
+        let log = harness.ingest_log(&arn);
+        assert!(
+            log.is_empty(),
+            "case {body_case:?}: a request whose body was never read persists nothing, got \
+             {log:?}"
+        );
+    }
+
+    for (index, (body_case, body)) in unreadable_bodies().into_iter().enumerate() {
+        let reference = format!("unreadable-body-probe-{index}");
+        let reply = harness.put_body(&reference, body).await;
+        assert_eq!(
+            (reply.status, reply.error_code().as_str()),
+            (400, "InvalidChannelARN"),
+            "case {body_case:?} with a reference outside the member's expression: expected \
+             the channel fault, got {} with body {}",
+            reply.status,
+            reply.body
+        );
+        assert_recorded_once(&records, body_case, &reference, "InvalidChannelARN");
+    }
+}
+
+/// Assert the ONE access record a request naming `channel` left behind: the operation, the
+/// access key id presented, the caller account, how the request ended, and the outcome being
+/// the code the caller was answered under.
+fn assert_recorded_once(
+    records: &Arc<Mutex<Vec<Record>>>,
+    case: &str,
+    channel: &str,
+    code: &str,
+) {
+    let captured = records_naming(records, channel);
+    assert_eq!(
+        captured.len(),
+        1,
+        "case {case:?}: expected exactly one access record naming {channel:?}, got {captured:?}"
+    );
+    let record = &captured[0];
+    assert_eq!(
+        stated(record, "operation"),
+        OPERATION,
+        "case {case:?}: the record must name the operation, got {record:?}"
+    );
+    assert_eq!(
+        stated(record, "outcome"),
+        code,
+        "case {case:?}: expected the outcome {code:?} the caller was answered under, got \
+         {record:?}"
+    );
+    assert_eq!(
+        stated(record, "akid"),
+        DEFAULT_ACCESS_KEY_ID,
+        "case {case:?}: the record must name the access key id presented, got {record:?}"
+    );
+    assert_eq!(
+        stated(record, "account_id"),
+        engine::emulator_account_id(),
+        "case {case:?}: the record must name the caller account, got {record:?}"
+    );
+    assert!(
+        !stated(record, "detail").is_empty(),
+        "case {case:?}: the record must state how the request ended, got {record:?}"
+    );
 }

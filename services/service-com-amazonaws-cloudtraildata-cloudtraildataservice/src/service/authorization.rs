@@ -144,10 +144,23 @@ pub fn judged_resource(req: &RtRequest) -> String {
 /// (`service_common::query_parameter`), which takes the FIRST spelling of a repeated
 /// parameter — the one the protocol's deserializer keeps.
 fn channel_reference_named(uri: &str) -> Option<String> {
-    let (_, query) = uri.split_once('?')?;
-    let reference = ::service_common::query_parameter(query, CHANNEL_ARN_PARAMETER)
-        .map(::smithy_server_runtime::percent_decode)?;
+    let reference = channel_reference_bound(uri)?;
     (!reference.is_empty()).then_some(reference)
+}
+
+/// The value `uri` BINDS to the channel reference, read exactly as
+/// [`channel_reference_named`] reads one — `None` only when the parameter is not bound at
+/// all, and `Some("")` for one bound with NO value, which is a value the member's modelled
+/// expression is held to rather than an absent member.
+///
+/// The two readings part only there, and each is what its own caller needs: a request that
+/// binds an empty reference addresses no channel for the decision above to judge
+/// ([`ANY_CHANNEL`]), while the boundary still holds that empty value to the member's
+/// expression and refuses it (see [`super::validation`]).
+pub(crate) fn channel_reference_bound(uri: &str) -> Option<String> {
+    let (_, query) = uri.split_once('?')?;
+    ::service_common::query_parameter(query, CHANNEL_ARN_PARAMETER)
+        .map(::smithy_server_runtime::percent_decode)
 }
 
 /// One modelled operation of this service, served behind the decision IAM takes in front of

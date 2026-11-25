@@ -190,6 +190,12 @@ pub const INVALID_CHANNEL_ARN_CODE: &str = "InvalidChannelARN";
 /// violation against this expression.
 pub const CHANNEL_ARN_PATTERN: &str = "^arn:.*$";
 
+/// The member this operation's input carries the channel reference in
+/// (`PutAuditEventsRequest$channelArn`,
+/// `smithy_query(query="operation", operation="PutAuditEvents")`), which is the path a
+/// clause about that value names it by.
+pub(crate) const CHANNEL_ARN_MEMBER: &str = "channelArn";
+
 /// This operation's own name, as the model declares it: the key the service serves it under,
 /// what the access record reports, and what the IAM action it is authorized under is built
 /// from.

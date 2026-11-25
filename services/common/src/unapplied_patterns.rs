@@ -61,6 +61,15 @@
 //! a request breaking an expression the boundary applies AND one it skips is still ONE
 //! counted refusal. [`stated_together`] is that merge, in the order AWS's own validator
 //! states the clauses of one request.
+//!
+//! # A value with no built input to walk
+//!
+//! One value of a request can need its member's expression answered where there is no built
+//! input at all to walk — a value bound OUTSIDE the body, which a service reads off the
+//! request before its payload is read. [`modelled_pattern_admits`] is that one evaluation,
+//! for one value and one expression, by the same engines and under the same reading: the
+//! requirement the model states for a member cannot then differ with whether the payload
+//! could be read.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -252,15 +261,37 @@ fn satisfies(pattern: &'static str, value: &str) -> Option<bool> {
 /// with compiles the expression at all. One that does not compile is treated there as
 /// satisfied, which is the gap this module closes.
 fn applied_at_the_boundary(pattern: &'static str) -> bool {
-    reading(pattern).applied_at_the_boundary
+    reading(pattern).boundary.is_some()
 }
 
-/// What one modelled expression is to this check: whether the engine behind `@pattern`
-/// compiles it, and its compiled form under the look-around-capable engine (`None` when that
-/// engine cannot compile it either).
+/// Whether `value` is a value the modelled `pattern` ADMITS, decided the way every request
+/// of this tree is held to a `@pattern`: by the engine the framework's boundary validates
+/// with where that engine compiles the expression, and by the look-around-capable engine
+/// here where it does not ([`satisfies`]) — as a FIND over the value, which is what a Smithy
+/// `@pattern` states. An expression NEITHER engine compiles admits every value, the
+/// framework's own treatment.
+///
+/// For a value a service has to hold to a member's expression where the validating walk has
+/// no built input to read it from: one bound OUTSIDE the body, read off the request before
+/// its payload is read at all, so the requirement the model states for that member is the
+/// same one whether or not the payload could be read. The expression is a MODEL CONSTANT,
+/// as every other expression this module evaluates is, and the same compiled form is reused
+/// ([`reading`]).
+#[must_use]
+pub fn modelled_pattern_admits(pattern: &'static str, value: &str) -> bool {
+    match &reading(pattern).boundary {
+        Some(compiled) => compiled.is_match(value),
+        None => satisfies(pattern, value) != Some(false),
+    }
+}
+
+/// What one modelled expression is to this check: the expression as the engine the
+/// framework's boundary validates with compiled it (`None` when that engine cannot compile
+/// it at all, which is the gap this module closes), and its compiled form under the
+/// look-around-capable engine (`None` when that engine cannot compile it either).
 #[derive(Debug, Clone)]
 struct Reading {
-    applied_at_the_boundary: bool,
+    boundary: Option<Arc<::regex::Regex>>,
     compiled: Option<Arc<::fancy_regex::Regex>>,
 }
 
@@ -279,7 +310,7 @@ fn reading(pattern: &'static str) -> Reading {
         return held;
     }
     let read = Reading {
-        applied_at_the_boundary: ::regex::Regex::new(pattern).is_ok(),
+        boundary: ::regex::Regex::new(pattern).ok().map(Arc::new),
         compiled: compiled(pattern),
     };
     locked(&READINGS)
@@ -609,6 +640,45 @@ mod tests {
             None,
             "an expression no engine here compiles must decide nothing"
         );
+    }
+
+    /// RULE: a value held to a modelled expression with no built input to walk is decided by
+    /// the engine the boundary validates with where that engine compiles the expression, by
+    /// the look-around-capable engine where it does not, and ADMITTED where neither does — as
+    /// a FIND over the value, which is what a Smithy `@pattern` states.
+    ///
+    /// The rows span the three readings: an expression the boundary's own engine compiles
+    /// (the one every `ChannelArn` member of CloudTrail Data is constrained with,
+    /// `smithy_query(query="shape", shape="ChannelArn")`), one carrying look-around that it
+    /// cannot (AWS Cloud Map's `NamespaceNamePrivate`), and one neither engine compiles.
+    #[test]
+    fn a_value_with_no_built_input_is_held_to_the_modelled_expression() {
+        const CHANNEL_ARN: &str = "^arn:.*$";
+        const NAMESPACE_NAME_PRIVATE: &str = "^(?!arn:)[!-~]{1,253}$";
+        // An expression neither engine compiles: a recursion the look-around engine refuses
+        // and a look-behind the boundary's engine refuses.
+        const UNCOMPILABLE: &str = "^(?<!x)(?R)$";
+
+        // (case, the expression, the value, whether the expression admits it)
+        let rows: [(&str, &str, &str, bool); 9] = [
+            ("the boundary's engine, a value it admits", CHANNEL_ARN, "arn:aws:cloudtrail:us-east-1:000000000000:channel/c", true),
+            ("the boundary's engine, the prefix alone", CHANNEL_ARN, "arn:", true),
+            ("the boundary's engine, a value it refuses", CHANNEL_ARN, "not-an-arn", false),
+            ("the boundary's engine, the empty value", CHANNEL_ARN, "", false),
+            ("the boundary's engine, the prefix mis-cased", CHANNEL_ARN, "ARN:aws:x", false),
+            ("look-around, a value it admits", NAMESPACE_NAME_PRIVATE, "example.internal", true),
+            ("look-around, a value it refuses", NAMESPACE_NAME_PRIVATE, "arn:aws:x", false),
+            ("look-around, a character the class excludes", NAMESPACE_NAME_PRIVATE, "has a space", false),
+            ("neither engine compiles it, so the value stands", UNCOMPILABLE, "anything", true),
+        ];
+        for (case, pattern, value, expected) in rows {
+            let admitted = modelled_pattern_admits(pattern, value);
+            assert_eq!(
+                admitted, expected,
+                "case {case:?}: expected the expression {pattern:?} to admit {value:?} == \
+                 {expected}, got {admitted}"
+            );
+        }
     }
 
     /// RULE: an expression the boundary's own engine compiles is NOT this module's business

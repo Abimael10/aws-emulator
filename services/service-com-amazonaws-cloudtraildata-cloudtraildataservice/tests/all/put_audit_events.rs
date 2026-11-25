@@ -260,14 +260,39 @@ impl Harness {
         let body = serde_json::json!({
             "auditEvents": events.iter().map(Ev::to_json).collect::<Vec<_>>(),
         });
+        self.dispatch(
+            access_key_id,
+            &uri,
+            serde_json::to_vec(&body).expect("serialize the request body"),
+        )
+        .await
+    }
+
+    /// The same call with the request body written VERBATIM.
+    ///
+    /// `put_as` renders the batch from [`Ev`] values, so a case about a body this service's
+    /// codec cannot build the operation's input from — a member sent as a type the model does
+    /// not declare, a document the JSON grammar cannot hold — hands its body over as text
+    /// instead. Everything else about the request is the same.
+    pub async fn put_body(&self, channel: &str, body: &str) -> Reply {
+        self.dispatch(
+            DEFAULT_ACCESS_KEY_ID,
+            &format!("/PutAuditEvents?channelArn={channel}"),
+            body.as_bytes().to_vec(),
+        )
+        .await
+    }
+
+    /// Send one request to the mounted service and read its answer: the ONE place these
+    /// suites build a request, so a case that writes its own body cannot differ from one
+    /// that renders a batch in anything but the body.
+    async fn dispatch(&self, access_key_id: &str, uri: &str, body: Vec<u8>) -> Reply {
         let request = http::Request::builder()
             .method("POST")
             .uri(uri)
             .header("authorization", sigv4_auth(access_key_id))
             .header("content-type", "application/json")
-            .body(bytes::Bytes::from(
-                serde_json::to_vec(&body).expect("serialize the request body"),
-            ))
+            .body(bytes::Bytes::from(body))
             .expect("a well-formed request");
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
