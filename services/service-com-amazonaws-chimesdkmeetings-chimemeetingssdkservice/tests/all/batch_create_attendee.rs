@@ -20,6 +20,12 @@
 //! or takes the meeting's documented defaults, how many attendees the meeting already
 //! holds when the batch arrives, and which items the meeting's own `MeetingFeatures`
 //! admit (all of them, none of them, or only the ones inside its attendee ceiling).
+//!
+//! The last suite below pins the per-item half of that rule: EVERY item carrying a
+//! capability set is judged against the meeting's features, so one call's items get their
+//! own answers whatever the identities they name — including an identity the meeting
+//! already holds an attendee for, whose stored attendee is answered unchanged when the set
+//! is admissible and refused in `Errors` when it is not.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -27,6 +33,8 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use service_com_amazonaws_chimesdkmeetings_chimemeetingssdkservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
+
+use crate::capability_refusal_message::{capability_set, expected_refusal};
 
 /// A SigV4 `Authorization` header whose credential scope names the `chime` signing name
 /// this service publishes (`OPERATIONS.md`, `## Wire protocol`). The scope is how the
@@ -609,4 +617,343 @@ async fn a_meeting_id_that_names_no_meeting_is_not_found() {
             listed.status, listed.body
         );
     }
+}
+
+/// One row of the per-item judgement table: the `MeetingFeatures` the meeting is created
+/// with, the effective maximum resolutions those features give it — so the expectation is
+/// read from the documentation and not from the handler — and the capability set the items
+/// of the batch carry.
+struct JudgementCase {
+    name: &'static str,
+    features: Option<Value>,
+    /// The meeting's effective `Video`/`Content` `MaxResolution`. The documented defaults
+    /// are `HD` for video and `FHD` for content (`VideoFeatures$MaxResolution` /
+    /// `ContentFeatures$MaxResolution`, "Defaults to …").
+    resolutions: (&'static str, &'static str),
+    carried: Value,
+}
+
+/// What the documented rules give ONE item of a batch.
+#[derive(Clone, Debug)]
+enum Outcome {
+    /// Reported in `Attendees` as the attendee the meeting ALREADY holds for the identity
+    /// the item names: nothing is minted, and the set the item carried is not applied to
+    /// it — changing those is `UpdateAttendeeCapabilities`.
+    Replayed,
+    /// Reported in `Attendees` as an attendee minted for this item.
+    Minted,
+    /// Reported in `Errors`, with the sentence of the class its set breaks.
+    Refused(&'static str),
+}
+
+/// A capability set an item carries is judged against the meeting's `MeetingFeatures` for
+/// EVERY item that carries one — `AttendeeCapabilities` documents that "all API requests
+/// that include `SendReceive`, `Send`, or `Receive` for `AttendeeCapabilities:Video` will
+/// be rejected with `ValidationError 400`", and the same sentence for
+/// `AttendeeCapabilities:Content` — so an inadmissible item is reported in `Errors` even
+/// when the meeting already holds an attendee for the identity it names, while every other
+/// item of the same call is served and the stored attendee keeps what it holds.
+///
+/// The table spans what the rule generalises over: which of the three documented corner
+/// cases the set breaks, which capability value breaks it, which `MeetingFeatures` make it
+/// inadmissible, sets the same meetings DO admit, whether the identity an item names is
+/// fresh or one the meeting already holds (named twice in the one call), whether an item
+/// carries a set at all, and where in the request each item sits.
+#[tokio::test]
+async fn every_item_of_a_batch_is_judged_against_the_meetings_features() {
+    let cases: Vec<JudgementCase> = vec![
+        JudgementCase {
+            name: "a video capability a Video:MaxResolution:None meeting forbids",
+            features: Some(json!({ "Video": { "MaxResolution": "None" } })),
+            resolutions: ("None", "FHD"),
+            carried: capability_set("SendReceive", "SendReceive", "None"),
+        },
+        JudgementCase {
+            name: "a video capability asking only to receive, in the same meeting",
+            features: Some(json!({ "Video": { "MaxResolution": "None" } })),
+            resolutions: ("None", "FHD"),
+            carried: capability_set("None", "Receive", "None"),
+        },
+        JudgementCase {
+            name: "a content capability a Content:MaxResolution:None meeting forbids",
+            features: Some(json!({ "Content": { "MaxResolution": "None" } })),
+            resolutions: ("HD", "None"),
+            carried: capability_set("Send", "SendReceive", "Send"),
+        },
+        JudgementCase {
+            name: "content reception without video reception, under the documented defaults",
+            features: None,
+            resolutions: ("HD", "FHD"),
+            carried: capability_set("SendReceive", "None", "Receive"),
+        },
+        JudgementCase {
+            name: "a set a meeting capping both axes at None forbids",
+            features: Some(json!({
+                "Video": { "MaxResolution": "None" },
+                "Content": { "MaxResolution": "None" },
+            })),
+            resolutions: ("None", "None"),
+            carried: capability_set("Send", "Send", "Send"),
+        },
+        JudgementCase {
+            name: "a set the documented defaults admit",
+            features: None,
+            resolutions: ("HD", "FHD"),
+            carried: capability_set("None", "Receive", "Receive"),
+        },
+        JudgementCase {
+            name: "a set a Video:MaxResolution:None meeting admits",
+            features: Some(json!({ "Video": { "MaxResolution": "None" } })),
+            resolutions: ("None", "FHD"),
+            carried: capability_set("Send", "None", "None"),
+        },
+    ];
+
+    let emulator = Emulator::new();
+    let mut refused_rows = 0usize;
+    let mut admitted_rows = 0usize;
+
+    for (index, case) in cases.into_iter().enumerate() {
+        let JudgementCase {
+            name,
+            features,
+            resolutions,
+            carried,
+        } = case;
+        // The expectation comes from the documented corner cases, restated once in the
+        // sibling suite, so it never reads back this crate's own judgement.
+        let refusal = expected_refusal(
+            &string_member(&carried, "Video"),
+            &string_member(&carried, "Content"),
+            resolutions.0,
+            resolutions.1,
+        );
+        if refusal.is_some() {
+            refused_rows += 1;
+        } else {
+            admitted_rows += 1;
+        }
+
+        let held = format!("user-held-{index}");
+        let fresh = format!("user-fresh-{index}");
+        let plain = format!("user-plain-{index}");
+        // (what the item is, the identity it names, the set it carries, the answer the
+        // documented rules give it).
+        let plan: Vec<(&str, String, Option<Value>, Outcome)> = vec![
+            (
+                "the identity the meeting already holds, carrying the row's set",
+                held.clone(),
+                Some(carried.clone()),
+                refusal.map_or(Outcome::Replayed, Outcome::Refused),
+            ),
+            (
+                "a fresh identity carrying the row's set",
+                fresh.clone(),
+                Some(carried.clone()),
+                refusal.map_or(Outcome::Minted, Outcome::Refused),
+            ),
+            (
+                "a fresh identity carrying no set at all",
+                plain.clone(),
+                None,
+                Outcome::Minted,
+            ),
+            (
+                "the held identity named a second time in the same call",
+                held.clone(),
+                Some(carried.clone()),
+                refusal.map_or(Outcome::Replayed, Outcome::Refused),
+            ),
+        ];
+
+        // The same items in both directions: an item's answer is its own, so it cannot
+        // depend on where in the request it sits.
+        for reversed in [false, true] {
+            let order = if reversed {
+                "reverse request order"
+            } else {
+                "request order"
+            };
+            let mut plan = plan.clone();
+            if reversed {
+                plan.reverse();
+            }
+
+            let token = format!("tok-judge-{index}-{}", if reversed { "rev" } else { "fwd" });
+            let meeting_id = emulator.meeting(&token, "us-east-1", features.clone()).await;
+            // The meeting already holds one attendee for the held identity, created with
+            // the meeting's own documented default capabilities.
+            let seeded = emulator.create_attendee(&meeting_id, &held).await;
+            assert_eq!(
+                seeded.status, 200,
+                "case {name:?} in {order}: CreateAttendee for the held identity expected \
+                 200, got {} with {:?}",
+                seeded.status, seeded.body
+            );
+            let stored = seeded.member("Attendee");
+            let stored_id = string_member(&stored, "AttendeeId");
+            let defaults = stored
+                .get("Capabilities")
+                .cloned()
+                .unwrap_or_else(|| panic!("case {name:?}: the stored attendee reports no \
+                     capabilities: {stored:?}"));
+
+            let items = Value::Array(
+                plan.iter()
+                    .map(|(_, user, carried, _)| match carried {
+                        Some(set) => json!({ "ExternalUserId": user, "Capabilities": set }),
+                        None => json!({ "ExternalUserId": user }),
+                    })
+                    .collect(),
+            );
+            let reply = emulator.batch_create_attendee(&meeting_id, &items).await;
+            assert_eq!(
+                (reply.status, reply.error_code.as_deref()),
+                (200, None),
+                "case {name:?} in {order}: a per-item refusal never fails the call, got {} \
+                 {:?} with {:?}",
+                reply.status,
+                reply.error_code,
+                reply.body
+            );
+
+            // `Attendees` carries the served items and `Errors` the refused ones, each in
+            // request order.
+            let served: Vec<&(&str, String, Option<Value>, Outcome)> = plan
+                .iter()
+                .filter(|(_, _, _, outcome)| !matches!(outcome, Outcome::Refused(_)))
+                .collect();
+            let returned = reply.list("Attendees");
+            assert_eq!(
+                external_user_ids(&returned),
+                served
+                    .iter()
+                    .map(|(_, user, _, _)| user.clone())
+                    .collect::<Vec<String>>(),
+                "case {name:?} in {order}: expected the served items in request order, got \
+                 {returned:?}"
+            );
+            let reported: Vec<(String, String, String)> = reply
+                .list("Errors")
+                .iter()
+                .map(|error| {
+                    (
+                        string_member(error, "ExternalUserId"),
+                        string_member(error, "ErrorCode"),
+                        string_member(error, "ErrorMessage"),
+                    )
+                })
+                .collect();
+            let expected_errors: Vec<(String, String, String)> = plan
+                .iter()
+                .filter_map(|(_, user, _, outcome)| match outcome {
+                    Outcome::Refused(message) => Some((
+                        user.clone(),
+                        "BadRequest".to_string(),
+                        (*message).to_string(),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                reported, expected_errors,
+                "case {name:?} in {order}: expected exactly the refused items, each naming \
+                 its identity, the code of the refusal and the sentence of the class its \
+                 set breaks, got {reported:?}"
+            );
+
+            for ((label, user, item_set, outcome), record) in served.iter().zip(returned.iter()) {
+                match outcome {
+                    Outcome::Replayed => {
+                        assert_eq!(
+                            *record, stored,
+                            "case {name:?} in {order}, {label:?} ({user}): the replay must \
+                             answer the stored attendee {stored:?} unchanged, got {record:?}"
+                        );
+                    }
+                    Outcome::Minted => {
+                        let minted_id = string_member(record, "AttendeeId");
+                        assert_ne!(
+                            minted_id, stored_id,
+                            "case {name:?} in {order}, {label:?} ({user}): a fresh identity \
+                             must get an attendee of its own, got the held identity's"
+                        );
+                        // An item that carried a set holds it; one that carried none holds
+                        // the meeting's defaults, the set the held attendee was created
+                        // with in this same meeting.
+                        let expected = item_set.clone().unwrap_or_else(|| defaults.clone());
+                        assert_eq!(
+                            record.get("Capabilities"),
+                            Some(&expected),
+                            "case {name:?} in {order}, {label:?} ({user}): expected \
+                             capabilities {expected:?}, got {:?}",
+                            record.get("Capabilities")
+                        );
+                        // Round trip: the record this call returned is the record a reader
+                        // reads.
+                        let read_back = emulator.get_attendee(&meeting_id, &minted_id).await;
+                        assert_eq!(
+                            read_back.status, 200,
+                            "case {name:?} in {order}, {label:?} ({user}): GetAttendee \
+                             expected 200, got {} with {:?}",
+                            read_back.status, read_back.body
+                        );
+                        assert_eq!(
+                            read_back.member("Attendee"),
+                            *record,
+                            "case {name:?} in {order}, {label:?} ({user}): GetAttendee must \
+                             read back the minted attendee"
+                        );
+                    }
+                    Outcome::Refused(message) => unreachable!(
+                        "case {name:?} in {order}, {label:?} ({user}): an item refused with \
+                         {message:?} is reported in Errors, never in Attendees"
+                    ),
+                }
+            }
+
+            // Round trip: the meeting holds the identity it already held plus exactly the
+            // ones minted here — a refused item left no trace — and the attendee of the
+            // held identity still carries the capabilities it was created with.
+            let listed = emulator.list_attendees(&meeting_id).await;
+            assert_eq!(
+                listed.status, 200,
+                "case {name:?} in {order}: ListAttendees expected 200, got {} with {:?}",
+                listed.status, listed.body
+            );
+            let stored_identities: BTreeSet<String> =
+                external_user_ids(&listed.list("Attendees")).into_iter().collect();
+            let expected_identities: BTreeSet<String> = std::iter::once(held.clone())
+                .chain(
+                    plan.iter()
+                        .filter(|(_, _, _, outcome)| matches!(outcome, Outcome::Minted))
+                        .map(|(_, user, _, _)| user.clone()),
+                )
+                .collect();
+            assert_eq!(
+                stored_identities, expected_identities,
+                "case {name:?} in {order}: the meeting must hold exactly the identities that \
+                 exist, got {stored_identities:?}"
+            );
+            let read_back = emulator.get_attendee(&meeting_id, &stored_id).await;
+            assert_eq!(
+                read_back.status, 200,
+                "case {name:?} in {order}: GetAttendee for the held attendee expected 200, \
+                 got {} with {:?}",
+                read_back.status, read_back.body
+            );
+            assert_eq!(
+                read_back.member("Attendee"),
+                stored,
+                "case {name:?} in {order}: the held identity's attendee must be unchanged by \
+                 the batch"
+            );
+        }
+    }
+
+    assert!(
+        refused_rows > 0 && admitted_rows > 0,
+        "the table must both refuse and admit sets, got {refused_rows} refused and \
+         {admitted_rows} admitted"
+    );
 }
