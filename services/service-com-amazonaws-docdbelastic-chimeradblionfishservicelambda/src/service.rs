@@ -45,9 +45,11 @@
 //! Two response headers of this service's wire are not what the framework's restJson1
 //! renderers write, and neither belongs to a modelled shape, so no handler can set them:
 //!
-//! * `x-amzn-errortype`, which every failure names its error shape in by that shape's
-//!   NAME alone — nothing is appended to it, neither the namespace that declares the
-//!   shape nor a locator for it inside a serving stack ([`error_type_locator`]);
+//! * `x-amzn-errortype`, which every failure names its error shape in by that shape's NAME
+//!   followed by the separator and the locator of the namespace that declares the shape, so
+//!   the leading token a client resolves the error from is the shape's name
+//!   ([`error_type_locator`], whose form, writer and wrappers are
+//!   [`service_common::error_type_locator`]'s);
 //! * `content-type`, which every response carrying a JSON payload — a success and a
 //!   failure alike — announces as the JSON media type the REQUEST named for its own
 //!   payload, defaulting to this service's native AWS JSON 1.1 media type when the
@@ -90,9 +92,12 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        let entry = ErrorTypeHeaderDefinition::new(crate::ServiceDefinition::new(engine));
+        // ONE locator for both layers, derived once from this service's own identity.
+        let naming_error_shape = NamingErrorShape::new(entry.locator().to_string());
         Self {
-            entry: ErrorTypeHeaderDefinition::new(crate::ServiceDefinition::new(engine)),
-            naming_error_shape: NamingErrorShape,
+            entry,
+            naming_error_shape,
         }
     }
 }

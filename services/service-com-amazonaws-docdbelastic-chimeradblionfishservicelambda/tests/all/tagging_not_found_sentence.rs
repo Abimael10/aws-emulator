@@ -24,10 +24,11 @@
 //! resource carries — are two rows of it.
 //!
 //! The second rule here is about the ENVELOPE rather than the sentence: every failure of
-//! this service names its error shape in `x-amzn-errortype` by that shape's NAME, the name
-//! the model declares it under, with nothing appended beside it. It holds for a modelled
-//! refusal an operation answered and for one the framework raised before any handler ran,
-//! and a success names no shape at all.
+//! this service names its error shape in `x-amzn-errortype` as a QUALIFIED value — that
+//! shape's NAME, the name the model declares it under, LEADING the value, then the separator
+//! and the locator of the namespace that declares the shape. It holds for a modelled refusal
+//! an operation answered and for one the framework raised before any handler ran, and a
+//! success names no shape at all.
 //!
 //! The third rule is the one the two HEADERS of such a refusal carry together, which is
 //! what a client classifies the answer by before it parses a byte of the body: **a refusal
@@ -83,6 +84,18 @@ const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
 /// The error shape every refusal below is refused with, as the model names it
 /// (`smithy_query(query="shape", shape="ResourceNotFoundException")`).
 const NOT_FOUND_SHAPE: &str = "ResourceNotFoundException";
+
+/// The namespace this service's shapes are declared in, as its service shape id carries it
+/// (`smithy_query(query="service_info")`:
+/// `com.amazonaws.docdbelastic#ChimeraDbLionfishServiceLambda`) — what the locator after the
+/// leading shape name names.
+const NAMESPACE: &str = "com.amazonaws.docdbelastic";
+
+/// The locator a qualified value carries after the shape name: the separator, the service
+/// stack's locator root, then the namespace that declares the shape.
+fn locator() -> String {
+    format!(":http://internal.amazon.com/coral/{NAMESPACE}/")
+}
 
 /// The ARN resource segments of those two classes.
 const CLUSTER_SEGMENT: &str = "cluster";
@@ -546,7 +559,7 @@ async fn an_operation_asked_for_one_named_class_keeps_its_own_sentence() {
 }
 
 #[tokio::test]
-async fn every_failure_names_its_error_shape_by_its_name() {
+async fn every_failure_names_its_error_shape_in_the_qualified_form() {
     // The envelope rule, over everything that can answer a failure: the modelled refusal
     // each tag operation answers for an ARN it holds nothing under, a refusal the
     // framework raises before any handler runs, and a typed reader's own refusal. A
@@ -585,16 +598,15 @@ async fn every_failure_names_its_error_shape_by_its_name() {
             status, 404,
             "case {case:?}: expected HTTP 404, got {status} with {body}"
         );
-        let expected = NOT_FOUND_SHAPE.to_string();
+        let expected = format!("{NOT_FOUND_SHAPE}{}", locator());
         assert_eq!(
             error_type.as_deref(),
             Some(expected.as_str()),
             "case {case:?}: expected {expected:?} in {ERROR_TYPE_HEADER}, got {error_type:?}"
         );
-        // The shape the header names is the shape the body names in `__type`, and the
-        // header carries nothing beside that name.
+        // The shape the header LEADS with is the shape the body names in `__type`.
         assert_eq!(
-            error_type.clone().unwrap_or_default(),
+            leading_token(&error_type.clone().unwrap_or_default()),
             error_code(&body),
             "case {case:?}: the header and the body must name one shape, got {error_type:?} \
              and {body}"
@@ -617,14 +629,15 @@ async fn every_failure_names_its_error_shape_by_its_name() {
     );
     let named = error_type.unwrap_or_default();
     assert_eq!(
-        named,
+        leading_token(&named),
         error_code(&body),
         "case \"an omitted required member\": the header must name the shape the body names, \
          got {named:?} and {body}"
     );
-    assert!(
-        !named.is_empty() && named.chars().all(|c| c.is_ascii_alphanumeric()),
-        "case \"an omitted required member\": expected the shape name alone in \
+    assert_eq!(
+        named,
+        format!("{}{}", leading_token(&named), locator()),
+        "case \"an omitted required member\": expected the shape name leading one locator in \
          {ERROR_TYPE_HEADER}, got {named:?}"
     );
 
@@ -641,7 +654,7 @@ async fn every_failure_names_its_error_shape_by_its_name() {
         status, 404,
         "case \"GetCluster on an absent cluster\": expected HTTP 404, got {status} with {body}"
     );
-    let expected = NOT_FOUND_SHAPE.to_string();
+    let expected = format!("{NOT_FOUND_SHAPE}{}", locator());
     assert_eq!(
         error_type.as_deref(),
         Some(expected.as_str()),
@@ -772,11 +785,12 @@ async fn a_tagging_refusal_announces_the_generic_media_type_and_leads_with_its_e
                     "case {case:?}: expected {NOT_FOUND_SHAPE:?} to lead \
                      {ERROR_TYPE_HEADER}, got {named_shape:?}"
                 );
-                // No Amazon-internal locator rides along: a client reading the whole value
-                // sees nothing a real answer does not carry.
-                assert!(
-                    !named_shape.contains("internal.amazon.com"),
-                    "case {case:?}: {ERROR_TYPE_HEADER} must carry no internal locator, got \
+                // One locator rides along, whichever layer answered: a value that passed a
+                // response layer twice would carry two.
+                assert_eq!(
+                    named_shape,
+                    format!("{NOT_FOUND_SHAPE}{}", locator()),
+                    "case {case:?}: expected one locator after the shape name, got \
                      {named_shape:?}"
                 );
                 // The envelope the two headers announce is the one the body carries.

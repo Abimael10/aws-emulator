@@ -3,25 +3,27 @@
 //! What this service writes in the `x-amzn-errortype` response header of a failure.
 //!
 //! The rule these suites assert: **a failure of this service names the error shape it is
-//! refused with in `x-amzn-errortype` by that shape's NAME — the name the model declares
-//! the error shape under — and the header carries nothing else**: no namespace before it,
-//! and nothing appended after it, in particular no locator naming where a serving stack
-//! declares the shape. A restJson1 client resolves the error shape from this header, so
-//! the value is the shape name and the same shape the body names in `__type`; a success
-//! names no error shape at all.
+//! refused with in `x-amzn-errortype` as a QUALIFIED value — the shape's NAME, as the model
+//! declares it, then the separator, then the locator of the namespace that declares the
+//! shape**, so the LEADING token a client resolves the error from is exactly the shape's name
+//! and is the same shape the body names in `__type`. Exactly one locator rides along,
+//! whichever of the service's two response layers answered. A success names no error shape at
+//! all.
 //!
 //! The model declares nothing about this header (the service only `@cors`-exposes it), so
-//! the rule above is the protocol's: restJson1 resolves an error shape from the header's
-//! value, and the shape names available are exactly the error shapes this model declares
-//! (`smithy_query(query="shape",
-//! shape="ResourceNotFoundException,ValidationException,ConflictException")`).
+//! the leading token is the protocol's: restJson1 resolves an error shape from the text
+//! before the separator, and the shape names available are exactly the error shapes this
+//! model declares (`smithy_query(query="shape",
+//! shape="ResourceNotFoundException,ValidationException,ConflictException")`). The qualified
+//! FORM is the one this wire family's shared module states and writes, with the locator
+//! derived from this service's own shape id.
 //!
-//! The rule generalises over the operation, over the error shape and over WHAT answered
-//! the failure — a handler's modelled refusal, a service-rule refusal, a refusal the
-//! framework raised before any handler ran, and a request naming no modelled operation at
-//! all — so the table below spans all of those rather than the one recorded refusal. The
-//! recorded cases, a `TagResource` and an `UntagResource` against an ARN no resource
-//! carries, are two of its rows.
+//! The rule generalises over the operation, over the error shape, over the resource class an
+//! ARN names and over WHAT answered the failure — a handler's modelled refusal, a
+//! service-rule refusal, a refusal the framework raised before any handler ran, and a request
+//! naming no modelled operation at all — so the table below spans all of those rather than
+//! the one recorded refusal. The recorded cases, a `TagResource` and an `UntagResource`
+//! against an ARN no resource carries, are two of its rows.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -29,13 +31,27 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// The region the suites sign with.
-const REGION: &str = "eu-west-2";
+pub(crate) const REGION: &str = "eu-west-2";
 
 /// The canonical placeholder account every emulated ARN carries.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// The header a restJson1 client resolves an error shape from.
 const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
+
+/// The namespace this service's shapes are declared in, as its service shape id carries it
+/// (`smithy_query(query="service_info")`:
+/// `com.amazonaws.docdbelastic#ChimeraDbLionfishServiceLambda`).
+const NAMESPACE: &str = "com.amazonaws.docdbelastic";
+
+/// The locator a qualified value carries after the shape name: the separator, the service
+/// stack's locator root, then the namespace that declares the shape.
+///
+/// Spelled out here on purpose rather than taken from the module the service writes it with,
+/// so this suite keeps its own INDEPENDENT oracle for the value on the wire.
+pub(crate) fn locator() -> String {
+    format!(":http://internal.amazon.com/coral/{NAMESPACE}/")
+}
 
 /// A SigV4 `Authorization` header for this service in [`REGION`].
 fn authorization() -> String {
@@ -46,7 +62,7 @@ fn authorization() -> String {
 }
 
 /// One emulator: the shared engine plus a router carrying only this service.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -60,7 +76,7 @@ fn emulator() -> MultiServiceRouter {
 
 /// Percent-encode one value the way an AWS SDK encodes a single path segment or one
 /// query-parameter value: an ARN carries both `:` and `/`.
-fn label(value: &str) -> String {
+pub(crate) fn label(value: &str) -> String {
     value
         .bytes()
         .map(|byte| match byte {
@@ -74,7 +90,7 @@ fn label(value: &str) -> String {
 
 /// Send one request and return its status, the `x-amzn-errortype` header and its parsed
 /// JSON body (`Value::Null` when the body is empty).
-async fn answer(
+pub(crate) async fn answer(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
@@ -121,7 +137,7 @@ fn error_code(body: &Value) -> String {
 }
 
 /// A `CreateCluster` body with every required member and nothing else.
-fn minimal_create(name: &str) -> Value {
+pub(crate) fn minimal_create(name: &str) -> Value {
     json!({
         "clusterName": name,
         "authType": "PLAIN_TEXT",
@@ -145,31 +161,38 @@ async fn create_arn(router: &MultiServiceRouter, name: &str) -> String {
         .to_string()
 }
 
-/// Assert `named` is a shape NAME and nothing else, and return it.
+/// Assert `named` is one shape named in the qualified form, and return the shape's NAME —
+/// the leading token, which is what a client resolves the error from.
 ///
-/// A name is what the model declares an error shape under: letters and digits, no
-/// namespace before it and nothing appended after it — so none of the characters a
-/// namespace (`#`), a locator (`:`, `/`) or a URL (`.`, whitespace) would bring.
-fn shape_name_only(case: &str, named: &Option<String>) -> String {
-    let named = named
-        .clone()
-        .unwrap_or_else(|| panic!("case {case:?}: a failure must name its error shape in {ERROR_TYPE_HEADER}"));
+/// The form asserted: the shape name, which is what the model declares an error shape under
+/// (letters and digits, with no namespace before it), then exactly one locator of the
+/// namespace that declares it. Asserting the WHOLE value is what pins the "exactly one
+/// locator" half of the rule: a value that passed both of the service's response layers
+/// twice would carry two.
+pub(crate) fn qualified_shape_named(case: &str, named: &Option<String>) -> String {
+    let named = named.clone().unwrap_or_else(|| {
+        panic!("case {case:?}: a failure must name its error shape in {ERROR_TYPE_HEADER}")
+    });
+    let (leading, _) = named.split_once(':').unwrap_or_else(|| {
+        panic!(
+            "case {case:?}: the header must carry a qualified value — the shape name, the \
+             separator and the locator — got {named:?}"
+        )
+    });
     assert!(
-        !named.is_empty(),
-        "case {case:?}: the named shape must not be empty"
+        !leading.is_empty(),
+        "case {case:?}: the named shape must not be empty, got {named:?}"
     );
-    for forbidden in ['#', ':', '/', '.', ' '] {
-        assert!(
-            !named.contains(forbidden),
-            "case {case:?}: the header must carry the shape name alone, found {forbidden:?} \
-             in {named:?}"
-        );
-    }
     assert!(
-        named.chars().all(|c| c.is_ascii_alphanumeric()),
-        "case {case:?}: a shape name is alphanumeric, got {named:?}"
+        leading.chars().all(|c| c.is_ascii_alphanumeric()),
+        "case {case:?}: the leading token is a shape name, so alphanumeric, got {leading:?}"
     );
-    named
+    let expected = format!("{leading}{}", locator());
+    assert_eq!(
+        named, expected,
+        "case {case:?}: expected {expected:?}, got {named:?}"
+    );
+    leading.to_string()
 }
 
 /// One failure to drive, and the error shape the model says answers it.
@@ -185,7 +208,7 @@ struct Failure {
 }
 
 #[tokio::test]
-async fn every_failure_names_its_error_shape_by_name_alone() {
+async fn every_failure_names_its_error_shape_in_the_qualified_form() {
     let router = emulator();
     let held = create_arn(&router, "named").await;
     let absent_cluster = format!(
@@ -194,6 +217,10 @@ async fn every_failure_names_its_error_shape_by_name_alone() {
     let absent_snapshot = format!(
         "arn:aws:docdb-elastic:{REGION}:{ACCOUNT}:cluster-snapshot/11111111-2222-3333-4444-555555555555"
     );
+    // Another resource class, in another region and with an id of another form: the rule is
+    // about the failure, not about one identifier.
+    let absent_foreign_snapshot =
+        format!("arn:aws:docdb-elastic:us-east-1:{ACCOUNT}:cluster-snapshot/sim2real-probe-snap-1");
 
     // The rows differ along the operation, the HTTP method, the status, the error shape
     // and what answered the failure.
@@ -215,9 +242,28 @@ async fn every_failure_names_its_error_shape_by_name_alone() {
             shape: Some("ResourceNotFoundException"),
         },
         Failure {
+            case: "UntagResource naming several keys on an unheld snapshot ARN (404)",
+            method: "DELETE",
+            path: format!(
+                "/tags/{}?tagKeys=Project&tagKeys=Owner",
+                label(&absent_foreign_snapshot)
+            ),
+            body: None,
+            status: 404,
+            shape: Some("ResourceNotFoundException"),
+        },
+        Failure {
             case: "ListTagsForResource on an ARN no resource carries (404)",
             method: "GET",
             path: format!("/tags/{}", label(&absent_cluster)),
+            body: None,
+            status: 404,
+            shape: Some("ResourceNotFoundException"),
+        },
+        Failure {
+            case: "ListTagsForResource on an unheld snapshot ARN (404)",
+            method: "GET",
+            path: format!("/tags/{}", label(&absent_foreign_snapshot)),
             body: None,
             status: 404,
             shape: Some("ResourceNotFoundException"),
@@ -304,7 +350,7 @@ async fn every_failure_names_its_error_shape_by_name_alone() {
             "case {case:?}: expected HTTP {}, got {status} with {body}",
             failure.status
         );
-        let named = shape_name_only(case, &error_type);
+        let named = qualified_shape_named(case, &error_type);
         if let Some(expected) = failure.shape {
             assert_eq!(
                 named, expected,
@@ -371,15 +417,17 @@ async fn a_success_names_no_error_shape() {
 }
 
 #[tokio::test]
-async fn a_request_naming_no_modeled_operation_names_no_shape_beside_its_name() {
+async fn a_request_naming_no_modeled_operation_is_qualified_the_same_way() {
     // The other layer of the service: a request the routing table cannot name is answered
     // by the framework's routing-failure renderer, which this service's response path also
-    // passes through. Whatever shape that names, it names it the same way.
+    // passes through. Whatever shape that names, it names it the same way — and the header
+    // must be THERE, since this is the layer the rule is most easily lost at.
     let router = emulator();
 
     for (case, method, path) in [
         ("a path no operation is bound to", "GET", "/not-an-operation"),
         ("a method no operation is bound to", "PATCH", "/clusters"),
+        ("the tagging path with no ARN label", "GET", "/tags"),
     ] {
         let (status, error_type, body) = answer(&router, method, path, None).await;
         assert!(
@@ -387,12 +435,10 @@ async fn a_request_naming_no_modeled_operation_names_no_shape_beside_its_name() 
             "case {case:?}: a request naming no operation is a failure, got {status} with \
              {body}"
         );
-        if error_type.is_some() {
-            let named = shape_name_only(case, &error_type);
-            assert!(
-                !named.is_empty(),
-                "case {case:?}: the named shape must not be empty, got {named:?}"
-            );
-        }
+        let named = qualified_shape_named(case, &error_type);
+        assert!(
+            !named.is_empty(),
+            "case {case:?}: the named shape must not be empty, got {named:?}"
+        );
     }
 }
