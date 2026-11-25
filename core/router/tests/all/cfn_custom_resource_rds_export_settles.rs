@@ -56,24 +56,24 @@ use crate::cloudformation_completed_stack_output_values::{
 
 /// The status a deployment whose provider answered `FAILED` has to reach: the create fails and
 /// the stack rolls back, which is where a rolled-back create settles.
-const ROLLBACK_COMPLETE: &str = "ROLLBACK_COMPLETE";
+pub(crate) const ROLLBACK_COMPLETE: &str = "ROLLBACK_COMPLETE";
 
 /// The logical ids every template below declares.
-const BUCKET: &str = "ExportBucket";
+pub(crate) const BUCKET: &str = "ExportBucket";
 const KEY: &str = "ExportKey";
 const EXPORT_ROLE: &str = "ExportRole";
 const TRIGGER_ROLE: &str = "TriggerRole";
 const TRIGGER_FUNCTION: &str = "TriggerFunction";
-const TRIGGER: &str = "TriggerResource";
+pub(crate) const TRIGGER: &str = "TriggerResource";
 
-/// The master user every DB instance below is created with, and its password — test
-/// credentials, and the only place in this suite they appear.
-const MASTER_USER: &str = "emuadmin";
-const MASTER_PASSWORD: &str = "emu-Secret-99";
+/// The master user every DB instance and DB cluster below is created with, and its password —
+/// test credentials, and the only place in the suites that deploy this template they appear.
+pub(crate) const MASTER_USER: &str = "emuadmin";
+pub(crate) const MASTER_PASSWORD: &str = "emu-Secret-99";
 
 /// The statuses an export task can have reached once nothing more is owed on it
 /// (`ExportTask$Status`), which is what a client polling one waits for.
-const TERMINAL_EXPORT_STATUSES: [&str; 3] = ["COMPLETE", "FAILED", "CANCELED"];
+pub(crate) const TERMINAL_EXPORT_STATUSES: [&str; 3] = ["COMPLETE", "FAILED", "CANCELED"];
 
 /// The provider every row deploys: it starts the export its properties describe through the
 /// AWS SDK its runtime supplies, and PUTs its own answer to the request's `ResponseURL` —
@@ -152,7 +152,7 @@ def handler(event, context):
 ///
 /// The whole router rather than the named services the sibling suite mounts: this chain spans
 /// CloudFormation, AWS Lambda, Amazon RDS, IAM, KMS and Amazon S3 at once.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = aws_emulator_router::build_router(engine);
     // The suite exercises the services, not SigV4: every call carries a credential scope so
@@ -191,7 +191,11 @@ async fn query(
 }
 
 /// One Amazon RDS call.
-async fn rds(router: &MultiServiceRouter, action: &str, params: &[(&str, String)]) -> Answered {
+pub(crate) async fn rds(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(&str, String)],
+) -> Answered {
     query(router, "rds", "2014-10-31", action, params).await
 }
 
@@ -202,10 +206,12 @@ macro_rules! params {
     };
 }
 
+pub(crate) use params;
+
 /// Read the Amazon RDS `action` until the element `tag` of its answer carries one of `wanted`,
 /// and hand back the answer it then read. The wait is on that CONDITION: the call is made again
 /// until it holds or [`SETTLE_DEADLINE`] passes.
-async fn read_rds_until(
+pub(crate) async fn read_rds_until(
     router: &MultiServiceRouter,
     case: &str,
     action: &str,
@@ -228,7 +234,7 @@ async fn read_rds_until(
 }
 
 /// Assert `answered` was served, and hand back its body.
-fn served(case: &str, answered: Answered) -> String {
+pub(crate) fn served(case: &str, answered: Answered) -> String {
     assert_eq!(
         answered.status,
         200,
@@ -317,7 +323,7 @@ fn trigger_role_policy() -> Value {
 
 /// Which role the trigger tells the export to run under.
 #[derive(Clone, Copy)]
-enum Role {
+pub(crate) enum Role {
     /// The stack's export role, which trusts the export service principal.
     TheExportRole,
     /// The provider's own execution role, which this account HOLDS and which trusts
@@ -335,21 +341,22 @@ impl Role {
 }
 
 /// What the trigger's properties name, which is what the provider's call carries.
-struct Trigger {
+pub(crate) struct Trigger {
     /// The export task the provider starts, which is also the prefix it writes under.
-    task: String,
-    /// The snapshot it exports.
-    source: String,
+    pub(crate) task: String,
+    /// The source it exports, as `SourceArn` names one: a snapshot of either kind, a cluster,
+    /// or a value the owning service holds nothing under.
+    pub(crate) source: String,
     /// The destination bucket: the stack's own, or a name nothing holds.
-    bucket: Value,
-    role: Role,
+    pub(crate) bucket: Value,
+    pub(crate) role: Role,
 }
 
 /// The template one row deploys: the destination bucket, the key the export is encrypted
 /// under, the role the export runs under, the provider's execution role, the provider itself,
 /// and the `Custom::` resource it backs — plus the Outputs a client reads the deployment's
 /// answer off.
-fn template(trigger: &Trigger) -> String {
+pub(crate) fn template(trigger: &Trigger) -> String {
     json!({
         "AWSTemplateFormatVersion": "2010-09-09",
         "Resources": {
@@ -415,7 +422,7 @@ fn template(trigger: &Trigger) -> String {
 /// was read from — through this crate's own `CreateStack` (which carries the capability a
 /// template creating IAM resources is deployed with, and asserts the submission itself was
 /// accepted) and its own poll for a status that is no longer `*_IN_PROGRESS`.
-async fn deployed(
+pub(crate) async fn deployed(
     router: &MultiServiceRouter,
     case: &str,
     stack: &str,
@@ -428,7 +435,11 @@ async fn deployed(
 /// The source every row exports: a DB instance polled to `available`, snapshotted, and the
 /// snapshot polled to `available`. Its ARN — the one Amazon RDS minted for it — is what a
 /// trigger's `SourceArn` names.
-async fn available_snapshot(router: &MultiServiceRouter, instance: &str, snapshot: &str) -> String {
+pub(crate) async fn available_snapshot(
+    router: &MultiServiceRouter,
+    instance: &str,
+    snapshot: &str,
+) -> String {
     let case = "the source the export reads";
     let created = rds(
         router,
@@ -489,7 +500,7 @@ async fn available_snapshot(router: &MultiServiceRouter, instance: &str, snapsho
 /// The list's entries are each wrapped in the member name the model gives them
 /// (`ExportTasksList$member` carries `xmlName` `ExportTask`), so the members are read from the
 /// one block that carries them.
-async fn reported_export_task(
+pub(crate) async fn reported_export_task(
     router: &MultiServiceRouter,
     case: &str,
     task: &str,
