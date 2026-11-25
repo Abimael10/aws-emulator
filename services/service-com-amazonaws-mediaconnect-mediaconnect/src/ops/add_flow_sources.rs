@@ -371,6 +371,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let first_added = flow.sources.len();
         flow.sources.extend(added);
+        // The flow holds sources it did not hold before, so the state its source metadata
+        // is reported from changed now (`StoredFlow::source_metadata_changed_at`).
+        flow.record_source_metadata_change(now);
 
         // "The details of the newly added sources" — read back out of the STORED flow,
         // not from the request, and only the sources this call appended.

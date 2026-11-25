@@ -217,6 +217,7 @@ impl Emulator {
                     vpc_interfaces: Vec::new(),
                     tags: BTreeMap::new(),
                     created_at: SystemTime::now(),
+                    source_metadata_changed_at: SystemTime::now(),
                 },
             );
         }

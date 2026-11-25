@@ -679,6 +679,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         *stored = updated;
+        // The source's stored configuration changed, so the state the flow's source
+        // metadata is reported from changed now
+        // (`StoredFlow::source_metadata_changed_at`).
+        flow.record_source_metadata_change(now);
 
         // "The details of the sources that are assigned to the flow" — read back out of
         // the STORE, never echoed from the request, so the response is what DescribeFlow

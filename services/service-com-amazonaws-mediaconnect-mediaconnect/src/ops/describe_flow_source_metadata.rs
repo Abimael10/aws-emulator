@@ -26,8 +26,12 @@
 //! is EMPTY and the optional `TsId` ("the transport stream ID (TSID) of the source, from the
 //! Program Association Table") is absent: no Program Association Table has ever been read.
 //! A populated program would be fabricated. `Timestamp` ("the timestamp of the most recent
-//! change in metadata for this flow's source") is absent for the same reason: no metadata
-//! has ever been observed, so there is no instant at which it last changed.
+//! change in metadata for this flow's source") is the instant the state this report is
+//! computed from last changed, read off the stored flow
+//! ([`crate::state::StoredFlow::source_metadata_changed_at`]) — the flow entered its status
+//! or the clock settled it into one, or one of its sources was added, updated or removed —
+//! never the instant of the read, so two reads with no change between them report the same
+//! instant.
 //!
 //! What the operation CAN report is the status of that absence, which is what `Messages`
 //! is for ("provides a status code and message regarding issues found with the flow source
@@ -255,10 +259,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // ARN the STORED flow carries, which is the identity the label resolved to.
             flow_arn: Some(flow.flow_arn.clone()),
             messages: Some(source_metadata_messages(flow)),
-            // No source metadata has ever been observed for a flow of this emulator, so
-            // there is no "most recent change in metadata" to timestamp. See the module
-            // docs.
-            timestamp: None,
+            // "The timestamp of the most recent change in metadata for this flow's source":
+            // the instant the STORED state this report is computed from last changed, not
+            // the instant of this read. See the module docs.
+            timestamp: Some(::aws_smithy_types::DateTime::from(
+                flow.source_metadata_changed_at,
+            )),
             transport_media_info: Some(observed_transport_media_info()),
             ndi_info: ndi_source_metadata_info(flow),
         })

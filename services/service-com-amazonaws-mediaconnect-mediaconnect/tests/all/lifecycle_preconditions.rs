@@ -173,6 +173,7 @@ pub(crate) fn seed_flow(emulator: &Emulator, name: &str, status: &str) -> String
             vpc_interfaces: Vec::new(),
             tags: BTreeMap::new(),
             created_at: SystemTime::now(),
+            source_metadata_changed_at: SystemTime::now(),
         },
     );
     flow_arn

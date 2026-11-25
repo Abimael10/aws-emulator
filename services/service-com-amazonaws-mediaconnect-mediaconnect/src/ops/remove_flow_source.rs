@@ -241,6 +241,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let removed = flow.sources.remove(position);
+        // The flow no longer holds that source, so the state its source metadata is
+        // reported from changed now (`StoredFlow::source_metadata_changed_at`).
+        flow.record_source_metadata_change(now);
         let flow_arn = flow.flow_arn.clone();
         let removed_source_arn = removed.source_arn;
 

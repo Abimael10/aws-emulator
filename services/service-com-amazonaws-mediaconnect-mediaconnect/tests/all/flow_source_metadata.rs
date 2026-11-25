@@ -11,9 +11,12 @@
 //! `tests/all/flow_source_report_preconditions.rs`; the fixtures here are therefore started
 //! before they are read. Nothing in this emulator ingests media, so no transport stream has
 //! ever been observed: `transportMediaInfo` carries an EMPTY program list for every flow
-//! (the structure is the shape of the report, `Programs` being a required member),
-//! `timestamp` is absent, and the NDI block reports an empty discovery rather than an
-//! invented sender.
+//! (the structure is the shape of the report, `Programs` being a required member), and the
+//! NDI block reports an empty discovery rather than an invented sender. `timestamp` is the
+//! instant the STATE this report is computed from last changed — the flow's status moved, or
+//! one of its sources was added, updated or removed — read off the store rather than the
+//! clock at the read, so it is reported for every flow this read is served for, it does not
+//! move between two reads with no change between them, and it moves when that state does.
 //!
 //! Each rule is asserted over a TABLE whose rows differ along what it generalises over —
 //! how many sources the flow holds, what they are named, which protocol they use, whether
@@ -29,6 +32,9 @@ use serde_json::{json, Value};
 
 use crate::flow_lifecycle::{Emulator, REGION};
 use crate::flow_source_report_preconditions::METADATA_REFUSAL;
+use crate::flow_sources::{add_flow_sources, described_sources, remove_flow_source};
+use crate::router_outputs::{now_epoch_seconds, reported_timestamp};
+use crate::update_flow_source::update_flow_source;
 
 /// The `MessageDetail$Code` values this operation reports, written out here rather than
 /// read from the crate so that a change to the handler's constants cannot quietly move
@@ -312,8 +318,8 @@ fn report_cases() -> Vec<ReportCase> {
 
 /// DescribeFlowSourceMetadata reports the STORED flow: its ARN, one coded message per
 /// stored source naming that source, `ndiInfo` exactly for a flow NDI is associated with,
-/// and no transport media or metadata timestamp for any flow — because nothing has been
-/// ingested.
+/// a transport media info with no program for any flow — because nothing has been ingested —
+/// and the instant the state it reports from last changed.
 ///
 /// Every fixture is STARTED first: the report is gated on the flow running (see
 /// `tests/all/flow_source_report_preconditions.rs`), so a running flow is what this rule is
@@ -323,6 +329,9 @@ async fn source_metadata_reports_the_stored_flow_and_its_sources() {
     let emulator = Emulator::new();
 
     for ReportCase { case, flow, ndi } in report_cases() {
+        // Read before the flow exists, so the timestamp it reports can be placed between
+        // the instant the flow was created and now.
+        let before_create = now_epoch_seconds();
         let (flow_arn, source_names) = create(&emulator, case, flow).await;
         assert!(
             !source_names.is_empty(),
@@ -357,8 +366,10 @@ async fn source_metadata_reports_the_stored_flow_and_its_sources() {
         assert_messages_are_worded(case, &body["messages"]);
 
         // Nothing is ingested, so the transport-stream report is the modelled structure
-        // with NO program in it, and there is no instant at which the source's metadata
-        // last changed.
+        // with NO program in it. The metadata timestamp is reported all the same: it is the
+        // instant the state this report is computed from last changed, which for a flow
+        // just started is the moment the clock settled it into its running status — so it
+        // lies between the create and now, and is never the epoch.
         assert_eq!(
             body["transportMediaInfo"],
             json!({ "programs": [] }),
@@ -366,11 +377,12 @@ async fn source_metadata_reports_the_stored_flow_and_its_sources() {
              info with no program, got {}",
             body["transportMediaInfo"]
         );
+        let reported = reported_timestamp(case, "timestamp", &body["timestamp"]);
         assert!(
-            body["timestamp"].is_null(),
-            "case {case:?}: no metadata timestamp is reported for a flow with no source \
-             metadata, got {}",
-            body["timestamp"]
+            reported >= before_create && reported <= now_epoch_seconds(),
+            "case {case:?}: the metadata timestamp is the instant the reported state last \
+             changed, so it falls between the create ({before_create}) and now, got \
+             {reported}"
         );
 
         if ndi {
@@ -473,6 +485,198 @@ async fn source_metadata_is_a_report_that_changes_nothing() {
     );
 }
 
+/// One kind of change to the STATE DescribeFlowSourceMetadata computes its report from.
+///
+/// The rows of the table below span what the timestamp rule generalises over: the flow's
+/// own status — which the report is gated on and which its messages name — and each write
+/// that moves the sources the report lists: appending one, rewriting one's configuration,
+/// and taking one away.
+#[derive(Debug, Clone, Copy)]
+enum SourceStateChange {
+    /// AddFlowSources appends a source to the flow.
+    SourceAdded,
+    /// UpdateFlowSource rewrites a stored source's configuration.
+    SourceUpdated,
+    /// RemoveFlowSource takes a source off the flow.
+    SourceRemoved,
+    /// StopFlow and StartFlow move the flow's status, which the clock then settles.
+    StoppedAndStartedAgain,
+}
+
+/// The CreateFlow body a row works on.
+///
+/// The row that appends a source needs room for a second one and the row that takes one
+/// away needs two to begin with, so both ask for failover `ENABLED` — "if the state is
+/// active, the flow can have one or two sources"
+/// (`smithy_query(query="doc",shape="FailoverConfig",member="State")`).
+fn change_fixture(change: SourceStateChange) -> Value {
+    match change {
+        SourceStateChange::SourceAdded => json!({
+            "name": "metadata-timestamp-add",
+            "source": { "name": "feed-a", "protocol": "rtp", "whitelistCidr": "10.12.0.0/16" },
+            "sourceFailoverConfig": { "state": "ENABLED" }
+        }),
+        SourceStateChange::SourceUpdated => json!({
+            "name": "metadata-timestamp-update",
+            "source": {
+                "name": "feed-a",
+                "protocol": "srt-listener",
+                "whitelistCidr": "10.13.0.0/16"
+            }
+        }),
+        SourceStateChange::SourceRemoved => json!({
+            "name": "metadata-timestamp-remove",
+            "sources": [
+                { "name": "feed-a", "protocol": "rtp", "whitelistCidr": "10.14.0.0/16" },
+                { "name": "feed-b", "protocol": "rist", "whitelistCidr": "10.15.0.0/16" }
+            ],
+            "sourceFailoverConfig": { "state": "ENABLED" }
+        }),
+        SourceStateChange::StoppedAndStartedAgain => json!({
+            "name": "metadata-timestamp-restart",
+            "source": { "name": "feed-a", "protocol": "rtp", "whitelistCidr": "10.16.0.0/16" }
+        }),
+    }
+}
+
+/// The `SourceArn` of the flow's source at `position`, read out of DescribeFlow — the
+/// identity the source operations address, never one the test invents.
+async fn nth_source_arn(
+    emulator: &Emulator,
+    case: &str,
+    flow_arn: &str,
+    position: usize,
+) -> String {
+    let sources = described_sources(emulator, case, flow_arn).await;
+    let source = sources.get(position).unwrap_or_else(|| {
+        panic!("case {case:?}: the fixture flow must hold a source at {position}, got {sources:?}")
+    });
+    source["sourceArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: a stored source carries its ARN, got {source}"))
+        .to_string()
+}
+
+/// Apply `change` to the running fixture flow, asserting the write was accepted.
+async fn apply_change(
+    emulator: &Emulator,
+    case: &str,
+    change: SourceStateChange,
+    flow_arn: &str,
+) {
+    match change {
+        SourceStateChange::SourceAdded => {
+            let (status, code, body) = add_flow_sources(
+                emulator,
+                flow_arn,
+                json!([
+                    { "name": "feed-b", "protocol": "rtp", "whitelistCidr": "10.17.0.0/16" }
+                ]),
+            )
+            .await;
+            assert_eq!(
+                (status, code.as_deref()),
+                (201, None),
+                "case {case:?}: AddFlowSources must be accepted, got {status} {code:?}: {body}"
+            );
+        }
+        SourceStateChange::SourceUpdated => {
+            let source_arn = nth_source_arn(emulator, case, flow_arn, 0).await;
+            let (status, code, body) = update_flow_source(
+                emulator,
+                flow_arn,
+                &source_arn,
+                json!({ "description": "the primary feed, relabelled" }),
+            )
+            .await;
+            assert_eq!(
+                (status, code.as_deref()),
+                (202, None),
+                "case {case:?}: UpdateFlowSource must be accepted, got {status} {code:?}: \
+                 {body}"
+            );
+        }
+        SourceStateChange::SourceRemoved => {
+            let source_arn = nth_source_arn(emulator, case, flow_arn, 1).await;
+            let (status, code, body) = remove_flow_source(emulator, flow_arn, &source_arn).await;
+            assert_eq!(
+                (status, code.as_deref()),
+                (202, None),
+                "case {case:?}: RemoveFlowSource must be accepted, got {status} {code:?}: \
+                 {body}"
+            );
+        }
+        SourceStateChange::StoppedAndStartedAgain => {
+            let (status, code, body) = emulator
+                .send("POST", &format!("/v1/flows/stop/{flow_arn}"), None)
+                .await;
+            assert_eq!(
+                (status, code.as_deref()),
+                (202, None),
+                "case {case:?}: StopFlow expected 202, got {status} {code:?}: {body}"
+            );
+            // Wait for the CONDITION the next start needs — the flow back in STANDBY —
+            // rather than for a span of time.
+            settled_status(emulator, case, flow_arn, STATUS_STANDBY).await;
+            start_and_settle(emulator, case, flow_arn).await;
+        }
+    }
+}
+
+/// The served report's `timestamp`, in seconds since the epoch.
+async fn metadata_timestamp(emulator: &Emulator, case: &str, flow_arn: &str) -> f64 {
+    let (status, code, body) = source_metadata(emulator, flow_arn).await;
+    assert_eq!(
+        (status, code.as_deref()),
+        (200, None),
+        "case {case:?}: a running flow's source metadata must be served, got {status} \
+         {code:?}: {body}"
+    );
+    reported_timestamp(case, "timestamp", &body["timestamp"])
+}
+
+/// `Timestamp` is "the timestamp of the most recent change in metadata for this flow's
+/// source": it is the instant the STATE the report is computed from last changed, so a read
+/// that changes nothing reports the same instant twice, and every change to that state —
+/// the flow's status, or the sources it holds — moves it forward.
+#[tokio::test]
+async fn the_metadata_timestamp_moves_with_the_state_it_reports_from() {
+    let emulator = Emulator::new();
+
+    for (case, change) in [
+        ("a source appended to the flow", SourceStateChange::SourceAdded),
+        (
+            "a source's configuration rewritten",
+            SourceStateChange::SourceUpdated,
+        ),
+        ("a source taken off the flow", SourceStateChange::SourceRemoved),
+        (
+            "the flow stopped and started again",
+            SourceStateChange::StoppedAndStartedAgain,
+        ),
+    ] {
+        let (flow_arn, _) = create(&emulator, case, change_fixture(change)).await;
+        start_and_settle(&emulator, case, &flow_arn).await;
+
+        let before = metadata_timestamp(&emulator, case, &flow_arn).await;
+        let again = metadata_timestamp(&emulator, case, &flow_arn).await;
+        assert_eq!(
+            before, again,
+            "case {case:?}: a read reports the instant the state last changed, it does not \
+             move it, got {before} then {again}"
+        );
+
+        apply_change(&emulator, case, change, &flow_arn).await;
+
+        let after = metadata_timestamp(&emulator, case, &flow_arn).await;
+        assert!(
+            after > before,
+            "case {case:?}: the change moves the metadata timestamp forward, got {after} \
+             where it was {before}"
+        );
+    }
+}
+
 /// The read is served EXACTLY while the flow is running: refused as created, refused for
 /// every instant of the start that has not settled yet, served once the flow is `ACTIVE`,
 /// and refused again once the stop has taken it out of `ACTIVE` — each time with the status
@@ -536,11 +740,13 @@ async fn the_read_is_served_exactly_while_the_flow_is_running() {
         served["messages"][0]["message"]
     );
     // Never any media: a running flow of this emulator receives nothing either, so its
-    // transport-stream report carries no program and no metadata timestamp.
+    // transport-stream report carries no program — and the metadata timestamp is still
+    // reported, because the clock settling the flow into its running status is itself a
+    // change to the state this report is computed from.
     assert!(
         served["transportMediaInfo"] == json!({ "programs": [] })
-            && served["timestamp"].is_null(),
-        "case {case:?}: a transport media info with no program and no metadata timestamp, \
+            && served["timestamp"].as_f64().is_some_and(|at| at > 0.0),
+        "case {case:?}: a transport media info with no program and a metadata timestamp, \
          got {served}"
     );
 

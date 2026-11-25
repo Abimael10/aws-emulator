@@ -14,11 +14,10 @@
 //! arrived on the input and been demultiplexed, and this emulator ingests no media: nothing
 //! listens on a router input's ingest address and no flow output or MediaLive channel output
 //! feeds one, so no program, PID, codec or resolution has ever been observed for any input.
-//! The optional union is therefore ABSENT rather than carrying a synthesised stream —
-//! `TransportMediaInfo$Programs` is required, so an empty list would itself claim "a
-//! transport stream with no programs", and a populated one would be fabricated. This is the
-//! same reading of the same shape as the flow-side
-//! [`crate::ops::describe_flow_source_metadata`].
+//! The optional union is therefore ABSENT: `RouterInputMetadata` declares exactly one
+//! variant, a transport stream, so any value of it would claim a transport stream was seen —
+//! unlike the flow-side [`crate::ops::describe_flow_source_metadata`], whose member is a
+//! STRUCTURE with a required program list and so has an empty-program form to report.
 //!
 //! What the operation CAN report is the status of that absence, which is what
 //! `SourceMetadataDetails$SourceMetadataMessages` is for: one coded entry per condition that

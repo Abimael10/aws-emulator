@@ -1087,9 +1087,36 @@ pub struct StoredFlow {
     /// [`StoredFlow::tags`] this is recorded now for the operations that will report it
     /// (the maintenance / reservation slices) rather than read in this one.
     pub created_at: SystemTime,
+    /// The instant the state this flow's SOURCE metadata is reported from last changed —
+    /// what DescribeFlowSourceMetadata answers as `Timestamp` ("the timestamp of the most
+    /// recent change in metadata for this flow's source").
+    ///
+    /// The report is computed from the flow's own status and from the sources it holds, so
+    /// this moves exactly when one of those changes: the flow enters a status
+    /// ([`StoredFlow::begin_transition`]) or the clock settles it into one
+    /// ([`StoredFlow::settle`]), and a source is added to, updated on or removed from the
+    /// flow ([`StoredFlow::record_source_metadata_change`], the one door those writes go
+    /// through). It starts at the instant the flow was created, because that is when the
+    /// flow's first sources were stored. It is NEVER the instant of a read: two reads with
+    /// no change between them report the same timestamp.
+    pub source_metadata_changed_at: SystemTime,
 }
 
 impl StoredFlow {
+    /// Record that the state this flow's source metadata is reported from changed at `at`.
+    ///
+    /// The one door every write that changes the flow's SOURCES (AddFlowSources,
+    /// UpdateFlowSource, RemoveFlowSource) records that change through, so what
+    /// DescribeFlowSourceMetadata reports as the instant the source's metadata last changed
+    /// cannot disagree with the store. A change is never recorded BACKWARDS: a write
+    /// materialised after a status the clock had already made due leaves the later instant
+    /// standing, so the reported timestamp never moves back.
+    pub fn record_source_metadata_change(&mut self, at: SystemTime) {
+        if at > self.source_metadata_changed_at {
+            self.source_metadata_changed_at = at;
+        }
+    }
+
     /// Materialise the status change the clock already made due, if it is due at `now`, and
     /// answer the MOVE it made — `None` when nothing was due.
     ///
@@ -1105,6 +1132,10 @@ impl StoredFlow {
             return None;
         }
         let previous_status = ::std::mem::replace(&mut self.status, pending.status);
+        // The flow's status is part of what its source metadata report is computed from, so
+        // the move the clock just materialised changed that metadata — at the instant it was
+        // DUE, not at the instant some later call materialised it.
+        self.record_source_metadata_change(pending.due_at);
         Some(FlowStatusChange::new(
             &self.flow_arn,
             &previous_status,
@@ -1122,6 +1153,9 @@ impl StoredFlow {
             status: settled.to_string(),
             due_at: now + TRANSITION_SPAN,
         });
+        // Entering the transient status is itself a change to the state the flow's source
+        // metadata is reported from (see [`StoredFlow::source_metadata_changed_at`]).
+        self.record_source_metadata_change(now);
     }
 
     /// The names of the outputs the flow already holds — what

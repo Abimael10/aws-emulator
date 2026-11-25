@@ -788,6 +788,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
             created_at: now,
+            // The flow's source metadata is reported from its status and the sources it
+            // holds, and both are being stored at this instant.
+            source_metadata_changed_at: now,
         };
 
         store.flows.insert(flow_arn.clone(), stored);
