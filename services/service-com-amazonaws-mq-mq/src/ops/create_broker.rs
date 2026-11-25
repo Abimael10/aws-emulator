@@ -352,10 +352,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = state::request_region(ctx.parts());
-        // The `host[:port]` this emulator was reached at, whose ZONE the broker's own
-        // published host is minted in, so a name this broker hands a client leads back to
-        // this process: the endpoint the request addressed, or the one this emulator is
-        // served at for a caller that addressed a host naming some service.
+        // The `host[:port]` this emulator was reached at, which is the host a broker with no
+        // socket of its own publishes its console and endpoints under, so what it hands a
+        // client leads back to this process: the endpoint the request addressed, or the one
+        // this emulator is served at for a caller that addressed a host naming some service.
         let reached_authority =
             ::service_common::data_plane_addressing::reached_emulator_endpoint_of_parts(
                 ctx.parts(),
@@ -674,27 +674,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // starts as the REPLICA of the primary its create named, which
             // `Broker::data_replication_role` derives, and only a promotion records one.
             data_replication_role: None,
-            // The host this broker publishes its console and endpoints under, carrying
-            // its own id and Region: it is composed here, from the id the store just
-            // minted, so every read of the broker publishes the one host.
-            published_host: state::published_broker_host(
-                &reached_authority,
-                &broker_id,
-                &region,
-            ),
-            // Filled in by the socket this create opens for the broker below, once the
-            // core has told the service which address it answers on.
+            // The host this broker publishes an address under for a protocol this
+            // emulator opens no socket of its own for: the host this emulator was reached
+            // at, read here so every read of the broker publishes the one host.
+            published_host: state::published_broker_host(&reached_authority),
+            // Filled in by the sockets this create opens for the broker below — its wire
+            // and its web console — once the core has told the service which addresses
+            // they answer on.
             served_endpoint: None,
+            console_endpoint: None,
         };
         store.brokers.insert(broker_id.clone(), broker);
         (broker_id, broker_arn)
         };
-        // A broker's wire endpoint is the address of a socket this emulator answers that
-        // protocol on — AMQP 0-9-1 for a RabbitMQ broker, STOMP for an ActiveMQ one — so
-        // that socket is opened here and its address written onto the record
-        // (`state::serve_broker`). The answer above publishes no endpoint — a broker still
-        // being provisioned has no instance to report one for — so the address is
-        // published before any reader can see one.
+        // A broker's wire endpoint and its console URL are addresses this emulator answers
+        // on — AMQP 0-9-1 for a RabbitMQ broker's wire, STOMP for an ActiveMQ one, HTTP for
+        // either engine's web console — so those sockets are opened here and their
+        // addresses written onto the record (`state::serve_broker`). The answer above
+        // publishes no address — a broker still being provisioned has no instance to report
+        // one for — so they are published before any reader can see one.
         state::serve_broker(&*self.engine, &state, &broker_id).await;
 
         Ok(CreateBrokerOutput {

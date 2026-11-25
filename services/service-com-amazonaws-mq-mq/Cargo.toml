@@ -32,6 +32,9 @@ quick-xml = "0.41"
 # `default-features = false` leaves out its client-side TCP/TLS connector, which the
 # core owns here.
 amq-protocol = { version = "10.7", default-features = false }
+# Escapes the stored values a broker's web console page renders, so no name a caller
+# chose can open or close an element of that document.
+html-escape = "0.2"
 # `service-common` carries the ONE reading of the address a client reaches this
 # emulator at, which a broker's published endpoints name, and of the framing an
 # answer that carries no content states (`service_common::no_content_responses`),

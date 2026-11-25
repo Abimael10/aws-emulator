@@ -26,8 +26,12 @@
 //!
 //! An ActiveMQ broker's OTHER published protocols (OpenWire, AMQP 1.0, MQTT and the
 //! WebSocket transport) are not answered here, so such a broker keeps publishing the ports
-//! Amazon MQ publishes for them under its own host rather than an address that would
-//! answer the wrong protocol.
+//! Amazon MQ publishes for them under the host this emulator answers on rather than an
+//! address that would answer the wrong protocol.
+//!
+//! The broker's WEB CONSOLE is a socket of its own, opened here beside the wire and served
+//! by [`super::broker_console`]: `consoleURL` is an address an operator opens, so it is the
+//! address of a socket this emulator answers an HTTP request at.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -42,6 +46,22 @@ use super::*;
 pub struct ServedAddress {
     pub host: String,
     pub port: u16,
+}
+
+/// The address the CORE says `listener` is dialable at, read through the one shared reading
+/// of it: a wildcard bind has no single address to dial and is published as loopback, and an
+/// IPv6 bind keeps its brackets.
+///
+/// Every socket this service opens for a broker — its wire and its web console
+/// ([`super::broker_console`]) — publishes its address through this one reading, so the two
+/// cannot drift on what a client is told to dial.
+pub fn served_address_of(listener: &::emulator_server::ResourceListener) -> ServedAddress {
+    let authority = ::service_common::data_plane_addressing::listener_authority(listener);
+    let host = ::service_common::data_plane_addressing::host_only(&authority).to_string();
+    let port = ::service_common::data_plane_addressing::addressed_port(Some(&authority))
+        .and_then(|port| u16::try_from(port).ok())
+        .unwrap_or_else(|| listener.port());
+    ServedAddress { host, port }
 }
 
 /// One broker's destinations and queues, shared between the store's record and every
@@ -130,14 +150,15 @@ pub fn served_wire(engine_type: &str) -> Option<ServedWire> {
     }
 }
 
-/// Open the socket a broker is served on and publish its address on the broker's record,
-/// so the endpoint its `BrokerInstance` reports for the protocol that socket speaks is one
-/// a client can reach.
+/// Open the sockets a broker is served on — its web console, and the wire its engine's
+/// clients speak — and publish their addresses on the broker's record, so the console URL
+/// and the endpoint its `BrokerInstance` reports for that wire are addresses a client can
+/// reach.
 ///
 /// Called by the create once the record is stored. Does nothing for a broker that already
-/// has a socket, for a broker whose engine this emulator serves no wire for, or on an
-/// engine that vends no listeners — in which case the broker publishes the port Amazon MQ
-/// publishes for its protocol on the host this emulator answered the create on.
+/// has its sockets or on an engine that vends no listeners — in which case the broker
+/// publishes the ports Amazon MQ publishes for its console and its protocols on the host
+/// this emulator answered the create on.
 pub async fn serve_broker<Eng: Send + Sync + 'static>(
     engine: &Eng,
     state: &::engine::ServiceState<ComAmazonawsMqMqState>,
@@ -148,25 +169,55 @@ pub async fn serve_broker<Eng: Send + Sync + 'static>(
         let Some(broker) = store.brokers.get(broker_id) else {
             return;
         };
-        let Some(wire) = served_wire(&broker.engine_type) else {
-            return;
-        };
-        if store.broker_data_planes.contains_key(broker_id) {
+        if store.broker_data_planes.contains_key(broker_id)
+            || store.broker_consoles.contains_key(broker_id)
+        {
             return;
         }
-        wire
+        served_wire(&broker.engine_type)
     };
     let Some(shared) = (engine as &dyn ::std::any::Any).downcast_ref::<::engine::InMemoryEngine>()
     else {
         ::tracing::warn!(
             broker_id,
-            "this engine vends no listeners, so the broker publishes the port Amazon MQ \
-             publishes for its protocol rather than a socket of this emulator's own"
+            "this engine vends no listeners, so the broker publishes the ports Amazon MQ \
+             publishes for its console and its protocols rather than sockets of this \
+             emulator's own"
         );
         return;
     };
     let listeners = shared.listeners();
     let message_broker = SharedMessageBroker::default();
+
+    // The console first: it is served for every broker, whichever wire its engine speaks.
+    match super::broker_console::open_broker_console(&listeners, state, broker_id).await {
+        Some(console) => {
+            let mut store = state.lock();
+            // A broker DELETED while the port was being bound is a broker whose console
+            // nothing will ever close again, so the handle is not stored at all: dropping
+            // it as this arm ends closes the port.
+            let published = match store.brokers.get_mut(broker_id) {
+                Some(record) => {
+                    record.console_endpoint = Some(console.endpoint().clone());
+                    true
+                }
+                None => false,
+            };
+            if published {
+                store.broker_consoles.insert(broker_id.to_string(), console);
+            }
+        }
+        None => ::tracing::warn!(
+            broker_id,
+            "no socket could be opened for this broker's web console, so it publishes the \
+             port Amazon MQ publishes that console on rather than a socket of this \
+             emulator's own"
+        ),
+    }
+
+    let Some(wire) = wire else {
+        return;
+    };
     let socket = BrokerSocket {
         state: state.clone(),
         broker_id: broker_id.to_string(),
@@ -197,18 +248,19 @@ pub async fn serve_broker<Eng: Send + Sync + 'static>(
         );
         return;
     };
-    // The address the CORE says the listener is dialable at, read through the one shared
-    // reading of it: a wildcard bind has no single address to dial and is published as
-    // loopback, and an IPv6 bind keeps its brackets.
-    let authority = ::service_common::data_plane_addressing::listener_authority(&listener);
-    let host = ::service_common::data_plane_addressing::host_only(&authority).to_string();
-    let port = ::service_common::data_plane_addressing::addressed_port(Some(&authority))
-        .and_then(|port| u16::try_from(port).ok())
-        .unwrap_or_else(|| listener.port());
-    let endpoint = ServedAddress { host, port };
+    let endpoint = served_address_of(&listener);
     let mut store = state.lock();
-    if let Some(record) = store.brokers.get_mut(broker_id) {
-        record.served_endpoint = Some(endpoint.clone());
+    // As for the console above: a broker deleted while the port was being bound takes no
+    // handle, so no socket outlives the record it belongs to.
+    let published = match store.brokers.get_mut(broker_id) {
+        Some(record) => {
+            record.served_endpoint = Some(endpoint.clone());
+            true
+        }
+        None => false,
+    };
+    if !published {
+        return;
     }
     store.broker_data_planes.insert(
         broker_id.to_string(),

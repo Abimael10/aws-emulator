@@ -31,6 +31,8 @@ mod activemq_plane;
 mod amqp_probe;
 /// Which configuration revision a broker runs, and where it comes from.
 mod broker_configuration;
+/// The socket a broker's web console is served on, and the page it answers with.
+mod broker_console;
 /// The socket a broker's clients connect to, and the address published for it.
 mod broker_data_plane;
 /// Whether a broker takes part in cross-Region data replication, and in which role.
@@ -50,6 +52,7 @@ mod rabbitmq_plane;
 
 pub use activemq_plane::*;
 pub use broker_configuration::*;
+pub use broker_console::*;
 pub use broker_data_plane::*;
 pub use broker_data_replication::*;
 pub use broker_endpoints::*;
@@ -384,17 +387,21 @@ pub struct Broker {
     /// broker of a replication pair holds before any promotion is derived from the pair
     /// itself ([`Broker::data_replication_role`]).
     pub data_replication_role: Option<String>,
-    /// The host THIS broker's console and endpoints are published under
-    /// ([`published_broker_host`]), which carries the broker's own id and Region so a
-    /// published address identifies the broker ([`Broker::allocated_instances`]).
-    /// Composed at create time so every read of the broker publishes the one host,
-    /// whichever host a later caller reached the emulator on.
+    /// The host THIS broker's console and endpoints are published under for a protocol
+    /// this emulator opened no socket of its own for ([`published_broker_host`]): the host
+    /// this emulator was reached at, read at create time so every read of the broker
+    /// publishes the one host whichever host a later caller reached the emulator on.
     pub published_host: String,
     /// The address of the socket this emulator OPENED for the broker, when its engine is
     /// one this emulator serves a wire for ([`serve_broker`]). It is what the broker's
     /// endpoint for that wire publishes, so what a client dials is where the broker really
     /// answers; `None` for a broker this emulator opened no socket for.
     pub served_endpoint: Option<ServedAddress>,
+    /// The address of the socket this emulator opened for the broker's WEB CONSOLE
+    /// ([`serve_broker`]), which is what `consoleURL` publishes; `None` for a broker whose
+    /// console socket could not be opened, which publishes the port Amazon MQ publishes
+    /// its engine's console on instead.
+    pub console_endpoint: Option<ServedAddress>,
 }
 
 impl Broker {
@@ -670,6 +677,11 @@ pub struct ComAmazonawsMqMqState {
     /// an entry closes that broker's port, so a broker's entry lives exactly as long as
     /// the broker does.
     pub broker_data_planes: BTreeMap<String, BrokerDataPlane>,
+    /// The web console of every broker this emulator opened a console socket for, keyed by
+    /// `BrokerId`: the socket's handle and the address it answers at. Dropping an entry
+    /// closes that broker's console port, so a broker's entry lives exactly as long as the
+    /// broker does.
+    pub broker_consoles: BTreeMap<String, BrokerConsole>,
 }
 
 impl ComAmazonawsMqMqState {

@@ -241,6 +241,7 @@ mod tests {
             data_replication_role: None,
             published_host: "127.0.0.1".to_string(),
             served_endpoint: None,
+            console_endpoint: None,
         }
     }
 }

@@ -419,16 +419,14 @@ const ACTIVEMQ_PROTOCOL_ORDER: &[(&str, u16, bool)] = &[
     ("wss", 61_619, false),
 ];
 
-/// What one engine's brokers publish: the engine, its wire protocols as
-/// `(scheme, port, served)` IN THE ORDER Amazon MQ publishes them, and the port its web
-/// console is published on.
+/// What one engine's brokers publish: the engine, and its wire protocols as
+/// `(scheme, port, served)` IN THE ORDER Amazon MQ publishes them.
 struct PublishedAddresses {
     engine_type: &'static str,
     protocols: &'static [(&'static str, u16, bool)],
-    console_port: u16,
 }
 
-/// The wire protocols and console port of each engine the model declares.
+/// The wire protocols of each engine the model declares.
 ///
 /// Source: the protocols and ports Amazon MQ publishes per engine (the Developer
 /// Guide's broker endpoint tables), IN THE ORDER it publishes them — an ActiveMQ broker's
@@ -438,18 +436,16 @@ const PUBLISHED_PROTOCOLS: &[PublishedAddresses] = &[
     PublishedAddresses {
         engine_type: ENGINE_TYPE_ACTIVEMQ,
         protocols: ACTIVEMQ_PROTOCOL_ORDER,
-        console_port: 8_162,
     },
     PublishedAddresses {
         engine_type: ENGINE_TYPE_RABBITMQ,
         protocols: &[("amqps", 5_671, true)],
-        console_port: 443,
     },
 ];
 
 /// RULE 5: a broker that is RUNNING publishes the instance allocated to it — its
-/// console URL and one endpoint per wire protocol its engine serves, all naming the one
-/// address the broker is published at — and a broker still being provisioned publishes
+/// console URL and one endpoint per wire protocol its engine serves, every one of them
+/// naming a host this emulator answers on — and a broker still being provisioned publishes
 /// none.
 #[tokio::test]
 async fn a_running_broker_publishes_its_console_and_one_endpoint_per_protocol() {
@@ -457,7 +453,6 @@ async fn a_running_broker_publishes_its_console_and_one_endpoint_per_protocol() 
 
     for (index, row) in PUBLISHED_PROTOCOLS.iter().enumerate() {
         let case = row.engine_type;
-        let console_port = row.console_port;
         let mut body = create_body(&format!("published-{index}"));
         body["engineType"] = json!(row.engine_type);
         let (status, created) = mq.create_broker(body).await;
@@ -497,21 +492,34 @@ async fn a_running_broker_publishes_its_console_and_one_endpoint_per_protocol() 
         let console_url = string_at(instance, "/consoleURL");
         let expected_console_prefix = "https://";
         assert!(
-            console_url.starts_with(expected_console_prefix)
-                && console_url.ends_with(&format!(":{console_port}")),
-            "case {case:?}: expected an https console URL on port {console_port}, got \
-             {console_url:?}"
+            console_url.starts_with(expected_console_prefix),
+            "case {case:?}: expected an https console URL, got {console_url:?}"
         );
-        // The host every address of this instance names: the one the console names, so
-        // the console and the endpoints agree on where the broker is.
-        let host = console_url
+        // The console is served on a socket of this emulator's own, so the URL names the
+        // address the core bound it at: this machine's loopback interface by default. The
+        // suite that OPENS the console on it is `broker_console_is_served`.
+        let console_authority = console_url
             .trim_start_matches(expected_console_prefix)
-            .trim_end_matches(&format!(":{console_port}"))
             .to_string();
-        assert!(
-            !host.is_empty(),
-            "case {case:?}: the console URL must name a host, got {console_url:?}"
+        let console_host = authority_host(case, &console_authority);
+        assert_eq!(
+            console_host, "127.0.0.1",
+            "case {case:?}: expected the console URL to name this machine's loopback address, \
+             got {console_url:?}"
         );
+        let console_port = console_authority
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            .unwrap_or_default();
+        let dialled = tokio::net::TcpStream::connect(("127.0.0.1", console_port)).await;
+        assert!(
+            dialled.is_ok(),
+            "case {case:?}: the console URL a running broker publishes must be an address it \
+             answers on, but {console_url:?} accepted no connection: {dialled:?}"
+        );
+        // The host every address of this instance names: the one the console names, so the
+        // console and the endpoints agree on where the broker is.
+        let host = console_host.clone();
 
         let endpoints = strings_at(instance, "/endpoints");
         assert_eq!(
@@ -563,9 +571,10 @@ async fn a_running_broker_publishes_its_console_and_one_endpoint_per_protocol() 
         }
 
         // `BrokerInstance$ipAddress` "Does not apply to RabbitMQ brokers"; where it
-        // does apply it is the address of the interface attached to THIS broker — an
-        // address of the broker's own, not of the host the control plane answered on —
-        // which `a_brokers_published_addresses_identify_that_broker` pins in full.
+        // does apply it is the address of the interface this emulator serves the broker
+        // on — the one its own sockets are bound on, which is the host every address of
+        // this instance names — and `a_brokers_published_addresses_are_served_by_it` pins
+        // that in full.
         let ip_address = instance.pointer("/ipAddress").and_then(Value::as_str);
         let applies = row.engine_type != ENGINE_TYPE_RABBITMQ;
         assert_eq!(
@@ -575,29 +584,20 @@ async fn a_running_broker_publishes_its_console_and_one_endpoint_per_protocol() 
              ({applies}), got {instance:?}"
         );
         if let Some(reported) = ip_address {
-            let address: std::net::Ipv4Addr = reported.parse().unwrap_or_else(|_| {
-                panic!("case {case:?}: expected an IPv4 address, got {reported:?}")
+            let address: std::net::IpAddr = reported.parse().unwrap_or_else(|_| {
+                panic!("case {case:?}: expected an IP address, got {reported:?}")
             });
             assert!(
-                address.is_private() && !address.is_loopback(),
-                "case {case:?}: expected the broker's own private interface address, got \
-                 {reported:?}"
+                !address.is_unspecified(),
+                "case {case:?}: expected the address of one interface, got {reported:?}"
             );
-            assert_ne!(
+            assert_eq!(
                 reported, host,
-                "case {case:?}: the interface address must be the broker's own rather than \
-                 the host it is published under, got {reported:?}"
+                "case {case:?}: the reported address must be the interface the broker is \
+                 served on, which is the host its addresses name, got {reported:?}"
             );
         }
     }
-}
-
-/// The host form Amazon MQ publishes a broker's addresses under, up to the zone the name
-/// lives in: the broker's own id, the ordinal of its first instance, the label naming
-/// Amazon MQ and the Region the broker was created in
-/// (`b-<id>-1.mq.<region>.<zone>`, the host the recorded broker answer's endpoints carry).
-fn broker_host_prefix(broker_id: &str, region: &str) -> String {
-    format!("{broker_id}-1.mq.{region}.")
 }
 
 /// The host of `authority`, which is everything ahead of the `:port` it ends in.
@@ -610,18 +610,18 @@ fn authority_host(case: &str, authority: &str) -> String {
     host.to_string()
 }
 
-/// RULE 11: every address a RUNNING broker publishes identifies THAT broker — its console
-/// URL and every endpoint this emulator opened no socket for name a host carrying the
-/// broker's own id and Region, so no two brokers of one account share an authority and both
-/// are recoverable from the address — and the `ipAddress` of a broker whose engine reports
-/// one is a private address of that broker's own interface, never the loopback address and
-/// never another broker's.
+/// RULE 11: every address a RUNNING broker publishes is an address THIS EMULATOR answers
+/// on — the console URL and every endpoint name the host its own sockets are bound on,
+/// which is an address of this machine and never a name composed from the broker's id and a
+/// DNS zone — the SOCKETS this emulator opened for a broker are that broker's own, so no two
+/// brokers publish the same console URL or the same served endpoint, and the `ipAddress` of
+/// a broker whose engine reports one is the address of that interface.
 #[tokio::test]
-async fn a_brokers_published_addresses_identify_that_broker() {
+async fn a_brokers_published_addresses_are_served_by_it() {
     // The rows span what the rule generalises over: the engine, which decides the protocol
-    // set, the console port and whether this emulator opens a socket of the broker's own,
-    // and the Region the create is signed for, which the published host carries. Each row
-    // creates TWO brokers, so what one publishes can be told from what the other does.
+    // set and whether this emulator opens a socket for a broker's wire, and the Region the
+    // create is signed for, which no published address depends on. Each row creates TWO
+    // brokers, so what one publishes can be told from what the other does.
     let rows: &[(&str, &str)] = &[
         ("us-west-2", ENGINE_TYPE_ACTIVEMQ),
         ("eu-central-1", ENGINE_TYPE_ACTIVEMQ),
@@ -658,30 +658,29 @@ async fn a_brokers_published_addresses_identify_that_broker() {
                 .and_then(Value::as_str)
                 .map(str::to_string);
 
-            // The console URL names the broker's own host, and the broker's id and Region
-            // are both recoverable from it.
-            let prefix = broker_host_prefix(&broker_id, region);
-            let console_authority = console_url
-                .strip_prefix("https://")
-                .unwrap_or_else(|| panic!("case {case:?}: expected an https console URL, got {console_url:?}"));
+            // The console URL names an address of THIS MACHINE, which is what an operator
+            // opening it reaches, and it answers there.
+            let console_authority = console_url.strip_prefix("https://").unwrap_or_else(|| {
+                panic!("case {case:?}: expected an https console URL, got {console_url:?}")
+            });
             let console_host = authority_host(&case, console_authority);
+            let address: std::net::IpAddr = console_host.parse().unwrap_or_else(|_| {
+                panic!(
+                    "case {case:?}: expected the console URL to name an address this emulator \
+                     answers on, got {console_url:?}"
+                )
+            });
             assert!(
-                console_host.starts_with(&prefix),
-                "case {case:?}: expected the console URL to name the host {prefix:?}<zone>, \
+                address.is_loopback(),
+                "case {case:?}: expected the console URL to name this machine's own interface, \
                  got {console_url:?}"
             );
-            let zone = &console_host[prefix.len()..];
             assert!(
-                !zone.is_empty() && !zone.starts_with('.') && !zone.ends_with('.'),
-                "case {case:?}: expected the broker's host to name a zone, got {console_url:?}"
+                !console_host.contains(&broker_id) && !console_host.contains("amazonaws"),
+                "case {case:?}: a published address must not be a name composed from the \
+                 broker's id and a DNS zone, got {console_url:?}"
             );
-            let first_label = console_host.split('.').next().unwrap_or_default();
-            assert_eq!(
-                first_label.strip_suffix("-1"),
-                Some(broker_id.as_str()),
-                "case {case:?}: expected the broker's id to be recoverable from \
-                 {console_url:?}"
-            );
+            dial(&case, &console_url).await;
 
             assert!(
                 !endpoints.is_empty(),
@@ -693,37 +692,20 @@ async fn a_brokers_published_addresses_identify_that_broker() {
                     .split_once("://")
                     .unwrap_or_else(|| panic!("case {case:?}: expected a URI, got {endpoint:?}"));
                 let host = authority_host(&case, authority);
-                if host == console_host {
-                    continue;
-                }
-                // An endpoint that does NOT name the broker's own host is one this
-                // emulator opened a socket of its own for, and the whole reason it names
-                // that socket instead is that a client dials it — so it is dialled here.
-                // The core binds its listeners on this machine's own interface, which is
-                // loopback unless the operator names another address, so that is the
-                // address such an endpoint carries and the one dialled below.
+                // Every endpoint names the one host the broker's sockets are bound on,
+                // which is the host the console names too: the console and the endpoints
+                // agree on where the broker is.
                 assert_eq!(
-                    host, "127.0.0.1",
-                    "case {case:?}: expected an endpoint of a socket of this emulator's own \
-                     to name this machine's loopback address, got {endpoint:?}"
-                );
-                let port = authority
-                    .rsplit_once(':')
-                    .and_then(|(_, port)| port.parse::<u16>().ok())
-                    .unwrap_or_default();
-                let dialled = tokio::net::TcpStream::connect(("127.0.0.1", port)).await;
-                assert!(
-                    dialled.is_ok(),
-                    "case {case:?}: an endpoint that does not name the broker's host must \
-                     be an address it answers on, but {endpoint:?} accepted no connection: \
-                     {dialled:?}"
+                    host, console_host,
+                    "case {case:?}: expected every published address to name the host this \
+                     emulator serves the broker on ({console_host:?}), got {endpoint:?}"
                 );
             }
 
             // `BrokerInstance$ipAddress` is "The IP address of the Elastic Network
             // Interface (ENI) attached to the broker. Does not apply to RabbitMQ brokers":
-            // where it applies it is a private address of the broker's own interface, and
-            // never the loopback address, which belongs to no broker.
+            // where it applies it is the address of the interface this emulator serves the
+            // broker on, which is the host its published addresses name.
             if *engine_type == ENGINE_TYPE_RABBITMQ {
                 assert_eq!(
                     ip_address, None,
@@ -734,13 +716,10 @@ async fn a_brokers_published_addresses_identify_that_broker() {
                 let reported = ip_address.clone().unwrap_or_else(|| {
                     panic!("case {case:?}: expected an ipAddress, got {instance:?}")
                 });
-                let address: std::net::Ipv4Addr = reported.parse().unwrap_or_else(|_| {
-                    panic!("case {case:?}: expected an IPv4 address, got {reported:?}")
-                });
-                assert!(
-                    address.is_private() && !address.is_loopback(),
-                    "case {case:?}: expected a private interface address rather than the \
-                     loopback address, got {reported:?}"
+                assert_eq!(
+                    reported, console_host,
+                    "case {case:?}: expected the address of the interface the broker is served \
+                     on, got {reported:?}"
                 );
             }
 
@@ -757,8 +736,8 @@ async fn a_brokers_published_addresses_identify_that_broker() {
             published.push((broker_id, console_url, endpoints, ip_address));
         }
 
-        // Two brokers of one account never advertise the same authority, so endpoint-keyed
-        // client state can tell them apart.
+        // One socket serves one broker, so no two brokers of one account publish the same
+        // console URL, nor the same endpoint for a wire this emulator answers.
         let (first, second) = (&published[0], &published[1]);
         let case = format!("{region}/{engine_type}/two brokers");
         assert_ne!(
@@ -766,24 +745,60 @@ async fn a_brokers_published_addresses_identify_that_broker() {
             "case {case:?}: two brokers must not share a console URL, got {:?}",
             first.1
         );
-        for endpoint in &first.2 {
-            assert!(
-                !second.2.contains(endpoint),
-                "case {case:?}: two brokers must not share the endpoint {endpoint:?}, got \
-                 {:?} and {:?}",
-                first.2,
-                second.2
-            );
-        }
-        if *engine_type != ENGINE_TYPE_RABBITMQ {
+        let served_schemes: Vec<&str> = PUBLISHED_PROTOCOLS
+            .iter()
+            .find(|row| row.engine_type == *engine_type)
+            .map(|row| {
+                row.protocols
+                    .iter()
+                    .filter(|(_scheme, _port, served)| *served)
+                    .map(|(scheme, _port, _served)| *scheme)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for scheme in served_schemes {
+            let prefix = format!("{scheme}://");
+            let endpoint_of = |published: &Vec<String>| {
+                published
+                    .iter()
+                    .find(|endpoint| endpoint.starts_with(&prefix))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        panic!("case {case:?}: expected a {scheme:?} endpoint, got {published:?}")
+                    })
+            };
+            let (mine, theirs) = (endpoint_of(&first.2), endpoint_of(&second.2));
             assert_ne!(
-                first.3, second.3,
-                "case {case:?}: two brokers must not report the same interface address, got \
-                 {:?}",
-                first.3
+                mine, theirs,
+                "case {case:?}: each broker publishes the socket opened for IT, got \
+                 {mine:?} twice"
             );
         }
     }
+}
+
+/// Open a TCP connection to the `host:port` a published `https` URL names, which is what an
+/// operator opening it does: a published address nothing answers at accepts no connection.
+///
+/// The host is held to this machine's loopback address first — the interface the core binds
+/// a listener on unless the operator names another — and the dial then names that literal.
+async fn dial(case: &str, url: &str) {
+    let authority = url.strip_prefix("https://").unwrap_or(url);
+    let (host, port) = authority
+        .rsplit_once(':')
+        .unwrap_or_else(|| panic!("case {case:?}: expected a host:port in {url:?}"));
+    let port: u16 = port
+        .parse()
+        .unwrap_or_else(|_| panic!("case {case:?}: expected a port in {url:?}"));
+    assert_eq!(
+        host, "127.0.0.1",
+        "case {case:?}: a case dials only this emulator's own loopback listener, got {url:?}"
+    );
+    let dialled = tokio::net::TcpStream::connect(("127.0.0.1", port)).await;
+    assert!(
+        dialled.is_ok(),
+        "case {case:?}: {url:?} must accept a connection, got {dialled:?}"
+    );
 }
 
 /// RULE 6: every broker runs a configuration — the one its create named, at the

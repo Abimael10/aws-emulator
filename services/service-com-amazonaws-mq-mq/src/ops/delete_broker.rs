@@ -151,11 +151,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         match store.brokers.remove(&input.broker_id) {
             Some(broker) => {
-                // The broker is gone, so the socket it was served on goes with it:
-                // dropping the data-plane record closes the port and severs every
-                // connection open on it, which is what a deleted broker owes a client
-                // still holding its address.
+                // The broker is gone, so the sockets it was served on go with it:
+                // dropping the data-plane and console records closes those ports and
+                // severs every connection open on them, which is what a deleted broker
+                // owes a client still holding its address.
                 store.broker_data_planes.remove(&input.broker_id);
+                store.broker_consoles.remove(&input.broker_id);
                 Ok(DeleteBrokerOutput {
                     broker_id: Some(broker.broker_id),
                 })
