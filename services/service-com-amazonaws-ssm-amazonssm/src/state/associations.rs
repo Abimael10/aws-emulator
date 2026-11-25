@@ -35,7 +35,8 @@
 //! adds an execution rather than rewriting the one before it. What those executions report is
 //! [`super::association_executions`].
 //!
-//! A create is owed its move off `Creating` ([`ASSOCIATION_CREATION_DELAY`]) the same way.
+//! A create is owed its move off `Creating` ([`ASSOCIATION_CREATION_DELAY`]) the same way,
+//! and so is an update: the span belongs to the version in force rather than to the create.
 //!
 //! What a managed node REPORTS for an association ([`AssociationRecord::reported_status`]) is
 //! held with it rather than derived from the clock: `UpdateAssociationStatus` is the node's own
@@ -100,7 +101,8 @@ pub const ASSOCIATION_EXECUTION_DELAY: Duration = Duration::from_secs(3);
 /// How long an association reports [`ASSOCIATION_DETAILED_STATUS_CREATING`] for. A create
 /// answers before the association is in place, so a caller reading straight after it sees
 /// the association still being created; the move off that detail is owed by the clock and
-/// is due this long after the create, whether or not anybody reads in between.
+/// is due this long after the version in force was applied, whether or not anybody reads in
+/// between — an update applies a version too, so it is owed the same span the create was.
 pub const ASSOCIATION_CREATION_DELAY: Duration = Duration::from_secs(3);
 
 /// How many associations one Region holds: "You can have at most 2,000 active
@@ -652,9 +654,27 @@ impl AssociationRecord {
     }
 
     /// The run of this association that had finished by `now`, or `None` when it has never
-    /// been dispatched to a node or its latest run is still in progress.
+    /// been dispatched to a node or its latest run is still in progress. The association's
+    /// CURRENT run is the subject — its result is the association's own — where
+    /// [`AssociationRecord::last_finished_run`] is the whole history's.
     pub fn finished_run(&self, now: SystemTime) -> Option<&AssociationRunRecord> {
         self.last_run().filter(|run| run.has_finished(now))
+    }
+
+    /// The MOST RECENT run of this association that had finished by `now`, over every run it
+    /// has had, or `None` for an association no run of which has finished yet.
+    ///
+    /// "The date on which the association was last run" and "the last date on which the
+    /// association was successfully run" (`AssociationDescription$LastExecutionDate`,
+    /// `$LastSuccessfulExecutionDate`) are facts about the association's HISTORY, so a run
+    /// dispatched since — by an update or by `StartAssociationsOnce` — leaves them where the
+    /// run that finished put them until it finishes itself. Reading only the current run would
+    /// un-report an execution that did happen the moment another was dispatched.
+    ///
+    /// Every run that has finished here finished `Success` ([`AssociationRunRecord::status`]),
+    /// which is why this is also the association's last SUCCESSFUL run.
+    pub fn last_finished_run(&self, now: SystemTime) -> Option<&AssociationRunRecord> {
+        self.executions.iter().rfind(|run| run.has_finished(now))
     }
 
     /// The version this association holds last, which is what a read that names none
@@ -715,12 +735,18 @@ impl AssociationRecord {
     /// "Information about the association" as of `now`: how far its progress and its latest
     /// run have got.
     ///
+    /// The detail `Creating` is reported for the span the version in FORCE is being put in
+    /// place ([`ASSOCIATION_CREATION_DELAY`]), whichever call applied it, where the
+    /// association has no finished run of its own to report instead: an update appends a
+    /// version the same way a create mints one, so the configuration a caller has just
+    /// applied is reported as being created until that span has passed.
+    ///
     /// A run that has FINISHED ([`AssociationRunRecord`]) is the association's result:
     /// `Success`, over the count of nodes it was dispatched to — which for a run dispatched
     /// to none is an EMPTY count, present because the association has executed and empty
     /// because that execution reached no target. Until then the status is `Pending` — no
     /// execution has reported a result — and the detail is `Creating` for as long as the
-    /// create is still settling ([`ASSOCIATION_CREATION_DELAY`]) and `InProgress` while a
+    /// version in force is still being put in place and `InProgress` while a
     /// dispatched run is still being worked through, with no count of targets by status,
     /// because nothing has reported one yet.
     pub fn overview(&self, now: SystemTime) -> AssociationOverview {
@@ -763,7 +789,14 @@ impl AssociationRecord {
                 ),
             };
         }
-        let creating = now < self.created_at + ASSOCIATION_CREATION_DELAY;
+        // The association's version in FORCE is what is being put in place: a create mints
+        // the first version and an update appends another, and either way the configuration
+        // just applied is reported as being created until that span has passed — for a create
+        // the two instants are the same one, because its first version is minted by it.
+        let applied_at = self
+            .latest()
+            .map_or(self.created_at, |version| version.created_at);
+        let creating = now < applied_at + ASSOCIATION_CREATION_DELAY;
         let dispatched = self
             .last_run()
             .is_some_and(|run| !run.nodes.is_empty());
@@ -788,8 +821,9 @@ impl AssociationRecord {
     ///
     /// Every member is what the create or the update that wrote `version` supplied, the id
     /// and the version number this store minted, or the overview above. A member no call
-    /// set is left unset rather than invented; the execution dates are those of the run
-    /// that had finished by `now` ([`AssociationRunRecord`]), and the members only a NODE
+    /// set is left unset rather than invented; the execution dates are those of the most
+    /// recent run that had finished by `now` ([`AssociationRecord::last_finished_run`]),
+    /// which a run dispatched since does not un-report, and the members only a NODE
     /// reports — the per-node status it sent through `UpdateAssociationStatus` and the
     /// alarms an execution invoked — are unset, because no node has reported one.
     pub fn to_association_description(
@@ -825,10 +859,10 @@ impl AssociationRecord {
             schedule_expression: version.schedule_expression.clone(),
             output_location: version.output_location.clone(),
             last_execution_date: self
-                .finished_run(now)
+                .last_finished_run(now)
                 .map(|run| crate::state::wire_instant(run.finished_at())),
             last_successful_execution_date: self
-                .finished_run(now)
+                .last_finished_run(now)
                 .map(|run| crate::state::wire_instant(run.finished_at())),
             association_name: version.association_name.clone(),
             max_errors: version.max_errors.clone(),
@@ -858,7 +892,8 @@ impl AssociationRecord {
     /// `AssociationVersion` is the version in force, and the members a version holds
     /// (`DocumentVersion`, the targets, the schedule, the association name, the schedule
     /// offset, the duration and the target maps) are that version's. `LastExecutionDate` is
-    /// the instant the run that had finished by `now` finished at.
+    /// the instant the most recent run that had finished by `now` finished at
+    /// ([`AssociationRecord::last_finished_run`]).
     pub fn to_association(&self, now: SystemTime) -> Association {
         let version = self.latest();
         Association {
@@ -871,7 +906,7 @@ impl AssociationRecord {
                 .map(|version| version.targets.clone())
                 .filter(|targets| !targets.is_empty()),
             last_execution_date: self
-                .finished_run(now)
+                .last_finished_run(now)
                 .map(|run| crate::state::wire_instant(run.finished_at())),
             overview: Some(self.overview(now)),
             schedule_expression: version.and_then(|version| version.schedule_expression.clone()),
