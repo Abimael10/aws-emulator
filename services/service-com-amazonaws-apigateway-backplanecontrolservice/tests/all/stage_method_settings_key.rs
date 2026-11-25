@@ -416,7 +416,10 @@ fn method_key(resource_path: &str, verb: &str) -> String {
 /// The `methodSettings` the `GetStages` collection reports for `stage_name` of `api` — the
 /// collection's own entry for that stage, so the map is asserted at the COLLECTION reader
 /// too and not only at the single-stage one.
-async fn listed_method_settings(
+///
+/// `pub(crate)` so the sibling `method_setting_documented_method_path_key` suite asserts the
+/// collection reader through this one copy of the read rather than a second of its own.
+pub(crate) async fn listed_method_settings(
     gateway: &Gateway,
     api: &str,
     stage_name: &str,
