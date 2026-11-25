@@ -431,7 +431,9 @@ async fn the_report_refuses_what_the_model_declares_a_fault_for() {
     a_backtrackable_cluster(&router, "emu-btr-refusals").await;
 
     // A cluster the store does not hold: "DBClusterIdentifier doesn't refer to an existing
-    // DB cluster."
+    // DB cluster." The sentence is the one the backtrack API words this fault with, which has
+    // no variable part at all — its text is pinned by
+    // `backtrack_api_cluster_not_found_wording`.
     let missing = expect_error(
         "a cluster the store does not hold",
         report(&router, "emu-btr-absent", &[]).await,
@@ -439,8 +441,8 @@ async fn the_report_refuses_what_the_model_declares_a_fault_for() {
         "DBClusterNotFoundFault",
     );
     assert!(
-        text(&missing, "Message").contains("emu-btr-absent"),
-        "the fault must name the cluster the request wrote, got {missing}"
+        !text(&missing, "Message").contains("emu-btr-absent"),
+        "the fault must not interpolate the cluster the request wrote, got {missing}"
     );
 
     // A backtrack identifier of this cluster's: the UUID the model's own example names, which

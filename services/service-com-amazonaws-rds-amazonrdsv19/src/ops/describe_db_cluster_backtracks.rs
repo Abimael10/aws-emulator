@@ -187,11 +187,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // to report, which is the modelled fault. RDS is regional, so only the region the
         // request was signed for is in scope, and the member accepts the identifier or the
         // ARN ([`crate::state::resolve_db_cluster`]).
+        //
+        // The sentence is the one the BACKTRACK api words this fault with
+        // ([`crate::state::BACKTRACK_DB_CLUSTER_NOT_FOUND_MESSAGE`]), the same one
+        // `BacktrackDBCluster` answers: it states the lookup itself failed and interpolates
+        // nothing — not the identifier the caller wrote and not the account the call was
+        // signed for — rather than the per-identifier wording this front door's OTHER
+        // cluster readers use.
         let named = input.db_cluster_identifier;
         let cluster = store.resolve_db_cluster(&region, &named).ok_or_else(|| {
             DescribeDBClusterBacktracksErrorModeled::DBClusterNotFoundFault(
                 DBClusterNotFoundFault {
-                    message: Some(crate::state::db_cluster_not_found_message(&named)),
+                    message: Some(
+                        crate::state::BACKTRACK_DB_CLUSTER_NOT_FOUND_MESSAGE.to_string(),
+                    ),
                 },
             )
         })?;

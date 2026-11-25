@@ -2384,8 +2384,9 @@ pub const DB_CLUSTER_DOES_NOT_EXIST_MESSAGE: &str = "The DB cluster doesn't exis
 /// as the API that call belongs to words the fault.
 ///
 /// A call that resolves the cluster as the SOURCE another resource stands on names it the
-/// other way ([`db_cluster_cannot_be_accessed_message`]), so the wording follows the API
-/// the call belongs to rather than whether it reads or writes.
+/// other way ([`db_cluster_cannot_be_accessed_message`]), and the calls of the BACKTRACK
+/// api name it no way at all ([`BACKTRACK_DB_CLUSTER_NOT_FOUND_MESSAGE`]), so the wording
+/// follows the API the call belongs to rather than whether it reads or writes.
 ///
 /// `named` is the value the REQUEST carried, not the key the store folded it to: the
 /// members that name a DB cluster accept "the user-supplied DB cluster identifier or the
@@ -2424,12 +2425,16 @@ pub fn db_cluster_cannot_be_accessed_message(named: &str) -> String {
     format!("The source cluster could not be found or cannot be accessed: {named}")
 }
 
-/// The sentence a `DBClusterNotFoundFault` carries where the call BACKTRACKS the cluster.
+/// The sentence a `DBClusterNotFoundFault` carries across the BACKTRACK api: the call that
+/// performs a backtrack on the cluster and the one that reports the backtracks performed on
+/// it.
 ///
-/// `BacktrackDBCluster` words this fault as a statement about the lookup itself, with no
-/// variable part at all — neither the identifier the caller wrote nor the account the call
-/// was signed for — so it is a constant, exactly as the modification's wording
-/// ([`MODIFY_DB_CLUSTER_NOT_FOUND_MESSAGE`]) is.
+/// That api words this fault as a statement about the lookup itself, with no variable part
+/// at all — neither the identifier the caller wrote nor the account the call was signed for
+/// — so it is a constant, exactly as the modification's wording
+/// ([`MODIFY_DB_CLUSTER_NOT_FOUND_MESSAGE`]) is, and every call of the api answers the one
+/// sentence rather than the per-identifier wording the other cluster readers use
+/// ([`db_cluster_not_found_message`]).
 pub const BACKTRACK_DB_CLUSTER_NOT_FOUND_MESSAGE: &str = "Could not find specified DB Cluster";
 
 /// Another wording this front door gives a `DBClusterNotFoundFault`: the one the call that
