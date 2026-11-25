@@ -148,7 +148,10 @@ async fn reported_stage(
 }
 
 /// `DeleteDirectory`, asserting it answers 200 with the id it was asked about.
-async fn delete(router: &MultiServiceRouter, directory_id: &str, case: &str) {
+///
+/// `pub(crate)` because the sibling suite `polled_lifecycles` ends the life of the directory
+/// it drives through this same delete (see [`refused_with`]).
+pub(crate) async fn delete(router: &MultiServiceRouter, directory_id: &str, case: &str) {
     let answer = ok(
         router,
         "DeleteDirectory",
@@ -175,7 +178,10 @@ async fn delete(router: &MultiServiceRouter, directory_id: &str, case: &str) {
 /// rather than for a span of time; the reads only READ — each step was owed at the instant it
 /// fell due whether or not anybody called — so what this collects is the chain the delete
 /// started.
-async fn stages_until_gone(
+///
+/// `pub(crate)` because the sibling suite `polled_lifecycles` collects the same teardown walk
+/// for the directory it drives through its whole life (see [`refused_with`]).
+pub(crate) async fn stages_until_gone(
     router: &MultiServiceRouter,
     directory_id: &str,
     case: &str,
@@ -213,7 +219,10 @@ fn with_request_id(diagnostic: &str, request_id: &str) -> String {
 
 /// Assert that `operation` with `body` is refused HTTP 400 / `EntityDoesNotExistException`
 /// with `diagnostic` followed by the request id the refusal itself reports.
-async fn refused_with(
+///
+/// `pub(crate)` because the sibling suite `polled_lifecycles` ends the life of a directory it
+/// drives on the same two refusal classes, and the sentences they carry are the ones below.
+pub(crate) async fn refused_with(
     router: &MultiServiceRouter,
     operation: &str,
     body: Value,
@@ -240,14 +249,16 @@ async fn refused_with(
 }
 
 /// The sentence a call whose subject has to be a directory this account holds is refused
-/// with, for the id the REQUEST named (`state::no_such_directory`).
-fn does_not_exist(directory_id: &str) -> String {
+/// with, for the id the REQUEST named (`state::no_such_directory`). `pub(crate)` for the
+/// sibling suite that ends a directory's life on the same class (see [`refused_with`]).
+pub(crate) fn does_not_exist(directory_id: &str) -> String {
     format!("Directory: '{directory_id}' does not exist.")
 }
 
 /// The sentence a reporting call FILTERED by ids the account has never held is refused with,
-/// naming those ids (`state::invalid_directory_ids`).
-fn invalid_directory_ids(directory_ids: &[&str]) -> String {
+/// naming those ids (`state::invalid_directory_ids`). `pub(crate)` for the sibling suite that
+/// tells the two classes apart the same way (see [`refused_with`]).
+pub(crate) fn invalid_directory_ids(directory_ids: &[&str]) -> String {
     format!("Invalid directory ID(s): {}.", directory_ids.join(","))
 }
 

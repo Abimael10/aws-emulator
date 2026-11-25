@@ -103,7 +103,10 @@ pub(crate) async fn vpc_of(ec2: &::aws_sdk_ec2::Client, subnet_id: &str) -> Stri
 /// client that reads the group off the directory then describes that single identifier: it has
 /// to resolve there to exactly one group, since an identifier the owner answers nothing for,
 /// or more than one group for, is not one a rule can be authorized against.
-async fn group_reported_by_ec2(
+///
+/// `pub(crate)` because the sibling suite `polled_lifecycles` resolves the group a directory
+/// it drives through its whole life reports with this same reader.
+pub(crate) async fn group_reported_by_ec2(
     ec2: &::aws_sdk_ec2::Client,
     group_id: &str,
     case: &str,
@@ -698,7 +701,10 @@ const ALL_IPV4: &str = "0.0.0.0/0";
 
 /// The IPv4 block EC2 — the service that owns VPCs — reports for `vpc_id`: the network the
 /// directory's servers sit on, and so the source every rule admitting their traffic carries.
-async fn block_of_vpc(ec2: &::aws_sdk_ec2::Client, vpc_id: &str) -> String {
+///
+/// `pub(crate)` because the sibling suite `polled_lifecycles` asserts the addresses and the
+/// ingress of the directory it drives against the block the OWNER of VPCs reports.
+pub(crate) async fn block_of_vpc(ec2: &::aws_sdk_ec2::Client, vpc_id: &str) -> String {
     let described = ec2
         .describe_vpcs()
         .vpc_ids(vpc_id)

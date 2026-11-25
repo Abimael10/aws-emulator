@@ -160,7 +160,11 @@ pub(crate) struct AccountSubnet {
     /// The VPC EC2 reports the subnet in — the VPC a placement naming it has to be made in,
     /// since a directory's servers sit in subnets OF the VPC the create names.
     pub(crate) vpc: String,
-    zone: String,
+    /// The Availability Zone EC2 reports the subnet in: the zone a directory placed in it has
+    /// to report among the zones of its placement. `pub(crate)` because the sibling suite
+    /// `polled_lifecycles` asserts the placement's `AvailabilityZones` against the zones the
+    /// OWNER of subnets reports rather than against values written into a case.
+    pub(crate) zone: String,
 }
 
 /// The emulator one case runs against: this service and EC2 on one engine, plus the subnets
@@ -330,7 +334,11 @@ async fn reported(ec2: &::aws_sdk_ec2::Client, subnet_id: &str) -> AccountSubnet
 
 /// Assert `address` is an address the subnet `cidr` can really hand one of its servers:
 /// inside the block, and neither of the addresses AWS reserves at its two ends.
-fn assert_address_in(address: &str, cidr: &str, case: &str) {
+///
+/// `pub(crate)` because the sibling suite `polled_lifecycles` checks the addresses of the
+/// directory it drives against the block the OWNER of the network reports with this same
+/// checker rather than a second copy of it.
+pub(crate) fn assert_address_in(address: &str, cidr: &str, case: &str) {
     let block: Ipv4Net = cidr
         .parse()
         .unwrap_or_else(|error| panic!("case {case:?}: EC2 reported the block {cidr:?}: {error}"));

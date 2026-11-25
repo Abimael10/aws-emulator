@@ -9,7 +9,8 @@
 //! was carried out among them — is answered with the operation's own empty result: HTTP 200, the
 //! `DeleteChangeSetResponse` envelope carrying a `RequestId` and no member of its own (the
 //! modelled output shape declares none), and no error. The call takes nothing but the change set
-//! it addressed: the stack the executed plan changed stays in the status that execution left it
+//! it addressed — by its own ARN or by the name it was created under, both of which address that
+//! one record: the stack the executed plan changed stays in the status that execution left it
 //! and keeps every resource it applied, a request that addresses no record at all is the same
 //! empty success, and discarding a record a second time changes nothing — so the plan, execute
 //! and discard cycle runs again over the same stack under the very same name.

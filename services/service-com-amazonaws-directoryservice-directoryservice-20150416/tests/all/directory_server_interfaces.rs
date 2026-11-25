@@ -79,7 +79,11 @@ async fn interfaces_held_by_ec2(ec2: &aws_sdk_ec2::Client, case: &str) -> Vec<Ne
 /// The interfaces of the account that belong to the directory `directory_id`: the ones whose
 /// description names it, which is how a client reconciling a directory against the owner of
 /// network interfaces finds them.
-async fn directory_interfaces(
+///
+/// `pub(crate)` because the sibling suite `polled_lifecycles` reconciles a directory it
+/// drives through its whole life against the owner of network interfaces with this same
+/// reader, rather than asking the question a second way.
+pub(crate) async fn directory_interfaces(
     ec2: &aws_sdk_ec2::Client,
     directory_id: &str,
     case: &str,
@@ -95,8 +99,9 @@ async fn directory_interfaces(
         .collect()
 }
 
-/// The subnets `interfaces` sit in, as a set compares them.
-fn subnets_of(interfaces: &[NetworkInterface]) -> BTreeSet<String> {
+/// The subnets `interfaces` sit in, as a set compares them. `pub(crate)` for the sibling
+/// suite that reconciles the same interfaces (see [`directory_interfaces`]).
+pub(crate) fn subnets_of(interfaces: &[NetworkInterface]) -> BTreeSet<String> {
     interfaces
         .iter()
         .filter_map(|interface| interface.subnet_id().map(str::to_string))
@@ -112,8 +117,9 @@ fn groups_of(interface: &NetworkInterface) -> BTreeSet<String> {
         .collect()
 }
 
-/// The primary private addresses of `interfaces`, as a set compares them.
-fn addresses_of(interfaces: &[NetworkInterface]) -> BTreeSet<String> {
+/// The primary private addresses of `interfaces`, as a set compares them. `pub(crate)` for
+/// the sibling suite that reconciles the same interfaces (see [`directory_interfaces`]).
+pub(crate) fn addresses_of(interfaces: &[NetworkInterface]) -> BTreeSet<String> {
     interfaces
         .iter()
         .filter_map(|interface| interface.private_ip_address().map(str::to_string))
@@ -173,8 +179,10 @@ async fn described_in_service(router: &MultiServiceRouter, directory_id: &str, c
     }
 }
 
-/// The `DnsIpAddrs` a description reports, as a set compares them.
-fn dns_addresses(described: &Value, case: &str) -> BTreeSet<String> {
+/// The `DnsIpAddrs` a description reports, as a set compares them. `pub(crate)` for the
+/// sibling suite that compares the same addresses against the interfaces the owner holds
+/// (see [`directory_interfaces`]).
+pub(crate) fn dns_addresses(described: &Value, case: &str) -> BTreeSet<String> {
     described["DnsIpAddrs"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: expected a DnsIpAddrs list, got {described}"))

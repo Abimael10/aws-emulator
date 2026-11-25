@@ -32,7 +32,10 @@ use crate::directory_lifecycle::{
 /// The `DirectoryType` a `CreateMicrosoftAD` directory reports: the `MicrosoftAD` value
 /// of the modelled `DirectoryType` enum
 /// (`smithy_query(query="shape",shape="DirectoryType")`).
-const TYPE_MICROSOFT_AD: &str = "MicrosoftAD";
+///
+/// `pub(crate)` because the sibling suite `polled_lifecycles` asserts the same type on the
+/// directory it drives through its whole life.
+pub(crate) const TYPE_MICROSOFT_AD: &str = "MicrosoftAD";
 
 /// The whole modelled `DirectoryEdition` catalog
 /// (`smithy_query(query="shape",shape="DirectoryEdition")`: `Enterprise`, `Standard`,
@@ -44,8 +47,9 @@ const EDITION_CATALOG: [(&str, bool); 3] =
     [("Enterprise", true), ("Standard", true), ("Hybrid", false)];
 
 /// The edition a request that names none gets, from the same sentence: "`Enterprise` is
-/// the default."
-const DEFAULT_EDITION: &str = "Enterprise";
+/// the default." `pub(crate)` for the sibling suite that creates rows with and without one
+/// (see [`TYPE_MICROSOFT_AD`]).
+pub(crate) const DEFAULT_EDITION: &str = "Enterprise";
 
 /// The whole modelled `NetworkType` catalog
 /// (`smithy_query(query="shape",shape="NetworkType")`). Unlike
@@ -56,7 +60,9 @@ const NETWORK_TYPE_CATALOG: [&str; 3] = ["Dual-stack", "IPv4", "IPv6"];
 /// The domain controllers a freshly created Managed Microsoft AD directory has: the
 /// minimum the modelled `DesiredNumberOfDomainControllers` allows (`range { min: 2 }`),
 /// one directory server per subnet of the two `DirectoryVpcSettings$SubnetIds` requires.
-const FRESH_DOMAIN_CONTROLLERS: i64 = 2;
+/// `pub(crate)` for the sibling suite that reads the same member back (see
+/// [`TYPE_MICROSOFT_AD`]).
+pub(crate) const FRESH_DOMAIN_CONTROLLERS: i64 = 2;
 
 /// A minimal well-formed `CreateMicrosoftAD` body for `name`: only the three required
 /// members, so every other value in the stored record is one the service derived.
