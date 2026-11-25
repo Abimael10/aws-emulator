@@ -38,10 +38,11 @@
 //!
 //! This module reads the document; it runs none of it. A `RUN`, `COPY` or `ADD` is recorded
 //! in the history as the instruction that ran and performs nothing else — nothing in this
-//! emulator fetches the base image a `FROM` names or executes a shell inside one
-//! ([`super::container_image`]), so the layer an image carries is its build context and no
-//! instruction adds another. Nothing here opens a file or reaches the host: it computes over
-//! the text it is handed.
+//! emulator executes a shell inside an image ([`super::container_image`]), so the layer an
+//! instruction would add is not one. What the document's own `FROM` names IS read
+//! ([`Declaration::base`]), because an image is built ON its base: the image the build
+//! environment HOLDS under that reference is the one the build stacks its context on. Nothing
+//! here opens a file or reaches the host: it computes over the text it is handed.
 //!
 //! # Bounds
 //!
@@ -54,8 +55,14 @@
 //! brought into force, with the resolution itself held to what is left, so nothing is
 //! allocated past it even once. A document that spends the budget is read no further and the
 //! declaration carries what was resolved before it ran out.
+//!
+//! Those bounds hold the TEXT a document comes to; what it costs to READ is held with them,
+//! because the two multiply as well: a variable an `ENV` sets and a port an `EXPOSE` states
+//! are each resolved against an index rather than against a walk of everything stated before
+//! them, so one document's budget cannot be spent on work quadratic in the entries it
+//! declares.
 
-use ::std::collections::BTreeMap;
+use ::std::collections::{BTreeMap, BTreeSet};
 
 /// The instruction a Dockerfile has to open with, which [`super::container_image`] holds the
 /// document to.
@@ -142,6 +149,10 @@ pub struct Declaration {
     /// The instructions that ran, resolved — the `created_by` of the configuration's
     /// `history` entries.
     history: Vec<String>,
+    /// `FROM`: the reference of the image this one is built ON, resolved, with the stage name
+    /// and the platform option the instruction may carry left off — `None` for a document that
+    /// states none.
+    base: Option<String>,
 }
 
 impl Declaration {
@@ -178,6 +189,18 @@ impl Declaration {
         config.into()
     }
 
+    /// The reference the image this one is built ON is named by: "a Dockerfile must begin
+    /// with a `FROM` instruction", and `FROM <image>[:<tag>]` "initializes a new build stage
+    /// and sets the base image for subsequent instructions".
+    ///
+    /// The LAST stage's base, for a document declaring several: the image a build produces is
+    /// the last stage's, so that is the one it is built on. A single-stage document states one
+    /// either way.
+    #[must_use]
+    pub fn base(&self) -> Option<&str> {
+        self.base.as_deref()
+    }
+
     /// The `history` array of the image configuration document: one entry per instruction
     /// that ran, carrying the instruction as it ran.
     #[must_use]
@@ -207,6 +230,12 @@ pub fn declared(document: &str, build_arguments: &BTreeMap<String, String>) -> D
     // `ARG` has been declared by then, plus what `ENV` has set. `ENV` wins over an `ARG` of
     // the same name, which is the order the builder resolves them in.
     let mut in_force: BTreeMap<String, String> = BTreeMap::new();
+    // WHERE each variable's entry sits in `declaration.environment`, and which ports have been
+    // stated: what one instruction costs is then the keys it declares and not the keys every
+    // instruction before it declared, so the resolution budget bounds the WORK a document sets
+    // off as well as the text it allocates.
+    let mut environment_entries: BTreeMap<String, usize> = BTreeMap::new();
+    let mut exposed_ports: BTreeSet<String> = BTreeSet::new();
     for instruction in instructions(document) {
         let (name, arguments) = match instruction.split_once(char::is_whitespace) {
             Some((name, arguments)) => (name.to_string(), arguments.trim().to_string()),
@@ -257,15 +286,20 @@ pub fn declared(document: &str, build_arguments: &BTreeMap<String, String>) -> D
                 for (key, value) in key_values(&resolved) {
                     in_force.insert(key.clone(), value.clone());
                     // One entry per variable: a later `ENV` of the same key replaces the
-                    // value the image carries rather than adding a second entry.
+                    // value the image carries rather than adding a second entry. WHERE that
+                    // entry sits is remembered, so a document declaring many variables costs
+                    // one lookup per key rather than a walk of every entry declared so far.
                     let entry = format!("{key}={value}");
-                    match declaration
-                        .environment
-                        .iter()
-                        .position(|held| held.starts_with(&format!("{key}=")))
-                    {
-                        Some(index) => declaration.environment[index] = entry,
-                        None => declaration.environment.push(entry),
+                    match environment_entries.get(&key) {
+                        Some(&index) => {
+                            if let Some(held) = declaration.environment.get_mut(index) {
+                                *held = entry;
+                            }
+                        }
+                        None => {
+                            environment_entries.insert(key, declaration.environment.len());
+                            declaration.environment.push(entry);
+                        }
                     }
                 }
             }
@@ -279,11 +313,14 @@ pub fn declared(document: &str, build_arguments: &BTreeMap<String, String>) -> D
                         true => port.to_string(),
                         false => format!("{port}/tcp"),
                     };
-                    if !declaration.exposed_ports.contains(&named) {
+                    // One entry per port, decided by the set rather than by a walk of the
+                    // ports stated so far, for the reason `ENV` keeps an index.
+                    if exposed_ports.insert(named.clone()) {
                         declaration.exposed_ports.push(named);
                     }
                 }
             }
+            FROM_INSTRUCTION => declaration.base = base_image(&resolved),
             "WORKDIR" => declaration.working_directory = Some(resolved.clone()),
             "USER" => declaration.user = Some(resolved.clone()),
             // Every other instruction is recorded as the instruction that ran and states
@@ -292,6 +329,18 @@ pub fn declared(document: &str, build_arguments: &BTreeMap<String, String>) -> D
         }
     }
     declaration
+}
+
+/// The image a `FROM` instruction's own arguments name: "FROM [--platform=<platform>]
+/// <image> [AS <name>]", so the reference is the first word that is not one of the
+/// instruction's options, and the stage name after it is not part of it.
+///
+/// `None` for an instruction naming no image at all, which names no base.
+fn base_image(arguments: &str) -> Option<String> {
+    arguments
+        .split_whitespace()
+        .find(|word| !word.starts_with("--"))
+        .map(str::to_string)
 }
 
 /// The instructions `document` states: its lines with the comments and the blank lines

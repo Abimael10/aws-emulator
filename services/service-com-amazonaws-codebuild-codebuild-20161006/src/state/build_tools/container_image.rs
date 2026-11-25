@@ -26,10 +26,16 @@
 //! composes are the ones a registry client would have sent, and the image a registry holds
 //! after the push is one a client can read back.
 //!
-//! What a build environment CANNOT do here is fetch the image a `FROM` instruction names:
-//! nothing in this emulator reaches a registry off it, so the image a build composes carries
-//! its own context as its single layer and no base layer. The instruction is still required
-//! to be there, because a Dockerfile without one is not a Dockerfile a build can run.
+//! What a build environment CANNOT do here is fetch the image a `FROM` instruction names off
+//! a registry this emulator does not serve: nothing in this emulator makes an outbound
+//! connection. The image the environment itself HOLDS under that reference is another matter —
+//! a `docker pull` of one of this emulator's own registries puts it there
+//! ([`super::docker_cli`]) — and a build FROM an image the environment holds is built ON it:
+//! the layers of the base come first and the context is the layer stacked on them, which is
+//! what makes the composed image really derived from the base. A `FROM` naming an image the
+//! environment does not hold leaves the composed image its own context as its single layer.
+//! The instruction is still required to be there, because a Dockerfile without one is not a
+//! Dockerfile a build can run.
 //!
 //! What the DOCUMENT declares about the image is read beside the context
 //! ([`super::dockerfile`]) and composed into the configuration blob: the environment, command,
@@ -37,6 +43,15 @@
 //! `history` whose entries are the instructions as they ran — resolved against the
 //! `--build-arg` values the command carried. So an image's digest depends on a build argument
 //! exactly where the Dockerfile uses it, as it does on the files of the context.
+//!
+//! # Bounds
+//!
+//! Every bound is this emulator's and none is reachable from a command: how many bytes of the
+//! working tree one context carries and how many bytes ALL of one image's layers come to
+//! ([`MAX_IMAGE_BYTES`]), how many layers one image carries ([`MAX_IMAGE_LAYERS`]), and how
+//! many files of the tree one context walks ([`MAX_CONTEXT_FILES`], [`MAX_CONTEXT_DEPTH`]). A
+//! build past any of them fails rather than growing this process, which is what bounds a
+//! CHAIN of builds each composed on the image before it.
 
 use super::dockerfile;
 use ::service_common::posix_shell_session::ProgramFiles;
@@ -61,12 +76,24 @@ pub const DEFAULT_DOCKERFILE: &str = "Dockerfile";
 /// it.
 const FROM_INSTRUCTION: &str = dockerfile::FROM_INSTRUCTION;
 
-/// How many bytes of the build's working tree ONE image carries.
+/// How many bytes of the build's working tree ONE image carries, and how many bytes ALL the
+/// layers of one image come to together.
 ///
 /// CHOSEN, not a Docker or a registry limit: the archive and its compression happen in this
 /// process and the blobs are then held in it, so what one image may cost is bounded here. A
-/// context past it is a build that fails rather than one that grows this process.
+/// context past it is a build that fails rather than one that grows this process, and so is an
+/// image built on a base whose layers already come to this much — a build stacks a layer on
+/// its base, so the bound has to be on the image and not only on the context it adds.
 pub const MAX_IMAGE_BYTES: usize = 256 * 1024;
+
+/// How many filesystem layers ONE image this environment holds carries — one per build in the
+/// chain that composed it, or one per entry of the manifest a pull delivered.
+///
+/// CHOSEN for the same reason as [`MAX_IMAGE_BYTES`], and bounding the other factor: a build
+/// may be run on the image a build before it composed, so without it the chain a buildspec's
+/// commands can make is what decides how many blobs this process holds. A composition past it
+/// fails, and so does a pull of a manifest naming more ([`super::registry_client`]).
+pub const MAX_IMAGE_LAYERS: usize = 15;
 
 /// How many files of the tree one image's context carries, and how deep the walk goes.
 ///
@@ -77,31 +104,42 @@ const MAX_CONTEXT_FILES: usize = 1024;
 /// See [`MAX_CONTEXT_FILES`].
 const MAX_CONTEXT_DEPTH: usize = 16;
 
-/// One image a build has composed: the blobs it is made of, which is everything a push
-/// sends.
+/// One image a build has composed or pulled: the blobs it is made of, which is everything a
+/// push sends.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalImage {
     /// The image configuration blob, as the bytes the registry stores.
     config: Vec<u8>,
-    /// The one layer blob: the gzip tar of the context the image was built from.
-    layer: Vec<u8>,
+    /// The filesystem layer blobs, each a gzip tar, in the order the manifest lists them:
+    /// the base image's layers first, then the one composed from the build's own context.
+    layers: Vec<Vec<u8>>,
 }
 
 impl LocalImage {
+    /// The image a registry HOLDS, as a pull of it delivers: the configuration blob and the
+    /// layer blobs its stored manifest names, in that manifest's own order.
+    #[must_use]
+    pub fn pulled(config: Vec<u8>, layers: Vec<Vec<u8>>) -> Self {
+        Self { config, layers }
+    }
+
     /// The configuration blob and its digest.
     #[must_use]
     pub fn config_blob(&self) -> (&[u8], String) {
         (&self.config, content_digest(&self.config))
     }
 
-    /// The layer blob and its digest.
+    /// Every layer blob and its digest, in the order the manifest lists them.
     #[must_use]
-    pub fn layer_blob(&self) -> (&[u8], String) {
-        (&self.layer, content_digest(&self.layer))
+    pub fn layer_blobs(&self) -> Vec<(&[u8], String)> {
+        self.layers
+            .iter()
+            .map(|layer| (layer.as_slice(), content_digest(layer)))
+            .collect()
     }
 
     /// The manifest a push sends for this image: the document that names its configuration
-    /// and its layer, each by digest and size.
+    /// and each of its layers, by digest and size.
     #[must_use]
     pub fn manifest(&self) -> String {
         ::serde_json::json!({
@@ -112,13 +150,35 @@ impl LocalImage {
                 "size": self.config.len(),
                 "digest": content_digest(&self.config),
             },
-            "layers": [{
+            "layers": self.layers.iter().map(|layer| ::serde_json::json!({
                 "mediaType": LAYER_MEDIA_TYPE,
-                "size": self.layer.len(),
-                "digest": content_digest(&self.layer),
-            }],
+                "size": layer.len(),
+                "digest": content_digest(layer),
+            })).collect::<Vec<::serde_json::Value>>(),
         })
         .to_string()
+    }
+
+    /// What this image's own configuration document states under `member`, for the image built
+    /// ON it: a derived image inherits its base's configuration, its filesystem and its
+    /// history, and the instructions of the new build add to them.
+    ///
+    /// `None` for a configuration blob that is no document at all, which states nothing to
+    /// inherit.
+    fn stated(&self, member: &str) -> Option<::serde_json::Value> {
+        let document: ::serde_json::Value = ::serde_json::from_slice(&self.config).ok()?;
+        match member.split_once('.') {
+            Some((outer, inner)) => document.get(outer)?.get(inner).cloned(),
+            None => document.get(member).cloned(),
+        }
+    }
+
+    /// The entries of the array this image's configuration states under `member`, and none for
+    /// a configuration that states no such array.
+    fn stated_array(&self, member: &str) -> Vec<::serde_json::Value> {
+        self.stated(member)
+            .and_then(|stated| stated.as_array().cloned())
+            .unwrap_or_default()
     }
 }
 
@@ -132,9 +192,27 @@ pub fn content_digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", hasher.finalize())
 }
 
+/// The base a Dockerfile declares, as the document in `files` at `dockerfile` names it
+/// resolved against the `--build-arg` values `build_arguments` the command carried.
+///
+/// It is read here rather than by the caller because a `FROM` is resolved like every other
+/// instruction ([`super::dockerfile`]): the reference a build is built ON can come from a
+/// build argument. `None` for a document the tree does not hold and one that names no image.
+pub fn declared_base(
+    files: &dyn ProgramFiles,
+    dockerfile: &str,
+    build_arguments: &BTreeMap<String, String>,
+) -> Option<String> {
+    let declaration = files.read(dockerfile)?;
+    self::dockerfile::declared(&declaration, build_arguments)
+        .base()
+        .map(str::to_string)
+}
+
 /// Compose the image `docker build` builds from the context at `context` in `files`, built
 /// from the Dockerfile at `dockerfile`, with the `--build-arg` values `build_arguments` the
-/// command carried.
+/// command carried, ON `base` — the image the build environment holds under the reference the
+/// document's `FROM` names, and `None` when it holds none.
 ///
 /// `Err` carries what the command reports instead: a Dockerfile the tree does not hold, a
 /// Dockerfile that is not one, a context with nothing in it, or a context past
@@ -144,6 +222,7 @@ pub fn composed(
     context: &str,
     dockerfile: &str,
     build_arguments: &BTreeMap<String, String>,
+    base: Option<&LocalImage>,
 ) -> Result<LocalImage, String> {
     let Some(declaration) = files.read(dockerfile) else {
         return Err(format!(
@@ -181,8 +260,28 @@ pub fn composed(
     let archive = archived(&carried)?;
     let layer = compressed(&archive)?;
     let declared = self::dockerfile::declared(&declaration, build_arguments);
-    let config = configuration(&archive, &declared);
-    Ok(LocalImage { config, layer })
+    let config = configuration(&archive, &declared, base);
+    // The image is built ON its base: the base's own layers, then the one this context
+    // composes.
+    let mut layers: Vec<Vec<u8>> = base.map(|base| base.layers.clone()).unwrap_or_default();
+    layers.push(layer);
+    // What the IMAGE comes to, which is what this process then holds: a build may be run on
+    // the image a build before it composed, so each of the two factors is bounded here rather
+    // than only the context this one added.
+    if layers.len() > MAX_IMAGE_LAYERS {
+        return Err(format!(
+            "failed to solve: an image this build environment composes carries at most \
+             {MAX_IMAGE_LAYERS} filesystem layers"
+        ));
+    }
+    let held: usize = layers.iter().map(Vec::len).sum();
+    if held > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "no space left on device: an image this build environment composes carries at most \
+             {MAX_IMAGE_BYTES} bytes"
+        ));
+    }
+    Ok(LocalImage { config, layers })
 }
 
 /// Whether `declaration` is a Dockerfile at all: one that states the `FROM` instruction a
@@ -291,22 +390,49 @@ const IMAGE_ARCHITECTURE: &str = ::std::env::consts::ARCH;
 const IMAGE_OS: &str = ::std::env::consts::OS;
 
 /// The image configuration document for a layer whose UNCOMPRESSED bytes are `archive`, as
-/// the Dockerfile `declared`.
+/// the Dockerfile `declared`, for an image built ON `base`.
 ///
 /// `rootfs.diff_ids` names each layer by the digest of its uncompressed archive, which is
-/// what an image configuration states about its filesystem; the platform values are this
-/// environment's own, and `config` and `history` are what the document declares
+/// what an image configuration states about its filesystem, so the base's own entries come
+/// first and this context's is the last. An image built on a base INHERITS that base's
+/// configuration and its history — the instructions of this build override the members they
+/// state and their entries are appended — and it is for the base's platform, because that is
+/// the filesystem it carries; an image built on nothing states this environment's own
+/// platform, and `config` and `history` are what the document declares
 /// ([`super::dockerfile`]).
-fn configuration(archive: &[u8], declared: &self::dockerfile::Declaration) -> Vec<u8> {
+fn configuration(
+    archive: &[u8],
+    declared: &self::dockerfile::Declaration,
+    base: Option<&LocalImage>,
+) -> Vec<u8> {
+    let stated = |member: &str| base.and_then(|base| base.stated(member));
+    let inherited = |member: &str| base.map(|base| base.stated_array(member)).unwrap_or_default();
+    let mut diff_ids = inherited("rootfs.diff_ids");
+    diff_ids.push(::serde_json::json!(content_digest(archive)));
+    let mut history = inherited("history");
+    history.extend(
+        declared
+            .history()
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
+    );
+    let mut config = stated("config")
+        .and_then(|stated| stated.as_object().cloned())
+        .unwrap_or_default();
+    if let Some(declared) = declared.configuration().as_object() {
+        config.extend(declared.clone());
+    }
     ::serde_json::json!({
-        "architecture": IMAGE_ARCHITECTURE,
-        "os": IMAGE_OS,
-        "config": declared.configuration(),
+        "architecture": stated("architecture")
+            .unwrap_or_else(|| ::serde_json::json!(IMAGE_ARCHITECTURE)),
+        "os": stated("os").unwrap_or_else(|| ::serde_json::json!(IMAGE_OS)),
+        "config": config,
         "rootfs": {
             "type": "layers",
-            "diff_ids": [content_digest(archive)],
+            "diff_ids": diff_ids,
         },
-        "history": declared.history(),
+        "history": history,
     })
     .to_string()
     .into_bytes()
@@ -403,12 +529,12 @@ mod tests {
         let mut seen: BTreeMap<String, &str> = BTreeMap::new();
         for (case, files) in rows {
             let tree = Tree::of(&files);
-            let image = composed(&tree, ".", DEFAULT_DOCKERFILE, &BTreeMap::new())
+            let image = composed(&tree, ".", DEFAULT_DOCKERFILE, &BTreeMap::new(), None)
                 .unwrap_or_else(|error| panic!("case {case:?}: expected an image, got {error}"));
             let digest = content_digest(image.manifest().as_bytes());
             // The same context, composed again, is the same image.
-            let again =
-                composed(&tree, ".", DEFAULT_DOCKERFILE, &BTreeMap::new()).expect("the same image");
+            let again = composed(&tree, ".", DEFAULT_DOCKERFILE, &BTreeMap::new(), None)
+                .expect("the same image");
             assert_eq!(
                 image, again,
                 "case {case:?}: the same context must compose the same image, got {:?} then {:?}",
@@ -430,13 +556,13 @@ mod tests {
             );
             assert_eq!(
                 manifest["layers"][0]["digest"].as_str(),
-                Some(image.layer_blob().1.as_str()),
+                Some(image.layer_blobs()[0].1.as_str()),
                 "case {case:?}: the manifest must name the layer blob's own digest, got \
                  {manifest}"
             );
             assert_eq!(
                 manifest["layers"][0]["size"].as_u64(),
-                u64::try_from(image.layer_blob().0.len()).ok(),
+                u64::try_from(image.layer_blobs()[0].0.len()).ok(),
                 "case {case:?}: the manifest must state the layer's own size, got {manifest}"
             );
         }
@@ -472,7 +598,7 @@ mod tests {
         ];
         for (case, files, composes) in rows {
             let tree = Tree::of(&files);
-            let answered = composed(&tree, ".", DEFAULT_DOCKERFILE, &BTreeMap::new());
+            let answered = composed(&tree, ".", DEFAULT_DOCKERFILE, &BTreeMap::new(), None);
             assert_eq!(
                 answered.is_ok(),
                 composes,
@@ -480,5 +606,121 @@ mod tests {
                 answered.map(|image| image.config_blob().1)
             );
         }
+    }
+
+    /// RULE: an image built ON a base is built on that base's own layers — the base's layers
+    /// come first, the context composes the one stacked on them, and the configuration states
+    /// the filesystem and the history of both.
+    ///
+    /// The rows differ along what the rule generalises over: how many layers the base carries
+    /// and whether there is a base at all.
+    #[test]
+    fn an_image_built_on_a_base_carries_that_bases_layers() {
+        let tree = Tree::of(&[("Dockerfile", "FROM base:one"), ("app.py", "print(1)")]);
+        let own = composed(&tree, ".", DEFAULT_DOCKERFILE, &BTreeMap::new(), None)
+            .expect("an image built on nothing");
+        // (case, the base, how many layers the composed image carries)
+        let rows: Vec<(&str, Option<LocalImage>, usize)> = vec![
+            ("no base the environment holds", None, 1),
+            ("a base of one layer", Some(own.clone()), 2),
+            (
+                "a base of two layers",
+                Some(
+                    composed(&tree, ".", DEFAULT_DOCKERFILE, &BTreeMap::new(), Some(&own))
+                        .expect("an image built on one"),
+                ),
+                3,
+            ),
+        ];
+        for (case, base, layers) in rows {
+            let image = composed(
+                &tree,
+                ".",
+                DEFAULT_DOCKERFILE,
+                &BTreeMap::new(),
+                base.as_ref(),
+            )
+            .unwrap_or_else(|error| panic!("case {case:?}: expected an image, got {error}"));
+            let blobs = image.layer_blobs();
+            assert_eq!(
+                blobs.len(),
+                layers,
+                "case {case:?}: expected {layers} layers, got {}",
+                blobs.len()
+            );
+            // The base's own layers come first, in their own order.
+            if let Some(base) = base.as_ref() {
+                let under: Vec<String> = base
+                    .layer_blobs()
+                    .iter()
+                    .map(|(_blob, digest)| digest.clone())
+                    .collect();
+                let stacked: Vec<String> = blobs
+                    .iter()
+                    .take(under.len())
+                    .map(|(_blob, digest)| digest.clone())
+                    .collect();
+                assert_eq!(
+                    stacked, under,
+                    "case {case:?}: expected the base's layers beneath, got {stacked:?}"
+                );
+            }
+            // The manifest names every layer, and the configuration states one filesystem
+            // entry per layer.
+            let manifest: ::serde_json::Value =
+                ::serde_json::from_str(&image.manifest()).expect("a manifest document");
+            assert_eq!(
+                manifest["layers"].as_array().map(Vec::len),
+                Some(layers),
+                "case {case:?}: the manifest must name every layer, got {manifest}"
+            );
+            let configuration: ::serde_json::Value =
+                ::serde_json::from_slice(image.config_blob().0).expect("a configuration");
+            assert_eq!(
+                configuration["rootfs"]["diff_ids"].as_array().map(Vec::len),
+                Some(layers),
+                "case {case:?}: the configuration must state every layer's filesystem, got \
+                 {configuration}"
+            );
+        }
+    }
+
+    /// RULE: an image this environment holds is bounded — in the layers it carries and in what
+    /// they come to — so a CHAIN of builds each composed on the image before it is refused
+    /// rather than growing this process without end.
+    #[test]
+    fn an_image_is_bounded_however_long_the_chain_that_composed_it() {
+        let tree = Tree::of(&[("Dockerfile", "FROM base:one"), ("app.py", "print(1)")]);
+        let mut held = composed(&tree, ".", DEFAULT_DOCKERFILE, &BTreeMap::new(), None)
+            .expect("an image built on nothing");
+        // Each composition stacks one more layer on the image before it.
+        for step in 2..=MAX_IMAGE_LAYERS {
+            held = composed(
+                &tree,
+                ".",
+                DEFAULT_DOCKERFILE,
+                &BTreeMap::new(),
+                Some(&held),
+            )
+            .unwrap_or_else(|error| panic!("step {step}: expected an image, got {error}"));
+            assert_eq!(
+                held.layer_blobs().len(),
+                step,
+                "step {step}: expected one layer per composition, got {}",
+                held.layer_blobs().len()
+            );
+        }
+        let past = composed(
+            &tree,
+            ".",
+            DEFAULT_DOCKERFILE,
+            &BTreeMap::new(),
+            Some(&held),
+        );
+        assert!(
+            past.is_err(),
+            "a composition past the bound is refused, got {:?} layers",
+            past.map(|image| image.layer_blobs().len())
+        );
     }
 }

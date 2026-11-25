@@ -48,6 +48,13 @@
 //! build reports, not the capacity that window consumes, and not the wait a build is given in
 //! the queue.
 //!
+//! That wait runs from the instant the build BECAME DUE, not from the instant a reader
+//! happened to look: a build nothing rations was owed its machine, and therefore its run and
+//! the wait before the run may be read, at that instant whether or not anybody called — so a
+//! client that looks once, late, sees the record the clock already owed rather than a build
+//! that starts over when it is read. The span itself is never zero, so a client that looks
+//! straight after starting a build still sees the build running.
+//!
 //! The two views can therefore be read apart: a build whose commands stated minutes reports
 //! itself finished, with the `endTime` those commands stated, while the machine it ran on is
 //! still accounted as taken for the rest of that window — so a build behind it is still
@@ -551,10 +558,18 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
                 artifacts: stored.artifacts.clone(),
                 secondary_artifacts: stored.secondary_artifacts.clone(),
                 start_millis: stored.start_millis,
-                // The instant the build left the queue, which is where it begins
-                // EXECUTING: this pass placed it, so this is where its wait for capacity
-                // ended — however long that wait was.
-                due_millis: now_millis.max(stored.settle_due_millis),
+                // The instant the build left the queue, which is where it begins EXECUTING.
+                // A build NOTHING rations left it the moment it became due: no machine had to
+                // free up for it, so the clock owed it that instant whether or not anybody
+                // looked, and the reader that materialises it sees a build that began then
+                // rather than one that began when it was read. A build that took a machine of
+                // its fleet left the queue when THIS pass found that machine free, which is
+                // where its own wait for capacity ended — however long that wait was.
+                due_millis: if fleet_arn.is_none() {
+                    stored.settle_due_millis
+                } else {
+                    now_millis.max(stored.settle_due_millis)
+                },
                 cache_restorable: cache_restorable
                     .get(&project_name)
                     .copied()

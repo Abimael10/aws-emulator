@@ -143,12 +143,16 @@ async fn image_tags(router: &MultiServiceRouter, case: &str, name: &str) -> Vec<
 
 /// How a member of a rendered `ImageIdentifier` reads when the request supplied none: Amazon
 /// ECR spells both members of the entry out and the absent one as the literal `null`.
-const UNSET_IDENTIFIER_MEMBER: &str = "null";
+pub(crate) const UNSET_IDENTIFIER_MEMBER: &str = "null";
 
 /// Amazon ECR's sentence for an `imageIds` entry the repository `repository` answers nothing
 /// to: the entry the REQUEST sent — both members spelled out, the one it omitted as
 /// [`UNSET_IDENTIFIER_MEMBER`] — then the repository and the registry it was looked for in.
-fn image_not_found_message(digest: &str, tag: &str, repository: &str) -> String {
+///
+/// `pub(crate)` here and below: the suite that drives what a build's `docker pull` delivers
+/// (`super::ecr_image_pull`) reads the same refusal back for a tag no push delivered, so the
+/// two suites ask the question the same way rather than each spelling the sentence out.
+pub(crate) fn image_not_found_message(digest: &str, tag: &str, repository: &str) -> String {
     format!(
         "The image with imageId {{imageDigest:'{digest}', imageTag:'{tag}'}} does not exist \
          within the repository with name '{repository}' in the registry with id '{}'",
@@ -158,7 +162,7 @@ fn image_not_found_message(digest: &str, tag: &str, repository: &str) -> String 
 
 /// What Amazon ECR answers `DescribeImages` for the single `imageIds` entry `id` of the
 /// repository `repository`: the HTTP status, the error type and the message.
-async fn described_image(
+pub(crate) async fn described_image(
     router: &MultiServiceRouter,
     repository: &str,
     id: &Value,

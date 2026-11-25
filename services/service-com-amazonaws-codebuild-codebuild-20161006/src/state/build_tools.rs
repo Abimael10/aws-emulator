@@ -20,13 +20,15 @@
 //!
 //! * [`aws_cli`] performs `aws ecr get-login-password`, which is Amazon ECR's
 //!   `GetAuthorizationToken` and whose answer is the registry password that service issued;
-//! * [`docker_cli`] performs `docker login`, `docker build`, `docker tag` and `docker push`:
-//!   the login presents the password to the registry it names, the build composes a real
-//!   image out of the files in the build's own working tree ([`container_image`]), and the
-//!   push uploads that image's blobs and manifest to the registry through the layer-upload
-//!   and `PutImage` calls a registry client makes — so the repository really holds the image
-//!   once the command has run, and a later `DescribeImages` of it reports exactly what was
-//!   pushed;
+//! * [`docker_cli`] performs `docker login`, `docker build`, `docker tag`, `docker pull` and
+//!   `docker push`: the login presents the password to the registry it names, the build
+//!   composes a real image out of the files in the build's own working tree
+//!   ([`container_image`]) and out of the base image the environment holds, the pull fetches
+//!   an image out of the registry its reference names through that registry's own data plane
+//!   ([`registry_client`]), and the push uploads an image's blobs and manifest to the registry
+//!   through the layer-upload and `PutImage` calls a registry client makes — so the repository
+//!   really holds the image once the command has run, and a later `DescribeImages` of it
+//!   reports exactly what was pushed;
 //! * [`docker_daemon`] answers the command a container build starts the daemon those Docker
 //!   commands are served by with, which a build environment runs only in privileged mode.
 //!
@@ -74,10 +76,12 @@
 //! Every bound is this emulator's and none is reachable from a command: the whole wall clock
 //! one build's tool calls may spend ([`TOOL_CALL_BUDGET`], shared by every call the build's
 //! commands make, so a build cannot hold the operation that performs it for longer whatever
-//! its buildspec says), how many bytes one pushed blob carries
-//! ([`container_image::MAX_IMAGE_BYTES`]) and how many images one build composes
-//! ([`MAX_LOCAL_IMAGES`]). The session's own bounds — the command budget, the line size, the
-//! tree size — are `::service_common::posix_shell_session`'s.
+//! its buildspec says), what one image this environment holds comes to — the bytes of all its
+//! layers together ([`container_image::MAX_IMAGE_BYTES`]) and how many layers it carries
+//! ([`container_image::MAX_IMAGE_LAYERS`], which bounds a chain of builds each composed on the
+//! image before it as well as the blobs one pull brings in) — and how many images one build
+//! holds at once ([`MAX_LOCAL_IMAGES`]). The session's own bounds — the command budget, the
+//! line size, the tree size — are `::service_common::posix_shell_session`'s.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -97,6 +101,8 @@ mod docker_cli;
 mod docker_daemon;
 /// What a Dockerfile declares about the image built from it.
 pub mod dockerfile;
+/// The registry data plane a `docker pull` fetches an image through.
+mod registry_client;
 
 /// The whole wall clock ONE build's tool calls may spend, shared by every call the build's
 /// commands make.
@@ -189,10 +195,12 @@ impl EnvironmentPrograms for BuildPrograms {
 #[derive(Debug, Default)]
 struct ToolState {
     /// The registry passwords Amazon ECR ISSUED to this build, so a login can only present a
-    /// credential the registry really handed over.
+    /// password that registry really handed over.
     issued_passwords: BTreeSet<String>,
-    /// The registries this build is logged in to, by the host a push addresses them at.
-    logins: BTreeSet<String>,
+    /// The registries this build is logged in to, by the host a push or a pull addresses them
+    /// at, each carrying the password the login presented — which is what the registry's own
+    /// data plane then authenticates a pull by.
+    logins: BTreeMap<String, String>,
     /// The images this build has composed, by the reference they were tagged with.
     images: BTreeMap<String, container_image::LocalImage>,
 }

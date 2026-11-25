@@ -6,35 +6,43 @@
 //! # The rule this module implements
 //!
 //! The commands a container build runs are the ones AWS documents for pushing an image to
-//! Amazon ECR, and each does what the CLI documents it as doing:
+//! Amazon ECR and for building one FROM an image of a private registry, and each does what
+//! the CLI documents it as doing:
 //!
 //! * `docker login --username AWS --password-stdin <registry>` authenticates to the registry
 //!   it names; the password it is given has to be one that registry ISSUED
 //!   ([`super::aws_cli`]), so a build that never asked for one — or one that presents
-//!   anything else — is not logged in, and the push that follows fails the way a push with no
-//!   credential fails;
+//!   anything else — is not logged in, and the push or pull that follows fails the way one
+//!   with no credential fails;
 //! * `docker build` composes an image out of the Dockerfile and the context it names
 //!   ([`super::container_image`]) and tags it, so the image exists in the build's own
-//!   environment and nowhere else yet;
+//!   environment and nowhere else yet; a Dockerfile whose `FROM` names an image this
+//!   environment HOLDS composes an image built ON it, carrying that base's own layers;
 //! * `docker tag` gives an image another reference, which is what a push then addresses;
-//! * `docker push` UPLOADS that image to the repository its reference names: each blob
+//! * `docker pull` DOWNLOADS the image its reference names out of that registry — the
+//!   manifest the repository holds and every blob it names, through the registry's own data
+//!   plane ([`super::registry_client`]) — so the environment then holds the very image the
+//!   registry holds, and a pull no policy in force lets the build's role make downloads
+//!   nothing;
+//! * `docker push` UPLOADS an image to the repository its reference names: each blob
 //!   through the registry's layer-upload calls and then the manifest through `PutImage`, so
 //!   the repository really holds the image once the command has exited 0 — and a push the
 //!   registry refused, or one no policy in force lets the build's role make (the role's own
 //!   documents and the repository's own policy decided together, `super::build_tools`), exits
 //!   non-zero with nothing uploaded.
 //!
-//! A reference is `[<registry>/]<repository>[:<tag>]`, and a push addresses the registry its
-//! own reference names: this environment reaches the registries of THIS emulator, and the
-//! LOGIN is what says a host is one of them — a login only records a registry whose own
-//! authorization token it presented — so a push to a host nothing logged in to is refused the
-//! way a push with no credential is.
+//! A reference is `[<registry>/]<repository>[:<tag>]`, and a push or a pull addresses the
+//! registry its own reference names: this environment reaches the registries of THIS emulator,
+//! and the LOGIN is what says a host is one of them — a login only records a registry whose
+//! own authorization token it presented — so a transfer to or from a host nothing logged in to
+//! is refused the way one with no credential is.
 //!
-//! Every other command of the CLI, and every form of these four that carries an option they
+//! Every other command of the CLI, and every form of these five that carries an option they
 //! do not take, is an invocation this program performs nothing of — the session reports it as
 //! a command it could not run.
 
 use super::container_image::{self, LocalImage};
+use super::registry_client;
 use super::{
     answered, service_answered, BuildTools, DOCKER_FAILED, MAX_LOCAL_IMAGES, PROGRAM_SUCCEEDED,
 };
@@ -63,6 +71,12 @@ const PUSH_ACTIONS: [&str; 4] = [
     "ecr:CompleteLayerUpload",
     "ecr:PutImage",
 ];
+
+/// The IAM actions a pull performs on the repository it addresses, in the order the pull
+/// performs them: the manifest it starts from and then the layers that manifest names (the
+/// pulling permissions the Amazon ECR User Guide lists for a repository, beside the
+/// registry-wide login the pull presents).
+const PULL_ACTIONS: [&str; 2] = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"];
 
 /// What one `docker` command line asks for — `None` for every invocation this program
 /// performs nothing of.
@@ -101,11 +115,16 @@ enum Requested {
         /// The image being pushed.
         reference: String,
     },
+    /// `pull`: download the image a reference names out of the repository it names.
+    Pull {
+        /// The image being pulled.
+        reference: String,
+    },
 }
 
 /// What the words of a `docker` command line ask for.
 ///
-/// The options read are the ones these four commands take and nothing else: a line carrying
+/// The options read are the ones these five commands take and nothing else: a line carrying
 /// any other option changes what the command does, so it is an invocation this program
 /// performs nothing of.
 fn requested(arguments: &[String]) -> Option<Requested> {
@@ -193,6 +212,14 @@ fn requested(arguments: &[String]) -> Option<Requested> {
                 reference: reference.to_string(),
             })
         }
+        "pull" => {
+            let [reference] = operands[..] else {
+                return None;
+            };
+            Some(Requested::Pull {
+                reference: reference.to_string(),
+            })
+        }
         _ => None,
     }
 }
@@ -237,6 +264,7 @@ pub(super) fn performed(
         ),
         Requested::Tag { source, target } => tagged(tools, &source, &target),
         Requested::Push { reference } => pushed(tools, &reference),
+        Requested::Pull { reference } => pulled(tools, &reference),
     })
 }
 
@@ -265,11 +293,12 @@ fn logged_in(tools: &BuildTools, registry: &str, presented: &str) -> ProgramOutc
     tools
         .state()
         .logins
-        .insert(registry_host(registry).to_string());
+        .insert(registry_host(registry).to_string(), presented.to_string());
     answered(PROGRAM_SUCCEEDED, vec!["Login Succeeded".to_string()])
 }
 
-/// `docker build`: compose the image the Dockerfile and the context name, and hold it under
+/// `docker build`: compose the image the Dockerfile and the context name, ON the base that
+/// Dockerfile's own `FROM` names where this environment holds it, and hold the result under
 /// each reference the command tags it with.
 fn built(
     tools: &BuildTools,
@@ -286,7 +315,24 @@ fn built(
         },
         str::to_string,
     );
-    let image = match container_image::composed(files, context, &dockerfile, build_arguments) {
+    // The image the build is built ON: the one this environment HOLDS under the reference the
+    // document's `FROM` names — which a `docker pull` is what puts there. Two cases answer
+    // `None` here and they are different in kind: a `FROM` naming no image of a registry
+    // (`scratch`, which IS no base, and a managed image this environment holds nothing of),
+    // and a registry reference nothing pulled. Neither is a refusal, because nothing in this
+    // emulator fetches an image off it ([`super::container_image`]): the build then carries
+    // its own context as its single layer.
+    let base = container_image::declared_base(files, &dockerfile, build_arguments)
+        .as_deref()
+        .and_then(Reference::parse)
+        .and_then(|base| tools.state().images.get(&base.held()).cloned());
+    let image = match container_image::composed(
+        files,
+        context,
+        &dockerfile,
+        build_arguments,
+        base.as_ref(),
+    ) {
         Ok(image) => image,
         Err(detail) => return tools.refused(DOCKER_PROGRAM, &detail, DOCKER_FAILED),
     };
@@ -385,7 +431,7 @@ fn pushed(tools: &BuildTools, reference: &str) -> ProgramOutcome {
             DOCKER_FAILED,
         );
     };
-    if !tools.state().logins.contains(&registry) {
+    if !tools.state().logins.contains_key(&registry) {
         // A push to Amazon ECR presents the credential a login recorded; a daemon holding
         // none for the registry has nothing to present. It is also what says the registry
         // the push addresses is one of THIS emulator's: a login only records a registry
@@ -414,27 +460,127 @@ fn pushed(tools: &BuildTools, reference: &str) -> ProgramOutcome {
         }
     }
     match uploaded(tools, &region, &reference, &image) {
-        Ok(digest) => answered(
-            PROGRAM_SUCCEEDED,
-            vec![
-                format!(
-                    "The push refers to repository [{registry}/{}]",
-                    reference.repository
-                ),
-                format!("{}: Pushed", short_digest(&image.layer_blob().1)),
-                format!(
-                    "{}: digest: {digest} size: {}",
-                    reference.tag,
-                    image.manifest().len()
-                ),
-            ],
-        ),
+        Ok(digest) => {
+            let mut written = vec![format!(
+                "The push refers to repository [{registry}/{}]",
+                reference.repository
+            )];
+            // One line per layer the push sent, as the CLI reports each.
+            written.extend(
+                image
+                    .layer_blobs()
+                    .iter()
+                    .map(|(_blob, digest)| format!("{}: Pushed", short_digest(digest))),
+            );
+            written.push(format!(
+                "{}: digest: {digest} size: {}",
+                reference.tag,
+                image.manifest().len()
+            ));
+            answered(PROGRAM_SUCCEEDED, written)
+        }
         Err(detail) => tools.refused(DOCKER_PROGRAM, &detail, DOCKER_FAILED),
     }
 }
 
+/// `docker pull`: download the image `reference` names out of the repository of the registry
+/// it names, and hold it under that reference.
+fn pulled(tools: &BuildTools, reference: &str) -> ProgramOutcome {
+    let Some(reference) = Reference::parse(reference) else {
+        return tools.refused(
+            DOCKER_PROGRAM,
+            &format!("invalid reference format: {reference}"),
+            DOCKER_FAILED,
+        );
+    };
+    let Some(registry) = reference.registry.clone() else {
+        return tools.refused(
+            DOCKER_PROGRAM,
+            &format!(
+                "Error response from daemon: pull access denied for {}: this build environment \
+                 reaches no registry outside this emulator",
+                reference.repository
+            ),
+            DOCKER_FAILED,
+        );
+    };
+    // A pull from a private registry presents the credential a login recorded, which is also
+    // what says the registry it addresses is one of THIS emulator's ([`logged_in`]).
+    let Some(password) = tools.state().logins.get(&registry).cloned() else {
+        return tools.refused(
+            DOCKER_PROGRAM,
+            &format!(
+                "Error response from daemon: pull access denied for {}, repository does not \
+                 exist or may require 'docker login'",
+                reference.image()
+            ),
+            DOCKER_FAILED,
+        );
+    };
+    // WHICH registry: the Region the host names when it is one Amazon ECR publishes, and
+    // otherwise the Region the build itself runs in — the same reading a push takes of the
+    // host it addresses.
+    let region = registry_region(&registry).unwrap_or_else(|| tools.region.clone());
+    let repository_arn = BuildTools::repository_arn(&region, &reference.repository);
+    // The two documents that can allow a pull of this repository decide it together, exactly
+    // as they decide a push: the role's own identity-based policies and the repository's own
+    // resource-based policy, read once through the service that owns it.
+    let shared = tools.repository_policy(&region, &reference.repository);
+    for action in PULL_ACTIONS {
+        if let Some(denial) = tools.withheld_with_shared(action, &repository_arn, shared.as_ref()) {
+            return tools.refused(DOCKER_PROGRAM, &format!("denied: {denial}"), DOCKER_FAILED);
+        }
+    }
+    // What this environment may still hold: the image a pull delivers is held for the length
+    // of the build, so a pull past that bound is refused rather than fetched.
+    {
+        let state = tools.state();
+        if state.images.len() >= MAX_LOCAL_IMAGES && !state.images.contains_key(&reference.held())
+        {
+            return tools.refused(
+                DOCKER_PROGRAM,
+                &format!("no space left on device: a build holds at most {MAX_LOCAL_IMAGES} images"),
+                DOCKER_FAILED,
+            );
+        }
+    }
+    let pulled = match registry_client::fetched(
+        tools,
+        &registry,
+        &password,
+        &reference.repository,
+        &reference.tag,
+    ) {
+        Ok(pulled) => pulled,
+        Err(detail) => return tools.refused(DOCKER_PROGRAM, &detail, DOCKER_FAILED),
+    };
+    let mut written = vec![format!(
+        "{}: Pulling from {}",
+        reference.tag, reference.repository
+    )];
+    written.extend(
+        pulled
+            .image
+            .layer_blobs()
+            .iter()
+            .map(|(_blob, digest)| format!("{}: Pull complete", short_digest(digest))),
+    );
+    written.push(format!("Digest: {}", pulled.digest));
+    written.push(format!(
+        "Status: Downloaded newer image for {}",
+        reference.held()
+    ));
+    tools.state().images.insert(reference.held(), pulled.image);
+    answered(PROGRAM_SUCCEEDED, written)
+}
+
 /// Upload `image`'s blobs and then its manifest, and answer the digest the registry stored
 /// the image under.
+///
+/// What the repository ALREADY holds is not sent again — a blob it holds, and the very image
+/// under the very reference this push addresses — because that is what the registry's own
+/// refusal of each says, and a push with nothing left to send has delivered what it
+/// addressed. Every other refusal is the push's failure.
 fn uploaded(
     tools: &BuildTools,
     region: &str,
@@ -443,11 +589,11 @@ fn uploaded(
 ) -> Result<String, String> {
     // Every blob the manifest references has to be in the repository before the manifest is
     // pushed: "after you upload the image layers, the PutImage API is called once".
-    for (blob, _) in [image.config_blob(), image.layer_blob()] {
+    for (blob, _digest) in ::std::iter::once(image.config_blob()).chain(image.layer_blobs()) {
         pushed_blob(tools, region, &reference.repository, blob)?;
     }
     tools.made(|| async {
-        let answer = tools
+        match tools
             .ecr(region)
             .put_image()
             .repository_name(&reference.repository)
@@ -456,13 +602,70 @@ fn uploaded(
             .image_tag(&reference.tag)
             .send()
             .await
-            .map_err(|error| service_answered("PutImage", &error))?;
-        answer
-            .image()
-            .and_then(|image| image.image_id())
-            .and_then(|id| id.image_digest.clone())
-            .ok_or_else(|| "The PutImage operation answered no image digest".to_string())
+        {
+            Ok(answer) => answer
+                .image()
+                .and_then(|image| image.image_id())
+                .and_then(|id| id.image_digest.clone())
+                .ok_or_else(|| "The PutImage operation answered no image digest".to_string()),
+            // The repository ALREADY holds this very image under this very reference, which
+            // is what the registry's refusal of the manifest says — the same reading the
+            // layers get ([`pushed_blob`]): there was nothing left for this push to send. What
+            // the repository SERVES for the reference is what says so, so it is read back
+            // before the push reports it delivered ([`delivered`]); a reference holding
+            // another image is a different refusal and the push fails on that.
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(|service| service.is_image_already_exists_exception()) =>
+            {
+                delivered(tools, region, reference, image).await
+            }
+            Err(error) => Err(service_answered("PutImage", &error)),
+        }
     })
+}
+
+/// The digest the repository SERVES for `reference`, when that is `image`'s own — the read
+/// that confirms a push the registry answered had nothing to send really delivered what the
+/// command addressed.
+///
+/// `Err` carries what the command reports instead: the read's own refusal, and a reference the
+/// repository resolves to another image, which is not the image this push addressed.
+async fn delivered(
+    tools: &BuildTools,
+    region: &str,
+    reference: &Reference,
+    image: &LocalImage,
+) -> Result<String, String> {
+    let digest = container_image::content_digest(image.manifest().as_bytes());
+    let served = tools
+        .ecr(region)
+        .batch_get_image()
+        .repository_name(&reference.repository)
+        .image_ids(
+            ::aws_sdk_ecr::types::ImageIdentifier::builder()
+                .image_tag(&reference.tag)
+                .build(),
+        )
+        .send()
+        .await
+        .map_err(|error| service_answered("BatchGetImage", &error))?;
+    let held = served
+        .images()
+        .first()
+        .and_then(|held| held.image_id())
+        .and_then(|id| id.image_digest.clone());
+    if held.as_deref() == Some(digest.as_str()) {
+        return Ok(digest);
+    }
+    Err(format!(
+        "Error response from daemon: the repository {} holds {} under {}, not the image this \
+         push addressed",
+        reference.repository,
+        held.unwrap_or_else(|| "no image".to_string()),
+        reference.tag
+    ))
 }
 
 /// Upload ONE blob of an image into `repository`, and answer the digest the registry
@@ -694,7 +897,7 @@ mod tests {
         }
     }
 
-    /// RULE: only the four commands this environment performs are performed, in the forms
+    /// RULE: only the five commands this environment performs are performed, in the forms
     /// they take.
     ///
     /// The rows differ along what the rule generalises over: which command is named, how its
@@ -827,7 +1030,24 @@ mod tests {
                     reference: "registry.example/app:v1".to_string(),
                 }),
             ),
-            ("another command of the CLI", vec!["pull", "app:v1"], None),
+            (
+                "a pull",
+                vec!["pull", "registry.example/app:v1"],
+                Some(Requested::Pull {
+                    reference: "registry.example/app:v1".to_string(),
+                }),
+            ),
+            (
+                "a pull naming two references",
+                vec!["pull", "registry.example/app:v1", "registry.example/app:v2"],
+                None,
+            ),
+            (
+                "a pull carrying an option this program does not take",
+                vec!["pull", "--all-tags", "registry.example/app"],
+                None,
+            ),
+            ("another command of the CLI", vec!["images"], None),
             ("no command at all", vec![], None),
         ];
         for (case, words, expected) in rows {
