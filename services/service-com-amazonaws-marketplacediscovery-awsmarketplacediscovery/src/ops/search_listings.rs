@@ -189,8 +189,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = store.lock();
 
         // Where the addresses this response announces — each summary's logo thumbnail and the
-        // reviews page of each review source that keeps one — are served: the endpoint THIS
-        // request reached the emulator at, because this emulator serves those pages itself.
+        // reviews page of each review source that keeps one — are served: the address THIS
+        // process answers requests at, because this emulator serves those pages itself.
         let announced = crate::state::announced_page_base(ctx);
 
         let locale = crate::state::resolve_requested_locale(input.locale.as_deref())

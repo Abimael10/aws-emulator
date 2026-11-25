@@ -4,7 +4,7 @@
 //! listing or product, and the reviews page a review source keeps for a listing.
 //!
 //! The rule under test: a URL this service hands a client to FETCH is an address THIS emulator
-//! serves — the endpoint the request reached it at, followed by a path minted from the
+//! serves — the address this process answers requests at, followed by a path minted from the
 //! record's own stored media — and an OPTIONAL one is announced only for a record that holds
 //! the media it names. So:
 //!
@@ -42,8 +42,8 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 
 /// The endpoint bases this emulator can report as its own: the forms a data port is published
 /// at, plus the base of an emulator served on no port at all (embedded in another process, or
-/// a test). One row each, because an address a record publishes has to follow whichever one the
-/// request that read it reached this emulator at.
+/// a test). One row each, because an address a record publishes has to follow the base this
+/// process is served at.
 pub(crate) const ENDPOINT_BASES: [&str; 4] = [
     "https://127.0.0.1:9297",
     "https://localhost:39355",
@@ -222,8 +222,8 @@ pub(crate) fn review_source(body: &Value) -> Option<(Value, Option<String>)> {
 }
 
 /// RULE: `logoThumbnailUrl` is the address THIS emulator serves that record's logo image at —
-/// the endpoint the request reached it at, followed by the path of the media record the catalog
-/// holds for the listing — and a fetch of it is answered here with a PNG.
+/// the address this process answers requests at, followed by the path of the media record the
+/// catalog holds for the listing — and a fetch of it is answered here with a PNG.
 ///
 /// Rows: every summary of a whole catalog page (hand-written records and derived ones, across
 /// every tier), each of the endpoint bases this emulator can be reached at.

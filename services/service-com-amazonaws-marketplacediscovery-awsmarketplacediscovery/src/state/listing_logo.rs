@@ -8,16 +8,16 @@
 //! listing" (`smithy_query(query="shape",shape="ListingSummary")`) — an address a client
 //! that renders a result tile FETCHES next, rather than a value it displays. AWS serves it
 //! off the marketplace's own media host, which this emulator neither owns nor is reached on,
-//! so what it publishes is an address of its OWN: the endpoint the request being answered
-//! reached this emulator at ([`announced_page_base`]) followed by the path minted here, which
-//! `crate::service` answers with the image.
+//! so what it publishes is an address of its OWN: the address this process answers requests
+//! at ([`announced_page_base`]) followed by the path minted here, which `crate::service`
+//! answers with the image.
 //!
 //! The per-record part of that address is the MEDIA RECORD the catalog holds for the record's
 //! logo ([`LogoMedia`]) — one media id per listing, minted over the listing's own id and
 //! carrying none of the text the listing is displayed by — so no absolute URL is stored for a
-//! logo at all: the host is whatever this emulator is reached on at the moment of the read,
-//! and the path is the record's. A URL published on any other host is one a client can render
-//! but never dereference.
+//! logo at all: the authority is the one this process answers requests at, read at the moment
+//! of the read, and the path is the record's. A URL published on any other address is one a
+//! client can render but never dereference.
 //!
 //! The image served there is the one every service that publishes a picture of a record it
 //! holds no uploaded bytes for serves (`service_common::record_identicon`), derived from that
@@ -79,8 +79,7 @@ impl LogoMedia {
         &self.media_id
     }
 
-    /// Where a client fetches this logo, for a caller that reached this emulator at
-    /// `endpoint_base`.
+    /// Where a client fetches this logo, for a response announced on `endpoint_base`.
     #[must_use]
     pub fn announced(&self, endpoint_base: &str) -> String {
         logo_url(endpoint_base, &self.media_id)

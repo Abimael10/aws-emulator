@@ -3,7 +3,7 @@
 //! The addresses a SEARCH PAGE announces, page by page and refinement by refinement.
 //!
 //! The rule under test: the addresses a listing summary publishes for a client to FETCH are
-//! read off that LISTING's own record and the endpoint the request reached this emulator at,
+//! read off that LISTING's own record and the address this process answers requests at,
 //! so they depend on neither the page a summary is served on, the page size it was asked for,
 //! nor the query that selected it:
 //!
@@ -199,8 +199,8 @@ async fn catalog_addresses(
         // text the listing is displayed by (the defect published `…/logos/<name slug>.png`).
         assert!(
             got.logo.starts_with(endpoint),
-            "case {base:?} {listing_id}: an announced address must begin with the endpoint this \
-             request reached this emulator at, got {:?}",
+            "case {base:?} {listing_id}: an announced address must begin with the address this \
+             process answers requests at, got {:?}",
             got.logo
         );
         let name = text(&summary, "listingName");
@@ -231,7 +231,7 @@ async fn catalog_addresses(
                 assert!(
                     url.starts_with(endpoint),
                     "case {base:?} {listing_id}: an announced address must begin with the \
-                     endpoint this request reached this emulator at, got {url:?}"
+                     address this process answers requests at, got {url:?}"
                 );
                 assert_record_part_names_no_listing_text(base, &listing_id, &name, url, 1);
                 for host in UNSERVED_HOSTS {

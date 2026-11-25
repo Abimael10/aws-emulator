@@ -20,8 +20,8 @@
 //! * the addresses a record publishes for a client to FETCH — its logo thumbnail image
 //!   ([`listing_logo`]) and the reviews page of a review source ([`listing_reviews`]), beside
 //!   the buyer-facing pages of a SaaS fulfillment option ([`saas_fulfillment`]) — each
-//!   announced on the endpoint the request reached this emulator at and served by
-//!   `crate::service`;
+//!   announced on the address this process answers requests at ([`announced_page_base`]) and
+//!   served by `crate::service`;
 //! * the listing match set `SearchListings` pages over and `SearchFacets` counts facets
 //!   from ([`ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState::search_matches`],
 //!   [`matches_every_search_filter`]);
@@ -42,6 +42,10 @@ mod taxonomy_features;
 /// names, and the addresses it announces them at.
 mod saas_fulfillment;
 
+/// The scheme and authority every address this service publishes for a client to FETCH is
+/// announced on: the one this process answers requests at.
+mod announced_address;
+
 /// The media record a catalog record's logo thumbnail is held as, the address this emulator
 /// announces it at, and the image it serves there.
 mod listing_logo;
@@ -56,8 +60,10 @@ mod page_cursor;
 
 pub use page_cursor::{decode_page_token, encode_page_token, page, PageCursorKey};
 
+pub use announced_address::announced_page_base;
+
 pub use saas_fulfillment::{
-    announced_page_base, saas_page_not_found_page, saas_page_path, saas_page_route, saas_page_url,
+    saas_page_not_found_page, saas_page_path, saas_page_route, saas_page_url,
     SaasPage, SaasServedPages, SAAS_FULFILLMENT_PLANE_SEGMENT, SAAS_PAGE_MEDIA_TYPE,
 };
 
@@ -373,8 +379,8 @@ impl FulfillmentOptionRecord {
             .clone()
     }
 
-    /// This option in `locale` as it is ANNOUNCED to a caller that reached this emulator at
-    /// `endpoint_base`: the stored option with each buyer-facing page the record names
+    /// This option in `locale` as it is ANNOUNCED on `endpoint_base`: the stored option with
+    /// each buyer-facing page the record names
     /// carried as the address this emulator serves that page at
     /// ([`saas_page_url`]), and no such member at all for a record that names none.
     ///
@@ -482,8 +488,8 @@ pub struct Listing {
     pub listing_id: String,
     pub text: Localized,
     /// The media record the catalog holds for this listing's logo thumbnail. The ADDRESS it
-    /// is announced at is composed per read, from the endpoint the request reached this
-    /// emulator at ([`LogoMedia::announced`]), because that is where the image is served.
+    /// is announced at is composed per read, from the address this process answers requests
+    /// at ([`LogoMedia::announced`]), because that is where the image is served.
     pub logo: LogoMedia,
     pub integration_guide: Option<String>,
     pub categories: Vec<Category>,
@@ -578,7 +584,7 @@ impl Product {
 
     /// This product's fulfillment options in `locale`, ordered by `fulfillmentOptionId`
     /// so every page of `ListFulfillmentOptions` is cut from one stable total order, each
-    /// announced to a caller that reached this emulator at `endpoint_base`
+    /// announced on `endpoint_base`
     /// ([`FulfillmentOptionRecord::announced`]).
     pub fn fulfillment_options(&self, locale: &str, endpoint_base: &str) -> Vec<FulfillmentOption> {
         let mut records: Vec<&FulfillmentOptionRecord> = self.fulfillment_options.iter().collect();
@@ -801,12 +807,13 @@ impl ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState {
     }
 
     /// The listing summary `SearchListings` returns for `listing`, in `preferred` locale, as
-    /// it is ANNOUNCED to a caller that reached this emulator at `endpoint_base`.
+    /// it is ANNOUNCED on `endpoint_base`.
     ///
     /// `logoThumbnailUrl` and the `sourceUrl` of each review source are the two members a
     /// client FETCHES rather than displays, so they have to lead back to this emulator: each
     /// is composed here from the record's own stored media ([`LogoMedia::announced`]) and
-    /// reviews ([`ReviewRecord::announced`]) at the endpoint this request arrived on, and
+    /// reviews ([`ReviewRecord::announced`]) on the address this process answers requests at,
+    /// and
     /// `sourceUrl` is absent for a source the record keeps no reviews page for. Every other
     /// member is the stored record's, unchanged ([`Self::listing_content`]).
     pub fn listing_summary(
@@ -830,8 +837,8 @@ impl ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState {
     /// `preferred` locale.
     ///
     /// The two members that are ADDRESSES this emulator serves are left at their default
-    /// here, because what they are depends on the endpoint the request being answered reached
-    /// this emulator at, which only [`Self::listing_summary`] is handed — so this projection
+    /// here, because what they are depends on the address this process answers requests at,
+    /// which only [`Self::listing_summary`] is handed — so this projection
     /// is never served to a client on its own. It exists because the keyword haystack
     /// ([`Self::search_haystack`]) reads the summary's TEXT and no address.
     fn listing_content(&self, listing: &Listing, preferred: &'static str) -> ListingSummary {
@@ -2116,9 +2123,9 @@ fn saas_option(
             fulfillment_option_id: id.to_string(),
             fulfillment_option_type: "SAAS".to_string(),
             fulfillment_option_display_name: fulfillment_option_display_name("SAAS"),
-            // Both addresses are filled in where the option is announced, from the endpoint
-            // the request that reads it reached this emulator at: a page is served HERE, and
-            // the address it is served at is not known at seeding time.
+            // Both addresses are filled in where the option is announced, from the address
+            // this process answers requests at: a page is served HERE, and the address it is
+            // served at is not known at seeding time.
             fulfillment_url: None,
             usage_instructions: usage_instructions.map(ToString::to_string),
             available_from_time: Some(datetime(available_from)),

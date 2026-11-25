@@ -207,7 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // documentation).
         let locale = product.text.content_locale(preferred);
         // The buyer-facing addresses a SaaS option announces are served by THIS emulator, so
-        // they are built from the address this request reached it at
+        // they are built from the address this process answers requests at
         // (`crate::state::announced_page_base`) rather than stored.
         let options =
             product.fulfillment_options(locale, &crate::state::announced_page_base(ctx));

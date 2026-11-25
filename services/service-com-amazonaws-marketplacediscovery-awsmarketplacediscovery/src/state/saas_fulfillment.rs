@@ -8,10 +8,10 @@
 //! `launchUrl`, "The URL that a buyer uses to launch the seller's SaaS product"
 //! (`smithy_query(query="shape",shape="SaasFulfillmentOption")`). AWS serves them on the
 //! seller's own hosts, which this emulator neither owns nor answers on, so what it publishes
-//! is an address of its OWN: the endpoint a request reached it at
-//! ([`::smithy_server_runtime::OperationContext::endpoint`]) followed by the path minted
-//! here, which `crate::service` answers from the stored record. A URL published on any other
-//! host is one the client can render but never dereference.
+//! is an address of its OWN: the address this process answers requests at
+//! ([`super::announced_page_base`]) followed by the path minted here, which `crate::service`
+//! answers from the stored record. A URL published on any other address is one the client can
+//! render but never dereference.
 //!
 //! Which of the two pages an option has is a property of its RECORD
 //! ([`SaasServedPages`]), so the option announces exactly the pages the catalog holds for it
@@ -109,28 +109,6 @@ pub fn saas_page_url(endpoint_base: &str, fulfillment_option_id: &str, page: Saa
         endpoint_base.trim_end_matches('/'),
         saas_page_path(fulfillment_option_id, page)
     )
-}
-
-/// The base URL the pages of a fulfillment option are ANNOUNCED on, for the request `ctx` is
-/// answering: the address that request reached this emulator at.
-///
-/// The reading is `service_common::data_plane_addressing`'s, in the order every address this
-/// emulator announces for a plane served at its own front door is taken in, so this service
-/// cannot drift from the others on which address that is: the emulator's OWN endpoint the
-/// request addressed (a caller that resolves nothing else), else the port this process is
-/// served on (so an address minted through an in-process call of another service is one that
-/// service's caller can reach too), else the base `OperationContext::endpoint` reports for an
-/// emulator served on no port at all. The scheme is the one every listener of this process
-/// presents a certificate for, whatever the endpoint base is written as.
-pub fn announced_page_base(ctx: &::smithy_server_runtime::OperationContext<'_>) -> String {
-    use ::service_common::data_plane_addressing::{
-        reached_emulator_endpoint_of_parts, served_endpoint_authority, url_authority,
-    };
-    let base = ctx.endpoint();
-    let authority = reached_emulator_endpoint_of_parts(ctx.parts())
-        .or_else(|| served_endpoint_authority(base.as_str()))
-        .unwrap_or_else(|| url_authority(base.as_str()).trim_end_matches('/').to_string());
-    format!("https://{authority}")
 }
 
 /// The fulfillment option and page a request `uri` addresses, for a path of the form

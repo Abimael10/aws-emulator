@@ -18,9 +18,9 @@
 //! `ReviewSourceId` declares exactly one value, `AWS_MARKETPLACE`
 //! (`smithy_query(query="shape",shape="ReviewSourceId")`) — the marketplace this emulator
 //! stands in for. So the page its reviews are read at is a page of THIS emulator's, announced
-//! on the endpoint the request being answered reached it at ([`announced_page_base`]) and
-//! served by `crate::service` from the stored record, exactly as the buyer-facing pages of a
-//! SaaS fulfillment option are ([`super::saas_fulfillment`]).
+//! on the address this process answers requests at ([`announced_page_base`]) and served by
+//! `crate::service` from the stored record, exactly as the buyer-facing pages of a SaaS
+//! fulfillment option are ([`super::saas_fulfillment`]).
 
 use super::saas_fulfillment::{escaped, request_target_path};
 use super::*;
@@ -68,8 +68,8 @@ pub fn reviews_list_id(listing_id: &str, source_id: &str) -> String {
 /// What a listing's review sources hold for it, as the catalog stores it.
 ///
 /// The stored summary carries NO `sourceUrl`: where a source's reviews are read is an address
-/// this emulator serves, which only the request being answered knows the host of, so it is
-/// composed when the record is announced ([`Self::announced`]) and never stored. Which
+/// this emulator serves, which only the response being composed knows the authority of, so it
+/// is composed when the record is announced ([`Self::announced`]) and never stored. Which
 /// sources keep a reviews page for the listing is the record's own
 /// ([`Self::reviews_lists`]), so a listing announces a reviews page exactly where the catalog
 /// holds one for it.
@@ -110,8 +110,8 @@ impl ReviewRecord {
         &self.summary
     }
 
-    /// This summary as it is ANNOUNCED to a caller that reached this emulator at
-    /// `endpoint_base`: each source's stored entry, carrying the address this emulator serves
+    /// This summary as it is ANNOUNCED on `endpoint_base`: each source's stored entry,
+    /// carrying the address this emulator serves
     /// that source's reviews page for this listing at — and no such member at all for a
     /// source the record keeps no page for.
     #[must_use]
