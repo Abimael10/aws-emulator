@@ -192,6 +192,12 @@ pub use extraction_jobs::*;
 mod memory_record_queries;
 pub use memory_record_queries::*;
 
+/// The RELEVANCE side of that same plane: [`MemoryRecordSearch`], how a search for a query
+/// ranks the records its scope selected, and [`ScoredMemoryRecord`], one ranked record with
+/// the score a search reports it with.
+mod memory_record_relevance;
+pub use memory_record_relevance::*;
+
 /// The payments plane: [`PaymentSessionRecord`], the payment sessions
 /// `CreatePaymentSession` opens under a payment manager and every later read of one reports.
 mod payment_sessions;

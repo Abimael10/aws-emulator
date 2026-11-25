@@ -179,6 +179,11 @@ async fn settled(observed: &Observed, case: &str, execution: &str) -> Value {
 ///
 /// The count is a FLOOR rather than the grade: a group holding more than the level selects
 /// is reported by the comparison the caller makes, not hidden by this wait.
+///
+/// A group the FIRST delivery into it has not created yet holds none of them, and CloudWatch
+/// Logs refuses a read of a group it does not hold, so the group's existence is what this
+/// looks for first: the wait is on the CONDITION either way, and the delivery owed by the
+/// clock creates the group as it lands.
 async fn delivered_for(
     observed: &Observed,
     case: &str,

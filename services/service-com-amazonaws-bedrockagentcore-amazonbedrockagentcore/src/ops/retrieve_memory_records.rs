@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RetrieveMemoryRecords
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RetrieveMemoryRecords`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RetrieveMemoryRecords::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SEARCHES a memory container's LONG-TERM memory records for the ones a query is about,
+//! and reports them ranked by how relevant each one is to it.
+//!
+//! A record is written by `BatchCreateMemoryRecords` and lives in the container
+//! ([`crate::state::StoredMemoryRecord`]), so this search computes its answer from what was
+//! stored: the container's records, narrowed by the namespace scope, the strategy
+//! association and the metadata expressions the request carries — the SAME narrowing
+//! `ListMemoryRecords` applies ([`crate::state::MemoryRecordSelection`]) — then ranked
+//! against `searchCriteria.searchQuery` by the share of the query's terms each record's own
+//! content carries ([`crate::state::MemoryRecordSearch`]), the most relevant first, at most
+//! `searchCriteria.topK` of them, in pages of `maxResults`.
+//!
+//! It reports nothing it did not read and no relevance it did not measure: a record sharing
+//! no term with the query is no match for it, a container holding no record the request's
+//! scope selects is an EMPTY page rather than a refusal, and a `memoryId` naming no
+//! container at all is refused at the container level, exactly as `GetMemoryRecord` refuses
+//! it.
+//!
+//! What one search is allowed to cost is bounded before the store is taken: the query's
+//! size is refused past this plane's stated ceilings
+//! ([`crate::state::checked_search_query`]) and the records it then reads are the
+//! container's own capped contents, so no factor of the work is one a request can grow —
+//! see the module docs of `crate::state::memory_record_relevance`.
 //!
 //! ## Shape of an operation
 //!
@@ -108,6 +123,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{MemoryRecordSearch, MemoryRecordSelection};
+
+/// The list this operation's `nextToken` belongs to, so a token minted by another
+/// paginated operation — a plain listing of the same records included — does not silently
+/// resume this search.
+const PAGE_KIND: &str = "retrievedMemoryRecords";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -182,18 +204,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RetrieveMemoryRecords` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RetrieveMemoryRecordsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RetrieveMemoryRecords"))
+        // IAM decides FIRST, ahead of the service resolving anything the request named:
+        // the resource this call addresses is the memory container the `memoryId` names and
+        // the namespace it asks for is published as the condition key AWS scopes this read
+        // by, both built from the request alone, so a caller no identity-based policy
+        // allows to search this container's records in that namespace is refused without
+        // being told whether it exists.
+        crate::state::authorize_memory(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::memory_arn(
+                &crate::state::request_region(ctx.parts()),
+                &input.memory_id,
+            ),
+            // The EXACT namespace the search asks for is the one value the key carries; a
+            // request narrowing by `namespacePath` asks for a whole hierarchy rather than
+            // one namespace, so it names none.
+            crate::state::AddressedNamespace::Named(input.namespace.as_deref()),
+        )
+        .map_err(RetrieveMemoryRecordsErrorModeled::AccessDeniedException)?;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RetrieveMemoryRecordsErrorModeled::ServiceException(ServiceException {
+                message: "the shared engine does not carry this service's state".to_string(),
+            })
+        })?;
+
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => crate::state::decode_next_token(PAGE_KIND, token).ok_or_else(|| {
+                RetrieveMemoryRecordsErrorModeled::ValidationException(ValidationException {
+                    message: "nextToken is not a token this operation issued".to_string(),
+                    reason: "CannotParse".to_string(),
+                    field_list: None,
+                })
+            })?,
+        };
+        // `@range(1..100)` on both members is refused at the boundary; the clamps keep this
+        // arithmetic total rather than restating that refusal.
+        let max_results = input.max_results.clamp(1, 100) as usize;
+        let top_k = input.search_criteria.top_k.clamp(1, 100) as usize;
+
+        let selection = MemoryRecordSelection {
+            namespace: input.namespace.as_deref(),
+            namespace_path: input.namespace_path.as_deref(),
+            memory_strategy_id: input.search_criteria.memory_strategy_id.as_deref(),
+            metadata_filters: input
+                .search_criteria
+                .metadata_filters
+                .as_deref()
+                .unwrap_or(&[]),
+        };
+        // A selection that cannot be evaluated as asked is refused whether or not the
+        // container holds any record.
+        selection.checked().map_err(|message| {
+            RetrieveMemoryRecordsErrorModeled::ValidationException(ValidationException {
+                message,
+                reason: "FieldValidationFailed".to_string(),
+                field_list: None,
+            })
+        })?;
+
+        // The QUERY is the caller's, and the ranking reads the container's records against
+        // it, so its size is bounded BEFORE any work proportional to it runs — and before
+        // the store is taken.
+        crate::state::checked_search_query(&input.search_criteria.search_query).map_err(
+            |message| {
+                RetrieveMemoryRecordsErrorModeled::ValidationException(ValidationException {
+                    message,
+                    reason: "FieldValidationFailed".to_string(),
+                    field_list: None,
+                })
+            },
+        )?;
+
+        // The OUTERMOST step of this path is the memory container, which is created
+        // through the CONTROL plane: whether the account holds one is resolved against the
+        // component that owns it, so a `memoryId` naming no container is refused rather
+        // than answered with an empty page. The inventory is read and released before this
+        // service's own store is taken, which is the lock order every reader of it keeps.
+        crate::state::memory_item_container_resolved(&*self.engine, &input.memory_id).map_err(
+            |missing| match missing {
+                Some(message) => RetrieveMemoryRecordsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(message),
+                    },
+                ),
+                None => RetrieveMemoryRecordsErrorModeled::ServiceException(ServiceException {
+                    message: "the shared engine does not carry the AgentCore resource inventory"
+                        .to_string(),
+                }),
+            },
+        )?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A record expiry is a time-to-live: a record the clock has already run out on is
+        // gone whether or not anybody searches for it, so it is not reported back.
+        store.expire_memory_records(now);
+
+        let ranked = store.retrieved_memory_records(
+            &input.memory_id,
+            &MemoryRecordSearch {
+                selection,
+                search_query: &input.search_criteria.search_query,
+                top_k,
+            },
+        );
+        // Rendered page-first: only the records of this page are cloned into the response,
+        // however many the ranking holds.
+        let (memory_record_summaries, next_token) =
+            crate::state::paginate_with(&ranked, PAGE_KIND, offset, max_results, |scored| {
+                scored.to_summary()
+            });
+
+        Ok(RetrieveMemoryRecordsOutput {
+            memory_record_summaries,
+            next_token,
+        })
     }
 }

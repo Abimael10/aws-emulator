@@ -108,6 +108,9 @@ service-com-amazonaws-bedrockruntime-amazonbedrockfrontendservice = { workspace 
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs`, so a new suite is picked up by being
+# there rather than by a hand-kept list.
+automod = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 # IAM and the token service, mounted beside this one in the test harness: the policies a
