@@ -1,20 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end cover for the BOUNDS of the retry policy inside a delivery policy
-//! document.
+//! End-to-end cover for the DOMAIN of the retry policy inside a delivery policy
+//! document: the numeric bounds of its counts and delays, and the closed vocabulary of
+//! its backoff curve.
 //!
 //! The RULE asserted here: a delivery policy is schema-validated when it is written, so
-//! every member of its retry policy is held to the bound SNS publishes for that member —
-//! a value outside it is refused `InvalidParameter` (HTTP 400) with a sentence naming the
-//! attribute, the member by the path the document writes it at, and the bound it crossed,
-//! and the value the record already held is still the one it reports. A value AT either
-//! published bound is accepted and reads back.
+//! every member of its retry policy is held to the domain SNS publishes for that member —
+//! a numeric member to its published bounds, and the backoff function to the published
+//! set of curve names — and a value outside that domain is refused `InvalidParameter`
+//! (HTTP 400) with a sentence naming the attribute, the member by the path the document
+//! writes it at, and the domain it left, while the value the record already held is still
+//! the one it reports. A value INSIDE the domain (at either published bound, or any
+//! published curve name) is accepted and reads back.
 //!
 //! The rows differ along what the rule generalises over: which retry member carries the
-//! value, which direction of its bound the value crosses (each published bound, and one
-//! past it), which DOCUMENT carries the retry policy — a subscription's own
+//! value, whether its domain is a numeric range or a closed set of names, which direction
+//! of its bound the value crosses (each published bound, and one past it) or how a name
+//! misses the vocabulary (an unpublished curve, a published one in another case, an empty
+//! name, a truncated one), which DOCUMENT carries the retry policy — a subscription's own
 //! `healthyRetryPolicy` and a topic's `http.defaultHealthyRetryPolicy` — and which
-//! operation carried the write (`Subscribe`, `SetSubscriptionAttributes`,
+//! operation carried the write (`Subscribe`, `SetSubscriptionAttributes`, `CreateTopic`,
 //! `SetTopicAttributes`).
 //!
 //! Every call goes over the wire through the router the emulator serves in production, so
@@ -471,6 +476,296 @@ async fn a_member_with_no_published_bound_is_accepted() {
         assert_eq!(
             status, 200,
             "case {case:?}: expected 200, got {status} / {code} {message}"
+        );
+    }
+}
+
+// =============================================================================
+// The backoff curve: a closed vocabulary rather than a numeric range
+// =============================================================================
+
+/// Every backoff curve SNS publishes for a retry policy's `backoffFunction`.
+///
+/// Source: the `backoffFunction` row of the SNS Developer Guide's delivery-policy table
+/// ("Amazon SNS message delivery retries"), which names the four retry-delay curves —
+/// arithmetic, exponential, geometric and linear — in the lower case the document writes
+/// them in. The rows below are therefore driven by the published catalog rather than by
+/// the one curve a recorded call used.
+const BACKOFF_FUNCTIONS: &[&str] = &["arithmetic", "exponential", "geometric", "linear"];
+
+/// Names that are NOT in that vocabulary, each missing it a different way: a curve SNS
+/// publishes no name for, a published name in another case, a truncation of one, and no
+/// name at all.
+const UNPUBLISHED_BACKOFF_FUNCTIONS: &[&str] =
+    &["quadratic", "cubic", "Exponential", "EXPONENTIAL", "expo", ""];
+
+/// The curve the control document every refusal below is measured against names.
+const CONTROL_BACKOFF_FUNCTION: &str = "exponential";
+
+/// Where a topic's EFFECTIVE delivery policy reports the curve its HTTP/S retries back
+/// off along.
+const EFFECTIVE_BACKOFF_POINTER: &str = "/http/defaultHealthyRetryPolicy/backoffFunction";
+
+/// A topic's delivery policy naming `function` as the curve its HTTP/S retries back off
+/// along, with every other member of the retry policy inside its published bounds, so the
+/// curve is the only thing a refusal can be about.
+fn topic_backoff_document(function: &str) -> String {
+    let numbers = concat!(
+        r#""minDelayTarget":5,"maxDelayTarget":60,"numRetries":7,"#,
+        r#""numMaxDelayRetries":2,"numNoDelayRetries":0,"numMinDelayRetries":1"#,
+    );
+    let retry = format!(r#"{{{numbers},"backoffFunction":"{function}"}}"#);
+    let http = format!(
+        r#"{{"defaultHealthyRetryPolicy":{retry},"disableSubscriptionOverrides":false}}"#
+    );
+    format!(r#"{{"http":{http}}}"#)
+}
+
+/// A subscription's delivery policy naming `function` as its curve, likewise with every
+/// numeric member inside its published bounds.
+fn subscription_backoff_document(function: &str) -> String {
+    format!(r#"{{"{SUBSCRIPTION_PATH}":{{"numRetries":7,"backoffFunction":"{function}"}}}}"#)
+}
+
+/// The clause a curve outside the published vocabulary is refused with: the member by the
+/// path the document writes it at, and the whole vocabulary, so the caller is told which
+/// value to change and what it may change it to.
+fn vocabulary_refusal(path: &str) -> String {
+    format!(
+        "{path}.backoffFunction must be one of {}",
+        BACKOFF_FUNCTIONS.join(", ")
+    )
+}
+
+/// The string `document` carries at `pointer`, or `None` when it carries none.
+fn string_at(document: &str, pointer: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(document)
+        .ok()?
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+/// A refused delivery policy: `InvalidParameter` at HTTP 400, naming the attribute and
+/// closing with the clause the member's domain states.
+fn assert_vocabulary_refusal(
+    case: &str,
+    (status, code, message): (u16, String, String),
+    clause: &str,
+) {
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected 400, got {status} / {code} {message}"
+    );
+    assert_eq!(
+        code, "InvalidParameter",
+        "case {case:?}: expected the InvalidParameter code, got {code} {message}"
+    );
+    assert!(
+        message.contains(ATTRIBUTE) && message.ends_with(clause),
+        "case {case:?}: expected a refusal naming {ATTRIBUTE} and ending {clause:?}, got \
+         {message:?}"
+    );
+}
+
+/// A TOPIC's retry policy takes only the published backoff curves: each of them is
+/// accepted and reaches the stored document and the effective policy computed from it,
+/// and a name outside the vocabulary is refused by both operations that write the
+/// attribute, leaving the document the topic already held — and the effective policy read
+/// from it — exactly as they were.
+#[tokio::test]
+async fn a_topics_backoff_function_must_be_one_of_the_published_curves() {
+    let sns = Sns::new();
+    let topic = sns.topic("topic-backoff-vocabulary").await;
+    let clause = vocabulary_refusal(TOPIC_PATH);
+
+    for function in BACKOFF_FUNCTIONS {
+        let case = format!("the published curve {function:?} on a topic");
+        let document = topic_backoff_document(function);
+        let (status, code, message) = set_topic(&sns, &topic, ATTRIBUTE, &document).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a published curve expected 200, got {status} / {code} {message}"
+        );
+        let held = topic_attributes(&sns, &topic).await;
+        assert_eq!(
+            held.get(ATTRIBUTE).map(String::as_str),
+            Some(document.as_str()),
+            "case {case:?}: the accepted document must read back, got {held:?}"
+        );
+        let reported = held
+            .get("EffectiveDeliveryPolicy")
+            .and_then(|policy| string_at(policy, EFFECTIVE_BACKOFF_POINTER));
+        assert_eq!(
+            reported.as_deref(),
+            Some(*function),
+            "case {case:?}: the accepted curve must reach the effective policy, got \
+             {reported:?}"
+        );
+    }
+
+    // The document the topic holds while every refusal below is attempted.
+    let held_document = topic_backoff_document(CONTROL_BACKOFF_FUNCTION);
+    let (status, code, message) = set_topic(&sns, &topic, ATTRIBUTE, &held_document).await;
+    assert_eq!(
+        status, 200,
+        "the control document expected 200, got {status} / {code} {message}"
+    );
+
+    for (index, function) in UNPUBLISHED_BACKOFF_FUNCTIONS.iter().enumerate() {
+        let case = format!("the unpublished curve {function:?} on a topic");
+        let document = topic_backoff_document(function);
+        assert_vocabulary_refusal(
+            &case,
+            set_topic(&sns, &topic, ATTRIBUTE, &document).await,
+            &clause,
+        );
+        let held = topic_attributes(&sns, &topic).await;
+        assert_eq!(
+            held.get(ATTRIBUTE).map(String::as_str),
+            Some(held_document.as_str()),
+            "case {case:?}: the refused write must leave the stored policy as it was, got \
+             {held:?}"
+        );
+        let reported = held
+            .get("EffectiveDeliveryPolicy")
+            .and_then(|policy| string_at(policy, EFFECTIVE_BACKOFF_POINTER));
+        assert_eq!(
+            reported.as_deref(),
+            Some(CONTROL_BACKOFF_FUNCTION),
+            "case {case:?}: the refused write must leave the effective policy as it was, got \
+             {reported:?}"
+        );
+
+        // `CreateTopic` holds the document to the same vocabulary, so a curve cannot be
+        // smuggled past it by the call that mints the topic — and the topic it names is
+        // not there to read afterwards.
+        let fresh = format!("created-backoff-{index:02}");
+        let created = sns
+            .call(
+                "CreateTopic",
+                &[
+                    ("Name", &fresh),
+                    ("Attributes.entry.1.key", ATTRIBUTE),
+                    ("Attributes.entry.1.value", &document),
+                ],
+            )
+            .await;
+        assert_vocabulary_refusal(
+            &format!("{case} through CreateTopic"),
+            (
+                created.status,
+                created.code(),
+                created.element("Message").unwrap_or_default(),
+            ),
+            &clause,
+        );
+        let listed = sns.call("ListTopics", &[]).await;
+        assert!(
+            !listed
+                .elements("TopicArn")
+                .iter()
+                .any(|arn| arn.ends_with(&format!(":{fresh}"))),
+            "case {case:?}: the refused CreateTopic must create no topic, got {}",
+            listed.body
+        );
+    }
+}
+
+/// A SUBSCRIPTION's own retry policy carries the same curve one level up, so the same
+/// vocabulary holds for it, on both operations that write the attribute, and a refusal
+/// stores nothing.
+#[tokio::test]
+async fn a_subscriptions_backoff_function_must_be_one_of_the_published_curves() {
+    let sns = Sns::new();
+    let topic = sns.topic("subscription-backoff-vocabulary").await;
+    let endpoint = "arn:aws:sqs:us-east-1:000000000000:subscription-backoff-vocabulary";
+    let arn = subscribe(&sns, "a backoff curve", &topic, endpoint).await;
+    let clause = vocabulary_refusal(SUBSCRIPTION_PATH);
+    let stored_pointer = format!("/{SUBSCRIPTION_PATH}/backoffFunction");
+
+    for function in BACKOFF_FUNCTIONS {
+        let case = format!("the published curve {function:?} on a subscription");
+        let document = subscription_backoff_document(function);
+        let (status, code, message) = set_subscription(&sns, &arn, ATTRIBUTE, &document).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a published curve expected 200, got {status} / {code} {message}"
+        );
+        let stored = subscription_attributes(&sns, &arn)
+            .await
+            .get(ATTRIBUTE)
+            .cloned()
+            .unwrap_or_default();
+        let reported = string_at(&stored, &stored_pointer);
+        assert_eq!(
+            reported.as_deref(),
+            Some(*function),
+            "case {case:?}: the accepted curve must read back, got {stored}"
+        );
+    }
+
+    let held_document = subscription_backoff_document(CONTROL_BACKOFF_FUNCTION);
+    let (status, code, message) = set_subscription(&sns, &arn, ATTRIBUTE, &held_document).await;
+    assert_eq!(
+        status, 200,
+        "the control document expected 200, got {status} / {code} {message}"
+    );
+
+    for (index, function) in UNPUBLISHED_BACKOFF_FUNCTIONS.iter().enumerate() {
+        let case = format!("the unpublished curve {function:?} on a subscription");
+        let document = subscription_backoff_document(function);
+        assert_vocabulary_refusal(
+            &case,
+            set_subscription(&sns, &arn, ATTRIBUTE, &document).await,
+            &clause,
+        );
+        let stored = subscription_attributes(&sns, &arn)
+            .await
+            .get(ATTRIBUTE)
+            .cloned()
+            .unwrap_or_default();
+        let reported = string_at(&stored, &stored_pointer);
+        assert_eq!(
+            reported.as_deref(),
+            Some(CONTROL_BACKOFF_FUNCTION),
+            "case {case:?}: the refused write must leave the stored policy as it was, got \
+             {stored}"
+        );
+
+        // `Subscribe` carries the attribute to the same vocabulary, on a subscription of
+        // its own so the write is the one being judged, and makes no subscription when it
+        // is refused.
+        let other = sns.topic(&format!("subscription-backoff-{index:02}")).await;
+        let answer = sns
+            .call(
+                "Subscribe",
+                &[
+                    ("TopicArn", &other),
+                    ("Protocol", "sqs"),
+                    ("Endpoint", endpoint),
+                    ("ReturnSubscriptionArn", "true"),
+                    ("Attributes.entry.1.key", ATTRIBUTE),
+                    ("Attributes.entry.1.value", &document),
+                ],
+            )
+            .await;
+        assert_vocabulary_refusal(
+            &format!("{case} through Subscribe"),
+            (
+                answer.status,
+                answer.code(),
+                answer.element("Message").unwrap_or_default(),
+            ),
+            &clause,
+        );
+        let listed = sns
+            .call("ListSubscriptionsByTopic", &[("TopicArn", &other)])
+            .await;
+        assert!(
+            listed.elements("SubscriptionArn").is_empty(),
+            "case {case:?}: the refused Subscribe must create no subscription, got {}",
+            listed.body
         );
     }
 }
