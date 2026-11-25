@@ -262,7 +262,9 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     // `AWS::ElasticLoadBalancingV2::ListenerRule` whose priority the listener already
     // evaluates a rule at carries it (`"<the service's sentence> (Service:
     // ElasticLoadBalancingV2, Status Code: 400, Request ID: …)"`, where Amazon Route 53's
-    // below carries `(SDK Attempt Count: …)` past the closing parenthesis).
+    // below carries `(SDK Attempt Count: …)` past the closing parenthesis). The LOAD
+    // BALANCER's own provider words the ATTEMPT-counting shape, which is recorded per provider
+    // ([`SDK_PROVIDER_SHAPES`]).
     (
         "elasticloadbalancing",
         "ElasticLoadBalancingV2",
@@ -897,11 +899,50 @@ const SDK_PROVIDER_SHAPES: &[(&str, &str, SdkDiagnostic)] = &[
         "ModifyMountTargetSecurityGroups",
         SdkDiagnostic::EnvelopeOnRefusedRequest,
     ),
+    // The `AWS::ElasticLoadBalancingV2::LoadBalancer` type's provider words the ATTEMPT-counting
+    // shape, where that service's entry above carries the bare envelope its LISTENER RULE
+    // provider words. Read from the recorded `ResourceStatusReason` of a load balancer whose
+    // declared `Scheme` is outside the set that member admits (in the behavioral corpus
+    // `simparity-behavioral-aws-v1`, check `cloudformation__cloudfront__ec2__elbv2.deploy-\
+    // loadbalancer-invalid-scheme-rejected`, whose reason reads `Resource handler returned
+    // message: "<the service's sentence> (Service: ElasticLoadBalancingV2, Status Code: 400,
+    // Request ID: …) (SDK Attempt Count: …)" (RequestToken: …, HandlerErrorCode:
+    // InvalidRequest)`). The rows beside the create are the same provider's other calls — the
+    // attributes it applies, the three placement calls an update makes and the delete — which
+    // word the shape it words; a recording of one of them is what would correct them.
+    (
+        "elasticloadbalancing",
+        "CreateLoadBalancer",
+        SdkDiagnostic::Attempts,
+    ),
+    (
+        "elasticloadbalancing",
+        "ModifyLoadBalancerAttributes",
+        SdkDiagnostic::Attempts,
+    ),
+    ("elasticloadbalancing", "SetSubnets", SdkDiagnostic::Attempts),
+    (
+        "elasticloadbalancing",
+        "SetSecurityGroups",
+        SdkDiagnostic::Attempts,
+    ),
+    (
+        "elasticloadbalancing",
+        "SetIpAddressType",
+        SdkDiagnostic::Attempts,
+    ),
+    (
+        "elasticloadbalancing",
+        "DeleteLoadBalancer",
+        SdkDiagnostic::Attempts,
+    ),
     // The calls that act on a listener's CERTIFICATE LIST are CloudFormation's own, not a
     // registry provider's: an `AWS::ElasticLoadBalancingV2::ListenerCertificate` is deployed by
     // a handler CloudFormation ships ([`provisioning::elbv2_listener_certificate`]), built
-    // against a generation of that service's SDK that words the PROXIED shape — where the four
-    // types that ARE resources of that service have providers wording its entry's bare envelope.
+    // against a generation of that service's SDK that words the PROXIED shape — where the
+    // providers of the types that ARE resources of that service word the two comma-separated
+    // shapes above: the load balancer's counts its SDK's attempts, and the other three word its
+    // entry's bare envelope.
     // Read from the recorded `ResourceStatusReason` of a `ListenerCertificate` pointed at a
     // well-formed certificate ARN that service resolves to nothing (in the behavioral corpus
     // `simparity-behavioral-aws-v1`, check `acm__cloudformation__ec2__elbv2.cfn-\
