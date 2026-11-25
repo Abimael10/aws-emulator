@@ -368,7 +368,8 @@ struct Row {
     failure: Failure,
     /// `MaximumRetryAttempts`: the attempts the pipe allows BEYOND the first.
     retries: i64,
-    /// The stage the record of the discarded batch must name.
+    /// The stage of the pipe that gave up on the batch, which the row's own assertions name
+    /// it by: the record of a discarded batch carries no such member of its own.
     stage: &'static str,
     /// Whether the failed stage's own resource named an error of its own.
     named_an_error: bool,
@@ -376,7 +377,8 @@ struct Row {
 
 /// RULE 1: a stream-sourced pipe attempts a batch it cannot move `MaximumRetryAttempts`
 /// times beyond the first and then discards it, sending the record of it to the destination
-/// its `DeadLetterConfig` names — a pointer at the discarded batch, never the records.
+/// its `DeadLetterConfig` names — a pointer at the discarded batch, never the records, whose
+/// `context` names the pipe that gave up and the condition it gave up under and nothing else.
 #[tokio::test]
 async fn a_batch_that_spends_its_retries_is_pointed_at_on_the_dead_letter_queue() {
     let rows: [Row; 3] = [
@@ -493,26 +495,13 @@ async fn a_batch_that_spends_its_retries_is_pointed_at_on_the_dead_letter_queue(
                 .is_some_and(|shard| shard.starts_with("shardId-")),
             "case {case:?}: expected the shard the batch was read from, got {letter}"
         );
+        // The WHOLE of the context object: the resource that gave up and the condition it
+        // gave up under, and no member beside them — so the stage that failed and the
+        // attempts the batch cost, which differ from row to row, reach it in no row.
         assert_eq!(
-            letter["context"]["pipeArn"],
-            json!(pipe_arn),
-            "case {case:?}: expected the pipe that gave up, got {letter}"
-        );
-        assert_eq!(
-            letter["context"]["condition"],
-            json!(RETRIES_EXHAUSTED),
-            "case {case:?}: expected the spent retries as the condition, got {letter}"
-        );
-        assert_eq!(
-            letter["context"]["stage"],
-            json!(row.stage),
-            "case {case:?}: expected the stage that gave up, got {letter}"
-        );
-        assert_eq!(
-            letter["context"]["approximateInvokeCount"],
-            json!(row.retries + 1),
-            "case {case:?}: expected {} attempt(s) at the batch, got {letter}",
-            row.retries + 1
+            letter["context"],
+            json!({ "partnerResourceArn": pipe_arn, "condition": RETRIES_EXHAUSTED }),
+            "case {case:?}: expected the pipe that gave up and why, got {letter}"
         );
         assert_eq!(
             letter["version"],
@@ -764,9 +753,9 @@ async fn a_dynamodb_stream_batch_is_pointed_at_under_its_own_member() {
         );
     }
     assert_eq!(
-        letter["context"]["pipeArn"],
-        json!(pipe_arn),
-        "case {case:?}: expected the pipe that gave up, got {letter}"
+        letter["context"],
+        json!({ "partnerResourceArn": pipe_arn, "condition": RETRIES_EXHAUSTED }),
+        "case {case:?}: expected the pipe that gave up and why, got {letter}"
     );
     assert!(
         !letter.to_string().contains(payload),

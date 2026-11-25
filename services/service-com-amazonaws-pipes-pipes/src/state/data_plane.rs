@@ -1247,7 +1247,7 @@ async fn discarded_or_failed(
     }
     let dead_lettered = match (&decided.dead_letter, polled.discarded_batch()) {
         (Some(destination), Some(batch)) => {
-            let body = dead_letter::payload(decided, &batch, &failure, failed);
+            let body = dead_letter::payload(decided, &batch, &failure);
             match dead_letter::send(callback, clients, record, destination, &body).await {
                 Ok(()) => Some(destination.arn().to_string()),
                 Err(detail) => {

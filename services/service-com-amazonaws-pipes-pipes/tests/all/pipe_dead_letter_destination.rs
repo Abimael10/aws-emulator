@@ -737,15 +737,19 @@ async fn the_record_of_a_discarded_batch_reaches_either_kind_of_destination() {
             json!(source_arn),
             "case {case:?}: expected the record to point at the source stream, got {record}"
         );
-        assert_eq!(
-            record["context"]["stage"],
-            json!("TARGET"),
-            "case {case:?}: expected the stage that gave up, got {record}"
+        // The WHOLE of the context object, whichever kind of destination holds the record:
+        // the resource that gave up and the condition it gave up under, and nothing beside
+        // them.
+        let pipe_arn = described.string("Arn");
+        assert!(
+            !pipe_arn.is_empty(),
+            "case {case:?}: the pipe must report its own ARN, got {}",
+            described.body
         );
         assert_eq!(
-            record["context"]["condition"],
-            json!("RetryAttemptsExhausted"),
-            "case {case:?}: expected the retries to be reported as spent, got {record}"
+            record["context"],
+            json!({ "partnerResourceArn": pipe_arn, "condition": "RetryAttemptsExhausted" }),
+            "case {case:?}: expected the pipe that gave up and why, got {record}"
         );
     }
 }

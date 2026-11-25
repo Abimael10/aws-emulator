@@ -12,10 +12,10 @@
 //! there, against the batch the source stands at); this module is the DESTINATION and the
 //! MESSAGE.
 //!
-//! The message is a POINTER, not the data: it names the pipe, the stage that failed, and the
-//! shard and the run of sequence numbers the discarded batch covered, so a client can read
-//! exactly those records off the stream again — the records' own payloads are never copied
-//! into it.
+//! The message is a POINTER, not the data: it names the pipe that gave up, the condition it
+//! gave up under, and the shard and the run of sequence numbers the discarded batch covered,
+//! so a client can read exactly those records off the stream again — the records' own
+//! payloads are never copied into it.
 //!
 //! WHICH destinations a pipe may name is also this module's: "either an Amazon SNS topic or
 //! Amazon SQS queue ARN" ([`resolve`]), and a value naming anything else is a destination no
@@ -40,6 +40,19 @@ const PAYLOAD_VERSION: &str = "1.0";
 /// allowed are spent ("discard records after the specified number of retries",
 /// `PipeSourceKinesisStreamParameters$MaximumRetryAttempts`).
 const RETRIES_EXHAUSTED: &str = "RetryAttemptsExhausted";
+
+/// The member the message's context names the RESOURCE that gave up under, and the member it
+/// names the CONDITION it gave up under: recorded behaviour, the two members a dead letter's
+/// `context` object carries and the whole of it.
+///
+/// The resource is the PIPE — the partner resource the record is attributed to, which is how
+/// a client reading the destination tells whose batch it is holding — and the condition is
+/// the fixed word for why it was given up on ([`RETRIES_EXHAUSTED`]). Nothing else travels
+/// in that object: which stage failed and how many attempts the batch cost are the
+/// execution's own record ([`super::execution_log`]) and not this document's.
+const PARTNER_RESOURCE_MEMBER: &str = "partnerResourceArn";
+/// See [`PARTNER_RESOURCE_MEMBER`].
+const CONDITION_MEMBER: &str = "condition";
 
 /// The member a discarded KINESIS batch is pointed at by, and the member a discarded
 /// DynamoDB-stream batch is: a dead letter says which kind of stream its pointer addresses,
@@ -168,18 +181,13 @@ pub(super) struct DiscardedBatch {
 }
 
 /// The message the pipe `run` sends to its dead-letter destination for the batch it
-/// discarded after `attempts` failed attempts at it.
+/// discarded.
 ///
-/// The failure CONTEXT and nothing else: the pipe that gave up, the stage that failed, why it
-/// gave up and how many attempts it took, the error the failed stage's own resource named
-/// when it named one, and the pointer bounding the records. None of the records' own payloads
-/// travels in it.
-pub(super) fn payload(
-    run: &RunningPipe,
-    batch: &DiscardedBatch,
-    failure: &FailedAttempt,
-    attempts: u32,
-) -> Value {
+/// The failure CONTEXT and nothing else: the pipe that gave up and why it gave up
+/// ([`PARTNER_RESOURCE_MEMBER`]), the error the failed stage's own resource named when it
+/// named one, and the pointer bounding the records. None of the records' own payloads travels
+/// in it.
+pub(super) fn payload(run: &RunningPipe, batch: &DiscardedBatch, failure: &FailedAttempt) -> Value {
     let mut pointer = json!({
         "shardId": batch.shard,
         "startSequenceNumber": batch.start_sequence_number,
@@ -198,10 +206,8 @@ pub(super) fn payload(
             .unwrap_or_default(),
         "version": PAYLOAD_VERSION,
         "context": {
-            "pipeArn": run.pipe_arn,
-            "stage": failure.stage.reported_stage(),
-            "condition": RETRIES_EXHAUSTED,
-            "approximateInvokeCount": attempts,
+            PARTNER_RESOURCE_MEMBER: run.pipe_arn,
+            CONDITION_MEMBER: RETRIES_EXHAUSTED,
         },
     });
     // What the resource the failed stage called said about its own run, when it said
@@ -298,14 +304,16 @@ mod tests {
         }
     }
 
-    /// RULE: a dead letter POINTS AT the discarded batch — the pipe that gave up, why it
-    /// gave up, the error the failed stage's resource named when it named one, and the shard
-    /// and run of sequence numbers the batch covered, under the member its SOURCE KIND is
-    /// reported under — and carries none of the records' own payloads.
+    /// RULE: a dead letter POINTS AT the discarded batch — the pipe that gave up and why it
+    /// gave up, as the two members its `context` object carries and the whole of them, the
+    /// error the failed stage's resource named when it named one, and the shard and run of
+    /// sequence numbers the batch covered, under the member its SOURCE KIND is reported
+    /// under — and carries none of the records' own payloads.
     ///
     /// The rows differ along the kind of stream the batch came from, the stage that failed
     /// and whether that stage's resource named an error of its own, which is what the rule
-    /// generalises over.
+    /// generalises over: none of those reaches the `context` object, which is the same two
+    /// members for every row.
     #[test]
     fn a_dead_letter_points_at_the_discarded_batch() {
         // (case, the member the pointer travels under, the attempt that failed)
@@ -342,7 +350,7 @@ mod tests {
             let run = kinesis_run("TRIM_HORIZON");
             let batch = discarded(member);
             let named = failure.function_error.clone();
-            let message = payload(&run, &batch, &failure, 3);
+            let message = payload(&run, &batch, &failure);
             let pointer = &message[member];
             assert_eq!(
                 pointer["shardId"],
@@ -369,25 +377,15 @@ mod tests {
                 ::serde_json::json!(run.source_arn),
                 "case {case:?}: expected the stream it was read off, got {message}"
             );
+            // The WHOLE of the context object, so a member beside these two is a failure
+            // rather than something the assertions below look past.
             assert_eq!(
-                message["context"]["pipeArn"],
-                ::serde_json::json!(run.pipe_arn),
-                "case {case:?}: expected the pipe that gave up, got {message}"
-            );
-            assert_eq!(
-                message["context"]["condition"],
-                ::serde_json::json!("RetryAttemptsExhausted"),
-                "case {case:?}: expected the retries to be reported as spent, got {message}"
-            );
-            assert_eq!(
-                message["context"]["approximateInvokeCount"],
-                ::serde_json::json!(3),
-                "case {case:?}: expected the attempts the batch cost, got {message}"
-            );
-            assert_eq!(
-                message["context"]["stage"],
-                ::serde_json::json!(failure.stage.reported_stage()),
-                "case {case:?}: expected the stage that gave up, got {message}"
+                message["context"],
+                ::serde_json::json!({
+                    "partnerResourceArn": run.pipe_arn,
+                    "condition": "RetryAttemptsExhausted",
+                }),
+                "case {case:?}: expected the pipe that gave up and why, got {message}"
             );
             assert_eq!(
                 message["version"],
