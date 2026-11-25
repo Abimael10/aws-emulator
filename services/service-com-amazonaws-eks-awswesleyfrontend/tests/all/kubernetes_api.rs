@@ -294,6 +294,61 @@ pub(crate) async fn dial_with(
     .await
 }
 
+/// The TLS connection a kubeconfig-built client opens to `endpoint`, trusting
+/// NOTHING but the certificates `trusted_pem` carries — and the error the handshake
+/// was refused with instead.
+///
+/// The ONE place this test crate builds that client, so every suite dials a published
+/// endpoint the same way: the trust anchors are exactly the published authority, the
+/// address dialled is the emulator's own loopback interface on the port the endpoint
+/// names, and the server name presented is the host it names. The failure is ANSWERED
+/// rather than panicked, because a suite that asks whether the authority of one
+/// cluster verifies the endpoint of another needs the handshake that must be refused
+/// (`crate::kubeconfig_authority_is_per_cluster`); [`dial_bytes`] unwraps it, naming
+/// the row that dialled.
+pub(crate) async fn tls_connection(
+    endpoint: &str,
+    trusted_pem: &str,
+) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, String> {
+    let authority = endpoint
+        .strip_prefix("https://")
+        .ok_or_else(|| format!("the endpoint must be an https URL, got {endpoint:?}"))?
+        .to_string();
+    let (host, port) = authority
+        .rsplit_once(':')
+        .ok_or_else(|| format!("the endpoint must carry a port, got {authority:?}"))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|error| format!("the endpoint's port must be a port, got {port:?}: {error}"))?;
+    let mut roots = rustls::RootCertStore::empty();
+    for certificate in rustls_pemfile::certs(&mut trusted_pem.as_bytes()) {
+        let certificate = certificate
+            .map_err(|error| format!("the trusted authority must be PEM certificates: {error}"))?;
+        roots.add(certificate).map_err(|error| {
+            format!("the trusted authority must load as a trust anchor: {error}")
+        })?;
+    }
+    let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|error| format!("the TLS client must configure: {error}"))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+    // The emulator's OWN listener, on the port it published. The address is a loopback
+    // literal here rather than the published host, so this crate dials nothing else.
+    let stream = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .map_err(|error| format!("the published address {authority:?} must accept: {error}"))?;
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|error| format!("{host:?} must be a server name: {error}"))?;
+    connector
+        .connect(server_name, stream)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// The same request once more, with the body written as the BYTES the client
 /// encoded it to — what a client that writes its object in an encoding other than
 /// a JSON document sends.
@@ -316,11 +371,8 @@ pub(crate) async fn dial_bytes(
             )
         })
         .to_string();
-    let (host, port) = authority.rsplit_once(':').unwrap_or_else(|| {
+    let (host, _port) = authority.rsplit_once(':').unwrap_or_else(|| {
         panic!("case {case:?}: the endpoint must carry a port, got {authority:?}")
-    });
-    let port: u16 = port.parse().unwrap_or_else(|error| {
-        panic!("case {case:?}: the endpoint's port must be a port, got {port:?}: {error}")
     });
     assert!(
         matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1"),
@@ -329,36 +381,9 @@ pub(crate) async fn dial_bytes(
     );
 
     // The ONLY trust anchor is the certificate authority the cluster published, so
-    // a handshake succeeds here exactly when the certificate served at the
-    // endpoint was issued by it.
-    let mut roots = rustls::RootCertStore::empty();
-    for certificate in rustls_pemfile::certs(&mut config.certificate_authority_pem.as_bytes()) {
-        let certificate = certificate.unwrap_or_else(|error| {
-            panic!("case {case:?}: the published CA must be PEM certificates: {error}")
-        });
-        roots.add(certificate).unwrap_or_else(|error| {
-            panic!("case {case:?}: the published CA must load as a trust anchor: {error}")
-        });
-    }
-    let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::aws_lc_rs::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .unwrap_or_else(|error| panic!("case {case:?}: the TLS client configures: {error}"))
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
-    // The emulator's OWN listener, on the port it published. The address is a loopback
-    // literal here rather than the published host, so this test dials nothing else.
-    let stream = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
-        .await
-        .unwrap_or_else(|error| {
-            panic!("case {case:?}: the published address {authority:?} must accept: {error}")
-        });
-    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
-        .unwrap_or_else(|error| panic!("case {case:?}: {host:?} must be a server name: {error}"));
-    let mut tls = connector
-        .connect(server_name, stream)
+    // a handshake succeeds here exactly when the certificate served at the endpoint
+    // was issued by it ([`tls_connection`]).
+    let mut tls = tls_connection(&config.endpoint, &config.certificate_authority_pem)
         .await
         .unwrap_or_else(|error| {
             panic!(

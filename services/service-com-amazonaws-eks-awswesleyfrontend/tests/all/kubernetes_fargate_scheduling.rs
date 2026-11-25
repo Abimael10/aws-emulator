@@ -41,7 +41,10 @@ use crate::wire::{call, encode_label, read_until, Answer, POLL_DEADLINE, POLL_IN
 /// trust policy and the create is refused on nothing — the cross-service suite
 /// `core/router/tests/all/eks_fargate_pod_execution_role_pulls.rs` is where the role
 /// really decides a pull.
-fn pod_execution_role() -> String {
+///
+/// Crate-visible, so every suite that gives a cluster Fargate capacity creates its
+/// profiles under the same role.
+pub(crate) fn pod_execution_role() -> String {
     format!(
         "arn:aws:iam::{}:role/AmazonEKSFargatePodExecutionRole",
         engine::emulator_account_id()
@@ -51,7 +54,10 @@ fn pod_execution_role() -> String {
 /// `CreateFargateProfile` for the profile `name` of `cluster`, carrying `selectors`,
 /// waited until the control plane reports it `ACTIVE` — which is when its capacity
 /// can take a pod.
-async fn active_profile(
+///
+/// The ONE driver for giving a cluster Fargate capacity, so a suite that needs a
+/// cluster whose only capacity is a profile creates it exactly as this one does.
+pub(crate) async fn active_profile(
     router: &MultiServiceRouter,
     cluster: &str,
     name: &str,
