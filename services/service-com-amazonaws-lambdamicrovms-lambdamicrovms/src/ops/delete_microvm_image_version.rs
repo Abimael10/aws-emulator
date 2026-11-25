@@ -7,7 +7,9 @@
 //! record, so a later read of it and the version listing both miss. The delete is
 //! idempotent — a repeat while the removal is in flight reports the same `DELETING`, and
 //! one addressed at a version an earlier delete already took reports the settled
-//! `DELETED` — while a version the image never held is refused with the modelled 404. An
+//! `DELETED` — while a version the image never held is refused with the modelled 404, and
+//! an `imageIdentifier` naming no image of this account at all with the modelled 400
+//! ([`crate::state::VERSION_DELETE_IMAGE_NOT_FOUND_REFUSAL`]). An
 //! image always holds at least one version, so the delete of the last one it still holds
 //! is refused with the modelled 400
 //! ([`crate::state::LAST_IMAGE_VERSION_REFUSAL`]) — removing the image itself is what
@@ -181,13 +183,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this API at all is a bad REQUEST instead, decided on the input.
         let name = match store.resolve_image_access(&region, &input.image_identifier) {
             crate::state::ImageAccess::Granted(name) => name,
+            // An identifier of this account's own namespace naming no image record here
+            // is this DELETE's bad REQUEST, not a resource absence: the call is
+            // `@idempotent` and its 404 is the benign outcome a repeat of a VERSION's own
+            // delete takes, so an address that names no IMAGE at all is the modelled 400
+            // (`crate::state::VERSION_DELETE_IMAGE_NOT_FOUND_REFUSAL`) a client's
+            // bad-request branch can tell apart.
             crate::state::ImageAccess::Absent => {
-                return Err(not_found(
-                    crate::state::version_address_image_not_found_message(
-                        &input.image_identifier,
-                        &input.image_version,
-                    ),
-                ));
+                return Err(image_not_found());
             }
             crate::state::ImageAccess::Denied => {
                 return Err(
@@ -217,12 +220,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let Some(image) = store.image_named_mut(&region, &name) else {
-            return Err(not_found(
-                crate::state::version_address_image_not_found_message(
-                    &input.image_identifier,
-                    &input.image_version,
-                ),
-            ));
+            // Unreachable while the verdict above resolved a name under this one lock; the
+            // honest answer for an address naming no image is the same 400 as above.
+            return Err(image_not_found());
         };
         // Past the image's verdict the lookup is an own-account one. A version this image
         // no longer HOLDS is one of two different answers. "This operation is idempotent;
@@ -304,8 +304,7 @@ fn unavailable() -> DeleteMicrovmImageVersionError {
     .into()
 }
 
-/// 404: the request named an image this account's own record no longer holds, or a
-/// version the resolved image does not hold.
+/// 404: the request named a version the resolved image does not hold.
 ///
 /// `ResourceNotFoundException` models `message` as its only required member;
 /// `resourceType` and `resourceId` are optional and this service leaves them unset, so
@@ -315,6 +314,18 @@ fn not_found(message: String) -> DeleteMicrovmImageVersionError {
         message,
         resource_type: None,
         resource_id: None,
+    })
+    .into()
+}
+
+/// 400: the `imageIdentifier` the request addressed resolves to no image record of this
+/// account, so the version it names has no image to be a version of.
+///
+/// The sentence is a constant of this refusal — it carries nothing from the request
+/// ([`crate::state::VERSION_DELETE_IMAGE_NOT_FOUND_REFUSAL`]).
+fn image_not_found() -> DeleteMicrovmImageVersionError {
+    DeleteMicrovmImageVersionErrorModeled::ValidationException(ValidationException {
+        message: Some(crate::state::VERSION_DELETE_IMAGE_NOT_FOUND_REFUSAL.to_string()),
     })
     .into()
 }

@@ -377,6 +377,21 @@ pub fn version_address_image_not_found_message(identifier: &str, image_version: 
     format!("MicroVMImage not found for MicroVMImage: {identifier}, Version: {image_version}")
 }
 
+/// The `message` of the 400 `DeleteMicrovmImageVersion` answers when the
+/// `imageIdentifier` it addresses resolves to no image record of the calling account.
+///
+/// The version DELETE refuses an unresolvable image as a bad REQUEST rather than as a
+/// resource absence: the call is `@idempotent` and a not-found is the benign outcome a
+/// repeated delete of a VERSION takes, so the one answer a client must be able to tell
+/// apart — the address naming no image at all — is the modelled `ValidationException`.
+/// The sentence is AWS's own for this refusal and has NO variable parts: it names
+/// neither the identifier nor the version the request carried, and nothing of the clock
+/// or of the record, which is why it is a constant rather than a template (recorded AWS
+/// behaviour). The not-found sentence of the version-addressed READS
+/// ([`version_address_image_not_found_message`]) stays theirs.
+pub const VERSION_DELETE_IMAGE_NOT_FOUND_REFUSAL: &str =
+    "MicroVM Image not found: UpdateRuntimeStateRequest(newState=UPDATING, failureReason=null)";
+
 /// The `message` of the 400 `DeleteMicrovmImageVersion` answers when the version it
 /// addresses is the last one its image still holds.
 ///

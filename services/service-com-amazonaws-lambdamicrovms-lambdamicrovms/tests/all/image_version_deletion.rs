@@ -11,6 +11,11 @@
 //! delete the ONE version an image still holds is refused with HTTP 400
 //! `ValidationException` and changes nothing.
 //!
+//! RULE: a version-addressed delete whose `imageIdentifier` resolves to no image record of
+//! the calling account is refused as a BAD REQUEST — HTTP 400 `ValidationException` with
+//! this service's constant sentence for it — rather than as the resource absence a
+//! repeated delete of a VERSION takes.
+//!
 //! Each test states that rule and exercises it over a SET of inputs; the values any one
 //! row happens to carry are examples, not the specification. The wire harness (`emulator`,
 //! `call`, `image_body`, `poll_until`, …) is the one `microvm_lifecycle` owns, the version
@@ -19,19 +24,20 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
     image_version_not_found_message, invalid_arn_format_message, managed_base_image_arn,
-    no_active_version_message, version_address_image_not_found_message,
-    FIRST_IMAGE_VERSION, IMAGE_STATE_UPDATED, IMAGE_STATE_UPDATE_FAILED,
-    LAST_IMAGE_VERSION_REFUSAL, MANAGED_BASE_IMAGE_IDS, VERSION_STATE_DELETED,
-    VERSION_STATE_DELETING, VERSION_STATE_SUCCESSFUL,
+    no_active_version_message, FIRST_IMAGE_VERSION, IMAGE_STATE_UPDATED,
+    IMAGE_STATE_UPDATE_FAILED, LAST_IMAGE_VERSION_REFUSAL, MANAGED_BASE_IMAGE_IDS,
+    VERSION_DELETE_IMAGE_NOT_FOUND_REFUSAL, VERSION_STATE_DELETED, VERSION_STATE_DELETING,
+    VERSION_STATE_SUCCESSFUL,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::image_build_outcome::get_version;
 use crate::image_denial_message::expected_denial_sentence;
 use crate::image_version_listing::list_versions;
+use crate::microvm_image_and_instance_paths::delete_image;
 use crate::microvm_lifecycle::{
-    as_uri_value, call, emulator, expected_image_arn, image_body, poll_until, run_microvm, ACCOUNT,
-    REGION,
+    as_uri_value, call, call_for_error_type, emulator, expected_image_arn, image_body, poll_until,
+    run_microvm, ACCOUNT, REGION,
 };
 
 /// A build role ARN: `RoleArn`, pattern
@@ -540,9 +546,11 @@ async fn a_deleted_version_can_no_longer_be_launched() {
 
 /// RULE: the verdict on the ADDRESS comes before anything else — an identifier of the
 /// AWS-owned namespace is denied before any lookup (HTTP 403), a value that is no
-/// identifier of this API at all is a bad request (HTTP 400), and an identifier of this
-/// account's own namespace naming no record here, or a version the resolved image never
-/// held, is the modelled not-found (HTTP 404).
+/// identifier of this API at all is a bad request (HTTP 400), an identifier of this
+/// account's own namespace naming no image record here is this delete's own bad request
+/// (HTTP 400 `ValidationException`, the constant sentence naming neither half of the
+/// address), and a version the resolved image never held is the modelled not-found
+/// (HTTP 404).
 #[tokio::test]
 async fn a_version_delete_addressed_at_nothing_is_refused_however_the_address_fails() {
     let router = emulator();
@@ -556,9 +564,9 @@ async fn a_version_delete_addressed_at_nothing_is_refused_however_the_address_fa
             "an ARN nobody minted",
             expected_image_arn("never-minted"),
             "1.0",
-            404,
-            "ResourceNotFoundException",
-            version_address_image_not_found_message(&expected_image_arn("never-minted"), "1.0"),
+            400,
+            "ValidationException",
+            VERSION_DELETE_IMAGE_NOT_FOUND_REFUSAL.to_string(),
         ),
         (
             "another account's ARN, outside this account's own namespace",
@@ -575,12 +583,9 @@ async fn a_version_delete_addressed_at_nothing_is_refused_however_the_address_fa
             "another region's ARN for a held name",
             format!("arn:aws:lambda:eu-central-1:{ACCOUNT}:microvm-image:held"),
             "1.0",
-            404,
-            "ResourceNotFoundException",
-            version_address_image_not_found_message(
-                &format!("arn:aws:lambda:eu-central-1:{ACCOUNT}:microvm-image:held"),
-                "1.0",
-            ),
+            400,
+            "ValidationException",
+            VERSION_DELETE_IMAGE_NOT_FOUND_REFUSAL.to_string(),
         ),
         (
             "an AWS-owned managed base image",
@@ -716,4 +721,192 @@ async fn deleting_a_version_whose_build_is_in_flight_settles_the_image() {
         "case {case:?}: the version the delete did not address is untouched, got {status} \
          {read}"
     );
+}
+
+/// The locator this service's wire qualifies every error shape with — the value a
+/// `restJson1` client resolves the error shape from (`error_type_locator_form` owns that
+/// rule). Written out here so the expectation is the recorded wire value rather than
+/// whatever the crate computes.
+const LOCATOR: &str = ":http://internal.amazon.com/coral/com.amazonaws.lambda.microvms/";
+
+/// The same delete as [`delete_version`], with the `x-amzn-errortype` header of the answer
+/// beside its status and body — how a `restJson1` client resolves the error shape a
+/// refusal names.
+async fn delete_version_for_error_type(
+    router: &MultiServiceRouter,
+    identifier: &str,
+    image_version: &str,
+) -> (u16, String, Value) {
+    let uri = format!(
+        "/2025-09-09/microvm-images/{}/versions/{}",
+        as_uri_value(identifier),
+        as_uri_value(image_version)
+    );
+    call_for_error_type(router, REGION, "DELETE", &uri, None).await
+}
+
+/// RULE: a version-addressed delete whose `imageIdentifier` is one of this account's own
+/// namespace but resolves to no image record in the region the request was signed for is
+/// refused as a BAD REQUEST — HTTP 400 `ValidationException`, qualified in
+/// `x-amzn-errortype` — carrying this service's constant sentence for that refusal, which
+/// names neither half of the address it was given, whatever form the unresolvable
+/// identifier takes and whatever version label it addresses.
+#[tokio::test]
+async fn a_version_delete_whose_image_resolves_to_nothing_is_a_bad_request() {
+    let router = emulator();
+    let case = "the unresolvable addresses";
+
+    // An image this account DOES hold, so the rows below are refused for the address they
+    // name rather than for an empty store, and so one row can address a name it holds here
+    // through another region's endpoint.
+    let held = image_with_versions(&router, case, "resolvable", 2).await;
+
+    // An image this account created and then deleted: past the removal the clock owes, its
+    // identifier is one of this account's own namespace that names no record.
+    let removed = image_with_versions(&router, case, "removed", 1).await;
+    let (status, deleted) = delete_image(&router, &removed).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: deleting the image {removed} expected 200, got {status} {deleted}"
+    );
+    poll_until(case, &format!("the image {removed} is gone"), || async {
+        let (status, _) = get_image(&router, &removed).await;
+        status == 404
+    })
+    .await;
+
+    // The identifier rows differ in HOW the own-account address fails to resolve: a name
+    // nothing was created under, a held name with a tail appended, a held name reached
+    // through another region's endpoint, an id-shaped name, and a record this account
+    // created and deleted.
+    let identifiers: Vec<(&str, String)> = vec![
+        (
+            "a name nothing was created under",
+            expected_image_arn("never-created"),
+        ),
+        (
+            "a held name with a tail nothing was created under",
+            format!("{held}-missing-9a120e37"),
+        ),
+        (
+            "this account's namespace in another region, a name it holds here",
+            format!("arn:aws:lambda:eu-central-1:{ACCOUNT}:microvm-image:resolvable"),
+        ),
+        (
+            "this account's namespace, an id-shaped name",
+            expected_image_arn("img-0a1b2c3d4e5f"),
+        ),
+        (
+            "an image this account created and deleted",
+            removed.clone(),
+        ),
+    ];
+
+    // `imageVersion` is `@length(1..2048)` with pattern `^[^\s]+$`
+    // (`smithy_query(query="operation", operation="DeleteMicrovmImageVersion")`), so every
+    // label below is one the boundary admits: the shortest, this service's own
+    // `major.minor` form for the first and for a later generation, a bare major, a label
+    // that is no version of this service at all, and the longest the member admits.
+    let longest = "v".repeat(2048);
+    let versions: Vec<(&str, String)> = vec![
+        ("the shortest label the member admits", "9".to_string()),
+        ("the first generation", FIRST_IMAGE_VERSION.to_string()),
+        ("a later generation", "2.0".to_string()),
+        ("a bare major", "1".to_string()),
+        ("no version of this service at all", "latest".to_string()),
+        ("the longest label the member admits", longest),
+    ];
+
+    for (address_case, identifier) in &identifiers {
+        for (version_case, image_version) in &versions {
+            let row = format!("{address_case}, {version_case}");
+            let (status, error_type, body) =
+                delete_version_for_error_type(&router, identifier, image_version).await;
+            assert_eq!(
+                status, 400,
+                "case {row:?}: {identifier}/{image_version} expected HTTP 400, got {status} \
+                 {body}"
+            );
+            assert_eq!(
+                body["__type"].as_str(),
+                Some("ValidationException"),
+                "case {row:?}: expected the body to name ValidationException, got {body}"
+            );
+            let qualified = format!("ValidationException{LOCATOR}");
+            assert_eq!(
+                error_type, qualified,
+                "case {row:?}: expected x-amzn-errortype {qualified:?}, got {error_type:?}"
+            );
+            assert_eq!(
+                body["message"].as_str(),
+                Some(VERSION_DELETE_IMAGE_NOT_FOUND_REFUSAL),
+                "case {row:?}: expected this refusal's constant sentence, got {:?}",
+                body["message"]
+            );
+            // The sentence is a CONSTANT: it takes neither half of the address the request
+            // carried, so a client can never parse either out of it.
+            let message = body["message"].as_str().unwrap_or_default();
+            assert!(
+                !message.contains(identifier.as_str()),
+                "case {row:?}: the sentence must not name the identifier, got {message:?}"
+            );
+            assert!(
+                !message.contains(image_version.as_str()),
+                "case {row:?}: the sentence must not name the version, got {message:?}"
+            );
+        }
+    }
+
+    // The positive control: the held image's older version still deletes through the same
+    // path, so the rows above are refused by the address and not by a dead path.
+    let (status, body) = delete_version(&router, &held, FIRST_IMAGE_VERSION).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: a version the account holds still deletes, got {status} {body}"
+    );
+}
+
+/// RULE: that bad request is the verdict on the IMAGE half of the address alone — a version
+/// the RESOLVED image never held keeps the modelled 404 `ResourceNotFoundException` naming
+/// the image and the version, and the version-addressed READ of an identifier resolving to
+/// no image keeps its own 404, so the delete's 400 classifies the address and nothing else
+/// moved with it.
+#[tokio::test]
+async fn the_bad_request_is_the_image_half_of_the_address_alone() {
+    let router = emulator();
+    let case = "the neighbouring refusals";
+    let held = image_with_versions(&router, case, "neighbours", 2).await;
+    let absent = expected_image_arn("never-created");
+
+    // The rows differ in the version label, as above: the resolved image never held any of
+    // them, and each is refused as the resource absence it is.
+    for image_version in ["9.9", "3", "latest"] {
+        let (status, error_type, body) =
+            delete_version_for_error_type(&router, &held, image_version).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: version {image_version} of the resolved image expected HTTP 404, \
+             got {status} {body}"
+        );
+        let qualified = format!("ResourceNotFoundException{LOCATOR}");
+        assert_eq!(
+            error_type, qualified,
+            "case {case:?}: expected x-amzn-errortype {qualified:?}, got {error_type:?}"
+        );
+        assert_eq!(
+            body["message"].as_str(),
+            Some(image_version_not_found_message(&held, image_version).as_str()),
+            "case {case:?}: expected the version-not-found refusal, got {:?}",
+            body["message"]
+        );
+
+        // The READ of an identifier that resolves to no image is untouched: it stays the
+        // 404 of a version-addressed lookup.
+        let (status, read) = get_version(&router, &absent, image_version).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: the version read of an unresolvable image stays 404, got {status} \
+             {read}"
+        );
+    }
 }
