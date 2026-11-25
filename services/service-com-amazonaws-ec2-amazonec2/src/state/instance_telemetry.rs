@@ -48,27 +48,31 @@
 //! * every other metric of an instance with basic monitoring is published once per
 //!   [`BASIC_MONITORING_PERIOD`].
 //!
-//! A period is a window of the WALL CLOCK anchored at a multiple of its own length — the way
-//! CloudWatch itself aggregates one ("CloudWatch aggregates data points based on the length of
-//! the period that you specify", `GetMetricStatistics`) — and the datapoint a period carries
-//! is stamped with that period's START. That is what makes the cadence observable: a 5-minute
-//! period begins on a 5-minute boundary, so a datapoint stamped off that grid can only have
-//! come from a 1-minute period. A period is published into exactly ONCE however often the
-//! sampler looks ([`ComAmazonawsEc2Amazonec2State::instance_metric_periods`] remembers which
-//! one each series last carried), so one period holds one reading of one instance rather than
-//! as many as something happened to look.
+//! A sample is TAKEN at the boundaries of that period — the instants of the WALL CLOCK that are
+//! multiples of the period's own length, the grid CloudWatch itself aggregates a period on
+//! ("CloudWatch aggregates data points based on the length of the period that you specify",
+//! `GetMetricStatistics`) — and each reading measures the period that ENDED at the boundary it
+//! was taken at ([`due_sample_instant`]). A datapoint carries the instant its reading was taken,
+//! which is what makes the cadence observable: the boundaries of a 5-minute period are 5-minute
+//! boundaries, so a datapoint stamped off that grid can only have been taken at the boundary of a
+//! 1-minute period. One boundary yields one reading however often the sampler looks
+//! ([`ComAmazonawsEc2Amazonec2State::instance_metric_periods`] remembers which instant each
+//! series was last read at), so a period holds one reading of one instance rather than as many as
+//! something happened to look.
 //!
-//! A reading is of a WHOLE period, so it is published once that period has CLOSED
-//! ([`due_period_start`]): the period the clock is still inside has not finished being measured,
-//! which is why a reader always sees the periods that are over and a 5-minute series lags
-//! further behind the clock than a 1-minute one. A period that ended before the instance's guest
-//! came up is no period of that instance at all and carries no reading.
+//! A reading is of the period BEHIND the instant it was taken at, so a reader sees a series that
+//! stops at the last boundary the clock has passed and a 5-minute series lags further behind the
+//! clock than a 1-minute one.
 //!
 //! Only a RUNNING instance publishes: these measurements are taken on a guest that is up, so
 //! an instance that is pending, stopped or terminated has nothing measuring it and no datapoint
-//! in the periods it was not running for — which is what tells an idle instance from one that
-//! is not there. Publication resumes with the instance: one started again is running again, so
-//! the next period it is running in carries its reading.
+//! at the instants it was not running at — which is what tells an idle instance from one that
+//! is not there. That is a fact of each DATAPOINT and not only of the series as a whole: a
+//! reading is stamped with the instant it was taken, so an instance's series carries nothing
+//! stamped before its guest came up and nothing stamped after it went away, and a client reading
+//! the series of an instance FROM ITS LAUNCH sees the instance's first reading one period after
+//! that launch rather than two. Publication resumes with the instance: one started again is
+//! running again, so the next boundary it is running at carries its reading.
 //!
 //! Two things drive those samples:
 //!
@@ -79,8 +83,8 @@
 //!   sampling while the store holds a running instance. A client watching an instance's
 //!   utilisation makes no further EC2 call before it looks for the next datapoint, so without
 //!   the task a series would stop at the last request's own reading. It does not change WHEN a
-//!   sample is due — [`due_period_start`] alone decides that — only how soon after a period
-//!   closes the reading of it is taken.
+//!   sample is due — [`due_sample_instant`] alone decides that — only how soon after a period's
+//!   boundary the reading of that period is taken.
 //!
 //! # The agent's series travel the same way
 //!
@@ -289,9 +293,9 @@ const STANDARD_STORAGE_RESOLUTION_SECONDS: i32 = 60;
 
 /// How often the clock looks at the store for a sample that has come due.
 ///
-/// Not a publishing schedule — what is published is decided by [`due_period_start`] alone — only
-/// how soon after a period closes the reading of it is taken. Far shorter than the shortest
-/// period above, so no period waits long for the reading it owes.
+/// Not a publishing schedule — what is published is decided by [`due_sample_instant`] alone —
+/// only how soon after a period's boundary the reading of that period is taken. Far shorter than
+/// the shortest period above, so no period waits long for the reading it owes.
 const SAMPLE_TICK: Duration = Duration::from_secs(5);
 
 /// How long a running clock's claim on the store stands before another call may start one.
@@ -333,7 +337,8 @@ pub fn publish_period(metric: &InstanceMetric, monitoring_state: &str) -> Durati
 /// The START of the `period`-long window `at` falls in, as epoch seconds.
 ///
 /// The windows are anchored at multiples of the period, which is how CloudWatch aggregates one,
-/// so this is both the period a reading belongs to and the time stamp its datapoint carries.
+/// so this is the last BOUNDARY of that period the clock has passed — the instant the reading of
+/// the period behind it was taken at ([`due_sample_instant`]).
 pub fn period_start(at: SystemTime, period: Duration) -> i64 {
     let seconds = at
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -343,19 +348,21 @@ pub fn period_start(at: SystemTime, period: Duration) -> i64 {
     i64::try_from(seconds - seconds % length).unwrap_or_default()
 }
 
-/// The period whose reading is DUE at `at`: the most recently CLOSED one, as the epoch seconds
-/// of its start.
+/// The instant the reading DUE at `at` was taken: the most recent boundary of `period` the clock
+/// has passed, as epoch seconds.
 ///
-/// A datapoint is the measurement of a whole period, so that period has to be OVER before there
-/// is a reading of it to publish: the period the clock is still inside has not finished being
-/// measured. That is what makes a reader see the periods that have closed rather than the one in
-/// flight, and why a 5-minute series lags further behind the clock than a 1-minute one.
-pub fn due_period_start(at: SystemTime, period: Duration) -> i64 {
-    period_start(at, period) - i64::try_from(period.as_secs()).unwrap_or_default()
+/// A sample is taken at a period's boundary and measures the period that ended there, so the
+/// reading due at any instant is the one belonging to the last boundary behind it: the period the
+/// clock is still inside has not been measured yet. That is both when the sample happened and the
+/// time stamp its datapoint carries, which is why a reader sees a series that stops at the last
+/// boundary the clock has passed, and why a 5-minute series lags further behind it than a
+/// 1-minute one.
+fn due_sample_instant(at: SystemTime, period: Duration) -> i64 {
+    period_start(at, period)
 }
 
-/// One datapoint an instance owes: which series it belongs to, what it measured and the period
-/// it measured in.
+/// One datapoint an instance owes: which series it belongs to, what it measured and the instant
+/// it was read at.
 #[derive(Debug, Clone)]
 struct DueSample {
     /// The instance the series is dimensioned on.
@@ -364,8 +371,8 @@ struct DueSample {
     metric: &'static InstanceMetric,
     /// The value that reading took.
     value: f64,
-    /// The start of the period it was taken in, which is the time stamp it carries.
-    period_start_secs: i64,
+    /// The instant it was taken at, which is the time stamp it carries.
+    taken_at_secs: i64,
     /// The AGGREGATE series this reading is also a contribution to, as `(dimension name,
     /// dimension value)` — empty for a reading that is published under the instance's own
     /// dimension alone ([`aggregate_dimensions`]).
@@ -584,8 +591,8 @@ fn publishes_metrics(instance: &InstanceRecord) -> bool {
     instance.state == InstanceStateName::Running
 }
 
-/// The datapoints the instances of `store` owe at `now`, and the periods they are published
-/// into recorded as taken — so each period of each series yields exactly one.
+/// The datapoints the instances of `store` owe at `now`, and the instants they were read at
+/// recorded as taken — so each boundary of each series yields exactly one.
 ///
 /// The bookkeeping of instances this store no longer holds goes with them, so a terminated
 /// instance that has been reclaimed leaves nothing behind.
@@ -606,27 +613,26 @@ fn due_samples(store: &mut ComAmazonawsEc2Amazonec2State, now: SystemTime) -> Ve
             .or_default();
         for metric in INSTANCE_METRICS {
             let period = publish_period(metric, &instance.monitoring_state);
-            let start = due_period_start(now, period);
-            if published.get(metric.name) == Some(&start) {
+            let taken_at_secs = due_sample_instant(now, period);
+            if published.get(metric.name) == Some(&taken_at_secs) {
                 continue;
             }
-            // The instant the period ENDED, which is the instant its reading is a reading as
-            // of: a period the instance's guest was not up for at all is no period of this
-            // instance, and the verdict a status check publishes is the verdict it had reached
-            // by then.
-            let closed_at = instant_at(start) + period;
-            if !was_measured_through(instance, closed_at) {
+            // The instant the sample was TAKEN, which is the instant its reading is a reading as
+            // of: a guest that was not up then was measured by nothing, and the verdict a status
+            // check publishes is the verdict it had reached by then.
+            let taken_at = instant_at(taken_at_secs);
+            if !was_measured_at(instance, taken_at) {
                 continue;
             }
-            let Some(value) = measurement(instance, metric, closed_at) else {
+            let Some(value) = measurement(instance, metric, taken_at) else {
                 continue;
             };
-            published.insert(metric.name, start);
+            published.insert(metric.name, taken_at_secs);
             samples.push(DueSample {
                 instance_id: instance.instance_id.clone(),
                 metric,
                 value,
-                period_start_secs: start,
+                taken_at_secs,
                 aggregates: aggregate_dimensions(instance, metric),
             });
         }
@@ -667,21 +673,26 @@ fn aggregate_dimensions(
     .collect()
 }
 
-/// Whether the guest of `instance` had come up by `closed_at`, the instant a period ended.
+/// Whether the guest of `instance` was up at `taken_at`, the instant a sample was taken.
 ///
-/// A period that was over before this guest came up is a period nothing of this instance was
-/// measured in, so it has no reading: an instance that has just launched has no history of
-/// periods it did not exist for. The instant measured against is the boot the guest actually had
-/// ([`super::instance_boots`]), which is also what the status checks are measured from.
-fn was_measured_through(instance: &InstanceRecord, closed_at: SystemTime) -> bool {
+/// A reading taken before this guest came up is a reading of nothing of this instance, so there
+/// is none: an instance that has just launched has no history of instants it did not exist at,
+/// and its series therefore carries nothing stamped before its launch. The instant measured
+/// against is the boot the guest actually had ([`super::instance_boots`]), which is also what the
+/// status checks are measured from.
+fn was_measured_at(instance: &InstanceRecord, taken_at: SystemTime) -> bool {
     super::instance_boots(instance)
         .last()
-        .is_some_and(|boot| boot.booted_at < closed_at)
+        .is_some_and(|boot| boot.booted_at < taken_at)
 }
 
-/// The instant the epoch second `secs` names.
+/// The instant the epoch second `secs` names, or the epoch itself for a second no instant can be
+/// built from — a seconds count beyond what the platform's clock can represent is no instant to
+/// take a reading at rather than a reason to unwind the sampler.
 fn instant_at(secs: i64) -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).unwrap_or_default())
+    SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(u64::try_from(secs).unwrap_or_default()))
+        .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
 /// What `metric` measures on `instance` as of `at`, or `None` when there is no measurement to
@@ -746,9 +757,11 @@ fn append<Eng: Send + Sync + 'static>(engine: &Eng, samples: &[DueSample], at: S
     let mut written: Vec<cloudwatch::state::WrittenSeries> = Vec::new();
     for sample in samples {
         let datum = cloudwatch::state::StoredDatum {
-            // The period's own start: the reading is the reading of that period, so an
-            // `Average`, a `Minimum` and a `Maximum` over it all answer from this one datapoint.
-            timestamp_secs: sample.period_start_secs as f64,
+            // The instant the reading was taken at: the reading is the reading of the period
+            // behind that instant, so an `Average`, a `Minimum` and a `Maximum` over the window
+            // holding it all answer from this one datapoint.
+            #[allow(clippy::cast_precision_loss)]
+            timestamp_secs: sample.taken_at_secs as f64,
             // One observation: the datapoint IS the reading taken of the instance.
             sample_count: 1.0,
             sum: sample.value,

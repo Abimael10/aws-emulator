@@ -8,13 +8,13 @@
 //! for the status-check metrics whatever that state is ("Basic monitoring | Status check metrics
 //! are available in 1-minute periods"), one minute for every other metric while detailed
 //! monitoring is on ("Detailed monitoring | You can get metrics in 1-minute periods") and five
-//! minutes while it is off ("All other metrics are available in 5-minute periods"). Each period
-//! is a wall-clock window anchored at a multiple of its own length and the datapoint in it is
-//! stamped with that window's start, which is what makes the cadence observable: a 5-minute
-//! period begins on a 5-minute boundary, so a stamp off that grid can only have come from a
-//! 1-minute period. Only an instance that is RUNNING is being measured, so one that is stopped
-//! publishes nothing for the periods it was not running in, and publication resumes when it runs
-//! again.
+//! minutes while it is off ("All other metrics are available in 5-minute periods"). Each reading
+//! is taken at a boundary of that period — a multiple of its own length on the wall clock — and
+//! carries the instant it was taken, which is what makes the cadence observable: the boundaries
+//! of a 5-minute period are 5-minute boundaries, so a stamp off that grid can only have been
+//! taken at the boundary of a 1-minute period. Only an instance that is RUNNING is being
+//! measured, so one that is stopped publishes nothing for the instants it was not running at, and
+//! publication resumes when it runs again.
 //!
 //! The rows span what the rule generalises over: the monitoring state (basic and detailed), the
 //! cadence class (a guest measurement and a status check), the metric (the whole published
@@ -62,8 +62,8 @@ pub(crate) const FIVE_MINUTES: i64 = 300;
 pub(crate) const SPAN_MINUTES: i64 = 10;
 
 /// How far into a minute each simulated sample is taken, in seconds: NOT on a period boundary,
-/// so a datapoint stamped with the boundary can only have been stamped with the period's start
-/// rather than with the instant the sample was taken.
+/// so a datapoint stamped with a boundary can only have been stamped with the instant its
+/// reading was TAKEN at rather than with the instant the sampler happened to look.
 const SAMPLE_OFFSET_SECS: i64 = 7;
 
 /// How long a poll keeps asking before giving up. Generous: every move it waits for is owed in
@@ -77,9 +77,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// How long the one case that keeps the WALL clock waits for the first reading of a 1-minute
 /// period.
 ///
-/// A reading is of a period that is OVER, so the first one of a freshly launched instance is
-/// owed when the minute it came up in closes — within a minute of the launch. Generous: several
-/// times that, so a loaded host is not what decides the case.
+/// A reading is taken at a period's boundary, so the first one of a freshly launched instance is
+/// owed at the first minute boundary after it came up — within a minute of the launch. Generous:
+/// several times that, so a loaded host is not what decides the case.
 const FIRST_READING_DEADLINE: Duration = Duration::from_secs(180);
 
 /// One row of the catalog table: a metric a running instance publishes, the unit it is measured
@@ -391,7 +391,7 @@ pub(crate) async fn datapoints(
 }
 
 /// Wall-clock now as epoch seconds.
-fn now_secs() -> i64 {
+pub(crate) fn now_secs() -> i64 {
     i64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -408,15 +408,15 @@ fn window_start(at: i64, period: i64) -> i64 {
 }
 
 /// Advance the sampler's clock minute by minute over `[base, base + SPAN_MINUTES * 60)`,
-/// sampling [`SAMPLE_OFFSET_SECS`] into the minute AFTER each of those minutes.
+/// sampling [`SAMPLE_OFFSET_SECS`] into each of those minutes.
 ///
-/// A reading is of a whole period, so it is published once that period is over: sampling just
-/// past each minute of the span is therefore what makes the periods INSIDE the span due. Each
-/// sample is the publish the running emulator makes on its own, asked for at an instant of this
-/// suite's choosing: that is what lets one test cover ten periods of two cadences without
+/// A reading is taken at a period's boundary and measures the period behind it, so sampling just
+/// past each minute of the span is what makes the readings taken AT the minutes of the span due.
+/// Each sample is the publish the running emulator makes on its own, asked for at an instant of
+/// this suite's choosing: that is what lets one test cover ten periods of two cadences without
 /// waiting ten minutes for them.
 pub(crate) fn sample_the_span(engine: &engine::InMemoryEngine, base: i64) {
-    sample_minutes(engine, base, 1..SPAN_MINUTES + 1);
+    sample_minutes(engine, base, 0..SPAN_MINUTES);
 }
 
 /// The same sampling over an arbitrary run of `minutes` of the span based at `base`, each sample
@@ -432,12 +432,15 @@ pub(crate) fn sample_minutes(
     minutes: std::ops::Range<i64>,
 ) {
     for minute in minutes {
-        let at = UNIX_EPOCH
-            + Duration::from_secs(
-                u64::try_from(base + minute * MINUTE + SAMPLE_OFFSET_SECS).unwrap_or_default(),
-            );
-        ec2::state::instance_telemetry::publish_instance_metrics_at(engine, at);
+        sample_at(engine, base + minute * MINUTE + SAMPLE_OFFSET_SECS);
     }
+}
+
+/// Ask the sampler for the readings due at the epoch second `at`, as the service's own clock asks
+/// for them: ONE look, at an instant of the caller's choosing.
+pub(crate) fn sample_at(engine: &engine::InMemoryEngine, at: i64) {
+    let at = UNIX_EPOCH + Duration::from_secs(u64::try_from(at).unwrap_or_default());
+    ec2::state::instance_telemetry::publish_instance_metrics_at(engine, at);
 }
 
 /// The periods of `[base, base + SPAN_MINUTES * 60)` a series published at `period` carries a
@@ -754,8 +757,8 @@ async fn publication_stops_with_the_instance_and_resumes_with_it() {
 }
 
 /// Rule, on the WALL clock: the series of a launched instance appears without any further EC2
-/// call, carrying the period it measured and not the one still open, and it is dimensioned on
-/// exactly `{InstanceId}`.
+/// call, carrying the instant its reading was taken and not one the clock has not reached, and it
+/// is dimensioned on exactly `{InstanceId}`.
 #[tokio::test]
 async fn a_launched_instance_publishes_its_cpu_series_with_no_further_call() {
     let case = "a launch with detailed monitoring and nothing else";
@@ -778,8 +781,8 @@ async fn a_launched_instance_publishes_its_cpu_series_with_no_further_call() {
     let instance_id = ec2_query::element(&body, "instanceId")
         .unwrap_or_else(|| panic!("case {case:?}: RunInstances must report its instance: {body}"));
     // The launch answers a `pending` instance, so nothing has been measured yet: what publishes
-    // the first reading is that clock, once the instance is running and the period it is running
-    // in is over. Nothing below calls EC2 again — the poll asks CloudWatch alone.
+    // the first reading is that clock, at the first minute boundary after the instance is
+    // running. Nothing below calls EC2 again — the poll asks CloudWatch alone.
     let start = window_start(now_secs(), FIVE_MINUTES) - FIVE_MINUTES;
     let end = start + 4 * FIVE_MINUTES;
     let deadline = Instant::now() + FIRST_READING_DEADLINE;
@@ -806,9 +809,9 @@ async fn a_launched_instance_publishes_its_cpu_series_with_no_further_call() {
             "case {case:?}: a 1-minute period begins on a whole minute, got {point:?}"
         );
         assert!(
-            point.at + MINUTE <= now_secs(),
-            "case {case:?}: a reading is of a period that is OVER, so the period it is stamped \
-             with must have closed by now ({}), got {point:?}",
+            point.at <= now_secs(),
+            "case {case:?}: a reading is taken at the boundary it is stamped with, so that \
+             instant must have passed by now ({}), got {point:?}",
             now_secs()
         );
         assert!(

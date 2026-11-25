@@ -11,12 +11,12 @@
 //! on one minute in either state ("Basic monitoring | Status check metrics are available in
 //! 1-minute periods"; Amazon EC2 User Guide, instance monitoring). The cadence is therefore
 //! decided AT INGEST and changes when the monitoring move settles, for the instances the call
-//! NAMED and no other: each period is a wall-clock window anchored at a multiple of its own
-//! length, stamped with that window's start, so one identical 300-second window holds one
-//! datapoint of a 5-minute series and one per minute of a 1-minute one — and a stamp off the
-//! 5-minute grid can only have come from a 1-minute period. A later `Period=60` read cannot
-//! invent a bucket that was never stored, which is what makes the two cadences tell a detailed
-//! instance from a basic twin.
+//! NAMED and no other: each reading is taken at a boundary of that period — a multiple of its own
+//! length on the wall clock — and stamped with the instant it was taken, so one identical
+//! 300-second window holds one datapoint of a 5-minute series and one per minute of a 1-minute
+//! one — and a stamp off the 5-minute grid can only have been taken at the boundary of a 1-minute
+//! period. A later `Period=60` read cannot invent a bucket that was never stored, which is what
+//! makes the two cadences tell a detailed instance from a basic twin.
 //!
 //! This is the SWITCH itself, which the sibling suites do not cover: `instance_metric_publication`
 //! settles each monitoring state before it drives a span and reads one instance per span, and
@@ -297,7 +297,7 @@ async fn monitor_instances_shortens_the_period_of_the_instance_it_names_only() {
     let base = span_base(SPAN_PHASE);
     let switch_at = base + SWITCH_MINUTE * MINUTE;
     // The span up to the switch: both twins are under basic monitoring for every period of it.
-    sample_minutes(&engine, base, 1..SWITCH_MINUTE + 1);
+    sample_minutes(&engine, base, 0..SWITCH_MINUTE);
     for instance_id in [&twin, &named] {
         assert_window(
             &router,
@@ -331,7 +331,7 @@ async fn monitor_instances_shortens_the_period_of_the_instance_it_names_only() {
 
     // The rest of the span, with the switch settled: the 300-second window after it is where the
     // two cadences are compared.
-    sample_minutes(&engine, base, SWITCH_MINUTE + 1..SPAN_MINUTES + 1);
+    sample_minutes(&engine, base, SWITCH_MINUTE..SPAN_MINUTES);
     assert_window(
         &router,
         &format!("{case}, after the switch"),
@@ -373,7 +373,7 @@ async fn unmonitor_instances_restores_the_period_of_the_instance_it_names_only()
     let base = span_base(SPAN_PHASE);
     let switch_at = base + SWITCH_MINUTE * MINUTE;
     // The span up to the switch: both instances are under detailed monitoring for it.
-    sample_minutes(&engine, base, 1..SWITCH_MINUTE + 1);
+    sample_minutes(&engine, base, 0..SWITCH_MINUTE);
     for instance_id in [&twin, &named] {
         assert_window(
             &router,
@@ -404,7 +404,7 @@ async fn unmonitor_instances_restores_the_period_of_the_instance_it_names_only()
     poll_until_reported(&router, case, &twin, "running", "enabled").await;
     poll_until_reported(&router, case, &named, "running", "disabled").await;
 
-    sample_minutes(&engine, base, SWITCH_MINUTE + 1..SPAN_MINUTES + 1);
+    sample_minutes(&engine, base, SWITCH_MINUTE..SPAN_MINUTES);
     assert_window(
         &router,
         &format!("{case}, after the switch"),
@@ -461,7 +461,7 @@ async fn the_switch_reaches_exactly_the_named_instances_of_a_larger_set() {
     poll_until_reported(&router, case, &untouched, "running", "disabled").await;
 
     let base = span_base(SPAN_PHASE);
-    sample_minutes(&engine, base, 1..SWITCH_MINUTE + 1);
+    sample_minutes(&engine, base, 0..SWITCH_MINUTE);
     // The last whole 300-second window of the sampled span, read for all three.
     let window_start = base + SWITCH_MINUTE * MINUTE - FIVE_MINUTES;
     for (instance_id, cadence) in [

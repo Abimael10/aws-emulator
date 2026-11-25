@@ -3978,11 +3978,11 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// first call was.
     pub capacity_manager_disable_client_tokens: BTreeSet<String>,
     /// Which period of each `AWS/EC2` series this store has already published for each
-    /// instance: the instance id, then the metric name, then the START of the period the last
-    /// datapoint of that series carried, as epoch seconds — see [`instance_telemetry`], the
-    /// submodule that owns this slice.
+    /// instance: the instance id, then the metric name, then the instant the last datapoint of
+    /// that series was read at, as epoch seconds — see [`instance_telemetry`], the submodule
+    /// that owns this slice.
     ///
-    /// What it is FOR is one datapoint per period: a period is published into exactly once,
+    /// What it is FOR is one datapoint per period: a period's boundary yields one reading,
     /// however often the sampler looks, so a reader's `Average`, `Minimum` and `Maximum` over a
     /// period agree about what that period measured. The metric name is a `&'static str` out of
     /// [`instance_telemetry::INSTANCE_METRICS`], so no request text reaches this map, and the
