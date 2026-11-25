@@ -9,6 +9,42 @@
 
 use super::*;
 
+/// The lowest identifier the FIRST instance of an account can be allocated.
+///
+/// An EC2 instance identifier is 64 bits wide (the long id form carries 17 hexadecimal
+/// digits for it, [`LONG_RESOURCE_ID_DIGITS`]), and the first one an account is allocated is
+/// drawn between this floor and [`FIRST_INSTANCE_IDENTIFIER_CEILING`]: high enough that the
+/// digits of the id it prints as carry no hint of being the account's first, and low enough
+/// that the identifiers drawn above it ([`MAX_INSTANCE_IDENTIFIER_STEP`]) have room left for
+/// orders of magnitude more instances than [`MAX_STORED_INSTANCES`].
+const FIRST_INSTANCE_IDENTIFIER_FLOOR: u64 = 1 << 60;
+
+/// One past the highest identifier the FIRST instance of an account can be allocated; see
+/// [`FIRST_INSTANCE_IDENTIFIER_FLOOR`].
+const FIRST_INSTANCE_IDENTIFIER_CEILING: u64 = 1 << 62;
+
+/// How far above the highest identifier already issued the next one can be drawn.
+///
+/// The gap is what makes an identifier unguessable from the one before it, and the ceiling on
+/// it is what keeps the space from being spent: the identifiers above
+/// [`FIRST_INSTANCE_IDENTIFIER_CEILING`] hold millions of steps this wide, which is far more
+/// instance ids than one run of this emulator allocates.
+const MAX_INSTANCE_IDENTIFIER_STEP: u64 = 1 << 40;
+
+/// A value drawn from `0..bound`, from the host's own randomness — the source the key
+/// material this service generates is drawn from as well.
+///
+/// A host that will not hand out randomness leaves the draw at the bottom of the range
+/// rather than failing the call that asked for an id: an identifier is unique because it is
+/// drawn ABOVE every one already issued, which holds however the draw came out.
+fn drawn_below(bound: u64) -> u64 {
+    let mut bytes = [0_u8; 8];
+    if ::aws_lc_rs::rand::fill(&mut bytes).is_err() {
+        return 0;
+    }
+    u64::from_be_bytes(bytes) % bound.max(1)
+}
+
 impl InstanceRecord {
     /// The state the clock owes an instance that has just reached `state`, or `None` when
     /// `state` is the end of the move it was making.
@@ -64,14 +100,46 @@ impl ComAmazonawsEc2Amazonec2State {
 
     /// A fresh, unused `i-` instance id.
     ///
-    /// The long form every instance id EC2 issues takes: `i-` and 17 lowercase
-    /// hexadecimal digits of a counter that starts at one, so the id is never the null
-    /// id and its leading digit is `0` — one of the two forms
-    /// [`instance_id_is_well_formed`] reads, which is what lets an id outside them be
-    /// answered as malformed rather than looked up.
+    /// The long form every instance id EC2 issues takes: `i-` and 17 lowercase hexadecimal
+    /// digits of the identifier the instance is allocated. A 64-bit identifier never fills
+    /// the seventeenth digit, so the leading digit is `0` and the id is never the null id —
+    /// one of the two forms [`instance_id_is_well_formed`] reads, which is what lets an id
+    /// outside them be answered as malformed rather than looked up.
+    ///
+    /// The identifier is DRAWN from that space, not counted up from one. EC2 allocates a
+    /// resource identifier UNPREDICTABLY, so a value a caller writes down for itself names no
+    /// resource of the account: an operation handed an id nothing was allocated answers the
+    /// refusal for a resource it does not hold, rather than the refusal that belongs to some
+    /// live resource an id counted from one would have landed on. Every draw lands ABOVE each
+    /// identifier already issued ([`ComAmazonawsEc2Amazonec2State::issued_instance_identifiers`]),
+    /// so no instance can be handed an id another already holds and launch order is still id
+    /// order — the order `DescribeInstances` reports and pages over.
     pub fn mint_instance_id(&mut self) -> String {
-        self.next_instance += 1;
-        format!("i-{:017x}", self.next_instance)
+        let identifier = self.drawn_instance_identifier();
+        self.issued_instance_identifiers.insert(identifier);
+        format!("i-{identifier:017x}")
+    }
+
+    /// The identifier the next instance of the account is allocated: a value drawn above
+    /// every identifier already issued, so it is both unpredictable and unused.
+    ///
+    /// The arithmetic cannot leave the space: the first identifier is drawn below
+    /// [`FIRST_INSTANCE_IDENTIFIER_CEILING`], each later one climbs by at most
+    /// [`MAX_INSTANCE_IDENTIFIER_STEP`], and the store admits at most
+    /// [`MAX_STORED_INSTANCES`] instances to draw for — a highest identifier far below the
+    /// top of the 64-bit space. The add is written saturating all the same, so no draw here
+    /// can overflow whatever those ceilings become.
+    fn drawn_instance_identifier(&self) -> u64 {
+        let Some(highest) = self.issued_instance_identifiers.last().copied() else {
+            // The FIRST identifier of the account is drawn high in the space, so neither it
+            // nor the ones that climb from it reads as a position in a sequence, and far
+            // enough below the top of the space to leave room for the climb.
+            return FIRST_INSTANCE_IDENTIFIER_FLOOR
+                + drawn_below(FIRST_INSTANCE_IDENTIFIER_CEILING - FIRST_INSTANCE_IDENTIFIER_FLOOR);
+        };
+        // The step is drawn from the identifiers just above the highest one, which is what
+        // keeps the digits of an id unguessable from the id before it.
+        highest.saturating_add(1 + drawn_below(MAX_INSTANCE_IDENTIFIER_STEP))
     }
 
     /// The next unused primary private IPv4 address, or `None` when the search is

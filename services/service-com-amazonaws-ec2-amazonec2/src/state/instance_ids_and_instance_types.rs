@@ -167,7 +167,7 @@ pub fn validate_tag_size<E>(
 }
 
 /// How many hexadecimal digits the LONG EC2 resource id form carries, the form every
-/// id this service mints uses (`i-00000000000000001`): "the form
+/// id this service mints uses (`i-0` and the identifier's sixteen digits): "the form
 /// `i-xxxxxxxxxxxxxxxxx`" of AWS's `InvalidInstanceID.Malformed` error-code entry,
 /// seventeen digits.
 pub const LONG_RESOURCE_ID_DIGITS: usize = 17;
@@ -202,8 +202,9 @@ pub const SHORT_RESOURCE_ID_DIGITS: usize = 8;
 ///   `InvalidInstanceID.Malformed`. The SHORT form carries no such spare bit, so nothing
 ///   constrains its leading digit.
 /// * The ALL-ZERO id, the value every client reaches for as a placeholder: AWS answers
-///   `i-00000000000000000` with `InvalidInstanceID.Malformed` too, and the mint counts
-///   from one, so no instance can ever hold the null id.
+///   `i-00000000000000000` with `InvalidInstanceID.Malformed` too, and the mint draws no
+///   identifier below [`ComAmazonawsEc2Amazonec2State::mint_instance_id`]'s own floor, so
+///   no instance can ever hold the null id.
 ///
 /// The SHORT form is a form EC2 READS even though it no longer ISSUES it: EC2 stopped
 /// handing out short resource ids when the long form was introduced, which is why nothing
@@ -269,12 +270,12 @@ pub fn instance_id_reads_as_one(id: &str) -> bool {
 /// digits, which EC2 hands out as an OBFUSCATED identifier: the service decodes it back to
 /// the resource it names before it looks anything up, which is why a value it cannot decode
 /// is answered `Invalid<Kind>.Malformed` and not as a resource that does not exist. The
-/// digits are what this service's own mints count in
-/// ([`ComAmazonawsEc2Amazonec2State::next_id`],
-/// [`ComAmazonawsEc2Amazonec2State::mint_instance_id`]), so reading them back is how this
-/// emulator decodes one.
+/// digits are the identifier itself: the one this service's mint for every other kind
+/// counts up ([`ComAmazonawsEc2Amazonec2State::next_id`]) and the one its instance mint
+/// draws ([`ComAmazonawsEc2Amazonec2State::mint_instance_id`]), so reading them back is how
+/// this emulator decodes one.
 ///
-/// The all-zero identifier is `None`: no mint counts from zero, so it is no identifier at
+/// The all-zero identifier is `None`: no mint issues it, so it is no identifier at
 /// all and the id-form readers already refuse it.
 pub fn long_form_identifier(id: &str) -> Option<u128> {
     let (_prefix, suffix) = id.rsplit_once('-')?;
@@ -303,22 +304,39 @@ impl ComAmazonawsEc2Amazonec2State {
     /// whose IDENTIFIER names another resource — the same answer for the same reason, one
     /// step further in.
     ///
-    /// The identifiers this service has issued are the ones its mints have counted:
-    /// [`Self::mint_instance_id`] counts INSTANCES, so an identifier at or below it is an
-    /// instance's own, whatever became of the instance; [`Self::next_id`] counts every other
-    /// kind, so an identifier at or below THAT one and above the instance mint was spent on
-    /// another resource. An identifier neither mint has reached is one this service has
-    /// issued to nothing at all, which is left to the lookup — the same conservative
-    /// direction [`Self::id_was_issued`] takes: a value the service may yet issue is
-    /// reported as a resource that does not exist rather than as an id it cannot read.
+    /// The identifiers this service has issued are the ones it has ALLOCATED:
+    /// [`Self::mint_instance_id`] draws an INSTANCE's own and records it
+    /// ([`Self::instance_identifier_was_issued`]), whatever became of the instance;
+    /// [`Self::next_id`] counts every other kind, so an identifier at or below THAT one that
+    /// no instance was allocated was spent on another resource. An identifier neither has
+    /// issued is one this service has issued to nothing at all, which is left to the lookup —
+    /// the same conservative direction [`Self::id_was_issued`] takes: a value the service may
+    /// yet issue is reported as a resource that does not exist rather than as an id it cannot
+    /// read.
     ///
     /// The retired SHORT form carries no identifier to decode (EC2 reads it without
     /// unobfuscation, [`instance_id_is_well_formed`]), so it is never refused here: a
     /// short-form id the account holds no instance for is simply absent.
     pub fn instance_id_identifies_another_resource(&self, instance_id: &str) -> bool {
         long_form_identifier(instance_id).is_some_and(|identifier| {
-            identifier > u128::from(self.next_instance) && identifier <= u128::from(self.id_counter)
+            !self.instance_identifier_was_issued(identifier)
+                && identifier <= u128::from(self.id_counter)
         })
+    }
+
+    /// Whether this service has allocated `identifier` to an instance of the account.
+    ///
+    /// The ONE question the instance-id decoders ask of the store
+    /// ([`instance_id_decodes_as_one`], [`Self::instance_id_identifies_another_resource`]):
+    /// the identifiers an instance id carries are DRAWN unpredictably rather than counted, so
+    /// what the service has issued is the set it recorded each draw in
+    /// ([`Self::mint_instance_id`]) and not a range below a counter. An identifier it never
+    /// drew is one no instance of this account was ever given, whether or not any instance
+    /// still holds it.
+    #[must_use]
+    pub fn instance_identifier_was_issued(&self, identifier: u128) -> bool {
+        u64::try_from(identifier)
+            .is_ok_and(|identifier| self.issued_instance_identifiers.contains(&identifier))
     }
 }
 
@@ -359,8 +377,8 @@ pub fn instance_id_decodes_as_one(
     instance_id: &str,
 ) -> bool {
     instance_id_is_well_formed(instance_id)
-        && !long_form_identifier(instance_id)
-            .is_some_and(|identifier| identifier > u128::from(store.next_instance))
+        && long_form_identifier(instance_id)
+            .is_none_or(|identifier| store.instance_identifier_was_issued(identifier))
 }
 
 /// Refuse the first id of `instance_ids` this service cannot READ, BEFORE any id of the
@@ -445,8 +463,9 @@ pub fn require_known_instance<E>(
 /// answered "Unable to unobfuscate ID." rather than as a resource that is not there — the
 /// reading [`ComAmazonawsEc2Amazonec2State::id_was_issued`] states for the kinds recorded
 /// taking it. The ids this service has issued as an instance's own are the ones
-/// [`ComAmazonawsEc2Amazonec2State::mint_instance_id`] has counted, so a long-form
-/// identifier above that counter is a value no instance of this account was ever given and
+/// [`ComAmazonawsEc2Amazonec2State::mint_instance_id`] has drawn
+/// ([`ComAmazonawsEc2Amazonec2State::instance_identifier_was_issued`]), so a long-form
+/// identifier it never drew is a value no instance of this account was ever given and
 /// the describe cannot decode it. The retired SHORT form carries no identifier to decode
 /// ([`instance_id_is_well_formed`]), so it is looked up and reported absent, which is what
 /// `DescribeInstances` was recorded answering for one.

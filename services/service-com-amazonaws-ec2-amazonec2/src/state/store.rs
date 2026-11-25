@@ -1606,7 +1606,25 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// The caller-chosen bytes the stored instances hold, bounded by
     /// [`MAX_STORED_BYTES`].
     pub(super) stored_bytes: usize,
-    pub(super) next_instance: u64,
+    /// Every identifier this service has ALLOCATED to an instance of the account
+    /// ([`ComAmazonawsEc2Amazonec2State::mint_instance_id`]), whatever became of the
+    /// instance that holds it.
+    ///
+    /// An instance id is EC2's long id form, which the service hands out as an OBFUSCATED
+    /// identifier and decodes before it looks anything up: a value merely SPELLED in that
+    /// form names no instance and is answered as one the service cannot read
+    /// ([`instance_id_decodes_as_one`]). The identifiers are DRAWN from the whole 64-bit
+    /// space rather than counted, so what the service has issued is this SET — a counter's
+    /// range would claim every value below the highest id it handed out, which is nearly
+    /// every value a caller can write down. Ordered, so the next draw climbs from the
+    /// highest one issued and launch order stays id order. Starts EMPTY: a fresh account
+    /// has been allocated no instance identifier.
+    ///
+    /// BOUNDED by the instances this store holds at all ([`MAX_STORED_INSTANCES`]): an
+    /// identifier is drawn for an instance the same call stores, and every launch path
+    /// refuses a launch that would take the store past that ceiling, so this holds one
+    /// `u64` per stored instance and never more.
+    pub(super) issued_instance_identifiers: BTreeSet<u64>,
     pub(super) next_reservation: u64,
     pub(super) next_private_ip: u32,
     /// Every VPC the account holds, by `VpcId`.
@@ -3986,7 +4004,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             client_tokens: HashMap::new(),
             assigned_private_ips: ::std::collections::HashSet::new(),
             stored_bytes: 0,
-            next_instance: 0,
+            issued_instance_identifiers: BTreeSet::new(),
             next_reservation: 0,
             next_private_ip: 0,
             vpcs: BTreeMap::new(),

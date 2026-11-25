@@ -384,7 +384,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
         // Reported in `InstanceId` order, which the page cursor names a position in — an
-        // instance id is hex digits of a counter that only grows, and the store holds its
+        // instance id is hex digits of an identifier drawn above every one issued before it,
+        // and the store holds its
         // instances in a map whose iteration order is not that order, so the selected set is
         // sorted into it before it is paged.
         selected.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));

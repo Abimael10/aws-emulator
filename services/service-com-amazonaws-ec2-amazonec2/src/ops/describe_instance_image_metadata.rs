@@ -341,7 +341,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Page in `InstanceId` order, which the cursor below names a position in: an
-        // instance id is the zero-padded hex of a counter that only grows, so id order is
+        // instance id is the zero-padded hex of an identifier drawn above every one issued
+        // before it, so id order is
         // launch order. The sort establishes the invariant the cursor depends on at the
         // point of use rather than inheriting it from the container the store happens to
         // hold its instances in.

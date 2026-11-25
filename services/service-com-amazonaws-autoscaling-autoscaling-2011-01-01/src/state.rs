@@ -387,15 +387,25 @@ pub const LIFECYCLE_TRANSITION: Duration = Duration::from_millis(500);
 /// reading the group in the same instant as that call still sees it — which is the whole of
 /// what a transient span is for — and nothing else waits on it.
 ///
-/// It is far shorter than the span the moves OUT of service take ([`LIFECYCLE_TRANSITION`]),
+/// That is also the FLOOR on the value: the span has to outlast the rest of the call that
+/// owes it, because the launch is made part way through a capacity change and the group is
+/// read by the NEXT call. A span of a few milliseconds is spent before the answer is even
+/// written — the launch, the activities it records, the load balancers it settles — so the
+/// state it exists to publish is already gone by the time anybody can ask for it, which is
+/// the same as having no transient state at all. This is a span a read of the group lands
+/// inside with room to spare, on a host doing other work as well.
+///
+/// It is shorter than the span the moves OUT of service take ([`LIFECYCLE_TRANSITION`]),
 /// because a launch is what a CLIENT waits on: a client written against Amazon EC2 Auto
 /// Scaling looks again at the interval the real service's provisioning work calls for — tens
 /// of seconds — and probes before it sleeps, so a launch this service has already made and
 /// then withholds from the read that follows the call costs that client one whole interval,
 /// and a sequence that chains several launches (a scale-out, a scale-out the group's load
 /// balancing blocks, and the launch that repairing the attachment owes) is not observable
-/// inside the client's budget at all. Chosen, not documented, and never slept for.
-pub const LAUNCH_TRANSITION: Duration = Duration::from_millis(2);
+/// inside the client's budget at all: several of them together still have to fit inside one
+/// such interval, which is what caps this span from above. Chosen, not documented, and never
+/// slept for.
+pub const LAUNCH_TRANSITION: Duration = Duration::from_millis(150);
 
 /// How long a group waits before ATTEMPTING an owed launch again, once the attempt it made
 /// was one Amazon EC2 took back ([`StoredGroup::launch_retry_due`]).

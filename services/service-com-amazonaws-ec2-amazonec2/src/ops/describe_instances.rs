@@ -399,8 +399,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .ok_or_else(|| crate::state::invalid_pagination_token_for(token))?,
             ),
         };
-        // Launch order IS id order — an instance id is 17 hex digits of a counter that only
-        // grows, and a reservation's id likewise — so the set assembled above is already in
+        // Launch order IS id order — an instance id is 17 hex digits of an identifier drawn
+        // above every one issued before it, and a reservation's id counts up likewise — so
+        // the set assembled above is already in
         // the order the cursor names a position in, reservation by reservation and instance
         // by instance within each. Paging it through the one definition of EC2 paging
         // ([`state::page_from_cursor`]): the cursor names the instance the page ends at, and
