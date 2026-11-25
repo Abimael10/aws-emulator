@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCodeReview
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCodeReview`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCodeReview::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a new code review configuration in an agent space: mints the code review's
+//! identity and timestamps, stores a record carrying every supplied input, and answers
+//! from that stored record, so a later read of the store reports exactly what the caller
+//! was told.
 //!
 //! ## Shape of an operation
 //!
@@ -107,12 +103,29 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-securityagent-securitya
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `CreateCodeReviewError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.securityagent#CreateCodeReview")]
+// here — hence the `CreateCodeReviewError` alias below.
+//
+// `CreateCodeReview` lists no errors of its own, so the four service-wide shapes this
+// handler needs are widened in with `extra_errors`: `ValidationException` (HTTP 400,
+// carrying the `fieldList` a real client reads), `ResourceNotFoundException` (HTTP 404)
+// for an `agentSpaceId` that resolves to no agent space — the same shape every operation
+// OF an agent space answers for one — `ServiceQuotaExceededException` (HTTP 402) past the
+// space's code review quota, and `InternalServerException` (HTTP 500).
+#[smithy_macros::operation_error(
+    "com.amazonaws.securityagent#CreateCodeReview",
+    extra_errors = [
+        "InternalServerException",
+        "ResourceNotFoundException",
+        "ServiceQuotaExceededException",
+        "ValidationException"
+    ]
+)]
 #[derive(Debug)]
 pub enum CreateCodeReviewErrorModeled {
+    InternalServerException(InternalServerException),
+    ResourceNotFoundException(ResourceNotFoundException),
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -166,18 +179,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCodeReview` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCodeReviewErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCodeReview"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateCodeReviewErrorModeled::InternalServerException(InternalServerException {
+                message: "the code review store is unavailable".to_string(),
+            })
+        })?;
+
+        // `agentSpaceId` is `@required` but carries no `@length` in the model, so an
+        // empty one reaches the handler. It names no agent space and never could, so it
+        // is a bad request rather than a missing resource — the same split every
+        // operation of this service that looks an id up applies.
+        if input.agent_space_id.is_empty() {
+            return Err(refused("agentSpaceId", "member must not be empty"));
+        }
+        // `title` is `@required` and also carries no `@length`, so a blank one reaches
+        // the handler too. A code review whose title is only whitespace has no title, so
+        // it is refused naming the member rather than stored.
+        if input.title.trim().is_empty() {
+            return Err(refused("title", "member must not be blank"));
+        }
+        // The budget cap jobs started from this review run under: the model states it
+        // must be a positive number, and `Double` carries no `@range`, so the values that
+        // are not one are refused here rather than stored (see
+        // `crate::state::max_task_hours_violation`).
+        if let Some(violation) = input
+            .max_task_hours
+            .and_then(crate::state::max_task_hours_violation)
+        {
+            return Err(refused("maxTaskHours", &violation));
+        }
+        // The asset lists carry no `@length` in the model and every entry is kept on the
+        // stored record and reported on each later read, so a list past the ceiling is
+        // refused naming the member instead of stored (see
+        // `crate::state::code_review_assets_violation`).
+        if let Some((path, violation)) = crate::state::code_review_assets_violation(&input.assets) {
+            return Err(refused(&path, &violation));
+        }
+
+        let mut state = state.lock();
+
+        // A code review is created IN an agent space, so a space the account does not
+        // hold has nothing to create it in: the service's `ResourceNotFoundException`
+        // (HTTP 404) with the sentence the agent space API states for an `agentSpaceId`
+        // that resolves to nothing, and nothing written to the store.
+        if !state.agent_spaces.contains_key(&input.agent_space_id) {
+            return Err(CreateCodeReviewErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::AGENT_SPACE_NOT_FOUND.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // Every code review is a stored record holding the assets and filters it was
+        // configured with, so how many one agent space can accumulate is bounded, as it
+        // is on the real service: past the quota this operation answers the service's own
+        // `ServiceQuotaExceededException` (HTTP 402) instead of growing the store without
+        // end.
+        if state.code_review_count(&input.agent_space_id)
+            >= crate::state::MAX_CODE_REVIEWS_PER_AGENT_SPACE
+        {
+            return Err(CreateCodeReviewErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The request would exceed the maximum number of code reviews ({}) \
+                         for this agent space",
+                        crate::state::MAX_CODE_REVIEWS_PER_AGENT_SPACE
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // A fresh identity per call: the id is the service's to choose, so two creates
+        // carrying the same title are two distinct code reviews. `createdAt` and
+        // `updatedAt` are the same instant on a record nothing has updated yet.
+        let now = ::std::time::SystemTime::now();
+        let record = crate::state::CodeReviewRecord {
+            code_review_id: state.mint_code_review_id(),
+            agent_space_id: input.agent_space_id,
+            title: input.title,
+            assets: input.assets,
+            service_role: input.service_role,
+            log_config: input.log_config,
+            code_remediation_strategy: input.code_remediation_strategy,
+            validation_mode: input.validation_mode,
+            max_task_hours: input.max_task_hours,
+            report_destination: input.report_destination,
+            report_filters: input.report_filters,
+            created_at: now,
+            updated_at: now,
+        };
+
+        // The response is projected from the record that was just persisted, through the
+        // SAME projection `BatchGetCodeReviews` answers from — so what the caller is told
+        // is exactly what a later read of the store reports, member for member.
+        let projected = record.modelled();
+        let output = CreateCodeReviewOutput {
+            code_review_id: projected.code_review_id,
+            agent_space_id: Some(projected.agent_space_id),
+            title: Some(projected.title),
+            assets: Some(projected.assets),
+            service_role: projected.service_role,
+            log_config: projected.log_config,
+            code_remediation_strategy: projected.code_remediation_strategy,
+            validation_mode: projected.validation_mode,
+            max_task_hours: projected.max_task_hours,
+            report_destination: projected.report_destination,
+            report_filters: projected.report_filters,
+            created_at: projected.created_at,
+            updated_at: projected.updated_at,
+        };
+        state
+            .code_reviews
+            .insert(record.code_review_id.clone(), record);
+
+        Ok(output)
     }
+}
+
+/// The operation's `ValidationException` (HTTP 400) for a member whose value the service
+/// cannot accept, naming the member and the constraint it failed — the form every
+/// client-input refusal of this service takes.
+fn refused(path: &str, violation: &str) -> CreateCodeReviewError {
+    CreateCodeReviewErrorModeled::ValidationException(ValidationException {
+        message: format!(
+            "1 validation error detected: value for '{path}' failed to satisfy \
+             constraint: {violation}"
+        ),
+        field_list: Some(vec![ValidationExceptionField {
+            path: path.to_string(),
+            message: violation.to_string(),
+        }]),
+    })
+    .into()
 }

@@ -70,6 +70,9 @@ macro_rules! sa_shape_type {
     (date_time) => {
         ::aws_smithy_schema::ShapeType::Timestamp
     };
+    (double) => {
+        ::aws_smithy_schema::ShapeType::Double
+    };
     (list_of_string) => {
         ::aws_smithy_schema::ShapeType::List
     };
@@ -88,7 +91,7 @@ macro_rules! sa_shape_type {
 /// `@timestampFormat("date-time")` chain call it cannot.
 ///
 /// `$kind` is the member's shape kind — `string` (a `string` or an `enum` shape, both
-/// string-encoded), `date_time`, `list_of_string`, `map_of_string`,
+/// string-encoded), `date_time`, `double`, `list_of_string`, `map_of_string`,
 /// `list_of_struct(T)` or `struct_of(T)`.
 macro_rules! sa_member_schema {
     ($ns:literal, $local:literal, $wire:literal, $idx:literal, date_time) => {
@@ -169,6 +172,9 @@ macro_rules! sa_write_member {
     };
     ($s:ident, $m:expr, $v:expr, date_time) => {
         $s.write_timestamp($m, $v)?;
+    };
+    ($s:ident, $m:expr, $v:expr, double) => {
+        $s.write_double($m, *$v)?;
     };
     ($s:ident, $m:expr, $v:expr, list_of_string) => {
         $s.write_list($m, &|__sl| {

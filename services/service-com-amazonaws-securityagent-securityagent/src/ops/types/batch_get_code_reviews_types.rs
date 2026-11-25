@@ -18,14 +18,44 @@ pub struct BatchGetCodeReviewsInput {
     pub agent_space_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityagent#BatchGetCodeReviewsOutput")]
+/// `BatchGetCodeReviewsOutput`, with its schema and serializer written out instead of
+/// derived, for two reasons — the machinery lives in `super::wire_shape`:
+///
+/// 1. BOTH PARTITION LISTS, ALWAYS. A batch read answers every requested id in exactly
+///    one of `codeReviews` and `notFound`, so a caller iterates both unconditionally and
+///    a strict deserializer faults on an absent one. The two fields are therefore plain
+///    `Vec`s, not `Option`s: there is no state of this response in which a list is
+///    absent, so none can be omitted — the same contract
+///    [`BatchGetAgentSpacesOutput`](super::BatchGetAgentSpacesOutput) states.
+/// 2. THE ELEMENT'S WIRE FORM. A `CodeReview` carries `@timestampFormat("date-time")`
+///    members, so it is written against the hand-written [`CodeReview::SCHEMA`] below
+///    rather than through the derive, which would render them as epoch numbers.
 #[derive(Debug, Clone, Default)]
 pub struct BatchGetCodeReviewsOutput {
-    pub code_reviews: Option<Vec<CodeReview>>,
-    pub not_found: Option<Vec<String>>,
+    pub code_reviews: Vec<CodeReview>,
+    pub not_found: Vec<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityagent#CodeReview")]
+sa_schema_and_codec!(
+    BatchGetCodeReviewsOutput,
+    BATCH_GET_CODE_REVIEWS_OUTPUT_SCHEMA,
+    "com.amazonaws.securityagent#BatchGetCodeReviewsOutput",
+    "com.amazonaws.securityagent",
+    "BatchGetCodeReviewsOutput",
+    modelled: [
+        (M_CODE_REVIEWS, code_reviews, "codeReviews", 0, req, list_of_struct(CodeReview)),
+        (M_NOT_FOUND, not_found, "notFound", 1, req, list_of_string),
+    ],
+    recorded: [],
+);
+
+/// `CodeReview`, with its schema and serializer written out instead of derived, for the
+/// reason `CreateCodeReviewOutput` carries: `createdAt`/`updatedAt` are
+/// `@timestampFormat("date-time")` members the derive would render as epoch numbers
+/// (`smithy_query(query="shape",shape="CodeReview",
+/// model_path="services/service-com-amazonaws-securityagent-securityagent/smithy-model/com-amazonaws-securityagent-securityagent.json")`).
+/// The read path answers the SAME projection as the create path — the record does not
+/// change shape between the call that minted it and a later read of it.
 #[derive(Debug, Clone, Default)]
 pub struct CodeReview {
     pub code_review_id: String,
@@ -42,4 +72,42 @@ pub struct CodeReview {
     pub created_at: Option<::aws_smithy_types::DateTime>,
     pub updated_at: Option<::aws_smithy_types::DateTime>,
 }
+
+sa_schema_and_codec!(
+    CodeReview,
+    CODE_REVIEW_SCHEMA,
+    "com.amazonaws.securityagent#CodeReview",
+    "com.amazonaws.securityagent",
+    "CodeReview",
+    modelled: [
+        (M_CODE_REVIEW_ID, code_review_id, "codeReviewId", 0, req, string),
+        (M_AGENT_SPACE_ID, agent_space_id, "agentSpaceId", 1, req, string),
+        (M_TITLE, title, "title", 2, req, string),
+        (M_ASSETS, assets, "assets", 3, req, struct_of(Assets)),
+        (M_SERVICE_ROLE, service_role, "serviceRole", 4, opt, string),
+        (M_LOG_CONFIG, log_config, "logConfig", 5, opt, struct_of(CloudWatchLog)),
+        (
+            M_CODE_REMEDIATION_STRATEGY,
+            code_remediation_strategy,
+            "codeRemediationStrategy",
+            6,
+            opt,
+            string
+        ),
+        (M_VALIDATION_MODE, validation_mode, "validationMode", 7, opt, string),
+        (M_MAX_TASK_HOURS, max_task_hours, "maxTaskHours", 8, opt, double),
+        (
+            M_REPORT_DESTINATION,
+            report_destination,
+            "reportDestination",
+            9,
+            opt,
+            struct_of(ReportDestination)
+        ),
+        (M_REPORT_FILTERS, report_filters, "reportFilters", 10, opt, struct_of(ReportFilters)),
+        (M_CREATED_AT, created_at, "createdAt", 11, opt, date_time),
+        (M_UPDATED_AT, updated_at, "updatedAt", 12, opt, date_time),
+    ],
+    recorded: [],
+);
 

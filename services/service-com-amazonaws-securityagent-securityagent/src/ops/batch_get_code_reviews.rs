@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetCodeReviews
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetCodeReviews`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetCodeReviews::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Retrieves information about one or more code reviews in an agent space: resolves
+//! each requested id IN that space and projects the stored record, reporting every id
+//! the store does not hold in `notFound`.
 //!
 //! ## Shape of an operation
 //!
@@ -74,12 +69,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-securityagent-securitya
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `BatchGetCodeReviewsError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.securityagent#BatchGetCodeReviews")]
+// here — hence the `BatchGetCodeReviewsError` alias below.
+//
+// `BatchGetCodeReviews` lists no errors of its own, and an id the store does not hold is
+// reported in `notFound` rather than as a failure, so the only shape this handler needs
+// is widened in with `extra_errors`: `InternalServerException` (HTTP 500).
+#[smithy_macros::operation_error(
+    "com.amazonaws.securityagent#BatchGetCodeReviews",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum BatchGetCodeReviewsErrorModeled {
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -133,18 +134,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetCodeReviews` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetCodeReviewsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetCodeReviews"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchGetCodeReviewsErrorModeled::InternalServerException(InternalServerException {
+                message: "the code review store is unavailable".to_string(),
+            })
+        })?;
+        // A read: it resolves the requested records and projects them, and writes
+        // nothing at all — a code review carries no status the clock owes, so a later
+        // caller sees exactly what this caller saw.
+        let state = state.lock();
+
+        let mut code_reviews = Vec::new();
+        let mut not_found = Vec::new();
+        // Each requested id is answered once, in the order it was asked for: a repeat of
+        // an id already answered adds no second entry to either list.
+        let mut answered = ::std::collections::BTreeSet::new();
+        for code_review_id in &input.code_review_ids {
+            if !answered.insert(code_review_id.clone()) {
+                continue;
+            }
+            // A code review is reachable only through the agent space that holds it, so
+            // an id of ANOTHER space resolves to nothing here and is answered exactly as
+            // an id nothing created is.
+            match state.code_review_in(&input.agent_space_id, code_review_id) {
+                // The stored record's own projection, never the request's text — the same
+                // one `CreateCodeReview` answered, so the read reports the record member
+                // for member.
+                Some(record) => code_reviews.push(record.modelled()),
+                // An unknown id is part of the answer, not a failure of the call: the
+                // operation models no error for it and reports it in `notFound`.
+                None => not_found.push(code_review_id.clone()),
+            }
+        }
+
+        // Both lists always, even when empty: every requested id lands in exactly one of
+        // them, so a caller iterates both unconditionally instead of distinguishing an
+        // absent member from an empty one.
+        Ok(BatchGetCodeReviewsOutput {
+            code_reviews,
+            not_found,
+        })
     }
 }
+

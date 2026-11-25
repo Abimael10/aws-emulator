@@ -40,6 +40,9 @@ sha2 = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# One integration-test target rooted at `tests/all/main.rs`: `automod::dir!` declares
+# one module per `tests/all/<name>.rs`, so a new suite is a new file and nothing else.
+automod = { workspace = true }
 # `time` for the suites that wait out a span the service's own clock owes — a target
 # domain's ownership check settles that long after the call that starts it.
 tokio = { workspace = true, features = ["time"] }

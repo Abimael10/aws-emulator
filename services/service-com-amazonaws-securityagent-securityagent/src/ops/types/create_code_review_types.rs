@@ -26,7 +26,17 @@ pub struct CreateCodeReviewInput {
     pub report_filters: Option<ReportFilters>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityagent#CreateCodeReviewOutput")]
+/// `CreateCodeReviewOutput`, with its schema and serializer written out instead of
+/// derived.
+///
+/// WHY it is not `#[smithy_macros::smithy(shape = ...)]` like the input beside it:
+/// `createdAt` and `updatedAt` carry `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation", operation="CreateCodeReview",
+/// model_path="services/service-com-amazonaws-securityagent-securityagent/smithy-model/com-amazonaws-securityagent-securityagent.json")`),
+/// which the derive drops, so they would go out as epoch-second NUMBERS where the model
+/// (and every SDK's generated deserializer) requires an RFC 3339 string. The machinery
+/// lives in `super::wire_shape`; the code review responses carry no
+/// recorded-but-unmodelled member, so `recorded:` is empty.
 #[derive(Debug, Clone, Default)]
 pub struct CreateCodeReviewOutput {
     pub code_review_id: String,
@@ -43,4 +53,42 @@ pub struct CreateCodeReviewOutput {
     pub report_destination: Option<ReportDestination>,
     pub report_filters: Option<ReportFilters>,
 }
+
+sa_schema_and_codec!(
+    CreateCodeReviewOutput,
+    CREATE_CODE_REVIEW_OUTPUT_SCHEMA,
+    "com.amazonaws.securityagent#CreateCodeReviewOutput",
+    "com.amazonaws.securityagent",
+    "CreateCodeReviewOutput",
+    modelled: [
+        (M_CODE_REVIEW_ID, code_review_id, "codeReviewId", 0, req, string),
+        (M_TITLE, title, "title", 1, opt, string),
+        (M_CREATED_AT, created_at, "createdAt", 2, opt, date_time),
+        (M_UPDATED_AT, updated_at, "updatedAt", 3, opt, date_time),
+        (M_ASSETS, assets, "assets", 4, opt, struct_of(Assets)),
+        (M_SERVICE_ROLE, service_role, "serviceRole", 5, opt, string),
+        (M_LOG_CONFIG, log_config, "logConfig", 6, opt, struct_of(CloudWatchLog)),
+        (M_AGENT_SPACE_ID, agent_space_id, "agentSpaceId", 7, opt, string),
+        (
+            M_CODE_REMEDIATION_STRATEGY,
+            code_remediation_strategy,
+            "codeRemediationStrategy",
+            8,
+            opt,
+            string
+        ),
+        (M_VALIDATION_MODE, validation_mode, "validationMode", 9, opt, string),
+        (M_MAX_TASK_HOURS, max_task_hours, "maxTaskHours", 10, opt, double),
+        (
+            M_REPORT_DESTINATION,
+            report_destination,
+            "reportDestination",
+            11,
+            opt,
+            struct_of(ReportDestination)
+        ),
+        (M_REPORT_FILTERS, report_filters, "reportFilters", 12, opt, struct_of(ReportFilters)),
+    ],
+    recorded: [],
+);
 

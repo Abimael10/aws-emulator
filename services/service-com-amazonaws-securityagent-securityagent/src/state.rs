@@ -21,6 +21,11 @@
 //! `GetArtifact` — and every artifact operation implemented after it — reads back THAT
 //! record rather than a second copy of it.
 //!
+//! The code review configurations created in an agent space live here too, keyed by
+//! their own id and carrying the id of the space that holds them, so `CreateCodeReview`
+//! writes one record and `BatchGetCodeReviews` — and every code review operation
+//! implemented after it — reads back THAT record rather than a second copy of it.
+//!
 //! The security requirement packs live here for the same reason:
 //! `CreateSecurityRequirementPack`, `GetSecurityRequirementPack`,
 //! `ListSecurityRequirementPacks` — and every pack operation implemented after them —
@@ -48,6 +53,13 @@ use sha2::{Digest, Sha256};
 mod aws_managed_requirements;
 
 pub use aws_managed_requirements::*;
+
+/// The code review configurations an agent space holds, their stored record and the one
+/// projection every code review response is answered from. Re-exported, so a handler
+/// reaches them through this one module like every other resource of this service.
+mod code_reviews;
+
+pub use code_reviews::*;
 
 use crate::ops::types::{
     AWSResources, AgentSpace, ApplicationSummary, Artifact, ArtifactMetadataItem, ArtifactSummary,
@@ -1786,6 +1798,10 @@ pub struct ComAmazonawsSecurityagentSecurityagentState {
     /// the upload order the records themselves carry ([`ArtifactRecord::sequence`]), since
     /// a minted id is opaque and carries no order.
     pub artifacts: BTreeMap<String, ArtifactRecord>,
+    /// Every stored code review, keyed by its `codeReviewId`. A `BTreeMap` for the same
+    /// reason as [`Self::applications`]: one stable order for a read that walks the code
+    /// reviews of an agent space and for a cursor to resume in.
+    pub code_reviews: BTreeMap<String, CodeReviewRecord>,
     /// The ownership-verification challenge this account holds for each domain name it
     /// has registered, keyed by that name in its normalised form
     /// ([`normalized_domain_name`]).
@@ -1840,6 +1856,7 @@ impl Default for ComAmazonawsSecurityagentSecurityagentState {
                 })
                 .collect(),
             artifacts: BTreeMap::new(),
+            code_reviews: BTreeMap::new(),
             domain_verification_tokens: BTreeMap::new(),
             identifiers: IdentifierMint::default(),
         }
@@ -2182,6 +2199,43 @@ impl ComAmazonawsSecurityagentSecurityagentState {
     ) -> Option<ArtifactRecord> {
         self.artifact_in(agent_space_id, artifact_id)?;
         self.artifacts.remove(artifact_id)
+    }
+
+    /// Mint the `codeReviewId` of a new code review.
+    ///
+    /// The code review class's own form ([`CODE_REVIEW_ID_PREFIX`]) over a fresh draw of
+    /// the account's one mint, taken while the store is locked, so two calls — including
+    /// two carrying the same `title` in the same agent space — get two distinct ids and
+    /// neither overwrites the other, and a code review id can never be an agent space's
+    /// or an artifact's id.
+    pub fn mint_code_review_id(&mut self) -> String {
+        format!("{CODE_REVIEW_ID_PREFIX}{}", self.identifiers.next_uuid())
+    }
+
+    /// How many code reviews the agent space `agent_space_id` holds, i.e. how many count
+    /// against that space's code review quota ([`MAX_CODE_REVIEWS_PER_AGENT_SPACE`]).
+    pub fn code_review_count(&self, agent_space_id: &str) -> usize {
+        self.code_reviews
+            .values()
+            .filter(|review| review.agent_space_id == agent_space_id)
+            .count()
+    }
+
+    /// The code review `code_review_id` names IN the agent space `agent_space_id`, or
+    /// `None` when that space holds no such code review.
+    ///
+    /// A code review is reachable only through the space that holds it — every operation
+    /// of one names the space beside the review — so an id that names a code review of
+    /// ANOTHER agent space resolves to nothing here, exactly as an id nothing minted
+    /// does.
+    pub fn code_review_in(
+        &self,
+        agent_space_id: &str,
+        code_review_id: &str,
+    ) -> Option<&CodeReviewRecord> {
+        self.code_reviews
+            .get(code_review_id)
+            .filter(|review| review.agent_space_id == agent_space_id)
     }
 }
 
