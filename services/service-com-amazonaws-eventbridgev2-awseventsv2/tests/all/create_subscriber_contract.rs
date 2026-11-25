@@ -214,7 +214,7 @@ impl Harness {
     /// `CreateSubscriber` as the operation itself answers it.
     ///
     /// A case that means a RETRY states its own token; every other create is given a fresh
-    /// one, which is the member this service requires of a create.
+    /// one, as a code-generated client supplies the member.
     async fn create(
         &self,
         input: CreateSubscriberInput,

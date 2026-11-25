@@ -15,12 +15,12 @@
 //! No operation of this service answers the framework's synthetic `ValidationException`,
 //! which its model does not declare at all.
 //!
-//! RULE 2 — every create of this service REQUIRES the `@idempotencyToken` `ClientToken`
-//! its input models, which the model itself leaves optional because a code-generated
-//! client fills it in: a request stating one is served and mints its resource, a repeat
+//! RULE 2 — the `@idempotencyToken` `ClientToken` each create of this service models,
+//! which the model leaves optional because a code-generated client fills it in: a request
+//! stating one is served and mints its resource, a repeat
 //! carrying the same token replays the one resource that token minted, and a second create
 //! of a name already taken under a token of its own is the name collision. What a create
-//! stating NO token is answered is `crate::create_requires_an_idempotency_token`'s rule.
+//! stating NO token is answered is `crate::create_without_an_idempotency_token`'s rule.
 //!
 //! RULE 3 — `DescribeEventBus` resolves the whole `EventBusArn` it is given, identifier
 //! segment included: an ARN carrying an identifier this service never minted addresses no
@@ -435,8 +435,8 @@ pub(crate) fn unminted_arn(region: &str, name: &str, bus_id: &str) -> String {
 }
 
 /// A `CreateEventBusInput` naming `name`, with `client_token` as the caller supplied it:
-/// `None` is the request that states no token at all, which every create of this service
-/// refuses ([`CLIENT_TOKEN_REQUIRED`]).
+/// `None` is the request that states no token at all, which the model leaves optional
+/// (`crate::create_without_an_idempotency_token`).
 pub(crate) fn create_bus(name: &str, client_token: Option<&str>) -> CreateEventBusInput {
     CreateEventBusInput {
         name: name.to_string(),
@@ -445,13 +445,8 @@ pub(crate) fn create_bus(name: &str, client_token: Option<&str>) -> CreateEventB
     }
 }
 
-/// The whole `Message` a create that states no `ClientToken` is refused with — spelled out
-/// here rather than read from the crate, so a reworded refusal fails the suites that drive
-/// it. The error shape it carries is [`INVALID_INPUT_EXCEPTION`].
-pub(crate) const CLIENT_TOKEN_REQUIRED: &str = "ClientToken is required";
-
-/// The input member every create of this service requires the caller to state, reached
-/// without naming which create's input shape it sits on.
+/// The idempotency-token member each create of this service models, reached without naming
+/// which create's input shape it sits on.
 ///
 /// This exists for [`with_client_token`], which is what the suites' harnesses put a token
 /// on a create that states none with.
@@ -478,9 +473,8 @@ impl StatesClientToken for CreateSubscriberInput {
     }
 }
 
-/// `input` with the `ClientToken` this service requires of every create, when the case
-/// states none of its own — what a code-generated client does for the member the model
-/// tags `@idempotencyToken`.
+/// `input` with a `ClientToken` on it, when the case states none of its own — what a
+/// code-generated client does for the member the model tags `@idempotencyToken`.
 ///
 /// The token is a FRESH one per call ([`fresh_client_token`]), so a create a case did not
 /// mean as a retry mints its own resource rather than replaying another's: a case about
@@ -757,11 +751,11 @@ async fn every_modelled_operation_states_its_refusal_in_the_modelled_shape() {
 // ---------------------------------------------------------------------------
 
 /// RULE 2 on the create whose whole output the model states: a request stating the
-/// `ClientToken` this service requires is served and mints the bus — over rows varying the
+/// `ClientToken` the model gives it is served and mints the bus — over rows varying the
 /// name grammar and the storage configuration, so neither the answer nor the mint is keyed
 /// to one request shape — and the bus it reports is the bus the store holds. The same row
-/// with no token at all is refused and mints nothing, which
-/// `crate::create_requires_an_idempotency_token` drives across every create.
+/// with no token at all is served too, which
+/// `crate::create_without_an_idempotency_token` drives across every create.
 #[tokio::test]
 async fn a_bus_create_is_served_when_it_states_the_idempotency_token() {
     let wire = Wire::new();
@@ -796,8 +790,8 @@ async fn a_bus_create_is_served_when_it_states_the_idempotency_token() {
             client_token: None,
             ..Default::default()
         });
-        // The token the harness states is the one member this service requires beyond the
-        // model's own, so this is a well-formed create: it is served, and what it reports
+        // The token the harness states is the member a code-generated client fills in, so
+        // this is a well-formed create: it is served, and what it reports
         // is the bus it minted.
         let created = wire
             .ok::<CreateEventBus<InMemoryEngine>>(case, &create)

@@ -205,16 +205,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let region = crate::state::request_region(ctx);
-        // The idempotency token is what makes a retried create a replay rather than a
-        // second bus, and this service REQUIRES the caller to state it: a create that
-        // carries none is refused here, before the key lookup and before the store is
-        // touched, so nothing is minted for it (`crate::state::client_token_required`).
-        if input.client_token.is_none() {
-            return Err(CreateEventBusErrorModeled::InvalidInputException(
-                crate::state::client_token_required(),
-            )
-            .into());
-        }
         // The key an encryption configuration names has to be one KMS holds: the
         // member's own constraints cannot say whether a key EXISTS, and a bus whose
         // key is not there could encrypt nothing. Asked before the store is
@@ -237,9 +227,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is gone replays nothing and its name is free again. The lookup is per
         // region, because a bus belongs to the region its create named.
         //
-        // The member is stated by every create this service serves (refused
-        // above when it is not), so the lookup below is what every create goes
-        // through.
+        // The member is `@idempotencyToken` and not `@required`, so a create
+        // that states none is matched against nothing and mints a bus of its
+        // own: there is no token for a later retry to replay, which is the
+        // whole of what omitting it costs the caller.
         if let Some(token) = input.client_token.as_deref() {
             if let Some(bus) = state.bus_by_client_token(&region, token) {
                 if !matches_stored(bus, &input) {

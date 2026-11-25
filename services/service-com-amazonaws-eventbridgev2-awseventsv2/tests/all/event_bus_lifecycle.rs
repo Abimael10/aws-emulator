@@ -155,8 +155,8 @@ impl Harness {
     /// Create one bus.
     ///
     /// A case that means a RETRY states its own `ClientToken`; every other create is given
-    /// a fresh one (`crate::modelled_input_refusal::with_client_token`), which is the
-    /// member this service requires of a create, as a code-generated client supplies it.
+    /// a fresh one (`crate::modelled_input_refusal::with_client_token`), as a
+    /// code-generated client supplies the member.
     async fn create(
         &self,
         input: CreateEventBusInput,

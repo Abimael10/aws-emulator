@@ -106,7 +106,7 @@ impl Harness {
         OperationContext::new(&self.parts, self.definition.identity(), self.callback.clone())
     }
 
-    /// Create one bus, with the idempotency token this service requires of every create
+    /// Create one bus, with the create's idempotency token
     /// supplied when the case states none of its own
     /// (`crate::modelled_input_refusal::with_client_token`).
     async fn create(&self, case: &str, input: CreateEventBusInput) -> CreateEventBusOutput {

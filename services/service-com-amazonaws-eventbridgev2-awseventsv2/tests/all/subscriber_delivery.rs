@@ -60,10 +60,10 @@ const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/event-delivery";
 
 /// How long a poll waits for a condition the emulator owes: far above the
 /// provisioning span a bus takes, so a loaded host has ample room.
-const PATIENCE: Duration = Duration::from_secs(30);
+pub(crate) const PATIENCE: Duration = Duration::from_secs(30);
 
 /// How long one pass of a poll sleeps before looking again.
-const POLL_INTERVAL: Duration = Duration::from_millis(25);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 // ---------------------------------------------------------------------------
 // The emulator and the two wire harnesses
@@ -72,7 +72,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// EventBridge V2 and Amazon SQS on ONE engine — the shape
 /// `core/router/src/lib.rs` mounts them in, which is what makes a handler's
 /// in-process callback reach the other service.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     emulator_with_store().0
 }
 
@@ -101,7 +101,7 @@ fn authorization(service: &str) -> String {
 
 /// One rpcv2Cbor call against EventBridge V2, answered as its HTTP status and
 /// raw body.
-async fn eventsv2_call<O: Operation>(
+pub(crate) async fn eventsv2_call<O: Operation>(
     router: &MultiServiceRouter,
     input: &O::Input,
 ) -> (u16, bytes::Bytes) {
@@ -127,7 +127,7 @@ async fn eventsv2_call<O: Operation>(
 }
 
 /// The same call, requiring a 200 and decoding the typed output.
-async fn eventsv2_ok<O: Operation>(
+pub(crate) async fn eventsv2_ok<O: Operation>(
     router: &MultiServiceRouter,
     input: &O::Input,
     case: &str,
@@ -175,7 +175,12 @@ async fn sqs(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16
 }
 
 /// The same call, requiring a 200.
-async fn sqs_ok(router: &MultiServiceRouter, operation: &str, body: &Value, case: &str) -> Value {
+pub(crate) async fn sqs_ok(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+    case: &str,
+) -> Value {
     let (status, answer) = sqs(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -189,7 +194,11 @@ async fn sqs_ok(router: &MultiServiceRouter, operation: &str, body: &Value, case
 // ---------------------------------------------------------------------------
 
 /// A queue called `name`: its url, and the ARN a subscriber targets it by.
-async fn given_queue(router: &MultiServiceRouter, case: &str, name: &str) -> (String, String) {
+pub(crate) async fn given_queue(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+) -> (String, String) {
     let created = sqs_ok(router, "CreateQueue", &json!({ "QueueName": name }), case).await;
     let url = created["QueueUrl"]
         .as_str()
@@ -344,7 +353,7 @@ async fn publish(
 }
 
 /// How many messages the queue at `queue_url` reports available right now.
-async fn queue_depth(router: &MultiServiceRouter, case: &str, queue_url: &str) -> u64 {
+pub(crate) async fn queue_depth(router: &MultiServiceRouter, case: &str, queue_url: &str) -> u64 {
     let attributes = sqs_ok(
         router,
         "GetQueueAttributes",
@@ -365,7 +374,7 @@ async fn queue_depth(router: &MultiServiceRouter, case: &str, queue_url: &str) -
 /// The bodies of the messages the queue at `queue_url` holds, polled until
 /// `expected` of them have been read or the deadline passes, each read as the
 /// document it is.
-async fn received_bodies(
+pub(crate) async fn received_bodies(
     router: &MultiServiceRouter,
     case: &str,
     queue_url: &str,

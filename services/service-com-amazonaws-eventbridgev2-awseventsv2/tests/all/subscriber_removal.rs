@@ -201,7 +201,7 @@ impl Harness {
     /// Create a subscriber and hand back its `SubscriberArn`.
     ///
     /// A case that means a RETRY states its own token; every other create is given a fresh
-    /// one, which is the member this service requires of a create.
+    /// one, as a code-generated client supplies the member.
     async fn create(&self, case: &str, input: CreateSubscriberInput) -> String {
         CreateSubscriber::new(Arc::clone(&self.engine))
             .handle(with_client_token(input), &self.ctx())

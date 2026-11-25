@@ -194,16 +194,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // onto, which the request names by ARN, so nothing here is read from the
         // request's own credential scope.
         let _ = ctx;
-        // The idempotency token is what makes a retried create a replay rather than a
-        // second source, and this service REQUIRES the caller to state it: a create that
-        // carries none is refused before the store is touched, so nothing is minted for
-        // it (`crate::state::client_token_required`).
-        if input.client_token.is_none() {
-            return Err(CreateEventSourceErrorModeled::InvalidInputException(
-                crate::state::client_token_required(),
-            )
-            .into());
-        }
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(CreateEventSourceErrorModeled::InternalException(InternalException {
                 message: Some("the event bus store is unavailable on this engine".to_string()),
@@ -258,6 +248,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a source that is gone replays nothing and its name is free again. The
         // lookup is per region, because an EventSource belongs to the region of
         // its bus.
+        //
+        // The member is `@idempotencyToken` and not `@required`, so a create
+        // that states none is matched against nothing and mints a source of its
+        // own: there is no token for a later retry to replay, which is the whole
+        // of what omitting it costs the caller.
         if let Some(token) = input.client_token.as_deref() {
             if let Some(source) = state.event_source_by_client_token(&region, token) {
                 if !matches_stored(source, &input) {

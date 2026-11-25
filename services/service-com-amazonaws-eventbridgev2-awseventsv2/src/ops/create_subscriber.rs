@@ -258,17 +258,6 @@ fn create(
 ) -> Result<Created, CreateSubscriberError> {
     state.settle_lifecycles(now);
 
-    // The idempotency token is what makes a retried create a replay rather than
-    // a second subscriber, and this service REQUIRES the caller to state it: a
-    // create that carries none is refused before anything is minted
-    // (`crate::state::client_token_required`).
-    if input.client_token.is_none() {
-        return Err(CreateSubscriberErrorModeled::InvalidInputException(
-            crate::state::client_token_required(),
-        )
-        .into());
-    }
-
     // The bus the subscriber is created on has to exist, and "The bus must
     // be ACTIVE": a bus that is still provisioning or on its way out cannot
     // take on a new subscriber.
@@ -368,6 +357,11 @@ fn create(
     // mismatch the model names. The token is read off the stored subscriber, so
     // one that is gone replays nothing and its name is free again. The lookup
     // is per region, because a subscriber belongs to the region of its bus.
+    //
+    // The member is `@idempotencyToken` and not `@required`, so a create that
+    // states none is matched against nothing and mints a subscriber of its
+    // own: there is no token for a later retry to replay, which is the whole
+    // of what omitting it costs the caller.
     if let Some(token) = input.client_token.as_deref() {
         if let Some(subscriber) = state.subscriber_by_client_token(&region, token) {
             if !matches_stored(subscriber, input) {
