@@ -11,8 +11,9 @@
 //! becomes the root user email address of the account, and the syntax it is held
 //! to is the email-address expression this service's model declares
 //! ([`crate::state::validated_email_address`]). An address another account
-//! already holds, or is already owed by its accepted update, is refused with the
-//! modelled 409 `ConflictException` and records nothing — the conflict this
+//! already holds, is already owed by its accepted update, or is owed to it as
+//! the root address its own id names, is refused with the modelled 409
+//! `ConflictException` and records nothing — the conflict this
 //! service's `ConflictException` documents by example, decided where the change
 //! is asked for rather than only where it is confirmed. A request on an account
 //! whose previous update has been accepted
@@ -233,8 +234,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // confirming step uses, and BEFORE the target record is reached, so a
         // refused start records nothing (not even the account record a stored
         // update would have created). The target account itself is skipped on
-        // both halves of the test: asking again for the address it already
-        // holds, or is already owed, takes that address from nobody.
+        // every half of the test: asking again for the address it already
+        // holds, is already owed, or is owed as the root address its own id
+        // names, takes that address from nobody.
         if store.primary_email_in_use_by_other(&input.primary_email, &account_id) {
             return Err(StartPrimaryEmailUpdateErrorModeled::ConflictException(
                 crate::state::primary_email_already_in_use(),

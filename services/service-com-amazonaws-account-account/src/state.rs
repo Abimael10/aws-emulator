@@ -383,8 +383,32 @@ const INITIAL_PRIMARY_EMAIL_DOMAIN: &str = "@example.com";
 /// inside `PrimaryEmailAddress`'s modelled `@length(min: 5, max: 64)`: 5
 /// characters of local part, a 12-digit id and 12 of domain is 29, and the
 /// shape carries no `@pattern` to satisfy beyond that.
+///
+/// Because the address is a function of the id ALONE, it is the address that id
+/// will hold whenever its record is first touched — so it belongs to that
+/// account before the record exists, which is what
+/// [`seeded_primary_email_account_id`] reads back off an address and what keeps
+/// one address from reaching two accounts.
 pub fn initial_primary_email(account_id: &str) -> String {
     format!("{INITIAL_PRIMARY_EMAIL_LOCAL_PART}{account_id}{INITIAL_PRIMARY_EMAIL_DOMAIN}")
+}
+
+/// The account whose seeded root address `address` is, or `None` for an address
+/// this emulator mints for no account — the inverse of
+/// [`initial_primary_email`].
+///
+/// An address is one this emulator mints only when it is EXACTLY that form: the
+/// local part, an account id of [`ACCOUNT_ID_LENGTH`] digits (`AccountId`'s own
+/// `^\d{12}$`) and the domain. An address that merely resembles it — another
+/// domain, a middle part that is not twelve digits — is nobody's seeded address
+/// and is admitted like any other.
+pub fn seeded_primary_email_account_id(address: &str) -> Option<&str> {
+    let account_id = address
+        .strip_prefix(INITIAL_PRIMARY_EMAIL_LOCAL_PART)?
+        .strip_suffix(INITIAL_PRIMARY_EMAIL_DOMAIN)?;
+    (account_id.len() == ACCOUNT_ID_LENGTH
+        && account_id.bytes().all(|digit| digit.is_ascii_digit()))
+    .then_some(account_id)
 }
 
 /// How many account records the store holds before a call that would create a
@@ -1282,6 +1306,13 @@ impl ComAmazonawsAccountAccountState {
     ///
     /// `None` when the id names no record and the store is already at that
     /// bound: no record is created and nothing is written.
+    ///
+    /// The record comes up seeded from the id ([`Account::new`]), its primary
+    /// email address included, and that address is never one another account
+    /// holds: an address this emulator owes an account whose record it has not
+    /// materialised yet is in use by that account from the start
+    /// ([`seeded_primary_email_owed`](Self::seeded_primary_email_owed)), so no
+    /// change can take it away before the record exists.
     pub fn account_mut(&mut self, account_id: &str, now: SystemTime) -> Option<&mut Account> {
         if !self.accounts.contains_key(account_id) && self.accounts.len() >= MAX_ACCOUNTS {
             return None;
@@ -1303,16 +1334,19 @@ impl ComAmazonawsAccountAccountState {
     }
 
     /// Whether `address` is already in use by an account OTHER than
-    /// `account_id`: another account holds it, or another account's update is
-    /// ACCEPTED for it, so its completion is already owed.
+    /// `account_id`: another account holds it, another account's update is
+    /// ACCEPTED for it, so its completion is already owed, or it is the root
+    /// address this emulator owes an account whose record it has not
+    /// materialised yet
+    /// ([`seeded_primary_email_owed`](Self::seeded_primary_email_owed)).
     ///
     /// The question is asked ON BEHALF of one account, and it is asked about
-    /// every OTHER account symmetrically — both halves of the test skip
-    /// `account_id`. Giving an account the address it already holds, or the one
-    /// its own accepted update is already owed, takes that address from nobody
-    /// and changes nothing, so it is not the conflict this service documents
-    /// ("you try to change an account's root user email to an email address
-    /// which is already in use").
+    /// every OTHER account symmetrically — every half of the test skips
+    /// `account_id`. Giving an account the address it already holds, the one its
+    /// own accepted update is already owed, or the root address its own id
+    /// names, takes that address from nobody and changes nothing, so it is not
+    /// the conflict this service documents ("you try to change an account's root
+    /// user email to an email address which is already in use").
     ///
     /// Settle first ([`settle_primary_email_updates`](Self::settle_primary_email_updates)):
     /// an address a completed update put on an account is in use from the
@@ -1320,6 +1354,12 @@ impl ComAmazonawsAccountAccountState {
     /// asked for is NOT in use — nothing has been changed for it yet, and the
     /// passcode it waits for may never arrive.
     pub fn primary_email_in_use_by_other(&self, address: &str, account_id: &str) -> bool {
+        if self
+            .seeded_primary_email_owed(address)
+            .is_some_and(|owed_to| owed_to != account_id)
+        {
+            return true;
+        }
         self.accounts
             .values()
             .filter(|account| account.account_id != account_id)
@@ -1329,6 +1369,30 @@ impl ComAmazonawsAccountAccountState {
                         update.is_accepted() && update.requested_email == address
                     })
             })
+    }
+
+    /// The account `address` is the seeded root address of while this emulator
+    /// holds no record of it — the account that address is OWED.
+    ///
+    /// An account's first primary email address is a function of its id alone
+    /// ([`initial_primary_email`]), so the address belongs to that account from
+    /// the start: materialising the record is this emulator's storage detail
+    /// ([`account_mut`](Self::account_mut) creates one on first touch), not the
+    /// instant the account comes to have a root user email address. Treating
+    /// such an address as free would hand it to another account and then seed
+    /// its own account with it on the next touch, leaving two records holding
+    /// one address — and leaving the account that was handed it unable to even
+    /// re-affirm the address it holds.
+    ///
+    /// An id whose record DOES exist is answered by that record instead: it
+    /// either still holds the address, which the holder half of
+    /// [`primary_email_in_use_by_other`](Self::primary_email_in_use_by_other)
+    /// reports, or a completed update moved it off, which frees the address
+    /// exactly as a completed update frees any other address, because nothing
+    /// seeds an existing record again.
+    fn seeded_primary_email_owed<'a>(&self, address: &'a str) -> Option<&'a str> {
+        seeded_primary_email_account_id(address)
+            .filter(|owed_to| !self.accounts.contains_key(*owed_to))
     }
 
     /// The account `account_id` names, for a mutating operation that must NOT
