@@ -28,7 +28,11 @@ use serde_json::{json, Value};
 const NAMESPACE: &str = "com.amazonaws.amplifyuibuilder#";
 
 /// The shipped Smithy model of this service, parsed once for the whole test target.
-fn model() -> &'static Value {
+///
+/// Shared, so a suite that asks the model a question of its own — which operations it
+/// binds `@paginated`, say — reads the shipped file through this one reader rather than
+/// loading and parsing it a second time in the same test binary.
+pub(crate) fn model() -> &'static Value {
     static MODEL: OnceLock<Value> = OnceLock::new();
     MODEL.get_or_init(|| {
         let path: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))

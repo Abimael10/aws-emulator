@@ -3,7 +3,7 @@
 //! The one page walk every paginated operation of this service serves a page from, end to
 //! end over HTTP.
 //!
-//! The rule under test, which all six of them implement: a page of an app environment's
+//! The rule under test, which all seven of them implement: a page of an app environment's
 //! records starts at the head of that environment's creation order when the request names
 //! no `nextToken`; a token is honoured only when it is one the service issued for that app
 //! environment over the collection the operation pages, and anything else is refused with
@@ -15,10 +15,15 @@
 //! once, in that one order.
 //!
 //! Each row drives the walk through a different operation — `ListComponents`,
-//! `ExportComponents`, `ListThemes`, `ExportThemes`, `ExportForms` and `ListCodegenJobs` —
-//! over the record kind that operation pages and the projection it serves, so the shared
-//! walk is exercised from every operation that reaches it. Every case goes through the
-//! router: routing, deserialization, the handler, the persisted state and serialization.
+//! `ExportComponents`, `ListThemes`, `ExportThemes`, `ListForms`, `ExportForms` and
+//! `ListCodegenJobs`, the seven operations the model binds `@paginated` — over the record
+//! kind that operation pages and the projection it serves, so the shared walk is exercised
+//! from every operation that reaches it. Every case goes through the router: routing,
+//! deserialization, the handler, the persisted state and serialization.
+//!
+//! A second case keeps that claim honest: it reads the row list against this service's
+//! Smithy model and requires the two to name the same operations, so a paginated operation
+//! missing from the suite fails here instead of leaving its page walk unexercised.
 
 use std::sync::Arc;
 
@@ -52,6 +57,11 @@ const SMALLEST_PAGE: usize = 1;
 
 /// A page size well inside that range, so a row also walks pages longer than one record.
 const SMALL_PAGE: usize = 2;
+
+/// The largest page `maxResults` admits, the maximum of that same `@range`: a page bound
+/// above the number of records stored, which every list row is also asked for, so the whole
+/// collection comes back as one page that ends the walk.
+const LARGEST_PAGE: usize = 100;
 
 /// One emulator: a router carrying only this service, over one shared engine.
 fn emulator() -> MultiServiceRouter {
@@ -250,9 +260,10 @@ struct Paginated {
     page_size: Option<usize>,
 }
 
-/// Every operation of this crate that serves a page, one row each: the two component
-/// listings the duplicated walk lived in, and the theme, form and codegen-job pages that
-/// now share it too.
+/// Every operation of this crate that serves a page, one row each — the seven the model
+/// binds `@paginated`: the two component listings the duplicated walk lived in, and the
+/// theme, form and codegen-job pages that now share it too, each collection with both the
+/// list and the export that pages it.
 fn paginated_operations() -> Vec<Paginated> {
     vec![
         Paginated {
@@ -280,6 +291,12 @@ fn paginated_operations() -> Vec<Paginated> {
             page_size: None,
         },
         Paginated {
+            operation: "ListForms",
+            kind: Kind::Forms,
+            page_uri: collection_uri,
+            page_size: Some(SMALLEST_PAGE),
+        },
+        Paginated {
             operation: "ExportForms",
             kind: Kind::Forms,
             page_uri: export_uri,
@@ -294,12 +311,68 @@ fn paginated_operations() -> Vec<Paginated> {
     ]
 }
 
+/// The short name of every operation the model binds `@paginated`, in one order.
+///
+/// The model comes from the test target's one shared reader,
+/// [`crate::modelled_refusal_statuses::model`], so this suite parses no second copy of the
+/// shipped file.
+fn modelled_paginated_operations() -> Vec<String> {
+    let model = crate::modelled_refusal_statuses::model();
+    let shapes = model["shapes"]
+        .as_object()
+        .expect("a Smithy model carries a shapes map");
+    let mut names: Vec<String> = shapes
+        .iter()
+        .filter(|(_, shape)| {
+            shape["type"] == "operation" && shape["traits"].get("smithy.api#paginated").is_some()
+        })
+        .map(|(id, _)| {
+            id.rsplit_once('#')
+                .map(|(_, short)| short.to_string())
+                .unwrap_or_else(|| id.clone())
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// The row list drives the walk from EVERY paginated operation of the service, which is
+/// what the suite claims: the operations it names are exactly the ones the shipped model
+/// binds `@paginated`, so a paginated operation the service grows, or one left out of the
+/// list, is a failure here rather than a silent hole in the walk's coverage.
+#[test]
+fn the_rows_are_every_paginated_operation_the_model_binds() {
+    let mut rows: Vec<String> = paginated_operations()
+        .iter()
+        .map(|row| row.operation.to_string())
+        .collect();
+    rows.sort();
+    let modelled = modelled_paginated_operations();
+    assert_eq!(
+        rows, modelled,
+        "the rows of the shared-walk suite must be exactly the operations the model binds \
+         @paginated, got rows {rows:?} against the model's {modelled:?}"
+    );
+}
+
 impl Paginated {
-    /// Ask this operation for one page, resumed at `token` when one is given.
+    /// Ask this operation for one page under the page size the row walks with, resumed at
+    /// `token` when one is given.
     async fn page(&self, router: &MultiServiceRouter, token: Option<&str>) -> Answer {
+        self.page_sized(router, self.page_size, token).await
+    }
+
+    /// Ask this operation for one page of at most `size` records — `None` to name no
+    /// `maxResults`, which is what an export admits — resumed at `token` when one is given.
+    async fn page_sized(
+        &self,
+        router: &MultiServiceRouter,
+        size: Option<usize>,
+        token: Option<&str>,
+    ) -> Answer {
         let base = (self.page_uri)(APP_ID, ENVIRONMENT, self.kind);
         let mut query: Vec<String> = Vec::new();
-        if let Some(size) = self.page_size {
+        if let Some(size) = size {
             query.push(format!("maxResults={size}"));
         }
         if let Some(token) = token {
@@ -434,6 +507,33 @@ async fn every_paginated_operation_serves_the_same_page_walk() {
                      asked for, got {length}"
                 );
             }
+
+            // A page bound above the number of records stored carries the whole app
+            // environment's collection and ends the walk, so the bound is the most a page
+            // serves rather than the count it always serves. The bounds in between are
+            // `super::shared_page_bound`'s subject; this case is about the page that ends
+            // the list.
+            let whole = row.page_sized(&router, Some(LARGEST_PAGE), None).await;
+            assert_eq!(
+                whole.status, 200,
+                "case {operation} whole list at maxResults={LARGEST_PAGE}: the page must be \
+                 served, got {} with {:?}",
+                whole.status, whole.body
+            );
+            assert_eq!(
+                whole.entity_ids(),
+                created,
+                "case {operation} whole list at maxResults={LARGEST_PAGE}: one page must carry \
+                 every record of the app environment, got {:?}",
+                whole.entity_ids()
+            );
+            assert_eq!(
+                whole.next_token(),
+                None,
+                "case {operation} whole list at maxResults={LARGEST_PAGE}: a page that ends the \
+                 list must carry no nextToken, got {:?}",
+                whole.next_token()
+            );
         }
 
         // A token the service issued for this app environment resumes at the record its
