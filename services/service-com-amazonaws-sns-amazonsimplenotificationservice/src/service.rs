@@ -525,10 +525,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // this service for the router, and the request would be claimed by nobody. The claim
         // is narrowed to exactly that request: this service's own published document path
         // (which no modelled operation of this API binds), presenting no credential, and
-        // addressed to the emulator's own endpoint — the one authority of the two
-        // `certificate_url` announces that names no service of its own. A credentialled
-        // request, and one addressed to this service's own host, are claimed by the routing
-        // below as every other request of this API is.
+        // addressed to the emulator's own endpoint — the authority a served process
+        // announces the document at ([`crate::state::notification_signature::announced_authority`]),
+        // which names no service of its own. A credentialled request, and one addressed to
+        // this service's own host, are claimed by the routing below as every other request of
+        // this API is.
         if crate::state::notification_signature::addresses_certificate(
             parts.method.as_str(),
             &parts.uri.to_string(),

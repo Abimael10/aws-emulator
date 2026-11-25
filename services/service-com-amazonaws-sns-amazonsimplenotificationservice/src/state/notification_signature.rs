@@ -133,18 +133,41 @@ pub fn signature_version(topic: Option<&TopicRecord>) -> &'static str {
     }
 }
 
+/// WHO a delivered document is for, which is what decides the authority its URL members
+/// name: the address THAT recipient reaches this service at ([`announced_authority`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recipient {
+    /// A CLIENT OF THIS EMULATOR reads the document out of the resource it was delivered
+    /// into, whenever it polls for it: the body of a message on a queue, a record put into a
+    /// stream. Such a reader talks to this process at the endpoint the process is served at,
+    /// which is therefore the address it reaches this service — and the documents these
+    /// members lead to — at.
+    ClientOfTheEmulator,
+    /// An ENDPOINT THIS EMULATOR SERVES is POSTed the document: a subscribed `http`/`https`
+    /// URL, or a subscribed function handed an event record. A request such a subscriber
+    /// makes is carried inside this process and resolved by the service its host NAMES, so
+    /// the address it reaches this service at is this service's own endpoint host.
+    EndpointThisEmulatorServes,
+}
+
 /// What signs the notifications of ONE topic for ONE request: the authority the document's
 /// URL members are announced at, the certificate URL a subscriber fetches the verifying key
 /// from, and the digest that topic's `SignatureVersion` selects.
 ///
 /// Built per request because the Region a message belongs to is read off the request that
 /// published it when the topic is no longer there; built per topic because that Region — and
-/// the digest — are the topic's own.
+/// the digest — are the topic's own; addressed to ONE recipient, because the address a
+/// document's members name is the one ITS recipient reaches this service at
+/// ([`Signer::addressed_to`]).
 #[derive(Debug, Clone)]
 pub struct Signer {
-    /// The ONE authority every URL member of the documents this signer seals names
-    /// ([`announced_authority`]).
-    authority: String,
+    /// The authority the documents of a [`Recipient::ClientOfTheEmulator`] name.
+    emulator_authority: String,
+    /// The authority the documents of a [`Recipient::EndpointThisEmulatorServes`] name.
+    service_authority: String,
+    /// Whose documents this signer seals, which is which of the two above every URL member
+    /// of them names ([`announced_authority`]).
+    recipient: Recipient,
     /// The PATH the signing certificate is published at, or `None` when this process has no
     /// key — in which case nothing is signed and no signature member is delivered.
     certificate_path: Option<String>,
@@ -159,15 +182,18 @@ pub struct Signer {
 }
 
 impl Signer {
-    /// The signer of `topic`'s notifications for the request `ctx` is serving.
+    /// The signer of the `topic` notifications `recipient` receives, for the request `ctx` is
+    /// serving.
     #[must_use]
     pub fn of_topic(
         ctx: &smithy_server_runtime::OperationContext<'_>,
         topic: Option<&TopicRecord>,
+        recipient: Recipient,
     ) -> Self {
-        // The certificate is published on the SNS endpoint of the REGION the signed message
-        // belongs to — the topic's own, which is what its ARN names — and on the Region this
-        // request addressed for a replay of a topic that is no longer there.
+        // The REGION the signed message belongs to — the topic's own, which is what its ARN
+        // names, and the one this request addressed for a replay of a topic that is no longer
+        // there. It names the authority only where this process is served on no port at all
+        // ([`announced_authority`]).
         let region = topic
             .map(|topic| topic.arn.as_str())
             .and_then(|arn| {
@@ -176,10 +202,35 @@ impl Signer {
             .map(str::to_string)
             .unwrap_or_else(|| super::request_region(ctx.parts()));
         Self {
-            authority: announced_authority(&region),
+            emulator_authority: announced_authority(
+                ctx,
+                &region,
+                Recipient::ClientOfTheEmulator,
+            ),
+            service_authority: announced_authority(
+                ctx,
+                &region,
+                Recipient::EndpointThisEmulatorServes,
+            ),
+            recipient,
             certificate_path: signing_key().map(SigningKey::certificate_path),
             version: signature_version(topic),
             signed: ::std::cell::RefCell::new(None),
+        }
+    }
+
+    /// The same signer, sealing the documents of `recipient` instead — which moves every URL
+    /// member of them onto the address THAT recipient reaches this service at.
+    ///
+    /// One publish fans out to subscribers of both kinds, and the string a notification's
+    /// signature is taken over carries none of the URL members
+    /// ([`SIGNED_MEMBERS`]), so re-addressing the signer changes where a document POINTS and
+    /// nothing a subscriber verifies.
+    #[must_use]
+    pub fn addressed_to(&self, recipient: Recipient) -> Self {
+        Self {
+            recipient,
+            ..self.clone()
         }
     }
 
@@ -191,7 +242,10 @@ impl Signer {
     /// two origins.
     #[must_use]
     pub fn announced_authority(&self) -> &str {
-        &self.authority
+        match self.recipient {
+            Recipient::ClientOfTheEmulator => &self.emulator_authority,
+            Recipient::EndpointThisEmulatorServes => &self.service_authority,
+        }
     }
 
     /// Where the certificate that verifies what this signer sealed is published: an `https`
@@ -203,7 +257,7 @@ impl Signer {
     #[must_use]
     pub fn certificate_url(&self) -> Option<String> {
         let path = self.certificate_path.as_deref()?;
-        Some(format!("https://{}{path}", self.authority))
+        Some(format!("https://{}{path}", self.announced_authority()))
     }
 
     /// Write the three signature members of `envelope` — the version, the signature of the
@@ -303,36 +357,52 @@ fn canonical_string(
     canonical
 }
 
-/// The ONE authority every URL member of a document delivered for a message of `region`
-/// names: the `SigningCertURL` a subscriber fetches the verifying certificate from, and the
-/// `SubscribeURL` / `UnsubscribeURL` it follows to confirm or to cancel.
+/// The ONE authority every URL member of a document delivered to `recipient` for a message
+/// of `region` names: the `SigningCertURL` a subscriber fetches the verifying certificate
+/// from, and the `SubscribeURL` / `UnsubscribeURL` it follows to confirm or to cancel.
 ///
-/// It is this service's OWN endpoint host for that Region — `sns.<region>.amazonaws.com`, on
-/// the default `https` port and with no port component at all — for all of them, because a
-/// subscriber does not merely read these members, it CHECKS them before trusting anything it
-/// was delivered: it "verif[ies] that the signing certificate URL is from an Amazon SNS
-/// address" and only then "retrieve[s] the certificate … and extract[s] the public key from
-/// it" (Amazon SNS Developer Guide, "Verifying the signatures of Amazon SNS messages"). A
-/// document whose members name two origins, or whose certificate is announced on an address
-/// that is no endpoint of this service, is one such a subscriber refuses whatever the
-/// signature over it says — and for a `SubscriptionConfirmation` that refusal is the `Token`
-/// never reaching the endpoint it was POSTed to, which is the only path a subscription to a
-/// URL has to `ConfirmSubscription`.
+/// It is the address THAT RECIPIENT REACHES THIS SERVICE AT, because a subscriber does not
+/// merely READ these members, it FOLLOWS them: it "retrieve[s] the certificate … and
+/// extract[s] the public key from it" (Amazon SNS Developer Guide, "Verifying the signatures
+/// of Amazon SNS messages") and the owner of a pending endpoint visits the `SubscribeURL` it
+/// was sent. A member naming an address its recipient cannot reach makes every one of those
+/// follow-ups fail — for a `SubscriptionConfirmation` that is the `Token` never reaching the
+/// endpoint it was POSTed to, the only path a subscription to a URL has to
+/// `ConfirmSubscription` — and a document whose members name two origins is one a subscriber
+/// that compares them refuses whatever the signature over it says. So ONE authority is named
+/// by every member of one document, and it is the one its reader can be answered at
+/// ([`addresses_certificate`], [`super::visited_link`]). Which address that is, is what the
+/// recipient says, and the two readings are not interchangeable:
 ///
-/// It is also the one address a SUBSCRIBER OF THIS EMULATOR can really fetch these documents
-/// at, which is what makes the announcement more than a claim. A subscriber of an `http`/`https`
-/// subscription here is served INSIDE this process — the endpoint behind a published function
-/// URL, say — and its own fetch is carried by the emulator rather than dialled, which resolves
-/// a URL to the service that answers it from the host naming that service's endpoint (or from a
-/// published plane's own address): an address of the loopback interface names no service, so a
-/// certificate announced there is a document such a subscriber's fetch never reaches. The host
-/// here names this service, so the fetch is claimed by it and answered with the document
-/// ([`addresses_certificate`], [`super::visited_link`]) — in-process for a subscriber this
-/// emulator serves itself, and at this emulator's endpoint for a client that states the host on
-/// the connection it already has.
+/// * a [`Recipient::ClientOfTheEmulator`] polls the resource the document was delivered into
+///   over the endpoint THIS PROCESS IS SERVED AT — the base
+///   [`::smithy_server_runtime::OperationContext::endpoint`] reports, the data port's own
+///   published `host[:port]`, which is where every client of this emulator reaches every
+///   service of it, whichever host the request that published the message happened to name;
+/// * a [`Recipient::EndpointThisEmulatorServes`] is POSTed the document inside this process
+///   and makes its fetch there too, where a request is resolved by the service its host
+///   NAMES rather than dialled, so the address it reaches this service at is this service's
+///   own endpoint host for the message's Region.
+///
+/// The second is also what the first falls back to for a process served on NO port — a
+/// router embedded in another program, or a test ([`::smithy_server_runtime::UNSERVED_URL_BASE`]
+/// names no address at all) — where every reader of a document is inside the process.
 #[must_use]
-pub fn announced_authority(region: &str) -> String {
-    format!("sns.{region}.amazonaws.com")
+pub fn announced_authority(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    recipient: Recipient,
+) -> String {
+    let service_authority = format!("sns.{region}.amazonaws.com");
+    match recipient {
+        Recipient::EndpointThisEmulatorServes => service_authority,
+        Recipient::ClientOfTheEmulator => {
+            ::service_common::data_plane_addressing::served_endpoint_authority(
+                ctx.endpoint().as_str(),
+            )
+            .unwrap_or(service_authority)
+        }
+    }
 }
 
 /// Whether `method` and `uri` address the signing certificate this service publishes, so

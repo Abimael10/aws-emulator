@@ -645,7 +645,14 @@ impl PendingConfirmation {
         let token = subscription.confirmation_token.as_deref()?;
         let endpoint = subscription.endpoint.as_deref()?;
         let target = EndpointLocation::of_url(&subscription.protocol, endpoint)?;
-        let signer = state::notification_signature::Signer::of_topic(ctx, topic);
+        // The document is POSTed to an endpoint this emulator serves, which is the recipient
+        // its URL members are addressed to
+        // ([`state::notification_signature::announced_authority`]).
+        let signer = state::notification_signature::Signer::of_topic(
+            ctx,
+            topic,
+            state::notification_signature::Recipient::EndpointThisEmulatorServes,
+        );
         Some(Self {
             target,
             topic_arn: subscription.topic_arn.clone(),
@@ -816,7 +823,13 @@ impl Cancellation {
     ) -> Option<Self> {
         let endpoint = subscription.endpoint.as_deref()?;
         let target = EndpointLocation::of_url(&subscription.protocol, endpoint)?;
-        let signer = state::notification_signature::Signer::of_topic(ctx, topic);
+        // POSTed to an endpoint this emulator serves, as the confirmation that started the
+        // subscription was ([`PendingConfirmation::of`]).
+        let signer = state::notification_signature::Signer::of_topic(
+            ctx,
+            topic,
+            state::notification_signature::Recipient::EndpointThisEmulatorServes,
+        );
         Some(Self {
             target,
             topic_arn: subscription.topic_arn.clone(),

@@ -982,7 +982,19 @@ pub(crate) fn subscription_deliveries(
     // What signs each notification of this message: the certificate a subscriber verifies it
     // against, and the digest the TOPIC's own `SignatureVersion` selects — read once for the
     // whole fan-out, because every subscriber of one topic verifies against the same key.
-    let signer = state::notification_signature::Signer::of_topic(ctx, topic);
+    //
+    // Two signers, differing only in WHO they address: the documents left in a queue or a
+    // stream are read by a client of this emulator and name the address it reaches this
+    // service at, and the ones POSTed to an endpoint this emulator serves name the address
+    // that subscriber reaches it at — one document still names one authority
+    // ([`state::notification_signature::announced_authority`]).
+    let signer = state::notification_signature::Signer::of_topic(
+        ctx,
+        topic,
+        state::notification_signature::Recipient::ClientOfTheEmulator,
+    );
+    let endpoint_signer = signer
+        .addressed_to(state::notification_signature::Recipient::EndpointThisEmulatorServes);
     // The body the subscribers of each protocol receive, rendered on first use: the whole
     // published message, unless it was published with a per-protocol structure, in which
     // case it is the branch that structure names for that protocol.
@@ -1053,7 +1065,7 @@ pub(crate) fn subscription_deliveries(
                     published,
                     protocol_body,
                     logged,
-                    &signer,
+                    &endpoint_signer,
                 ) else {
                     continue;
                 };
@@ -1098,7 +1110,7 @@ pub(crate) fn subscription_deliveries(
                     published,
                     body,
                     logged,
-                    &signer,
+                    &endpoint_signer,
                     &policy,
                 ) else {
                     continue;

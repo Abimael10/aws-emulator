@@ -5,28 +5,35 @@
 //!
 //! The RULE asserted here: one document SNS delivers names ONE authority in EVERY URL member
 //! it carries — the `SigningCertURL` (`SigningCertUrl` in a function's event record) beside
-//! its `SubscribeURL` / `UnsubscribeURL` siblings — and that authority is Amazon SNS's own
-//! endpoint host for the Region the TOPIC is in, `sns.<region>.amazonaws.com`, as an `https`
-//! URL on the default port, whatever address the publishing client itself reached this
-//! emulator at; the certificate's path names the certificate file
-//! (`/SimpleNotificationService-<id>.pem`); and an UNAUTHENTICATED fetch of that URL answers
+//! its `SubscribeURL` / `UnsubscribeURL` siblings — and that authority is the address THE
+//! RECIPIENT OF THAT DOCUMENT reaches this service at, whatever address the client that
+//! published the message itself reached it at. For a document a CLIENT OF THIS EMULATOR reads
+//! out of the resource it was delivered into — the body of a message on a queue — that is the
+//! address this process is SERVED at; for one POSTed to an endpoint this emulator serves
+//! itself — a subscribed URL, or a function handed an event record — it is Amazon SNS's own
+//! endpoint host for the Region the TOPIC is in, `sns.<region>.amazonaws.com` as an `https`
+//! URL on the default port, since a request such a subscriber makes is resolved inside this
+//! process by the service its host names. The two readings coincide on a router served on NO
+//! port, which is what every row below that publishes no base drives: there every reader of a
+//! document is inside the process. The certificate's path names the certificate file
+//! (`/SimpleNotificationService-<id>.pem`), and an UNAUTHENTICATED fetch of that URL answers
 //! the X.509 certificate whose public key verifies the message's signature.
 //!
 //! That is what the documented verification procedure needs of it: a subscriber "verif[ies]
 //! that the signing certificate URL is from an Amazon SNS address" before fetching it, then
 //! "retrieve[s] the certificate … and extract[s] the public key from it" and checks the
 //! signature (Amazon SNS Developer Guide, "Verifying the signatures of Amazon SNS
-//! messages"). A URL on any other host — a sibling member's host included, and the address
-//! some client happened to reach this process at above all, which is an endpoint of no
-//! service and so a document a subscriber's own fetch never reaches — is one such a
-//! subscriber refuses the message over, and a fetch that needs a credential is one it cannot
-//! make: it holds none for the service that delivered to it.
+//! messages"). A URL on any other host — a sibling member's host above all, which makes one
+//! document claim two origins — is one such a subscriber refuses the message over, and a
+//! fetch that needs a credential is one it cannot make: it holds none for the service that
+//! delivered to it.
 //!
-//! The rows differ along what the rule generalises over: the Region the topic lives in
-//! (which is the host the URL names), the `SignatureVersion` the topic signs under (both
-//! published values, which select the two digests), and the KIND of document the URL travels
-//! in — the JSON envelope a queue subscriber receives and the `Records` envelope a
-//! subscribed function receives, which spell the member differently.
+//! The rows differ along what the rule generalises over: the Region the topic lives in, the
+//! `SignatureVersion` the topic signs under (both published values, which select the two
+//! digests), the address this emulator is published at and the one the publishing client
+//! reached, and the KIND of document the URL travels in — the JSON envelope a queue
+//! subscriber receives and the `Records` envelope a subscribed function receives, which spell
+//! the member differently and are read by recipients of the two kinds.
 
 use std::sync::Arc;
 
@@ -47,9 +54,23 @@ struct Emulator {
 }
 
 fn emulator(authenticates: bool) -> Emulator {
+    built(authenticates, None)
+}
+
+/// The same pair, published at `served_at` — the URL the data port of a SERVED process is
+/// reached at, which the core records on the router the moment it starts serving. `None`
+/// leaves the router served on no port at all, which is what a test router and a router
+/// embedded in another program are.
+fn built(authenticates: bool, served_at: Option<&str>) -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(authenticates);
+    if let Some(base) = served_at {
+        router.set_url_base(
+            smithy_server_runtime::EndpointUrl::parse(base)
+                .unwrap_or_else(|| panic!("the published base {base:?} must be an endpoint URL")),
+        );
+    }
     router.register_service(
         service_com_amazonaws_sns_amazonsimplenotificationservice::EmulatedService::new(
             Arc::clone(&engine),
@@ -395,12 +416,13 @@ async fn a_delivered_envelope_names_the_certificate_on_the_sns_endpoint_of_its_r
 }
 
 /// A publish whose request reached THE EMULATOR'S OWN ENDPOINT — the address a client on the
-/// machine this process runs on talks to — still names the certificate on this SERVICE's own
-/// endpoint host for the message's Region, not on the address that client happened to reach:
-/// an address of the loopback interface is an endpoint of no service, so a certificate
-/// announced there is one a subscriber's own fetch never resolves, while the host named here
-/// is claimed by this service however the fetch arrives. The rows differ along the authority
-/// the request reached: a loopback address with a port, and a host name with one.
+/// machine this process runs on talks to — names the certificate at the address this process
+/// is SERVED at rather than at the one that client happened to reach, which for the router
+/// here, served on no port, is this service's own endpoint host for the message's Region: the
+/// delivered document is read by a client other than the publisher, so the host one request
+/// arrived on says nothing about where the next one can fetch the certificate, while the host
+/// named here is claimed by this service however the fetch arrives. The rows differ along the
+/// authority the request reached: a loopback address with a port, and a host name with one.
 #[tokio::test]
 async fn a_publish_reaching_the_emulators_own_endpoint_names_the_certificate_on_the_endpoint_host()
 {
@@ -730,7 +752,8 @@ struct AuthorityRow {
 /// port on the loopback interface, an ephemeral port on it, a host name carrying a port, a
 /// host name carrying none, an IPv6 literal, and one of AWS's own endpoint hosts (the address
 /// a caller that resolves AWS's own names reached) — and along the Region the message belongs
-/// to, which is the one thing the announced authority does depend on.
+/// to, which for a router served on no port is the one thing the announced authority depends
+/// on.
 fn authority_rows() -> Vec<AuthorityRow> {
     vec![
         AuthorityRow {
@@ -772,11 +795,13 @@ fn authority_rows() -> Vec<AuthorityRow> {
     ]
 }
 
-/// RULE: every URL member of ONE delivered notification envelope names ONE authority — this
-/// service's own endpoint host for the message's Region, on the default `https` port, whatever
-/// address the publishing client reached — and that authority SERVES both of the documents
-/// those members lead to: the signing certificate the envelope's `Signature` verifies against,
-/// and the unsubscribe call its sibling link writes.
+/// RULE: every URL member of ONE delivered notification envelope names ONE authority —
+/// whatever address the publishing client reached — and that authority SERVES both of the
+/// documents those members lead to: the signing certificate the envelope's `Signature`
+/// verifies against, and the unsubscribe call its sibling link writes. This router is served
+/// on no port, so that one authority is this service's own endpoint host for the message's
+/// Region, on the default `https` port; a SERVED process announces the address it is served
+/// at ([`every_url_member_names_the_address_this_emulator_is_served_at`]).
 #[tokio::test]
 async fn every_url_member_of_a_delivered_envelope_names_one_served_authority() {
     for (index, row) in authority_rows().iter().enumerate() {
@@ -875,6 +900,194 @@ async fn every_url_member_of_a_delivered_envelope_names_one_served_authority() {
         // (`state::request_region`), and a subscription of another Region is refused by this
         // API's region isolation — which is that reading's subject, not this rule's.
         if row.region == DEFAULT_VISIT_REGION {
+            let (status, ended) = fetched_anonymously(&emulator, &unsubscribe_url).await;
+            assert_eq!(
+                (status, ended.contains("UnsubscribeResponse")),
+                (200, true),
+                "case {case:?}: following {unsubscribe_url:?} must perform the unsubscribe it \
+                 writes, got {status} / {ended}"
+            );
+        }
+    }
+}
+
+/// One row of the rule below: the address this emulator is PUBLISHED at, the host the
+/// publishing client reached, the Region the message belongs to, and the authority every URL
+/// member of the delivered envelope must then name.
+struct ServedRow {
+    case: &'static str,
+    /// The base URL the data port is published at, or `None` for a process served on no port.
+    served_at: Option<&'static str>,
+    /// The host the PUBLISH reached, which is not what the announcement is read from: the
+    /// document is read by another client of this emulator than the one that published it.
+    reached: &'static str,
+    region: &'static str,
+    /// The authority — `host[:port]` — every URL member of the delivered envelope names.
+    announced: &'static str,
+}
+
+/// The rows differ along the FORM of the published address (a loopback address on the
+/// default data port and on an OS-assigned one, a host name carrying a port, an IPv6
+/// literal), along the Region the message belongs to, and along the host the publishing
+/// client itself reached — one of AWS's own names for some rows and another address of this
+/// process for others — which the announced authority does not depend on. The last row is a
+/// process served on NO port, where the one address a caller inside it reaches this service
+/// at is this service's own endpoint host for the message's Region.
+fn served_rows() -> Vec<ServedRow> {
+    vec![
+        ServedRow {
+            case: "a loopback address on the default data port",
+            served_at: Some("https://127.0.0.1:9297"),
+            reached: "sns.us-east-1.amazonaws.com",
+            region: "us-east-1",
+            announced: "127.0.0.1:9297",
+        },
+        ServedRow {
+            case: "a loopback address on an OS-assigned port, published while the publish \
+                   reached another address of this process",
+            served_at: Some("https://127.0.0.1:43677"),
+            reached: "127.0.0.1:38211",
+            region: "us-west-2",
+            announced: "127.0.0.1:43677",
+        },
+        ServedRow {
+            case: "a host name carrying a port",
+            served_at: Some("https://localhost:38211"),
+            reached: "localhost:9297",
+            region: "eu-central-1",
+            announced: "localhost:38211",
+        },
+        ServedRow {
+            case: "an IPv6 literal",
+            served_at: Some("https://[::1]:9297"),
+            reached: "sns.us-east-1.amazonaws.com",
+            region: "us-east-1",
+            announced: "[::1]:9297",
+        },
+        ServedRow {
+            case: "a process served on no port at all",
+            served_at: None,
+            reached: "sns.us-west-2.amazonaws.com",
+            region: "us-west-2",
+            announced: "sns.us-west-2.amazonaws.com",
+        },
+    ]
+}
+
+/// RULE: every URL member of ONE delivered document names ONE authority, and that authority
+/// is the address THE RECIPIENT OF THAT DOCUMENT reaches this service at. Here the recipient
+/// is a CLIENT OF THIS EMULATOR — the consumer that polls the queue the envelope was
+/// delivered into — so the authority is the address this process is SERVED at, whatever host
+/// the client that published the message reached, and it ANSWERS both documents those members
+/// lead to: the signing certificate, and the unsubscribe call the sibling link writes. (The
+/// other recipient of the same rule, an endpoint this emulator serves itself, is driven by
+/// the function- and URL-subscriber tests below and by the started-emulator suite in
+/// `core/router/tests/all`.)
+#[tokio::test]
+async fn every_url_member_names_the_address_this_emulator_is_served_at() {
+    for (index, row) in served_rows().iter().enumerate() {
+        let case = row.case;
+        let region = row.region;
+        let emulator = built(false, row.served_at);
+        let topic = element(
+            &sns_on(
+                &emulator,
+                row.reached,
+                region,
+                "CreateTopic",
+                &[("Name", &format!("served-authority-{index}"))],
+            )
+            .await,
+            "TopicArn",
+        );
+        let (queue_url, queue_arn) =
+            given_queue(&emulator, region, &format!("served-authority-{index}")).await;
+        let subscription = element(
+            &sns_on(
+                &emulator,
+                row.reached,
+                region,
+                "Subscribe",
+                &[
+                    ("TopicArn", &topic),
+                    ("Protocol", "sqs"),
+                    ("Endpoint", &queue_arn),
+                ],
+            )
+            .await,
+            "SubscriptionArn",
+        );
+        sns_on(
+            &emulator,
+            row.reached,
+            region,
+            "Publish",
+            &[("TopicArn", &topic), ("Message", "a signed body")],
+        )
+        .await;
+
+        let envelope = delivered(&emulator, region, &queue_url, case).await;
+        let certificate_url = envelope["SigningCertURL"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no SigningCertURL in {envelope}"))
+            .to_string();
+        let unsubscribe_url = envelope["UnsubscribeURL"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no UnsubscribeURL in {envelope}"))
+            .to_string();
+        for (member, url) in [
+            ("SigningCertURL", &certificate_url),
+            ("UnsubscribeURL", &unsubscribe_url),
+        ] {
+            let authority = https_authority(case, member, url);
+            assert_eq!(
+                authority, row.announced,
+                "case {case:?}: {member} must name the address this emulator is reached at \
+                 ({announced:?}) and no other, got {url:?}",
+                announced = row.announced
+            );
+        }
+        assert_published_at(case, row.announced, &certificate_url);
+        assert!(
+            unsubscribe_url
+                .ends_with(&format!("?Action=Unsubscribe&SubscriptionArn={subscription}")),
+            "case {case:?}: the unsubscribe link must write the call that ends this \
+             subscription, got {unsubscribe_url:?}"
+        );
+
+        // The announced authority ANSWERS the certificate, and that certificate verifies what
+        // was delivered: the whole of what a subscriber following the member does.
+        let (status, certificate) = fetched_anonymously(&emulator, &certificate_url).await;
+        assert_eq!(
+            (status, certificate.starts_with("-----BEGIN CERTIFICATE-----")),
+            (200, true),
+            "case {case:?}: an anonymous fetch of {certificate_url:?} must answer the PEM \
+             certificate, got {status} / {certificate}"
+        );
+        let version = envelope["SignatureVersion"].as_str().unwrap_or_default();
+        let signature = ::aws_smithy_types::base64::decode(
+            envelope["Signature"].as_str().unwrap_or_default(),
+        )
+        .unwrap_or_else(|error| panic!("case {case:?}: the signature is base64: {error}"));
+        assert!(
+            verifies(
+                &certificate,
+                version,
+                &canonical_string(&envelope),
+                &signature,
+            ),
+            "case {case:?}: the certificate at {certificate_url:?} must verify the delivered \
+             signature over {SIGNED_MEMBERS:?}, got {envelope}"
+        );
+
+        // And the sibling link is answered at that same authority, which is what makes the
+        // announced address one a recipient can really follow.
+        //
+        // Only for a subscription of the Region a visit resolves to: a link is followed with
+        // NO credential, so the Region such a request addresses is the account default
+        // (`state::request_region`), and a subscription of another Region is refused by this
+        // API's region isolation — which is that reading's subject, not this rule's.
+        if region == DEFAULT_VISIT_REGION {
             let (status, ended) = fetched_anonymously(&emulator, &unsubscribe_url).await;
             assert_eq!(
                 (status, ended.contains("UnsubscribeResponse")),
