@@ -909,6 +909,181 @@ async fn a_file_that_cannot_be_probed_is_refused_for_why() {
 }
 
 #[tokio::test]
+async fn a_media_file_the_store_holds_nothing_at_is_the_fixed_file_refusal() {
+    let emulator = emulator_with_bucket().await;
+    // One file the store DOES hold, so a row naming an absent file beside a present one
+    // asks for something the service could have served.
+    let present = "in/present.wav";
+    put_object(&emulator, present, &wave(1, 8_000, 16, 800)).await;
+
+    /// A key nothing in this test ever writes, so the store answers it holds nothing there.
+    const ABSENT_KEY: &str = "in/never-written-here.mp4";
+    /// What a probe of a media file the object store holds nothing at answers: FIXED text
+    /// for that error class, interpolating nothing — what is absent is an object of the
+    /// caller's, not a resource of this service's.
+    const MISSING_FILE: &str = "The file does not exist.";
+    /// What a probe of a missing MediaConvert RESOURCE would answer instead: the other
+    /// template, whose one variable part is the input member the reference was read from.
+    /// The two refusals have to stay distinguishable, which is the point of the contrast
+    /// at the end of this test.
+    const MISSING_RESOURCE: &str = "The resource you specified in name was not found.";
+
+    /// One row: how the request addresses a media file the store holds nothing at.
+    struct Row {
+        case: &'static str,
+        files: Value,
+    }
+    let absent_uri = s3_uri(ABSENT_KEY);
+    let rows = vec![
+        Row {
+            case: "an s3:// URI",
+            files: json!([{ "fileUrl": absent_uri }]),
+        },
+        Row {
+            case: "a virtual-hosted S3 endpoint URL",
+            files: json!([{
+                "fileUrl": format!("https://{BUCKET}.s3.{REGION}.amazonaws.com/{ABSENT_KEY}"),
+            }]),
+        },
+        Row {
+            case: "a virtual-hosted endpoint URL in the legacy dash spelling",
+            files: json!([{
+                "fileUrl": format!("https://{BUCKET}.s3-{REGION}.amazonaws.com/{ABSENT_KEY}"),
+            }]),
+        },
+        Row {
+            case: "a path-style S3 endpoint URL",
+            files: json!([{
+                "fileUrl": format!("https://s3.{REGION}.amazonaws.com/{BUCKET}/{ABSENT_KEY}"),
+            }]),
+        },
+        Row {
+            case: "a path-style endpoint URL over http",
+            files: json!([{
+                "fileUrl": format!("http://s3.{REGION}.amazonaws.com/{BUCKET}/{ABSENT_KEY}"),
+            }]),
+        },
+        Row {
+            case: "a key whose characters the URL percent-escapes",
+            files: json!([{
+                "fileUrl": format!(
+                    "https://{BUCKET}.s3.{REGION}.amazonaws.com/in/never%20written%20here.mp4"
+                ),
+            }]),
+        },
+        Row {
+            case: "a key many levels deep",
+            files: json!([{ "fileUrl": s3_uri("in/one/two/three/four/absent.mov") }]),
+        },
+        Row {
+            case: "a bucket this account does not hold",
+            files: json!([{ "fileUrl": format!("s3://{ABSENT_BUCKET}/{ABSENT_KEY}") }]),
+        },
+        Row {
+            case: "a bucket this account does not hold, addressed as an endpoint URL",
+            files: json!([{
+                "fileUrl":
+                    format!("https://{ABSENT_BUCKET}.s3.{REGION}.amazonaws.com/{ABSENT_KEY}"),
+            }]),
+        },
+        Row {
+            case: "the absent file after one the store holds",
+            files: json!([
+                { "fileUrl": s3_uri(present) },
+                { "fileUrl": s3_uri(ABSENT_KEY) },
+            ]),
+        },
+        Row {
+            case: "the absent file named twice",
+            files: json!([
+                { "fileUrl": s3_uri(ABSENT_KEY) },
+                { "fileUrl": s3_uri(ABSENT_KEY) },
+            ]),
+        },
+    ];
+
+    for row in &rows {
+        let reply = emulator
+            .send(
+                "POST",
+                "/2017-08-29/probe",
+                Some(json!({ "inputFiles": row.files })),
+            )
+            .await;
+        assert_eq!(
+            reply.status, 404,
+            "case {:?}: expected HTTP 404, got {} {:?}",
+            row.case, reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_type.as_deref(),
+            Some("NotFoundException"),
+            "case {:?}: expected NotFoundException, got {:?}",
+            row.case,
+            reply.error_type
+        );
+        let message = reply.string("/message");
+        assert_eq!(
+            message, MISSING_FILE,
+            "case {:?}: expected the missing-media-file message, got {message:?}",
+            row.case
+        );
+        // The text is fixed: no part of the request — the member name, the bucket, the key
+        // or the URL's own spelling — is interpolated into it.
+        for fragment in [
+            "fileUrl",
+            BUCKET,
+            ABSENT_BUCKET,
+            "never-written-here",
+            "s3://",
+            "amazonaws",
+            "resource",
+        ] {
+            assert!(
+                !message.contains(fragment),
+                "case {:?}: the message must interpolate nothing, but {fragment:?} is in \
+                 {message:?}",
+                row.case
+            );
+        }
+        // Nothing is reported for a refused request: a partial list would claim the files
+        // it left out were never asked about.
+        assert_eq!(
+            reply.at("/probeResults"),
+            &Value::Null,
+            "case {:?}: a refused probe reports no result, got {:?}",
+            row.case,
+            reply.body
+        );
+    }
+
+    // The contrast: a missing RESOURCE of this service is the other 404, which names the
+    // input member its reference was read from. One message per error class.
+    let queue = emulator.get_queue("mediaconvert-probe-no-such-queue").await;
+    assert_eq!(
+        queue.status, 404,
+        "a queue this account does not hold must be 404, got {} {:?}",
+        queue.status, queue.body
+    );
+    assert_eq!(
+        queue.error_type.as_deref(),
+        Some("NotFoundException"),
+        "a missing queue must be NotFoundException, got {:?}",
+        queue.error_type
+    );
+    let queue_message = queue.string("/message");
+    assert_eq!(
+        queue_message, MISSING_RESOURCE,
+        "a missing resource must keep the member-naming template, got {queue_message:?}"
+    );
+    assert_ne!(
+        queue_message, MISSING_FILE,
+        "a missing resource and a missing media file must not collapse onto one message, \
+         both answered {queue_message:?}"
+    );
+}
+
+#[tokio::test]
 async fn probing_a_file_changes_nothing_a_later_caller_sees() {
     let emulator = emulator_with_bucket().await;
     let key = "in/read-twice.wav";
