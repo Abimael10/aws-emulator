@@ -29,20 +29,29 @@
 //! `message` and the error class in `__type`, and nothing else, so two refusals of ONE
 //! condition carry the same body byte for byte while each names its own call in the header.
 //!
+//! RULE 3 holds over the WHOLE surface of this service, not only its control plane, so it
+//! is pinned over the QUERY plane's own refusals — the three `StartQuery*` / `StopQuery*` /
+//! `GetQueryStatus*` / `GetQueryResults*` lifecycles — and along the TEARDOWN a client
+//! script ends with: a scope created, settled, deleted, and then asked for again.
+//!
 //! Each suite is a TABLE whose rows differ along what the rule generalizes over:
 //! rule 1 over the resource type, the operation that reports it, the identifier's
 //! form and length, and the Region the request is signed for; rule 2 over the enum
 //! (its value count, and whether sorted order differs from declared order), the
 //! member, and whether the member is bound to the query string, to the body, or to a
 //! structure nested inside a list in the body; rule 3 over the error class and its
-//! status (400, 402, 403, 404, 409), the operation that answers it, and whether the
-//! sentence it closes carries anything built from the request.
+//! status (400, 402, 403, 404, 409), the operation that answers it, the plane it
+//! belongs to, and whether the sentence it closes carries anything built from the
+//! request.
 
 use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::harness::{client_token, targets, Emulator, ACCOUNT_ID, REGION, SIGNING_NAME};
+use crate::harness::{
+    client_token, extra_region, targets, Emulator, ACCOUNT_ID, REGION, SIGNING_NAME,
+};
 
 /// How a missing MONITOR is worded: the fixed prefix `Monitor [`, the monitor's ARN,
 /// and `] doesn't exist`. The ARN namespace comes from the harness constant the other
@@ -1023,5 +1032,402 @@ async fn a_refusal_body_carries_the_sentence_and_the_class_alone() {
         statuses,
         client_error_statuses(),
         "the rows must span every client-error status this service answers, got {statuses:?}"
+    );
+}
+
+/// How long a poll for a status the clock owes keeps looking before it gives up.
+/// Deliberately far longer than the span a fresh resource settles after, so a loaded
+/// host does not decide the outcome.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long one round of such a poll waits before looking again.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Look again until the scope reports the terminal status the clock owes it, so a
+/// teardown that starts from a settled scope waits for the CONDITION rather than for a
+/// span of the clock.
+async fn await_scope_succeeded(emulator: &Emulator, scope_id: &str, case: &str) {
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let read = emulator.get_scope(scope_id).await;
+        if read.text("status") == "SUCCEEDED" {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: the scope never reached SUCCEEDED; last status {:?} with body {}",
+            read.text("status"),
+            read.body
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// The monitor counterpart: look again until the monitor reports `ACTIVE`.
+async fn await_monitor_active(emulator: &Emulator, monitor_name: &str, case: &str) {
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let read = emulator.get_monitor(monitor_name).await;
+        if read.text("monitorStatus") == "ACTIVE" {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: the monitor never reached ACTIVE; last status {:?} with body {}",
+            read.text("monitorStatus"),
+            read.body
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// RULE 3 along the TEARDOWN a client script ends with: a scope created, settled,
+/// deleted, and then asked for again.
+///
+/// The repeat of the delete, and the read that verifies it, are refused with the one
+/// missing-scope sentence and nothing after it — so the three refusals of that one
+/// condition carry ONE body between them while each names its own call in the header. A
+/// text closing with the envelope a client renders would carry that call's own request
+/// id, and no two refusals of one condition could ever compare equal.
+///
+/// The rows differ in the Region every call of the row is signed for — the Region the
+/// sentence's ARN is built from — so each row runs in its own store, a scope being a
+/// per-account, per-Region resource.
+#[tokio::test]
+async fn a_torn_down_scope_states_the_missing_scope_sentence_alone() {
+    // (case, the Region every call of the row is signed for). The catalog of Regions is
+    // the harness's own; index 1 and index 9 are two codes other than the Region most of
+    // this crate's suites sign for.
+    let rows = [
+        ("the Region this crate's suites sign for", REGION),
+        ("another Region of the same length", extra_region(1)),
+        ("a longer Region code", extra_region(9)),
+    ];
+
+    for (case, region) in rows {
+        let emulator = Emulator::new_in(region);
+        let created = emulator
+            .create_scope(json!({
+                "targets": targets(&[("123456789012", "us-east-1")]),
+                "clientToken": client_token(31),
+            }))
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: the scope must be created, got {} with body {}",
+            created.status, created.body
+        );
+        let scope_id = created.text("scopeId");
+        await_scope_succeeded(&emulator, &scope_id, case).await;
+
+        let deleted = emulator.delete_scope(&scope_id).await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {case:?}: the settled scope must delete, got {} with body {}",
+            deleted.status, deleted.body
+        );
+
+        // The one sentence the condition "this store holds no such scope" is worded with,
+        // built from the Region the request was signed for.
+        let sentence = scope_not_found(region, &scope_id);
+        let after = vec![
+            ("the delete repeated", emulator.delete_scope(&scope_id).await),
+            (
+                "the delete repeated once more",
+                emulator.delete_scope(&scope_id).await,
+            ),
+            (
+                "the read that verifies the teardown",
+                emulator.get_scope(&scope_id).await,
+            ),
+        ];
+
+        let mut ids: Vec<String> = Vec::new();
+        for (step, answer) in &after {
+            let row_case = format!("{case} / {step}");
+            assert_refusal_body(
+                &row_case,
+                answer,
+                404,
+                "ResourceNotFoundException",
+                &sentence,
+            );
+            ids.push(answer.request_id.clone());
+        }
+        for (step, answer) in &after[1..] {
+            assert_eq!(
+                answer.body, after[0].1.body,
+                "case {case:?} / {step}: one condition carries one body, got {} after {}",
+                answer.body, after[0].1.body
+            );
+        }
+        let distinct: BTreeSet<&String> = ids.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            ids.len(),
+            "case {case:?}: each refusal names its own call, got {ids:?}"
+        );
+    }
+}
+
+/// A `scopeId` of the form this service mints that no `CreateScope` of this suite minted,
+/// so a refusal it draws is about the scope being absent and not about the form of the id.
+const ABSENT_SCOPE_ID: &str = "00000000-0000-4000-8000-0000000000fe";
+
+/// The same for a `queryId`: of the shape this service mints (`state::query_id`), minted
+/// by no start.
+const UNMINTED_QUERY_ID: &str = "00000000-0000-4000-8000-00000000beef";
+
+/// How this service words a `queryId` that names no query it holds: a fixed prefix and
+/// the id the REQUEST carried, in braces. A query carries no ARN of its own, so this is
+/// the query counterpart of the ARN-qualified wordings above.
+fn no_such_query(query_id: &str) -> String {
+    format!("There's no query with id {{{query_id}}}")
+}
+
+/// Which of the three query lifecycles the model binds a row drives. Each family has its
+/// own collection URI, its own metric enum and its own owner — a monitor for one, the
+/// scope for the other two — so the table runs over all three rather than over the one
+/// a recorded call happens to use.
+#[derive(Clone, Copy, Debug)]
+enum QueryFamily {
+    /// `/monitors/{monitorName}/topContributorsQueries`.
+    Monitor,
+    /// `/workloadInsights/{scopeId}/topContributorsQueries`.
+    WorkloadInsights,
+    /// `/workloadInsights/{scopeId}/topContributorsDataQueries`.
+    WorkloadInsightsData,
+}
+
+/// Every family, so a table spans the whole query plane.
+const QUERY_FAMILIES: &[QueryFamily] = &[
+    QueryFamily::Monitor,
+    QueryFamily::WorkloadInsights,
+    QueryFamily::WorkloadInsightsData,
+];
+
+impl QueryFamily {
+    /// A metric this family's own metric enum declares: `MonitorMetric`
+    /// (`smithy_query(query="shape", shape="MonitorMetric")`: ROUND_TRIP_TIME, TIMEOUTS,
+    /// RETRANSMISSIONS, DATA_TRANSFERRED) for the monitor family, and
+    /// `WorkloadInsightsMetric` (the same set without ROUND_TRIP_TIME) for the other two.
+    fn metric(self) -> &'static str {
+        match self {
+            QueryFamily::Monitor => "ROUND_TRIP_TIME",
+            _ => "TIMEOUTS",
+        }
+    }
+
+    /// This family's query collection under `owner`, from the `@http` URI of its
+    /// `StartQuery*` operation.
+    fn collection(self, owner: &str) -> String {
+        match self {
+            QueryFamily::Monitor => format!("/monitors/{owner}/topContributorsQueries"),
+            QueryFamily::WorkloadInsights => {
+                format!("/workloadInsights/{owner}/topContributorsQueries")
+            }
+            QueryFamily::WorkloadInsightsData => {
+                format!("/workloadInsights/{owner}/topContributorsDataQueries")
+            }
+        }
+    }
+
+    /// The sentence a reference to an owner of this family's kind that the store cannot
+    /// resolve is refused with: the resource TYPE the request named, in this service's
+    /// wording for a reference it can neither resolve nor authorize.
+    fn unresolved_owner(self) -> &'static str {
+        match self {
+            QueryFamily::Monitor => "monitor supplied doesn't exist",
+            _ => "scope supplied doesn't exist",
+        }
+    }
+}
+
+/// A `StartQuery*` body naming the window `start`..`end`, with a metric this family's own
+/// enum declares and the `destinationCategory` every such request carries
+/// (`smithy_query(query="shape", shape="DestinationCategory")` declares UNCLASSIFIED).
+fn start_query_body(family: QueryFamily, start: &str, end: &str) -> Value {
+    json!({
+        "startTime": start,
+        "endTime": end,
+        "metricName": family.metric(),
+        "destinationCategory": "UNCLASSIFIED",
+    })
+}
+
+/// One row of the query-plane refusal table: the call, and the refusal the model declares
+/// for the condition it meets.
+struct QueryRefusalRow {
+    /// What this row varies, named in every assertion.
+    case: String,
+    method: &'static str,
+    uri: String,
+    body: Option<Value>,
+    status: u16,
+    /// The error class the model declares for this condition, as the protocol renders it.
+    class: &'static str,
+    sentence: String,
+}
+
+/// RULE 3 across the QUERY plane: every refusal of the three query lifecycles states its
+/// sentence and nothing after it, so one condition reads one body however often it is
+/// refused, and the id of each call travels in the header alone.
+///
+/// The rows span all three families, the condition that is refused (a window that names
+/// no interval, an owner the store cannot resolve, an id that names no query), the three
+/// statuses those conditions are modelled under (400 `ValidationException`, 403
+/// `AccessDeniedException`, 404 `ResourceNotFoundException`), the HTTP method (POST, GET
+/// and DELETE), and both kinds of sentence: one built from the request and one wholly
+/// fixed.
+#[tokio::test]
+async fn every_query_plane_refusal_states_its_sentence_alone() {
+    let emulator = Emulator::new();
+    let created = emulator
+        .create_scope(json!({
+            "targets": targets(&[("123456789012", "us-east-1")]),
+            "clientToken": client_token(41),
+        }))
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "the parent scope must be created, got {} with body {}",
+        created.status, created.body
+    );
+    let scope_id = created.text("scopeId");
+    let scope_arn = created.text("scopeArn");
+
+    let monitor_name = "query-refusal-probe";
+    let monitor = emulator
+        .create_monitor(json!({
+            "monitorName": monitor_name,
+            "scopeArn": scope_arn,
+            "localResources": [{ "type": "AWS::EC2::VPC", "identifier": "vpc-query-refusal" }],
+            "clientToken": client_token(42),
+        }))
+        .await;
+    assert_eq!(
+        monitor.status, 200,
+        "the parent monitor must be created, got {} with body {}",
+        monitor.status, monitor.body
+    );
+    // The owners a query hangs off are settled before any query call, exactly as a client
+    // script waits for them to be.
+    await_scope_succeeded(&emulator, &scope_id, "the parent scope").await;
+    await_monitor_active(&emulator, monitor_name, "the parent monitor").await;
+
+    // A monitor name of the modelled form (`ResourceName`'s pattern) this store holds no
+    // monitor under.
+    let absent_monitor = "query-refusal-absent";
+
+    let mut rows: Vec<QueryRefusalRow> = Vec::new();
+    for family in QUERY_FAMILIES.iter().copied() {
+        let owner = match family {
+            QueryFamily::Monitor => monitor_name.to_string(),
+            _ => scope_id.clone(),
+        };
+        let absent_owner = match family {
+            QueryFamily::Monitor => absent_monitor.to_string(),
+            _ => ABSENT_SCOPE_ID.to_string(),
+        };
+        let live = family.collection(&owner);
+        let unresolved = family.collection(&absent_owner);
+        // The reader that DOES model an absence reports the owner by its ARN, each kind in
+        // its own wording (rule 1).
+        let absent_owner_sentence = match family {
+            QueryFamily::Monitor => monitor_not_found(REGION, absent_monitor),
+            _ => scope_not_found(REGION, ABSENT_SCOPE_ID),
+        };
+        rows.extend([
+            QueryRefusalRow {
+                case: format!("{family:?}: a window whose end precedes its start"),
+                method: "POST",
+                uri: live.clone(),
+                body: Some(start_query_body(
+                    family,
+                    "2026-10-22T20:07:07Z",
+                    "2026-10-22T19:07:07Z",
+                )),
+                status: 400,
+                class: "ValidationException",
+                sentence: "EndTime cannot be before StartTime".to_string(),
+            },
+            QueryRefusalRow {
+                case: format!("{family:?}: a start under an owner nothing resolves"),
+                method: "POST",
+                uri: unresolved.clone(),
+                body: Some(start_query_body(
+                    family,
+                    "2026-10-22T19:07:07Z",
+                    "2026-10-22T20:07:07Z",
+                )),
+                status: 403,
+                class: "AccessDeniedException",
+                sentence: family.unresolved_owner().to_string(),
+            },
+            QueryRefusalRow {
+                case: format!("{family:?}: the status of an id no start minted"),
+                method: "GET",
+                uri: format!("{live}/{UNMINTED_QUERY_ID}/status"),
+                body: None,
+                status: 400,
+                class: "ValidationException",
+                sentence: no_such_query(UNMINTED_QUERY_ID),
+            },
+            QueryRefusalRow {
+                case: format!("{family:?}: the results of that same id"),
+                method: "GET",
+                uri: format!("{live}/{UNMINTED_QUERY_ID}/results"),
+                body: None,
+                status: 404,
+                class: "ResourceNotFoundException",
+                sentence: no_such_query(UNMINTED_QUERY_ID),
+            },
+            QueryRefusalRow {
+                case: format!("{family:?}: a stop of that same id"),
+                method: "DELETE",
+                uri: format!("{live}/{UNMINTED_QUERY_ID}"),
+                body: None,
+                status: 400,
+                class: "ValidationException",
+                sentence: no_such_query(UNMINTED_QUERY_ID),
+            },
+            QueryRefusalRow {
+                case: format!("{family:?}: results read under an owner nothing resolves"),
+                method: "GET",
+                uri: format!("{unresolved}/{UNMINTED_QUERY_ID}/results"),
+                body: None,
+                status: 404,
+                class: "ResourceNotFoundException",
+                sentence: absent_owner_sentence,
+            },
+        ]);
+    }
+
+    let mut statuses: BTreeSet<u16> = BTreeSet::new();
+    for row in &rows {
+        let first = emulator.call(row.method, &row.uri, row.body.clone()).await;
+        let again = emulator.call(row.method, &row.uri, row.body.clone()).await;
+        assert_refusal_body(&row.case, &first, row.status, row.class, &row.sentence);
+        assert_refusal_body(&row.case, &again, row.status, row.class, &row.sentence);
+        assert_eq!(
+            first.body, again.body,
+            "case {:?}: two refusals of one condition carry one body, got {} then {}",
+            row.case, first.body, again.body
+        );
+        assert_ne!(
+            first.request_id, again.request_id,
+            "case {:?}: each refusal names its own call, got {:?} twice",
+            row.case, first.request_id
+        );
+        statuses.insert(row.status);
+    }
+
+    // The statuses the conditions above are modelled under, so the table is not one class
+    // repeated across the three families.
+    assert_eq!(
+        statuses,
+        BTreeSet::from([400u16, 403, 404]),
+        "the rows must span the statuses the query plane refuses a client with, got \
+         {statuses:?}"
     );
 }
