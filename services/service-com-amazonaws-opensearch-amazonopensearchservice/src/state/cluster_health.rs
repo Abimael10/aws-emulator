@@ -20,6 +20,11 @@
 //! ([`ShardAllocation::status`]). A provisioned cluster of this emulator always has a data
 //! node to hold a primary, so its reading of the red indicator is zero unassigned primaries
 //! rather than a colour nothing measured.
+//!
+//! The same allocation read COPY BY COPY — which shard each copy belongs to, whether it is
+//! the primary, the node holding it and the documents it holds — is what a shard listing
+//! reports ([`shard_copies`]), so the rows a client reads and the counts the health reports
+//! are one arithmetic seen at two grains.
 
 use super::{json_from_document, Domain, Index};
 
@@ -224,4 +229,119 @@ impl ShardAllocation {
         self.assigned_primaries
             .saturating_add(self.unassigned_primaries)
     }
+}
+
+/// One COPY of one shard of an index, as the cluster placed it: which shard it is a copy
+/// of, whether it is the primary, the data node holding it and how many documents that
+/// shard holds.
+///
+/// The per-copy reading of the same allocation [`ShardAllocation`] counts: a copy this
+/// carries a node for is one the arithmetic counted as assigned, and a copy with none is
+/// one it counted as unassigned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardCopy {
+    /// Which of the index's primary shards this is a copy of, numbered from zero as the
+    /// engine numbers them.
+    pub shard: i64,
+    /// Whether this is the PRIMARY copy. Each shard has exactly one.
+    pub primary: bool,
+    /// Which data node of the cluster holds this copy, as its place in the cluster's own
+    /// node census, or `None` for a copy the topology has no node for.
+    pub node: Option<usize>,
+    /// How many documents the shard holds — the documents the engine's own routing puts on
+    /// it ([`routed_shard`]). A copy IS a copy, so every copy of one shard holds the same
+    /// documents.
+    pub documents: usize,
+}
+
+/// Every copy of every shard of `index` on a cluster of `data_nodes` data nodes, shard by
+/// shard and the primary of each before its replicas — the order a shard listing reports
+/// them in.
+///
+/// Where each copy sits follows from the one rule the allocation arithmetic states: a copy
+/// of a shard needs a data node of its own, so the primary of a shard takes one node and
+/// each replica the next one round, which leaves no two copies of a shard on one node and
+/// spreads the primaries of successive shards over the cluster. The copies past what the
+/// topology can hold ([`assigned_replica_copies`]) have no node at all, which is what makes
+/// them the unassigned ones.
+///
+/// The copies this materialises are bounded by [`MAX_SHARDS_PER_INDEX`], the engine's own
+/// ceiling on the shards and copies ONE index may ask for: the two settings are a caller's,
+/// so without that bound the rows a reader of this allocation builds would be sized by the
+/// product of two values the caller chose.
+pub fn shard_copies(index: &Index, data_nodes: i32) -> Vec<ShardCopy> {
+    let shards = setting_number(&index.schema, NUMBER_OF_SHARDS)
+        .unwrap_or(1)
+        .clamp(1, MAX_SHARDS_PER_INDEX);
+    let copies = setting_number(&index.schema, NUMBER_OF_REPLICAS)
+        .unwrap_or(1)
+        .clamp(0, MAX_SHARDS_PER_INDEX);
+    let assigned = assigned_replica_copies(copies, data_nodes);
+    let nodes = i64::from(data_nodes).max(0);
+    // What each shard HOLDS, from the routing of every document the index holds: counted
+    // once here rather than per copy, because a replica holds the documents of the shard it
+    // is a copy of.
+    let mut held: Vec<usize> = vec![0; usize::try_from(shards).unwrap_or(1)];
+    for id in index.documents.keys() {
+        let at = usize::try_from(routed_shard(id, shards)).unwrap_or(0);
+        if let Some(documents) = held.get_mut(at) {
+            *documents = documents.saturating_add(1);
+        }
+    }
+    let node_at = |offset: i64| -> Option<usize> {
+        if nodes == 0 {
+            return None;
+        }
+        usize::try_from(offset.rem_euclid(nodes)).ok()
+    };
+    let mut placed: Vec<ShardCopy> = Vec::new();
+    let ceiling = usize::try_from(MAX_SHARDS_PER_INDEX).unwrap_or(usize::MAX);
+    for shard in 0..shards {
+        if placed.len() >= ceiling {
+            break;
+        }
+        let documents = held
+            .get(usize::try_from(shard).unwrap_or(0))
+            .copied()
+            .unwrap_or(0);
+        placed.push(ShardCopy {
+            shard,
+            primary: true,
+            node: node_at(shard),
+            documents,
+        });
+        for copy in 0..copies {
+            if placed.len() >= ceiling {
+                break;
+            }
+            placed.push(ShardCopy {
+                shard,
+                primary: false,
+                node: if copy < assigned {
+                    node_at(shard.saturating_add(copy).saturating_add(1))
+                } else {
+                    None
+                },
+                documents,
+            });
+        }
+    }
+    placed
+}
+
+/// The primary shard the engine routes the document `id` to: the floored remainder of the
+/// 32-bit murmur3 hash of the id over the index's shard count, which is the routing
+/// function the engine's default `_routing` applies.
+///
+/// A function of the id alone, so the same document is on the same shard on every read and
+/// the per-shard counts of one index always add up to the documents it holds.
+pub fn routed_shard(id: &str, shards: i64) -> i64 {
+    let shards = shards.max(1);
+    let hash = ::murmur3::murmur3_32(&mut ::std::io::Cursor::new(id.as_bytes()), 0).unwrap_or(0);
+    // Read as the SIGNED 32-bit value the engine computes the hash as, and with the FLOORED
+    // remainder it takes of it, so a hash with its top bit set routes to the shard it routes
+    // to there rather than to another one.
+    #[allow(clippy::cast_possible_wrap)]
+    let signed = i64::from(hash as i32);
+    signed.rem_euclid(shards)
 }

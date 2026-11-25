@@ -2036,7 +2036,7 @@ async fn a_reserved_first_segment_is_never_read_as_an_index_name() {
     // (the case, the method, the path)
     let rows: &[(&str, &str, &str)] = &[
         ("a reserved endpoint this surface serves nothing for", "POST", "/_msearch"),
-        ("a reserved endpoint under a served prefix", "GET", "/_cat/shards"),
+        ("a reserved endpoint under a served prefix", "GET", "/_cat/allocation"),
         ("a reserved two-segment path", "POST", "/_search/scroll"),
         ("a reserved endpoint named like a document path", "PUT", "/_reindex/_doc/one"),
         ("a reserved endpoint named like an index's settings", "GET", "/_bogus/_settings"),

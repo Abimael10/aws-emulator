@@ -197,7 +197,7 @@ mod index_settings;
 /// them.
 mod index_mapping;
 
-/// The `_cat` APIs: the compact listings of a cluster's indexes and nodes.
+/// The `_cat` APIs: the compact listings of a cluster's indexes, nodes and shard copies.
 mod cat;
 
 /// The COMPONENT TEMPLATE API: the building blocks a composable index template is
@@ -1745,6 +1745,8 @@ fn serve_resolved(
         ["_cat", "indices"] => cat::indices(domain, request, None),
         ["_cat", "indices", index] => cat::indices(domain, request, Some(index)),
         ["_cat", "nodes"] => cat::nodes(domain, request),
+        ["_cat", "shards"] => cat::shards(domain, request, None),
+        ["_cat", "shards", index] => cat::shards(domain, request, Some(index)),
         // The component templates a composable index template is composed of.
         ["_component_template"] => {
             component_templates::component_template_request(domain, request, None)

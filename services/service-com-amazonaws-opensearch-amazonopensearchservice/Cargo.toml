@@ -149,6 +149,12 @@ service-com-amazonaws-opensearchserverless-opensearchserverless = { workspace = 
 # alarm evaluation read — the way the IAM, Cognito, S3, CloudWatch Logs, KMS, Certificate
 # Manager and Service Quotas stores above are reached.
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# The murmur3 hash, which is the function the engine ROUTES a document to a primary shard
+# by: a document's shard is the floored remainder of the 32-bit murmur3 hash of its id over
+# the index's shard count (`state::cluster_health::routed_shard`), so the per-shard document
+# counts a shard listing reports are the engine's own routing rather than a split invented
+# here. The maintained implementation states the hash.
+murmur3 = "0.5"
 # RFC 6902 JSON Patch, which is the form the security plugin's audit-configuration API takes
 # a write of that configuration in (`state::audit`): the patch document a client sends is
 # applied by the maintained implementation rather than by a walk written here.
