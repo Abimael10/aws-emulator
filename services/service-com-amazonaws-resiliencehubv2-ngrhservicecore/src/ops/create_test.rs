@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Configures one of this service's test templates for a service, storing the test inside
+//! that service's record. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A test is "a test created for a service by configuring a test template", so the create
+//! resolves BOTH references before it writes: the `serviceArn` against the stored services,
+//! and the `testTemplateArn` against the service-owned catalog
+//! (`crate::state::TEST_TEMPLATE_CATALOG`). It is also graded against the service's
+//! resilience policy — a test measures recovery against the recovery-time objective in
+//! force for the service, so a service whose effective policy states no multi-AZ RTO has
+//! nothing for a test to be measured against and the create is refused
+//! `ValidationException` (see [`crate::state::multi_az_rto_rejection`]). "Each service has
+//! one test per template", so a second create for a template the service already has a test
+//! for is a `ConflictException` rather than a second test.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +158,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTest"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateTestErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the resiliencehub service store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        let service_arn = input.service_arn;
+
+        // A test is created FOR a service, so the parent must exist before anything is
+        // stored: a `serviceArn` naming no service is a 404, not a test with no service.
+        // Every refusal below reads the service first, so nothing is minted until the call
+        // is known to be a create.
+        let Some(service) = store.services.get(&service_arn) else {
+            return Err(service_not_found(&service_arn).into());
+        };
+
+        // A test template is SERVICE-owned: no operation in this model creates one, so the
+        // ARN the request configures has to name a template this service publishes. A
+        // well-formed ARN says nothing about that, so it is resolved against the catalog,
+        // and one that names nothing in it is refused rather than stored as a test
+        // configured from a template no run could ever execute.
+        let Some(template) = crate::state::catalog_template(&input.test_template_arn) else {
+            return Err(CreateTestErrorModeled::ResourceNotFoundException(
+                crate::state::test_template_not_found(&input.test_template_arn),
+            )
+            .into());
+        };
+
+        // What the test would be measured against: the objectives the service's resilience
+        // policy puts in force, resolved from the policy store under this same lock. A
+        // service with no multi-AZ RTO in force is refused here — before the id is minted
+        // and before anything is written — so no test is ever stored that nothing could
+        // grade.
+        let effective =
+            store.effective_policy_values(service.policy_arn.as_deref(), &service.account_id);
+        if let Some(refusal) = crate::state::multi_az_rto_rejection(&service_arn, &effective) {
+            return Err(CreateTestErrorModeled::ValidationException(refusal).into());
+        }
+
+        // "Each service has one test per template": the template identifies the service's
+        // test, so a second create for a template it already has a test for is a conflict,
+        // not a second test.
+        if service.test_for_template(template.resource_id).is_some() {
+            return Err(CreateTestErrorModeled::ConflictException(ConflictException {
+                message: crate::state::test_for_template_exists_message(
+                    &input.test_template_arn,
+                    &service_arn,
+                ),
+            })
+            .into());
+        }
+
+        // The call is a create: take the next creation-order position and mint the id.
+        let sequence = store.next_sequence();
+        let test_id = crate::state::mint_test_id(&region);
+        let record = crate::state::TestRecord {
+            test_id: test_id.clone(),
+            test_template_arn: input.test_template_arn,
+            // A `CreateTest` request states no name of its own, so the test is named after
+            // the template it was configured from.
+            name: template.name.to_string(),
+            logging_configuration: input.logging_configuration,
+            stop_conditions: input.stop_conditions,
+            role_name: input.role_name,
+            parameters: input.parameters.map(|values| values.into_iter().collect()),
+            // Nothing has run this test yet, so it has no runs and no successful ones.
+            total_test_runs: 0,
+            successful_test_runs: 0,
+            created_at: now,
+            sequence,
+        };
+        // The response is projected through the same path every later read answers from.
+        let test = record.to_test(&service_arn);
+        // Re-reached mutably now that the counter has been read: the store has been held
+        // under this one lock throughout, so the service is still there, and a store that
+        // somehow lost it answers the same 404 rather than panicking.
+        let Some(service) = store.services.get_mut(&service_arn) else {
+            return Err(service_not_found(&service_arn).into());
+        };
+        service.tests.insert(test_id, record);
+
+        Ok(CreateTestOutput { test })
     }
+}
+
+/// The refusal for a `serviceArn` that names no stored service: a test is created for a
+/// service, so without that service there is nothing to configure a test for.
+fn service_not_found(service_arn: &str) -> CreateTestErrorModeled {
+    CreateTestErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
+        crate::state::SERVICE_RESOURCE_TYPE,
+        service_arn,
+    ))
 }

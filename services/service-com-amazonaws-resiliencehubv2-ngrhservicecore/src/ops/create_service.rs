@@ -308,6 +308,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nor any assertion, nor a `CreateAssertion` token to replay.
             assertions: Default::default(),
             assertion_idempotency: Default::default(),
+            // Nor any test configured from a test template.
+            tests: Default::default(),
             // The log of what has been done to this service starts empty; the create's own
             // entry goes in through `record_service_event` below, the one path every event
             // this crate records is appended through.

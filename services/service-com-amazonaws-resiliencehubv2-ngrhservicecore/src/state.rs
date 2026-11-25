@@ -42,6 +42,11 @@
 //! `CreateServiceFunctionResources` may associate with one of its functions — asking the
 //! component that owns each one rather than taking a caller's word for it.
 //!
+//! [`service_tests`] holds the `Test` records a service holds — the tests
+//! `CreateTest` configures from this store's test-template catalog and `GetTest` reads back
+//! (a test lives inside its service's record, so deleting the service takes its tests with
+//! it).
+//!
 //! [`service_events`] holds the EVENT LOG of a service: the record every mutation of a
 //! service, or of a resource inside it, appends to and `ListServiceEvents` reports.
 //!
@@ -62,6 +67,7 @@ mod invoker_role;
 mod not_found;
 mod policies;
 mod service_events;
+mod service_tests;
 mod systems;
 mod tagging;
 mod user_journeys;
@@ -74,7 +80,9 @@ pub use availability_slo::{
     availability_slo_rejection, unsupported_availability_slo_target_message,
     ALLOWED_AVAILABILITY_SLO_TARGETS, AVAILABILITY_SLO_TARGET_FIELD,
 };
-pub use conflicts::{name_already_exists_message, two_requests_one_token_message};
+pub use conflicts::{
+    name_already_exists_message, test_for_template_exists_message, two_requests_one_token_message,
+};
 pub use discovered_resources::{
     DiscoveredResource, Discovery, DiscoverySource, MAX_RESOURCES_PER_SERVICE_FUNCTION,
 };
@@ -100,6 +108,11 @@ pub use service_events::{
     SERVICE_EVENT_INPUT_SOURCES_UPDATED, SERVICE_EVENT_POLICY_ASSOCIATED,
     SERVICE_EVENT_POLICY_DISASSOCIATED, SERVICE_EVENT_SYSTEM_ASSOCIATED,
     SERVICE_EVENT_SYSTEM_DISASSOCIATED,
+};
+pub use service_tests::{
+    catalog_template, mint_test_id, multi_az_rto_rejection, multi_az_rto_required_message,
+    test_not_found, test_template_not_found, TestRecord, TEST_RESOURCE_TYPE,
+    TEST_TEMPLATE_RESOURCE_TYPE,
 };
 pub use systems::{
     mint_system_arn, system_in_use_message, SystemCreateRequest, SystemIdempotencyRecord,
@@ -327,6 +340,14 @@ pub struct ServiceRecord {
     /// a second one, and the same token offered for different text is refused. Scoped to
     /// the parent service for the same reason as above.
     pub assertion_idempotency: BTreeMap<String, AssertionIdempotencyRecord>,
+    /// The tests created on this service, keyed by `testId`. See [`service_tests`] — held
+    /// inside the parent record for the same reason [`Self::assertions`] is.
+    ///
+    /// BOUNDED by the catalog rather than by a quota of its own: a test is created by
+    /// configuring one of the templates the service publishes and "each service has one
+    /// test per template", so this map never holds more entries than
+    /// [`TEST_TEMPLATE_CATALOG`] has rows, however often a caller repeats the create.
+    pub tests: BTreeMap<String, TestRecord>,
     /// This service's event log: one entry per change made to the service or to a resource
     /// inside it, in the order they were recorded. See [`service_events`] — held inside the
     /// parent record for the same reason [`Self::assertions`] is, so deleting the service

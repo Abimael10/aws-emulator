@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the test stored under `testId` in the service `serviceArn` names. This is the
+//! ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A `@readonly` read: it resolves both identifiers against the store and projects the
+//! stored record through the one `Test` projection every reader of a test answers from
+//! (`crate::state::TestRecord::to_test`), so what `CreateTest` stored and what this reports
+//! cannot drift. Nothing is written — an identifier naming nothing stored is refused
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +142,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTest"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetTestErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the resiliencehub service store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let store = state.lock();
+
+        // A test lives inside its service's record, so the service is resolved first: an
+        // ARN naming no service is a missing SERVICE, which is a different refusal from a
+        // service that holds no test under this id.
+        let Some(service) = store.services.get(&input.service_arn) else {
+            return Err(GetTestErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(
+                    crate::state::SERVICE_RESOURCE_TYPE,
+                    &input.service_arn,
+                ),
+            )
+            .into());
+        };
+        let Some(record) = service.tests.get(&input.test_id) else {
+            return Err(GetTestErrorModeled::ResourceNotFoundException(
+                crate::state::test_not_found(&input.test_id),
+            )
+            .into());
+        };
+
+        Ok(GetTestOutput {
+            test: record.to_test(&input.service_arn),
+        })
     }
 }
