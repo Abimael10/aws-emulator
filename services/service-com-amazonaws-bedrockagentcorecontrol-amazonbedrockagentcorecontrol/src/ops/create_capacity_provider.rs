@@ -243,6 +243,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
+        // A provider whose accepted deletion the clock has already made due is gone, with the
+        // name it stood under, before this create counts or mints anything.
+        store.expire_deleted_capacity_providers(now);
 
         // Read again under the guard that WRITES: the guard above was dropped for the call
         // in between, so two requests carrying one token could both have got past it, and
@@ -292,6 +295,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             transient_status: crate::state::CAPACITY_PROVIDER_STATUS_CREATING.to_string(),
             settled_status: crate::state::CAPACITY_PROVIDER_STATUS_READY.to_string(),
             settles_at: now + crate::state::CAPACITY_PROVIDER_SETTLE_DELAY,
+            // Nobody has deleted this provider, so the clock owes no removal of it.
+            removal_due_at: None,
         };
         let output = record.create_output(now);
 

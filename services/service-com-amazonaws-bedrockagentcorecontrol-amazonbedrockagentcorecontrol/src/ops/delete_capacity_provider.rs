@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCapacityProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCapacityProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCapacityProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes a capacity provider: the call ACCEPTS the deletion (202), the provider reports
+//! `DELETING` from then on, and the record is gone from [`crate::state`] when the removal the
+//! clock owes it comes due ([`crate::state::CAPACITY_PROVIDER_REMOVAL_DELAY`]) — nothing here
+//! sleeps for it, so a caller that deletes and then polls the provider sees `DELETING` and
+//! then the modelled 404.
+//!
+//! A provider agent runtime versions are still configured with is NOT destroyed underneath
+//! them: "Before you delete a capacity provider, disassociate all agent runtimes and runtime
+//! versions that reference it. If any references remain, the operation fails." Such a request
+//! is the modelled `ValidationException` (400, [`crate::state::capacity_provider_in_use`])
+//! with nothing written, and the references are the ones this service persists
+//! ([`crate::state::ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState::capacity_provider_is_referenced`]).
+//!
+//! An id naming no provider this account holds is the modelled 404, in the sentence every
+//! other read of a capacity provider answers a missing one with
+//! ([`crate::state::capacity_provider_not_found`]).
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +175,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCapacityProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCapacityProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCapacityProvider"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteCapacityProviderErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the capacity provider store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // What the clock already owes, materialised before this call reads: a runtime whose
+        // deletion is due is gone with the versions it published, so the reference those
+        // versions carried goes with it, and a provider whose own earlier deletion is due is
+        // gone before this call looks for it.
+        store.expire_deleted_agent_runtimes(now);
+        store.expire_deleted_capacity_providers(now);
+
+        // Whether any stored agent-runtime version is still configured with this provider,
+        // read before the record is borrowed to write: such a provider is kept, and the
+        // caller deletes the attached versions first.
+        let referenced = store.capacity_provider_is_referenced(&input.capacity_provider_id);
+
+        // The store is keyed by the `capacityProviderId` the create minted; an id naming no
+        // stored provider is the modelled 404, in the sentence every read of a provider
+        // answers a missing one with — including one a stored runtime version names but this
+        // service never created, which there is no record to delete.
+        let record = store
+            .capacity_providers
+            .get_mut(&input.capacity_provider_id)
+            .ok_or_else(|| {
+                DeleteCapacityProviderErrorModeled::ResourceNotFoundException(
+                    crate::state::capacity_provider_not_found(&input.capacity_provider_id),
+                )
+            })?;
+
+        // A provider an agent runtime version still names is kept, and nothing is written
+        // for this request.
+        if referenced {
+            return Err(DeleteCapacityProviderErrorModeled::ValidationException(
+                crate::state::capacity_provider_in_use(&input.capacity_provider_id),
+            )
+            .into());
+        }
+
+        // The deletion is ACCEPTED here (202) and the provider reports `DELETING` from now
+        // on; the record goes when the span the clock owes passes. `clientToken` needs no
+        // record of its own: the accepted deletion is recorded on the provider itself and is
+        // not re-armed, so a replayed request — carrying that token or not — is answered with
+        // the same id and status the first one was, for as long as the provider is readable.
+        record.begin_deleting(now);
+
+        Ok(record.delete_output(now))
     }
 }

@@ -12,8 +12,8 @@ use super::*;
 
 use crate::ops::types::{
     CapacityProviderSummary, ComputeConfiguration, CreateCapacityProviderOutput,
-    GetCapacityProviderOutput, PermissionsConfiguration, UpdateCapacityProviderOutput,
-    UpdatedDescription,
+    DeleteCapacityProviderOutput, GetCapacityProviderOutput, PermissionsConfiguration,
+    UpdateCapacityProviderOutput, UpdatedDescription,
 };
 
 /// The modelled not-found error for a capacity provider this account does not hold.
@@ -142,6 +142,10 @@ pub fn capacity_provider_arn(region: &str, capacity_provider_id: &str) -> String
 pub const CAPACITY_PROVIDER_STATUS_CREATING: &str = "CREATING";
 pub const CAPACITY_PROVIDER_STATUS_UPDATING: &str = "UPDATING";
 pub const CAPACITY_PROVIDER_STATUS_READY: &str = "READY";
+/// "`DELETING` – The service is deleting the capacity provider"
+/// (`smithy_query shape=CapacityProviderStatus`): what a provider whose deletion has been
+/// ACCEPTED reports until the removal the clock owes it comes due.
+pub const CAPACITY_PROVIDER_STATUS_DELETING: &str = "DELETING";
 
 /// Whether a provider reporting `status` can take an accepted change right now.
 ///
@@ -196,6 +200,43 @@ pub const CAPACITY_PROVIDER_SETTLE_DELAY: Duration = super::REGISTRY_SETTLE_DELA
 /// looping on create cannot grow this process's memory without bound.
 pub const MAX_CAPACITY_PROVIDERS: usize = 1_000;
 
+/// How long an ACCEPTED capacity provider deletion stays under way — the span the provider
+/// reports `DELETING` for before the clock owes its removal.
+///
+/// `DeleteCapacityProvider` answers 202 carrying `status` (`CapacityProviderStatus`), so the
+/// deletion is asynchronous: the call accepts it, it does not carry it out. AWS documents no
+/// duration for it, so the span is chosen — the same one the sibling resources' transitions
+/// take ([`super::AGENT_RUNTIME_REMOVAL_DELAY`]), long enough that a caller acting straight
+/// after the delete still observes the provider going away. Stored as an instant on the
+/// record and never slept on.
+pub const CAPACITY_PROVIDER_REMOVAL_DELAY: Duration = super::AGENT_RUNTIME_REMOVAL_DELAY;
+
+/// How this service words the refusal of a `DeleteCapacityProvider` for a provider agent
+/// runtime versions are still attached to: what could not be done, the provider by the id the
+/// request named it with, and what the caller has to delete before the provider can go, as
+/// the recorded `DeleteCapacityProvider` words it.
+///
+/// "Before you delete a capacity provider, disassociate all agent runtimes and runtime
+/// versions that reference it. If any references remain, the operation fails"
+/// (`smithy_query doc shape=DeleteCapacityProvider`) — so a referenced provider is not
+/// destroyed underneath the runtimes that launch instances from it: the delete is refused and
+/// the caller deletes the attached versions first, rather than the references being silently
+/// cascaded away. Nothing is wrong with the request's members — it is the stored state that
+/// refuses it — so `reason` is [`VALIDATION_REASON_RESOURCE_CONFLICT`] and there is no
+/// `fieldList`. The sentence around the id is fixed, the id quoted inside it; the id itself is
+/// the one the request's path carried.
+pub fn capacity_provider_in_use(capacity_provider_id: &str) -> ValidationException {
+    ValidationException {
+        message: format!(
+            "Cannot delete capacity provider '{capacity_provider_id}' because it still has \
+             attached agent runtime versions. Delete all attached agent runtime versions \
+             before deleting the capacity provider."
+        ),
+        reason: VALIDATION_REASON_RESOURCE_CONFLICT.to_string(),
+        field_list: None,
+    }
+}
+
 /// One capacity provider: everything `CreateCapacityProvider` persisted for it, and the
 /// status the clock owes it.
 ///
@@ -222,6 +263,10 @@ pub struct CapacityProviderRecord {
     /// When the clock owes the move from one to the other. Stored, never slept on: a read
     /// materialises the transition the clock already made due.
     pub settles_at: SystemTime,
+    /// When the clock owes this provider's REMOVAL, once a delete has been accepted for it;
+    /// `None` for a provider nobody has deleted. Stored, never slept on, for the reason
+    /// [`Self::settles_at`] is.
+    pub removal_due_at: Option<SystemTime>,
 }
 
 impl CapacityProviderRecord {
@@ -229,10 +274,42 @@ impl CapacityProviderRecord {
     /// settled one from then on. No read performs it — it is due at that instant whether or
     /// not anybody looks.
     pub fn status_at(&self, now: SystemTime) -> &str {
+        // A provider whose deletion has been accepted reports that it is going away,
+        // whatever it was doing before: it is the one thing a client polling it needs to
+        // see.
+        if self.is_deleting() {
+            return CAPACITY_PROVIDER_STATUS_DELETING;
+        }
         if now < self.settles_at {
             &self.transient_status
         } else {
             &self.settled_status
+        }
+    }
+
+    /// Whether this provider's deletion has been accepted and is still under way.
+    pub fn is_deleting(&self) -> bool {
+        self.removal_due_at.is_some()
+    }
+
+    /// Accept this provider's deletion: it reports `DELETING` from now on, and the clock owes
+    /// its removal [`CAPACITY_PROVIDER_REMOVAL_DELAY`] later.
+    ///
+    /// A deletion already under way is NOT re-armed — `DeleteCapacityProvider` is
+    /// `@idempotent` (`smithy_query operation=DeleteCapacityProvider`), so a repeat reports
+    /// the same provider going away rather than pushing its removal further out.
+    pub fn begin_deleting(&mut self, now: SystemTime) {
+        if !self.is_deleting() {
+            self.removal_due_at = Some(now + CAPACITY_PROVIDER_REMOVAL_DELAY);
+        }
+    }
+
+    /// This provider as `DeleteCapacityProvider`'s response envelope: the id the request
+    /// addressed it by and the status it reports now the deletion has been accepted.
+    pub fn delete_output(&self, now: SystemTime) -> DeleteCapacityProviderOutput {
+        DeleteCapacityProviderOutput {
+            capacity_provider_id: self.capacity_provider_id.clone(),
+            status: self.status_at(now).to_string(),
         }
     }
 
@@ -360,6 +437,36 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
         self.capacity_providers
             .contains_key(capacity_provider_id)
             .then(|| capacity_provider_id.clone())
+    }
+
+    /// Remove every capacity provider whose deletion the clock has already made due, with the
+    /// idempotency records naming it.
+    ///
+    /// Called by every operation that reads the capacity-provider store, before it reads: the
+    /// removal was owed at this instant whether or not anybody called, so a caller that
+    /// deletes and then polls the provider sees `DELETING` and then the modelled 404 without
+    /// anything sleeping for it.
+    pub fn expire_deleted_capacity_providers(&mut self, now: SystemTime) {
+        let due: Vec<String> = self
+            .capacity_providers
+            .iter()
+            .filter(|(_, record)| record.removal_due_at.is_some_and(|at| now >= at))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in due {
+            self.capacity_providers.remove(&id);
+            self.forget_capacity_provider_client_tokens_for(&id);
+        }
+    }
+
+    /// Drop the idempotency records naming a capacity provider that no longer exists, for the
+    /// same reason [`Self::forget_gateway_client_tokens_for`] does.
+    fn forget_capacity_provider_client_tokens_for(&mut self, capacity_provider_id: &str) {
+        self.capacity_provider_idempotency
+            .retain(|_, id| id != capacity_provider_id);
+        let live = &self.capacity_provider_idempotency;
+        self.capacity_provider_idempotency_order
+            .retain(|token| live.contains_key(token));
     }
 
     /// Record what a `clientToken` produced for `operation`, evicting the oldest record once

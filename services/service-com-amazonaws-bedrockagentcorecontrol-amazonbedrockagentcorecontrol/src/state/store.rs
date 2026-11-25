@@ -318,9 +318,22 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
     /// version counts too — a version carries the association, and the runtime
     /// plane accepts one whose provider was never created through this service.
     pub fn holds_capacity_provider(&self, capacity_provider_id: &str) -> bool {
-        if self.capacity_providers.contains_key(capacity_provider_id) {
-            return true;
-        }
+        self.capacity_providers.contains_key(capacity_provider_id)
+            || self.capacity_provider_is_referenced(capacity_provider_id)
+    }
+
+    /// Whether any stored agent-runtime VERSION is still configured with the capacity
+    /// provider `capacity_provider_id` — the references that have to be disassociated
+    /// "before you delete a capacity provider" (`smithy_query doc
+    /// shape=DeleteCapacityProvider`).
+    ///
+    /// The association is the one this service persists, the same one
+    /// [`Self::runtime_versions_for_capacity_provider`] reports a provider's versions by: a
+    /// version carries a `capacityProviderConfiguration` naming the provider's ARN. A runtime
+    /// whose own deletion the clock has already made due is gone, with the versions it
+    /// published, before this is asked — every caller materialises that removal first
+    /// ([`Self::expire_deleted_agent_runtimes`]).
+    pub fn capacity_provider_is_referenced(&self, capacity_provider_id: &str) -> bool {
         self.agent_runtimes.values().any(|record| {
             record
                 .versions

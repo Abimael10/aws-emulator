@@ -178,7 +178,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let now = ::std::time::SystemTime::now();
-        let store = state.lock();
+        let mut store = state.lock();
+        // A provider whose accepted deletion the clock has already made due is gone before
+        // this read looks for it, which is what turns the `DELETING` a caller polls into the
+        // modelled 404.
+        store.expire_deleted_capacity_providers(now);
 
         // The store is keyed by the `capacityProviderId` the create minted; an id naming no
         // stored provider is the modelled 404 rather than an empty envelope.

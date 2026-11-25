@@ -198,6 +198,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // A provider whose accepted deletion the clock has already made due is gone before
+        // this update looks for it, so a change asked of a removed provider is the modelled
+        // 404 rather than a write onto a record nothing can read any more.
+        store.expire_deleted_capacity_providers(now);
 
         // A replayed request carrying the same `clientToken` answers with the provider that
         // token first updated, rather than applying a second change: "If this token matches a

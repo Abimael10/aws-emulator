@@ -185,8 +185,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // A runtime whose deletion the clock has already made due is gone, with the
-        // versions it published, before this listing reads.
+        // versions it published, before this listing reads — and so is a capacity
+        // provider whose own accepted deletion has come due.
         store.expire_deleted_agent_runtimes(now);
+        store.expire_deleted_capacity_providers(now);
 
         // A capacity provider this account does not hold is an authorization
         // refusal, not an empty page: this operation models `AccessDeniedException`

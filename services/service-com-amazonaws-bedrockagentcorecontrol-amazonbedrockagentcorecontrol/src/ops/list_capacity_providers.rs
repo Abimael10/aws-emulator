@@ -159,7 +159,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let now = ::std::time::SystemTime::now();
-        let store = state.lock();
+        let mut store = state.lock();
+        // A provider whose accepted deletion the clock has already made due is gone before
+        // this listing reads, so it reports `DELETING` and then nothing at all.
+        store.expire_deleted_capacity_providers(now);
 
         // The token is opaque on the wire: it carries the `capacityProviderId` the previous
         // page ended on, and the next page starts strictly after it.
