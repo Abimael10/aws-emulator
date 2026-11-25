@@ -5,8 +5,8 @@
 //! A metric stream is a metered pipeline: beside the records it pushes into its destination it
 //! publishes, as metrics of its OWN, how much it streamed — the series a client watches a
 //! stream's volume on, and the ones its cost is read from. They live in the reserved
-//! [`METRIC_STREAMS_NAMESPACE`] under the [`STREAM_NAME_DIMENSION`] dimension naming the stream
-//! they are about, so no caller can publish them (`PutMetricData` refuses the reserved
+//! [`METRIC_STREAMS_NAMESPACE`], so no caller can publish them (`PutMetricData` refuses the
+//! reserved
 //! namespace prefix, [`crate::ops::put_metric_data`]) and the service itself is the only thing
 //! that puts a series there — the same seam this service meters its own API through
 //! ([`crate::state::usage`]).
@@ -31,6 +31,17 @@
 //!   publish at all — its role cannot be assumed, its role may not put records into the
 //!   destination, the destination refused the put — reports a non-zero rate while a healthy one
 //!   reports zero, which is what tells the two apart from the publisher's side.
+//!
+//! Each of the three is published TWICE, into the two series a reader asks for it by: the
+//! stream's own series, under [`STREAM_NAME_DIMENSION`] naming the stream it is about
+//! ([`metering_key`]), and the ACCOUNT-level aggregate of that same metric, which carries no
+//! dimension at all ([`account_metering_key`]). The dimension set is part of a series' identity
+//! and a read names it exactly ("If a specific combination of dimensions was not published, you
+//! can't retrieve statistics for it", `GetMetricStatisticsInput$Dimensions`), so the aggregate is
+//! a series of its own and every stream of the account meters into it: a `Sum` of the aggregate
+//! over a window is what the account's streams updated in it, which is at least what any one of
+//! them did, and an `Average` of the aggregated rate is the mean share over every attempt the
+//! account's streams made.
 //!
 //! All three are stamped with the instant the export was MADE rather than with the period the
 //! records report: the counters are a reading of the stream's own throughput, so a backdated
@@ -83,6 +94,34 @@ pub fn metering_key(metric_name: &str, stream_name: &str) -> MetricKey {
         metric_name: metric_name.to_string(),
         dimensions,
     }
+}
+
+/// The series the ACCOUNT-level aggregate of one of a stream's own metrics lives in: the same
+/// metric name in the same namespace, with NO dimension at all.
+///
+/// Derived from the metric name alone, so every stream of the account meters into the one
+/// aggregate series, and the series a reader asks for without naming a stream is that same
+/// series.
+#[must_use]
+pub fn account_metering_key(metric_name: &str) -> MetricKey {
+    MetricKey {
+        namespace: METRIC_STREAMS_NAMESPACE.to_string(),
+        metric_name: metric_name.to_string(),
+        dimensions: DimensionSet::new(),
+    }
+}
+
+/// BOTH series one of a stream's own metrics is published into: the stream's own, and the
+/// account-level aggregate of that metric.
+///
+/// Every reading below goes through this, so neither series can be written without the other:
+/// the aggregate is the same observation under a dimension set of its own, which is what makes a
+/// read of it report the account while a read under the stream's dimension reports the stream.
+fn metering_keys(metric_name: &str, stream_name: &str) -> [MetricKey; 2] {
+    [
+        metering_key(metric_name, stream_name),
+        account_metering_key(metric_name),
+    ]
 }
 
 /// The share of ONE publish attempt's metric updates that did not reach the destination, as
@@ -141,6 +180,10 @@ impl State {
     /// ([`State::append_self_metered_count`]): a `Sum` over a window is how much that window
     /// streamed, a `SampleCount` is the same number and an `Average` is 1 — the aggregate of
     /// that many single updates.
+    ///
+    /// Counted into both series the metric is published in ([`metering_keys`]): the stream's own
+    /// and the account-level aggregate, so a `Sum` of the aggregate holds this stream's updates
+    /// beside every other stream's.
     pub fn meter_exported_updates(
         &mut self,
         stream_name: &str,
@@ -154,7 +197,9 @@ impl State {
             (METRIC_UPDATE, exported.updates),
             (TOTAL_METRIC_UPDATE, exported.statistic_updates),
         ] {
-            self.append_self_metered_count(metering_key(metric_name, stream_name), count, now_secs);
+            for key in metering_keys(metric_name, stream_name) {
+                self.append_self_metered_count(key, count, now_secs);
+            }
         }
     }
 
@@ -165,12 +210,14 @@ impl State {
     /// ([`State::append_self_metered_ratio`]): a `Maximum` over a window is the worst share that
     /// window saw, and an `Average` is the mean share over the attempts it held. An attempt that
     /// published everything observes 0, which is a measurement and not an absence.
+    ///
+    /// Reported into both series the metric is published in ([`metering_keys`]), so the
+    /// account-level aggregate holds one observation per attempt of every stream of the account
+    /// while each stream's own series holds only its own.
     pub fn meter_publish_error_rate(&mut self, stream_name: &str, rate: f64, now_secs: f64) {
-        self.append_self_metered_ratio(
-            metering_key(PUBLISH_ERROR_RATE, stream_name),
-            rate,
-            now_secs,
-        );
+        for key in metering_keys(PUBLISH_ERROR_RATE, stream_name) {
+            self.append_self_metered_ratio(key, rate, now_secs);
+        }
     }
 }
 
@@ -193,6 +240,56 @@ mod tests {
             additional: (0..additional)
                 .map(|index| (format!("p{index}0"), index as f64))
                 .collect(),
+        }
+    }
+
+    /// RULE: one of a stream's own metrics is published into TWO series — the stream's own,
+    /// identified by the dimension naming it, and the account-level aggregate of the same metric
+    /// name with no dimension at all — both in the reserved namespace.
+    #[test]
+    fn each_reading_is_published_as_the_stream_s_own_and_as_the_account_aggregate() {
+        // The rows differ along what the rule generalises over: which of the namespace's three
+        // metrics is metered, and which stream it is about.
+        let rows: [(&str, &str, &str); 5] = [
+            ("the update counter", METRIC_UPDATE, "orders"),
+            ("the statistic counter", TOTAL_METRIC_UPDATE, "orders"),
+            ("the error rate", PUBLISH_ERROR_RATE, "orders"),
+            ("another stream's update counter", METRIC_UPDATE, "audit-7"),
+            ("another stream's error rate", PUBLISH_ERROR_RATE, "audit-7"),
+        ];
+        for (case, metric_name, stream_name) in rows {
+            let [own, aggregate] = metering_keys(metric_name, stream_name);
+            let mut expected = DimensionSet::new();
+            expected.insert(
+                STREAM_NAME_DIMENSION.to_string(),
+                stream_name.to_string(),
+            );
+            assert_eq!(
+                (
+                    own.namespace.as_str(),
+                    own.metric_name.as_str(),
+                    &own.dimensions
+                ),
+                (METRIC_STREAMS_NAMESPACE, metric_name, &expected),
+                "case {case:?}: the stream's own series must be the metric under the dimension \
+                 naming it, got {own:?}"
+            );
+            assert_eq!(
+                (
+                    aggregate.namespace.as_str(),
+                    aggregate.metric_name.as_str(),
+                    &aggregate.dimensions
+                ),
+                (METRIC_STREAMS_NAMESPACE, metric_name, &DimensionSet::new()),
+                "case {case:?}: the account aggregate must be the same metric with no dimension, \
+                 got {aggregate:?}"
+            );
+            assert_eq!(
+                aggregate,
+                account_metering_key(metric_name),
+                "case {case:?}: every stream must meter into the one aggregate series, got \
+                 {aggregate:?}"
+            );
         }
     }
 

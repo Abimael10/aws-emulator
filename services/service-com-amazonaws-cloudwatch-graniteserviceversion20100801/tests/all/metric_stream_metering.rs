@@ -347,7 +347,8 @@ async fn the_total_counts_each_configured_statistic_as_one_more_update() {
 }
 
 /// RULE: the counters are a stream's OWN series, identified by the dimension naming it — so one
-/// stream's counts are not another's, and the series is not readable without that dimension.
+/// stream's counts are not another's, while the same metric with no dimension at all is the
+/// account's aggregate of them.
 #[tokio::test]
 async fn the_counters_are_identified_by_the_stream_they_are_about() {
     let emulator = Emulator::new();
@@ -383,15 +384,16 @@ async fn the_counters_are_identified_by_the_stream_they_are_about() {
 
     // The dimension is part of the series' identity: "If a specific combination of dimensions
     // was not published, you can't retrieve statistics for it"
-    // (`GetMetricStatisticsInput$Dimensions`), so the same metric name with no dimension at all
-    // names a series nothing published into.
-    for metric_name in [METRIC_UPDATE, TOTAL_METRIC_UPDATE] {
+    // (`GetMetricStatisticsInput$Dimensions`), so the same metric name with NO dimension at all
+    // names a series of its own — the ACCOUNT-level aggregate of that metric, which every stream
+    // of the account meters into, so it holds both streams' counts rather than either one's.
+    for (metric_name, expected) in [(METRIC_UPDATE, 4.0), (TOTAL_METRIC_UPDATE, 8.0)] {
         let (sum, datapoints) = metered(&emulator, metric_name, json!([])).await;
         assert_eq!(
-            (sum, datapoints),
-            (0.0, 0),
-            "case {metric_name:?}: the counters must be readable only under the dimension naming \
-             the stream, got a sum of {sum} over {datapoints} datapoint(s)"
+            (sum, datapoints > 0),
+            (expected, true),
+            "case {metric_name:?}: the aggregate with no dimension must hold what every stream \
+             counted, expected a sum of {expected}, got {sum} over {datapoints} datapoint(s)"
         );
     }
 }
