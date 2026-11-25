@@ -12,6 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 mod association_periods;
+mod auto_association;
 mod item_associations;
 mod refusals;
 mod billing_period_checks;
@@ -20,6 +21,7 @@ mod period_history;
 mod tagging;
 mod charges;
 pub use association_periods::*;
+pub use auto_association::*;
 pub use period_history::*;
 pub use tagging::*;
 pub use pagination::*;
@@ -1699,8 +1701,9 @@ impl BillingGroupRecord {
     /// True when this group automatically associates the accounts newly joining the
     /// consolidated billing family — `AccountGrouping.AutoAssociate`, where an absent
     /// flag is the default `false`. One reading of the flag, so every rule that turns
-    /// on it (the state-wide cap on holders, the refusal to delete a holder) decides
-    /// from the same answer.
+    /// on it (the association itself, the state-wide cap on holders, the refusal to
+    /// delete a holder) decides from the same answer; the association is
+    /// [`ComAmazonawsBillingconductorAwsbillingconductorState::associate_accounts_that_joined_the_family`].
     pub fn auto_associates(&self) -> bool {
         self.auto_associate.unwrap_or(false)
     }
@@ -2918,7 +2921,9 @@ const TRANSFER_DIRECTIONS: &[&str] = &["inbound", "outbound"];
 /// * `billing_family_account_ids` records the consolidated billing family's own
 ///   roster, which NO request writes (an account joins a family in AWS Organizations,
 ///   not here), so it is bounded by whatever recorded it rather than by a cap of this
-///   store, and no caller can grow it.
+///   store, and no caller can grow it. `observed_family_accounts` mirrors that roster —
+///   one id per account the family holds now — so it is bounded by the same thing and by
+///   nothing a caller does either.
 /// * `unassociated_accounts` keeps the released accounts this service has SEEN, beside
 ///   the family's own roster, so a later `ListAccountAssociations` reports one as
 ///   `UNMONITORED` even where no roster is known. The family's accounts are reported
@@ -3072,6 +3077,20 @@ pub struct ComAmazonawsBillingconductorAwsbillingconductorState {
     /// ([`account_not_in_billing_family`]), while every account of the roster is a
     /// linked account this service reports whether or not a billing group holds it.
     pub billing_family_account_ids: Option<BTreeSet<String>>,
+    /// The consolidated billing family's roster as this service has already OBSERVED it:
+    /// the account ids the family held the last time an operation looked at it
+    /// ([`Self::associate_accounts_that_joined_the_family`]).
+    ///
+    /// An account joins a consolidated billing family in AWS Organizations, so an account
+    /// the roster holds and this set does not is one that JOINED the family since the last
+    /// look — which is what a billing group electing `AccountGrouping.AutoAssociate` takes
+    /// in, and an account that was already in the family is not. Every observation
+    /// REPLACES it, so it mirrors the roster: one id per account the family holds now,
+    /// bounded by whatever records that roster rather than by a cap of this store (the
+    /// reason [`Self::billing_family_account_ids`] has none), and an account that LEAVES
+    /// the family is forgotten with it, so one that rejoins has joined again. Private so
+    /// no handler can record an observation of its own: the one method above writes it.
+    observed_family_accounts: BTreeSet<String>,
 }
 
 /// The kind -> store-map dispatch both tag accessors share, written ONCE.
@@ -3423,7 +3442,11 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
     /// linked account stays in the consolidated billing family whether or not it was in a
     /// billing group then, so one that joined a group later is reported for an earlier
     /// period with no group at all, and a family account no group has ever held is reported
-    /// with none too.
+    /// with none too — including one the group electing `AccountGrouping.AutoAssociate` has
+    /// not taken in because it was already in the family then
+    /// ([`Self::associate_accounts_that_joined_the_family`], which writes the membership of
+    /// one it HAS taken in, so this read answers for it from the same index as for any
+    /// other member).
     ///
     /// `organization` is the family as the organization itself records it, read from the
     /// Organizations store before this store's guard was taken

@@ -124,6 +124,19 @@
 //! that names no resource is answered by resource resolution (HTTP 404), not by the
 //! payer gate, so this service's tag operations resolve their `ResourceArn` and answer
 //! from the store like any other read or write.
+//!
+//! ## Why this file settles the automatic account associations
+//!
+//! `AccountGrouping.AutoAssociate` elects the billing group that "will automatically
+//! associate newly added Amazon Web Services accounts that join your consolidated billing
+//! family", and an account JOINS a family in AWS Organizations: the membership that group
+//! owes a joining account is therefore owed from the instant the account joins, with no
+//! request of this service involved. One place in front of every operation of the control
+//! plane settles it ([`crate::state::settle_automatic_account_associations`]), so each
+//! reader of a membership — the account listing, a group's `Size`, the one-account-one-group
+//! refusals, a disassociation — answers from the one membership index whichever operation
+//! looks first, instead of 34 handlers settling a rule of their own and disagreeing by the
+//! order they are called in.
 
 pub mod validation;
 
@@ -465,6 +478,22 @@ impl<Op: Operation, Eng: Send + Sync + 'static> ErasedOperation for PreHandlerCh
             // reached by a request whose signature verified.
             if self.payer_gated && !crate::state::caller_is_payer_account(&*self.engine) {
                 return payer_account_denial(protocol, ctx, Op::NAME, started);
+            }
+            // The automatic association the consolidated billing family's roster has made
+            // due, settled once ahead of the operation (see
+            // [`crate::state::settle_automatic_account_associations`]). An account joins a
+            // family in AWS Organizations, so the group electing
+            // `AccountGrouping.AutoAssociate` owes it a membership from the instant it
+            // joins, with no request of this service involved: settling it HERE — in front
+            // of every operation of the control plane rather than inside each one — is what
+            // makes every reader of a membership agree, whichever operation looks first,
+            // instead of each one settling a rule of its own. The gate above has just
+            // established that this caller IS the payer account, so nothing a caller this
+            // control plane is closed to asks for reaches it; the operations it does not
+            // gate are the tagging surface, which addresses a resource by ARN and reads no
+            // membership at all ([`PAYER_UNGATED_OPERATIONS`]).
+            if self.payer_gated {
+                crate::state::settle_automatic_account_associations(&*self.engine);
             }
             // Nothing to reword and nobody to deny: the request is served by the
             // generated operation, which runs the whole framework sequence (deserialize,
