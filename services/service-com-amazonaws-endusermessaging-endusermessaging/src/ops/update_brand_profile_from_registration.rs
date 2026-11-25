@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateBrandProfileFromRegistration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateBrandProfileFromRegistration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateBrandProfileFromRegistration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implement it here — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +160,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateBrandProfileFromRegistration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateBrandProfileFromRegistrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateBrandProfileFromRegistration"))
+        // Which profile is refreshed and from which registration is read off the input
+        // alone: `brandProfileId` is a path label the deserializer has already bound and
+        // every other member is a body member, so no request metadata takes part.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateBrandProfileFromRegistrationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::NO_STORE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Perform the work, and apply the terminal status, the clock had already made due:
+        // each was owed at its own instant whether or not anybody called, so this import
+        // is recorded against the profile every earlier job had already left behind.
+        store.settle_jobs(now);
+
+        // Both identifiers take either a bare id or the resource's ARN. A value that is
+        // neither can name its resource in no state and is refused as invalid input; a
+        // well-formed identifier this store holds no record for is refused as not found.
+        // The profile is resolved first, because it is the resource this operation is
+        // addressed at.
+        let brand_profile_id = store
+            .resolve_brand_profile_id(&input.brand_profile_id)
+            .map(str::to_string)
+            .map_err(|unreachable| match unreachable {
+                crate::state::UnreachableResource::Invalid(invalid) => {
+                    UpdateBrandProfileFromRegistrationErrorModeled::ValidationException(invalid)
+                }
+                crate::state::UnreachableResource::NotFound(missing) => {
+                    UpdateBrandProfileFromRegistrationErrorModeled::ResourceNotFoundException(
+                        missing,
+                    )
+                }
+            })?;
+        let registration_id = store
+            .resolve_registration_id(crate::state::REGISTRATION_ID_MEMBER, &input.registration_id)
+            .map(str::to_string)
+            .map_err(|unreachable| match unreachable {
+                crate::state::UnreachableResource::Invalid(invalid) => {
+                    UpdateBrandProfileFromRegistrationErrorModeled::ValidationException(invalid)
+                }
+                crate::state::UnreachableResource::NotFound(missing) => {
+                    UpdateBrandProfileFromRegistrationErrorModeled::ResourceNotFoundException(
+                        missing,
+                    )
+                }
+            })?;
+
+        // `onAttributeConflict` "specifies how the service resolves an attribute that
+        // already exists": `REPLACE` overwrites the existing value with the incoming one,
+        // `PRESERVE` keeps the existing value — and the modelled enum documents `REPLACE`
+        // as the default, which is therefore what a request omitting the member asks for.
+        // `smartMatch` decides which attributes map at all and "the default is true". Both
+        // are modelled, so the boundary validator has already refused any other value.
+        let replace_existing_values = input
+            .on_attribute_conflict
+            .as_deref()
+            .unwrap_or(crate::state::REPLACE_ON_ATTRIBUTE_CONFLICT)
+            == crate::state::REPLACE_ON_ATTRIBUTE_CONFLICT;
+        let smart_match = input
+            .smart_match
+            .unwrap_or(crate::state::SMART_MATCH_DEFAULT);
+        // This operation "runs asynchronously", so the call records what is to be done and
+        // the import itself is performed when the clock makes the job's transition due:
+        // until then the profile's attributes are what they were, and the job is reported
+        // as `PROCESSING`.
+        let work = crate::state::JobWork::ImportRegistration {
+            brand_profile_id: brand_profile_id.clone(),
+            registration_id,
+            replace_existing_values,
+            smart_match,
+        };
+
+        // `clientToken` is `@idempotencyToken`: a repeat of a request already served
+        // reports the SAME job instead of starting a second import — and only a repeat of
+        // THAT request does. A caller that reused the token for different parameters is
+        // told so, rather than handed the first request's job as if the new parameters had
+        // been applied.
+        if let Some(served) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.job_started_by(token))
+        {
+            if served.operation_type != OPERATION_TYPE || served.settlement.work != work {
+                return Err(
+                    UpdateBrandProfileFromRegistrationErrorModeled::ValidationException(
+                        crate::state::idempotency_mismatch(),
+                    )
+                    .into(),
+                );
+            }
+            // The first request's own answer, down to the identifier it gave: a repeat is
+            // served what it was served then, not a second reading of it.
+            return Ok(UpdateBrandProfileFromRegistrationOutput {
+                results: vec![JobResult {
+                    job_id: served.id.clone(),
+                    resource_identifier: served
+                        .resource_identifier
+                        .clone()
+                        .unwrap_or(input.registration_id),
+                }],
+            });
+        }
+
+        // One job per identifier the request asked about, which is one registration here,
+        // and `results` pairs each job with that identifier as the request spelled it.
+        let job_id = store.mint_job_id();
+        store.record_job(crate::state::Job::started(
+            &job_id,
+            now,
+            crate::state::StartedJob {
+                operation_type: OPERATION_TYPE,
+                brand_profile_id: &brand_profile_id,
+                resource_identifier: &input.registration_id,
+                client_token: input.client_token.as_deref(),
+                work,
+            },
+        ));
+        Ok(UpdateBrandProfileFromRegistrationOutput {
+            results: vec![JobResult {
+                job_id,
+                resource_identifier: input.registration_id,
+            }],
+        })
     }
 }
+
+/// The `operationType` the jobs this operation starts carry: this operation's own name, as
+/// `JobOperationType` — "the type of mutating operation that created the job" — reports it,
+/// and one of [`crate::state::JOB_OPERATION_TYPE_VALUES`].
+const OPERATION_TYPE: &str = "UpdateBrandProfileFromRegistration";

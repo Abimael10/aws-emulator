@@ -477,6 +477,22 @@ pub fn attribute_media_ceiling_exceeded() -> String {
     )
 }
 
+/// The sentence a request is refused with when it would push a profile past
+/// [`MAX_BRAND_PROFILE_ATTRIBUTES`]: one wording of this emulator's own ceiling, whichever
+/// operation would have crossed it — a create of attributes, or an import that would have
+/// to create them.
+#[must_use]
+pub fn brand_profile_attribute_ceiling_exceeded() -> String {
+    format!(
+        "The maximum number of attributes for a brand profile ({MAX_BRAND_PROFILE_ATTRIBUTES}) would be exceeded."
+    )
+}
+
+/// The `attributeType` of an attribute that carries an inline value, as
+/// `BrandProfileAttributeType` documents it: "TEXT stores an inline value". A member of
+/// [`crate::ops::types::BRAND_PROFILE_ATTRIBUTE_TYPE_VALUES`].
+pub const TEXT_ATTRIBUTE_TYPE: &str = "TEXT";
+
 /// One slot of the default attribute template: the attribute's name, the type of
 /// value it takes and the category it is grouped under.
 #[derive(Debug, Clone, Copy)]

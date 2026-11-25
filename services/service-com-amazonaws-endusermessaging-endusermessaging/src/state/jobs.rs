@@ -72,25 +72,110 @@ pub const JOB_SETTLEMENT_DELAY: Duration = Duration::from_secs(3);
 /// member at fault in `ValidationExceptionField$path`: by the member's own name.
 const OPERATION_TYPE_MEMBER: &str = "operationType";
 
-/// The terminal state the clock owes a job that is still `PROCESSING`: when it comes
-/// due, and what the job reports once it does.
+/// The `resourceType` a job reports for a brand profile it created or updated: a member
+/// of [`crate::ops::types::JOB_RESOURCE_TYPE_VALUES`], the enum `JobResource$resourceType`
+/// targets — not the hyphenated resource vocabulary a refusal names a resource by.
+pub const BRAND_PROFILE_JOB_RESOURCE_TYPE: &str = "BRAND_PROFILE";
+
+/// The `errorCode` a job that could not reach a resource it was to operate on reports.
 ///
-/// Held beside the job's current status rather than applied at once, because the API
-/// reports an accepted job as `PROCESSING` and only then as finished; it is a change
-/// the clock makes due at [`Self::due_at`] whether or not anybody asks for it.
-#[derive(Debug, Clone)]
-pub struct JobSettlement {
-    /// The instant this job's terminal status becomes due.
-    pub due_at: SystemTime,
-    /// The `JobStatus` the job reports from then on.
+/// `JobErrorCode` is "a machine-readable code identifying why a job failed" and is modelled
+/// as a plain string with no value set, so the code names the error CLASS the failure
+/// belongs to — the modelled error a synchronous operation refusing the same request would
+/// answer with — rather than a token of its own.
+pub const RESOURCE_NOT_FOUND_JOB_ERROR_CODE: &str = "ResourceNotFoundException";
+
+/// The `errorCode` a job whose work would push a store past one of this service's ceilings
+/// reports, in that same vocabulary.
+pub const SERVICE_QUOTA_EXCEEDED_JOB_ERROR_CODE: &str = "ServiceQuotaExceededException";
+
+/// What performing a job's work produced: the terminal status the job reports from then on,
+/// and what it reports beside it.
+///
+/// One shape whether the outcome was decided when the job was accepted or computed by the
+/// work itself, so a job report states it the same way either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobOutcome {
+    /// The `JobStatus` the job reports from then on: terminal by construction, since both
+    /// constructors below name a terminal status.
     pub status: String,
     /// `errorCode`, which a job reports only once it has failed.
     pub error_code: Option<String>,
     /// `errorMessage`, which a job reports only once it has failed.
     pub error_message: Option<String>,
-    /// The resources the job created or updated, which it reports once it has
-    /// finished.
+    /// The resources the job created or updated, which it reports once it has finished.
     pub resources: Vec<JobResource>,
+}
+
+impl JobOutcome {
+    /// The outcome of a job that finished its work, carrying the resources it created or
+    /// updated.
+    #[must_use]
+    pub fn succeeded(resources: Vec<JobResource>) -> Self {
+        Self {
+            status: SUCCESS_JOB_STATUS.to_string(),
+            error_code: None,
+            error_message: None,
+            resources,
+        }
+    }
+
+    /// The outcome of a job whose work did not finish, carrying the machine-readable code
+    /// and the human-readable description the API reports only for a failed job.
+    #[must_use]
+    pub fn failed(error_code: &str, error_message: &str) -> Self {
+        Self {
+            status: FAILED_JOB_STATUS.to_string(),
+            error_code: Some(error_code.to_string()),
+            error_message: Some(error_message.to_string()),
+            resources: Vec::new(),
+        }
+    }
+}
+
+/// What a job does when the clock makes its transition due, and what it then reports.
+///
+/// The work is recorded rather than performed by the call that started the job, because
+/// such an operation "runs asynchronously": the API reports the job as `PROCESSING` and the
+/// change it makes becomes visible when the job finishes. Performing it is therefore owed
+/// by the clock alone ([`ComAmazonawsEndusermessagingEndusermessagingState::settle_jobs`]),
+/// at the instant it came due, whether or not anybody polled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobWork {
+    /// Nothing to perform: the job reports the outcome that was decided when it was
+    /// accepted.
+    Decided(JobOutcome),
+    /// Import the fields of a registration into a brand profile's attributes, as
+    /// `UpdateBrandProfileFromRegistration` asks
+    /// ([`ComAmazonawsEndusermessagingEndusermessagingState::import_registration_into_brand_profile`]).
+    ImportRegistration {
+        /// The `brandProfileId` the fields are imported into.
+        brand_profile_id: String,
+        /// The `registrationId` they are imported from.
+        registration_id: String,
+        /// Whether a registration value overwrites an attribute value already there, which
+        /// is what `onAttributeConflict` chose.
+        replace_existing_values: bool,
+        /// `smartMatch`, which decides which attributes map at all.
+        smart_match: bool,
+    },
+}
+
+/// The terminal state the clock owes a job that is still `PROCESSING`: when it comes
+/// due, and what the job does and reports once it does.
+///
+/// Held beside the job's current status rather than applied at once, because the API
+/// reports an accepted job as `PROCESSING` and only then as finished; it is a change
+/// the clock makes due at [`Self::due_at`] whether or not anybody asks for it. It stays on
+/// the record after it has been applied — the job's own `status` is terminal from then on —
+/// because the work it names is also what a repeat of the `clientToken` that started the
+/// job is compared against.
+#[derive(Debug, Clone)]
+pub struct JobSettlement {
+    /// The instant this job's terminal status becomes due.
+    pub due_at: SystemTime,
+    /// What the job does when `due_at` arrives, and what it reports from then on.
+    pub work: JobWork,
 }
 
 impl JobSettlement {
@@ -99,10 +184,7 @@ impl JobSettlement {
     pub fn succeeds_at(due_at: SystemTime, resources: Vec<JobResource>) -> Self {
         Self {
             due_at,
-            status: SUCCESS_JOB_STATUS.to_string(),
-            error_code: None,
-            error_message: None,
-            resources,
+            work: JobWork::Decided(JobOutcome::succeeded(resources)),
         }
     }
 
@@ -111,11 +193,14 @@ impl JobSettlement {
     pub fn fails_at(due_at: SystemTime, error_code: &str, error_message: &str) -> Self {
         Self {
             due_at,
-            status: FAILED_JOB_STATUS.to_string(),
-            error_code: Some(error_code.to_string()),
-            error_message: Some(error_message.to_string()),
-            resources: Vec::new(),
+            work: JobWork::Decided(JobOutcome::failed(error_code, error_message)),
         }
+    }
+
+    /// The settlement of a job whose terminal status is whatever performing `work`
+    /// produces, due `JOB_SETTLEMENT_DELAY` after the call that started it.
+    pub fn performs_at(due_at: SystemTime, work: JobWork) -> Self {
+        Self { due_at, work }
     }
 }
 
@@ -142,9 +227,37 @@ pub struct Job {
     pub resources: Vec<JobResource>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
-    /// The terminal status the clock still owes this job, or `None` for a job that
-    /// has already reached one.
-    pub settlement: Option<JobSettlement>,
+    /// The identifier from the request this job processes, as
+    /// `JobResult$resourceIdentifier` reports it — "the identifier from your request that
+    /// this job is processing" — kept as the request spelled it. `None` for a job no
+    /// request of this emulator started.
+    pub resource_identifier: Option<String>,
+    /// The `clientToken` the request that started this job carried, when it carried one.
+    /// Kept on the record rather than in a map beside it, so the token lives and dies with
+    /// the job it names and is bounded by the same ceiling.
+    pub client_token: Option<String>,
+    /// The transition the clock owes this job: when it comes due, and what the job does
+    /// and reports then.
+    pub settlement: JobSettlement,
+}
+
+/// What a request that starts a job asks of it, beside the instant it was accepted at.
+///
+/// One argument rather than six, so a call that starts a job names each of them.
+#[derive(Debug)]
+pub struct StartedJob<'a> {
+    /// `operationType` — the operation starting the job, one of
+    /// [`JOB_OPERATION_TYPE_VALUES`].
+    pub operation_type: &'a str,
+    /// The profile the job operates on.
+    pub brand_profile_id: &'a str,
+    /// The identifier from the request this job processes, as
+    /// `JobResult$resourceIdentifier` reports it.
+    pub resource_identifier: &'a str,
+    /// The request's `clientToken`, when it carried one.
+    pub client_token: Option<&'a str>,
+    /// What the job does when the clock makes its transition due.
+    pub work: JobWork,
 }
 
 impl Job {
@@ -167,30 +280,26 @@ impl Job {
             resources: Vec::new(),
             created_at: at,
             updated_at: at,
-            settlement: Some(settlement),
+            resource_identifier: None,
+            client_token: None,
+            settlement,
         }
     }
 
-    /// Apply the terminal status the clock has made due by `now`, if any.
-    ///
-    /// The job is reported as having changed when the transition came due, not when
-    /// something got around to reading it, so `updated_at` is the instant it was owed.
-    fn settle(&mut self, now: SystemTime) {
-        if self
-            .settlement
-            .as_ref()
-            .is_none_or(|settlement| now < settlement.due_at)
-        {
-            return;
-        }
-        let Some(settlement) = self.settlement.take() else {
-            return;
-        };
-        self.status = settlement.status;
-        self.error_code = settlement.error_code;
-        self.error_message = settlement.error_message;
-        self.resources = settlement.resources;
-        self.updated_at = settlement.due_at;
+    /// A job the service has just accepted from a request: `PROCESSING` as of `at`,
+    /// performing the work that request asked for — and reporting what that produced —
+    /// when the clock makes the transition due, [`JOB_SETTLEMENT_DELAY`] later.
+    pub fn started(id: &str, at: SystemTime, started: StartedJob<'_>) -> Self {
+        let mut job = Self::accepted(
+            id,
+            started.operation_type,
+            Some(started.brand_profile_id),
+            at,
+            JobSettlement::performs_at(at + JOB_SETTLEMENT_DELAY, started.work),
+        );
+        job.resource_identifier = Some(started.resource_identifier.to_string());
+        job.client_token = started.client_token.map(str::to_string);
+        job
     }
 }
 
@@ -234,15 +343,69 @@ impl ComAmazonawsEndusermessagingEndusermessagingState {
         self.jobs.insert(job.id.clone(), job);
     }
 
-    /// Apply the terminal status the clock has made due by `now` to every stored job.
+    /// The job a request carrying `client_token` started, or `None` when this state has no
+    /// record of that token.
+    ///
+    /// `clientToken` is `@idempotencyToken`, so a repeat of a request already served
+    /// reports the job that request started instead of starting a second one. The scan is
+    /// over a map bounded by [`MAX_JOBS`].
+    pub fn job_started_by(&self, client_token: &str) -> Option<&Job> {
+        self.jobs
+            .values()
+            .find(|job| job.client_token.as_deref() == Some(client_token))
+    }
+
+    /// Perform the work, and apply the terminal status, the clock has made due by `now`
+    /// for every stored job.
     ///
     /// Owed by the clock alone — each transition was due at its own instant whether or
     /// not anybody called — so materialising it is what lets every operation read one
     /// store in which no job is still reported as `PROCESSING` after its work was due
-    /// to finish.
+    /// to finish, and none of that work is still outstanding.
+    ///
+    /// A job's work is performed once: the job's own `status` is terminal from then on, and
+    /// only a job still reported as `PROCESSING` is due for anything. The jobs are taken in
+    /// the order their transitions came due, so two whose work touches one resource land in
+    /// the order the clock owed them rather than in the order their ids sort.
     pub fn settle_jobs(&mut self, now: SystemTime) {
-        for job in self.jobs.values_mut() {
-            job.settle(now);
+        let mut due: Vec<(SystemTime, String)> = self
+            .jobs
+            .iter()
+            .filter(|(_, job)| {
+                job.status == PROCESSING_JOB_STATUS && job.settlement.due_at <= now
+            })
+            .map(|(id, job)| (job.settlement.due_at, id.clone()))
+            .collect();
+        due.sort();
+        for (due_at, id) in due {
+            let Some(work) = self.jobs.get(&id).map(|job| job.settlement.work.clone()) else {
+                continue;
+            };
+            let outcome = match work {
+                JobWork::Decided(outcome) => outcome,
+                JobWork::ImportRegistration {
+                    brand_profile_id,
+                    registration_id,
+                    replace_existing_values,
+                    smart_match,
+                } => self.import_registration_into_brand_profile(
+                    &brand_profile_id,
+                    &registration_id,
+                    replace_existing_values,
+                    smart_match,
+                    due_at,
+                ),
+            };
+            let Some(job) = self.jobs.get_mut(&id) else {
+                continue;
+            };
+            job.status = outcome.status;
+            job.error_code = outcome.error_code;
+            job.error_message = outcome.error_message;
+            job.resources = outcome.resources;
+            // The job is reported as having changed when the transition came due, not when
+            // something got around to reading it.
+            job.updated_at = due_at;
         }
     }
 }

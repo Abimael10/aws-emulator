@@ -161,6 +161,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let mut store = state.lock();
+        // Perform the work, and apply the terminal status, the clock had already made due:
+        // each was owed at its own instant whether or not anybody called, so a delete is
+        // judged against the profile every earlier job had already left behind.
+        store.settle_jobs(::std::time::SystemTime::now());
         let id = store
             .resolve_brand_profile_id(&input.brand_profile_id)
             .map(str::to_string)

@@ -147,7 +147,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `@readonly`: paging a list never changes what a later caller sees.
+        // `@readonly`: paging a list never changes what a later caller sees. The one write
+        // below materialises the work and the terminal statuses the clock had already made
+        // due, each of which was owed at its own instant whether or not anybody called.
         let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListBrandProfilesErrorModeled::InternalServerException(
@@ -184,7 +186,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(MAX_PAGE_SIZE)
             .clamp(1, MAX_PAGE_SIZE);
 
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A job's work changes the profile it operates on at the instant it comes due, so a
+        // page states each profile as of the transitions the clock had already owed.
+        store.settle_jobs(now);
         // A range query, not a scan: resuming costs O(log n) + O(page) rather than
         // walking every stored profile on each page.
         let start = match resume_after.as_deref() {

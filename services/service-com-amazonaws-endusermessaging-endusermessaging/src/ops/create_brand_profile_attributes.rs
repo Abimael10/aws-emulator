@@ -169,6 +169,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // Perform the work, and apply the terminal status, the clock had already made due:
+        // each was owed at its own instant whether or not anybody called, so these
+        // attributes are created against the profile every earlier job had already left
+        // behind.
+        store.settle_jobs(now);
 
         // The attributes belong to one profile, so an identifier that is not one of a
         // brand profile, or that names no stored profile, is refused against the
@@ -367,10 +372,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateBrandProfileAttributesErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
-                        message: format!(
-                            "The maximum number of attributes for a brand profile ({}) would be exceeded.",
-                            crate::state::MAX_BRAND_PROFILE_ATTRIBUTES
-                        ),
+                        message: crate::state::brand_profile_attribute_ceiling_exceeded(),
                     },
                 )
                 .into(),

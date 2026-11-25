@@ -20,6 +20,11 @@ use std::sync::Arc;
 #[path = "state_roundtrip/job_listing.rs"]
 mod job_listing;
 
+// The other half of that contract: a job whose WORK changes another resource when the
+// clock makes the transition due, rather than only reporting a status.
+#[path = "state_roundtrip/registration_import.rs"]
+mod registration_import;
+
 /// A probe type owned by this test. `state::<T>()` is keyed by TYPE, so a test can use
 /// its own without touching `ComAmazonawsEndusermessagingEndusermessagingState`.
 #[derive(Default)]

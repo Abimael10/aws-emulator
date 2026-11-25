@@ -164,7 +164,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `@readonly`: reporting one attribute changes nothing a later caller sees.
+        // `@readonly`: reporting one attribute changes nothing a later caller sees. The
+        // one write below materialises the work and the terminal statuses the clock had
+        // already made due, each of which was owed at its own instant whether or not
+        // anybody called.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetBrandProfileAttributeErrorModeled::InternalServerException(
                 InternalServerException {
@@ -173,7 +176,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A job that imports a registration's fields writes the profile's attributes at the
+        // instant it comes due, so a report states the attribute as of the transitions the
+        // clock had already owed.
+        store.settle_jobs(now);
 
         // An attribute belongs to one profile, so an identifier that is not one of a
         // brand profile, or that names no stored profile, is refused against the

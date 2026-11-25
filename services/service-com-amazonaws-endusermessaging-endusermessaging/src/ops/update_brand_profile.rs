@@ -188,7 +188,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // Perform the work, and apply the terminal status, the clock had already made due:
+        // each was owed at its own instant whether or not anybody called, so this update is
+        // applied to the profile every earlier job had already left behind.
+        store.settle_jobs(now);
         let id = store
             .resolve_brand_profile_id(&input.brand_profile_id)
             .map(str::to_string)
@@ -219,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(enabled) = input.deletion_protection_enabled {
             profile.deletion_protection_enabled = enabled;
         }
-        profile.updated_at = ::std::time::SystemTime::now();
+        profile.updated_at = now;
 
         Ok(UpdateBrandProfileOutput {
             brand_profile_id: profile.id.clone(),

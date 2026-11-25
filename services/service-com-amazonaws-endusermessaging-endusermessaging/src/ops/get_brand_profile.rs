@@ -159,8 +159,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `@readonly`: this handler only reads. Nothing here moves a status, consumes a
-        // quota or bumps a counter.
+        // `@readonly`: this handler reports. The one write below materialises the work and
+        // the terminal statuses the clock had already made due, each of which was owed at
+        // its own instant whether or not anybody called.
         let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetBrandProfileErrorModeled::InternalServerException(
@@ -170,7 +171,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A job's work changes the profile it operates on at the instant it comes due, so a
+        // report states the profile as of the transitions the clock had already owed.
+        store.settle_jobs(now);
         let brand_profile_id = store
             .resolve_brand_profile_id(&input.brand_profile_id)
             .map(str::to_string)

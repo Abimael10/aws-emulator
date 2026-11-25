@@ -168,6 +168,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let mut store = state.lock();
+        // Perform the work, and apply the terminal status, the clock had already made due:
+        // each was owed at its own instant whether or not anybody called, so a delete is
+        // judged against the attributes every earlier job had already left behind.
+        store.settle_jobs(::std::time::SystemTime::now());
 
         // An attribute belongs to one profile, so an identifier that is not one of a
         // brand profile, or that names no stored profile, is refused against the

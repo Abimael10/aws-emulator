@@ -37,6 +37,11 @@ pub use notify_code_configuration_templates::*;
 mod jobs;
 pub use jobs::*;
 
+/// The registrations a brand profile is mapped to and from, which values name one, and
+/// how a registration's fields are imported into a profile's attributes.
+mod registrations;
+pub use registrations::*;
+
 /// The service's own ARN namespace / sigv4 signing name, as the Smithy model's
 /// `aws.api#service` trait declares it (`arnNamespace`/`endpointPrefix`
 /// `end-user-messaging`).
@@ -213,6 +218,10 @@ pub struct ComAmazonawsEndusermessagingEndusermessagingState {
     /// Every asynchronous job, keyed by `jobId`. A `BTreeMap` so `ListJobs` pages in
     /// a stable, resumable order. Bounded by [`MAX_JOBS`].
     pub jobs: BTreeMap<String, Job>,
+    /// Every registration, keyed by `registrationId`. A `BTreeMap` so a scan over the
+    /// registrations of one brand profile is in a stable, resumable order. Bounded by
+    /// [`MAX_REGISTRATIONS`].
+    pub registrations: BTreeMap<String, Registration>,
     /// Every one-time passcode verification in flight, keyed by
     /// `verificationId`. A `BTreeMap` so a scan over the verifications of one
     /// recipient is in a stable order. Bounded by [`MAX_VERIFICATIONS`], and

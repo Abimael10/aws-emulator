@@ -144,7 +144,11 @@ pub struct NotifyCodeConfiguration {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.endusermessaging#JobResource")]
-#[derive(Debug, Clone, Default)]
+// `PartialEq`/`Eq`: a repeat of an `@idempotencyToken` is served the job that token
+// started only when the request repeats the one it served, which is a comparison of the
+// work that job records (`crate::state::JobWork`) — the resources a decided outcome
+// carries among it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JobResource {
     pub resource_type: String,
     pub resource_id: String,
