@@ -66,3 +66,29 @@ Cause 2 (DeleteTrustStore validation order):
 2. Send DeleteTrustStore (DELETE /2020-05-31/trust-store/{Id}) for a well-formed trust-store Id that does not exist, with the If-Match header missing or carrying a version token that is not valid.
 3. Observe HTTP 404 / EntityNotFound / 'The specified trust store does not exist.' instead of HTTP 400 / InvalidIfMatchVersion / 'The If-Match version is missing or not valid for the resource.'.
 4. Re-replay fixtures cloudfront-trust-store-delete-not-found#task#1, cloudfront-trust-store-error-paths#task#3, cloudfront-trust-store-lifecycle#task#4 and cloudfront-trust-store-lookup-and-missing-source-error#task#3 to confirm a fix.
+
+## Resolution
+
+Cause 2 FIXED; cause 1 DECLINED as a per-run generated value.
+
+- Cause 2: `InvalidIfMatchVersion` is decided against the `If-Match` header alone, so the
+  trust store's conditional writes now answer it before they resolve the path `Id`. Both
+  operations of that resource that take an `If-Match` were changed —
+  `src/ops/delete_trust_store.rs` and `src/ops/update_trust_store.rs`'s `admitted` — each
+  reusing the crate's existing `state::if_match_version` form predicate and its one
+  `InvalidIfMatchVersion` sentence. A header that DOES carry a version token still reaches
+  the record, so an absent id is `EntityNotFound` (404) and a token that is not the current
+  one is a failed precondition (412). The four replayed trust-store fixtures pass.
+  `tests/all/trust_store_if_match_form.rs` pins the rule over both operations, every way a
+  value can fail to be a version token and every id form; the two rows of
+  `tests/all/trust_store_delete.rs` / `tests/all/trust_store_update.rs` that had pinned the
+  old order now expect the recorded one.
+- Cause 1: the equality the cause is about already holds in this tree — a tenant's version
+  token lives in ONE field of its record, minted by the calls that change the tenant, and
+  every projection that carries an `ETag` (the summary both listings report through
+  `distribution_tenant_summary`, the tenant's own read, the create, the update, the web ACL
+  association) reads that field. What is left is the TEXT of the token, a value the service
+  generates per run that no rule derives from the request; the recorded literal is identical
+  across sweeps while this emulator's token moved with unrelated changes to its mint, so the
+  step compares the recording's literal. `tests/all/tenant_listing_version_token.rs` and
+  `tests/all/tenant_version_token_is_minted_by_a_write.rs` pin the rule itself.

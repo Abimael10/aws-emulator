@@ -3,10 +3,11 @@
 //! `UpdateTrustStore`, end to end over HTTP.
 //!
 //! The rule under test: updating a trust store is a CONDITIONAL, PARTIAL write of the one
-//! record the create persisted. The `Id` has to name a stored trust store (`EntityNotFound`,
-//! HTTP 404) and the `If-Match` has to be that record's current version token — a value that
-//! is no version token at all is `InvalidIfMatchVersion` (HTTP 400) and a well-formed token
-//! that is not the current one is `PreconditionFailed` (HTTP 412). Every member beyond those
+//! record the create persisted. The `If-Match` has to carry a version token at all — a value
+//! that is no version token is `InvalidIfMatchVersion` (HTTP 400), decided against the header
+//! alone and so before the `Id` is resolved — the `Id` has to name a stored trust store
+//! (`EntityNotFound`, HTTP 404), and the token has to be that record's current one (a
+//! well-formed token that is not is `PreconditionFailed`, HTTP 412). Every member beyond those
 //! two is optional, so what the request STATES is replaced and what it leaves out is carried
 //! over untouched; a `CaCertificatesBundleSource` the request names is READ and the
 //! certificate count the record then reports is the count of certificates in THAT object, so
@@ -530,9 +531,10 @@ async fn an_if_match_that_is_not_the_current_version_refuses_the_update() {
 }
 
 /// RULE: the `Id` is "the trust store ID" — the token the create minted and the key the
-/// record is held under, not the identifier the reads of this resource resolve — and it is
-/// resolved BEFORE the precondition, so an id no stored trust store answers to is
-/// `EntityNotFound` (404) whatever the request's `If-Match` carries.
+/// record is held under, not the identifier the reads of this resource resolve — so an id no
+/// stored trust store answers to is `EntityNotFound` (404) under any readable version token,
+/// while an `If-Match` that carries no version token at all is refused on the HEADER
+/// (`InvalidIfMatchVersion`, 400) before the id is resolved at all.
 #[tokio::test]
 async fn an_id_no_trust_store_answers_to_is_not_found() {
     let emulator = Emulator::new();
@@ -557,10 +559,28 @@ async fn an_id_no_trust_store_answers_to_is_not_found() {
     ];
 
     for (case, id) in absent {
-        for (spelling, if_match) in [
-            ("a token another record holds", present.etag.clone()),
-            ("no version token at all", "bogus".to_string()),
-            ("a token nothing holds", UNHELD_VERSION_TOKEN.to_string()),
+        for (spelling, if_match, status, code, message) in [
+            (
+                "a token another record holds",
+                present.etag.clone(),
+                404,
+                "EntityNotFound",
+                TRUST_STORE_NOT_FOUND,
+            ),
+            (
+                "a token nothing holds",
+                UNHELD_VERSION_TOKEN.to_string(),
+                404,
+                "EntityNotFound",
+                TRUST_STORE_NOT_FOUND,
+            ),
+            (
+                "no version token at all",
+                "bogus".to_string(),
+                400,
+                "InvalidIfMatchVersion",
+                INVALID_IF_MATCH_VERSION,
+            ),
         ] {
             let refused = update_trust_store(
                 &emulator.router,
@@ -571,20 +591,20 @@ async fn an_id_no_trust_store_answers_to_is_not_found() {
             )
             .await;
             assert_eq!(
-                refused.status, 404,
-                "case {case:?} ({spelling}): expected HTTP 404 for {id:?}, got {} with {}",
+                refused.status, status,
+                "case {case:?} ({spelling}): expected HTTP {status} for {id:?}, got {} with {}",
                 refused.status, refused.raw
             );
             assert_eq!(
                 refused.error_code(),
-                "EntityNotFound",
-                "case {case:?} ({spelling}): expected EntityNotFound, got {}",
+                code,
+                "case {case:?} ({spelling}): expected {code}, got {}",
                 refused.raw
             );
             let stated = refused.root().find_text("Message").unwrap_or_default();
             assert_eq!(
-                stated, TRUST_STORE_NOT_FOUND,
-                "case {case:?} ({spelling}): expected the message {TRUST_STORE_NOT_FOUND:?}, got \
+                stated, message,
+                "case {case:?} ({spelling}): expected the message {message:?}, got \
                  {stated:?}"
             );
         }

@@ -6,11 +6,12 @@
 //! optimistic-concurrency precondition every conditional write of this service runs under —
 //! so the identifier answers no later read, and the name it held is free again.
 //!
-//! The order the refusals are decided in is the order the request can be judged in: the `Id`
-//! has to name a stored trust store at all (`EntityNotFound`, 404), the `If-Match` the
-//! request carried has to be that record's current version token — a value that is no
-//! version token at all is `InvalidIfMatchVersion` (400) and a well-formed token that is not
-//! the current one is `PreconditionFailed` (412) — and a trust store a stored distribution
+//! The order the refusals are decided in is the order the request can be judged in: the
+//! `If-Match` the request carried has to carry a version token AT ALL, which is a property of
+//! the header alone and so is answered before anything is resolved (`InvalidIfMatchVersion`,
+//! 400); the `Id` has to name a stored trust store (`EntityNotFound`, 404); that record's
+//! current version token has to be the one the header carries, so a well-formed token that is
+//! not the current one is `PreconditionFailed` (412); and a trust store a stored distribution
 //! still validates viewer certificates against cannot be deleted at all
 //! (`CannotDeleteEntityWhileInUse`, 409). NO refusal writes anything: the record and the
 //! version token an `If-Match` is checked against stand exactly as they were, so a caller
@@ -181,6 +182,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::state::store_unavailable());
         };
         let _ = ctx;
+
+        // The FORM of the `If-Match` header, decided against nothing but the header itself:
+        // `InvalidIfMatchVersion` is "the If-Match version is missing or not valid", a
+        // property of the REQUEST, so it is answered before the `Id` is resolved — no stored
+        // version could make a header carrying no version token valid, and the answer is the
+        // same whether or not the id names a stored trust store. The member is `@required`,
+        // so a request stating no `If-Match` never reaches here.
+        if crate::state::if_match_version(Some(input.if_match.as_str())).is_none() {
+            return Err(DeleteTrustStoreErrorModeled::InvalidIfMatchVersion(
+                crate::state::invalid_if_match_version(),
+            )
+            .into());
+        }
+
         let mut store = state.lock();
         // Materialise whatever the clock already owes this service's state before the call
         // reads it, so the version this precondition is evaluated against is the one a read
@@ -191,8 +206,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is held under — not the `Identifier` the reads of this resource kind resolve — so
         // the delete removes the one record that id addresses. An id no stored trust store
         // answers to names nothing to delete: `EntityNotFound` is what this operation models
-        // for an entity it cannot find, and it is decided before anything else is spent on
-        // the request.
+        // for an entity it cannot find, and it is decided once the request itself has been
+        // found readable and before anything else is spent on it.
         let Some(stored) = store.trust_stores.get(&input.id) else {
             return Err(DeleteTrustStoreErrorModeled::EntityNotFound(
                 crate::state::trust_store_not_found(),
@@ -202,14 +217,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let current_etag = stored.etag.clone();
 
         // "The current version (ETag value) of the trust store you are deleting": the
-        // precondition is evaluated next, the way HTTP evaluates one, so a caller holding a
-        // version that is no longer current is told that before anything about what the trust
-        // store is attached to. A value that is no version token at all is "the If-Match
-        // version is missing or not valid", and a well-formed token that is not the stored
-        // one is a failed precondition — worded as the resource DOCUMENTS a caller
-        // conditionally rewrites word it, which is the family a trust store belongs to. The
-        // member is `@required`, so a request stating no `If-Match` is refused at the request
-        // boundary.
+        // precondition is evaluated against the stored version next, the way HTTP evaluates
+        // one, so a caller holding a version that is no longer current is told that before
+        // anything about what the trust store is attached to. A well-formed token that is not
+        // the stored one is a failed precondition — worded as the resource DOCUMENTS a caller
+        // conditionally rewrites word it, which is the family a trust store belongs to; the
+        // header's own form was judged above, so the `Invalid` arm is unreachable here and
+        // answers the same refusal if it is ever reached.
         match crate::state::check_if_match(&current_etag, Some(input.if_match.as_str())) {
             IfMatch::Current => {}
             IfMatch::Invalid => {

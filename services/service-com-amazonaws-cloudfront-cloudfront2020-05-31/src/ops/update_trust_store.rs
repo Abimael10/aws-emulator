@@ -19,11 +19,12 @@
 //! because the caller's bundle is not what is at fault. The stored record therefore never
 //! reports a bundle source whose certificates were counted in another object.
 //!
-//! The refusals are decided in the order the request can be judged in: the `Id` has to name
-//! a stored trust store (`EntityNotFound`, 404), the `If-Match` has to be that record's
-//! current version token — a value that is no version token at all is
-//! `InvalidIfMatchVersion` (400) and a well-formed token that is not the current one is
-//! `PreconditionFailed` (412) — and only then is a bundle read. NO refusal writes anything,
+//! The refusals are decided in the order the request can be judged in: the `If-Match` has to
+//! carry a version token at all — a value that is no version token is
+//! `InvalidIfMatchVersion` (400), a property of the header alone and so answered before the
+//! `Id` is resolved — then the `Id` has to name a stored trust store (`EntityNotFound`, 404),
+//! then the token has to be that record's current one (a well-formed token that is not is
+//! `PreconditionFailed`, 412) — and only then is a bundle read. NO refusal writes anything,
 //! so a caller that re-reads the trust store and retries with the version it reports lands.
 //!
 //! An accepted update is a WRITE: it versions the record afresh, so the token the caller
@@ -281,15 +282,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// Whether a request may write the trust store `id` names, under the `If-Match` it carried.
 ///
-/// The two refusals a conditional write of this resource is judged by, in the order it can
-/// be judged in: the id has to name a stored trust store at all — `EntityNotFound` is what
-/// this operation models for an entity it cannot find, and a precondition can only be
-/// checked against a stored version — and the `If-Match` has to be that record's current
-/// version token, where a value that is no version token at all is "the If-Match version is
-/// missing or not valid" and a well-formed token that is not the stored one is a failed
-/// precondition, worded as the resources a caller conditionally rewrites word it. The
-/// `If-Match` member is `@required`, so a request stating none is refused at the request
-/// boundary.
+/// The refusals a conditional write of this resource is judged by, in the order it can be
+/// judged in: the `If-Match` has to carry a version token AT ALL — "the If-Match version is
+/// missing or not valid", a property of the HEADER the request carried and so decided
+/// against nothing but that header, before any id is resolved — then the id has to name a
+/// stored trust store (`EntityNotFound` is what this operation models for an entity it
+/// cannot find), and then the token has to be that record's current one, where a well-formed
+/// token that is not the stored one is a failed precondition, worded as the resources a
+/// caller conditionally rewrites word it. The `If-Match` member is `@required`, so a request
+/// stating none is refused at the request boundary.
 ///
 /// ONE function, called both before and after the bundle read, so the request is judged by
 /// the same rule at the instant it is admitted and at the instant it is written.
@@ -298,6 +299,12 @@ fn admitted(
     id: &str,
     if_match: &str,
 ) -> Result<(), UpdateTrustStoreError> {
+    if crate::state::if_match_version(Some(if_match)).is_none() {
+        return Err(UpdateTrustStoreErrorModeled::InvalidIfMatchVersion(
+            crate::state::invalid_if_match_version(),
+        )
+        .into());
+    }
     let Some(stored) = store.trust_stores.get(id) else {
         return Err(UpdateTrustStoreErrorModeled::EntityNotFound(
             crate::state::trust_store_not_found(),
@@ -306,6 +313,7 @@ fn admitted(
     };
     match crate::state::check_if_match(&stored.etag, Some(if_match)) {
         IfMatch::Current => Ok(()),
+        // Unreachable: the header's form was judged above, and the same refusal answers it.
         IfMatch::Invalid => Err(UpdateTrustStoreErrorModeled::InvalidIfMatchVersion(
             crate::state::invalid_if_match_version(),
         )
