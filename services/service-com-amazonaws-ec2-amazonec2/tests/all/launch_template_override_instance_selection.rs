@@ -10,10 +10,9 @@
 //! `FleetLaunchTemplateOverridesRequest$InstanceRequirements`). An override is one Spot pool of
 //! the fleet, and the two members are two ways of saying what that pool launches, so:
 //!
-//! * an override carrying BOTH is refused with the one sentence AWS words that refusal with,
-//!   whichever fleet API it was sent to and wherever in the overrides list it sits, under the
-//!   code that API answers it with — the Spot Fleet surface's
-//!   `InvalidParameterCombinationException` and the EC2 Fleet surface's
+//! * an override carrying BOTH is refused wherever in the overrides list it sits, with the code
+//!   and the sentence the API it was sent to answers that refusal with — the Spot Fleet
+//!   surface's `InvalidParameterCombinationException` and the EC2 Fleet surface's
 //!   `InvalidParameterValue`;
 //! * an override carrying instance REQUIREMENTS alone is refused with `UnsupportedOperation`:
 //!   this service resolves no instance types from a requirement set, and a pool that quietly
@@ -27,8 +26,10 @@
 //! members it carries — and every refusal is checked to have stored NOTHING.
 
 use ec2::state::{
-    ComAmazonawsEc2Amazonec2State as Ec2State, INSTANCE_REQUIREMENTS_WITH_INSTANCE_TYPE_MESSAGE,
+    ComAmazonawsEc2Amazonec2State as Ec2State,
+    CREATE_FLEET_REQUIREMENTS_WITH_INSTANCE_TYPE_MESSAGE,
     INVALID_PARAMETER_COMBINATION_EXCEPTION, INVALID_PARAMETER_VALUE,
+    SPOT_FLEET_REQUIREMENTS_WITH_INSTANCE_TYPE_MESSAGE,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -127,6 +128,16 @@ impl Api {
                     template_id,
                 ),
             ],
+        }
+    }
+
+    /// The sentence this API answers an override carrying BOTH members with. The two surfaces
+    /// word the second mention of the instance-type member differently, so the expectation is
+    /// read off the API the row sends to rather than shared.
+    fn both_members_message(self) -> &'static str {
+        match self {
+            Api::SpotFleet => SPOT_FLEET_REQUIREMENTS_WITH_INSTANCE_TYPE_MESSAGE,
+            Api::Fleet => CREATE_FLEET_REQUIREMENTS_WITH_INSTANCE_TYPE_MESSAGE,
         }
     }
 
@@ -302,10 +313,10 @@ async fn an_override_says_what_its_pool_launches_exactly_once() {
                     || expected_code == INVALID_PARAMETER_VALUE
                 {
                     let message = error_message(&body);
+                    let expected = row.api.both_members_message();
                     assert_eq!(
-                        message, INSTANCE_REQUIREMENTS_WITH_INSTANCE_TYPE_MESSAGE,
-                        "case {case:?}: expected the sentence \
-                         {INSTANCE_REQUIREMENTS_WITH_INSTANCE_TYPE_MESSAGE:?}, got {message:?}"
+                        message, expected,
+                        "case {case:?}: expected the sentence {expected:?}, got {message:?}"
                     );
                 }
                 let after = store_counts(&engine);

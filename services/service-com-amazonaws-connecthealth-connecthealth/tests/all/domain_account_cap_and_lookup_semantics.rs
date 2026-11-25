@@ -14,11 +14,13 @@
 //!    succeeds with status `ACTIVE`. (That the count is per Region rather than
 //!    cross-Region is asserted in `tests/all/region_scoping.rs`; every row here is signed
 //!    for one Region.)
-//! 2. `DeleteDomain` reports every `domainId` it resolves no domain for — one this service
-//!    never minted, one it minted and has since purged, and one whose domain is live in
-//!    another Region — as the ONE error the operation models,
-//!    `ResourceNotFoundException` at HTTP 404, whose detail member names the requested id.
-//!    A READ (`GetDomain`) resolves the same domain, so it answers the same way.
+//! 2. `DeleteDomain` refuses every `domainId` it resolves no domain for, split on the
+//!    id's ALLOCATION HISTORY: one this service minted and has since purged, and one
+//!    whose domain is live in another Region, are the ONE error the operation models,
+//!    `ResourceNotFoundException` at HTTP 404, whose detail member names the requested id;
+//!    one it never minted resolves no ARN for the front door to authorize and is refused
+//!    there, with no detail member value at all. A READ (`GetDomain`) resolves the domain
+//!    itself, so it reports the modelled 404 for either.
 //! 3. A Domain-not-found answer reports `Domain not found: <domainId>`, the requested id
 //!    verbatim, from whichever operation resolved the Domain.
 //! 4. `GetMedicalScribeListeningSession` resolves a session only under the exact
@@ -309,34 +311,90 @@ async fn a_domain_whose_deletion_is_still_in_flight_keeps_its_slot_until_the_pur
     );
 }
 
+/// Why a well-formed `domainId` resolves no domain in the Region a request is signed
+/// for, which is what the refusal of a DELETE turns on: an id this service never
+/// allocated names no resource an ARN can be resolved for, while one it allocated and no
+/// longer holds here is a resource this account had and has lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unresolvable {
+    /// No allocation history at all.
+    NeverAllocated,
+    /// Allocated by this service, and not held in the Region the request names.
+    AllocatedAndLost,
+}
+
+/// Assert how `DeleteDomain` refuses an id that resolves nothing: the modelled 404 naming
+/// the requested id for an id this service allocated, and the front door's own
+/// detail-less refusal for one it never did.
+fn assert_delete_refusal(
+    case: &str,
+    kind: Unresolvable,
+    domain_id: &str,
+    status: u16,
+    body: &Value,
+) {
+    match kind {
+        Unresolvable::AllocatedAndLost => {
+            assert_eq!(
+                (status, error_code(body).as_str()),
+                (404, "ResourceNotFoundException"),
+                "case {case:?}: expected the modelled not-found, got {status} {body:?}"
+            );
+            assert_eq!(
+                detail_text(case, body),
+                format!("Domain not found: {domain_id}"),
+                "case {case:?}: the not-found must name the requested id, got {body:?}"
+            );
+        }
+        Unresolvable::NeverAllocated => {
+            assert_eq!(
+                (status, error_code(body).as_str()),
+                (403, "AuthorizerConfigurationException"),
+                "case {case:?}: expected the front door's refusal of an id with no \
+                 allocation history, got {status} {body:?}"
+            );
+            assert_eq!(
+                body.get("message"),
+                Some(&Value::Null),
+                "case {case:?}: that refusal carries no detail at all, so the member is an \
+                 explicit null, got {body:?}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
-async fn delete_domain_reports_the_modelled_not_found_for_every_unresolvable_id() {
+async fn delete_domain_refuses_every_unresolvable_id_by_its_allocation_history() {
     let emulator = Emulator::new("us-east-1");
 
     // Every way a well-formed `domainId` can resolve no domain in the Region a request is
-    // signed for, so no row's answer can depend on what the store remembers about the id:
-    // ids this service never minted (both modelled prefixes, both ends of the modelled
-    // length range, digits only, and a pronounceable id), an id it minted and has since
-    // purged, and the id of a domain that is LIVE in another Region.
-    let mut rows: Vec<(String, String)> = vec![
+    // signed for: ids this service never minted (both modelled prefixes, both ends of the
+    // modelled length range, digits only, and a pronounceable id), an id it minted and has
+    // since purged, and the id of a domain that is LIVE in another Region.
+    let mut rows: Vec<(String, Unresolvable, String)> = vec![
         (
             "never minted, digits only (24)".to_string(),
+            Unresolvable::NeverAllocated,
             unresolvable_domain_id("dom-", '2', 24),
         ),
         (
             "never minted, the shortest dom- id (20)".to_string(),
+            Unresolvable::NeverAllocated,
             unresolvable_domain_id("dom-", 'a', 20),
         ),
         (
             "never minted, the longest dom- id (25)".to_string(),
+            Unresolvable::NeverAllocated,
             unresolvable_domain_id("dom-", 'z', 25),
         ),
         (
             "never minted, a legacy hai- id".to_string(),
+            Unresolvable::NeverAllocated,
             unresolvable_domain_id("hai-", '0', 21),
         ),
         (
             "never minted, a named id".to_string(),
+            Unresolvable::NeverAllocated,
             "dom-doesnotexist00000".to_string(),
         ),
     ];
@@ -354,7 +412,11 @@ async fn delete_domain_reports_the_modelled_not_found_for_every_unresolvable_id(
         .send("DELETE", &format!("/domain/{purged}"), None)
         .await;
     assert_eq!(status, 200, "the first DeleteDomain got {status} {deleted:?}");
-    rows.push(("minted and since purged".to_string(), purged));
+    rows.push((
+        "minted and since purged".to_string(),
+        Unresolvable::AllocatedAndLost,
+        purged,
+    ));
     // A domain that is LIVE in another Region: an id this service minted, naming a domain
     // this Region's endpoint holds nothing under.
     let elsewhere = string_at(
@@ -363,9 +425,13 @@ async fn delete_domain_reports_the_modelled_not_found_for_every_unresolvable_id(
             .await,
         "domainId",
     );
-    rows.push(("live in another Region".to_string(), elsewhere.clone()));
+    rows.push((
+        "live in another Region".to_string(),
+        Unresolvable::AllocatedAndLost,
+        elsewhere.clone(),
+    ));
 
-    for (case, domain_id) in &rows {
+    for (case, kind, domain_id) in &rows {
         // Twice: the model declares the operation `@idempotent` and a refused delete
         // writes nothing, so the repeat is answered identically.
         for attempt in 1..=2 {
@@ -373,16 +439,7 @@ async fn delete_domain_reports_the_modelled_not_found_for_every_unresolvable_id(
             let (status, body) = emulator
                 .send("DELETE", &format!("/domain/{domain_id}"), None)
                 .await;
-            assert_eq!(
-                (status, error_code(&body).as_str()),
-                (404, "ResourceNotFoundException"),
-                "case {case:?}: expected the modelled not-found, got {status} {body:?}"
-            );
-            assert_eq!(
-                detail_text(&case, &body),
-                format!("Domain not found: {domain_id}"),
-                "case {case:?}: the not-found must name the requested id, got {body:?}"
-            );
+            assert_delete_refusal(&case, *kind, domain_id, status, &body);
         }
 
         // The READ resolves the same domain, so it answers the same way: an id that
@@ -436,7 +493,8 @@ async fn every_domain_lookup_words_its_not_found_the_same_way() {
     let live_subscription = string_at(&subscription, "subscriptionId");
 
     // A domain that was allocated and deleted, and one that never existed: both are
-    // "not found" to every operation that resolves a domain.
+    // "not found" to every operation that resolves a domain, apart from the DELETE of an
+    // id with no allocation history at all.
     let gone = string_at(
         &emulator
             .create_domain(&json!({ "name": "clinic-gone" }))
@@ -483,6 +541,20 @@ async fn every_domain_lookup_words_its_not_found_the_same_way() {
             // sent with it.
             let request = (method != "DELETE").then(|| json!({}));
             let (status, body) = emulator.send(method, &path, request.as_ref()).await;
+            // The DELETE is the one operation whose refusal splits on the id's allocation
+            // history, so for an id this service never allocated it is the front door's
+            // detail-less refusal rather than this service's wording
+            // ([`assert_delete_refusal`]).
+            if operation == "DeleteDomain" && domain_id == &never {
+                assert_delete_refusal(
+                    &case,
+                    Unresolvable::NeverAllocated,
+                    domain_id,
+                    status,
+                    &body,
+                );
+                continue;
+            }
             assert_eq!(
                 (status, error_code(&body).as_str()),
                 (404, "ResourceNotFoundException"),

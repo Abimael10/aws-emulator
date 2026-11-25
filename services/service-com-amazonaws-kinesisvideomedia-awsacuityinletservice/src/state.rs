@@ -324,12 +324,27 @@ impl ComAmazonawsKinesisvideomediaAwsacuityinletserviceState {
         let stream = self.log_mut(&registered.arn, &registered.name);
         let fragment_number = stream.next_fragment_number.to_string();
         stream.next_fragment_number += 1;
-        stream.fragments.push(Fragment {
-            fragment_number: fragment_number.clone(),
-            producer_timestamp: produced.producer_timestamp,
-            server_timestamp: produced.server_timestamp,
-            chunk: produced.chunk.clone(),
-        });
+        // The log is ordered by the instant the producer captured each fragment at, which
+        // is the order its readers resolve a cursor in ([`MediaStream::fragments`]). A
+        // producer may open a new session whose timecodes name instants an earlier session
+        // already covered — a RELATIVE session restarts its offsets at 0 — so the fragment
+        // takes its place in that order rather than the end of the vector, AFTER every
+        // fragment captured at the same instant, so fragments of one instant stay in the
+        // order they were received.
+        let position = stream
+            .fragments
+            .iter()
+            .rposition(|held| held.producer_timestamp <= produced.producer_timestamp)
+            .map_or(0, |last| last + 1);
+        stream.fragments.insert(
+            position,
+            Fragment {
+                fragment_number: fragment_number.clone(),
+                producer_timestamp: produced.producer_timestamp,
+                server_timestamp: produced.server_timestamp,
+                chunk: produced.chunk.clone(),
+            },
+        );
         drop_oldest_beyond_the_ceiling(stream);
         // The cursors that named the fragments which just went are dropped with them: a
         // continuation store that outlived the media would be the one piece of

@@ -946,9 +946,9 @@ async fn an_unconfigured_channel_cannot_be_updated_or_deleted() {
 
     // Rows: another registered team with a known channel, the stored team with an
     // unknown channel, the shortest legal ids, and a channel id one character longer
-    // than the stored one. Each row's workspace is registered below, because a channel
-    // configuration can only be missing from a workspace the account HAS: an
-    // unregistered `teamId` is the documented conflict instead, covered in
+    // than the stored one. Each row's workspace is registered below, so the miss is
+    // asserted inside a workspace the account holds; the same answer for a workspace it
+    // does not hold is covered in
     // [`crate::channel_configuration_workspace_precondition`].
     let absent: [(&str, &str); 4] = [
         ("T99999ZZZZZ", "C01234A5BCD"),

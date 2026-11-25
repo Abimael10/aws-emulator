@@ -2,16 +2,15 @@
 
 //! The time ordering of one stream's fragment log, across ingest SESSIONS.
 //!
-//! The rule under test: a stream's fragment log is ordered by capture time, so a
-//! submitted Cluster captured BEFORE the newest fragment the stream already holds is
-//! refused in band — one `ERROR` acknowledgement of
-//! `FRAGMENT_TIMECODE_LESSER_THAN_PREVIOUS` (4004) naming that Cluster, inside the same
-//! `200`, ending the session there — and is never appended, whether the fragment it goes
-//! back before was taken by the same session or by an earlier one, while a Cluster
-//! captured at or after that instant is taken. The instant compared is the one the
-//! producer captured at, which a session's `x-amzn-fragment-timecode-type` and
-//! `x-amzn-producer-start-timestamp` decide, so two sessions declaring different ones are
-//! still ordered against each other.
+//! The rule under test: a Cluster's timecode is read against the session that submitted it
+//! — its `x-amzn-fragment-timecode-type` and `x-amzn-producer-start-timestamp` — so the
+//! `FRAGMENT_TIMECODE_LESSER_THAN_PREVIOUS` (4004) fault is about THAT session's own run of
+//! timecodes: a Cluster captured before the Cluster the same session submitted ahead of it is
+//! refused in band, one `ERROR` acknowledgement naming that Cluster inside the same `200`,
+//! ending the session there. A NEW connection states a new run — a RELATIVE session's
+//! timecodes legitimately restart near zero, naming instants an earlier session already
+//! covered — so it is taken, and the stream's log keeps its own ordering by placing each
+//! fragment at the instant it was captured at, wherever in the log that falls.
 //!
 //! The first table spans what the rule generalises over: the follow-on session's timecode
 //! type and producer start, whether it goes back on its first Cluster or on a later one,
@@ -376,10 +375,10 @@ struct Case {
     expected_log_millis: Vec<u64>,
 }
 
-/// RULE: a fragment log is ordered by capture time, so a Cluster captured before the
-/// newest fragment the stream already holds is refused with
-/// `FRAGMENT_TIMECODE_LESSER_THAN_PREVIOUS` and not appended — across sessions as within
-/// one — while a Cluster captured at or after that instant is taken.
+/// RULE: the `FRAGMENT_TIMECODE_LESSER_THAN_PREVIOUS` fault is about one SESSION's own run
+/// of timecodes, so a Cluster behind the Cluster its own session submitted ahead of it is
+/// refused and not appended, while a new session naming instants the log already covers is
+/// taken and placed at those instants — the log stays in capture order either way.
 #[tokio::test]
 async fn a_cluster_behind_the_log_is_refused_whichever_session_submits_it() {
     let newest = BASE_MILLIS + SEEDED_SPAN_MILLIS;
@@ -387,53 +386,54 @@ async fn a_cluster_behind_the_log_is_refused_whichever_session_submits_it() {
 
     let cases: Vec<Case> = vec![
         Case {
-            // The session the issue recorded: a second ABSOLUTE session whose only
-            // Cluster names an instant ten seconds before the fragment already held.
+            // A second ABSOLUTE session whose only Cluster names an instant five seconds
+            // before the fragment already held: a new run of timecodes, so it is taken and
+            // placed at the instant it names.
             name: "an ABSOLUTE session behind the log",
             stream: "log-order-absolute-behind",
             timecode_type: "ABSOLUTE",
             producer_start_millis: BASE_MILLIS,
             timecodes: vec![newest - 5_000],
-            taken: 0,
-            refused_at: Some(newest - 5_000),
-            expected_log_millis: seeded.clone(),
+            taken: 1,
+            refused_at: None,
+            expected_log_millis: vec![BASE_MILLIS, newest - 5_000, newest],
         },
         Case {
-            // One millisecond behind the log's newest stamp is still behind it: the
-            // bound is the newest instant held, not a window around it.
+            // One millisecond behind the log's newest stamp lands one millisecond before
+            // it: the placement is by the instant, not by a window around it.
             name: "an ABSOLUTE session one millisecond behind the log",
             stream: "log-order-absolute-one-milli",
             timecode_type: "ABSOLUTE",
             producer_start_millis: BASE_MILLIS,
             timecodes: vec![newest - 1],
-            taken: 0,
-            refused_at: Some(newest - 1),
-            expected_log_millis: seeded.clone(),
+            taken: 1,
+            refused_at: None,
+            expected_log_millis: vec![BASE_MILLIS, newest - 1, newest],
         },
         Case {
-            // The log's OLDEST stamp is an instant the log holds, and it is still behind
-            // the newest one: the comparison is against the end of the log.
+            // An instant the log ALREADY holds: the fragment goes after the one captured
+            // at the same instant, so fragments of one instant stay in receipt order.
             name: "an ABSOLUTE session at the log's oldest instant",
             stream: "log-order-absolute-oldest",
             timecode_type: "ABSOLUTE",
             producer_start_millis: BASE_MILLIS,
             timecodes: vec![BASE_MILLIS],
-            taken: 0,
-            refused_at: Some(BASE_MILLIS),
-            expected_log_millis: seeded.clone(),
+            taken: 1,
+            refused_at: None,
+            expected_log_millis: vec![BASE_MILLIS, BASE_MILLIS, newest],
         },
         Case {
-            // A RELATIVE session is ordered at the instants its producer start puts its
-            // timecodes at, so a producer that restarts with an earlier start timestamp
-            // goes back even though its first timecode is near zero.
+            // A RELATIVE session is placed at the instants its producer start puts its
+            // timecodes at, which a producer that restarts with an earlier start timestamp
+            // puts inside the span the log already covers.
             name: "a RELATIVE session whose producer start is behind the log",
             stream: "log-order-relative-behind",
             timecode_type: "RELATIVE",
             producer_start_millis: BASE_MILLIS,
             timecodes: vec![1_000],
-            taken: 0,
-            refused_at: Some(1_000),
-            expected_log_millis: seeded.clone(),
+            taken: 1,
+            refused_at: None,
+            expected_log_millis: vec![BASE_MILLIS, BASE_MILLIS + 1_000, newest],
         },
         Case {
             // Equal is not lesser: a session resuming exactly at the newest instant held
@@ -469,7 +469,7 @@ async fn a_cluster_behind_the_log_is_refused_whichever_session_submits_it() {
         },
         Case {
             // The Clusters taken before the fault stay ingested, and the one that goes
-            // back is behind the log the session itself just extended.
+            // back is behind the Cluster this very session submitted ahead of it.
             name: "a session that goes back after extending the log",
             stream: "log-order-back-after-extending",
             timecode_type: "ABSOLUTE",
@@ -567,8 +567,8 @@ async fn a_cluster_behind_the_log_is_refused_whichever_session_submits_it() {
     }
 }
 
-/// One read of a log a refused session could not disorder: the instant requested and the
-/// index of the first chunk the session must deliver.
+/// One read of a log a later session placed a fragment inside: the instant requested and
+/// the index of the first chunk the session must deliver.
 struct Read {
     case: &'static str,
     /// The requested instant, in epoch milliseconds.
@@ -578,8 +578,9 @@ struct Read {
 
 /// RULE: `GetMedia`'s timestamp start selector starts with the chunk CONTAINING the
 /// requested instant and delivers every chunk after it, so no fragment stamped at or
-/// after that instant is left undelivered — which holds because the log a refused
-/// out-of-order session could not disorder is in capture order.
+/// after that instant is left undelivered — which holds because a session naming instants
+/// the log already covers has its fragments placed at those instants, leaving the log in
+/// capture order.
 #[tokio::test]
 async fn a_timestamp_selector_delivers_every_chunk_at_or_after_the_requested_instant() {
     const STREAM: &str = "log-order-read-back";
@@ -589,8 +590,8 @@ async fn a_timestamp_selector_delivers_every_chunk_at_or_after_the_requested_ins
     let arn = harness.create_stream(STREAM).await;
     seed(&harness, STREAM).await;
 
-    // The session of the report: one Cluster captured before the fragment already held,
-    // which the log does not take.
+    // A second session whose one Cluster is captured inside the span the log already
+    // covers: it is taken, and placed between the two fragments already held.
     let behind = submit(
         &harness,
         STREAM,
@@ -613,9 +614,9 @@ async fn a_timestamp_selector_delivers_every_chunk_at_or_after_the_requested_ins
     let stamps: Vec<u64> = held.iter().map(|(_, millis, _)| *millis).collect();
     assert_eq!(
         stamps,
-        vec![BASE_MILLIS, newest],
-        "case \"a session behind the log\": the log holds only the fragments it took, \
-         got {stamps:?}"
+        vec![BASE_MILLIS, newest - 5_000, newest],
+        "case \"a session behind the log\": the log holds every fragment it took, in \
+         capture order, got {stamps:?}"
     );
 
     let reads = [
@@ -625,21 +626,28 @@ async fn a_timestamp_selector_delivers_every_chunk_at_or_after_the_requested_ins
             expected_start: 0,
         },
         Read {
-            // The read of the report: an instant inside the first chunk's span, after
-            // which the later chunk must still arrive.
-            case: "inside the earliest chunk's span",
+            // The instant the later session's fragment was captured at, which is the chunk
+            // the read starts with, after which the newest chunk must still arrive.
+            case: "exactly the instant the later session placed",
             wanted: newest - 5_000,
+            expected_start: 1,
+        },
+        Read {
+            // An instant inside the first chunk's span: the chunk containing it is the one
+            // carrying the newest stamp that is not after it.
+            case: "inside the earliest chunk's span",
+            wanted: newest - 7_000,
             expected_start: 0,
         },
         Read {
             case: "exactly the newest instant",
             wanted: newest,
-            expected_start: 1,
+            expected_start: 2,
         },
         Read {
             case: "after every fragment",
             wanted: newest + 10_000,
-            expected_start: 1,
+            expected_start: 2,
         },
     ];
 

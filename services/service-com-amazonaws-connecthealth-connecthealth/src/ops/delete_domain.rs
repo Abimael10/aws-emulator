@@ -3,9 +3,11 @@
 //! @op DeleteDomain
 //! IMPLEMENTED: moves the PERSISTED domain into `DELETING` and records when the purge
 //! the clock then owes falls due; the stored record is what the response reports.
-//! Repeating the call is harmless (`@idempotent`). A `domainId` this Region resolves no
-//! domain for is the modelled 404 `ResourceNotFoundException`, whatever the id's own
-//! history — it is the ONE error the operation declares.
+//! Repeating the call is harmless (`@idempotent`). An id this account WAS allocated and
+//! has lost — purged after an earlier delete, or held in another Region — is the modelled
+//! 404 `ResourceNotFoundException`, the ONE error the operation declares; an id with no
+//! allocation history at all resolves to no ARN for the front door to authorize, which is
+//! the unmodelled refusal [`AUTHORIZER_CONFIGURATION`] carries.
 //!
 //! ## Shape of an operation
 //!
@@ -147,6 +149,24 @@ impl From<DeleteDomainErrorModeled> for DeleteDomainError {
     }
 }
 
+/// The error code the front door answers for a `domainId` with no allocation history at
+/// all.
+///
+/// Recorded behaviour, not a modelled shape: this code is declared on no shape of this
+/// service's model (`smithy_query(query="shape",
+/// shape="AuthorizerConfigurationException")` finds nothing), and `DeleteDomain`'s own
+/// `errors` list is exactly `[ResourceNotFoundException]`. An id this service never
+/// allocated names no resource an ARN can be resolved for, so the call is refused where
+/// that resolution happens — in FRONT of the service, which is why the refusal carries no
+/// detail of this service's own: the body's detail member is an explicit null rather than
+/// a sentence ([`crate::scaffolded::UnmodeledError::message`]).
+const AUTHORIZER_CONFIGURATION: &str = "AuthorizerConfigurationException";
+
+/// The HTTP status that refusal is answered with: the front door's own, a client fault
+/// rather than a server one, so an SDK does not retry a request whose id can never
+/// resolve.
+const AUTHORIZER_CONFIGURATION_STATUS: u16 = 403;
+
 /// The `DeleteDomain` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -203,18 +223,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialise_due(now);
 
         let Some(domain) = store.held_domain_mut(&region, &input.domain_id) else {
-            // An id this Region resolves no domain for — never minted, purged after an
-            // earlier delete, or held in another Region — is one condition, reported through
-            // the ONE error this operation declares: `ResourceNotFoundException` at 404
-            // (`smithy_query(query="operation", operation="DeleteDomain")` lists exactly
-            // that one), naming the id the request addressed through the shared constructor.
-            // Nothing ahead of this lookup knows more about the id than the lookup does, so
-            // the id's own allocation history cannot change the answer: the
-            // idempotent-cleanup path — delete a domain that is already gone — terminates in
-            // "already gone" whichever way the id came to resolve nothing.
+            // An id this Region resolves no domain for splits in two on its ALLOCATION
+            // HISTORY, which is what the front door can resolve an ARN from:
             //
-            // Not a 5xx: the condition is permanent and lies in the request's own id, and an
-            // SDK retries a server fault.
+            //   * an id this service never allocated names no resource for the request to
+            //     be authorized against at all, so the call is refused by the front door
+            //     ahead of this service's own answer, with no detail to give
+            //     ([`AUTHORIZER_CONFIGURATION`]);
+            //   * an id it DID allocate and no longer holds — purged after an earlier
+            //     delete, or held in another Region — is a resource this account had and
+            //     has lost, which is the ONE error this operation declares:
+            //     `ResourceNotFoundException` at 404 (`smithy_query(query="operation",
+            //     operation="DeleteDomain")` lists exactly that one), naming the id the
+            //     request addressed through the shared constructor. That is what the
+            //     idempotent-cleanup path — delete a domain that is already gone —
+            //     terminates in.
+            //
+            // Neither is a 5xx: both conditions are permanent and lie in the request's own
+            // id, and an SDK retries a server fault.
+            if !store.has_allocated_domain(&input.domain_id) {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    AUTHORIZER_CONFIGURATION,
+                    AUTHORIZER_CONFIGURATION_STATUS,
+                    None,
+                ));
+            }
             return Err(DeleteDomainErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::service::error_detail::domain_not_found_message(

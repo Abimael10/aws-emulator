@@ -648,9 +648,21 @@ pub fn unsupported_operation<E>(message: impl Into<String>) -> Scaffolded<E> {
 /// answered with and nothing else uses it.
 pub const INVALID_PARAMETER_COMBINATION_EXCEPTION: &str = "InvalidParameterCombinationException";
 
-/// EC2's sentence for that override, which carries no variable part: it names the two members
-/// and what to do about them, whichever fleet API the override was sent to.
-pub const INSTANCE_REQUIREMENTS_WITH_INSTANCE_TYPE_MESSAGE: &str =
+/// The SPOT FLEET surface's sentence for that override, which carries no variable part: it
+/// names the two members and what to do about them.
+///
+/// The second mention of the instance-type member is spelled as the two words "Instance Type"
+/// here. That is not a typo of the member name: the recorded refusal of an override carrying
+/// both members differs per API in BOTH the code and this one spelling, so each surface keeps
+/// the sentence it is answered with ([`CREATE_FLEET_REQUIREMENTS_WITH_INSTANCE_TYPE_MESSAGE`]
+/// is the EC2 Fleet surface's, where it is one word).
+pub const SPOT_FLEET_REQUIREMENTS_WITH_INSTANCE_TYPE_MESSAGE: &str =
+    "You can specify either InstanceRequirements or InstanceType, but not both. Remove either \
+     InstanceRequirements or Instance Type, and try again.";
+
+/// The EC2 FLEET surface's sentence for that same override: the same refusal, worded with the
+/// instance-type member spelled as the API spells it.
+pub const CREATE_FLEET_REQUIREMENTS_WITH_INSTANCE_TYPE_MESSAGE: &str =
     "You can specify either InstanceRequirements or InstanceType, but not both. Remove either \
      InstanceRequirements or InstanceType, and try again.";
 
@@ -661,32 +673,30 @@ pub const INSTANCE_REQUIREMENTS_WITH_INSTANCE_TYPE_MESSAGE: &str =
 /// (`LaunchTemplateOverrides$InstanceRequirements`, and the same note on
 /// `FleetLaunchTemplateOverridesRequest$InstanceRequirements`): the two members are two ways of
 /// saying which instance type a pool launches, so an override carrying both describes its pool
-/// twice. The ONE sentence of that refusal lives above, so no fleet API words it differently;
-/// WHICH code carries it is a fact of the API the override was sent to, recorded per API —
-/// this is the Spot Fleet surface's, and [`create_fleet_requirements_with_instance_type`] is
-/// the EC2 Fleet surface's.
+/// twice. WHICH code and WHICH wording carry that refusal is a fact of the API the override was
+/// sent to, recorded per API — this is the Spot Fleet surface's, and
+/// [`create_fleet_requirements_with_instance_type`] is the EC2 Fleet surface's.
 pub fn instance_requirements_with_instance_type<E>() -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_PARAMETER_COMBINATION_EXCEPTION,
         400,
-        INSTANCE_REQUIREMENTS_WITH_INSTANCE_TYPE_MESSAGE,
+        SPOT_FLEET_REQUIREMENTS_WITH_INSTANCE_TYPE_MESSAGE,
     )
 }
 
 /// Refuse that same override the way the EC2 FLEET surface answers it: HTTP 400
-/// [`INVALID_PARAMETER_VALUE`], with the one sentence
-/// [`INSTANCE_REQUIREMENTS_WITH_INSTANCE_TYPE_MESSAGE`] holds.
+/// [`INVALID_PARAMETER_VALUE`], with
+/// [`CREATE_FLEET_REQUIREMENTS_WITH_INSTANCE_TYPE_MESSAGE`].
 ///
 /// `CreateFleet`'s recorded refusal of an override carrying both members answers EC2's own
 /// parameter-value code rather than the `…Exception` spelling the Spot Fleet surface answers
-/// ([`instance_requirements_with_instance_type`]), so the code is kept per API while the
-/// sentence stays single: a client branching on `InvalidParameterValue` reads the EC2 Fleet
-/// refusal as the fixable request error it is.
+/// ([`instance_requirements_with_instance_type`]), so a client branching on
+/// `InvalidParameterValue` reads the EC2 Fleet refusal as the fixable request error it is.
 pub fn create_fleet_requirements_with_instance_type<E>() -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_PARAMETER_VALUE,
         400,
-        INSTANCE_REQUIREMENTS_WITH_INSTANCE_TYPE_MESSAGE,
+        CREATE_FLEET_REQUIREMENTS_WITH_INSTANCE_TYPE_MESSAGE,
     )
 }
 
