@@ -21862,6 +21862,7 @@ dependencies = [
  "hex",
  "http",
  "icalendar",
+ "indexmap 2.14.2",
  "iso8601",
  "percent-encoding",
  "regex",

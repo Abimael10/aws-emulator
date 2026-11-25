@@ -17,7 +17,12 @@
 //! no call registers a schema of its own, so a write is what defines the type
 //! ([`super::ComAmazonawsSsmAmazonssmState::holds_custom_inventory_type`]) and the SHAPE of
 //! that schema is read off the items ([`custom_type_schema`]) rather than from a second
-//! store. That is what `DeleteInventory` addresses: "Delete a custom inventory type or the
+//! store. The ATTRIBUTE ORDER of that shape is the order the write stated its content in: an
+//! item's entries are held in an `indexmap::IndexMap`, and the order a map of the request
+//! carries is the order the framework's streaming request reader read the body's own members
+//! in, so it is the caller's order rather than any serializer's.
+//!
+//! That is what `DeleteInventory` addresses: "Delete a custom inventory type or the
 //! data associated with a custom Inventory type. Deleting a custom inventory type is also
 //! referred to as deleting a custom inventory schema", so deleting the DATA leaves the type
 //! defined and holding nothing, while deleting the SCHEMA leaves the name standing for
@@ -31,7 +36,7 @@
 //! request is the same deletion rather than a second one.
 
 use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::BTreeSet;
 use std::time::SystemTime;
 
 use crate::ops::types::{
@@ -43,24 +48,45 @@ use super::inventory::CUSTOM_TYPE_PREFIX;
 
 /// How many custom inventory types one Region may hold items of.
 ///
-/// The EMULATOR's own ceiling rather than a quota Systems Manager publishes: a put is the
-/// only thing that admits a type, callers may write as many as they like, and the store is
-/// held in memory for as long as the process runs. A put that would admit one past it is
-/// refused through the modelled `CustomSchemaCountLimitExceededException` and writes
-/// nothing. What it counts is the types a Region has DEFINED
+/// The cap this endpoint enforces on the custom schemas an account may register per Region: a
+/// put is the only thing that admits a type, so a put that would admit one past it is refused
+/// through the modelled `CustomSchemaCountLimitExceededException`, in the sentence that names
+/// the cap ([`custom_schema_count_exceeded_message`]), and writes nothing. What it counts is
+/// the types a Region has DEFINED
 /// ([`super::ComAmazonawsSsmAmazonssmState::defined_custom_inventory_types`]), since a
 /// definition outlives the items written under it.
 pub const MAX_CUSTOM_INVENTORY_TYPES: usize = 20;
 
 /// How many inventory items this store holds at once, across every Region and node — the
-/// emulator's own bound on the one map a put grows, for the same reason
-/// [`MAX_CUSTOM_INVENTORY_TYPES`] exists.
+/// emulator's own bound on the one map a put grows, since the store is held in memory for as
+/// long as the process runs.
 pub const MAX_CUSTOM_INVENTORY_ITEMS: usize = 1_000;
+
+/// How many attributes one ENTRY of an inventory item may carry.
+///
+/// The emulator's own bound, and the one that bounds the WORK a write makes this store do: the
+/// attribute names an entry carries are the caller's, and they are what the registration
+/// comparison ([`registered_attributes`], [`same_attributes`]) and every later schema read
+/// ([`custom_type_schema`]) walk. Held to before anything reads the store, so what is stored is
+/// bounded by it and the refusal it states ([`item_attribute_ceiling_message`]) travels in the
+/// modelled `ItemSizeLimitExceededException`.
+pub const MAX_ITEM_ATTRIBUTES: usize = 100;
+
+/// How many ENTRIES — rows — one inventory item may carry.
+///
+/// The emulator's own bound, beside [`MAX_ITEM_ATTRIBUTES`] and for the same reason: the rows
+/// an item carries are the caller's, and they are what the registration comparison walks and
+/// what this store then holds. The modelled `InventoryItemEntryList` admits up to 10,000 rows;
+/// this store holds the ceiling below, held to before anything reads the store, so the work one
+/// write makes is bounded by the request's own item count times these two ceilings. The refusal
+/// it states ([`item_entry_ceiling_message`]) travels in the modelled
+/// `ItemSizeLimitExceededException`.
+pub const MAX_ITEM_ENTRIES: usize = 100;
 
 /// How many custom inventory TYPE DEFINITIONS this store holds at once, across every Region.
 ///
-/// The emulator's own bound, like the two above, and a bound of its own because a definition
-/// OUTLIVES the items written under it
+/// The emulator's own bound, like the item one above, and a bound of its own because a
+/// definition OUTLIVES the items written under it
 /// ([`super::ComAmazonawsSsmAmazonssmState::holds_custom_inventory_type`]): the item ceiling
 /// does not bound the definitions a put leaves behind, and the Region a call is signed for is
 /// the caller's to choose, so neither does the per-Region one. A put that would define one
@@ -68,14 +94,24 @@ pub const MAX_CUSTOM_INVENTORY_ITEMS: usize = 1_000;
 /// writes nothing.
 pub const MAX_CUSTOM_INVENTORY_TYPE_DEFINITIONS: usize = MAX_CUSTOM_INVENTORY_ITEMS;
 
-/// What a put refused by [`MAX_CUSTOM_INVENTORY_TYPES`] reports: the emulator's own ceiling,
-/// named as the emulator's, with the figure it stands at.
+/// How Systems Manager refuses a put that would register a custom inventory schema past the
+/// count it enforces: one sentence naming the cap the refusal was taken at.
+///
+/// RECORDED BEHAVIOUR (corpus `simparity-behavioral-aws-v1`, unit
+/// `ssm.put-inventory-custom-schema-limit-exceeded-rejected`): a put past the enforced custom
+/// schema count is answered 400 `CustomSchemaCountLimitExceededException` with this sentence —
+/// fixed text apart from `limit`, which is the cap the call was held to, so a refusal states
+/// the figure it was refused at rather than describing this store.
+#[must_use]
+pub fn custom_schema_count_exceeded_message(limit: usize) -> String {
+    format!("Total custom inventory schema count exceeded the limit {limit}.")
+}
+
+/// What a put refused by [`MAX_CUSTOM_INVENTORY_TYPES`] reports
+/// ([`custom_schema_count_exceeded_message`] with the ceiling it was held to).
 #[must_use]
 pub fn custom_schema_ceiling_message() -> String {
-    format!(
-        "This emulator holds at most {MAX_CUSTOM_INVENTORY_TYPES} custom inventory types per \
-         Region"
-    )
+    custom_schema_count_exceeded_message(MAX_CUSTOM_INVENTORY_TYPES)
 }
 
 /// What a put refused by [`MAX_CUSTOM_INVENTORY_ITEMS`] reports.
@@ -87,13 +123,12 @@ pub fn custom_item_ceiling_message() -> String {
     )
 }
 
-/// What a put refused by [`MAX_CUSTOM_INVENTORY_TYPE_DEFINITIONS`] reports.
+/// What a put refused by [`MAX_CUSTOM_INVENTORY_TYPE_DEFINITIONS`] reports: the same refusal
+/// the per-Region ceiling states ([`custom_schema_count_exceeded_message`]), because it is the
+/// same modelled error class — what differs is only the cap the call was held to.
 #[must_use]
 pub fn custom_schema_total_ceiling_message() -> String {
-    format!(
-        "This emulator holds at most {MAX_CUSTOM_INVENTORY_TYPE_DEFINITIONS} custom inventory \
-         type definitions across every Region"
-    )
+    custom_schema_count_exceeded_message(MAX_CUSTOM_INVENTORY_TYPE_DEFINITIONS)
 }
 
 /// How this service refuses a type name a WRITE of custom inventory may not carry: the name
@@ -127,6 +162,98 @@ pub const UNSUPPORTED_ITEM_CONTEXT: &str = "The Context attribute that you speci
                                             InventoryItem isn't allowed for this inventory \
                                             type. You can only use the Context attribute with \
                                             inventory types like AWS:ComplianceItem.";
+
+/// The attributes the custom type whose `items` these are is REGISTERED with at
+/// `schema_version`: the names ONE of its rows of that version carries, in the ORDER the write
+/// that stated that row did.
+///
+/// A custom type's schema is not a record of its own — the write that first puts an item under
+/// a type and version is what registers that version's attribute set, and the set is read off
+/// the items (see the module docs), which is the same set, in the same order, a schema read
+/// reports ([`custom_type_schema`]). Every row of every item of a type and version carries the
+/// SAME attributes, because that is what each write is held to ([`same_attributes`]), so the
+/// registration is the first row this Region holds of them rather than a walk of all of them.
+/// An EMPTY list is a version this Region holds no row of, so the next write of it is the one
+/// that registers it.
+#[must_use]
+pub fn registered_attributes<'a>(
+    schema_version: &str,
+    items: impl IntoIterator<Item = &'a CustomInventoryItemRecord>,
+) -> Vec<String> {
+    items
+        .into_iter()
+        .filter(|item| item.schema_version == schema_version)
+        .flat_map(|item| item.content.iter())
+        .map(|entry| entry.keys().cloned().collect::<Vec<String>>())
+        .find(|attributes| !attributes.is_empty())
+        .unwrap_or_default()
+}
+
+/// Whether `present` names the same attributes as `required`, whatever ORDER each states them
+/// in: what an item has to match is the registered SET, and the order a write states its
+/// attributes in is what the registration KEEPS rather than a second thing to match.
+#[must_use]
+pub fn same_attributes(present: &[String], required: &[String]) -> bool {
+    present.iter().collect::<BTreeSet<_>>() == required.iter().collect::<BTreeSet<_>>()
+}
+
+/// How this service refuses an item whose content does not carry the attribute set the type it
+/// is written under is registered with ([`registered_attributes`]): the attributes the item
+/// carries and the ones its type requires, so the caller reads which attribute it dropped or
+/// added.
+///
+/// RECORDED BEHAVIOUR (corpus `simparity-behavioral-aws-v1`, unit
+/// `ssm.inventory-custom-schema-server-side-validation`): a write whose content does not match
+/// the registered schema is answered 400 `InvalidItemContentException` with this sentence —
+/// fixed text apart from the two bracketed lists, which are the attributes of the request's own
+/// item and the attributes the registered schema stands for.
+#[must_use]
+pub fn item_content_mismatch_message(present: &[String], required: &[String]) -> String {
+    format!(
+        "Custom inventory item doesn't match schema: input item [{}] but required [{}].",
+        attribute_list(present),
+        attribute_list(required)
+    )
+}
+
+/// One attribute list as the refusal above spells it: every name followed by a space, in the
+/// order the write that stated them did — which for the registered set is the order a schema
+/// read reports the type's attributes in ([`custom_type_schema`]).
+///
+/// At most [`MAX_ITEM_ATTRIBUTES`] names, which is the ceiling every entry is held to before
+/// anything is stored, so the refusal a one-entry request produces is bounded whatever the
+/// store holds: a conforming registration is one entry's attribute set and so never reaches
+/// the cap.
+fn attribute_list(attributes: &[String]) -> String {
+    attributes
+        .iter()
+        .take(MAX_ITEM_ATTRIBUTES)
+        .map(|name| format!("{name} "))
+        .collect()
+}
+
+/// What a put refused by [`MAX_ITEM_ATTRIBUTES`] reports: the emulator's own ceiling on how
+/// many attributes one entry of an inventory item carries, with the figure it stands at.
+///
+/// Named as the emulator's, like the other ceilings this store chooses
+/// ([`custom_item_ceiling_message`]), because the bound is this store's rather than a count
+/// Systems Manager publishes a sentence for — unlike the custom schema count, which is refused
+/// in the service's own words ([`custom_schema_count_exceeded_message`]).
+#[must_use]
+pub fn item_attribute_ceiling_message() -> String {
+    format!(
+        "This emulator holds at most {MAX_ITEM_ATTRIBUTES} attributes in one inventory item \
+         entry"
+    )
+}
+
+/// What a put refused by [`MAX_ITEM_ENTRIES`] reports: the emulator's own ceiling on how many
+/// entries one inventory item carries, with the figure it stands at. Named as the emulator's,
+/// for the reason [`item_attribute_ceiling_message`] gives.
+#[must_use]
+pub fn item_entry_ceiling_message() -> String {
+    format!("This emulator holds at most {MAX_ITEM_ENTRIES} entries in one inventory item")
+}
 
 /// How this service refuses a type name a DELETE cannot address because it is not a custom
 /// type: "Delete a custom inventory type or the data associated with a custom Inventory
@@ -192,8 +319,10 @@ pub struct CustomInventoryItemRecord {
     /// put that carried none.
     pub content_hash: Option<String>,
     /// "The inventory data of the inventory type" — the entries the put supplied, held
-    /// exactly as they came so a read reports what was written.
-    pub content: Vec<HashMap<String, String>>,
+    /// exactly as they came so a read reports what was written, in an `indexmap::IndexMap` so
+    /// each entry keeps the attribute ORDER the write stated (see
+    /// [`registered_attributes`]).
+    pub content: Vec<::indexmap::IndexMap<String, String>>,
     /// When the put that persisted this item ran.
     pub written_at: SystemTime,
 }
@@ -295,11 +424,13 @@ pub const ATTRIBUTE_DATA_TYPE_NUMBER: &str = "NUMBER";
 /// The schema of the custom type `type_name`, read off the items `items` holds of it.
 ///
 /// A custom type's schema is not a record of its own — nothing registers one, a put is what
-/// admits the type (see the module docs) — so the schema IS what the items say: its
-/// attributes are the names their content carries, in ascending name order, and each
-/// attribute's data type is `number` only where every value reported under it is one
-/// ([`ATTRIBUTE_DATA_TYPE_NUMBER`]). The version is the one the LAST put wrote, which is the
-/// schema version the type is currently reported under.
+/// admits the type (see the module docs) — so the schema IS what the items say. The version is
+/// the one the LAST put wrote, which is the schema version the type is currently reported
+/// under, and the attributes are the ones the items of THAT version carry
+/// ([`registered_attributes`]), in the order the writes stated them: a schema states one
+/// version's attribute set, so the set this read reports is the set a write of that version is
+/// held to. Each attribute's data type is `number` only where every value reported under it is
+/// one ([`ATTRIBUTE_DATA_TYPE_NUMBER`]).
 ///
 /// `None` for a type whose items name no attribute at all: `InventoryItemSchema$Attributes`
 /// is `@required` with at least one attribute, so there is no schema to report for one.
@@ -308,9 +439,22 @@ pub fn custom_type_schema<'a>(
     type_name: &str,
     items: impl IntoIterator<Item = &'a CustomInventoryItemRecord>,
 ) -> Option<InventoryItemSchema> {
-    let mut numeric: BTreeMap<String, bool> = BTreeMap::new();
-    let mut version: Option<(SystemTime, String)> = None;
-    for item in items {
+    let held: Vec<&CustomInventoryItemRecord> = items.into_iter().collect();
+    let mut version: Option<(SystemTime, &str)> = None;
+    for item in &held {
+        if version
+            .as_ref()
+            .is_none_or(|(written, _)| *written <= item.written_at)
+        {
+            version = Some((item.written_at, item.schema_version.as_str()));
+        }
+    }
+    let (_, reported) = version?;
+    let mut numeric: ::indexmap::IndexMap<String, bool> = ::indexmap::IndexMap::new();
+    for item in held
+        .iter()
+        .filter(|item| item.schema_version == reported)
+    {
         for entry in &item.content {
             for (name, value) in entry {
                 let numbers = value.parse::<f64>().is_ok();
@@ -320,19 +464,13 @@ pub fn custom_type_schema<'a>(
                     .or_insert(numbers);
             }
         }
-        if version
-            .as_ref()
-            .is_none_or(|(written, _)| *written <= item.written_at)
-        {
-            version = Some((item.written_at, item.schema_version.clone()));
-        }
     }
     if numeric.is_empty() {
         return None;
     }
     Some(InventoryItemSchema {
         type_name: type_name.to_string(),
-        version: version.map(|(_, version)| version),
+        version: Some(reported.to_string()),
         attributes: numeric
             .into_iter()
             .map(|(name, numbers)| InventoryItemAttribute {

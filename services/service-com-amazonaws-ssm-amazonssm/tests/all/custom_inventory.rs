@@ -179,20 +179,27 @@ fn custom_schema_types(reported: &Value) -> Vec<String> {
 /// a second one.
 #[tokio::test]
 async fn a_put_is_read_back_as_the_item_of_that_node_and_type() {
-    /// One row: the entries a put carries, and what the read must report back.
+    /// One row: the entries a put carries, what the read must report back, and the entries a
+    /// second put of the same type replaces them with — which carry the attribute set the
+    /// first put registered for that type, since a write of another set is content that does
+    /// not match the type's schema (covered by
+    /// `all/inventory_custom_schema_enforcement.rs`).
     struct Row {
         case: &'static str,
         entries: Value,
+        replacement: Value,
     }
 
     let rows = [
         Row {
             case: "one entry of one attribute",
             entries: json!([{ "RackLocation": "Bay B/Row 4" }]),
+            replacement: json!([{ "RackLocation": "Bay Z/Row 9" }]),
         },
         Row {
             case: "one entry of several attributes, one of them numeric",
             entries: json!([{ "RackLocation": "Bay C/Row 1", "Units": "42" }]),
+            replacement: json!([{ "RackLocation": "Bay Z/Row 9", "Units": "7" }]),
         },
         Row {
             case: "several entries",
@@ -200,14 +207,17 @@ async fn a_put_is_read_back_as_the_item_of_that_node_and_type() {
                 { "RackLocation": "Bay D/Row 2" },
                 { "RackLocation": "Bay D/Row 3" },
             ]),
+            replacement: json!([{ "RackLocation": "Bay Z/Row 9" }]),
         },
         Row {
             case: "an entry carrying no attribute at all",
             entries: json!([{}]),
+            replacement: json!([{ "RackLocation": "Bay Z/Row 9" }]),
         },
         Row {
             case: "an item carrying no entry at all",
             entries: json!([]),
+            replacement: json!([{ "RackLocation": "Bay Z/Row 9" }]),
         },
     ];
 
@@ -251,7 +261,7 @@ async fn a_put_is_read_back_as_the_item_of_that_node_and_type() {
         }
 
         // A second put of the same type REPLACES the item rather than adding a second one.
-        let replacement = json!([{ "RackLocation": "Bay Z/Row 9" }]);
+        let replacement = row.replacement.clone();
         let (status, body) = put(
             &router,
             crate::parameter_store::REGION,

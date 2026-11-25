@@ -31,7 +31,6 @@
 //! the name, whether a type is defined, data-deleted or schema-deleted, and whether a
 //! deletion listing names an id, names an unissued one, or names none.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -847,7 +846,7 @@ async fn the_definitions_this_endpoint_holds_are_bounded_across_every_region() {
                 schema_version: VERSION.to_string(),
                 capture_time: CAPTURED.to_string(),
                 content_hash: None,
-                content: vec![HashMap::from([(
+                content: vec![::indexmap::IndexMap::from([(
                     "Filler".to_string(),
                     "1".to_string(),
                 )])],
@@ -891,12 +890,10 @@ async fn the_definitions_this_endpoint_holds_are_bounded_across_every_region() {
     );
     assert_eq!(
         error_message(&body),
-        format!(
-            "This emulator holds at most {} custom inventory type definitions across every \
-             Region",
+        custom_inventory::custom_schema_count_exceeded_message(
             custom_inventory::MAX_CUSTOM_INVENTORY_TYPE_DEFINITIONS
         ),
-        "case {case:?}: the refusal names the emulator's own ceiling, got {:?}",
+        "case {case:?}: the refusal names the count it was taken at, got {:?}",
         error_message(&body)
     );
 

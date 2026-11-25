@@ -30,7 +30,6 @@
 //! both narrowing flags in every combination, each published `MaxResults` bound and one past
 //! it, and where a token resumes.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -198,10 +197,12 @@ impl Emulator {
                     schema_version: VERSION.to_string(),
                     capture_time: CAPTURED.to_string(),
                     content_hash: None,
-                    content: vec![HashMap::from([(
-                        "Serial".to_string(),
-                        "SN-7781".to_string(),
-                    )])],
+                    // One entry, collected into the order-preserving map the record holds its
+                    // content in — the attribute order a write states is the order the type's
+                    // schema keeps.
+                    content: vec![[("Serial".to_string(), "SN-7781".to_string())]
+                        .into_iter()
+                        .collect()],
                     written_at: SystemTime::now(),
                 },
             );

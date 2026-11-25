@@ -118,6 +118,13 @@ service-com-amazonaws-efs-magnolioapiservice-v20150201 = { workspace = true }
 # generated client is needed — the emulator supplies the transport, so the SDK's own HTTPS
 # stack and runtime are left out.
 aws-sdk-eventbridge = { version = "1", default-features = false }
+# An ORDER-PRESERVING map: a custom inventory item's content keeps the attribute order the
+# write that registered the type stated, which is the order that type's schema is reported in
+# and the order the refusal of a write that does not match it names its attributes in
+# (`state::custom_inventory`). The order a write states is the order its own JSON body carries,
+# read by the framework's streaming request reader, so what this map preserves is the request's
+# own order whatever any serializer in this workspace does with a map of its own.
+indexmap = "2.14"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

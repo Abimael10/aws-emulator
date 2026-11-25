@@ -625,7 +625,19 @@ pub fn held_item(
     Some(HeldInventoryItem {
         schema_version: item.schema_version.clone(),
         capture_time: Some(item.capture_time.clone()),
-        entries: item.content.clone(),
+        // The item's entries keep the attribute ORDER the write stated them in
+        // ([`super::custom_inventory::registered_attributes`]); a reported entry is the same
+        // attributes and values, in the map the modelled output carries them in.
+        entries: item
+            .content
+            .iter()
+            .map(|entry| {
+                entry
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect()
+            })
+            .collect(),
     })
 }
 

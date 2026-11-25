@@ -25,7 +25,12 @@ pub struct InventoryItem {
     pub schema_version: String,
     pub capture_time: String,
     pub content_hash: Option<String>,
-    pub content: Option<Vec<std::collections::HashMap<String, String>>>,
+    /// "The inventory data of the inventory type", held in an `indexmap::IndexMap` rather than
+    /// a `HashMap` so each entry keeps the ATTRIBUTE ORDER the request stated: the write that
+    /// first puts an item under a type registers that type's attribute set
+    /// ([`crate::state::custom_inventory::registered_attributes`]), and the order it stated
+    /// them in is the order the schema is reported in and named in.
+    pub content: Option<Vec<::indexmap::IndexMap<String, String>>>,
     pub context: Option<std::collections::HashMap<String, String>>,
 }
 

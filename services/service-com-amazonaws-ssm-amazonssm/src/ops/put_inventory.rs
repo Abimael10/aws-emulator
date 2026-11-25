@@ -27,7 +27,20 @@
 //!    put writes, by the decision above — defines none and a context stated for one is the
 //!    modelled `UnsupportedInventoryItemContextException`
 //!    ([`crate::state::custom_inventory::UNSUPPORTED_ITEM_CONTEXT`]);
-//! 5. the emulator's own ceilings on how many custom types and items this store holds.
+//! 5. how large one ITEM is: how many entries it carries and how many attributes each entry
+//!    carries, held to the emulator's own ceilings
+//!    ([`crate::state::custom_inventory::MAX_ITEM_ENTRIES`],
+//!    [`crate::state::custom_inventory::MAX_ITEM_ATTRIBUTES`]) before anything reads the
+//!    store, so an item past either is the modelled `ItemSizeLimitExceededException` and
+//!    nothing oversized is stored;
+//! 6. each item's CONTENT against the schema its type is registered with at the schema version
+//!    the item names ([`crate::state::custom_inventory::registered_attributes`]): the write
+//!    that first puts an item under a type and version registers that version's attribute set,
+//!    and a later write of the same version whose content carries another set is the modelled
+//!    `InvalidItemContentException`
+//!    ([`crate::state::custom_inventory::item_content_mismatch_message`]), so the attribute set
+//!    a consumer discovered through `GetInventorySchema` is the one the type's rows keep;
+//! 7. the emulator's own ceilings on how many custom types and items this store holds.
 //!
 //! A refused put writes NOTHING: every item of the request is checked before the first one
 //! is persisted, so a request carrying one bad item leaves the node's inventory as it was.
@@ -294,6 +307,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into(),
                 );
+            }
+        }
+
+        // How large an ITEM may be is bounded before anything reads the store: the rows and the
+        // attribute names a write states are the caller's, and they are what the comparison
+        // below and every later schema read walk, so an item past either ceiling is refused
+        // through the modelled `ItemSizeLimitExceededException` and nothing oversized is ever
+        // stored. Both checks read a length only — no scan — and precede every store read this
+        // validation makes.
+        for item in &input.items {
+            let entries = item.content.as_ref().map_or(0, Vec::len);
+            if entries > custom::MAX_ITEM_ENTRIES {
+                return Err(PutInventoryErrorModeled::ItemSizeLimitExceededException(
+                    ItemSizeLimitExceededException {
+                        type_name: Some(item.type_name.clone()),
+                        message: Some(custom::item_entry_ceiling_message()),
+                    },
+                )
+                .into());
+            }
+            for entry in item.content.iter().flatten() {
+                if entry.len() > custom::MAX_ITEM_ATTRIBUTES {
+                    return Err(PutInventoryErrorModeled::ItemSizeLimitExceededException(
+                        ItemSizeLimitExceededException {
+                            type_name: Some(item.type_name.clone()),
+                            message: Some(custom::item_attribute_ceiling_message()),
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+
+        // Every item carries the attribute set the type it is written under is REGISTERED with
+        // at the schema version it names: the first write of a type at a version registers the
+        // set its content carries ([`crate::state::custom_inventory::registered_attributes`]),
+        // and a later write of that same version whose content drops an attribute — or adds one
+        // the schema does not stand for — is content that does not match the schema, which is
+        // the modelled `InvalidItemContentException` and writes nothing. A version this Region
+        // holds no item of is the version this put REGISTERS, which is how a caller revises a
+        // custom schema rather than breaking the one its consumers read.
+        //
+        // The registration is read ONCE per `(type name, schema version)` the request names,
+        // rather than once per item, and it is the FIRST row this Region holds of that pair
+        // rather than a walk of all of them — every row of a pair carries the same attributes,
+        // which is what this very comparison holds each write to. So the work this validation
+        // costs is one pass over the items of each named type (at most
+        // `MAX_CUSTOM_INVENTORY_ITEMS`) plus the rows the REQUEST carries: at most its item
+        // count times `MAX_ITEM_ENTRIES` times `MAX_ITEM_ATTRIBUTES`, every factor of which is
+        // held to a ceiling above.
+        let mut registrations: ::std::collections::BTreeMap<(String, String), Vec<String>> =
+            ::std::collections::BTreeMap::new();
+        for item in &input.items {
+            let key = (item.type_name.clone(), item.schema_version.clone());
+            let required = registrations.entry(key).or_insert_with(|| {
+                custom::registered_attributes(
+                    &item.schema_version,
+                    store.custom_inventory_of_type(&region, &item.type_name),
+                )
+            });
+            for entry in item.content.iter().flatten() {
+                let present: Vec<String> = entry.keys().cloned().collect();
+                if required.is_empty() {
+                    // Nothing stands under this type and version yet, so this entry is what
+                    // registers the attribute set — and the entries beside it in the same item,
+                    // and the items beside it in the same request, are held to it, because one
+                    // item is one type's rows.
+                    *required = present;
+                    continue;
+                }
+                if !custom::same_attributes(&present, required) {
+                    return Err(PutInventoryErrorModeled::InvalidItemContentException(
+                        InvalidItemContentException {
+                            type_name: Some(item.type_name.clone()),
+                            message: Some(custom::item_content_mismatch_message(
+                                &present, required,
+                            )),
+                        },
+                    )
+                    .into());
+                }
             }
         }
 
