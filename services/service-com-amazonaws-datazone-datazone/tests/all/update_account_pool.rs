@@ -22,6 +22,10 @@
 //! 4. A patch outside a modelled constraint is refused with the modelled validation
 //!    error and nothing is written, so the pool still reads back as it was.
 //! 5. An update touches ONE pool: every other pool of the domain reads back unchanged.
+//! 6. A patch applies to the pool AS IT NOW STANDS, so successive updates accumulate —
+//!    an earlier step's members survive a later one that omits them — and every reader of
+//!    the pool (`GetAccountPool` and the `ListAccountPools` summary) reports the record as
+//!    the last update left it.
 
 use crate::harness::{accounts, Emulator};
 use serde_json::{json, Map, Value};
@@ -570,5 +574,162 @@ async fn a_patch_outside_a_modelled_constraint_is_refused_and_stores_nothing() {
             read_back.get("updatedBy").is_none(),
             "case {label:?}: a refused patch must not mark the pool updated, got {read_back:?}"
         );
+    }
+}
+
+/// The members `AccountPoolSummary` declares and a pool's own record also carries, so the
+/// listing is checked as a READER of the same stored pool rather than against literals
+/// (SOURCE: `smithy_query(query="shape", shape="AccountPoolSummary")`).
+const SUMMARY_MEMBERS: [&str; 7] = [
+    "domainId",
+    "id",
+    "name",
+    "resolutionStrategy",
+    "domainUnitId",
+    "createdBy",
+    "updatedBy",
+];
+
+/// The summary `ListAccountPools` reports for `pool`, which has to be among them.
+async fn listed_summary(dz: &Emulator, domain: &str, pool: &str, label: &str) -> Value {
+    let listed = dz
+        .call("GET", &format!("/v2/domains/{domain}/account-pools"), None)
+        .await;
+    assert_eq!(
+        listed.status, 200,
+        "case {label:?}: expected 200 from ListAccountPools, got {} {:?}",
+        listed.status, listed.body
+    );
+    listed
+        .body
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|item| item.get("id").and_then(Value::as_str) == Some(pool))
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "case {label:?}: ListAccountPools must report pool {pool:?}, got {:?}",
+                listed.body
+            )
+        })
+}
+
+/// A timestamp member as epoch seconds, so two of them can be ordered.
+fn epoch_seconds(answer: &Value, member: &str, label: &str) -> f64 {
+    answer
+        .get(member)
+        .and_then(Value::as_f64)
+        .unwrap_or_else(|| panic!("case {label:?}: expected a {member} timestamp, got {answer:?}"))
+}
+
+#[tokio::test]
+async fn successive_updates_accumulate_and_every_reader_reports_the_patched_pool() {
+    let dz = Emulator::new();
+    let domain = dz.available_domain("update-account-pool-successive").await;
+    let (pool, created) = create_pool(&dz, &domain, "successive", static_pool()).await;
+
+    // One pool patched step after step: each step is applied to the pool as the step
+    // BEFORE it left it, so the expectation carries every earlier member forward. The
+    // steps differ along what the rule generalises over — which members a step carries
+    // (one, several, none), the kind of each value, both members of the `AccountSource`
+    // union, and a step that repeats the one before it unchanged.
+    let repeated = json!({
+        "accountSource": {
+            "customAccountPoolHandler": {
+                "lambdaFunctionArn":
+                    "arn:aws:lambda:us-west-2:555566667777:function:resolve_pool",
+                "lambdaExecutionRoleArn":
+                    "arn:aws:iam::555566667777:role/service-role/PoolResolver",
+            }
+        }
+    });
+    let steps: Vec<(&str, Value)> = vec![
+        ("the name only, over the created record", json!({ "name": "first rename" })),
+        (
+            "a description, leaving the name the step before set alone",
+            json!({ "description": "the accounts this pool now resolves" }),
+        ),
+        ("a custom handler replacing the created static list", repeated.clone()),
+        ("the same patch again, unchanged", repeated),
+        ("a patch that carries nothing, over an updated record", json!({})),
+        (
+            "every patchable member at once",
+            json!({
+                "name": "fully patched",
+                "description": "replaced in one call",
+                "resolutionStrategy": RESOLUTION_STRATEGY_MANUAL,
+                "accountSource": { "accounts": accounts(3) },
+            }),
+        ),
+        (
+            "the name again, leaving the whole accumulated record alone",
+            json!({ "name": "last rename" }),
+        ),
+    ];
+
+    let mut expected = Value::Object(merged(&created, &json!({})));
+    for (label, patch) in steps {
+        expected = Value::Object(merged(&expected, &patch));
+
+        let updated = dz
+            .call(
+                "PATCH",
+                &format!("/v2/domains/{domain}/account-pools/{pool}"),
+                Some(patch.clone()),
+            )
+            .await;
+        assert_eq!(
+            updated.status, 200,
+            "case {label:?}: expected 200 from UpdateAccountPool, got {} {:?}",
+            updated.status, updated.body
+        );
+        let expected_members = expected.as_object().expect("an object").clone();
+        assert_members(label, "UpdateAccountPool", &updated.body, &expected_members);
+
+        // The accumulated record is what the pool's own reader answers, member for
+        // member, with the create's members still as they were stored.
+        let read_back = read_pool(&dz, &domain, &pool, label).await;
+        assert_members(
+            label,
+            "GetAccountPool after the update",
+            &read_back,
+            &expected_members,
+        );
+        for member in ["id", "domainId", "domainUnitId", "createdBy", "createdAt"] {
+            assert_eq!(
+                read_back.get(member),
+                created.get(member),
+                "case {label:?}: {member} belongs to the create, so it must still be {:?}, got {:?}",
+                created.get(member),
+                read_back.get(member)
+            );
+        }
+        assert_eq!(
+            read_back.get("updatedBy").and_then(Value::as_str),
+            Some(CALLER),
+            "case {label:?}: expected the signing principal as updatedBy, got {:?}",
+            read_back
+        );
+        assert!(
+            epoch_seconds(&read_back, "lastUpdatedAt", label)
+                >= epoch_seconds(&read_back, "createdAt", label),
+            "case {label:?}: an updated pool's last update must not precede its creation, got \
+             {read_back:?}"
+        );
+
+        // The listing is a reader of the SAME record, so it reports the pool as the last
+        // update left it rather than as it was created.
+        let summary = listed_summary(&dz, &domain, &pool, label).await;
+        for member in SUMMARY_MEMBERS {
+            assert_eq!(
+                summary.get(member),
+                read_back.get(member),
+                "case {label:?}: the summary's {member} must be the stored {:?}, got {:?}",
+                read_back.get(member),
+                summary.get(member)
+            );
+        }
     }
 }
