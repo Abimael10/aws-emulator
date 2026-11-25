@@ -168,11 +168,20 @@ pub fn valid_metrics_message() -> String {
     )
 }
 
-/// The same sentence for the granularity an enable asks for.
+/// The sentence a request asking for a granularity this service does not aggregate at is
+/// refused with.
+///
+/// The counterpart of [`valid_metrics_message`] for the granularity member, in the wording
+/// this refusal class carries: the subject stays plural (`metrics`) while the thing named
+/// is singular (`granularity type is`). Every word of it is fixed text; its ONE variable
+/// part is the bracketed enumeration of the granularities the service accepts, read from
+/// the catalog it publishes ([`super::METRIC_GRANULARITIES`], what
+/// `DescribeMetricCollectionTypes` reports as `Granularities`) rather than written out
+/// here, so the sentence states the very set the request was checked against.
 #[must_use]
 pub fn valid_metric_granularities_message() -> String {
     format!(
-        "Valid metric granularity values are: [{}].",
+        "Valid metrics granularity type is: [{}].",
         super::METRIC_GRANULARITIES.join(", ")
     )
 }
