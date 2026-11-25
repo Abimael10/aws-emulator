@@ -388,7 +388,10 @@ async fn a_listing_is_refused_where_the_integrated_experience_is_not_enabled() {
         ("a listing bounded by a page", json!({ "MaxResults": 1 })),
         (
             "a listing of a sync's own data",
-            json!({ "SyncName": "explorer" }),
+            json!({
+                "SyncName":
+                    service_com_amazonaws_ssm_amazonssm::state::node_listing::MANAGED_NODE_SYNC_NAME,
+            }),
         ),
     ];
 

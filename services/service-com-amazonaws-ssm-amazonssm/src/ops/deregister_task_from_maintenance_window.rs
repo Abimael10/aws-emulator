@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeregisterTaskFromMaintenanceWindow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeregisterTaskFromMaintenanceWindow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Remove a task from a maintenance window. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeregisterTaskFromMaintenanceWindow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The task is the one `RegisterTaskWithMaintenanceWindow` persisted, in the one store in
+//! [`crate::state::maintenance_window_tasks`], so what this removes is what a later
+//! `DescribeMaintenanceWindowTasks` and `GetMaintenanceWindowTask` then no longer report —
+//! and what no longer holds a registered target of the same window, which is the reference a
+//! safe `DeregisterTargetFromMaintenanceWindow` is refused for
+//! ([`crate::ops::deregister_target_from_maintenance_window`]).
+//!
+//! The two ids are read the way the sibling removal of a window's TARGET reads its own: the
+//! WINDOW id names a resource — "the ID of the maintenance window the task should be removed
+//! from" — so a window this endpoint holds none of is refused `DoesNotExistException` and
+//! nothing is removed, while the removal itself asks for a STATE rather than for a resource,
+//! so a `WindowTaskId` an existing window already holds none of is that state, answered 200
+//! with the request's own ids and nothing written. That is what lets a teardown that retried
+//! after a timeout converge instead of taking a hard error for a state already reached.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +155,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeregisterTaskFromMaintenanceWindow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeregisterTaskFromMaintenanceWindowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeregisterTaskFromMaintenanceWindow"))
+        // `WindowId`'s and `WindowTaskId`'s presence, lengths and patterns are MODELLED
+        // constraints the centralized walk has already refused anything outside of: what is
+        // resolved here is which window holds which task.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeregisterTaskFromMaintenanceWindowErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the maintenance window store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // A window and its tasks live in the Region the endpoint names, which is the signed
+        // credential scope's.
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        if store
+            .maintenance_window(&region, &input.window_id)
+            .is_none()
+        {
+            return Err(
+                DeregisterTaskFromMaintenanceWindowErrorModeled::DoesNotExistException(
+                    DoesNotExistException {
+                        message: Some(
+                            crate::state::maintenance_windows::maintenance_window_not_found_message(
+                                &input.window_id,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A task this window holds none of is a task already removed from it, which is the
+        // state the request asks for: nothing is written, nothing is resurrected, and the ids
+        // the request named are echoed back. The removal answers whether there was one to
+        // remove, and either way the state the request asked for is the state that holds.
+        store.remove_maintenance_window_task(&region, &input.window_id, &input.window_task_id);
+
+        // "The ID of the maintenance window the task was removed from" and "the ID of the
+        // task removed from the maintenance window": the request's own ids, now that the
+        // removal has happened.
+        Ok(DeregisterTaskFromMaintenanceWindowOutput {
+            window_id: Some(input.window_id),
+            window_task_id: Some(input.window_task_id),
+        })
     }
 }

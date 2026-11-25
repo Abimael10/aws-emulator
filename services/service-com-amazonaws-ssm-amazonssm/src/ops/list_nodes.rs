@@ -19,17 +19,19 @@
 //!
 //! ## Which requests are refused, and with which modelled error
 //!
-//! * An account that has not enabled the Systems Manager integrated experience is answered
-//!   `UnsupportedOperationException` ([`crate::state::node_listing::NOT_ENABLED_MESSAGE`]),
-//!   before anything the request names is looked at. Enabling the experience is what puts
-//!   the Amazon Web Services managed node resource data sync in the account
-//!   ([`crate::state::node_listing::MANAGED_NODE_SYNC_NAME`]), which is what the decision is
-//!   taken from — per Region, because a sync is a regional record.
 //! * A `SyncName` other than that one names no sync a node listing can read — "the name of
 //!   the supported resource data sync is AWS-QuickSetup-ManagedNode" — so it is
 //!   `ResourceDataSyncNotFoundException`, carrying the name and the sync type the listing
 //!   looked for beside the sentence this service words a sync it cannot find with
-//!   ([`crate::state::resource_data_syncs::sync_not_found_message`]).
+//!   ([`crate::state::resource_data_syncs::sync_not_found_message`]). A sync that does not
+//!   exist is not an operation this account cannot run, so a `SyncName` the request states
+//!   is resolved BEFORE the account's experience is read.
+//! * An account that has not enabled the Systems Manager integrated experience is answered
+//!   `UnsupportedOperationException` ([`crate::state::node_listing::NOT_ENABLED_MESSAGE`]),
+//!   before anything else the request names is looked at. Enabling the experience is what
+//!   puts the Amazon Web Services managed node resource data sync in the account
+//!   ([`crate::state::node_listing::MANAGED_NODE_SYNC_NAME`]), which is what the decision is
+//!   taken from — per Region, because a sync is a regional record.
 //! * A `NextToken` this service did not hand out is `InvalidNextToken`.
 //!
 //! A filter whose `Key` is outside the modelled `NodeFilterKey` enum, and an operator
@@ -219,21 +221,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let named_sync = non_empty(input.sync_name.as_deref());
         let regions = {
             let store = state.lock();
-            // An account that has not enabled the integrated experience has no node
-            // listing at all, which is answered before anything the request names is
-            // looked at.
-            if !store.has_integrated_experience(&region) {
-                return Err(ListNodesErrorModeled::UnsupportedOperationException(
-                    UnsupportedOperationException {
-                        message: Some(node_listing::NOT_ENABLED_MESSAGE.to_string()),
-                    },
-                )
-                .into());
-            }
             // "The name of the supported resource data sync is AWS-QuickSetup-ManagedNode":
             // any other name names no sync whose nodes this listing could read, so it is
             // reported as a sync that does not exist — the sync a node listing reads
-            // aggregates data from its source, which is the `SyncFromSource` type.
+            // aggregates data from its source, which is the `SyncFromSource` type. A sync
+            // that does not exist and an operation this account cannot run are DISTINCT
+            // conditions, so the sync the request NAMES is resolved first: a client
+            // branching on the code is told which of the two it ran into, and the name it
+            // asked for is echoed back on the error.
             if let Some(named) =
                 named_sync.filter(|named| *named != node_listing::MANAGED_NODE_SYNC_NAME)
             {
@@ -242,6 +237,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         message: Some(sync_not_found_message(named, SYNC_TYPE_FROM_SOURCE)),
                         sync_name: Some(named.to_string()),
                         sync_type: Some(SYNC_TYPE_FROM_SOURCE.to_string()),
+                    },
+                )
+                .into());
+            }
+            // An account that has not enabled the integrated experience has no node
+            // listing at all, which is answered before anything else the request names is
+            // looked at.
+            if !store.has_integrated_experience(&region) {
+                return Err(ListNodesErrorModeled::UnsupportedOperationException(
+                    UnsupportedOperationException {
+                        message: Some(node_listing::NOT_ENABLED_MESSAGE.to_string()),
                     },
                 )
                 .into());

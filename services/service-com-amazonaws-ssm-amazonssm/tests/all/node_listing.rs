@@ -232,7 +232,9 @@ async fn a_listing_is_refused_until_the_account_enables_the_integrated_experienc
 
     // One row per member a request may carry, including the two a listing would otherwise
     // refuse on (an unissued page token, a page size outside the modelled range): the
-    // account has no node listing at all, so none of them is looked at.
+    // account has no node listing at all, so none of them is looked at. A `SyncName` naming
+    // a sync no node listing reads is the one exception, answered below: that sync does not
+    // exist whether or not the account has the experience, which is a different condition.
     let cases: &[(&str, Value)] = &[
         ("no member at all", json!({})),
         (
@@ -241,7 +243,6 @@ async fn a_listing_is_refused_until_the_account_enables_the_integrated_experienc
         ),
         ("a page size", json!({ "MaxResults": 1 })),
         ("the supported sync name", json!({ "SyncName": MANAGED_NODE_SYNC })),
-        ("another sync name", json!({ "SyncName": "inventory-sync" })),
         ("an unissued page token", json!({ "NextToken": "not-a-token" })),
     ];
     for (case, body) in cases {
@@ -261,6 +262,26 @@ async fn a_listing_is_refused_until_the_account_enables_the_integrated_experienc
             "case {case:?}: expected the not-enabled sentence, got {parsed}"
         );
     }
+
+    // A `SyncName` naming a sync a node listing cannot read is reported as the sync that
+    // does not exist, carrying the name the request asked for — the two refusals mean
+    // different things, so the named sync is resolved before the account's experience is.
+    let (status, parsed) = list(&router, &json!({ "SyncName": "inventory-sync" })).await;
+    assert_eq!(
+        status, 400,
+        "case \"another sync name\": expected HTTP 400, got {status} with {parsed}"
+    );
+    assert_eq!(
+        error_code(&parsed),
+        "ResourceDataSyncNotFoundException",
+        "case \"another sync name\": expected the sync-not-found refusal, got {parsed}"
+    );
+    assert_eq!(
+        parsed["SyncName"].as_str(),
+        Some("inventory-sync"),
+        "case \"another sync name\": the refusal echoes the sync the request named, got \
+         {parsed}"
+    );
 
     // The experience is per Region, like the sync it is read from: enabling it at one
     // endpoint leaves the other without a node listing.

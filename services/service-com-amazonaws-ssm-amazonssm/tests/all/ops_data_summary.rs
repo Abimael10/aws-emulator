@@ -256,9 +256,8 @@ async fn aggregated_rows(
         1,
         "case {case:?}: counts are reported as one entity, got {parsed}"
     );
-    assert_eq!(
-        reported[0]["Id"].as_str(),
-        Some(""),
+    assert!(
+        reported[0].get("Id").is_none(),
         "case {case:?}: a count belongs to no resource, got {parsed}"
     );
     reported[0]["Data"][type_name]["Content"]
@@ -618,14 +617,9 @@ async fn an_aggregator_counts_the_selected_ops_data_per_value_of_the_attribute_i
     ];
 
     for (case, body, want) in table {
-        if want.is_empty() {
-            let parsed = summary(&router, case, &body).await;
-            assert!(
-                entities(&parsed).is_empty(),
-                "case {case:?}: expected no counted entity, got {parsed}"
-            );
-            continue;
-        }
+        // An aggregation that counted nothing is reported as the entity whose `Content` is
+        // the empty list — the envelope says the aggregation ran, whatever it counted — so
+        // the same reading answers every row.
         let reported = aggregated_rows(&router, case, &body, TYPE_OPS_ITEM).await;
         assert_eq!(
             reported, want,
@@ -706,16 +700,18 @@ async fn a_published_type_this_service_has_collected_nothing_for_reports_nothing
             "case {type_name:?}: a type nothing has reported for holds no OpsData, got {parsed}"
         );
 
-        // Nor is an aggregator over it refused: there is simply nothing to count.
-        let counted = summary(
+        // Nor is an aggregator over it refused: there is simply nothing to count, which is
+        // the entity envelope for that type carrying the empty `Content` list.
+        let counted = aggregated_rows(
             &router,
             type_name,
             &json!({ "Aggregators": [aggregator(type_name, "Anything")] }),
+            type_name,
         )
         .await;
         assert!(
-            entities(&counted).is_empty(),
-            "case {type_name:?}: nothing collected is nothing counted, got {counted}"
+            counted.is_empty(),
+            "case {type_name:?}: nothing collected is nothing counted, got {counted:?}"
         );
     }
 }
@@ -931,7 +927,8 @@ async fn a_request_naming_what_this_service_cannot_serve_is_refused_with_its_mod
             "a filter key that is not the dotted form",
             json!({ "Filters": [{ "Key": "Status", "Values": ["Open"] }] }),
             "InvalidFilter",
-            INVALID_FILTER,
+            "Invalid filter key Status. The key format must be TypeName.AttributeName, \
+             such as AWS:Application.Name.",
         ),
         (
             "a filter key over a type no OpsData is published under",
@@ -954,7 +951,8 @@ async fn a_request_naming_what_this_service_cannot_serve_is_refused_with_its_mod
                 "Filters": [{ "Key": "Category", "Values": ["Cost"] }],
             }] }),
             "InvalidFilter",
-            INVALID_FILTER,
+            "Invalid filter key Category. The key format must be TypeName.AttributeName, \
+             such as AWS:Application.Name.",
         ),
         (
             "a reported type name outside the published list",
@@ -996,7 +994,7 @@ async fn a_request_naming_what_this_service_cannot_serve_is_refused_with_its_mod
         assert_eq!(
             error_message(&parsed),
             want_message,
-            "case {case:?}: expected the error class's own sentence, got {parsed}"
+            "case {case:?}: expected the wording this refusal class states, got {parsed}"
         );
     }
 

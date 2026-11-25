@@ -21,15 +21,17 @@
 //!   the request is answered against what it ASKS for before the account is looked at. A
 //!   member outside the closed enum the model declares for it is refused by the centralized
 //!   request walk before this handler runs.
+//! * A `SyncName` other than that sync's names no sync a node summary can read — "the name of
+//!   the supported resource data sync is AWS-QuickSetup-ManagedNode" — so it is
+//!   `ResourceDataSyncNotFoundException`, carrying the name and the sync type the summary
+//!   looked for ([`crate::state::resource_data_syncs::sync_not_found_message`]). A sync that
+//!   does not exist is not an operation this account cannot run, so a `SyncName` the request
+//!   states is resolved BEFORE the account's experience is read.
 //! * An account that has not enabled the Systems Manager integrated experience is answered
 //!   `UnsupportedOperationException` ([`crate::state::node_listing::NOT_ENABLED_MESSAGE`]),
 //!   exactly as the sibling `ListNodes` answers it: enabling the experience is what puts the
 //!   Amazon Web Services managed node resource data sync in the account, which is what the
 //!   decision is taken from — per Region, because a sync is a regional record.
-//! * A `SyncName` other than that sync's names no sync a node summary can read — "the name of
-//!   the supported resource data sync is AWS-QuickSetup-ManagedNode" — so it is
-//!   `ResourceDataSyncNotFoundException`, carrying the name and the sync type the summary
-//!   looked for ([`crate::state::resource_data_syncs::sync_not_found_message`]).
 //! * A `NextToken` this service did not hand out is `InvalidNextToken`.
 //!
 //! ## Grouping and paging
@@ -232,21 +234,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let named_sync = non_empty(input.sync_name.as_deref());
         let (regions, page_key) = {
             let store = state.lock();
-            // An account that has not enabled the integrated experience has no node summary
-            // at all, which is answered before anything else the request names is looked at
-            // — the refusal the sibling `ListNodes` answers such an account with.
-            if !store.has_integrated_experience(&region) {
-                return Err(ListNodesSummaryErrorModeled::UnsupportedOperationException(
-                    UnsupportedOperationException {
-                        message: Some(node_listing::NOT_ENABLED_MESSAGE.to_string()),
-                    },
-                )
-                .into());
-            }
             // "The name of the supported resource data sync is AWS-QuickSetup-ManagedNode":
             // any other name names no sync whose nodes this summary could count, so it is
             // reported as a sync that does not exist — the sync a node summary reads
-            // aggregates data from its source, which is the `SyncFromSource` type.
+            // aggregates data from its source, which is the `SyncFromSource` type. A sync
+            // that does not exist and an operation this account cannot run are DISTINCT
+            // conditions, so the sync the request NAMES is resolved first — the reading the
+            // sibling `ListNodes` takes.
             if let Some(named) =
                 named_sync.filter(|named| *named != node_listing::MANAGED_NODE_SYNC_NAME)
             {
@@ -260,6 +254,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into(),
                 );
+            }
+            // An account that has not enabled the integrated experience has no node summary
+            // at all, which is answered before anything else the request names is looked at
+            // — the refusal the sibling `ListNodes` answers such an account with.
+            if !store.has_integrated_experience(&region) {
+                return Err(ListNodesSummaryErrorModeled::UnsupportedOperationException(
+                    UnsupportedOperationException {
+                        message: Some(node_listing::NOT_ENABLED_MESSAGE.to_string()),
+                    },
+                )
+                .into());
             }
             (
                 store.node_listing_regions(&region, named_sync.is_some()),

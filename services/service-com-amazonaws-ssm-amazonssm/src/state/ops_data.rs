@@ -30,7 +30,9 @@
 //!
 //! A filter key is `<TypeName>.<AttributeName>` over one of those types
 //! ([`filter_key_rejection`]), the same dotted form Inventory's filters carry
-//! ([`super::inventory::split_qualified_attribute`]), and the operators are the modelled
+//! ([`super::inventory::split_qualified_attribute`]) and refused with the same wording when
+//! it is not that form ([`super::inventory::invalid_filter_key_message`]), and the operators
+//! are the modelled
 //! `OpsFilterOperatorType` values — `Exists` asking only whether the attribute is reported
 //! at all and every other one the comparison this service filters by everywhere
 //! ([`super::operator_matches`]).
@@ -191,12 +193,19 @@ pub fn names_attribute(type_name: &str, attribute: &str) -> bool {
 /// form, over a type this service publishes, naming an attribute of that type. A key naming
 /// a published type whose OpsData this service holds none of is served — against the nothing
 /// that type has reported — rather than refused.
-pub fn filter_key_rejection(key: &str) -> Option<&'static str> {
+///
+/// A key that is not that FORM names no attribute of any type, so the refusal states the
+/// rule and the key the request carried, through the one wording this service has for a key
+/// of the wrong form ([`super::inventory::invalid_filter_key_message`], which the sibling
+/// Inventory query's filter keys are refused with too). A key that IS the form but names a
+/// type or an attribute no published type carries is refused with this error class's own
+/// sentence.
+pub fn filter_key_rejection(key: &str) -> Option<String> {
     let Some((type_name, attribute)) = split_qualified_attribute(key) else {
-        return Some(super::inventory::INVALID_FILTER);
+        return Some(super::inventory::invalid_filter_key_message(key));
     };
     if !is_ops_data_type(type_name) || !names_attribute(type_name, attribute) {
-        return Some(super::inventory::INVALID_FILTER);
+        return Some(super::inventory::INVALID_FILTER.to_string());
     }
     None
 }

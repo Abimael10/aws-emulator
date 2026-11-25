@@ -155,7 +155,7 @@ async fn a_batch_creates_one_association_per_entry() {
         let response = batched(
             &router,
             case,
-            &json!({"Entries": entries, "AssociationDispatchAssumeRole": DISPATCH_ROLE}),
+            &json!({"Entries": entries.clone(), "AssociationDispatchAssumeRole": DISPATCH_ROLE}),
         )
         .await;
 
@@ -188,6 +188,18 @@ async fn a_batch_creates_one_association_per_entry() {
                 DISPATCH_ROLE,
                 "case {case:?}: entry {position} dispatches under the role the request named, \
                  got {description:?}"
+            );
+            // "The document version you want to associate with the targets. Can be a
+            // specific version or the default version" (`DocumentVersion`): the association
+            // is pinned to one either way, so the description reports the selector the entry
+            // named, or the default version an entry that named none was bound to.
+            assert_eq!(
+                text(description, "DocumentVersion"),
+                entries[position]["DocumentVersion"]
+                    .as_str()
+                    .unwrap_or("$DEFAULT"),
+                "case {case:?}: entry {position} reports the document version State Manager \
+                 bound, got {description:?}"
             );
             let id = text(description, "AssociationId");
             assert!(

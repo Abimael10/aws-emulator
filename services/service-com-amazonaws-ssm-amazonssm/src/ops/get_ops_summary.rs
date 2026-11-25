@@ -26,7 +26,8 @@
 //! * A `Filters` key that names no attribute of a published OpsData type — not the dotted
 //!   `<TypeName>.<AttributeName>` form, a type outside that list, or an attribute outside
 //!   the schema of a type whose attributes this service knows — is `InvalidFilter`
-//!   ([`crate::state::ops_data::filter_key_rejection`]).
+//!   ([`crate::state::ops_data::filter_key_rejection`]), which states the form a key must
+//!   take and the offending key for a key that is not that form.
 //! * An `Aggregators` entry that names no OpsData type, a type outside the published list,
 //!   no attribute to count by, an attribute its type does not carry, or an aggregation other
 //!   than the count this service computes
@@ -47,9 +48,10 @@
 //! selected items per distinct value of the attribute it names, and a nested aggregator
 //! refines each of those counts into the counts of its own attribute within them ("a nested
 //! aggregator for viewing counts of OpsData", `OpsAggregator$Aggregators`). A count belongs
-//! to no resource, so the counts are reported as the one entity whose `Id` is empty — the
-//! way the other aggregated read of this service reports one
-//! ([`crate::state::inventory::AGGREGATED_ENTITY_ID`]).
+//! to no resource, so the counts are reported as the one entity that names none, and that
+//! entity reports an item for EVERY OpsData type the aggregators name — with an empty
+//! `Content` for a type no selected item was counted under, so an aggregation that matched
+//! nothing is an empty list rather than a missing element.
 //!
 //! A page of the per-item report holds `MaxResults` entities (the modelled range 1..50) and
 //! the `NextToken` is the id of the resource the next page starts at, which is total because
@@ -355,11 +357,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 pub const MAX_AGGREGATOR_NESTING: usize = 10;
 
 /// The modelled refusal of a filter key this operation cannot serve.
-fn invalid_filter(why: &str) -> GetOpsSummaryError {
-    GetOpsSummaryErrorModeled::InvalidFilter(InvalidFilter {
-        message: Some(why.to_string()),
-    })
-    .into()
+fn invalid_filter(why: String) -> GetOpsSummaryError {
+    GetOpsSummaryErrorModeled::InvalidFilter(InvalidFilter { message: Some(why) }).into()
 }
 
 /// The modelled refusal of an aggregator this operation cannot count over.
@@ -449,8 +448,9 @@ fn reported_entity(item: &crate::state::ops_data::OpsDataItem) -> OpsEntity {
 }
 
 /// The counts `aggregators` asks for over the OpsData `items`, as the one entity that carries
-/// them — or no entity at all when the aggregation counted nothing, which is what OpsData
-/// reporting none of the aggregated attribute holds.
+/// them: an entity item per OpsData type the aggregators name, whose `Content` holds that
+/// type's counted entries — EMPTY when no selected item was counted under it, the aggregation
+/// having run and matched nothing.
 ///
 /// The walk counts no more entries than an item may carry
 /// ([`crate::state::ops_data::MAX_AGGREGATED_ENTRIES`]) and refuses the request when the
@@ -460,11 +460,15 @@ fn aggregated_entities(
     items: &[&crate::state::ops_data::OpsDataItem],
     aggregators: &[OpsAggregator],
 ) -> Result<Vec<OpsEntity>, GetOpsSummaryError> {
-    use crate::state::inventory::AGGREGATED_ENTITY_ID;
     use crate::state::ops_data::MAX_AGGREGATED_ENTRIES;
 
     let mut counted: std::collections::BTreeMap<String, Vec<AggregatedEntry>> =
         std::collections::BTreeMap::new();
+    // Every type the request asked to be counted over is reported, whether or not the
+    // account holds OpsData of it: the entity item says the aggregation of that type ran and
+    // its `Content` says what it counted, so a client reading the counts of the type it
+    // asked about finds the empty list rather than nothing at all.
+    seed_counted_types(aggregators, &mut counted);
     let mut remaining = MAX_AGGREGATED_ENTRIES;
     aggregate(items, aggregators, &Vec::new(), &mut counted, &mut remaining)?;
     if counted.is_empty() {
@@ -488,9 +492,35 @@ fn aggregated_entities(
         })
         .collect();
     Ok(vec![OpsEntity {
-        id: Some(AGGREGATED_ENTITY_ID.to_string()),
+        // "ID of the OpsItem entity" (`OpsEntity$Id`) is the resource the reported OpsData is
+        // about, and a count is the OpsData of no single resource — so the entity carrying
+        // the counts names none.
+        id: None,
         data: Some(data),
     }])
+}
+
+/// Record an empty count for every OpsData type `aggregators` names, the nested aggregators
+/// included.
+///
+/// Each aggregator counts over the type IT names ("a nested aggregator for viewing counts of
+/// OpsData", `OpsAggregator$Aggregators`), so each of those types is one the summary reports
+/// an entity item for, and one whose `Content` is empty when nothing was counted under it.
+///
+/// The nesting this walks is the nesting [`check_aggregators`] has already refused anything
+/// past ([`MAX_AGGREGATOR_NESTING`]), and that runs before a single item of OpsData is read,
+/// so the depth here is bounded by that check rather than by what the request asked for —
+/// the same bound the counting walk below stands on.
+fn seed_counted_types(
+    aggregators: &[OpsAggregator],
+    counted: &mut std::collections::BTreeMap<String, Vec<AggregatedEntry>>,
+) {
+    for aggregator in aggregators {
+        if let Some(type_name) = crate::state::non_empty(aggregator.type_name.as_deref()) {
+            counted.entry(type_name.to_string()).or_default();
+        }
+        seed_counted_types(aggregator.aggregators.as_deref().unwrap_or_default(), counted);
+    }
 }
 
 /// One aggregated entry under construction: the attribute names and values it has
