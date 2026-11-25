@@ -715,6 +715,17 @@ pub fn named_project_absent_message(project_name: &str) -> String {
 /// for. Recorded behaviour — the model states no message for the error.
 pub const WEBHOOK_NOT_FOUND_MESSAGE: &str = "Webhook does not exist for this project";
 
+/// What CodeBuild states as the reason a webhook cannot be created for a project that
+/// already carries one, carried by the modelled `ResourceAlreadyExistsException`.
+///
+/// The sibling of [`WEBHOOK_NOT_FOUND_MESSAGE`] for the opposite precondition on the same
+/// resource, and fixed text for the same reason: a project holds at most one webhook, so
+/// `this project` is part of the sentence CodeBuild emits rather than a substitution for
+/// the name the request sent, and neither the project nor its ARN reaches the wire. A
+/// client keying on the duplicate-webhook branch therefore sees one sentence for every
+/// project. Recorded behaviour — the model states no message for the error.
+pub const WEBHOOK_ALREADY_EXISTS_MESSAGE: &str = "Webhook already exists for this project";
+
 /// What CodeBuild states as the reason a request addresses a report group this account
 /// does not hold — the sibling of [`PROJECT_NOT_FOUND_MESSAGE`] for the other resource
 /// kind addressed by ARN alone, and fixed text for the same reason. It is the sentence

@@ -215,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(not_found());
             };
             if stored.project.webhook.is_some() {
-                return Err(already_exists(&project_arn));
+                return Err(already_exists());
             }
             (
                 stored
@@ -300,7 +300,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found());
         };
         if stored.project.webhook.is_some() {
-            return Err(already_exists(&project_arn));
+            return Err(already_exists());
         }
         stored.project.webhook = Some(webhook.clone());
         // The project's settings changed, which is what `Project$lastModified` reports.
@@ -330,12 +330,12 @@ fn not_found() -> CreateWebhookError {
 
 /// The project already carries a webhook, and a project has at most one: AWS models
 /// that as `ResourceAlreadyExistsException`, "the specified resource cannot be created,
-/// because a resource with the same settings already exists".
-fn already_exists(project_arn: &str) -> CreateWebhookError {
+/// because a resource with the same settings already exists". Worded with
+/// [`crate::state::WEBHOOK_ALREADY_EXISTS_MESSAGE`], the fixed sentence CodeBuild states
+/// for that precondition — so nothing identifying the project reaches the wire.
+fn already_exists() -> CreateWebhookError {
     CreateWebhookErrorModeled::ResourceAlreadyExistsException(ResourceAlreadyExistsException {
-        message: Some(format!(
-            "A webhook already exists for CodeBuild project: {project_arn}"
-        )),
+        message: Some(crate::state::WEBHOOK_ALREADY_EXISTS_MESSAGE.to_string()),
     })
     .into()
 }
