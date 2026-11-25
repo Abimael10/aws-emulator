@@ -31,8 +31,9 @@
 //!    the membership the deregistration left, and the room the target held is free again.
 //!    The targets the group HELD are reported under `successful`; a target it holds no
 //!    registration of is reported under `unsuccessful` with the `TargetNotFound` failure
-//!    code, and leaves the stored membership exactly as it was (`DeregisterTargets` is
-//!    `@idempotent`: a retry changes nothing).
+//!    code and the failure class's own fixed `failureMessage`, and leaves the stored
+//!    membership exactly as it was (`DeregisterTargets` is `@idempotent`: a retry changes
+//!    nothing).
 
 use service_com_amazonaws_vpclattice_mercurycontrolplane::state;
 
@@ -65,13 +66,6 @@ fn not_owned(label: &str, id: &str) -> String {
     )
 }
 
-/// How the service reports a target a deregistration named that its target group holds no
-/// registration of: the label of what the target is, the submitted id, and the target
-/// group the request named.
-fn not_registered(label: &str, id: &str, target_group_id: &str) -> String {
-    format!("{label} {id} is not registered with target group {target_group_id}.")
-}
-
 /// One row of the per-target admission table: the case, the target-group type, the config
 /// the group is created with, the targets the registration sends, the (id, port) pairs it
 /// has to STORE, and the (id, label of what the target is, port) of each target it has to
@@ -98,16 +92,14 @@ type ReasonCase = (
 );
 
 /// One row of the deregistration table: the case, the target-group type, the config the
-/// group is created with, the two targets it registers in turn, whether that type's targets
-/// are reached over connections that drain, and what a per-target failure calls a target of
-/// that type.
+/// group is created with, the two targets it registers in turn, and whether that type's
+/// targets are reached over connections that drain.
 type DeregistrationCase = (
     &'static str,
     &'static str,
     Option<serde_json::Value>,
     [&'static str; 2],
     bool,
-    &'static str,
 );
 
 /// One row of the not-registered table: the case, the targets the deregistration names,
@@ -543,7 +535,7 @@ async fn a_targets_status_carries_the_reason_code_for_the_case_it_is_in() {
 async fn a_deregistered_target_leaves_the_groups_membership() {
     let lattice = Lattice::new();
 
-    // (case, type, config, the two targets, whether its targets drain, the failure label)
+    // (case, type, config, the two targets, whether its targets drain)
     let cases: Vec<DeregistrationCase> = vec![
         (
             "a LAMBDA target has no connections to drain",
@@ -551,7 +543,6 @@ async fn a_deregistered_target_leaves_the_groups_membership() {
             None,
             [A_LAMBDA, ANOTHER_LAMBDA],
             false,
-            "Lambda",
         ),
         (
             "an IP target is reached over a connection",
@@ -559,7 +550,6 @@ async fn a_deregistered_target_leaves_the_groups_membership() {
             Some(vpc_config("HTTP", Some(80))),
             ["10.0.0.21", "10.0.0.22"],
             true,
-            "Target",
         ),
         (
             "an INSTANCE target is reached over a connection",
@@ -567,13 +557,10 @@ async fn a_deregistered_target_leaves_the_groups_membership() {
             Some(vpc_config("HTTP", Some(80))),
             ["i-0123456789abcdef0", "i-0a1b2c3d"],
             true,
-            "Target",
         ),
     ];
 
-    for (index, (case, group_type, config, targets, drains, label)) in
-        cases.into_iter().enumerate()
-    {
+    for (index, (case, group_type, config, targets, drains)) in cases.into_iter().enumerate() {
         let (id, _) = a_target_group(
             &lattice,
             &format!("deregister-{index}"),
@@ -676,7 +663,7 @@ async fn a_deregistered_target_leaves_the_groups_membership() {
                 vec![(
                     targets[0].to_string(),
                     state::TARGET_FAILURE_TARGET_NOT_FOUND.to_string(),
-                    not_registered(label, targets[0], &id),
+                    state::TARGET_FAILURE_DEREGISTER_MESSAGE.to_string(),
                     None,
                 )],
                 "case {case:?}: the retry reports the target it could not deregister, got {}",
@@ -763,7 +750,7 @@ async fn a_deregistration_reports_what_it_holds_no_registration_of_and_changes_n
                     .map(|(target, port)| (
                         target.to_string(),
                         state::TARGET_FAILURE_TARGET_NOT_FOUND.to_string(),
-                        not_registered("Target", target, &id),
+                        state::TARGET_FAILURE_DEREGISTER_MESSAGE.to_string(),
                         *port,
                     ))
                     .collect::<Vec<(String, String, String, Option<i64>)>>(),
@@ -783,7 +770,7 @@ async fn a_deregistration_reports_what_it_holds_no_registration_of_and_changes_n
     }
 
     // A target this service would never have registered is one the group holds no
-    // registration of either, named by what a target of that type IS.
+    // registration of either, reported with the same per-target failure as any other.
     let case = "a function of another account";
     let (lambda_group, _) = a_target_group(&lattice, "deregister-foreign", "LAMBDA", None).await;
     let answer = deregister_targets(
@@ -802,7 +789,7 @@ async fn a_deregistration_reports_what_it_holds_no_registration_of_and_changes_n
         vec![(
             FOREIGN_LAMBDA.to_string(),
             state::TARGET_FAILURE_TARGET_NOT_FOUND.to_string(),
-            not_registered("Lambda", FOREIGN_LAMBDA, &lambda_group),
+            state::TARGET_FAILURE_DEREGISTER_MESSAGE.to_string(),
             None,
         )],
         "case {case:?}: the target is reported per target, got {}",

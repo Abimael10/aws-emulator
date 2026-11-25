@@ -67,8 +67,8 @@ pub use auth_policies::{
 };
 pub use tags::{tag_target, TAGGABLE_KINDS, TAG_TARGET_NOT_FOUND_MESSAGE};
 pub use targets::{
-    check_target_owner, connections_drain, not_registered_message, TargetHealth, TargetRejection,
-    HEALTH_CHECK_MEMBER, TARGET_DRAINING_TIME, TARGET_FAILURE_INVALID_TARGET,
+    check_target_owner, connections_drain, TargetHealth, TargetRejection, HEALTH_CHECK_MEMBER,
+    TARGET_DRAINING_TIME, TARGET_FAILURE_DEREGISTER_MESSAGE, TARGET_FAILURE_INVALID_TARGET,
     TARGET_FAILURE_TARGET_NOT_FOUND, TARGET_REASON_HEALTH_CHECK_DISABLED,
     TARGET_REASON_HEALTH_CHECK_NOT_SUPPORTED, TARGET_STATUS_DRAINING,
 };

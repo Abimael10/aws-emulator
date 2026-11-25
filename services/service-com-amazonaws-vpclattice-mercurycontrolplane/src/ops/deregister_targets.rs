@@ -246,7 +246,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut requested: Vec<(String, Option<i32>)> = Vec::with_capacity(input.targets.len());
         let mut seen: std::collections::HashSet<(String, Option<i32>)> =
             std::collections::HashSet::with_capacity(input.targets.len());
-        let group_type = group.group_type.clone();
         for target in &input.targets {
             crate::state::check_target_id(&group.group_type, &target.id)
                 .map_err(|violation| refused(&violation))?;
@@ -281,13 +280,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // holds no registration of is not a target this call deregistered, so it is
             // reported per target with the `failureCode` and `failureMessage` the model
             // carries for one — the same per-target channel a registration reports a
-            // target it cannot register in.
+            // target it cannot register in. The message is this failure class's own fixed
+            // text ([`crate::state::TARGET_FAILURE_DEREGISTER_MESSAGE`]): it says that the
+            // target failed to deregister and interpolates nothing, so the entry's `id`
+            // and `port` remain the only per-target values it carries.
             unsuccessful.push(TargetFailure {
-                failure_message: Some(crate::state::not_registered_message(
-                    &group_type,
-                    &target,
-                    &id,
-                )),
+                failure_message: Some(crate::state::TARGET_FAILURE_DEREGISTER_MESSAGE.to_string()),
                 id: Some(target),
                 port,
                 failure_code: Some(crate::state::TARGET_FAILURE_TARGET_NOT_FOUND.to_string()),

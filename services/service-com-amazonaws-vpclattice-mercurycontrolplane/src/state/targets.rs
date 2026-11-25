@@ -20,8 +20,8 @@
 //! * [`ComAmazonawsVpclatticeMercurycontrolplaneState::deregister_targets`] — the one
 //!   removal path for a registration, with the connection draining `TargetStatus`
 //!   documents for a target that is being deregistered, and the per-target failure a
-//!   deregistration reports for a target its target group holds no registration of
-//!   ([`not_registered_message`]).
+//!   deregistration reports for a target it cannot deregister
+//!   ([`TARGET_FAILURE_TARGET_NOT_FOUND`], [`TARGET_FAILURE_DEREGISTER_MESSAGE`]).
 
 use std::time::{Duration, SystemTime};
 
@@ -85,6 +85,16 @@ pub const TARGET_FAILURE_INVALID_TARGET: &str = "InvalidTarget";
 /// service refuses, it is one the target group does not have, so it carries its own token
 /// beside [`TARGET_FAILURE_INVALID_TARGET`].
 pub const TARGET_FAILURE_TARGET_NOT_FOUND: &str = "TargetNotFound";
+
+/// The `failureMessage` of a target a deregistration could not deregister.
+///
+/// SOURCE: recorded AWS behaviour. `TargetFailure`'s `failureMessage` is "the failure
+/// message", typed as a free `String` the model fixes no text for, and the service answers
+/// ONE fixed sentence for this failure class: it interpolates nothing from the request and
+/// nothing from service state — no target id, no ARN, no port, no target group — so every
+/// target of every target-group type that a deregistration cannot deregister carries
+/// exactly this text.
+pub const TARGET_FAILURE_DEREGISTER_MESSAGE: &str = "Target failed to deregister.";
 
 /// What a target reports: its `TargetStatus` and the `reasonCode` that says which case
 /// that status is (`None` for a status that has only one case).
@@ -154,24 +164,6 @@ pub fn check_target_owner(group_type: &str, id: &str) -> Result<(), TargetReject
 fn not_owned_message(label: &str, id: &str, caller: &str) -> String {
     format!("{label} {id} is not owned by account {caller}.")
 }
-
-/// How the service reports a target a deregistration named that its target group holds no
-/// registration of, so there is nothing for the call to deregister.
-///
-/// The failure CLASS is recorded AWS behaviour ([`TARGET_FAILURE_TARGET_NOT_FOUND`]); the
-/// sentence is this service's own, in the grammar of its one recorded per-target failure
-/// ([`not_owned_message`]): the label of what a target of this target-group type is, the
-/// target id the request submitted, the condition, and the target group it was submitted
-/// against — every variable part taken from the request.
-pub fn not_registered_message(group_type: &str, id: &str, target_group_id: &str) -> String {
-    let label = arn_target_label(group_type).unwrap_or(TARGET_LABEL);
-    format!("{label} {id} is not registered with target group {target_group_id}.")
-}
-
-/// What a target whose `id` is not another service's ARN is called in a per-target
-/// failure: an instance id or an IP address names no kind of its own, so the failure names
-/// it by the member it was submitted at.
-const TARGET_LABEL: &str = "Target";
 
 /// What a target of `group_type` IS, when the type's own documentation makes its `id` an
 /// ARN: the label a failure names it by (`Target`'s `id`, "If the target group type is
