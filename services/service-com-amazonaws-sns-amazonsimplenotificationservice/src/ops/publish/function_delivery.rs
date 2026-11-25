@@ -522,12 +522,13 @@ fn records_envelope(
     notification
         .entry(SUBJECT_MEMBER)
         .or_insert(serde_json::Value::Null);
-    if let Some(url) = super::unsubscribe_url(&published.topic_arn, subscription_arn) {
-        notification.insert(
-            UNSUBSCRIBE_URL_MEMBER.to_string(),
-            serde_json::Value::from(url),
-        );
-    }
+    notification.insert(
+        UNSUBSCRIBE_URL_MEMBER.to_string(),
+        serde_json::Value::from(super::unsubscribe_url(
+            signer.announced_authority(),
+            subscription_arn,
+        )),
+    );
     // The signature members are written once the record's notification is complete,
     // because the string that is signed is built from the members the subscriber receives;
     // the layout then puts every member in the order a notification carries them

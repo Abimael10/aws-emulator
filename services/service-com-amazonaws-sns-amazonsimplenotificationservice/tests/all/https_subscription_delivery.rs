@@ -72,7 +72,11 @@ const LOOK_INTERVAL: Duration = Duration::from_millis(25);
 /// outside the endpoint, and then answers from the request's own path: a confirmation request
 /// is always taken, a notification to a `/fail` path is refused with a server error, and every
 /// other notification is taken.
-const SINK_HANDLER: &str = r#"
+///
+/// `pub(crate)`: the suite that pins the ONE authority a delivered document's URL members name
+/// observes the POSTs through this same endpoint rather than a second copy of it
+/// (`signing_certificate_address.rs`).
+pub(crate) const SINK_HANDLER: &str = r#"
 import base64
 import json
 
@@ -97,23 +101,25 @@ def lambda_handler(event, context):
 "#;
 
 /// One request the endpoint recorded.
+///
+/// `pub(crate)` for the reason [`SINK_HANDLER`] is.
 #[derive(Debug, Clone)]
-struct Recorded {
+pub(crate) struct Recorded {
     /// The path the request addressed, which is the subscription it belongs to.
-    path: String,
+    pub(crate) path: String,
     /// The request's headers, as HTTP compares them: lowercased.
-    headers: Value,
+    pub(crate) headers: Value,
     /// The document POSTed.
-    body: String,
+    pub(crate) body: String,
 }
 
 impl Recorded {
-    fn header(&self, name: &str) -> Option<&str> {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
         self.headers.get(name).and_then(Value::as_str)
     }
 
     /// The POSTed document as JSON, or a failing case when it is not JSON at all.
-    fn document(&self, case: &str) -> Value {
+    pub(crate) fn document(&self, case: &str) -> Value {
         serde_json::from_str(&self.body).unwrap_or_else(|error| {
             panic!(
                 "case {case:?}: the POSTed body must be a JSON document, got {error} for {:?}",
@@ -157,7 +163,9 @@ async fn drain_recorded(emulator: &Emulator, capture_url: &str) -> Vec<Recorded>
 ///
 /// Every POST this suite asserts on has already been made by the time the call that owed it
 /// answered, so this waits only for the capture queue to have them all.
-async fn recorded_for(
+///
+/// `pub(crate)` for the reason [`SINK_HANDLER`] is.
+pub(crate) async fn recorded_for(
     emulator: &Emulator,
     capture_url: &str,
     path: &str,
@@ -181,7 +189,9 @@ async fn recorded_for(
 
 /// The function URL the endpoint of every row addresses: an `AuthType=NONE` URL of `function`,
 /// granted to every caller so an anonymous delivery reaches the handler.
-async fn given_function_url(emulator: &Emulator, function: &str) -> String {
+///
+/// `pub(crate)` for the reason [`SINK_HANDLER`] is.
+pub(crate) async fn given_function_url(emulator: &Emulator, function: &str) -> String {
     let (status, url) = lambda(
         emulator,
         "POST",

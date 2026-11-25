@@ -2285,12 +2285,13 @@ pub(super) fn notification_document(
     signer: &state::notification_signature::Signer,
 ) -> ::serde_json::Map<String, ::serde_json::Value> {
     let mut envelope = notification_members(published, body);
-    if let Some(url) = unsubscribe_url(&published.topic_arn, subscription_arn) {
-        envelope.insert(
-            UNSUBSCRIBE_URL_MEMBER.to_string(),
-            serde_json::Value::from(url),
-        );
-    }
+    envelope.insert(
+        UNSUBSCRIBE_URL_MEMBER.to_string(),
+        serde_json::Value::from(unsubscribe_url(
+            signer.announced_authority(),
+            subscription_arn,
+        )),
+    );
     // The signature is taken over the members the subscriber receives
     // ([`state::notification_signature`]), so the envelope is sealed once it is complete
     // and the three members it writes are then moved into their place in the layout.
@@ -2392,18 +2393,14 @@ fn notification_members(
 }
 
 /// The call that cancels ONE subscription, as the notification delivered to it carries it:
-/// the `Unsubscribe` action of the Region the topic is in, naming that subscription.
+/// the `Unsubscribe` action naming that subscription, on `authority` — the ONE address every
+/// URL member of the delivered document names
+/// ([`state::notification_signature::announced_authority`]), which is the same one its
+/// sibling `SigningCertURL` and the confirmation link a pending subscription is sent are
+/// announced at.
 ///
 /// Each subscriber of a topic is handed the link to ITS OWN subscription, never a sibling's,
-/// because following it ends the subscription it was delivered to. `None` for a topic whose
-/// ARN names no Region, which addresses no regional endpoint.
-fn unsubscribe_url(topic_arn: &str, subscription_arn: &str) -> Option<String> {
-    let region = ::service_common::arn::region_of(topic_arn, SNS_ARN_NAMESPACE)?;
-    Some(format!(
-        "https://sns.{region}.amazonaws.com/?Action=Unsubscribe&\
-         SubscriptionArn={subscription_arn}"
-    ))
+/// because following it ends the subscription it was delivered to.
+pub(super) fn unsubscribe_url(authority: &str, subscription_arn: &str) -> String {
+    format!("https://{authority}/?Action=Unsubscribe&SubscriptionArn={subscription_arn}")
 }
-
-/// The ARN namespace of this service, which its topics' and subscriptions' ARNs name.
-const SNS_ARN_NAMESPACE: &str = "sns";

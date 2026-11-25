@@ -727,9 +727,10 @@ fn token_document(
     document.insert("Token".to_string(), ::serde_json::Value::from(token));
     document.insert("TopicArn".to_string(), ::serde_json::Value::from(topic_arn));
     document.insert("Message".to_string(), ::serde_json::Value::from(message));
-    if let Some(url) = subscribe_url(topic_arn, token) {
-        document.insert("SubscribeURL".to_string(), ::serde_json::Value::from(url));
-    }
+    document.insert(
+        "SubscribeURL".to_string(),
+        ::serde_json::Value::from(subscribe_url(signer.announced_authority(), topic_arn, token)),
+    );
     if let Some(timestamp) = state::rfc3339(sent_at) {
         document.insert("Timestamp".to_string(), ::serde_json::Value::from(timestamp));
     }
@@ -743,18 +744,16 @@ fn token_document(
 }
 
 /// The call that confirms ONE subscription, as the confirmation request delivered to its
-/// endpoint carries it: the `ConfirmSubscription` action of the Region the topic is in,
-/// presenting that subscription's own token.
-///
-/// `None` for a topic whose ARN names no Region, which addresses no regional endpoint — the
-/// same reading the unsubscribe link of a delivered notification makes
-/// ([`super::unsubscribe_url`]).
-fn subscribe_url(topic_arn: &str, token: &str) -> Option<String> {
-    let region = ::service_common::arn::region_of(topic_arn, super::SNS_ARN_NAMESPACE)?;
-    Some(format!(
-        "https://sns.{region}.amazonaws.com/?Action=ConfirmSubscription&\
+/// endpoint carries it: the `ConfirmSubscription` action presenting that subscription's own
+/// token, on `authority` — the ONE address every URL member of this document names
+/// ([`state::notification_signature::announced_authority`]), which is the same one its
+/// sibling `SigningCertURL` and the unsubscribe link of a delivered notification are
+/// announced at ([`super::unsubscribe_url`]).
+fn subscribe_url(authority: &str, topic_arn: &str, token: &str) -> String {
+    format!(
+        "https://{authority}/?Action=ConfirmSubscription&\
          TopicArn={topic_arn}&Token={token}"
-    ))
+    )
 }
 
 /// The FINAL CANCELLATION one subscription's endpoint is sent when the subscription was ended

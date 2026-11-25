@@ -133,18 +133,21 @@ pub fn signature_version(topic: Option<&TopicRecord>) -> &'static str {
     }
 }
 
-/// What signs the notifications of ONE topic for ONE request: the certificate URL a
-/// subscriber fetches the verifying key from, and the digest that topic's
-/// `SignatureVersion` selects.
+/// What signs the notifications of ONE topic for ONE request: the authority the document's
+/// URL members are announced at, the certificate URL a subscriber fetches the verifying key
+/// from, and the digest that topic's `SignatureVersion` selects.
 ///
-/// Built per request because the certificate URL leads back to THIS emulator and is signed
-/// for the caller that will fetch it; built per topic because the digest is the topic's own
-/// setting.
+/// Built per request because the Region a message belongs to is read off the request that
+/// published it when the topic is no longer there; built per topic because that Region — and
+/// the digest — are the topic's own.
 #[derive(Debug, Clone)]
 pub struct Signer {
-    /// The URL the signing certificate is published at, or `None` when this process has no
+    /// The ONE authority every URL member of the documents this signer seals names
+    /// ([`announced_authority`]).
+    authority: String,
+    /// The PATH the signing certificate is published at, or `None` when this process has no
     /// key — in which case nothing is signed and no signature member is delivered.
-    certificate_url: Option<String>,
+    certificate_path: Option<String>,
     /// The `SignatureVersion` the notifications sealed by this signer declare.
     version: &'static str,
     /// The last canonical string this signer signed, with its signature: one published
@@ -173,10 +176,34 @@ impl Signer {
             .map(str::to_string)
             .unwrap_or_else(|| super::request_region(ctx.parts()));
         Self {
-            certificate_url: certificate_url(ctx, &region),
+            authority: announced_authority(&region),
+            certificate_path: signing_key().map(SigningKey::certificate_path),
             version: signature_version(topic),
             signed: ::std::cell::RefCell::new(None),
         }
+    }
+
+    /// The ONE authority every URL member of a document this signer seals names: the
+    /// `SigningCertURL` written here, and the `SubscribeURL` / `UnsubscribeURL` the document
+    /// carries beside it ([`announced_authority`] states the rule).
+    ///
+    /// Read by whatever builds those sibling members, so one delivered document cannot name
+    /// two origins.
+    #[must_use]
+    pub fn announced_authority(&self) -> &str {
+        &self.authority
+    }
+
+    /// Where the certificate that verifies what this signer sealed is published: an `https`
+    /// URL on this signer's announced authority whose path is the certificate's own file name
+    /// ([`SigningKey::certificate_path`]).
+    ///
+    /// `None` when this process has no key — there is then no certificate to publish — so a
+    /// URL is withheld rather than one being delivered that leads nowhere.
+    #[must_use]
+    pub fn certificate_url(&self) -> Option<String> {
+        let path = self.certificate_path.as_deref()?;
+        Some(format!("https://{}{path}", self.authority))
     }
 
     /// Write the three signature members of `envelope` — the version, the signature of the
@@ -218,7 +245,7 @@ impl Signer {
         envelope: &mut ::serde_json::Map<String, ::serde_json::Value>,
         certificate_member: &str,
     ) {
-        let Some(url) = self.certificate_url.as_deref() else {
+        let Some(url) = self.certificate_url() else {
             return;
         };
         let Some(signature) = self.signature(&canonical_string(members, envelope)) else {
@@ -276,47 +303,36 @@ fn canonical_string(
     canonical
 }
 
-/// Where the signing certificate is published for the request `ctx` is serving, for a message
-/// of `region`: an `https` URL whose path is the certificate's own file name
-/// ([`SigningKey::certificate_path`]), on the address a SUBSCRIBER of this emulator can fetch
-/// it at.
+/// The ONE authority every URL member of a document delivered for a message of `region`
+/// names: the `SigningCertURL` a subscriber fetches the verifying certificate from, and the
+/// `SubscribeURL` / `UnsubscribeURL` it follows to confirm or to cancel.
 ///
-/// A subscriber VERIFIES a delivered message by fetching this URL and checking the signature
-/// with the certificate it answers — "Retrieve the certificate … and extract the public key
-/// from it" (Amazon SNS Developer Guide, "Verifying the signatures of Amazon SNS messages") —
-/// so the URL has to lead back to this emulator, and the address is chosen the way every
-/// other endpoint this emulator announces for a client to reach is:
+/// It is this service's OWN endpoint host for that Region — `sns.<region>.amazonaws.com`, on
+/// the default `https` port and with no port component at all — for all of them, because a
+/// subscriber does not merely read these members, it CHECKS them before trusting anything it
+/// was delivered: it "verif[ies] that the signing certificate URL is from an Amazon SNS
+/// address" and only then "retrieve[s] the certificate … and extract[s] the public key from
+/// it" (Amazon SNS Developer Guide, "Verifying the signatures of Amazon SNS messages"). A
+/// document whose members name two origins, or whose certificate is announced on an address
+/// that is no endpoint of this service, is one such a subscriber refuses whatever the
+/// signature over it says — and for a `SubscriptionConfirmation` that refusal is the `Token`
+/// never reaching the endpoint it was POSTed to, which is the only path a subscription to a
+/// URL has to `ConfirmSubscription`.
 ///
-/// * the authority the request REACHED this emulator at
-///   ([`::service_common::data_plane_addressing::reached_emulator_endpoint_of_parts`]), for a
-///   client that resolves nothing else — which is the client a subscriber of this emulator
-///   is;
-/// * else the authority this process is SERVED at
-///   ([`::service_common::data_plane_addressing::served_endpoint_authority`]), so a message
-///   delivered on an in-process call of another service still names an address its own caller
-///   can reach;
-/// * else Amazon SNS's own endpoint host of the message's Region, the form AWS publishes the
-///   certificate at, for a caller that resolves AWS's own names — the same last resort the
-///   `SubscribeURL` and `UnsubscribeURL` of these documents name that endpoint by.
-///
-/// Whichever it is, the host names this service, so a fetch of the URL is claimed by it and
-/// served the document ([`addresses_certificate`]).
-///
-/// `None` when this process has no key — there is then no certificate to publish — so a URL
-/// is withheld rather than one being delivered that leads nowhere.
-fn certificate_url(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
-    region: &str,
-) -> Option<String> {
-    let path = signing_key()?.certificate_path();
-    let authority = ::service_common::data_plane_addressing::reached_emulator_endpoint_of_parts(
-        ctx.parts(),
-    )
-    .or_else(|| {
-        ::service_common::data_plane_addressing::served_endpoint_authority(ctx.endpoint().as_str())
-    })
-    .unwrap_or_else(|| format!("sns.{region}.amazonaws.com"));
-    Some(format!("https://{authority}{path}"))
+/// It is also the one address a SUBSCRIBER OF THIS EMULATOR can really fetch these documents
+/// at, which is what makes the announcement more than a claim. A subscriber of an `http`/`https`
+/// subscription here is served INSIDE this process — the endpoint behind a published function
+/// URL, say — and its own fetch is carried by the emulator rather than dialled, which resolves
+/// a URL to the service that answers it from the host naming that service's endpoint (or from a
+/// published plane's own address): an address of the loopback interface names no service, so a
+/// certificate announced there is a document such a subscriber's fetch never reaches. The host
+/// here names this service, so the fetch is claimed by it and answered with the document
+/// ([`addresses_certificate`], [`super::visited_link`]) — in-process for a subscriber this
+/// emulator serves itself, and at this emulator's endpoint for a client that states the host on
+/// the connection it already has.
+#[must_use]
+pub fn announced_authority(region: &str) -> String {
+    format!("sns.{region}.amazonaws.com")
 }
 
 /// Whether `method` and `uri` address the signing certificate this service publishes, so
