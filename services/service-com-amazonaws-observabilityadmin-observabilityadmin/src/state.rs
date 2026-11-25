@@ -718,10 +718,11 @@ impl StoredTelemetryPipeline {
 ///   documentation says the pipeline "currently supports a single source per pipeline,
 ///   but is structured as a list to accommodate multiple pipelines in the
 ///   configuration", so the list spans the sections the document declares.
-/// * `DataSources` is one entry per data source those source plugins declare, each with
-///   the name and the type it was declared with. A source that declares none still has
-///   one, named the way `DataSource$Name`'s documentation says that source kind names
-///   it: see [`undeclared_data_source`].
+/// * `DataSources` is one entry per data source those source plugins declare, each named
+///   and typed the way `DataSource`'s documentation says that KIND of source names one —
+///   a source reading AWS-vended log events by the metadata of the events vended for the
+///   pipeline, a third-party source by the document: see [`data_source`]. A source that
+///   declares none still has one.
 /// * `Processors` is the processor names in document order and `ProcessorCount` is how
 ///   many there are, so the two never disagree.
 /// * `Sinks` is the sink plugin names those sections declare.
@@ -914,19 +915,27 @@ pub(crate) fn declared_data_source_names(options: &Node) -> Vec<&str> {
         .collect()
 }
 
-/// One data source of a summary: the name and the type the document declared for it, and
-/// what each is when the document declared it not.
+/// One data source of a summary: what it is NAMED, by the kind of source it belongs to,
+/// and the type that kind reports for it.
 ///
-/// `DataSource`'s documentation splits BOTH of those by the KIND of source, which is why
-/// the source plugin and the pipeline's name reach here. For a source reading log events
-/// AWS vends ([`is_vended_log_source_type`]), the data source "includes both a name and
-/// type extracted from the log event metadata": those events are the ones vended for the
-/// pipeline itself, so a name the document leaves out is the pipeline's own — as
-/// [`data_source_identifier`] spells it, since what the metadata carries is an
-/// identifier — and a type it leaves out is [`DEFAULT_DATA_SOURCE_TYPE`]. "For
-/// third-party sources (such as S3), this includes only a name", which "defaults to the
-/// plugin name if not specified", "with the type field left empty" — so such a source
-/// reports no type at all unless the document declares one.
+/// `DataSource`'s documentation splits both by the KIND of source, which is why the
+/// source plugin and the pipeline's name reach here.
+///
+/// The NAME: for a source reading log events AWS vends
+/// ([`is_vended_log_source_type`]) the name "corresponds to the `data_source_name` from
+/// the log event metadata" — the metadata of the events vended FOR THIS PIPELINE, which
+/// is not the configuration document, so the name is the pipeline's own whatever name
+/// the document declares, as [`data_source_identifier`] spells it, since what the
+/// metadata carries is an identifier. A `data_source_name` on such a source's block
+/// selects which vended log feed the pipeline reads — it is what the vended-log schema's
+/// restrictions are keyed by — and does not rename the data source. For a third-party
+/// source the name is "either the configured `data_source_name` or defaults to the
+/// plugin name if not specified", so there, and only there, a declared name governs.
+///
+/// The TYPE: a vended source's data source carries one — [`DEFAULT_DATA_SOURCE_TYPE`]
+/// when the document declares none — while "[f]or third-party sources (such as S3), this
+/// includes only a name", "with the type field left empty", so such a source reports no
+/// type at all unless the document declares one.
 fn data_source(
     plugin: &str,
     pipeline: &str,
@@ -935,10 +944,10 @@ fn data_source(
 ) -> DataSource {
     let vended = is_vended_log_source_type(plugin);
     DataSource {
-        name: Some(match name {
-            Some(declared) => declared.to_string(),
-            None if vended => data_source_identifier(pipeline),
-            None => plugin.to_string(),
+        name: Some(if vended {
+            data_source_identifier(pipeline)
+        } else {
+            name.unwrap_or(plugin).to_string()
         }),
         r#type: declared_type
             .map(str::to_string)
@@ -946,8 +955,8 @@ fn data_source(
     }
 }
 
-/// The pipeline `name` as the data source of its own vended log events names it: the
-/// `data_source_name` the metadata carries is an IDENTIFIER, which separates its words
+/// The pipeline `name` as the metadata of its own vended log events names it: the
+/// `data_source_name` that metadata carries is an IDENTIFIER, which separates its words
 /// with `_`, where a pipeline's resource name separates them with `-`.
 ///
 /// The two forms cannot be confused: `TelemetryPipelineName`'s pattern

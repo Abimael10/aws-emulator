@@ -15,8 +15,8 @@
 //!    declares, one `DataSources` entry per data source those sources declare, the
 //!    processor names in document order, their count, and the sink plugin names — so the
 //!    summary is DERIVED from the stored body, never from the request that read it;
-//! 2. a source declaring no data source still has one, named the way
-//!    `DataSource$Name`'s documentation says that kind of source names it;
+//! 2. every data source is named the way `DataSource$Name`'s documentation says that
+//!    KIND of source names one, whether or not the document declares a name for it;
 //! 3. `ProcessorCount` is the length of `Processors`, whatever the document declares;
 //! 4. a body the configuration reader cannot read declares no components, so such a
 //!    pipeline carries no summary at all;
@@ -95,14 +95,18 @@ async fn create_and_read(emulator: &Emulator, name: &str, body: &str) -> Value {
 /// of name/type mappings, as the `data_source_name`/`data_source_type` pair the log
 /// event metadata names them by, not at all), how many of them there are, and how the
 /// document is spelled (YAML or the JSON it is a superset of).
+///
+/// Each row names the pipeline it creates, because a source reading AWS-vended log events
+/// names its data source after that pipeline (rule 2 below).
 #[tokio::test]
 async fn a_read_reports_the_components_the_stored_document_declares() {
     let emulator = emulator();
 
-    for (index, (case, body, expected)) in [
+    for (case, name, body, expected) in [
         (
             "a pipeline under the document's own `pipeline` property, naming one data \
              source",
+            "summary-trail-feed",
             "version: \"2\"\npipeline:\n  source:\n    cloudwatch_logs:\n      \
                data_sources:\n        - name: aws_cloudtrail\n          type: default\n  \
              processor:\n    - parse_json: {}\n  \
@@ -110,7 +114,7 @@ async fn a_read_reports_the_components_the_stored_document_declares() {
                 .to_string(),
             json!({
                 "Sources": [{ "Type": "cloudwatch_logs" }],
-                "DataSources": [{ "Name": "aws_cloudtrail", "Type": "default" }],
+                "DataSources": [{ "Name": "summary_trail_feed", "Type": "default" }],
                 "Processors": ["parse_json"],
                 "ProcessorCount": 1,
                 "Sinks": ["cloudwatch_logs"],
@@ -118,6 +122,7 @@ async fn a_read_reports_the_components_the_stored_document_declares() {
         ),
         (
             "two data sources listed by name only, each taking the default type",
+            "summary-two-feeds",
             "pipeline:\n  source:\n    cloudwatch_logs:\n      data_sources:\n        \
                - aws_cloudtrail\n        - aws_security_hub_cspm\n  \
              sink:\n    - cloudwatch_logs: {}\n"
@@ -125,8 +130,8 @@ async fn a_read_reports_the_components_the_stored_document_declares() {
             json!({
                 "Sources": [{ "Type": "cloudwatch_logs" }],
                 "DataSources": [
-                    { "Name": "aws_cloudtrail", "Type": "default" },
-                    { "Name": "aws_security_hub_cspm", "Type": "default" },
+                    { "Name": "summary_two_feeds", "Type": "default" },
+                    { "Name": "summary_two_feeds", "Type": "default" },
                 ],
                 "Processors": [],
                 "ProcessorCount": 0,
@@ -135,6 +140,7 @@ async fn a_read_reports_the_components_the_stored_document_declares() {
         ),
         (
             "a source naming its data source by the pair the log metadata names",
+            "summary-archive",
             "source:\n  s3:\n    data_source_name: archive-logs\n    \
                data_source_type: custom\n\
              sink:\n  - cloudwatch_logs: {}\n"
@@ -149,6 +155,7 @@ async fn a_read_reports_the_components_the_stored_document_declares() {
         ),
         (
             "several processors, reported in document order and counted",
+            "summary-processors",
             "source:\n  http: {}\n\
              processor:\n  \
                - parse_json: {}\n  \
@@ -166,6 +173,7 @@ async fn a_read_reports_the_components_the_stored_document_declares() {
         ),
         (
             "a sink written as a mapping of one plugin rather than a sequence",
+            "summary-mapping-sink",
             "source:\n  http: {}\nsink:\n  cloudwatch_logs:\n    log_group: /aws/x\n".to_string(),
             json!({
                 "Sources": [{ "Type": "http" }],
@@ -177,6 +185,7 @@ async fn a_read_reports_the_components_the_stored_document_declares() {
         ),
         (
             "the same pipeline written as JSON, which YAML 1.2 is a superset of",
+            "summary-json-waf",
             json!({
                 "pipeline": {
                     "source": { "cloudwatch_logs": { "data_sources": [{ "name": "aws_waf" }] } },
@@ -187,7 +196,7 @@ async fn a_read_reports_the_components_the_stored_document_declares() {
             .to_string(),
             json!({
                 "Sources": [{ "Type": "cloudwatch_logs" }],
-                "DataSources": [{ "Name": "aws_waf", "Type": "default" }],
+                "DataSources": [{ "Name": "summary_json_waf", "Type": "default" }],
                 "Processors": ["parse_json"],
                 "ProcessorCount": 1,
                 "Sinks": ["cloudwatch_logs"],
@@ -195,6 +204,7 @@ async fn a_read_reports_the_components_the_stored_document_declares() {
         ),
         (
             "two sections chained by a pipeline sink and a pipeline source",
+            "summary-chained",
             "entry:\n  \
                source:\n    http: {}\n  \
                processor:\n    - trim_string:\n        with_keys: [\"message\"]\n  \
@@ -215,11 +225,8 @@ async fn a_read_reports_the_components_the_stored_document_declares() {
                 "Sinks": ["pipeline", "cloudwatch_logs"],
             }),
         ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let pipeline = create_and_read(&emulator, &format!("summary-{index}"), &body).await;
+    ] {
+        let pipeline = create_and_read(&emulator, name, &body).await;
         let summary = pipeline
             .get("ConfigurationSummary")
             .unwrap_or_else(|| panic!("case {case:?}: expected a summary, got {pipeline:?}"));
@@ -249,15 +256,16 @@ async fn a_read_reports_the_components_the_stored_document_declares() {
 }
 
 // =============================================================================
-// Rule 2 — a source declaring no data source still has one
+// Rule 2 — every data source is named the way its source kind names one
 // =============================================================================
 
-/// A source that declares no data source still has one, and a data source that declares
-/// no type may still report one: `DataSource$Name`'s documentation splits both defaults
-/// by the KIND of source. A source reading log events AWS vends reads the events vended
-/// for the pipeline itself, so its data source is the pipeline, under the pipeline's own
-/// name and the default type; a third-party source "defaults to the plugin name if not
-/// specified", "with the type field left empty".
+/// A data source is named, and typed, the way `DataSource`'s documentation says its KIND
+/// of source names one — whether or not the document declares a name for it. A source
+/// reading log events AWS vends reads the events vended for the pipeline itself, so its
+/// data source is the pipeline, under the pipeline's own name in identifier form and the
+/// default type, whatever `data_source_name` the document declares; a third-party source
+/// reports the configured name, or "defaults to the plugin name if not specified", "with
+/// the type field left empty".
 ///
 /// The rows differ along what the rule generalises over: the kind of source (two
 /// AWS-vended ones, two different third-party ones), where the document writes the
@@ -312,10 +320,11 @@ async fn a_source_declaring_no_data_source_is_named_the_way_its_kind_names_one()
             Some(json!([{ "Name": "archive-logs" }, { "Name": "audit-logs" }])),
         ),
         (
-            "a CloudWatch Logs source that DOES declare its data source",
+            "a CloudWatch Logs source that DOES declare its data source, whose declared \
+             name does not rename the one the metadata carries",
             "pipeline:\n  source:\n    cloudwatch_logs:\n      data_sources:\n        \
                - aws_cloudtrail\n  sink:\n    - cloudwatch_logs: {}\n",
-            Some(json!([{ "Name": "aws_cloudtrail", "Type": "default" }])),
+            None,
         ),
     ]
     .into_iter()

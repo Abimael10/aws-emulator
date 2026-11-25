@@ -54,3 +54,27 @@ Code evidence: services/service-com-amazonaws-observabilityadmin-observabilityad
 2. Replay wire fixture observabilityadmin-telemetry-pipeline-workflow (trace set simparity-wire-aws-v1) through step task#5. The fixture creates a telemetry pipeline whose configuration document declares an AWS-vended CloudWatch Logs source carrying an explicit data_source_name different from the pipeline's resource name, then calls GetTelemetryPipeline on it.
 3. Compare $.Pipeline.ConfigurationSummary.DataSources in the 200 response against the recording: AWS reports Name = the pipeline's resource name with '-' replaced by '_', the emulator reports Name = the document's declared data_source_name.
 4. Equivalent by hand: CreateTelemetryPipeline with Name "my-pipe-one" and a configuration whose vended-log source block declares data_source_name "some-other-label" (any token differing from the pipeline name), then GetTelemetryPipeline PipelineIdentifier="my-pipe-one". AWS answers DataSources[0] = {"Name": "my_pipe_one", "Type": "default"}; the emulator answers the document's label instead. ListTelemetryPipelines' TelemetryPipelineSummary.ConfigurationSummary shows the same divergence, being derived by the same code.
+
+## Resolution
+
+Cause 1 is FIXED: the NAME half of `DataSource`'s split is now keyed on the kind of
+source, in the one place the summary is derived (`src/state.rs` `data_source`). A source
+reading AWS-vended log events is reported under the identifier the metadata of the events
+vended for that pipeline carries — the pipeline's resource name with every `-` replaced by
+`_` — whatever `data_source_name` the configuration document declares for it; a declared
+name on such a source selects which vended feed the pipeline reads (which is what the
+vended-log schema's restrictions are keyed by) and no longer renames the data source. Only
+a third-party source is named by the document's configured name, falling back to the plugin
+name. `ListTelemetryPipelines` changes with it, both reads being derived from the same
+stored document; no state write is involved.
+
+The replay's residual difference at `$.Pipeline.ConfigurationSummary.DataSources[0]` is the
+hex suffix of the pipeline name the fixture GENERATES per run: the recorded element carries
+the recording run's generated pipeline name in identifier form and the replayed request
+creates a pipeline under another, so both values are each run's own pipeline name, and the
+recorded token cannot be produced from the replayed request. The resolved issue
+`20261031T203350Z-observabilityadmin-gettelemetrypipeline-data-source-name-and-validatetelemetrypipelineconfiguration-restriction-errors.md`
+records the same residual for the same step. The rule itself is pinned by
+`tests/all/vended_log_pipelines.rs`, over every vended source plugin the schema carries a
+branch for and both third-party kinds, and across an update that re-points the document at
+another declared name.
