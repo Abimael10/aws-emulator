@@ -4460,11 +4460,26 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
 
     /// Ask one of a service's tasks to stop, with `STOPPED` owed by the clock
     /// [`TRANSITION_SPAN`] from now — the same two-step stop `StopTask` records.
+    ///
+    /// A task whose LAUNCH Amazon ECS has already failed takes the stop that failure earned
+    /// instead ([`TaskRecord::earned_launch_failure`]): such a task never ran, so it is not
+    /// one the scheduler stopped — [`STOP_CODE_SERVICE_SCHEDULER`] is the code of a task the
+    /// scheduler took out of a set it was holding up, which is why the sentences it carries
+    /// describe a scaling activity, a deployment or a failed health check. The launch failure
+    /// was recorded against the task before this stop was asked for and nothing it does can
+    /// launch it, so the task stops under [`STOP_CODE_TASK_FAILED_TO_START`] with that
+    /// failure as its `stoppedReason`, exactly as it would have when the attempt that failed
+    /// it ran out ([`TaskRecord::launch_failure_due_at`]) — which this stop ends, the way
+    /// every other stop of such a task does ([`Self::advance_clock`]).
     pub(super) fn stop_service_task(&mut self, task_arn: &str, now: SystemTime, reason: &str) {
         let Some(task) = self.tasks.get_mut(task_arn) else {
             return;
         };
         if task.desired_status == STATUS_STOPPED {
+            return;
+        }
+        if let Some(failure) = task.earned_launch_failure() {
+            task.fail_launch(&failure, now);
             return;
         }
         task.desired_status = STATUS_STOPPED.to_string();

@@ -1293,6 +1293,20 @@ impl TaskRecord {
             .and_then(|at| SystemTime::try_from(at).ok())
     }
 
+    /// The `stoppedReason` of the stop this task has ALREADY EARNED, for one whose launch
+    /// Amazon ECS could not make: the failure the launch steps recorded against it
+    /// ([`TaskRecord::launch_failure`]) while it was still coming up, so the stop it is owed
+    /// is [`Self::fail_launch`] whenever that stop is recorded.
+    ///
+    /// `None` for a task nothing is known to block, and for one that was launched after all:
+    /// a task that has STARTED ran, so a stop it takes afterwards is that stop's own.
+    pub fn earned_launch_failure(&self) -> Option<String> {
+        if self.started_at.is_some() || !self.is_pending() {
+            return None;
+        }
+        self.launch_failure.clone()
+    }
+
     /// Stop this task because Amazon ECS could not launch its containers at all, as of
     /// `at`: the task never ran, so it gets no `startedAt`, its containers no exit code,
     /// and the stop carries [`STOP_CODE_TASK_FAILED_TO_START`] with `reason` as its
