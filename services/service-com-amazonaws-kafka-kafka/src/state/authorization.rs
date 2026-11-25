@@ -71,16 +71,11 @@
 //!
 //! An operation that CHANGES how clients reach the cluster its ARN names — the
 //! multi-VPC and public-access connectivity surface a cluster's own resource-based
-//! policy is attached for — takes one step more
-//! ([`authorize_registered_cluster`]): an action on that surface is allowed only by
-//! a document attached to the cluster it applies to or by one of the caller's own
-//! naming that cluster, so a cluster this endpoint holds no record of is allowed by
-//! nothing, and the call is refused as unauthorized rather than described as an
-//! absent or unusable resource — which keeps "you may not" and "it is not there" the
-//! one answer on that surface, whatever the registry holds. The operations that
-//! change OTHER parts of a cluster, and every one that merely REPORTS on it, answer
-//! an absence as the absence it is (the modelled `NotFoundException`), which is what
-//! this service's recorded answers show for them one by one.
+//! policy is attached for — takes no further step: the recorded answer for a cluster
+//! this endpoint holds no record of is the modelled `NotFoundException` with this
+//! service's fixed sentence, exactly as for the operations that change OTHER parts of
+//! a cluster and for every one that merely REPORTS on it, so an absence is answered as
+//! the absence it is whichever part of a cluster the call addresses.
 //!
 //! What the CALLER's own identity-based policies say about the action is the other
 //! half of the same question, and it is asked FIRST, inside
@@ -539,20 +534,6 @@ pub fn authorize_caller_action<Eng: Send + Sync + 'static, E>(
     authorize_action(action, target_arn)
 }
 
-/// The same gate for the control-plane action of `operation`, over a target that is
-/// NOT a cluster of this service: it takes the caller's own policies and the ARN's
-/// account into account and nothing else. The operations whose target IS a cluster
-/// take [`authorize_caller_operation`], which also decides whether the value names
-/// one.
-fn authorize_caller_operation_only<Eng: Send + Sync + 'static, E>(
-    engine: &Eng,
-    ctx: &::smithy_server_runtime::OperationContext<'_>,
-    operation: &str,
-    target_arn: &str,
-) -> Result<(), crate::scaffolded::Scaffolded<E>> {
-    authorize_caller_action(engine, ctx, &control_plane_action(operation), target_arn)
-}
-
 /// The resource an authorization decision is taken over when the request named
 /// none this service can act on: IAM's wildcard, which is what an action with no
 /// resource to scope it is decided against, and what the refusal then names.
@@ -609,82 +590,6 @@ fn no_grant_for_cluster<Eng: Send + Sync + 'static, E>(
     access_denied(
         ::service_common::iam_authorization::not_authorized_to_perform(
             &principal, action, resource,
-        ),
-    )
-}
-
-/// The decision for the control-plane action of `operation` on the CLUSTER
-/// `cluster_arn` names, for an operation that CHANGES how clients reach that
-/// cluster.
-///
-/// The multi-VPC and public-access connectivity surface is what a cluster's own
-/// resource-based policy is attached for, so an action on it is allowed only by a
-/// document attached to the cluster it applies to or by one of the caller's own that
-/// names that cluster: a cluster this endpoint holds no record of is allowed by
-/// NOTHING — there is no resource-based policy to allow it, which is the clause the
-/// refusal closes with
-/// ([`::service_common::iam_authorization::not_authorized_by_resource_policy`]).
-/// The answer is therefore the authorization refusal — [`ACCESS_DENIED_CODE`] at
-/// [`ACCESS_DENIED_STATUS`] — and NOT a description of the resource: on this surface
-/// "you may not" and "it is not there" are the one answer, so nothing of what this
-/// registry holds is disclosed. The mutations of other parts of a cluster, and the
-/// operations that merely REPORT on one, answer an absence as the absence it is.
-///
-/// Taken over the ARN AS SUBMITTED and before the operation resolves anything: the
-/// registry is only asked whether it holds a cluster under that ARN at this
-/// endpoint, and nothing is settled, read or written on the way. A value that names
-/// no cluster of this service at all is left to the operation's own parameter
-/// refusal, which is what the service answers for a mistyped path segment; the
-/// caller's own policies and another account's ARN are decided first, by
-/// [`authorize_caller_action`].
-pub fn authorize_registered_cluster<Eng: Send + Sync + 'static, E>(
-    engine: &Eng,
-    ctx: &::smithy_server_runtime::OperationContext<'_>,
-    operation: &str,
-    cluster_arn: &str,
-    region: &str,
-) -> Result<(), crate::scaffolded::Scaffolded<E>> {
-    authorize_caller_operation_only(engine, ctx, operation, cluster_arn)?;
-    // A value that is not this service's cluster ARN names no cluster for the
-    // decision to be taken over, and the operation answers it as the parameter it
-    // is.
-    if !crate::state::is_cluster_arn(cluster_arn) {
-        return Ok(());
-    }
-    if let Some(state) = crate::state::service_state(engine) {
-        if state.lock().cluster_in(region, cluster_arn).is_some() {
-            return Ok(());
-        }
-    }
-    Err(no_resource_policy_for_cluster(
-        engine,
-        ctx,
-        operation,
-        cluster_arn,
-    ))
-}
-
-/// The refusal [`authorize_registered_cluster`] answers with, built from the
-/// request alone: the principal that signed, the control-plane action of
-/// `operation` and the cluster ARN as submitted, in the shared sentence for a
-/// request no resource-based policy allows.
-///
-/// Stated here so the operation that takes this decision BEFORE it resolves the
-/// cluster, and the same operation finding the cluster gone once it holds the
-/// registry's guard, answer the one thing. It reads nothing of this service's own
-/// state, so it may be built while that guard is held.
-pub fn no_resource_policy_for_cluster<Eng: Send + Sync + 'static, E>(
-    engine: &Eng,
-    ctx: &::smithy_server_runtime::OperationContext<'_>,
-    operation: &str,
-    cluster_arn: &str,
-) -> crate::scaffolded::Scaffolded<E> {
-    let principal = crate::state::identity_authorization::calling_principal(engine, ctx);
-    access_denied(
-        ::service_common::iam_authorization::not_authorized_by_resource_policy(
-            &principal,
-            &control_plane_action(operation),
-            cluster_arn,
         ),
     )
 }

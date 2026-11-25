@@ -565,13 +565,18 @@ async fn reject_refuses_a_reference_it_cannot_act_on() {
     }
 
     // A well-formed cluster ARN of this account that this endpoint holds no
-    // cluster for: nothing grants the action on it, so the call reaches no grant
-    // instead of being described as an unusable reference.
+    // cluster for: a reference the call cannot resolve, refused as the unusable
+    // parameter it is.
     let ghost = ghost_cluster_arn();
     let unheld = emulator
         .reject_client_vpc_connection(&ghost, &connection)
         .await;
-    assert_access_denied(&unheld, "a-cluster-no-registry-holds", &ghost);
+    assert_bad_parameter(
+        &unheld,
+        "a-cluster-no-registry-holds",
+        CLUSTER_ARN_MEMBER,
+        BAD_REQUEST_MESSAGE,
+    );
     assert_every_reader_reports(
         &emulator,
         REGION,
@@ -583,12 +588,17 @@ async fn reject_refuses_a_reference_it_cannot_act_on() {
     .await;
 
     // A regional endpoint acts only on its own Region's clusters, so the same
-    // live pair is unusable from another Region's endpoint — and that endpoint
-    // holds no cluster under the ARN, so nothing grants the action on it there.
+    // live pair is unusable from another Region's endpoint — that endpoint holds no
+    // cluster under the ARN, so the reference resolves to nothing there.
     let elsewhere = emulator
         .reject_client_vpc_connection_in("eu-central-1", &cluster, &connection)
         .await;
-    assert_access_denied(&elsewhere, "another-regions-endpoint", &cluster);
+    assert_bad_parameter(
+        &elsewhere,
+        "another-regions-endpoint",
+        CLUSTER_ARN_MEMBER,
+        BAD_REQUEST_MESSAGE,
+    );
     assert_every_reader_reports(
         &emulator,
         REGION,
@@ -709,21 +719,23 @@ fn arn_of_cluster(region: &str, account: &str, name: &str, id: &str) -> String {
     format!("arn:aws:kafka:{region}:{account}:cluster/{name}/{id}")
 }
 
-/// RULE: this operation CHANGES the cluster's client connectivity and its model
-/// gives it no channel for reporting that the cluster is absent
-/// (`smithy_query(query="operation",operation="RejectClientVpcConnection")`:
+/// RULE: this operation's model gives it no channel for reporting that a resource is
+/// absent (`smithy_query(query="operation",operation="RejectClientVpcConnection")`:
 /// BadRequest/Forbidden/InternalServerError/ServiceUnavailable/Unauthorized, no
-/// NotFoundException), so the cluster-scoped decision is taken on the `ClusterArn`
-/// AS SUBMITTED: a well-formed cluster ARN this endpoint holds no cluster for is
-/// granted by nothing — a cluster that is not there carries no resource-based
-/// policy for the action to be allowed by — so the call is refused as unauthorized
-/// whatever the rest of the request carries.
+/// NotFoundException), so a `ClusterArn` this endpoint's Region holds no cluster for
+/// is a reference the call cannot resolve and is refused with this service's one
+/// fixed parameter sentence, naming `clusterArn` — the same answer an unresolvable
+/// CONNECTION reference earns, and whatever the rest of the request carries. An ARN
+/// of ANOTHER account is a different question, decided by the resource-scoped gate
+/// before this one.
 ///
-/// The rows differ along whose account the ARN names, which Region it names, which
-/// name and id it carries, and what the `vpcConnectionArn` member carries; the
-/// control at the end is a cluster this endpoint really holds.
+/// The rows differ along which Region the ARN names, which name and id it carries,
+/// and what the `vpcConnectionArn` member carries — with the member the refusal names
+/// per row, since a `vpcConnectionArn` that is no ARN at all is a defect of the
+/// request this operation answers before it resolves the cluster. The control at the
+/// end is a cluster this endpoint really holds.
 #[tokio::test]
-async fn a_cluster_this_endpoint_holds_no_record_of_grants_nothing() {
+async fn a_cluster_this_endpoint_holds_no_record_of_is_an_unresolvable_reference() {
     let emulator = Emulator::new();
     let held = emulator.vpc_connection_target("reject-auth-held").await;
     let live = emulator
@@ -731,36 +743,34 @@ async fn a_cluster_this_endpoint_holds_no_record_of_grants_nothing() {
         .await;
     sleep_past_vpc_connection_activation();
 
-    let mut rows: Vec<(String, &str, String, String)> = vec![
+    let mut rows: Vec<(String, &str, String, String, &str)> = vec![
         (
             "a-never-issued-cluster-of-this-account".to_string(),
             REGION,
             arn_of_cluster(REGION, ACCOUNT, "unissued-one", UNISSUED_CLUSTER_IDS[0]),
             live.clone(),
+            CLUSTER_ARN_MEMBER,
         ),
         (
             "a-never-issued-cluster-with-an-unresolvable-connection".to_string(),
             REGION,
             arn_of_cluster(REGION, ACCOUNT, "unissued-probe", UNISSUED_CLUSTER_IDS[2]),
             ghost_connection_arn(GHOST_CONNECTION_ID),
+            CLUSTER_ARN_MEMBER,
         ),
         (
             "a-never-issued-cluster-with-a-connection-member-of-no-arn-shape".to_string(),
             REGION,
             arn_of_cluster(REGION, ACCOUNT, "unissued-two", UNISSUED_CLUSTER_IDS[1]),
             "not-an-arn".to_string(),
-        ),
-        (
-            "a-cluster-of-another-account".to_string(),
-            REGION,
-            arn_of_cluster(REGION, OTHER_ACCOUNT, "foreign", UNISSUED_CLUSTER_IDS[0]),
-            live.clone(),
+            VPC_CONNECTION_ARN_MEMBER,
         ),
         (
             "a-cluster-of-another-region".to_string(),
             REGION,
             arn_of_cluster("eu-central-1", ACCOUNT, "elsewhere", UNISSUED_CLUSTER_IDS[0]),
             live.clone(),
+            CLUSTER_ARN_MEMBER,
         ),
         (
             // The ARN of a cluster this emulator holds, submitted to ANOTHER
@@ -769,29 +779,29 @@ async fn a_cluster_this_endpoint_holds_no_record_of_grants_nothing() {
             "eu-central-1",
             held.clone(),
             live.clone(),
+            CLUSTER_ARN_MEMBER,
         ),
     ];
     // Every unissued id this suite names is covered as a cluster of its own, so
     // the rule is not asserted on one spelling of an id.
     for id in UNISSUED_CLUSTER_IDS {
         let arn = arn_of_cluster(REGION, ACCOUNT, "unissued-per-id", id);
-        if !rows.iter().any(|(_, _, cluster, _)| *cluster == arn) {
+        if !rows.iter().any(|(_, _, cluster, _, _)| *cluster == arn) {
             rows.push((
                 format!("a-never-issued-cluster-under-id-{id}"),
                 REGION,
                 arn,
                 live.clone(),
+                CLUSTER_ARN_MEMBER,
             ));
         }
     }
 
-    let mut answered: BTreeSet<String> = BTreeSet::new();
-    for (case, region, cluster, connection) in &rows {
+    for (case, region, cluster, connection, member) in &rows {
         let reply = emulator
             .reject_client_vpc_connection_in(region, cluster, connection)
             .await;
-        assert_access_denied(&reply, case, cluster);
-        answered.insert(reply.error_message().to_string());
+        assert_bad_parameter(&reply, case, member, BAD_REQUEST_MESSAGE);
         // Nothing moved: the live connection of the held cluster is still in
         // service, so a refused reject rejects nothing.
         let state = described_state(&emulator, REGION, case, &live).await;
@@ -800,17 +810,17 @@ async fn a_cluster_this_endpoint_holds_no_record_of_grants_nothing() {
             "case {case}: a refused reject must change no connection, got {state:?}"
         );
     }
-    // One sentence per resource and nothing else varying: as many distinct
-    // messages as there were distinct ARNs.
-    let submitted: BTreeSet<&String> = rows.iter().map(|(_, _, cluster, _)| cluster).collect();
-    assert_eq!(
-        answered.len(),
-        submitted.len(),
-        "expected one refusal sentence per submitted ARN, got {answered:?}"
-    );
 
-    // The control: the cluster this endpoint really holds grants the action, so
-    // the same request shape is served rather than refused.
+    // A cluster of ANOTHER account is refused by the resource-scoped gate instead,
+    // before this endpoint is asked what it holds.
+    let foreign = arn_of_cluster(REGION, OTHER_ACCOUNT, "foreign", UNISSUED_CLUSTER_IDS[0]);
+    let denied = emulator
+        .reject_client_vpc_connection(&foreign, &live)
+        .await;
+    assert_access_denied(&denied, "a-cluster-of-another-account", &foreign);
+
+    // The control: the cluster this endpoint really holds resolves, so the same
+    // request shape is served rather than refused.
     assert_accepted(
         &emulator.reject_client_vpc_connection(&held, &live).await,
         "control",
@@ -822,13 +832,12 @@ async fn a_cluster_this_endpoint_holds_no_record_of_grants_nothing() {
     );
 }
 
-/// RULE: the refusal hides the distinction between "not permitted" and "not
-/// present" — a cluster of another account and a never-issued cluster of the
-/// caller's own account are answered the SAME status and code, and the sentence
-/// carries nothing of the registry's contents beyond the ARN the request itself
-/// submitted.
+/// RULE: the refusal of a cluster reference this endpoint cannot resolve carries
+/// nothing of the registry's contents — one fixed sentence, whatever the registry
+/// holds under a neighbouring name — so neither the cluster this endpoint does hold
+/// nor the connection on it can be read out of it.
 #[tokio::test]
-async fn the_unauthorized_refusal_discloses_nothing_about_the_registry() {
+async fn the_unresolvable_reference_refusal_discloses_nothing_about_the_registry() {
     let emulator = Emulator::new();
     let held = emulator.vpc_connection_target("reject-auth-secret").await;
     let live = emulator
@@ -836,14 +845,10 @@ async fn the_unauthorized_refusal_discloses_nothing_about_the_registry() {
         .await;
     sleep_past_vpc_connection_activation();
 
-    // Rows: the two refusals that must be indistinguishable, plus a third ARN of
-    // this account differing only in the cluster NAME, so the answer is shown not
-    // to depend on what the registry holds under a neighbouring name.
+    // Rows: a never-issued cluster of this account, and one differing from a held
+    // cluster only in the NAME, so the answer is shown not to depend on what the
+    // registry holds under a neighbouring name.
     let rows: Vec<(&str, String)> = vec![
-        (
-            "another-accounts-cluster",
-            arn_of_cluster(REGION, OTHER_ACCOUNT, "foreign", UNISSUED_CLUSTER_IDS[0]),
-        ),
         (
             "this-accounts-never-issued-cluster",
             arn_of_cluster(REGION, ACCOUNT, "never-issued", UNISSUED_CLUSTER_IDS[0]),
@@ -862,7 +867,7 @@ async fn the_unauthorized_refusal_discloses_nothing_about_the_registry() {
     let mut shapes: BTreeSet<(u16, String)> = BTreeSet::new();
     for (case, arn) in &rows {
         let reply = emulator.reject_client_vpc_connection(arn, &live).await;
-        assert_access_denied(&reply, case, arn);
+        assert_bad_parameter(&reply, case, CLUSTER_ARN_MEMBER, BAD_REQUEST_MESSAGE);
         shapes.insert((reply.status, reply.error_code().to_string()));
         let message = reply.error_message().to_string();
         // Nothing of the registry: neither the cluster this endpoint does hold
@@ -874,10 +879,6 @@ async fn the_unauthorized_refusal_discloses_nothing_about_the_registry() {
                  got {message:?}"
             );
         }
-        assert!(
-            message.contains(arn.as_str()),
-            "case {case}: the refusal must name the resource as submitted, got {message:?}"
-        );
     }
     let shapes: Vec<&(u16, String)> = shapes.iter().collect();
     assert_eq!(

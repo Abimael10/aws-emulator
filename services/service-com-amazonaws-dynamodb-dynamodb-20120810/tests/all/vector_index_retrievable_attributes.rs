@@ -199,6 +199,7 @@ async fn a_search_hands_back_only_what_the_vector_index_projects() {
             whole: &["extra", "note", "pk", "tenant", "tier"],
             narrowed: &["note", "vec"],
         },
+        // An index projecting its keys alone hands back the table's key and nothing else.
         Row {
             index: "keys-only",
             partitioned: false,
@@ -211,6 +212,8 @@ async fn a_search_hands_back_only_what_the_vector_index_projects() {
             whole: &["note", "pk"],
             narrowed: &["note", "vec"],
         },
+        // The `INCLUDE` that names the vector attribute hands back no more than the one
+        // that does not: the vector comes back only where the REQUEST names it.
         Row {
             index: "include-the-vector",
             partitioned: false,

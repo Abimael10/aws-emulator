@@ -197,11 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 AssociateOpsItemRelatedItemErrorModeled::OpsItemRelatedItemAlreadyExistsException(
                     OpsItemRelatedItemAlreadyExistsException {
-                        message: Some(related_items::already_exists_message(
-                            // A response of this protocol carries no request id, so the
-                            // frame names none.
-                            None,
-                        )),
+                        message: Some(related_items::already_exists_message()),
                         resource_uri: Some(input.resource_uri.clone()),
                         ops_item_id: Some(input.ops_item_id.clone()),
                     },

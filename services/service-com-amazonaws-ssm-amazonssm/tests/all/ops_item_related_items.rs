@@ -46,11 +46,14 @@ const PAGE_SIZE_BOUNDS: &[i64] = &[1, 50];
 
 /// The message Systems Manager words for `OpsItemRelatedItemAlreadyExistsException`: the
 /// name of the input member whose value is already associated with the OpsItem, then the
-/// frame the service appends to a refusal of this operation — the service it came from, the
-/// status and error code it carries, and the request id of the response it travels on,
-/// which this protocol's responses do not carry.
-const ALREADY_EXISTS_MESSAGE: &str = "ResourceUri (Service: AmazonSSM; Status Code: 400; \
-     Error Code: OpsItemRelatedItemAlreadyExistsException; Request ID: None; Proxy: null)";
+/// frame the service appends to a refusal it worded itself — the service it came from, the
+/// status and error code it carries, and the request id of the response it travels on, whose
+/// value is that response's own and so is read rather than written here.
+const ALREADY_EXISTS_OPENING: &str = "ResourceUri (Service: AmazonSSM; Status Code: 400; \
+     Error Code: OpsItemRelatedItemAlreadyExistsException; Request ID: ";
+
+/// Where that frame closes, around the request id.
+const SDK_ENVELOPE_CLOSING: &str = "; Proxy: null)";
 
 /// An OpsItem to hang related items off, returning its id.
 async fn ops_item(router: &MultiServiceRouter, title: &str) -> String {
@@ -394,11 +397,21 @@ async fn associating_one_resource_twice_is_refused() {
             "OpsItemRelatedItemAlreadyExistsException",
             "case {case}: expected the already-exists refusal, got {response}"
         );
-        assert_eq!(
-            response["Message"].as_str(),
-            Some(ALREADY_EXISTS_MESSAGE),
-            "case {case}: expected the message Systems Manager words for this error class, \
-             got {response}"
+        let message = response["Message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case}: the refusal carries a Message, got {response}"))
+            .to_string();
+        assert!(
+            message.starts_with(ALREADY_EXISTS_OPENING) && message.ends_with(SDK_ENVELOPE_CLOSING),
+            "case {case}: expected {ALREADY_EXISTS_OPENING:?} … {SDK_ENVELOPE_CLOSING:?}, got \
+             {message:?}"
+        );
+        let request_id =
+            &message[ALREADY_EXISTS_OPENING.len()..message.len() - SDK_ENVELOPE_CLOSING.len()];
+        assert!(
+            is_uuid(request_id),
+            "case {case}: the frame names the request id of the response it travels on, got \
+             {request_id:?} in {message:?}"
         );
         assert_eq!(
             response["ResourceUri"].as_str(),

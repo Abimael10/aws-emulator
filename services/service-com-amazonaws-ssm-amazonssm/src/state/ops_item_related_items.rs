@@ -83,32 +83,18 @@ pub const ALREADY_EXISTS_CODE: &str = "OpsItemRelatedItemAlreadyExistsException"
 /// 400), and so what the frame below names as its status.
 pub const ALREADY_EXISTS_STATUS: u16 = 400;
 
-/// The service the exception frame names, which is the service shape the operation targets
-/// (`com.amazonaws.ssm#AmazonSSM`, the `AmazonSSM.<Operation>` of every request's
-/// `X-Amz-Target`).
-pub const EXCEPTION_SOURCE_SERVICE: &str = "AmazonSSM";
-
-/// How the frame reads the request id of a response that carries none, which is how the
-/// recorded refusal of this operation reads it: this service's protocol puts no request id
-/// on a response, so the frame has no id of this request to name.
-pub const ABSENT_REQUEST_ID: &str = "None";
-
 /// How Systems Manager words the refusal of an association of a resource that is already a
 /// related item of the OpsItem: the member at fault, then the frame the service appends to
-/// a refusal of this operation — the service the refusal came from, the status and error
-/// code it carries, and the request id of the response it travels on.
+/// a refusal it worded itself — the service the refusal came from, the status and error code
+/// it carries, and the request id of the response it travels on.
 ///
-/// `request_id` is that response's own request id, so the frame restates the refusal a
-/// client already has rather than inventing anything; a response carrying none is read as
-/// [`ABSENT_REQUEST_ID`]. The ARN that collided and the OpsItem it collided on travel in
-/// the exception's own members rather than in this sentence.
-pub fn already_exists_message(request_id: Option<&str>) -> String {
-    format!(
-        "{COLLIDING_MEMBER} (Service: {EXCEPTION_SOURCE_SERVICE}; Status Code: \
-         {ALREADY_EXISTS_STATUS}; Error Code: {ALREADY_EXISTS_CODE}; Request ID: {}; Proxy: \
-         null)",
-        request_id.unwrap_or(ABSENT_REQUEST_ID)
-    )
+/// The frame is the ONE envelope writer this crate holds
+/// ([`super::with_sdk_error_envelope`]), so this refusal carries the request id its response
+/// reports, exactly as every other refusal this service words itself does. The ARN that
+/// collided and the OpsItem it collided on travel in the exception's own members rather than
+/// in this sentence.
+pub fn already_exists_message() -> String {
+    super::with_sdk_error_envelope(COLLIDING_MEMBER, ALREADY_EXISTS_STATUS, ALREADY_EXISTS_CODE)
 }
 
 /// The wire code of the refusal of an association the OpsItem does not hold, which is the

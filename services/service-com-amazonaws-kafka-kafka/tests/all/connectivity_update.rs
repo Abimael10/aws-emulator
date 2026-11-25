@@ -22,7 +22,7 @@
 //! which endpoints the new configuration exposes.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_kafka_kafka::state::authorization::caller_principal;
+use service_com_amazonaws_kafka_kafka::state::RESOURCE_NOT_FOUND_MESSAGE;
 
 use crate::cluster_lifecycle::BOOTSTRAP_MEMBERS;
 use crate::kafka_harness::{
@@ -618,16 +618,16 @@ async fn update_connectivity_refuses_what_it_cannot_apply() {
             ),
             REGION,
             json!({ "currentVersion": version, "connectivityInfo": connectivity }),
-            403,
-            "AccessDeniedException",
+            404,
+            "NotFoundException",
         ),
         (
             "another-region",
             arn.clone(),
             "us-east-1",
             json!({ "currentVersion": version, "connectivityInfo": connectivity }),
-            403,
-            "AccessDeniedException",
+            404,
+            "NotFoundException",
         ),
         (
             "stale-version",
@@ -682,9 +682,8 @@ async fn update_connectivity_refuses_what_it_cannot_apply() {
         }
     }
 
-    // The resource-level refusal carries IAM's sentence for a request no
-    // resource-based policy allows, over the ARN exactly as submitted — and
-    // discloses nothing about what this endpoint holds under it.
+    // The absence is reported as the absence it is, in this service's one fixed
+    // sentence for a resource it does not hold — which carries nothing of the request.
     let absent_arn = format!(
         "arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/absent/11111111-2222-4333-8444-555555555555-1"
     );
@@ -695,18 +694,15 @@ async fn update_connectivity_refuses_what_it_cannot_apply() {
         json!({ "currentVersion": version, "connectivityInfo": connectivity }),
     )
     .await;
-    let action = "kafka:UpdateConnectivity";
     assert_eq!(
         absent.body["message"].as_str(),
-        Some(
-            format!(
-                "User: {} is not authorized to perform: {action} on resource: {absent_arn} \
-                 because no resource-based policy allows the {action} action",
-                caller_principal()
-            )
-            .as_str()
-        ),
-        "case absent-cluster: expected IAM's no-resource-policy sentence, got {}",
+        Some(RESOURCE_NOT_FOUND_MESSAGE),
+        "case absent-cluster: expected the not-found sentence, got {}",
+        absent.body
+    );
+    assert!(
+        !absent.body.to_string().contains(absent_arn.as_str()),
+        "case absent-cluster: the refusal carries nothing of the request, got {}",
         absent.body
     );
 

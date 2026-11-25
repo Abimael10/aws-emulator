@@ -1834,6 +1834,10 @@ pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
         is_attachable: true,
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["backup:CopyIntoBackupVault","backup:DescribeBackupVault","dynamodb:CreateBackup","dynamodb:DescribeBackup","dynamodb:DescribeTable","ec2:CreateImage","ec2:CreateSnapshot","ec2:DescribeInstances","ec2:DescribeSnapshots","ec2:DescribeVolumes","elasticfilesystem:Backup","elasticfilesystem:DescribeFilesystems","fsx:CreateBackup","fsx:DescribeBackups","fsx:DescribeFileSystems","rds:CreateDBClusterSnapshot","rds:CreateDBSnapshot","rds:DescribeDBClusterSnapshots","rds:DescribeDBClusters","rds:DescribeDBInstances","rds:DescribeDBSnapshots","redshift:CreateClusterSnapshot","redshift:DescribeClusterSnapshots","redshift:DescribeClusters","storagegateway:CreateSnapshot","tag:GetResources","timestream:GetAwsBackupStatus","timestream:StartAwsBackupJob"],"Resource":"*"}]}"#,
     },
+    // The counterpart for the role AWS Backup performs a RESTORE under, read the same way:
+    // each supported type's grants include the action that CREATES the resource back from a
+    // recovery point, so a role carrying this policy is allowed the restore of every
+    // supported type and allowed none of the backup actions above.
     AwsManagedPolicy {
         path: "/service-role/",
         policy_name: "AWSBackupServiceRolePolicyForRestores",
@@ -1842,7 +1846,7 @@ pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
         published: "2019-01-12T20:11:05Z",
         revised: "2024-08-15T18:31:09Z",
         is_attachable: true,
-        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["dynamodb:RestoreTableFromBackup","ec2:CreateVolume","ec2:DescribeSnapshots","elasticfilesystem:CreateFilesystem","rds:RestoreDBInstanceFromDBSnapshot","storagegateway:CreateStorediSCSIVolume"],"Resource":"*"}]}"#,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["dynamodb:RestoreTableFromBackup","ec2:CreateVolume","ec2:DescribeSnapshots","ec2:RunInstances","elasticfilesystem:CreateFilesystem","elasticfilesystem:Restore","fsx:CreateFileSystemFromBackup","rds:RestoreDBClusterFromSnapshot","rds:RestoreDBInstanceFromDBSnapshot","redshift:RestoreFromClusterSnapshot","storagegateway:CreateStorediSCSIVolume","timestream:StartAwsRestoreJob"],"Resource":"*"}]}"#,
     },
     AwsManagedPolicy {
         path: "/service-role/",

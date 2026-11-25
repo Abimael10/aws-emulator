@@ -392,7 +392,6 @@ async fn a_result_carries_the_attributes_the_index_projects() {
         // The vector attribute is held by every index that is keyed by it, so a projection
         // naming it retrieves it — and only it.
         ("all-index", json!("emb"), Value::Null, &["emb"]),
-        // `note` is outside what a `KEYS_ONLY` index holds, so only the vector comes back.
         ("keys-index", json!("note, emb"), Value::Null, &["emb"]),
     ];
     for (index, projection_expression, names, expected) in cases {

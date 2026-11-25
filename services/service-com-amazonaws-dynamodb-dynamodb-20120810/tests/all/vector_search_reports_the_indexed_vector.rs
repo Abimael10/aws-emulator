@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What a `SearchVectors` result carries of the VECTOR the index found the item by.
+//! What a `SearchVectors` result reports OF the vector the index found the item by.
 //!
 //! RULE under test: **the vector attribute an index finds an item by is retrieved only
 //! where the request NAMES it — "a string that identifies one or more attributes to
@@ -17,8 +17,9 @@
 //! (each of the three the model declares), its `Dimensions` (one, two and three), the name
 //! of the vector attribute, the `ProjectionType` of the index (each of the three), and the
 //! coordinates themselves — a whole number, a negative, a half, a value with more decimal
-//! digits than a 32-bit float carries, and the first whole number that type cannot
-//! represent (2^24 + 1, which it holds as 2^24).
+//! digits than a 32-bit float carries, and the first whole number that type cannot represent
+//! (2^24 + 1). Every row is also searched for its own coordinates, so each one's item is the
+//! nearest whatever the distance function.
 //!
 //! Nothing here waits a fixed span: each table is polled until the table and its index
 //! report `ACTIVE` through the crate's shared bounded waiter, whose deadline is a backstop
@@ -32,13 +33,13 @@ use serde_json::{json, Value};
 
 use crate::emulator::{emulator, ok, search_result_attributes, table_when, REGION};
 
-/// One row: a table carrying one vector index, the item written into it, and the coordinates
-/// the index is expected to hold for that item.
+/// One row: a table carrying one vector index, the item written into it, and the attributes
+/// a search through that index reports of it.
 struct Row {
     case: &'static str,
     table: &'static str,
     index: &'static str,
-    /// The name of the vector attribute, which the index is keyed by.
+    /// The name of the vector attribute, which the index finds its items by.
     attribute: &'static str,
     distance: &'static str,
     projection: fn() -> Value,
@@ -119,7 +120,8 @@ impl Row {
         self.written_vector()
     }
 
-    /// The coordinates a result is expected to carry, in DynamoDB list form.
+    /// The coordinates a retrieval of the vector carries, in DynamoDB list form: the form
+    /// the INDEX holds them in.
     fn held_vector(&self) -> Value {
         Value::Array(
             self.held
@@ -220,6 +222,13 @@ async fn a_default_retrieval_leaves_out_the_vector_the_index_finds_items_by() {
         )
         .await;
 
+        // The item the index found by its vector is answered, with a score for it.
+        assert!(
+            answered["SearchResults"][0]["Score"].is_number(),
+            "case {:?}: expected the score the search computed from the vector it found the \
+             item by, got {answered}",
+            row.case
+        );
         let reported = reported_attributes(&answered);
         assert_eq!(
             reported,
@@ -256,7 +265,7 @@ async fn a_default_retrieval_leaves_out_the_vector_the_index_finds_items_by() {
 }
 
 #[tokio::test]
-async fn a_projection_may_narrow_a_result_to_the_indexed_vector_alone() {
+async fn a_projection_naming_the_indexed_vector_retrieves_it_as_the_index_holds_it() {
     let router = emulator();
     let rows = rows();
     for row in &rows {
@@ -289,11 +298,16 @@ async fn a_projection_may_narrow_a_result_to_the_indexed_vector_alone() {
         )
         .await;
 
+        assert!(
+            answered["SearchResults"][0]["Score"].is_number(),
+            "case {:?}: the item is still found and scored, got {answered}",
+            row.case
+        );
         let reported = reported_attributes(&answered);
         assert_eq!(
             reported,
             vec![row.attribute.to_string()],
-            "case {:?}: a projection naming the vector reports that attribute alone, got \
+            "case {:?}: a projection naming the vector retrieves that attribute alone, got \
              {reported:?} from {answered}",
             row.case
         );
@@ -301,8 +315,8 @@ async fn a_projection_may_narrow_a_result_to_the_indexed_vector_alone() {
         assert_eq!(
             carried,
             row.held_vector(),
-            "case {:?}: the narrowed result carries the coordinates the index holds ({:?}), \
-             got {carried} from {answered}",
+            "case {:?}: the retrieved coordinates are the ones the index holds ({:?}), got \
+             {carried} from {answered}",
             row.case,
             row.held
         );

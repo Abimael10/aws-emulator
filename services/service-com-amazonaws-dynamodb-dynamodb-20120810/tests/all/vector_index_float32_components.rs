@@ -387,8 +387,9 @@ async fn a_projection_retrieves_the_vector_attribute_as_the_index_holds_it() {
          attribute, got {reported:?} from {narrowed}"
     );
 
-    // And the coordinates those narrowed results carry are the held ones, whichever order
-    // the scores put them in.
+    // And the coordinates those key-less results carry are the held ones, whichever order
+    // the scores put them in: narrowing a retrieval to the vector alone changes what a
+    // result carries, never the form the index holds it in.
     let mut held: Vec<String> = narrowed["SearchResults"]
         .as_array()
         .cloned()
@@ -404,7 +405,7 @@ async fn a_projection_retrieves_the_vector_attribute_as_the_index_holds_it() {
     expected.sort();
     assert_eq!(
         held, expected,
-        "case \"a projection naming the vector attribute\": the coordinates are the ones \
-         the index holds, got {held:?} from {narrowed}"
+        "case \"a projection naming the vector attribute\": the coordinates are the ones the \
+         index holds, got {held:?} from {narrowed}"
     );
 }

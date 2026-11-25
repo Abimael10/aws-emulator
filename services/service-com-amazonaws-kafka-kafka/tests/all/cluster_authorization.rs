@@ -64,15 +64,6 @@ const CROSS_ACCOUNT_PASS_ROLE_MESSAGE: &str = "Cross-account pass role is not al
 /// `kafka-cluster` namespace.
 const CLUSTER_CONNECT_ACTION: &str = "kafka-cluster:Connect";
 
-/// The operations that CHANGE how clients reach a cluster — the multi-VPC and
-/// public-access surface a cluster's own resource-based policy is attached for.
-/// There a well-formed ARN of the caller's OWN account is still refused as
-/// unauthorized when this endpoint holds no cluster under it (nothing can grant an
-/// action on a cluster that carries no document), which is what the own-account
-/// boundary below asserts for them instead of a non-denial;
-/// `connectivity_absent_cluster_refusal.rs` drives that rule over its own table.
-const CONNECTIVITY_MUTATIONS: [&str; 2] = ["UpdateConnectivity", "RejectClientVpcConnection"];
-
 /// Where the ARN a call acts on travels, which is the other thing the rule has to
 /// hold over: every form reaches the same decision.
 #[derive(Debug, Clone)]
@@ -498,12 +489,9 @@ async fn the_decision_precedes_body_validation() {
 /// RULE (the other boundary): the decision rests on the ARN's ACCOUNT, so a cluster
 /// ARN of the caller's own account is never refused by it — the call reaches the
 /// checks and the lookups it always did, and a cluster the caller owns is served.
-///
-/// A mutation of the cluster's client-connectivity surface ([`CONNECTIVITY_MUTATIONS`])
-/// is the one call this does not leave at a non-denial: its grant could only have
-/// rested on a document attached to the cluster, so an ARN this endpoint holds no
-/// cluster for is refused there whatever account it names — asserted as that refusal
-/// here, and driven over its own table in `connectivity_absent_cluster_refusal.rs`.
+/// What this endpoint holds under such an ARN is then each operation's own to answer,
+/// including the mutations of the cluster's client-connectivity surface, which
+/// `connectivity_absent_cluster_refusal.rs` drives over its own table.
 #[tokio::test]
 async fn a_cluster_arn_of_the_callers_own_account_is_never_denied() {
     let emulator = Emulator::new();
@@ -512,18 +500,6 @@ async fn a_cluster_arn_of_the_callers_own_account_is_never_denied() {
     for call in cluster_calls() {
         let (uri, body) = call.request(&absent);
         let reply = emulator.call(call.method, &uri, body).await;
-        if CONNECTIVITY_MUTATIONS.contains(&call.case) {
-            assert_eq!(
-                (reply.status, reply.error_code()),
-                (ACCESS_DENIED_STATUS, ACCESS_DENIED_CODE),
-                "case {}: a cluster this endpoint holds no record of grants this action by \
-                 nothing, got {} {}",
-                call.case,
-                reply.status,
-                reply.body
-            );
-            continue;
-        }
         assert_ne!(
             reply.status, ACCESS_DENIED_STATUS,
             "case {}: an ARN of the caller's own account must not be refused as unauthorized, \
