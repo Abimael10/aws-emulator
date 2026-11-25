@@ -475,7 +475,9 @@ pub const DEFAULT_NODE_TYPE: &str = "ra3.xlplus";
 /// One emulator carrying the Data API and BOTH Redshift control planes over ONE
 /// shared engine, the way the router mounts them in production — plus
 /// EventBridge and Amazon SQS, so a statement's published status change travels
-/// the real bus to a real queue.
+/// the real bus to a real queue. [`Warehouses::with_no_event_bus`] mounts the same
+/// emulator WITHOUT the bus, for the suite that observes what becomes of an
+/// announcement nothing takes.
 ///
 /// A cluster and a workgroup are THEIR resources, so every suite that needs the
 /// Data API to resolve a real compute target — or to read what that target was
@@ -490,6 +492,22 @@ pub struct Warehouses {
 
 impl Warehouses {
     pub fn new() -> Self {
+        Self::mounted(true)
+    }
+
+    /// The same emulator with NO event bus mounted at all, so a `PutEvents` this
+    /// service makes has nowhere to go and the status change it carries is one
+    /// the bus did not take.
+    ///
+    /// The configuration a suite needs to observe what becomes of an
+    /// announcement that was asked for and could not be published; every other
+    /// suite drives [`Warehouses::new`], which mounts the bus.
+    pub fn with_no_event_bus() -> Self {
+        Self::mounted(false)
+    }
+
+    /// The harness, with EventBridge mounted beside the rest when `event_bus`.
+    fn mounted(event_bus: bool) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         set_engine_deadline(&*engine, TEST_ENGINE_DEADLINE);
         let mut router = MultiServiceRouter::new();
@@ -505,9 +523,13 @@ impl Warehouses {
                 Arc::clone(&engine),
             ),
         );
-        router.register_service(
-            service_com_amazonaws_eventbridge_awsevents::EmulatedService::new(Arc::clone(&engine)),
-        );
+        if event_bus {
+            router.register_service(
+                service_com_amazonaws_eventbridge_awsevents::EmulatedService::new(Arc::clone(
+                    &engine,
+                )),
+            );
+        }
         router.register_service(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new(
             Arc::clone(&engine),
         ));

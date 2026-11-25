@@ -40,9 +40,23 @@
 //! A queued event is published with NO store lock held ([`publish_pending`]):
 //! EventBridge is reached the way every emulated service reaches another, through
 //! the framework's in-process callback, so this crate names no other service's
-//! crate. Publication is BEST EFFORT — an emulator with no EventBridge mounted has
-//! nowhere to publish — so a failure is logged and the statement's own record
-//! stands.
+//! crate. Publication never changes the statement's own record: whatever the bus
+//! answers, the record stands and the operations that report the statement answer
+//! the same.
+//!
+//! A status change stays OWED until the bus TAKES it. A publication the bus did
+//! not accept — a request that failed, or an entry it refused or said nothing
+//! about — puts its status changes back at the head of the queue
+//! ([`publish_pending`]), so the next drain publishes them: the queue is what
+//! records that the announcement a submission asked for has not been made yet.
+//! Dropping them there instead would make a submission that asked for an event one
+//! that never gets it and never can, which is the one outcome this module exists
+//! to prevent, and it would be invisible beside a submission that asked for
+//! nothing. A drain ABANDONED mid-request gives its whole batch back
+//! ([`TakenEvents`]), so an announcement the bus may already have taken can be
+//! offered a second time: AT LEAST once, deliberately, because a client waiting on
+//! an event it asked for is stopped by a lost announcement and not by a repeated
+//! one.
 //!
 //! WHICH call publishes: the task that runs the statement, as soon as it has
 //! recorded the outcome, so the event arrives whether or not anybody polls; and
@@ -218,7 +232,7 @@ fn epoch_millis(at: SystemTime) -> i64 {
 }
 
 /// Publish every statement event this store has queued onto the account's default
-/// EventBridge bus, and leave the queue empty.
+/// EventBridge bus, and leave queued exactly what the bus did not take.
 ///
 /// Called with NO store lock held: each drain takes its events out in one critical
 /// section, so nothing is published twice, and the in-process `PutEvents` runs
@@ -226,8 +240,18 @@ fn epoch_millis(at: SystemTime) -> i64 {
 /// ([`MAX_PUBLISHED_PER_DRAIN`]) and the number of drains is capped
 /// ([`MAX_DRAINS_PER_CALL`]), so no single call is unbounded, and repeating the
 /// drain is what guarantees the tail of a burst is published by the call that
-/// produced it rather than waiting for a later one. Nothing about the answer an
-/// operation gives changes either way.
+/// produced it rather than waiting for a later one.
+///
+/// What the bus did not take of a drain is OWED again: it goes back at the head of
+/// the queue, so the next drain — which every terminal transition makes — offers it
+/// once more, and this call makes no further drain, because a bus that is not
+/// taking announcements at this instant would do no better with the rest of the
+/// queue. Nothing about the answer an operation gives changes either way.
+///
+/// The batch a drain has taken is held by a guard that gives it back when this
+/// future ends however it ends ([`TakenEvents`]), so a drain abandoned at its
+/// `await` — a timeout, a lost `select!` branch, a task aborted at shutdown —
+/// leaves the status change owed rather than consumed.
 pub async fn publish_pending<Eng: Send + Sync + 'static>(
     callback: &EmbeddedEmulator,
     engine: &Eng,
@@ -236,24 +260,96 @@ pub async fn publish_pending<Eng: Send + Sync + 'static>(
         return;
     };
     for _drain in 0..MAX_DRAINS_PER_CALL {
-        let events = state
+        let taken = state
             .lock()
             .take_statement_events(MAX_PUBLISHED_PER_DRAIN);
-        if events.is_empty() {
+        if taken.is_empty() {
             return;
         }
-        publish_batch(callback, &events).await;
+        let mut held = TakenEvents {
+            state: ::engine::ServiceState::clone(&state),
+            events: taken,
+        };
+        let unpublished = publish_batch(callback, &held.events).await;
+        // What the bus took is no longer owed; what it did not is what the guard
+        // gives back when this scope ends.
+        held.events = unpublished;
+        if !held.events.is_empty() {
+            return;
+        }
+    }
+}
+
+/// The batch ONE drain took out of the store, held for as long as that drain is
+/// being made and given back when this value is dropped.
+///
+/// A drain takes its events out before it offers them to the bus, so between those
+/// two instants the store does not hold them: this is what makes that window safe
+/// to abandon. Whatever is left in `events` when the drain ends is still owed, on
+/// the cancellation path as much as on the ordinary one, which is what keeps a
+/// status change a submission asked for from being consumed by an attempt that
+/// never completed.
+///
+/// A drain abandoned mid-request gives the WHOLE batch back, including an entry
+/// the request it travelled in may already have delivered, so such an
+/// announcement can be published twice. That is the trade this guard makes on
+/// purpose: a client driven by an event it asked for is stopped by an
+/// announcement that never comes and not by one that comes twice.
+struct TakenEvents {
+    state: ::engine::ServiceState<super::ComAmazonawsRedshiftdataRedshiftdataState>,
+    events: Vec<StatementEvent>,
+}
+
+impl Drop for TakenEvents {
+    fn drop(&mut self) {
+        let owed = ::std::mem::take(&mut self.events);
+        if owed.is_empty() {
+            return;
+        }
+        self.state.lock().requeue_statement_events(owed);
+    }
+}
+
+// By hand, because what is diagnosable about a taken batch is which statements'
+// status changes it holds rather than the store handle it gives them back through.
+impl ::std::fmt::Debug for TakenEvents {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("TakenEvents")
+            .field("events", &self.events)
+            .finish()
     }
 }
 
 /// Publish one drain, in `PutEvents` requests of at most [`MAX_PUT_EVENTS_ENTRIES`]
-/// entries, one request per Region the drained events belong to.
-async fn publish_batch(callback: &EmbeddedEmulator, events: &[StatementEvent]) {
-    for window in events.chunks(MAX_PUT_EVENTS_ENTRIES) {
+/// entries, one request per Region the drained events belong to, and answer the
+/// status changes the bus did NOT take — in the order they were queued in.
+///
+/// Every Region's request is made: an event is published in the Region its
+/// statement ran in, so a bus that did not take one Region's request says nothing
+/// about another's. What is answered is addressed BY POSITION in `events`, so the
+/// answer is in queue order whichever request each event travelled in.
+async fn publish_batch(
+    callback: &EmbeddedEmulator,
+    events: &[StatementEvent],
+) -> Vec<StatementEvent> {
+    let mut unpublished: Vec<usize> = Vec::new();
+    for (chunk, window) in events.chunks(MAX_PUT_EVENTS_ENTRIES).enumerate() {
+        let first = chunk * MAX_PUT_EVENTS_ENTRIES;
         for region in regions_of(window) {
             let client = ::service_common::eventbridge_client::eventbridge_client(callback, &region);
             let mut request = client.put_events();
-            for event in window.iter().filter(|event| event.region == region) {
+            // The entries of this request, in the order they are added to it,
+            // each beside its position in `events`: `PutEvents` answers one
+            // outcome PER ENTRY in that same order, so this is what an outcome
+            // is read back against.
+            let offered: Vec<(usize, &StatementEvent)> = window
+                .iter()
+                .enumerate()
+                .filter(|(_, event)| event.region == region)
+                .map(|(position, event)| (first + position, event))
+                .collect();
+            for (_, event) in &offered {
                 let mut entry = ::aws_sdk_eventbridge::types::PutEventsRequestEntry::builder()
                     .event_bus_name(DEFAULT_EVENT_BUS)
                     .source(EVENT_SOURCE)
@@ -272,23 +368,52 @@ async fn publish_batch(callback: &EmbeddedEmulator, events: &[StatementEvent]) {
                 request = request.entries(entry.build());
             }
             match request.send().await {
-                Err(error) => ::tracing::warn!(
-                    region = %region,
-                    error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                    "a statement status change could not be published to EventBridge"
-                ),
+                // Nothing in this request reached the bus, so every status
+                // change it carried is still owed.
+                Err(error) => {
+                    ::tracing::warn!(
+                        region = %region,
+                        error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                        statements = ?statement_ids(&offered),
+                        "a statement status change could not be published to EventBridge, so it \
+                         stays queued"
+                    );
+                    unpublished.extend(offered.iter().map(|(at, _)| *at));
+                }
                 // The bus answers one outcome PER ENTRY, so a request it
                 // accepted can still have refused some of the events in it. An
                 // event nobody will ever receive is exactly what this module
                 // exists to prevent, so a refused entry is said out loud —
-                // naming the statements whose status change did not land —
-                // rather than passing as a published one.
-                Ok(answered) if answered.failed_entry_count() > 0 => {
+                // naming the statements whose status change did not land — and
+                // that status change stays queued rather than passing as a
+                // published one.
+                //
+                // An entry the answer says NOTHING about — an answer carrying
+                // fewer outcomes than the request carried entries — is not one
+                // the bus said it took either, so it stays queued as well: the
+                // only entries treated as published are those the bus answered
+                // for, without an error code.
+                Ok(answered) => {
+                    let results = answered.entries();
+                    let refused: Vec<(usize, &StatementEvent)> = offered
+                        .iter()
+                        .enumerate()
+                        .filter(|(slot, _)| {
+                            results
+                                .get(*slot)
+                                .is_none_or(|result| result.error_code().is_some())
+                        })
+                        .map(|(_, offer)| *offer)
+                        .collect();
+                    if refused.is_empty() {
+                        continue;
+                    }
                     ::tracing::warn!(
                         region = %region,
-                        refused = answered.failed_entry_count(),
-                        reasons = ?answered
-                            .entries()
+                        refused = refused.len(),
+                        answered_for = results.len(),
+                        offered = offered.len(),
+                        reasons = ?results
                             .iter()
                             .filter_map(|result| {
                                 result.error_code().map(|code| {
@@ -296,19 +421,31 @@ async fn publish_batch(callback: &EmbeddedEmulator, events: &[StatementEvent]) {
                                 })
                             })
                             .collect::<Vec<_>>(),
-                        statements = ?window
-                            .iter()
-                            .filter(|event| event.region == region)
-                            .map(|event| event.statement_id.clone())
-                            .collect::<Vec<_>>(),
-                        "EventBridge refused a statement status change, so nothing was published \
-                         for it"
+                        statements = ?statement_ids(&refused),
+                        "EventBridge did not take a statement status change, so nothing was \
+                         published for it and it stays queued"
                     );
+                    unpublished.extend(refused.iter().map(|(at, _)| *at));
                 }
-                Ok(_published) => {}
             }
         }
     }
+    // In the order the status changes were queued in, whichever request each of
+    // them travelled in, and each of them once.
+    unpublished.sort_unstable();
+    unpublished.dedup();
+    unpublished
+        .into_iter()
+        .filter_map(|at| events.get(at).cloned())
+        .collect()
+}
+
+/// The statements one group of offered events is about, for the log.
+fn statement_ids(offered: &[(usize, &StatementEvent)]) -> Vec<String> {
+    offered
+        .iter()
+        .map(|(_, event)| event.statement_id.clone())
+        .collect()
 }
 
 /// The Regions the events of one window belong to, each once and in the order they

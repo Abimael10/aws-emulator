@@ -3815,11 +3815,59 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
     /// reached, and the queue cannot grow without bound.
     fn queue_statement_event(&mut self, event: statement_events::StatementEvent) {
         self.statement_events.push(event);
-        let queued = self.statement_events.len();
-        if queued > statement_events::MAX_PENDING_EVENTS {
-            self.statement_events
-                .drain(..queued - statement_events::MAX_PENDING_EVENTS);
+        self.trim_statement_events();
+    }
+
+    /// Give back the status changes a drain took and the bus did not take, so
+    /// they are owed again — at the HEAD of the queue, which is where they came
+    /// from, so the queue stays in the order the status changes happened in.
+    ///
+    /// Bounded exactly as queueing a new status change is
+    /// ([`Self::trim_statement_events`]): a bus that takes nothing cannot grow
+    /// this queue past what a bus that takes everything leaves. Which end loses
+    /// at the ceiling is the same either way — the OLDEST status changes, which
+    /// after a requeue are the ones just given back: a queue at its ceiling is
+    /// one whose announcements nothing is taking, and the newest statements'
+    /// status changes are the ones a client is still waiting on.
+    pub(crate) fn requeue_statement_events(
+        &mut self,
+        mut events: Vec<statement_events::StatementEvent>,
+    ) {
+        if events.is_empty() {
+            return;
         }
+        events.append(&mut self.statement_events);
+        self.statement_events = events;
+        self.trim_statement_events();
+    }
+
+    /// Bring the queue of owed status changes back inside
+    /// [`statement_events::MAX_PENDING_EVENTS`], dropping the OLDEST first.
+    ///
+    /// The ONE place the bound is applied, so appending a new status change and
+    /// giving back one the bus did not take cannot bound the queue differently.
+    /// Each drop is said out loud: the status change was ASKED for, so a queue
+    /// at its ceiling is losing announcements and an operator reading the log is
+    /// the only one who can see it.
+    fn trim_statement_events(&mut self) {
+        let queued = self.statement_events.len();
+        if queued <= statement_events::MAX_PENDING_EVENTS {
+            return;
+        }
+        let dropped = queued - statement_events::MAX_PENDING_EVENTS;
+        ::tracing::warn!(
+            dropped,
+            ceiling = statement_events::MAX_PENDING_EVENTS,
+            statements = ?self
+                .statement_events
+                .iter()
+                .take(dropped)
+                .map(|event| event.statement_id.clone())
+                .collect::<Vec<_>>(),
+            "the queue of status changes waiting to be published is at its ceiling, so the \
+             oldest of them are dropped unpublished"
+        );
+        self.statement_events.drain(..dropped);
     }
 
     /// Take at most `limit` queued status changes out, oldest first, for
