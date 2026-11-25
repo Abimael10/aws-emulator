@@ -21,7 +21,7 @@
 //! sequence of writes cannot grow the store through a string nothing counted. A write
 //! past a ceiling is refused with the ceiling it met rather than taken.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ::serde_json::Value;
 
@@ -50,6 +50,14 @@ pub const RELATIONSHIP_END_MEMBER: &str = "~end";
 /// The `~entityType` of each kind of element.
 pub const NODE_ENTITY_TYPE: &str = "node";
 pub const RELATIONSHIP_ENTITY_TYPE: &str = "relationship";
+
+/// The predicate the statement about an element's LABEL is written with.
+///
+/// Every statement about an element is a quad whose PREDICATE position names what the
+/// statement says — a property key, an edge label, or this one for the element's own label
+/// — so the label predicate is one of the graph's predicates like any other
+/// ([`PropertyGraph::distinct_predicate_count`]).
+pub const LABEL_PREDICATE_KEY: &str = "~label";
 
 /// The most nodes one store holds.
 ///
@@ -155,6 +163,32 @@ impl PropertyGraph {
     #[must_use]
     pub fn relationship_count(&self) -> usize {
         self.relationships.len()
+    }
+
+    /// How many distinct PREDICATES the store holds.
+    ///
+    /// Every statement the store holds about an element is a quad whose predicate position
+    /// names what the statement says: the key of a property set on a node or on a
+    /// relationship, the type of a relationship, and [`LABEL_PREDICATE_KEY`] for the
+    /// statement carrying an element's own label. The count is of the DISTINCT ones, so a
+    /// predicate many elements use is one predicate, and an empty graph holds none.
+    ///
+    /// ONE pass over the store answers it, bounded by what the store holds rather than by
+    /// the request.
+    #[must_use]
+    pub fn distinct_predicate_count(&self) -> usize {
+        let mut predicates: BTreeSet<&str> = BTreeSet::new();
+        for node in self.nodes.values() {
+            if !node.labels.is_empty() {
+                predicates.insert(LABEL_PREDICATE_KEY);
+            }
+            predicates.extend(node.properties.keys().map(String::as_str));
+        }
+        for relationship in self.relationships.values() {
+            predicates.insert(relationship.rel_type.as_str());
+            predicates.extend(relationship.properties.keys().map(String::as_str));
+        }
+        predicates.len()
     }
 
     /// How many nodes the store holds carrying each label, by label.

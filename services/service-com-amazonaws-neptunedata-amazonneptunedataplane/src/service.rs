@@ -58,6 +58,16 @@
 //! One response is announced by the framework alone, because no author seam reaches it: the
 //! authentication refusal, which the router renders through
 //! `definition().refusal_response(..)` before this service is asked anything.
+//!
+//! ## The media type a TEXT REPORT announces
+//!
+//! Two operations of this plane answer with a text report rather than a JSON document, and
+//! the media type their payload announces is the one the MODEL declares for it. That rule,
+//! and the wrapper the two are served through, live in [`text_report_media_type`].
+
+mod text_report_media_type;
+
+pub use text_report_media_type::TEXT_REPORT_OPERATIONS;
 
 use service_common::response_media_type::{ResponseMediaType, ResponseMediaTypeOperation};
 use smithy_server_runtime::{
@@ -91,6 +101,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// request walk announces this service's media type too. Held in a field, built once,
     /// because [`Service::override_operation`] hands back a borrow of it.
     media_type: ResponseMediaTypeOperation,
+    /// The wrapper the operations answering with a TEXT REPORT are served through instead:
+    /// it serves the same walk and then announces the media type the model declares for
+    /// that payload (see [`text_report_media_type`]).
+    text_report: text_report_media_type::TextReportResponse,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -101,6 +115,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(engine),
             media_type: ResponseMediaTypeOperation::new(RESPONSE_MEDIA_TYPE),
+            text_report: text_report_media_type::TextReportResponse::new(
+                ResponseMediaTypeOperation::new(RESPONSE_MEDIA_TYPE),
+            ),
         }
     }
 }
@@ -134,8 +151,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // request whose routing key names no modelled operation is declined here, so the
         // framework answers it as the unroutable request it is, through
         // `override_routing_error` below, which re-announces that answer too.
-        service_common::response_media_type::routes(&self.entry, req)
-            .then_some(&self.media_type as _)
+        if !service_common::response_media_type::routes(&self.entry, req) {
+            return None;
+        }
+        // An operation whose payload the model declares a media type for is served through
+        // the wrapper that announces it: the body of a text report is not a JSON document,
+        // so the one value its response announces is the model's own.
+        match self.entry.protocol().routing_key(req).ok() {
+            Some(key) if TEXT_REPORT_OPERATIONS.contains(&key) => Some(&self.text_report as _),
+            _ => Some(&self.media_type as _),
+        }
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

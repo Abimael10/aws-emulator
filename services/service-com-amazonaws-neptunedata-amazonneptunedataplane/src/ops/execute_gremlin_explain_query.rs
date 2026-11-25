@@ -4,8 +4,10 @@
 //!
 //! Explains a Gremlin query: reads the submitted traversal and reports the plan this
 //! engine would evaluate it with, as the text blob the operation answers with. The
-//! reading and the planning live in [`crate::state::gremlin_explain_report`]; the query
-//! the engine explained is recorded in this service's Gremlin query registry, which the
+//! reading and the planning live in [`crate::state::gremlin_explain_report`], which is
+//! also handed what the report says about the DATABASE serving the explain — the engine
+//! version the status reports and the predicates the stored graph holds; the query the
+//! engine explained is recorded in this service's Gremlin query registry, which the
 //! status family then reports.
 //!
 //! ## Shape of an operation
@@ -246,7 +248,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        let report = crate::state::gremlin_explain_report(&input.gremlin_query, &traversal);
+        // What the report says about the DATABASE the plan would be evaluated against: the
+        // engine version the cluster this plane answers for was provisioned with — the same
+        // value its engine status reports — and how many distinct predicates its graph
+        // holds. The cluster directory and this service's store are taken one at a time, so
+        // no order between the two locks can invert.
+        let cluster = crate::state::provisioned_cluster(&*self.engine);
+        let (engine_version, predicate_count) = {
+            let store = state.lock();
+            (
+                store.engine_status.reported(cluster.as_ref()).db_engine_version,
+                store.graph.distinct_predicate_count(),
+            )
+        };
+        let report = crate::state::gremlin_explain_report(
+            &input.gremlin_query,
+            &traversal,
+            &crate::state::ExplainContext {
+                // The explain runs within this call, so the instant it ran is now.
+                explained_at: ::std::time::SystemTime::now(),
+                engine_version: &engine_version,
+                predicate_count,
+            },
+        );
 
         // The explain is answered within this call, so the query the engine has just read
         // and planned is recorded as one it accepted and finished: the status family

@@ -17,7 +17,16 @@
 //! for a property statement; the edge's own id for an edge statement).
 //!
 //! Nothing here EVALUATES the traversal: an explain reports the plan for a query, not its
-//! results, so this module reads no graph data and needs none.
+//! results, so this module reads no graph data and needs none — what the report says about
+//! the DATABASE it ran against (its engine version, the predicates its graph holds) is
+//! handed to the renderer by the caller.
+//!
+//! The report itself — the sections, their order and the syntax each plan is printed in —
+//! lives in [`report`].
+
+mod report;
+
+pub use report::*;
 
 use std::fmt::Write as _;
 
@@ -37,10 +46,6 @@ pub const MAX_ARGUMENT_DEPTH: usize = 32;
 
 /// The traversal source a Gremlin query starts from.
 pub const GRAPH_TRAVERSAL_SOURCE: &str = "g";
-
-/// The predicate position of a statement about an element's label, which is how the
-/// elements of a label are found and how `hasLabel` and `label()` are matched.
-const LABEL_PREDICATE: &str = "<~label>";
 
 /// The graph position of a property statement: the default graph.
 const DEFAULT_GRAPH: &str = "<~>";
@@ -582,6 +587,10 @@ fn render_argument(argument: &Argument) -> String {
     }
 }
 
+/// The step class a terminal `count` compiles to, which the optimized plan answers inside
+/// the graph query rather than with a step iterator.
+const TERMINAL_COUNT_STEP: &str = "CountGlobalStep";
+
 /// How a step is printed in the report's traversal sections: the name of the step class
 /// it compiles to, applied to the arguments it was compiled with.
 ///
@@ -612,7 +621,7 @@ fn tinkerpop_step(step: &Call) -> String {
         "label" => "LabelStep".to_string(),
         "key" => "PropertyKeyStep".to_string(),
         "value" => "PropertyValueStep".to_string(),
-        "count" => "CountGlobalStep".to_string(),
+        "count" => TERMINAL_COUNT_STEP.to_string(),
         "sum" => "SumGlobalStep".to_string(),
         "max" => "MaxGlobalStep".to_string(),
         "min" => "MinGlobalStep".to_string(),
@@ -636,6 +645,16 @@ fn tinkerpop_step(step: &Call) -> String {
             many => format!("SelectStep(last,[{}])", many.join(", ")),
         },
         _ => generic_step(&step.name, &rendered),
+    }
+}
+
+/// The step CLASS `step` compiles to, without the arguments it was compiled with: the name
+/// the plan's `path` annotation reports an element's binding step by.
+fn step_class(step: &Call) -> String {
+    let printed = tinkerpop_step(step);
+    match printed.find('(') {
+        Some(at) => printed[..at].to_string(),
+        None => printed,
     }
 }
 
@@ -760,6 +779,22 @@ fn pattern_key(key: &str) -> String {
     format!("<{}>", key.escape_debug())
 }
 
+/// The predicate position of a statement about an element's LABEL, which is how the
+/// elements of a label are found and how `hasLabel` and `label()` are matched: the graph's
+/// own label predicate ([`super::LABEL_PREDICATE_KEY`]) written as a pattern writes a
+/// predicate.
+fn label_predicate() -> String {
+    pattern_key(super::LABEL_PREDICATE_KEY)
+}
+
+/// A LABEL as a pattern position writes one: a term, not a string literal. A label names a
+/// kind of element rather than carrying a caller's datum, so it is written like a predicate
+/// — which is what tells `<airport>` (the label) apart from `"airport"` (a property value
+/// that happens to read the same).
+fn pattern_label(label: &str) -> String {
+    pattern_key(label)
+}
+
 /// What the pattern-matching part of the traversal is positioned on.
 #[derive(Debug, Clone)]
 enum Position {
@@ -770,6 +805,8 @@ enum Position {
 
 /// How a `has`-family filter turns into a quad pattern.
 enum FilterPattern {
+    /// The statement about the element's LABEL, pinned to one label (`hasLabel(label)`).
+    Label { label: String },
     /// Both the predicate and the object position are bound (`has(key, value)`).
     Value { predicate: String, object: String },
     /// The property must be there, so its value is a variable the pattern binds.
@@ -789,19 +826,52 @@ fn filter_pattern(step: &Call) -> Option<FilterPattern> {
             predicate: pattern_key(key),
             object: pattern_value(value)?,
         }),
-        ("hasLabel", [label]) => Some(FilterPattern::Value {
-            predicate: LABEL_PREDICATE.to_string(),
-            object: pattern_value(label)?,
+        // A label is a term, so only a label WRITTEN as one (a string) names a label this
+        // engine can match; anything else is left to the step iterators.
+        ("hasLabel", [Argument::Text(label)]) => Some(FilterPattern::Label {
+            label: pattern_label(label),
         }),
         _ => None,
     }
 }
 
-/// The plan the report's "Optimized Traversal" section prints.
+/// The label `step` pins the element's label statement to, for a step that pins it to
+/// exactly one — which is what the label pattern folds into itself instead of matching a
+/// second statement for.
+fn pinned_label(step: &Call) -> Option<String> {
+    match filter_pattern(step)? {
+        FilterPattern::Label { label } => Some(label),
+        FilterPattern::Value { .. } | FilterPattern::Existence { .. } => None,
+    }
+}
+
+/// One quad pattern of the plan: the positions it matches, the variables it projects out,
+/// and the term its object position is CONSTRAINED to when a filter pinned one.
+///
+/// Kept in its positions rather than as rendered text, because the two plan sections of
+/// the report print the same pattern differently: the converted plan states a pinned label
+/// as a filter beside the pattern and the optimized plan folds it into the object position
+/// (see [`report`]).
+#[derive(Debug, Clone)]
+struct PlanPattern {
+    /// Whether this is the statement about an element's LABEL, which the plan prints in
+    /// its own form.
+    label: bool,
+    subject: Term,
+    predicate: Term,
+    object: Term,
+    graph: Term,
+    /// The variables the pattern projects out, in ascending id order.
+    projected: Vec<usize>,
+    /// The term the object position is pinned to, when a filter pinned one.
+    bound: Option<String>,
+}
+
+/// The plan the report's traversal sections print.
 #[derive(Debug, Default)]
 struct ExplainPlan {
     /// The quad patterns the pushed-down part of the traversal matches.
-    patterns: Vec<String>,
+    patterns: Vec<PlanPattern>,
     /// The elements and values those patterns bind, in the order they were bound.
     path: Vec<String>,
     /// The first variable id no pattern uses.
@@ -810,12 +880,16 @@ struct ExplainPlan {
     answers: &'static str,
     /// The steps left for the step iterators, in order.
     remaining: Vec<String>,
+    /// Whether the one step left after the pushed-down prefix is a terminal COUNT, which
+    /// the optimized plan answers inside the graph query instead of leaving to a step
+    /// iterator.
+    counts: bool,
 }
 
 /// Builds [`ExplainPlan`] by walking the traversal's steps and pushing down the ones it
 /// can match with quad patterns.
 struct PlanBuilder {
-    patterns: Vec<String>,
+    patterns: Vec<PlanPattern>,
     path: Vec<String>,
     next_var: usize,
     position: Option<Position>,
@@ -823,6 +897,9 @@ struct PlanBuilder {
     /// Set once a step has bound a VALUE: the pattern-matching part of a plan walks
     /// elements, so it ends where the values begin.
     finished: bool,
+    /// Set when the label pattern just built already pins the label the NEXT step filters
+    /// on, so that step matches nothing more of its own.
+    folded_label_filter: bool,
 }
 
 impl PlanBuilder {
@@ -834,6 +911,7 @@ impl PlanBuilder {
             position: None,
             answers: "Vertex",
             finished: false,
+            folded_label_filter: false,
         }
     }
 
@@ -844,37 +922,61 @@ impl PlanBuilder {
         Term::Variable(id)
     }
 
-    /// Record that `term` is bound, which is what the plan's `path` annotation lists.
-    fn bind(&mut self, kind: &str, term: &Term, node: &str) {
-        self.path.push(format!("{kind}({}):{node}", term.render()));
+    /// Record that `term` is bound, and by WHICH step: the plan's `path` annotation lists
+    /// each element it binds together with the step class that bound it.
+    fn bind(&mut self, kind: &str, term: &Term, step: &Call) {
+        self.path
+            .push(format!("{kind}({}):{}", term.render(), step_class(step)));
     }
 
     /// Add the pattern `(subject, predicate, object, graph)`, projecting out the
     /// variables of `projected` it binds.
+    ///
+    /// `label` marks the statement about an element's LABEL and `bound` is the term the
+    /// object position is pinned to, if any — the two facts the report needs to print the
+    /// same pattern in the converted and in the optimized plan.
+    #[allow(clippy::too_many_arguments)]
     fn add_pattern(
         &mut self,
+        label: bool,
         subject: &Term,
         predicate: &Term,
         object: &Term,
         graph: &Term,
         projected: &[&Term],
+        bound: Option<String>,
     ) {
         let mut variables: Vec<usize> = projected.iter().filter_map(|term| term.variable()).collect();
         variables.sort_unstable();
         variables.dedup();
-        let projection = variables
-            .iter()
-            .map(|id| format!("?{id}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        self.patterns.push(format!(
-            "PatternNode[({}, {}, {}, {}) . project {} .]",
-            subject.render(),
-            predicate.render(),
-            object.render(),
-            graph.render(),
-            projection
-        ));
+        self.patterns.push(PlanPattern {
+            label,
+            subject: subject.clone(),
+            predicate: predicate.clone(),
+            object: object.clone(),
+            graph: graph.clone(),
+            projected: variables,
+            bound,
+        });
+    }
+
+    /// Add the statement about `element`'s LABEL: the pattern a scan matches an element by,
+    /// binding the label itself to a variable, with the label `pinned` folded into the same
+    /// pattern when a filter pinned one.
+    fn add_label_pattern(&mut self, element: &Term, pinned: Option<String>) -> Term {
+        let label = self.fresh();
+        let predicate = Term::Literal(label_predicate());
+        let graph = Term::Literal(DEFAULT_GRAPH.to_string());
+        self.add_pattern(
+            true,
+            element,
+            &predicate,
+            &label,
+            &graph,
+            &[element],
+            pinned,
+        );
+        label
     }
 
     /// Push `step` down into the patterns, and report whether it went down. A step that
@@ -911,15 +1013,23 @@ impl PlanBuilder {
             // express, so the start is left to the step iterators.
             _ => return false,
         };
-        self.bind("Vertex", &start, "GraphNode");
+        self.bind("Vertex", &start, step);
         self.answers = "Vertex";
+        // A `hasLabel` right after the scan pins the label of the SAME statement the scan
+        // matches, so it is folded into that one pattern rather than matching a second
+        // one; any other filter that goes down too is what finds the start, so no label
+        // statement is matched for it at all.
+        let pinned = arguments
+            .is_empty()
+            .then(|| next.and_then(pinned_label))
+            .flatten();
         let found_by_filter =
             arguments.is_empty() && next.is_some_and(|next| filter_pattern(next).is_some());
-        if !found_by_filter {
-            let label = self.fresh();
-            let graph = Term::Literal(DEFAULT_GRAPH.to_string());
-            let predicate = Term::Literal(LABEL_PREDICATE.to_string());
-            self.add_pattern(&start, &predicate, &label, &graph, &[&start, &label]);
+        if pinned.is_some() {
+            self.add_label_pattern(&start, pinned);
+            self.folded_label_filter = true;
+        } else if !found_by_filter {
+            self.add_label_pattern(&start, None);
         }
         self.position = Some(Position::Vertex(start));
         true
@@ -939,8 +1049,8 @@ impl PlanBuilder {
         let label = self.fresh();
         let to = self.fresh();
         let edge = self.fresh();
-        self.add_pattern(&from, &label, &to, &edge, &[&from, &to, &edge]);
-        self.bind("Edge", &edge, "GraphNode");
+        self.add_pattern(false, &from, &label, &to, &edge, &[&from, &to, &edge], None);
+        self.bind("Edge", &edge, step);
         self.answers = "Edge";
         self.position = Some(Position::Edge {
             id: edge,
@@ -956,18 +1066,29 @@ impl PlanBuilder {
             Position::Vertex(term) => term.clone(),
             Position::Edge { id, .. } => id.clone(),
         };
+        // The label this filter pins is already folded into the label pattern the scan
+        // matches, so the filter itself matches nothing more.
+        if self.folded_label_filter {
+            self.folded_label_filter = false;
+            if pinned_label(step).is_some() {
+                return true;
+            }
+        }
         if let Some(pattern) = filter_pattern(step) {
             let graph = Term::Literal(DEFAULT_GRAPH.to_string());
             match pattern {
+                FilterPattern::Label { label } => {
+                    self.add_label_pattern(&element, Some(label));
+                }
                 FilterPattern::Value { predicate, object } => {
                     let predicate = Term::Literal(predicate);
                     let object = Term::Literal(object);
-                    self.add_pattern(&element, &predicate, &object, &graph, &[&element]);
+                    self.add_pattern(false, &element, &predicate, &object, &graph, &[&element], None);
                 }
                 FilterPattern::Existence { predicate } => {
                     let predicate = Term::Literal(predicate);
                     let value = self.fresh();
-                    self.add_pattern(&element, &predicate, &value, &graph, &[&element]);
+                    self.add_pattern(false, &element, &predicate, &value, &graph, &[&element], None);
                 }
             }
             return true;
@@ -1005,13 +1126,13 @@ impl PlanBuilder {
         };
         let walks_edges = step.name.ends_with('E');
         if walks_edges {
-            self.add_pattern(&from, &predicate, &to, &edge, &[&from, &to, &edge]);
+            self.add_pattern(false, &from, &predicate, &to, &edge, &[&from, &to, &edge], None);
         } else {
-            self.add_pattern(&from, &predicate, &to, &edge, &[&from, &to]);
+            self.add_pattern(false, &from, &predicate, &to, &edge, &[&from, &to], None);
         }
-        self.bind("Vertex", &other, "GraphNode");
+        self.bind("Vertex", &other, step);
         if walks_edges {
-            self.bind("Edge", &edge, "GraphNode");
+            self.bind("Edge", &edge, step);
             self.answers = "Edge";
             self.position = Some(Position::Edge {
                 id: edge,
@@ -1048,28 +1169,43 @@ impl PlanBuilder {
     /// positioned on, which binds a VALUE rather than another element — so the graph
     /// query answers with values, and the pattern-matching part of the plan ends here.
     fn property(&mut self, element: &Term, step: &Call) -> bool {
+        let reads_label = step.name == "label";
         let predicate = match (step.name.as_str(), step.arguments()) {
-            ("label", []) => Term::Literal(LABEL_PREDICATE.to_string()),
+            ("label", []) => Term::Literal(label_predicate()),
             ("values", []) => self.fresh(),
             ("values", [Argument::Text(key)]) => Term::Literal(pattern_key(key)),
             _ => return false,
         };
         let value = self.fresh();
         let graph = Term::Literal(DEFAULT_GRAPH.to_string());
-        self.add_pattern(element, &predicate, &value, &graph, &[element, &value]);
-        self.bind("Value", &value, "ValueNode");
+        self.add_pattern(
+            reads_label,
+            element,
+            &predicate,
+            &value,
+            &graph,
+            &[element, &value],
+            None,
+        );
+        self.bind("Value", &value, step);
         self.answers = "Value";
         self.finished = true;
         true
     }
 
     fn finish(self, remaining: Vec<String>) -> ExplainPlan {
+        // A terminal count over a pushed-down prefix is answered by the graph query
+        // itself: there is nothing after it to hand traversers to, so the optimized plan
+        // counts the matches instead of iterating them.
+        let counts = !self.patterns.is_empty()
+            && matches!(remaining.as_slice(), [only] if only == TERMINAL_COUNT_STEP);
         ExplainPlan {
             patterns: self.patterns,
             path: self.path,
             max_var_id: self.next_var,
             answers: self.answers,
             remaining,
+            counts,
         }
     }
 }
@@ -1101,56 +1237,4 @@ fn build_plan(traversal: &Traversal, printed: &[PrintedStep]) -> ExplainPlan {
     builder.finish(remaining)
 }
 
-/// The explain report for `query`, which `traversal` is the reading of.
-///
-/// Derived from the traversal alone, so the same query always explains the same way.
-pub fn gremlin_explain_report(query: &str, traversal: &Traversal) -> String {
-    let printed = printed_steps(traversal);
-    let plan = build_plan(traversal, &printed);
 
-    let mut report = String::new();
-    let _ = writeln!(report, "{REPORT_RULE}");
-    let _ = writeln!(report, "Neptune Gremlin Explain");
-    let _ = writeln!(report, "{REPORT_RULE}");
-    let _ = writeln!(report);
-    let _ = writeln!(report, "Query String");
-    let _ = writeln!(report, "============");
-    let _ = writeln!(report, "{}", query.trim());
-    let _ = writeln!(report);
-    let _ = writeln!(report, "Original Traversal");
-    let _ = writeln!(report, "==================");
-    let _ = writeln!(
-        report,
-        "[{}]",
-        printed
-            .iter()
-            .map(|step| step.text.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    let _ = writeln!(report);
-    let _ = writeln!(report, "Optimized Traversal");
-    let _ = writeln!(report, "===================");
-    let _ = writeln!(report, "Neptune steps:");
-    let _ = writeln!(report, "[");
-    if !plan.patterns.is_empty() {
-        let _ = writeln!(report, "    +- NeptuneGraphQueryStep({}) {{", plan.answers);
-        let _ = writeln!(report, "        JoinGroupNode {{");
-        for pattern in &plan.patterns {
-            let _ = writeln!(report, "            {pattern}");
-        }
-        let _ = writeln!(
-            report,
-            "        }}, annotations={{path=[{}], maxVarId={}}}",
-            plan.path.join(", "),
-            plan.max_var_id
-        );
-        let _ = writeln!(report, "    }}");
-        let _ = writeln!(report, "    +- NeptuneTraverserConverterStep");
-    }
-    for step in &plan.remaining {
-        let _ = writeln!(report, "    +- {step}");
-    }
-    let _ = writeln!(report, "]");
-    report
-}
