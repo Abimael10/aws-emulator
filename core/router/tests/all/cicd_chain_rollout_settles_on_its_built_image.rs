@@ -657,7 +657,7 @@ async fn register_pinned_revision(
     let server = if serves {
         format!("python3 -m http.server {PORT} --directory {DOCUMENT_ROOT}")
     } else {
-        "sleep 600".to_string()
+        "sleep infinity".to_string()
     };
     let command = format!(
         "mkdir -p {DOCUMENT_ROOT} && echo \"{document}\" > {DOCUMENT_ROOT}/index.html && {server}"

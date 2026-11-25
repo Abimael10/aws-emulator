@@ -344,7 +344,7 @@ fn serving_command() -> Value {
 
 /// The command of a container that runs NO server, so nothing of its task is listening at all.
 fn silent_command() -> Value {
-    json!(["sh", "-c", "sleep 300"])
+    json!(["sh", "-c", "sleep infinity"])
 }
 
 /// Register one `awsvpc`, Fargate-compatible revision of `family` whose container runs `command`

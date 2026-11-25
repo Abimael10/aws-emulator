@@ -607,7 +607,7 @@ const STOPPED: &str = "STOPPED";
 
 /// The program the container of a row that LAUNCHES runs: it writes one line and then stays
 /// up, so such a task is observable in the `RUNNING` state it reached.
-const STAYS_UP_PROGRAM: &str = "echo ready; sleep 300";
+const STAYS_UP_PROGRAM: &str = "echo ready; sleep infinity";
 
 /// One row: the call that starts the task, the group its container's `awslogs` configuration
 /// names, what its execution role may do, and the launch that produces.

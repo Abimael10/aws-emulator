@@ -119,9 +119,9 @@ const LOOKS_FOR_AN_INVARIANT: usize = 5;
 /// The command a container runs so that it stays up for as long as a row observes it: a
 /// container's own program is what keeps its task running, and a task whose essential
 /// container has exited is stopped ("The task stopped because an essential container
-/// exited").
+/// exited"). The wait names no end of its own, so nothing inside the container ends it.
 fn stays_up() -> Value {
-    json!(["sh", "-c", "sleep 300"])
+    json!(["sh", "-c", "sleep infinity"])
 }
 
 /// A container definition named `name` that stays up, carrying `health_check` when one is
@@ -1177,7 +1177,7 @@ async fn describe_rollout(router: &MultiServiceRouter, arn: &str, case: &str) ->
 /// The program a row's container runs: what that row writes into its own filesystem, and
 /// then the wait that keeps the container up for as long as the row observes it.
 fn writes_then_stays_up(writes: &str) -> Value {
-    json!(["sh", "-c", format!("{writes}sleep 300")])
+    json!(["sh", "-c", format!("{writes}sleep infinity")])
 }
 
 /// A container definition named `name` running `command` under `health_check`, carrying

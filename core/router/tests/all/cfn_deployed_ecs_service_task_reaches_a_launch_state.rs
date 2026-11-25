@@ -365,7 +365,7 @@ fn template(row: &Row, subnet: &str) -> String {
           Command:
             - sh
             - -c
-            - echo "{SPOKEN_LINE}"; sleep 3600
+            - echo "{SPOKEN_LINE}"; sleep infinity
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -658,7 +658,7 @@ async fn an_ec2_launch_type_service_converges_on_the_capacity_its_stack_brought_
           Command:
             - sh
             - -c
-            - echo "{SPOKEN_LINE}"; sleep 3600
+            - echo "{SPOKEN_LINE}"; sleep infinity
   Service:
     Type: AWS::ECS::Service
     DependsOn: Instance

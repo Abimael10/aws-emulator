@@ -563,7 +563,7 @@ async fn given_estate(router: &MultiServiceRouter, case: &str) -> (String, Strin
                 "essential": true,
                 "cpu": 128,
                 "memory": 256,
-                "command": ["sh", "-c", "echo bound; sleep 3600"],
+                "command": ["sh", "-c", "echo bound; sleep infinity"],
                 "portMappings": [{ "containerPort": 80, "protocol": "tcp" }],
             }],
         }),

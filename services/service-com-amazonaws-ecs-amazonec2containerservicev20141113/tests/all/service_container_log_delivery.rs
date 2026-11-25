@@ -86,10 +86,11 @@ const EXECUTION_ROLE: &str = "scheduledLogsExecutionRole";
 const ECS_TASKS_PRINCIPAL: &str = "ecs-tasks.amazonaws.com";
 const ASSUME_ROLE: &str = "sts:AssumeRole";
 
-/// How long the container's program stays up after it has written its lines, so a task of a
+/// The wait the container's program ends on after it has written its lines, so a task of a
 /// converged service is a task whose program is still running — the shape of the workload a
-/// service runs.
-const STAY_UP_SECONDS: u32 = 300;
+/// service runs. It names no end of its own, because what ends such a container is the service
+/// taking its task away rather than anything in the program.
+const STAYS_UP: &str = "infinity";
 
 /// How often a poll re-reads the emulator. A cadence, not a bound: a poll that finds its
 /// condition unmet looks again until its deadline, so this decides how promptly the suite
@@ -327,7 +328,7 @@ fn program(row: &Row) -> Vec<String> {
     for line in row.lines {
         script.push_str(&format!("echo {line}; "));
     }
-    script.push_str(&format!("sleep {STAY_UP_SECONDS}"));
+    script.push_str(&format!("sleep {STAYS_UP}"));
     vec!["sh".to_string(), "-c".to_string(), script]
 }
 

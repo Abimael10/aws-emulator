@@ -424,7 +424,7 @@ async fn a_draining_host_has_its_service_task_relocated_onto_the_other_host() {
                 "image": "busybox",
                 "cpu": 64,
                 "memory": 64,
-                "command": ["sh", "-c", "sleep 1800"],
+                "command": ["sh", "-c", "sleep infinity"],
                 "essential": true,
             }],
         }),

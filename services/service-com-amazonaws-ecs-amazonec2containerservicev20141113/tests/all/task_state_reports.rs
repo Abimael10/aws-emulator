@@ -998,7 +998,7 @@ async fn the_server_moves_a_task_whose_reports_are_refused() {
             "containerDefinitions": [{
                 "name": FIRST_CONTAINER,
                 "image": IMAGE,
-                "command": ["sleep", "3600"],
+                "command": ["sleep", "infinity"],
                 "essential": true,
             }],
         }),

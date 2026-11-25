@@ -537,7 +537,7 @@ async fn register_revision(router: &MultiServiceRouter, row: &Row) {
             "image": IMAGE,
             "essential": false,
             "memory": 128,
-            "command": ["/bin/sh", "-c", "sleep 600"],
+            "command": ["/bin/sh", "-c", "sleep infinity"],
             "healthCheck": health_check(probe, 1, None),
         }));
     }

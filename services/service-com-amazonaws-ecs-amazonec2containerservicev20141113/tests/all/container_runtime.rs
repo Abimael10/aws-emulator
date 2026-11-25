@@ -517,7 +517,7 @@ async fn a_stop_sends_the_container_the_signal_its_program_answers() {
         },
         Case {
             name: "no handler at all, so the signal ends the program",
-            command: &["sh", "-c", "echo up; sleep 3600"],
+            command: &["sh", "-c", "echo up; sleep infinity"],
             farewell: None,
             // "the exit status shall be 128 plus the signal number": SIGTERM is 15.
             exit_code: 143,

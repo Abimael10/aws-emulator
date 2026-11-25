@@ -18,12 +18,12 @@
 //!
 //! **And the gate REACHES that verdict whatever duration a container's program states.** The
 //! seconds in a container's `sleep` are a caller's word about how long its program took, not
-//! time this emulator spends: a program that states a wait and then goes on settles as
-//! promptly as one that states none, so a dependent is released, or failed, instead of being
-//! held for as long as some program's words. A wait a program ENDS on is the other thing: the
-//! container is waiting for something else to end it, which is how a container stays up, so it
-//! is honoured — which is what makes the HOLD observable here at all, because such a
-//! dependency is still `RUNNING` while its dependent waits behind it.
+//! time this emulator spends: a program that states a wait settles as promptly as one that
+//! states none, so a dependent is released, or failed, instead of being held for as long as
+//! some program's words. A wait a program goes round a LOOP on is the other thing: the
+//! container is waiting for something else, which is how a container stays up, so it is
+//! honoured — which is what makes the HOLD observable here at all, because such a dependency is
+//! still `RUNNING` while its dependent waits behind it.
 //!
 //! Only the assembled services can pin this: the jobs are placed on a MANAGED/FARGATE compute
 //! environment, each one's container RUNS AS an Amazon ECS task of that environment's cluster
@@ -33,9 +33,9 @@
 //! The rows differ along what the rule generalises over: HOW MANY jobs a dependent names
 //! (one, two, and a chain of three where the middle job is both), WHICH way each of them ends
 //! (a container that exits 0, one that exits non-zero, and a mix of the two), and WHAT the
-//! containers' programs state (a wait between two steps, a wait they end on, and no wait at
-//! all) — including a wait far longer than this suite's own deadline, which is what would hold
-//! the gate if a stated duration were spent.
+//! containers' programs state (a wait between two steps, a wait they go round a bounded loop
+//! on, and no wait at all) — including a wait far longer than this suite's own deadline, which
+//! is what would hold the gate if a stated duration were spent.
 //!
 //! What is NOT asserted here, because the owning crate's own suites assert it: the release of
 //! a dependent whose dependency a CALLER ended (`services/service-com-amazonaws-batch-
@@ -270,7 +270,8 @@ pub(crate) async fn network_of(router: &MultiServiceRouter) -> (String, String) 
 ///
 /// The `command` of each is an argument vector naming a shell and a program, which is how a
 /// job definition writes a script. They differ in WHAT the program states about its own time:
-/// one states a wait and then goes on, one ends on a wait, and one states none at all.
+/// one states a wait and then goes on, one goes round a bounded loop waiting, and one states
+/// none at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Program {
     /// States a wait BETWEEN its steps and then exits 0: a duration the program states, which
@@ -280,10 +281,11 @@ enum Program {
     /// The same, exiting non-zero: the status this container exited with is the status its job
     /// ends on.
     StatesAWaitThenFails,
-    /// ENDS on a wait, which is how a container stays up: the job running it is `RUNNING` for
-    /// as long as its program says before exiting 0. This is the dependency a row uses when it
+    /// Goes round a LOOP waiting, which is how a container stays up, for a bounded number of
+    /// trips and then exits 0: a wait inside a loop is honoured, so the job running it is
+    /// `RUNNING` for as long as those trips take. This is the dependency a row uses when it
     /// wants the HOLD to be observable.
-    EndsOnAWait,
+    WaitsRoundALoopThenEnds,
     /// States no wait at all and exits 0.
     ExitsAtOnce,
 }
@@ -294,7 +296,7 @@ impl Program {
         match self {
             Self::StatesAWaitThenSucceeds => "jd-states-a-wait-then-succeeds",
             Self::StatesAWaitThenFails => "jd-states-a-wait-then-fails",
-            Self::EndsOnAWait => "jd-ends-on-a-wait",
+            Self::WaitsRoundALoopThenEnds => "jd-waits-round-a-loop-then-ends",
             Self::ExitsAtOnce => "jd-exits-at-once",
         }
     }
@@ -307,10 +309,14 @@ impl Program {
             // stated rather than spent.
             Self::StatesAWaitThenSucceeds => vec!["/bin/sh", "-c", "sleep 600; exit 0"],
             Self::StatesAWaitThenFails => vec!["/bin/sh", "-c", "sleep 900; exit 9"],
-            // Three seconds is long enough for a dependent submitted beside this job to be
-            // seen waiting behind it (one span of the job plane's clock), and it is the
-            // program's LAST word, so it is honoured.
-            Self::EndsOnAWait => vec!["/bin/sh", "-c", "echo holding the container up; sleep 3"],
+            // Three trips of a second each is long enough for a dependent submitted beside
+            // this job to be seen waiting behind it (one span of the job plane's clock), and a
+            // wait a program goes round a LOOP on is honoured rather than stated.
+            Self::WaitsRoundALoopThenEnds => vec![
+                "/bin/sh",
+                "-c",
+                "echo holding the container up; for trip in 1 2 3; do sleep 1; done",
+            ],
             Self::ExitsAtOnce => vec!["/bin/sh", "-c", "exit 0"],
         }
     }
@@ -329,7 +335,7 @@ impl Program {
 const PROGRAMS: [Program; 4] = [
     Program::StatesAWaitThenSucceeds,
     Program::StatesAWaitThenFails,
-    Program::EndsOnAWait,
+    Program::WaitsRoundALoopThenEnds,
     Program::ExitsAtOnce,
 ];
 
@@ -350,7 +356,7 @@ struct Row {
 const ROWS: &[Row] = &[
     Row {
         case: "one dependency that succeeds",
-        dependencies: &[Program::EndsOnAWait],
+        dependencies: &[Program::WaitsRoundALoopThenEnds],
         dependent: Program::StatesAWaitThenSucceeds,
         released: true,
     },
@@ -362,19 +368,19 @@ const ROWS: &[Row] = &[
     },
     Row {
         case: "two dependencies that both succeed",
-        dependencies: &[Program::EndsOnAWait, Program::ExitsAtOnce],
+        dependencies: &[Program::WaitsRoundALoopThenEnds, Program::ExitsAtOnce],
         dependent: Program::ExitsAtOnce,
         released: true,
     },
     Row {
         case: "two dependencies, the second of which fails",
-        dependencies: &[Program::EndsOnAWait, Program::StatesAWaitThenFails],
+        dependencies: &[Program::WaitsRoundALoopThenEnds, Program::StatesAWaitThenFails],
         dependent: Program::ExitsAtOnce,
         released: false,
     },
     Row {
         case: "a dependent whose own container fails",
-        dependencies: &[Program::EndsOnAWait],
+        dependencies: &[Program::WaitsRoundALoopThenEnds],
         dependent: Program::StatesAWaitThenFails,
         released: true,
     },
@@ -620,7 +626,7 @@ async fn a_dependents_gate_holds_then_releases_or_fails_it() {
         &router,
         chain_case,
         "chain-first",
-        Program::EndsOnAWait.definition(),
+        Program::WaitsRoundALoopThenEnds.definition(),
         &[],
     )
     .await;
@@ -644,7 +650,8 @@ async fn a_dependents_gate_holds_then_releases_or_fails_it() {
     // THE HOLD, for every dependent at once and before anything is waited on: a dependent
     // leaves `SUBMITTED` for `PENDING` — not for `RUNNABLE` — while the job it waits on is
     // still unfinished, it echoes every id it waits on, and nothing of a run is reported for
-    // it. The job each hold is observed against is one whose program ENDS on a wait, so it is
+    // it. The job each hold is observed against is one whose program waits round a LOOP, so it
+    // is
     // still running by the time this walk reaches its row.
     for (case, dependent_id, waited_on) in ROWS
         .iter()
@@ -695,7 +702,7 @@ async fn a_dependents_gate_holds_then_releases_or_fails_it() {
 
         // THE DEPENDENCIES. Each one settles on its own container's exit status, whatever its
         // program stated about its own time — the row's first one, which the hold was observed
-        // against, ENDS on a wait and so really ran for it.
+        // against, waits round a LOOP and so really ran for it.
         let mut latest_stop = 0_i64;
         for (position, program) in row.dependencies.iter().enumerate() {
             let detail = until_terminal(&router, case, &waited_on[position]).await;
@@ -716,17 +723,18 @@ async fn a_dependents_gate_holds_then_releases_or_fails_it() {
                 panic!("case {case:?}: a job that ran reports stoppedAt, got {detail}")
             });
             latest_stop = latest_stop.max(stopped);
-            if *program == Program::EndsOnAWait {
+            if *program == Program::WaitsRoundALoopThenEnds {
                 let started = instant(&detail, "startedAt").unwrap_or_else(|| {
                     panic!("case {case:?}: a job that ran reports startedAt, got {detail}")
                 });
-                // A wait the program ENDS on is honoured, so the run really covers it: the
-                // bound is far under the three seconds the program states, which is what
-                // makes it safe on a loaded host.
+                // A wait a program goes round a LOOP on is honoured, so the run really covers
+                // it: the bound is far under the three trips of a second the program states,
+                // which is what makes it safe on a loaded host.
                 assert!(
                     stopped - started >= 1_000,
-                    "case {case:?}: a container that ends on a wait stays up for it, so its \
-                     job's run must span it, got startedAt {started} and stoppedAt {stopped}"
+                    "case {case:?}: a container waiting round a loop stays up for those trips, \
+                     so its job's run must span them, got startedAt {started} and stoppedAt \
+                     {stopped}"
                 );
             }
         }

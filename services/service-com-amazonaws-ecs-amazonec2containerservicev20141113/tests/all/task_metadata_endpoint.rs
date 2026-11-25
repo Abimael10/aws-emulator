@@ -150,7 +150,7 @@ fn reading_program() -> String {
             "wget -qO- ${METADATA_URI_VARIABLE}/stats; echo {MISSING_WGET_STATUS_LINE}$?"
         ),
         format!("echo {DONE_LINE}"),
-        "sleep 300".to_string(),
+        "sleep infinity".to_string(),
     ]
     .join("; ")
 }
@@ -491,7 +491,7 @@ fn probing_container(name: &str, probe: &str) -> Value {
         "name": name,
         "image": IMAGE,
         "memory": CONTAINER_MEMORY_MIB,
-        "command": ["sh", "-c", "sleep 300"],
+        "command": ["sh", "-c", "sleep infinity"],
         "healthCheck": {
             "command": ["CMD-SHELL", probe],
             "interval": PROBE_INTERVAL_SECONDS,

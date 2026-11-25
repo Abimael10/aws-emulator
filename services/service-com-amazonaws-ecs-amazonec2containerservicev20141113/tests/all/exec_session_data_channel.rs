@@ -175,7 +175,7 @@ impl Channel {
 /// Reachable from the suites beside this one, which launch tasks of the same shape.
 pub(crate) fn long_running_container(name: &str) -> Value {
     let mut definition = container(name, "public.ecr.aws/nginx/nginx:latest");
-    definition["command"] = json!(["sleep", "600"]);
+    definition["command"] = json!(["sleep", "infinity"]);
     definition
 }
 

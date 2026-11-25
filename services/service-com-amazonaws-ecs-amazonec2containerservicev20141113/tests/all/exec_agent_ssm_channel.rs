@@ -234,7 +234,7 @@ async fn exec_enabled_task(
     case: &str,
 ) -> String {
     let mut definition = container(CONTAINER, "public.ecr.aws/nginx/nginx:latest");
-    definition["command"] = json!(["sleep", "600"]);
+    definition["command"] = json!(["sleep", "infinity"]);
     ok(
         router,
         "RegisterTaskDefinition",

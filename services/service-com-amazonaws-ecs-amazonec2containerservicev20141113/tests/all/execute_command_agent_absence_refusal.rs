@@ -239,7 +239,7 @@ async fn register(router: &MultiServiceRouter, family: &str, role_arn: &str, cas
                 "name": CONTAINER,
                 "image": IMAGE,
                 "essential": true,
-                "command": ["sleep", "600"],
+                "command": ["sleep", "infinity"],
             }],
         }),
         case,

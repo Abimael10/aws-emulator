@@ -195,7 +195,7 @@ const ROWS: &[Row] = &[
     Row {
         // And a program that starts no server at all: its own line, and nothing else.
         case: "a program that starts no server at all",
-        command: &["sh", "-c", "echo up; sleep 300"],
+        command: &["sh", "-c", "echo up; sleep infinity"],
         prefix: "no-server",
         family: "server-startup-no-server",
         expected: &[Expected::Line("up")],

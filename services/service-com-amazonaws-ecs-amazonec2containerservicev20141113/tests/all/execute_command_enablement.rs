@@ -85,7 +85,7 @@ const POLL_BUDGET: Duration = Duration::from_secs(60);
 /// against them, rather than any assumption about how fast the host runs.
 fn long_running_container(name: &str) -> Value {
     let mut definition = container(name, "public.ecr.aws/nginx/nginx:latest");
-    definition["command"] = json!(["sleep", "600"]);
+    definition["command"] = json!(["sleep", "infinity"]);
     definition
 }
 

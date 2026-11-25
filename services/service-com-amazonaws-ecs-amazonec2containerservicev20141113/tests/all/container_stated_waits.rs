@@ -3,13 +3,13 @@
 //! What a duration a container's PROGRAM states costs this emulator, and what it does not.
 //!
 //! RULE under test: **the seconds in a container's `sleep` are a caller's word about how long
-//! its program took, so a wait the program states BETWEEN two of its own steps is taken as
-//! stated and the next step runs at once — the task stops on the status its program exited
-//! with, however many seconds that program said it waited. The wait a program has nothing left
-//! to do but sit in is another thing: a wait it ENDS on, one with no end of its own (`sleep
-//! infinity`) and one it goes round a LOOP on are the container waiting for something else to
-//! end it, which is how a container stays up, so those are honoured and the task goes on
-//! RUNNING.**
+//! its program took, so a wait the program STATES is taken as stated and what the program does
+//! next — its next step, or its own end — follows at once: the task stops on the status its
+//! program exited with, however many seconds that program said it waited. The wait a container
+//! has nothing but something OUTSIDE its program to end it is another thing: a wait with no end
+//! of its own (`sleep infinity`) and one the program goes round a LOOP on are the container
+//! waiting for something else to end it, which is how a container stays up, so those are
+//! honoured and the task goes on RUNNING.**
 //!
 //! Why the bound has to be this emulator's: a container's program is request-supplied, and
 //! everything that waits on its task waits with it — the AWS Batch job whose dependents are
@@ -28,9 +28,9 @@
 //!
 //! The rows differ along what the rule generalises over: WHERE the wait stands in the program
 //! (between two steps, among several, inside a branch that is followed by more, last, last
-//! after other steps, inside a loop, with no end of its own), HOW LONG it states (seconds far
-//! beyond this suite's whole budget, down to one second) and the FORM the container states it
-//! in (a shell program and a bare argument vector).
+//! after other steps, as the whole argument vector, inside a loop, with no end of its own), HOW
+//! LONG it states (seconds far beyond this suite's whole budget, down to one second) and the
+//! FORM the container states it in (a shell program and a bare argument vector).
 
 use std::time::{Duration, Instant};
 
@@ -54,8 +54,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(60);
 const POLL_BUDGET: Duration = Duration::from_secs(90);
 
 /// How long the rows that must GO ON running are watched, re-read inside the loop that spends
-/// it. Far under the thirty seconds those programs end on, so a run that honoured the wait is
-/// still running at the end of it however slowly the host got there.
+/// it. Their waits name no end of their own, so a run that honoured one is still running at the
+/// end of this window however slowly the host got there.
 const WATCH_WINDOW: Duration = Duration::from_secs(2);
 
 /// `Task$lastStatus` members this suite names.
@@ -68,10 +68,11 @@ const ESSENTIAL_CONTAINER_EXITED: &str = "EssentialContainerExited";
 /// What one row's program does with the time it states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ends {
-    /// The program states a wait and then goes ON: the task stops with this exit status, which
-    /// a run that SPENT the stated seconds could not reach inside [`POLL_BUDGET`].
+    /// The program states a wait and then goes on — to another step, or to its own end: the
+    /// task stops with this exit status, which a run that SPENT the stated seconds could not
+    /// reach inside [`POLL_BUDGET`].
     Exits(i64),
-    /// The program has nothing left to do but wait, so the container stays up and the task
+    /// The program's wait names no end of its own, so the container stays up and the task
     /// goes on RUNNING through [`WATCH_WINDOW`].
     RunsOn,
 }
@@ -108,14 +109,16 @@ const ROWS: &[Row] = &[
         ends: Ends::Exits(5),
     },
     Row {
+        // The wait is the last thing the program has to do, and it names an end of its own:
+        // the program comes to its end there, with the status the wait answered.
         case: "a wait the program ends on",
         command: &["/bin/sh", "-c", "echo up; sleep 30"],
-        ends: Ends::RunsOn,
+        ends: Ends::Exits(0),
     },
     Row {
         case: "a wait the program states as its whole argument vector",
         command: &["sleep", "30"],
-        ends: Ends::RunsOn,
+        ends: Ends::Exits(0),
     },
     Row {
         case: "a wait the program goes round a loop on",
@@ -194,8 +197,8 @@ fn exit_code_of(task: &Value, case: &str) -> Option<i64> {
     present_count(container, "exitCode", case)
 }
 
-/// RULE: a wait a program states between its own steps is stated, not spent; a wait it has
-/// nothing left to do but sit in keeps the container up.
+/// RULE: a wait a program states is stated, not spent; a wait that names no end of its own
+/// keeps the container up.
 #[tokio::test]
 async fn a_wait_a_program_states_between_its_steps_is_not_spent() {
     let router = service();
@@ -225,8 +228,9 @@ async fn a_wait_a_program_states_between_its_steps_is_not_spent() {
         launched.push((row, run_task(&router, &family, row.case).await));
     }
 
-    // The rows whose program goes ON: the task stops on the status that program exited with,
-    // inside a budget far shorter than the seconds it said it waited.
+    // The rows whose program goes on — to another step or to its own end: the task stops on
+    // the status that program exited with, inside a budget far shorter than the seconds it said
+    // it waited.
     for (row, arn) in &launched {
         let Ends::Exits(status) = row.ends else {
             continue;
@@ -246,8 +250,8 @@ async fn a_wait_a_program_states_between_its_steps_is_not_spent() {
         );
     }
 
-    // The rows whose program has nothing left to do but wait: each task reaches `RUNNING` and
-    // STAYS there. Watched in ONE loop over every such row, so the window is spent once
+    // The rows whose wait names no end of its own: each task reaches `RUNNING` and STAYS
+    // there. Watched in ONE loop over every such row, so the window is spent once
     // rather than once per row, and re-read INSIDE it, so what the assertion rests on is the
     // condition holding read after read.
     let waiting: Vec<(&Row, &String)> = launched
@@ -267,8 +271,8 @@ async fn a_wait_a_program_states_between_its_steps_is_not_spent() {
             assert_eq!(
                 string(&task, "lastStatus", case),
                 RUNNING,
-                "case {case:?}: a container with nothing left to do but wait stays up, so its \
-                 task goes on running, got {task}"
+                "case {case:?}: a container whose wait names no end of its own stays up, so \
+                 its task goes on running, got {task}"
             );
             assert_eq!(
                 exit_code_of(&task, case),

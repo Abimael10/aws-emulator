@@ -519,7 +519,7 @@ fn program(row: &Row) -> String {
     for line in row.matching_lines.iter().chain(row.quiet_lines) {
         written.push_str(&format!("echo \"{line}\"; "));
     }
-    format!("{written}sleep 3600")
+    format!("{written}sleep infinity")
 }
 
 /// The template one row deploys: the execution role Amazon ECS pulls as, the log group its

@@ -125,7 +125,7 @@ fn probing_container(probe: &str) -> Value {
         "name": "app",
         "image": "public.ecr.aws/amazonlinux/amazonlinux:latest",
         "memory": 128,
-        "command": ["sh", "-c", "sleep 300"],
+        "command": ["sh", "-c", "sleep infinity"],
         "essential": true,
         "healthCheck": {
             "command": ["CMD-SHELL", probe],

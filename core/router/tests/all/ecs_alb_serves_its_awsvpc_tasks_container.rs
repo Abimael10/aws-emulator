@@ -235,7 +235,7 @@ const ROWS: &[Row] = &[
         command: &[
             "/bin/sh",
             "-c",
-            "echo CONTAINER-SERVED-BODY > /usr/share/nginx/html/index.html && sleep 600",
+            "echo CONTAINER-SERVED-BODY > /usr/share/nginx/html/index.html && sleep infinity",
         ],
         port: 80,
         path: "/",

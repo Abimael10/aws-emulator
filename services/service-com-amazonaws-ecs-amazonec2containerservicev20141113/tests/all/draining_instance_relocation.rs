@@ -191,7 +191,7 @@ async fn draining_a_container_instance_relocates_the_service_task_it_hosts() {
                 "name": "worker",
                 "image": "public.ecr.aws/nginx/nginx:latest",
                 "memory": 128,
-                "command": ["sh", "-c", "sleep 300"],
+                "command": ["sh", "-c", "sleep infinity"],
             }],
         }),
         case,
