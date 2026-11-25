@@ -142,7 +142,15 @@ pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 
 /// One Amazon Cognito user pools call that must succeed (`awsJson1_1`, `POST /` with
 /// `X-Amz-Target`).
-async fn cognito(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
+///
+/// Shared with the suite that drives a subscription's group guard over the real-time endpoint
+/// ([`crate::graphql_api_realtime_group_guard_deferral`]), which puts a user in a group the
+/// pool already holds, so the tree holds ONE reading of how a user-pool call is made.
+pub(crate) async fn cognito(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> Value {
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("https://cognito-idp.{REGION}.amazonaws.com/"))
