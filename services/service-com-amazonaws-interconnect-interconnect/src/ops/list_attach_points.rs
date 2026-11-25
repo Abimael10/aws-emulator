@@ -116,6 +116,18 @@ impl crate::state::CursorRefusal for ListAttachPointsError {
     }
 }
 
+/// Which variant of this operation's error channel the unresolvable-environment refusal
+/// travels in. WHICH refusal that verdict calls for, and how it is worded, is
+/// `crate::state::environment_in_region_or_refuse`'s to say.
+impl crate::state::EnvironmentRefusal for ListAttachPointsError {
+    fn environment_not_found(message: String) -> Self {
+        ListAttachPointsErrorModeled::InterconnectClientException(InterconnectClientException {
+            message,
+        })
+        .into()
+    }
+}
+
 /// The `ListAttachPoints` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -190,26 +202,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )?;
 
         // The attach points are listed FOR an Environment, so the catalog record the
-        // `environmentId` names is what the listing is scoped by — looked up in the
-        // catalog of the Region this request was signed for, because an Environment
-        // produces connections that land in that Region alone. An id that Region's
-        // catalog does not hold, one of another Region's catalog included, has no
-        // Environment here to list anything for. An unresolvable environment is this
-        // service's own client fault — the caller named an environment model that does
-        // not exist — so it is the 400 `InterconnectClientException` every
-        // environment-resolving operation gives, never the connection-scoped not-found
-        // shape and never an empty page, which a caller could not tell from "this
-        // environment offers none". It is a verdict about what the request NAMES, so it
-        // is reached only once the request's own members have been judged above.
-        let Some(environment) = crate::state::environment_in_region(&region, &input.environment_id)
-        else {
-            return Err(ListAttachPointsErrorModeled::InterconnectClientException(
-                InterconnectClientException {
-                    message: crate::state::environment_not_found_message(&input.environment_id),
-                },
-            )
-            .into());
-        };
+        // `environmentId` names is what the listing is scoped by — resolved by the one
+        // judgement every operation whose SUBJECT is an Environment applies
+        // (`crate::state::environment_in_region_or_refuse`), in the catalog of the Region
+        // this request was signed for, because an Environment produces connections that
+        // land in that Region alone. An id that Region's catalog does not hold, one of
+        // another Region's catalog included, has no Environment here to list anything
+        // for, and that shared judgement also decides the class and the wording it is
+        // refused with — never an empty page, which a caller could not tell from "this
+        // environment offers none" — so this handler supplies only which variant of its
+        // own channel that refusal travels in. It is a verdict about what the request
+        // NAMES, so it is reached only once the request's own members have been judged
+        // above.
+        let environment = crate::state::environment_in_region_or_refuse::<ListAttachPointsError>(
+            &region,
+            &input.environment_id,
+        )?;
 
         // The ARN attach points this service owns itself (the Connections of this
         // endpoint that are already providing connectivity) come off the store under one

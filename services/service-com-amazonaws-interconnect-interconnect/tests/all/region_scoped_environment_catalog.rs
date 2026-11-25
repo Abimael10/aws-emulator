@@ -18,6 +18,12 @@
 //! crate's suites sign for plus four more on four other continents, so no row's Region
 //! is the harness default by accident — and, inside each Region, over every Environment
 //! its own catalog offers.
+//!
+//! The last suite here pins the other half of that rule: the three operations whose
+//! SUBJECT is an Environment (the per-id read, the attach-point listing and the create)
+//! resolve an id through ONE judgement, so they answer an unresolvable one with ONE
+//! answer — the same status, the same code and the same sentence, compared against each
+//! other rather than each against a constant — and serve a resolvable one.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -231,6 +237,192 @@ async fn an_environment_of_another_region_resolves_nowhere_else() {
             0,
             "case {region:?}: expected the refused creates to have placed nothing, got {:?}",
             listed["connections"]
+        );
+    }
+}
+
+/// Every `environmentId` a row is refused for, as `(shape, id)`.
+///
+/// Each fits the `@length(min: 1, max: 64)` the model gives `EnvironmentId`
+/// (`smithy_query(query="shape",shape="EnvironmentId")`, which puts no pattern on it),
+/// and the rows differ in what makes them unresolvable: the shortest and the longest id
+/// the member may carry, a published id of this Region with its case changed, a
+/// published id with one more character on it, a plausible id of a partner no catalog
+/// publishes, and text that is not of this service's id form at all. `offered` is an id
+/// the called Region's catalog DOES hold, so the near-miss rows are near misses of a
+/// real one.
+fn unresolvable_id_shapes(offered: &str) -> Vec<(String, String)> {
+    let (min, max) = ENVIRONMENT_ID_LENGTH;
+    vec![
+        (
+            "the shortest id the member may carry".to_string(),
+            "x".repeat(min),
+        ),
+        (
+            "the longest id the member may carry".to_string(),
+            "e".repeat(max),
+        ),
+        (
+            "a published id of this Region in upper case".to_string(),
+            offered.to_ascii_uppercase(),
+        ),
+        (
+            "a published id of this Region with one character appended".to_string(),
+            format!("{offered}0"),
+        ),
+        (
+            "a plausible id of a partner no catalog publishes".to_string(),
+            "env-csp-unknownpartner-us-east-1".to_string(),
+        ),
+        (
+            "text that is not an id of this service at all".to_string(),
+            "not-an-environment".to_string(),
+        ),
+    ]
+}
+
+/// The `(status, code, message)` each operation whose SUBJECT is an Environment answers
+/// `environment_id` with, through the endpoint of `region`.
+///
+/// `attach_point` and `bandwidth` are ones the Region's own catalog takes, so what any
+/// of these answers is about the `environmentId` alone.
+async fn environment_subject_answers(
+    emulator: &Emulator,
+    region: &str,
+    environment_id: &str,
+    attach_point: &str,
+    bandwidth: &str,
+) -> Vec<(&'static str, (u16, String, String))> {
+    let requests = [
+        ("GetEnvironment", json!({ "id": environment_id })),
+        (
+            "ListAttachPoints",
+            json!({ "environmentId": environment_id }),
+        ),
+        (
+            "CreateConnection",
+            json!({
+                "environmentId": environment_id,
+                "bandwidth": bandwidth,
+                "attachPoint": { "directConnectGateway": attach_point },
+            }),
+        ),
+    ];
+    let mut answers = Vec::new();
+    for (operation, request) in requests {
+        let (status, body) = emulator.ic_in(region, operation, request).await;
+        answers.push((operation, (status, code(&body), message(&body))));
+    }
+    answers
+}
+
+/// RULE: an `environmentId` is resolved in the called Region's catalog by ONE judgement
+/// shared by every operation whose SUBJECT is an Environment, so the per-id read, the
+/// attach-point listing and the create cannot disagree about whether an id resolves, nor
+/// about the class and the wording of the refusal when it does not.
+#[tokio::test]
+async fn every_environment_subject_operation_answers_one_verdict() {
+    let emulator = Emulator::new();
+    let by_region = catalogs(&emulator).await;
+    // An attach point the account really holds, so nothing below is refused for the
+    // attach point instead of the Environment.
+    let attach_point = emulator.attach_point().await;
+
+    for (region, catalog) in &by_region {
+        let offered = ids_of(catalog);
+        let creatable = creatable_environments(catalog);
+        let environment = creatable
+            .first()
+            .expect("every Region's catalog offers an Environment that takes a connection")
+            .clone();
+        let environment_id = text(&environment, "environmentId");
+        let bandwidth = available_bandwidths(&environment)
+            .into_iter()
+            .next()
+            .expect("a creatable Environment offers a bandwidth");
+
+        for (shape, id) in unresolvable_id_shapes(&environment_id) {
+            let case = format!("{region} / {shape} ({id})");
+            let (min, max) = ENVIRONMENT_ID_LENGTH;
+            let length = id.chars().count();
+            assert!(
+                (min..=max).contains(&length),
+                "case {case:?}: expected the row to fit an EnvironmentId of length {min}..{max}, got {length}"
+            );
+            assert!(
+                !offered.contains(&id),
+                "case {case:?}: expected the row to be outside this Region's catalog, got one it offers"
+            );
+
+            let answers = environment_subject_answers(
+                &emulator,
+                region,
+                &id,
+                &attach_point,
+                &bandwidth,
+            )
+            .await;
+            let (first_operation, first) = answers
+                .first()
+                .cloned()
+                .expect("three operations were asked");
+            for (operation, answer) in &answers {
+                // ONE verdict: every operation's answer is the same answer, compared
+                // against its neighbour's and not only against a constant.
+                assert_eq!(
+                    answer, &first,
+                    "case {case:?}: expected {operation} to answer exactly what {first_operation} answers ({first:?}), got {answer:?}"
+                );
+            }
+            // And that one answer is the refusal this service gives an unresolvable
+            // environment: HTTP 400, `InterconnectClientException`, worded from the id
+            // the request carried.
+            let (status, reported_code, reported_message) = first;
+            assert_environment_not_found(
+                &case,
+                &id,
+                status,
+                &json!({ "__type": reported_code, "message": reported_message }),
+            );
+        }
+
+        // The same seam SERVES a resolvable id, through each of the three operations: the
+        // read reports the catalog record, the attach-point listing is served for it, and
+        // a connection is placed on it.
+        let fetched = emulator.environment_in(region, &environment_id).await;
+        assert_eq!(
+            fetched, environment,
+            "case {region:?}/{environment_id:?}: expected GetEnvironment to report the listed record, got {fetched:?}"
+        );
+        let listed = emulator
+            .ic_ok_in(
+                region,
+                "ListAttachPoints",
+                json!({ "environmentId": environment_id }),
+            )
+            .await;
+        assert!(
+            listed["attachPoints"].is_array(),
+            "case {region:?}/{environment_id:?}: expected a served attach-point page, got {listed:?}"
+        );
+        let mut request = Map::new();
+        request.insert("environmentId".to_string(), json!(environment_id));
+        request.insert("bandwidth".to_string(), json!(bandwidth));
+        request.insert(
+            "attachPoint".to_string(),
+            json!({ "directConnectGateway": attach_point }),
+        );
+        if let Some(remote_account) = crate::emulator::remote_account_for(&environment) {
+            request.insert("remoteAccount".to_string(), remote_account);
+        }
+        let created = emulator
+            .ic_ok_in(region, "CreateConnection", Value::Object(request))
+            .await;
+        assert_eq!(
+            text(&created["connection"], "environmentId"),
+            environment_id,
+            "case {region:?}/{environment_id:?}: expected the connection to be placed on the resolved Environment, got {:?}",
+            created["connection"]["environmentId"]
         );
     }
 }

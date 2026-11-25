@@ -2553,6 +2553,43 @@ pub fn environment_in_region(region: &str, environment_id: &str) -> Option<Envir
     environment_catalog(region).remove(environment_id)
 }
 
+/// The refusal an ENVIRONMENT-RESOLUTION verdict can call for, in the error channel of
+/// the operation that asked for it.
+///
+/// Every operation of this service carries its own modelled error enum, so the rule
+/// deciding WHICH refusal an `environmentId` (or `GetEnvironment$id`) that resolves to
+/// nothing calls for and what it says lives once — in
+/// [`environment_in_region_or_refuse`] — and an operation whose SUBJECT is an Environment
+/// supplies only this: which variant of its own channel that refusal travels in. A
+/// handler therefore cannot classify or word this refusal differently from its
+/// neighbour.
+pub trait EnvironmentRefusal: Sized {
+    /// The called Region's catalog holds no Environment for the id the request carried,
+    /// and no operation creates one, so there is nothing to synthesize for it: naming an
+    /// environment model that does not exist is this service's own client fault, which
+    /// is the modelled `InterconnectClientException` (HTTP 400), worded by
+    /// [`environment_not_found_message`].
+    fn environment_not_found(message: String) -> Self;
+}
+
+/// Resolve the Environment an operation whose SUBJECT is an Environment was called for,
+/// refusing the call when the catalog of `region` holds no such record.
+///
+/// The ONE judgement every environment-resolving operation of this service applies, so
+/// which `environmentId`s a caller may address — and how an unresolvable one is answered
+/// — does not depend on which of them it called. The id is resolved in the catalog of
+/// the Region the request was signed for ([`environment_in_region`]), because an
+/// Environment produces connections that land in that Region alone, so an id out of
+/// ANOTHER Region's catalog is refused exactly as an id no catalog holds at all is: it
+/// names an Environment whose connections this endpoint cannot place.
+pub fn environment_in_region_or_refuse<E: EnvironmentRefusal>(
+    region: &str,
+    environment_id: &str,
+) -> Result<Environment, E> {
+    environment_in_region(region, environment_id)
+        .ok_or_else(|| E::environment_not_found(environment_not_found_message(environment_id)))
+}
+
 /// The `AttachPointType` a descriptor for a Direct Connect gateway carries.
 ///
 /// `AttachPointDescriptor$type` is "the type of this AttachPoint, which will dictate the

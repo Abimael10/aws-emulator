@@ -144,6 +144,18 @@ impl crate::state::direct_connect::AttachPointRefusal for CreateConnectionError 
     }
 }
 
+/// Which variant of this operation's error channel the unresolvable-environment refusal
+/// travels in. WHICH refusal that verdict calls for, and how it is worded, is
+/// `crate::state::environment_in_region_or_refuse`'s to say.
+impl crate::state::EnvironmentRefusal for CreateConnectionError {
+    fn environment_not_found(message: String) -> Self {
+        CreateConnectionErrorModeled::InterconnectClientException(InterconnectClientException {
+            message,
+        })
+        .into()
+    }
+}
+
 /// The `CreateConnection` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -278,22 +290,19 @@ fn judge_against_store(
     }
 
     // The Environment dictates the partner, the location and the product type,
-    // none of which the request carries. It is resolved in the catalog of the Region
+    // none of which the request carries. It is resolved by the one judgement every
+    // operation whose SUBJECT is an Environment applies
+    // (`crate::state::environment_in_region_or_refuse`), in the catalog of the Region
     // this create was signed for, because an Environment produces connections that
     // land in that Region alone: an id this endpoint's catalog does not hold — one of
     // another Region's catalog included — has nothing to create a connection across,
-    // and naming one is this service's own client fault: the 400
-    // `InterconnectClientException` every environment-resolving operation gives, with
-    // the message built from the requested id.
-    let Some(environment) = crate::state::environment_in_region(region, &input.environment_id)
-    else {
-        return Err(CreateConnectionErrorModeled::InterconnectClientException(
-            InterconnectClientException {
-                message: crate::state::environment_not_found_message(&input.environment_id),
-            },
-        )
-        .into());
-    };
+    // and that shared judgement also decides the class and the wording naming one is
+    // refused with, so this handler supplies only which variant of its own channel
+    // that refusal travels in.
+    let environment = crate::state::environment_in_region_or_refuse::<CreateConnectionError>(
+        region,
+        &input.environment_id,
+    )?;
 
     // `EnvironmentState`: only an environment that is not `unavailable` can take
     // new connections ("available: the environment is available and new

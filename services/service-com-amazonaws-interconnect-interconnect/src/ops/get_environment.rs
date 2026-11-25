@@ -95,6 +95,18 @@ impl From<GetEnvironmentErrorModeled> for GetEnvironmentError {
     }
 }
 
+/// Which variant of this operation's error channel the unresolvable-environment refusal
+/// travels in. WHICH refusal that verdict calls for, and how it is worded, is
+/// `crate::state::environment_in_region_or_refuse`'s to say.
+impl crate::state::EnvironmentRefusal for GetEnvironmentError {
+    fn environment_not_found(message: String) -> Self {
+        GetEnvironmentErrorModeled::InterconnectClientException(InterconnectClientException {
+            message,
+        })
+        .into()
+    }
+}
+
 /// The `GetEnvironment` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -141,21 +153,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Region and nothing of this service's own store is read or written here.
         let _ = &self.engine;
 
-        // There is nothing to synthesize for an id that Region's catalog does not hold,
-        // because no operation creates an Environment: an unresolvable environment is
-        // this service's own client fault, so it is the 400 `InterconnectClientException`
-        // every environment-resolving operation gives, with the message built from the
-        // requested id. An id out of ANOTHER Region's catalog is answered that way too —
-        // it names an Environment whose connections land somewhere this endpoint cannot
-        // place them.
-        let Some(environment) = crate::state::environment_in_region(&region, &input.id) else {
-            return Err(GetEnvironmentErrorModeled::InterconnectClientException(
-                InterconnectClientException {
-                    message: crate::state::environment_not_found_message(&input.id),
-                },
-            )
-            .into());
-        };
+        // The id is resolved by the one judgement every operation whose SUBJECT is an
+        // Environment applies (`crate::state::environment_in_region_or_refuse`), which
+        // also decides the class and the wording an id that Region's catalog does not
+        // hold is refused with, so this handler supplies only which variant of its own
+        // channel that refusal travels in. An id out of ANOTHER Region's catalog is
+        // refused there too — it names an Environment whose connections land somewhere
+        // this endpoint cannot place them.
+        let environment = crate::state::environment_in_region_or_refuse::<GetEnvironmentError>(
+            &region,
+            &input.id,
+        )?;
         Ok(GetEnvironmentOutput { environment })
     }
 }
