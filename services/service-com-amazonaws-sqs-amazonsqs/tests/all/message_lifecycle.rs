@@ -1147,6 +1147,9 @@ async fn the_retained_message_bytes_and_count_are_bounded() {
         MAX_MESSAGES_PER_QUEUE, MAX_RETAINED_MESSAGE_BYTES, MAX_RETAINED_MESSAGE_BYTES_PER_QUEUE,
     };
     const MIB: usize = 1024 * 1024;
+    /// How many entries one batch send carries: "delivers up to ten messages to the
+    /// specified queue" (`SendMessageBatch`).
+    const BATCH_ENTRIES: usize = 10;
 
     // Per-queue byte budget: 1 MiB bodies until the budget is full, then a refusal.
     let sqs = Emulator::new();
@@ -1224,19 +1227,24 @@ async fn the_retained_message_bytes_and_count_are_bounded() {
          got {status} {answer:?}"
     );
 
-    // Per-queue message count: tiny bodies, so only the count can bind.
+    // Per-queue message count: tiny bodies, so only the count can bind. Sent in batches
+    // of the ten entries one batch send accepts, because the ceiling is an order of
+    // magnitude above the thousand-message workloads a queue is filled by.
     let sqs = Emulator::new();
     let url = sqs.create_queue("count-budget").await;
-    for index in 0..MAX_MESSAGES_PER_QUEUE {
+    for batch in 0..MAX_MESSAGES_PER_QUEUE / BATCH_ENTRIES {
+        let entries: Vec<Value> = (0..BATCH_ENTRIES)
+            .map(|entry| json!({ "Id": entry.to_string(), "MessageBody": "x" }))
+            .collect();
         let (status, answer) = sqs
             .call(
-                "SendMessage",
-                &json!({ "QueueUrl": url, "MessageBody": "x" }),
+                "SendMessageBatch",
+                &json!({ "QueueUrl": url, "Entries": entries }),
             )
             .await;
         assert_eq!(
             status, 200,
-            "case message {index}: expected acceptance below the bound, got {status} {answer:?}"
+            "case batch {batch}: expected acceptance below the bound, got {status} {answer:?}"
         );
     }
     let (status, answer) = sqs
@@ -1250,6 +1258,219 @@ async fn the_retained_message_bytes_and_count_are_bounded() {
         (403, "OverLimit"),
         "case one message past the bound: got {status} {answer:?}"
     );
+}
+
+/// What a queue takes when NOBODY HAS DRAINED IT: a producer running ahead of its
+/// consumer.
+///
+/// The RULE asserted here: **Amazon SQS places no bound on how many messages a queue
+/// holds, so a send is never refused because the queue has already accepted a thousand
+/// of them.** The one depth quota Amazon SQS publishes is on messages IN FLIGHT —
+/// "approximately 120,000" for a standard queue — and it is answered on a RECEIVE, not
+/// on a send; a queue's stored depth is bounded by nothing a client can read off the
+/// API, so every send a producer makes is taken, every message it was told was accepted
+/// is still there, and a drain hands all of them back. A fan-out subscriber is exactly
+/// this producer's reader: one message per published event arrives before anything
+/// consumes them, and the publisher is told its batch was accepted either way — so a
+/// send refused for depth is a message lost with nothing reporting it.
+///
+/// The rows span what the rule generalises over: how DEEP the queue gets (just past the
+/// thousand a batch workload is built from, and twice it) and the FORM the depth is
+/// reached in (one `SendMessage` per message, batches of ten, and a queue that was
+/// already holding messages when the workload started). Each row asserts that every send
+/// was accepted, that the queue reports the depth it was sent, and that a drain hands
+/// back exactly the bodies that were sent — no message dropped, none invented.
+///
+/// This store's OWN ceilings are the subject of
+/// [`the_retained_message_bytes_and_count_are_bounded`] above, which is where the depth
+/// ceiling kept clear of these workloads is pinned; this test is about the depth a client
+/// reaches.
+#[tokio::test]
+async fn an_undrained_queue_takes_every_send_and_hands_all_of_them_back() {
+    /// How many entries one batch send carries: "delivers up to ten messages to the
+    /// specified queue" (`SendMessageBatch`).
+    const BATCH_ENTRIES: usize = 10;
+    /// How many messages one receive asks for: "Valid values: 1 to 10"
+    /// (`ReceiveMessageRequest$MaxNumberOfMessages`).
+    const RECEIVE_AT_ONCE: usize = 10;
+    /// The depth a batch workload of a thousand events reaches on a subscriber's queue,
+    /// which is the figure the rows are built around.
+    const BATCH_WORKLOAD: usize = 1_000;
+
+    /// One row: the case, how many messages the producer sends, how many the queue was
+    /// already holding when it started, and whether the workload is sent in batches.
+    struct Row {
+        case: &'static str,
+        sent: usize,
+        held: usize,
+        batched: bool,
+    }
+    let rows: [Row; 4] = [
+        Row {
+            case: "one past the thousand a batch workload is built from",
+            sent: BATCH_WORKLOAD + 1,
+            held: 0,
+            batched: false,
+        },
+        Row {
+            case: "a thousand onto a queue already holding messages",
+            sent: BATCH_WORKLOAD,
+            held: 5,
+            batched: true,
+        },
+        Row {
+            case: "twice the batch workload",
+            sent: 2 * BATCH_WORKLOAD,
+            held: 0,
+            batched: true,
+        },
+        Row {
+            case: "a batch workload sent one message at a time",
+            sent: BATCH_WORKLOAD,
+            held: 0,
+            batched: false,
+        },
+    ];
+
+    for row in rows {
+        let Row {
+            case,
+            sent,
+            held,
+            batched,
+        } = row;
+        let sqs = Emulator::new();
+        let url = sqs.create_queue("undrained").await;
+
+        // Send `bodies`, requiring every one to be accepted: one `SendMessage` per
+        // message, or batches of the ten entries one batch send carries.
+        let send = |bodies: Vec<String>, batched: bool| {
+            let sqs = &sqs;
+            let url = url.clone();
+            async move {
+                if !batched {
+                    for body in bodies {
+                        let (status, answer) = sqs
+                            .call(
+                                "SendMessage",
+                                &json!({ "QueueUrl": &url, "MessageBody": body }),
+                            )
+                            .await;
+                        assert_eq!(
+                            status, 200,
+                            "case {case}: a send answered {status} {answer:?}"
+                        );
+                        assert!(
+                            answer["MessageId"].as_str().is_some_and(|id| !id.is_empty()),
+                            "case {case}: an accepted send reported no MessageId: {answer:?}"
+                        );
+                    }
+                    return;
+                }
+                for batch in bodies.chunks(BATCH_ENTRIES) {
+                    let entries: Vec<Value> = batch
+                        .iter()
+                        .enumerate()
+                        .map(|(entry, body)| {
+                            json!({ "Id": entry.to_string(), "MessageBody": body })
+                        })
+                        .collect();
+                    let (status, answer) = sqs
+                        .call(
+                            "SendMessageBatch",
+                            &json!({ "QueueUrl": &url, "Entries": entries }),
+                        )
+                        .await;
+                    assert_eq!(
+                        status, 200,
+                        "case {case}: a batch send answered {status} {answer:?}"
+                    );
+                    let successful = answer["Successful"]
+                        .as_array()
+                        .map_or(0, std::vec::Vec::len);
+                    let failed = answer["Failed"].as_array().map_or(0, std::vec::Vec::len);
+                    assert_eq!(
+                        (successful, failed),
+                        (batch.len(), 0),
+                        "case {case}: a batch send of {} entries reported {successful} \
+                         successful and {failed} failed: {answer:?}",
+                        batch.len()
+                    );
+                }
+            }
+        };
+
+        // What the queue is already holding: an earlier publication its consumer has not
+        // read yet.
+        let holding: Vec<String> = (0..held).map(|index| format!("held-{index}")).collect();
+        send(holding.clone(), true).await;
+        let bodies: Vec<String> = (0..sent).map(|index| format!("sent-{index:06}")).collect();
+        send(bodies.clone(), batched).await;
+
+        // The queue reports the depth it was sent: nothing was dropped to make room.
+        let depth = sqs.count(&url, "ApproximateNumberOfMessages").await;
+        assert_eq!(
+            depth,
+            (sent + held).to_string(),
+            "case {case}: expected the queue to hold the {} messages it was sent, it \
+             reports {depth}",
+            sent + held
+        );
+
+        // And a drain hands back exactly what was sent, each message once.
+        let mut received: Vec<String> = Vec::new();
+        loop {
+            let (status, answer) = sqs
+                .call(
+                    "ReceiveMessage",
+                    &json!({ "QueueUrl": &url, "MaxNumberOfMessages": RECEIVE_AT_ONCE }),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case}: ReceiveMessage answered {status} {answer:?}"
+            );
+            let messages = answer["Messages"].as_array().cloned().unwrap_or_default();
+            if messages.is_empty() {
+                break;
+            }
+            for message in messages {
+                received.push(message["Body"].as_str().unwrap_or_default().to_string());
+                let receipt = message["ReceiptHandle"].as_str().unwrap_or_default();
+                let (status, answer) = sqs
+                    .call(
+                        "DeleteMessage",
+                        &json!({ "QueueUrl": &url, "ReceiptHandle": receipt }),
+                    )
+                    .await;
+                assert_eq!(
+                    status, 200,
+                    "case {case}: DeleteMessage answered {status} {answer:?}"
+                );
+            }
+        }
+        assert_eq!(
+            received.len(),
+            sent + held,
+            "case {case}: expected {} messages from the drain, got {}",
+            sent + held,
+            received.len()
+        );
+        let expected: std::collections::BTreeSet<&str> = bodies
+            .iter()
+            .chain(holding.iter())
+            .map(String::as_str)
+            .collect();
+        let got: std::collections::BTreeSet<&str> =
+            received.iter().map(String::as_str).collect();
+        let missing: Vec<&&str> = expected.difference(&got).collect();
+        let foreign: Vec<&&str> = got.difference(&expected).collect();
+        assert!(
+            missing.is_empty() && foreign.is_empty(),
+            "case {case}: the drain must hand back exactly what was sent — missing \
+             {missing:?}, foreign {foreign:?}"
+        );
+    }
 }
 
 /// A FIFO queue serves the message plane like any other queue — the FIFO rules

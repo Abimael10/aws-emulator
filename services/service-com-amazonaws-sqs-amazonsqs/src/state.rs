@@ -757,10 +757,27 @@ pub fn queues_quota_message(name: &str) -> String {
 /// accepted.
 pub const MAX_RECENTLY_DELETED_NAMES: usize = MAX_QUEUES;
 
-/// How many messages one queue holds. `MessageRetentionPeriod` is an AWS duration
-/// (4 days by default, up to 14), far longer than an emulator session, so it does not
-/// bound memory on its own: `SendMessage` refuses past this.
-pub const MAX_MESSAGES_PER_QUEUE: usize = 1_000;
+/// How many messages one queue holds — this emulator's own ceiling, kept CLEAR of the
+/// depth a client's workload reaches.
+///
+/// Amazon SQS bounds nothing by how many messages a queue has ALREADY accepted — a queue
+/// holds as many as a producer sends it — and the one depth quota it publishes is on
+/// messages IN FLIGHT, "approximately 120,000" for a standard queue, which a RECEIVE is
+/// answered `OverLimit` past. So a send is never refused because the queue a consumer has
+/// not drained yet is deep: a producer running ahead of its consumer is the ordinary use
+/// of a queue, and a fan-out subscriber's queue holds one message per published event
+/// until something drains it.
+///
+/// This figure is therefore a memory guard and nothing a client can read off the API, and
+/// it sits an order of magnitude above the depth those workloads reach — a batch
+/// publication of a thousand events, plus whatever its queue was already holding — rather
+/// than at the round number such a workload is built from, where it would refuse exactly
+/// the sends that workload makes. `MessageRetentionPeriod` is an AWS duration (4 days by
+/// default, up to 14), far longer than an emulator session, so it does not bound memory on
+/// its own, and the BYTE budgets below ([`MAX_RETAINED_MESSAGE_BYTES_PER_QUEUE`] per queue
+/// and [`MAX_RETAINED_MESSAGE_BYTES`] across every queue) bound what the store holds
+/// whatever the depth.
+pub const MAX_MESSAGES_PER_QUEUE: usize = 10_000;
 
 /// How many message bytes one queue holds, so a few large messages are bounded as well
 /// as many small ones.
@@ -907,7 +924,13 @@ pub const MAX_MESSAGE_ATTRIBUTES: usize = 10;
 /// are bounded by this emulator rather than by what it holds, exactly as the deleted ones
 /// are: past the bound the handles superseded earliest are forgotten, and a caller
 /// presenting one of those is answered for a handle this queue no longer recognises.
-pub const MAX_SUPERSEDED_HANDLES_PER_QUEUE: usize = MAX_MESSAGES_PER_QUEUE;
+///
+/// A figure of its own rather than the queue's depth ceiling
+/// ([`MAX_MESSAGES_PER_QUEUE`]), and the same one the deduplication tokens carry: a
+/// superseded handle is DERIVED data bounded by EVICTION, so what the store may hold of it
+/// is a choice about memory on its own, and it is not covered by the message BYTE budgets
+/// below, which count what a message carries.
+pub const MAX_SUPERSEDED_HANDLES_PER_QUEUE: usize = 1_000;
 
 /// How many receipt handles one queue remembers as deleted (see
 /// [`Queue::deleted_handles`]).
@@ -916,8 +939,10 @@ pub const MAX_SUPERSEDED_HANDLES_PER_QUEUE: usize = MAX_MESSAGES_PER_QUEUE;
 /// past this bound the queue forgets the handles it retired first. Like a deduplication
 /// token, a retired handle is derived data whose only effect is answering a repeat of a
 /// delete that already succeeded, so forgetting one loses nothing a client was told had
-/// been accepted.
-pub const MAX_DELETED_HANDLES_PER_QUEUE: usize = MAX_MESSAGES_PER_QUEUE;
+/// been accepted — which is why this is a figure of its own and not the queue's depth
+/// ceiling ([`MAX_MESSAGES_PER_QUEUE`]), bounded by eviction and not by the message BYTE
+/// budgets below.
+pub const MAX_DELETED_HANDLES_PER_QUEUE: usize = 1_000;
 
 /// How many deduplication tokens one queue remembers. A token outlives the message it
 /// suppressed ("Amazon SQS continues to keep track of the message deduplication ID even
