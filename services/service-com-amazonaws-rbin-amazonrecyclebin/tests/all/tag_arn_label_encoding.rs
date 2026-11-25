@@ -8,12 +8,13 @@
 //! that to hold; `:` is legal unencoded in a path segment (RFC 3986 `pchar`), and a
 //! percent escape is case-insensitive. The rule under test: the ARN the service minted
 //! resolves to its rule whichever of those forms a client sends, and a rule carrying no
-//! tags reports `Tags` as a PRESENT empty array rather than omitting the member — a
+//! tags OMITS the optional `Tags` member rather than reporting an empty array — a
 //! distinction a map- or list-defaulting assertion cannot see.
 //!
 //! `tests/all/resource_tags.rs` covers the tag sets, the upsert/removal rules and the
-//! quota; this suite covers only the addressing and the empty-list shape, over the
-//! encodings an SDK or a hand-rolled client may produce.
+//! quota, and `tests/all/reported_tags_member.rs` the presence of the member over the
+//! whole class of tag sets; this suite covers only the addressing, over the encodings an
+//! SDK or a hand-rolled client may produce, and the one untagged shape.
 
 use std::sync::Arc;
 
@@ -97,11 +98,17 @@ async fn rule_with_tags(router: &MultiServiceRouter, case: &str, tags: Value) ->
         .to_string()
 }
 
-/// The `Tags` list of a response, as `(Key, Value)` pairs.
+/// The `Tags` list of a response, as `(Key, Value)` pairs. A response with NO `Tags`
+/// member reports no tag assignment at all, which is the empty set of pairs.
 fn tag_pairs(body: &Value) -> Vec<(String, String)> {
+    match body.get("Tags") {
+        None | Some(Value::Null) => return Vec::new(),
+        Some(Value::Array(_)) => {}
+        Some(other) => panic!("expected Tags to be absent or a list, got {other:?}"),
+    }
     body["Tags"]
         .as_array()
-        .unwrap_or_else(|| panic!("expected Tags to be an array, got {:?}", body["Tags"]))
+        .expect("Tags checked to be a list just above")
         .iter()
         .map(|tag| {
             (
@@ -166,7 +173,7 @@ async fn the_resource_arn_label_resolves_however_the_client_escaped_it() {
 }
 
 #[tokio::test]
-async fn an_untagged_rule_reports_tags_as_a_present_empty_array() {
+async fn an_untagged_rule_omits_the_tags_member() {
     let router = router();
     // Both ways a rule can end up holding no tags: created with an empty list, and
     // created with tags that are then all unassigned.
@@ -207,10 +214,11 @@ async fn an_untagged_rule_reports_tags_as_a_present_empty_array() {
             status, 200,
             "case {case:?}: expected HTTP 200, got {status} / {listed:?}"
         );
-        // `Tags` is a modelled list, so it is PRESENT as an empty array — not omitted.
+        // `Tags` reports the tags ASSIGNED to the rule, and this rule has no assignment
+        // to report: the optional member is absent, not present as an empty array.
         assert!(
-            listed["Tags"].is_array(),
-            "case {case:?}: expected Tags to be reported as an array, got {:?}",
+            listed.get("Tags").is_none_or(Value::is_null),
+            "case {case:?}: expected no Tags member at all, got {:?}",
             listed["Tags"]
         );
         assert!(

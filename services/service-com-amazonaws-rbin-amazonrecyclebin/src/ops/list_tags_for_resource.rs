@@ -171,10 +171,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // The tag list is reported even when empty: `Tags` is a modelled list, so an
-        // untagged rule answers `[]` rather than omitting the member.
+        // The tags assigned to the rule are reported through the one normalisation every
+        // renderer of that member shares: the stored assignments when the rule carries
+        // any, and no `Tags` member at all when it carries none — an untagged rule has no
+        // tag assignment to report, and an absent optional member is not an empty list.
         Ok(ListTagsForResourceOutput {
-            tags: Some(rule.tags.clone()),
+            tags: rule.reported_tags(),
         })
     }
 }

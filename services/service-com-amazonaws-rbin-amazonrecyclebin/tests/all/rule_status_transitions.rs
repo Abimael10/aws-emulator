@@ -62,8 +62,9 @@ fn status_of(body: &Value) -> &str {
 
 /// A response's `Tags` as a key -> value map, or `None` when the member is ABSENT —
 /// the difference this suite is about, so an absent member and an empty list are not
-/// collapsed into one another.
-fn tags_of(body: &Value) -> Option<BTreeMap<String, String>> {
+/// collapsed into one another. `pub(crate)` so every suite of this target that has to
+/// tell those two apart reads the member through this one reader.
+pub(crate) fn tags_of(body: &Value) -> Option<BTreeMap<String, String>> {
     match body.get("Tags") {
         None | Some(Value::Null) => None,
         Some(Value::Array(list)) => Some(

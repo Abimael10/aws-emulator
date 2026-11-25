@@ -384,6 +384,22 @@ impl Rule {
         }
     }
 
+    /// The `Tags` member every response that reports this rule's own tags carries: the
+    /// stored tag assignments when the rule has any, and NOTHING at all when it has none.
+    ///
+    /// `Tags` is the same optional member, documented the same way — "Information about
+    /// the tags assigned to the retention rule" — on every shape that reports it, read
+    /// off the one [`Self::tags`] field. A rule carrying no tags has no tag assignment to
+    /// report, so the member is left unset rather than serialized as an empty list: an
+    /// absent optional member and a present empty collection are different on the wire.
+    /// The normalisation lives here, in one place, so no two renderers of this one field
+    /// can answer differently for the same rule. (The resource-SELECTION members —
+    /// `ResourceTags` / `ExcludeResourceTags` — are reported either way: they are always
+    /// part of a rule's record, empty or not.)
+    pub fn reported_tags(&self) -> Option<Vec<Tag>> {
+        (!self.tags.is_empty()).then(|| self.tags.clone())
+    }
+
     /// Whether the rule's lock still forbids modifying or deleting it.
     ///
     /// Per the model: `locked` cannot be modified or deleted; `pending_unlock` has

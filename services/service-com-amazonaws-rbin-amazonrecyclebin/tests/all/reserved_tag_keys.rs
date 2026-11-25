@@ -162,17 +162,23 @@ pub(crate) async fn stored_tags(router: &MultiServiceRouter, case: &str, rule_ar
         status, 200,
         "case {case:?}: ListTagsForResource returned {status} / {listed:?}"
     );
-    let mut out: Vec<(String, String)> = listed["Tags"]
-        .as_array()
-        .unwrap_or_else(|| panic!("case {case:?}: expected Tags to be an array, got {listed:?}"))
-        .iter()
-        .map(|tag| {
-            (
-                tag["Key"].as_str().unwrap_or_default().to_string(),
-                tag["Value"].as_str().unwrap_or_default().to_string(),
-            )
-        })
-        .collect();
+    let mut out: Vec<(String, String)> = match listed.get("Tags") {
+        // A rule holding no tags has no tag assignment to report, so the optional member
+        // is ABSENT: that is the empty tag set, not a malformed body.
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(list)) => list
+            .iter()
+            .map(|tag| {
+                (
+                    tag["Key"].as_str().unwrap_or_default().to_string(),
+                    tag["Value"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect(),
+        Some(other) => {
+            panic!("case {case:?}: expected Tags to be absent or a list, got {other:?}")
+        }
+    };
     out.sort();
     out
 }
