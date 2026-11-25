@@ -7,34 +7,37 @@
 //! `Endpoint` is "The connection endpoint for the created cluster"
 //! (`smithy_query(query="operation", operation="CreateCluster")`) and `ClusterVpcEndpoint`
 //! is "The VPC connection endpoint for the cluster": neither is a label a client reads, but
-//! a host it then DIALS to reach that cluster's data plane. So the only thing either member
-//! may carry is an address THIS emulator answers on — the host of the one
-//! endpoint it serves its whole surface at ([`addressing::served_endpoint_authority`]).
+//! a host it then DIALS to reach that cluster's data plane. So neither may name anything
+//! outside this emulator — a name in a zone Amazon Web Services publishes its own endpoints
+//! in ([`addressing::AWS_ENDPOINT_DNS_SUFFIXES`]) resolves nowhere near this process or,
+//! worse, at genuine infrastructure, so a client handed one leaves the emulated environment
+//! carrying the credentials it holds and reaches no cluster at all.
 //!
-//! A name in a zone Amazon Web Services publishes its own endpoints in
-//! ([`addressing::AWS_ENDPOINT_DNS_SUFFIXES`]) resolves nowhere near this process or, worse,
-//! at genuine infrastructure, so a client handed one leaves the emulated environment
-//! carrying the credentials it holds and reaches no cluster at all. A name of this
-//! emulator's OWN invention is no better: nothing answers for a sub-name of the host this
-//! process is reached at, so a client that resolves one reaches nothing either.
+//! What the two members differ in is WHOSE address they are. The cluster's own `endpoint` is
+//! the address this process answers its data plane on, so it is the host of the one endpoint
+//! it serves its whole surface at ([`addressing::served_endpoint_authority`]) and nothing
+//! built around the cluster. A cluster's VPC connection endpoint is the PRIVATE access path
+//! to that one cluster, which Amazon Web Services gives a name of its own — the cluster's
+//! identifier, the endpoint service in front of it and its Region — so it is composed from
+//! the stored cluster ([`cluster_vpc_endpoint`]) under the zone this emulator may announce
+//! its own names in ([`announced_zone`]), the loopback zone RFC 6761 reserves for the
+//! interface the core binds its listeners on. Each cluster therefore has a VPC host of its
+//! own, two reads of one cluster report one host, and the name still leads back here.
 //!
-//! ONE host therefore answers for every cluster here, and for every access path to it, where
-//! Amazon Web Services gives each cluster — and each path — a dedicated name: this process
-//! serves its whole surface at a single endpoint, and
-//! which cluster a session is on is what the connection itself carries. The member is a
-//! HOSTNAME and nothing else — no scheme, no path and no port, which is also all
-//! `Endpoint`'s and `ClusterVpcEndpoint`'s `^[a-zA-Z0-9.-]+$` admit ([`is_endpoint_host`]) —
-//! so a client dials it on
-//! the database's own port, exactly as it does the name Amazon Web Services publishes.
+//! The member is a HOSTNAME and nothing else — no scheme, no path and no port, which is also
+//! all `Endpoint`'s and `ClusterVpcEndpoint`'s `^[a-zA-Z0-9.-]+$` admit
+//! ([`is_endpoint_host`]) — so a client dials it on the database's own port, exactly as it
+//! does the name Amazon Web Services publishes.
 //!
-//! What the two members do NOT share is a NAME: which endpoint service fronts a cluster is a
-//! name and not an address, so it is derived from the cluster's own stored endpoint-service
-//! suffix ([`crate::state::vpc_endpoint_service_name`]) rather than from where this process
-//! answers.
+//! What neither carries is the endpoint service's NAME: which endpoint service fronts a
+//! cluster is a name and not an address, so it is derived from the cluster's own stored
+//! endpoint-service suffix ([`crate::state::vpc_endpoint_service_name`]) rather than from
+//! where this process answers.
 //!
-//! Nothing of a request moves the answer: where this emulator is served is a property of the
-//! PROCESS and not of the host a request happened to carry, so the address the create
-//! publishes and the address every later read reports cannot drift from one another.
+//! Nothing of a request moves either answer: where this emulator is served is a property of
+//! the PROCESS and not of the host a request happened to carry, and the cluster half is read
+//! off the stored cluster, so the address the create publishes and the address every later
+//! read reports cannot drift from one another.
 
 use ::service_common::data_plane_addressing as addressing;
 
@@ -42,11 +45,11 @@ use ::service_common::data_plane_addressing as addressing;
 /// `ctx`: the host of the one endpoint this process answers on, with no port and no path
 /// ([`announced_host`]).
 ///
-/// The reading for EVERY address of a cluster this service reports — `CreateCluster`'s and
-/// `GetCluster`'s `endpoint`, and `GetVpcEndpointServiceName`'s `clusterVpcEndpoint`, which
-/// is likewise a host a client resolves and then dials (see this module's docs) — so the
-/// access paths Amazon Web Services gives dedicated names cannot drift onto addresses this
-/// process does not answer on.
+/// The reading for the address of the cluster's own DATA PLANE — `CreateCluster`'s and
+/// `GetCluster`'s `endpoint`, the host a client opens a database session on — so the address
+/// the create publishes cannot drift onto one this process does not answer on. The cluster's
+/// VPC connection endpoint is a name of the cluster's own and is composed instead
+/// ([`cluster_vpc_endpoint`]).
 ///
 /// What it is read from is the tree's one statement of where this emulator answers
 /// ([`::smithy_server_runtime::OperationContext::endpoint`], "the base URL a later request
@@ -79,13 +82,77 @@ pub fn announced_host(served_base: &str) -> String {
 
 /// Whether `value` is a host `Endpoint`'s `^[a-zA-Z0-9.-]+$` admits
 /// (`smithy_query(query="shape", shape="Endpoint")`), which `ClusterVpcEndpoint` — the member
-/// `GetVpcEndpointServiceName` reports the same stored host in — declares too.
+/// `GetVpcEndpointServiceName` reports a cluster's VPC connection endpoint in — declares too.
 #[must_use]
 pub fn is_endpoint_host(value: &str) -> bool {
     !value.is_empty()
         && value
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-'))
+}
+
+/// The DNS ZONE this emulator may announce a name of its OWN in, for an emulator whose own
+/// endpoint is `served_base`: read off the authority that base names
+/// ([`addressing::announced_zone_of_authority`]), which answers the loopback zone for a
+/// process reached at an address literal, at no endpoint at all, or at a host Amazon Web
+/// Services publishes its own endpoints at.
+///
+/// RFC 6761 reserves `localhost` and "any names falling within `.localhost.`" for the
+/// loopback interface the core binds its listeners on, so a name this service announces
+/// under that zone resolves to this process rather than to anything of Amazon Web Services'
+/// own.
+#[must_use]
+pub fn announced_zone(served_base: &str) -> String {
+    let served = addressing::served_endpoint_authority(served_base).unwrap_or_default();
+    addressing::announced_zone_of_authority(&served)
+}
+
+/// The VPC CONNECTION endpoint of one cluster, for the emulator serving `ctx`
+/// ([`vpc_endpoint_host`]).
+#[must_use]
+pub fn cluster_vpc_endpoint(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    identifier: &str,
+    endpoint_service_suffix: &str,
+    region: &str,
+) -> String {
+    vpc_endpoint_host(
+        ctx.endpoint().as_str(),
+        identifier,
+        endpoint_service_suffix,
+        region,
+    )
+}
+
+/// The VPC CONNECTION endpoint of one cluster: the cluster's own `identifier` as the leading
+/// label, the `dsql-` label carrying that cluster's endpoint-service suffix — the same suffix
+/// the reply's `serviceName` names the endpoint service by
+/// ([`crate::state::vpc_endpoint_service_name`]) — the cluster's Region, and the zone an
+/// emulator served at `served_base` announces its own names in ([`announced_zone`]).
+///
+/// `ClusterVpcEndpoint` is "The VPC connection endpoint for the cluster"
+/// (`smithy_query(query="doc", shape="GetVpcEndpointServiceNameOutput",
+/// member="clusterVpcEndpoint")`): a cluster's PRIVATE access path has a name of its own, so
+/// the host names the cluster it fronts and the endpoint service in front of it — two reads
+/// of one cluster name one host, and two clusters are never reported under the same one. The
+/// zone is this emulator's rather than one Amazon Web Services serves, so the name leads back
+/// to this process and no client resolving it leaves the emulated environment.
+///
+/// Every label is folded through [`addressing::dns_label`], so no value a request carried can
+/// make the announced host name an authority the caller chose, and the result is a host
+/// `ClusterVpcEndpoint`'s `^[a-zA-Z0-9.-]+$` admits ([`is_endpoint_host`]).
+#[must_use]
+pub fn vpc_endpoint_host(
+    served_base: &str,
+    identifier: &str,
+    endpoint_service_suffix: &str,
+    region: &str,
+) -> String {
+    let identifier = addressing::dns_label(identifier);
+    let service = addressing::dns_label(&format!("dsql-{endpoint_service_suffix}"));
+    let region = addressing::dns_label(region);
+    let zone = announced_zone(served_base);
+    format!("{identifier}.{service}.{region}.{zone}")
 }
 
 #[cfg(test)]
@@ -155,6 +222,58 @@ mod tests {
                 admitted, *want,
                 "case {case:?}: expected {want:?} for {value:?}, got {admitted:?}"
             );
+        }
+    }
+
+    /// RULE: a cluster's VPC connection endpoint names that cluster — its identifier as the
+    /// leading label, then the endpoint service in front of it and the cluster's Region —
+    /// under the zone this emulator announces its own names in, whatever base it is served
+    /// at.
+    ///
+    /// The rows span the bases an emulator is served at (a loopback literal, a name, one
+    /// with no port, a routable address, no endpoint at all, and a base in a zone Amazon Web
+    /// Services serves) and the Regions a cluster is minted in.
+    #[test]
+    fn a_clusters_vpc_endpoint_names_the_cluster_under_this_emulators_zone() {
+        let loopback = addressing::LOOPBACK_ZONE;
+        let identifier = "01m7n6yw08s3kcvvjfgrbp7esk";
+        let suffix = "7cwu";
+        // (case, the base this emulator is served at, the zone it announces in)
+        let bases: &[(&str, &str, &str)] = &[
+            ("a loopback literal", "https://127.0.0.1:9297", loopback),
+            ("a name with a port", "https://emulator.test:39355", "emulator.test"),
+            ("a name with no port", "https://emulator-host", "emulator-host"),
+            ("a routable address", "https://198.51.100.7:8443", loopback),
+            (
+                "an emulator served on no port",
+                ::smithy_server_runtime::UNSERVED_URL_BASE,
+                loopback,
+            ),
+            (
+                "a base in a zone Amazon Web Services serves",
+                "https://dsql.us-west-2.on.aws",
+                loopback,
+            ),
+        ];
+        for (case, base, zone) in bases {
+            for region in ["us-east-1", "eu-west-1", "ap-southeast-2"] {
+                let host = vpc_endpoint_host(base, identifier, suffix, region);
+                let want = format!("{identifier}.dsql-{suffix}.{region}.{zone}");
+                assert_eq!(
+                    host, want,
+                    "case {case:?} in {region}: expected {want:?}, got {host:?}"
+                );
+                assert!(
+                    is_endpoint_host(&host),
+                    "case {case:?} in {region}: {host:?} must satisfy ClusterVpcEndpoint's \
+                     pattern"
+                );
+                assert!(
+                    !addressing::addresses_an_aws_endpoint(&host),
+                    "case {case:?} in {region}: {host:?} must name no endpoint of Amazon Web \
+                     Services' own"
+                );
+            }
         }
     }
 }

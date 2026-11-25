@@ -10,11 +10,10 @@
 //! associated with this job"); the lines each child's container writes are delivered to that
 //! child's OWN CloudWatch Logs stream — the one `AttemptContainerDetail$logStreamName` names
 //! for it, "the name of the CloudWatch Logs log stream that's associated with the container" —
-//! one event per line, as the container wrote them; and a `ListJobs` selection by `arrayJobId`
-//! "lists all child jobs from within the specified array", whatever status each child is in,
-//! while the implicit `RUNNING` default belongs to a listing of a job QUEUE ("the job status
-//! used to filter jobs in the specified queue … If you don't specify a status, only `RUNNING`
-//! jobs are returned").**
+//! one event per line, as the container wrote them; and a `ListJobs` that names no `jobStatus`
+//! answers only the `RUNNING` jobs of whatever it selected ("the job status used to filter jobs
+//! in the specified queue … If you don't specify a status, only `RUNNING` jobs are returned"),
+//! so the children of an array are enumerated by asking for the status they are in.**
 //!
 //! Two things a client does with an array job therefore work: it can read the output of a named
 //! child, and it can enumerate the children at all.
@@ -340,9 +339,9 @@ async fn listed(router: &MultiServiceRouter, case: &str, request: &Value) -> Vec
 }
 
 /// RULE: each array child's container writes its own lines — labelled by the index AWS Batch
-/// sets for it — into the stream `DescribeJobs` names for that child, and `ListJobs` by
-/// `arrayJobId` enumerates every child whatever status it is in while a listing of the QUEUE
-/// keeps the documented `RUNNING` default.
+/// sets for it — into the stream `DescribeJobs` names for that child, and `ListJobs` keeps the
+/// documented `RUNNING` default for a listing that names no status, whether that listing
+/// selects the array parent's children or the whole queue.
 #[tokio::test]
 async fn every_array_child_writes_its_own_index_to_its_own_log_stream() {
     let case = "an array of three children";
@@ -492,10 +491,22 @@ async fn every_array_child_writes_its_own_index_to_its_own_log_stream() {
         "case {case:?}: expected every child counted as {SUCCEEDED}, got {parent}"
     );
 
-    // And the children are ENUMERABLE: a listing by `arrayJobId` lists all of them, whatever
-    // status each is in — every one of them is terminal by now, so none is `RUNNING`.
+    // And the children are ENUMERABLE: a listing by `arrayJobId` keeps the documented
+    // `RUNNING` default, so it answers none of them now that every one is terminal, while
+    // the status they are in lists them all.
     let children = listed(&router, case, &json!({"arrayJobId": &parent_id})).await;
-    let mut indexes: Vec<i64> = children
+    assert!(
+        children.is_empty(),
+        "case {case:?}: a listing that names no status answers only {RUNNING} jobs, got \
+         {children:?}"
+    );
+    let every_child = listed(
+        &router,
+        case,
+        &json!({"arrayJobId": &parent_id, "jobStatus": SUCCEEDED}),
+    )
+    .await;
+    let mut indexes: Vec<i64> = every_child
         .iter()
         .filter_map(|child| child["arrayProperties"]["index"].as_i64())
         .collect();
@@ -503,21 +514,11 @@ async fn every_array_child_writes_its_own_index_to_its_own_log_stream() {
     assert_eq!(
         indexes,
         (0..SIZE).collect::<Vec<i64>>(),
-        "case {case:?}: expected every child listed by arrayJobId, got {children:?}"
+        "case {case:?}: expected every child listed by arrayJobId, got {every_child:?}"
     );
 
-    // A status the caller NAMES selects, in that same listing.
-    let succeeded = listed(
-        &router,
-        case,
-        &json!({"arrayJobId": &parent_id, "jobStatus": SUCCEEDED}),
-    )
-    .await;
-    assert_eq!(
-        succeeded.len(),
-        usize::try_from(SIZE).unwrap_or_default(),
-        "case {case:?}: expected the {SUCCEEDED} children, got {succeeded:?}"
-    );
+    // A status the caller NAMES selects, in that same listing — and one no child is in
+    // selects nothing.
     let running = listed(
         &router,
         case,

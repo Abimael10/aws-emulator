@@ -27,7 +27,9 @@ use service_com_amazonaws_dsql_dsql::state::{
     RecordedCall, TokenScope, MAX_CLUSTERS, MAX_CREATE_TOKENS, MAX_RETIRED_CLUSTERS,
     STATUS_DELETED,
 };
-use service_common::data_plane_addressing::{AWS_ENDPOINT_DNS_SUFFIXES, LOOPBACK_ZONE};
+use service_common::data_plane_addressing::{
+    announced_zone_of_authority, AWS_ENDPOINT_DNS_SUFFIXES, LOOPBACK_ZONE,
+};
 
 use crate::harness::{
     absent_identifier, expected_arn, is_cluster_id, wait_for_the_clock, Dsql,
@@ -328,13 +330,13 @@ fn is_endpoint(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
 }
 
-/// RULE: every response that reports an address a client dials to reach a cluster —
-/// `CreateCluster`'s own answer, the retry a repeated `clientToken` replays, `GetCluster`'s
-/// read of the stored cluster and the `clusterVpcEndpoint` `GetVpcEndpointServiceName`
-/// reports — names the host THIS emulator is served at, so a client that dials the value
-/// reaches this process. Never a host in a zone Amazon Web Services publishes its own
-/// endpoints in, and never a name of this emulator's own invention, whatever Region the
-/// request is signed for.
+/// RULE: every response that reports the address a client dials to reach a cluster's data
+/// plane — `CreateCluster`'s own answer, the retry a repeated `clientToken` replays and
+/// `GetCluster`'s read of the stored cluster — names the host THIS emulator is served at, so
+/// a client that dials the value reaches this process; and the `clusterVpcEndpoint`
+/// `GetVpcEndpointServiceName` reports names the CLUSTER, under the zone this emulator
+/// announces its own names in. Never a host in a zone Amazon Web Services publishes its own
+/// endpoints in, whatever Region the request is signed for.
 #[tokio::test]
 async fn every_reported_cluster_endpoint_names_this_emulators_own_host() {
     for (base, announced) in ENDPOINT_BASES {
@@ -378,11 +380,6 @@ async fn every_reported_cluster_endpoint_names_this_emulators_own_host() {
                     fetched.str("endpoint"),
                     announced.to_string(),
                 ),
-                (
-                    "GetVpcEndpointServiceName's clusterVpcEndpoint",
-                    fronted.str("clusterVpcEndpoint"),
-                    announced.to_string(),
-                ),
             ] {
                 assert_eq!(
                     reported, wanted,
@@ -400,6 +397,34 @@ async fn every_reported_cluster_endpoint_names_this_emulators_own_host() {
                          Services' own ({suffix}), got {reported:?}"
                     );
                 }
+            }
+
+            // The VPC access path is a name of the CLUSTER's, in the zone this emulator may
+            // announce a name of its own in — read through the one helper the service reads it
+            // through, so the expectation cannot drift from the handler's own reading.
+            let zone = announced_zone_of_authority(announced);
+            let vpc_host = fronted.str("clusterVpcEndpoint");
+            assert!(
+                vpc_host.starts_with(&format!("{identifier}.")),
+                "case {case:?}: clusterVpcEndpoint must name the cluster {identifier:?}, got \
+                 {vpc_host:?}"
+            );
+            assert!(
+                vpc_host.ends_with(&format!(".{region}.{zone}")),
+                "case {case:?}: clusterVpcEndpoint must end in the cluster's Region and this \
+                 emulator's zone ({region}.{zone}), got {vpc_host:?}"
+            );
+            assert!(
+                is_endpoint(&vpc_host),
+                "case {case:?}: clusterVpcEndpoint must satisfy ^[a-zA-Z0-9.-]+$, got \
+                 {vpc_host:?}"
+            );
+            for suffix in AWS_ENDPOINT_DNS_SUFFIXES {
+                assert!(
+                    !vpc_host.ends_with(suffix),
+                    "case {case:?}: clusterVpcEndpoint must name no endpoint of Amazon Web \
+                     Services' own ({suffix}), got {vpc_host:?}"
+                );
             }
             assert_eq!(
                 replayed.str("identifier"),

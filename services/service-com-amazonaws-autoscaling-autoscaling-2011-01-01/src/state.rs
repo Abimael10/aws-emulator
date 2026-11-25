@@ -141,7 +141,8 @@ pub mod lifecycle_actions;
 
 pub use lifecycle_actions::{
     abandoned_launch_cause, abandoned_lifecycle_action_message, no_active_action_by_instance_message,
-    no_active_action_by_token_message, not_addressed_message, HeldStep, HeldTransition,
+    no_active_action_by_token_message, no_active_action_under_hook_message, not_addressed_message,
+    HeldStep, HeldTransition,
     LifecycleActionEnding, LifecycleActionKey, LifecycleActionRefusal, LifecycleActionResolution,
     PendingLifecycleActionEvent, StoredLifecycleAction, LAUNCH_LIFECYCLE_ACTION,
     LIFECYCLE_PENDING_PROCEED, LIFECYCLE_PENDING_WAIT, LIFECYCLE_TERMINATING_PROCEED,

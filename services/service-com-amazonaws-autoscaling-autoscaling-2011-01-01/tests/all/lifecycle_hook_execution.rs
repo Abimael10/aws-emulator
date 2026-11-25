@@ -594,9 +594,10 @@ enum Addressed {
     Nothing,
 }
 
-/// RULE 4: a callback addressed at no held action is refused naming the IDENTIFIER of the
-/// action it addressed and nothing else — the token when it named one, and otherwise the
-/// INSTANCE it named, never the hook the lookup happened to be made under.
+/// RULE 4: a callback addressed at no held action is refused naming the half of the address
+/// that matched nothing — the token when it named one, otherwise the INSTANCE it named, and
+/// the hook BESIDE that instance exactly when the instance is still held by an outstanding
+/// action of some OTHER hook, which makes the named hook the half that found nothing.
 ///
 /// The rows differ along which half of the address matched nothing — including a group the
 /// account does not hold, which holds no active action either — and each row is driven
@@ -634,6 +635,9 @@ async fn a_callback_naming_no_held_action_says_which_half_matched_nothing() {
         // A token the service never minted, in the shape the member is modelled in.
         let unknown_token = "00000000-0000-4000-8000-000000000000";
         let absent_instance = "i-0123456789abcdef0";
+        // A hook name the group does not carry, for the row whose HOOK is the half of the
+        // address that matches nothing.
+        let absent_hook = "not-a-hook";
         if *addressed == Addressed::ConsumedAction || *addressed == Addressed::DeletedHook {
             complete(&router, case, &group, hook, &[
                 ("LifecycleActionToken", token.as_str()),
@@ -660,9 +664,14 @@ async fn a_callback_naming_no_held_action_says_which_half_matched_nothing() {
         }
 
         let (addressing, expected): (Vec<(&str, &str)>, String) = match addressed {
+            // The instance is STILL held, at the group's own hook, so the hook this row
+            // names is the half of the address that matched nothing and is named too.
             Addressed::AnotherHook => (
                 vec![("InstanceId", instance_id.as_str())],
-                format!("No active Lifecycle Action found with instance ID {instance_id}"),
+                format!(
+                    "No active Lifecycle Action found with instance ID {instance_id} and \
+                     HookName {absent_hook}"
+                ),
             ),
             Addressed::ConsumedAction | Addressed::DeletedHook => (
                 vec![("InstanceId", instance_id.as_str())],
@@ -692,7 +701,7 @@ async fn a_callback_naming_no_held_action_says_which_half_matched_nothing() {
         // The hook the call names: the one holding nothing for the row that is about the hook
         // half of the address, and the group's own hook otherwise.
         let named_hook = if *addressed == Addressed::AnotherHook {
-            "not-a-hook"
+            absent_hook
         } else {
             hook
         };
@@ -724,10 +733,126 @@ async fn a_callback_naming_no_held_action_says_which_half_matched_nothing() {
                 ("ValidationError".to_string(), expected.clone()),
                 "case {case:?} through {door}: got {body}"
             );
-            assert!(
-                !message.contains(named_hook),
-                "case {case:?} through {door}: the refusal must not name the hook \
-                 {named_hook:?}, got {message:?}"
+            // The hook appears in the sentence only where the instance is still held by
+            // another hook's action; every other row's instance holds nothing, so its
+            // refusal names the identifier it addressed and nothing else.
+            let names_the_hook = *addressed == Addressed::AnotherHook;
+            assert_eq!(
+                message.contains(named_hook),
+                names_the_hook,
+                "case {case:?} through {door}: the refusal must {} name the hook \
+                 {named_hook:?}, got {message:?}",
+                if names_the_hook { "" } else { "not" }
+            );
+        }
+    }
+}
+
+/// WHICH hook a callback that is refused under a still-held instance names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnderHook {
+    /// A hook the group does not carry at all.
+    Absent,
+    /// The group's own hook whose action the caller already consumed, while another of its
+    /// hooks goes on holding the instance.
+    Consumed,
+    /// A hook of the group installed for the OTHER transition, which holds this launch
+    /// nothing.
+    OtherTransition,
+}
+
+/// RULE 4b: while an instance is still held by an outstanding action, a callback that looks
+/// for its action under a hook holding NONE of it is refused with the hook-qualified
+/// sentence — the fixed text around the request's own `InstanceId` and `LifecycleHookName` —
+/// and the holds it did not address are left exactly as they were.
+///
+/// The rows differ along WHY the named hook holds nothing (a hook the group never had, one
+/// whose own action this caller consumed, one installed for the other transition) and along
+/// how many other hooks are still holding the instance, because the sentence is about the
+/// hook the call named and not about how many others hold it. Each row is driven through
+/// BOTH doors that take the address.
+#[tokio::test]
+async fn a_callback_under_a_hook_holding_nothing_names_that_hook() {
+    let rows: &[(&str, UnderHook, usize)] = &[
+        ("a hook the group does not carry, one hook holding", UnderHook::Absent, 1),
+        ("a hook the group does not carry, two hooks holding", UnderHook::Absent, 2),
+        ("a hook whose own action was consumed", UnderHook::Consumed, 2),
+        ("a hook installed for the other transition", UnderHook::OtherTransition, 1),
+    ];
+
+    for (index, (case, under, holding)) in rows.iter().enumerate() {
+        let (router, engine, subnet) = fixture().await;
+        let group = format!("asg-under-hook-{index}");
+        create_group(&router, case, &group, &subnet, 0, &[]).await;
+        // The launch hooks that HOLD the instance, and — for the row about it — one hook of
+        // the other transition, which holds a launch nothing.
+        let holders: Vec<String> = (0..*holding).map(|n| format!("hold-{n}")).collect();
+        for holder in &holders {
+            put_hook(&router, case, &group, holder, LAUNCHING, CONTINUE).await;
+        }
+        if *under == UnderHook::OtherTransition {
+            put_hook(&router, case, &group, "teardown", TERMINATING, CONTINUE).await;
+        }
+        set_capacity(&router, case, &group, 1).await;
+        let instances = poll_states(&router, case, &group, PENDING_WAIT, 1).await;
+        let instance_id = instances
+            .first()
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: the held instance must be reported"));
+
+        // The hook the refused call names: one the group never had, one whose own action
+        // this caller consumes below, or one of the other transition.
+        let named_hook = match under {
+            UnderHook::Absent => "no-such-hook".to_string(),
+            UnderHook::Consumed => holders[0].clone(),
+            UnderHook::OtherTransition => "teardown".to_string(),
+        };
+        if *under == UnderHook::Consumed {
+            complete(&router, case, &group, &named_hook, &[
+                ("InstanceId", instance_id.as_str()),
+                ("LifecycleActionResult", CONTINUE),
+            ])
+            .await;
+        }
+        let held_before = held_actions(&engine, &group);
+        assert!(
+            !held_before.is_empty(),
+            "case {case:?}: the instance must still be held by another hook, got {held_before:?}"
+        );
+
+        let expected = format!(
+            "No active Lifecycle Action found with instance ID {instance_id} and HookName \
+             {named_hook}"
+        );
+        for door in ["CompleteLifecycleAction", "RecordLifecycleActionHeartbeat"] {
+            let mut params: Vec<(&str, &str)> = vec![
+                ("AutoScalingGroupName", group.as_str()),
+                ("LifecycleHookName", named_hook.as_str()),
+                ("InstanceId", instance_id.as_str()),
+            ];
+            if door == "CompleteLifecycleAction" {
+                params.push(("LifecycleActionResult", CONTINUE));
+            }
+            let (status, body) = query(&router, door, &params).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?} through {door}: expected HTTP 400, got {status} with {body:?}"
+            );
+            assert_eq!(
+                refusal_of(&body),
+                ("ValidationError".to_string(), expected.clone()),
+                "case {case:?} through {door}: got {body}"
+            );
+            assert_eq!(
+                held_actions(&engine, &group),
+                held_before,
+                "case {case:?} through {door}: a refused callback releases nothing"
+            );
+            let states = reported_states(&router, case, &group).await;
+            assert_eq!(
+                states,
+                vec![PENDING_WAIT.to_string()],
+                "case {case:?} through {door}: the instance must stay held, got {states:?}"
             );
         }
     }

@@ -11,9 +11,11 @@
 //! The endpoint service's NAME is DERIVED from the persisted cluster — its region and
 //! the endpoint-service suffix it was minted with — through
 //! [`crate::state::vpc_endpoint_service_name`], so two reads of one cluster agree and a
-//! read invents nothing. The connection ENDPOINT beside it is an ADDRESS a client dials,
-//! so it is the host this emulator answers on ([`crate::state::cluster_endpoint`]), the
-//! same value every report of the cluster's own `endpoint` carries.
+//! read invents nothing. The VPC connection ENDPOINT beside it is composed from that same
+//! stored cluster ([`crate::state::cluster_vpc_endpoint`]): the cluster's identifier, the
+//! endpoint service in front of it and the cluster's region, under the zone this emulator
+//! announces its own names in — so the host names the cluster whose private access path it
+//! is, and resolves back to this process.
 //!
 //! ## Shape of an operation
 //!
@@ -197,13 +199,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &region,
                 &cluster.vpc_endpoint_service_suffix,
             ),
-            // "The VPC connection endpoint for the cluster": an address a client
-            // DIALS, so the only thing it may carry is the host this emulator
-            // answers on — the very value every report of this cluster's
-            // `endpoint` carries (`crate::state::cluster_endpoint`). A per-cluster
-            // name of this emulator's own invention resolves nowhere near this
-            // process, so a client handed one reaches no cluster at all.
-            cluster_vpc_endpoint: Some(crate::state::cluster_endpoint(ctx)),
+            // "The VPC connection endpoint for the cluster": the PRIVATE access path to
+            // this one cluster, which has a name of its own — the cluster's identifier,
+            // the endpoint service in front of it and the cluster's Region — composed from
+            // the stored cluster under the zone this emulator announces its own names in
+            // (`crate::state::cluster_vpc_endpoint`), so the host names the cluster and
+            // still leads back to this process.
+            cluster_vpc_endpoint: Some(crate::state::cluster_vpc_endpoint(
+                ctx,
+                &cluster.identifier,
+                &cluster.vpc_endpoint_service_suffix,
+                &region,
+            )),
         })
     }
 }

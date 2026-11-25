@@ -5,10 +5,11 @@
 //! The RULE under test: the operation reports the VPC endpoint service that fronts the
 //! PERSISTED cluster the `@httpLabel` `identifier` names — `com.amazonaws.{region}.dsql-`
 //! qualified by the SHORT endpoint-service suffix that cluster was minted with, in that
-//! cluster's region — together with that cluster's VPC CONNECTION endpoint, which is an
-//! address a client DIALS and is therefore the host this emulator is served at, the same
-//! value the cluster's own `endpoint` carries. A cluster this service does not hold is
-//! refused with the modelled `ResourceNotFoundException` (404).
+//! cluster's region — together with that cluster's VPC CONNECTION endpoint, which is that
+//! cluster's OWN host: its identifier as the leading label, the `dsql-` label carrying the
+//! same suffix the service name carries, the cluster's region, and the zone this emulator
+//! announces its own names in. A cluster this service does not hold is refused with the
+//! modelled `ResourceNotFoundException` (404).
 //!
 //! Every case drives `MultiServiceRouter::dispatch` with a signed-looking restJson1
 //! request, so the route, the `@httpLabel` binding, the boundary constraint check and
@@ -81,12 +82,11 @@ impl Dsql {
 /// from the cluster rather than assumed.
 const REGIONS: &[&str] = &["us-east-1", "eu-west-1", "ap-southeast-2", "us-gov-west-1"];
 
-/// The host this emulator is served at when the harness drives it in process — the
-/// loopback zone, which RFC 6761 reserves, with every name under it, for the loopback
-/// interface the core binds its listeners on. Every address a reply reports has to be
-/// this host, because that is where a client reaches this process; `cluster_lifecycle`
-/// spans the other bases it can be served at.
-const ANNOUNCED_HOST: &str = "localhost";
+/// The zone this emulator announces its own names in when the harness drives it in process
+/// — the loopback zone, which RFC 6761 reserves, with every name under it, for the loopback
+/// interface the core binds its listeners on. A name this service announces therefore ends
+/// in it; `cluster_lifecycle` spans the other bases the emulator can be served at.
+const ANNOUNCED_ZONE: &str = "localhost";
 
 /// How many characters the per-cluster endpoint-service suffix carries. Source: the
 /// recorded service's own reply, whose `serviceName` carries a four-character token
@@ -115,17 +115,23 @@ fn is_endpoint_service_suffix(suffix: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
 }
 
-/// Whether the `clusterVpcEndpoint` of ONE reply is the address this emulator is served
-/// at: the host the same cluster's `endpoint` carries, and nothing built around the
-/// cluster or the endpoint service underneath it.
-fn is_this_emulators_host(reported: &str, cluster_endpoint: &str) -> bool {
-    reported == cluster_endpoint && reported == ANNOUNCED_HOST
+/// Whether the `clusterVpcEndpoint` of ONE reply is the VPC connection host of the cluster
+/// `identifier` fronted by the endpoint service `suffix` in `region`: the cluster's own
+/// labels under the zone this emulator announces in, and nothing of the address this process
+/// happens to be reached at.
+fn is_this_clusters_vpc_host(
+    reported: &str,
+    identifier: &str,
+    suffix: &str,
+    region: &str,
+) -> bool {
+    reported == format!("{identifier}.dsql-{suffix}.{region}.{ANNOUNCED_ZONE}")
 }
 
 /// RULE: for a persisted cluster in any region, the reported service name is
 /// `com.amazonaws.{cluster region}.dsql-{that cluster's endpoint-service suffix}` and
-/// the reported VPC connection endpoint is the address this emulator answers on — the
-/// host the cluster's own `endpoint` carries.
+/// the reported VPC connection endpoint is that cluster's own host — its identifier, the
+/// same endpoint-service suffix, its region, and the zone this emulator announces in.
 #[tokio::test]
 async fn the_service_name_names_the_persisted_cluster_and_its_region() {
     for region in REGIONS {
@@ -167,14 +173,12 @@ async fn the_service_name_names_the_persisted_cluster_and_its_region() {
 
             let reported = answered.str("clusterVpcEndpoint");
             // The round trip: the cluster the reply is about is the one the control
-            // plane holds, and the address it answers on is the one that cluster's own
-            // `endpoint` carries.
+            // plane holds, and the VPC host it is fronted at names that cluster.
             let read_back = dsql.get(&identifier).await;
             assert!(
-                is_this_emulators_host(&reported, &read_back.str("endpoint")),
-                "case {case:?} in {region}: clusterVpcEndpoint must be the host this \
-                 emulator is served at ({ANNOUNCED_HOST:?}) and no name invented around \
-                 the cluster, got {reported:?}"
+                is_this_clusters_vpc_host(&reported, &identifier, &suffix, region),
+                "case {case:?} in {region}: clusterVpcEndpoint must be \
+                 {identifier}.dsql-{suffix}.{region}.{ANNOUNCED_ZONE}, got {reported:?}"
             );
             assert!(
                 is_cluster_vpc_endpoint(&reported),
@@ -188,22 +192,20 @@ async fn the_service_name_names_the_persisted_cluster_and_its_region() {
                  is about, got {:?}",
                 read_back.str("identifier")
             );
-            assert_eq!(
+            assert_ne!(
                 reported,
                 read_back.str("endpoint"),
-                "case {case:?} in {region}: clusterVpcEndpoint must be the address the \
-                 cluster's own endpoint reports, got {reported:?} against {:?}",
+                "case {case:?} in {region}: the VPC access path has a host of its own, \
+                 not the cluster's data-plane endpoint {:?}",
                 read_back.str("endpoint")
             );
         }
     }
 }
 
-/// RULE (invariant): the endpoint service's NAME is a property of the cluster, so
-/// distinct clusters get distinct names and repeated reads of one cluster get the same
-/// name. The VPC connection ENDPOINT is a property of this PROCESS — the address it
-/// answers on — so it is stable the same way and is the one host every cluster is
-/// reached at.
+/// RULE (invariant): both members are properties of the CLUSTER, so distinct clusters get
+/// distinct names and distinct VPC hosts, while repeated reads of one cluster get the same
+/// name and the same host.
 #[tokio::test]
 async fn names_are_stable_per_cluster_and_distinct_between_clusters() {
     let dsql = Dsql::new();
@@ -236,10 +238,10 @@ async fn names_are_stable_per_cluster_and_distinct_between_clusters() {
                 "case {left_id:?} vs {right_id:?}: distinct clusters must get distinct \
                  service names, both got {left_name:?}"
             );
-            assert_eq!(
+            assert_ne!(
                 left_endpoint, right_endpoint,
-                "case {left_id:?} vs {right_id:?}: every cluster is reached at the one host \
-                 this emulator answers on, got {left_endpoint:?} and {right_endpoint:?}"
+                "case {left_id:?} vs {right_id:?}: distinct clusters must be fronted at \
+                 distinct VPC hosts, both got {left_endpoint:?}"
             );
         }
     }
@@ -292,13 +294,14 @@ async fn the_region_is_the_clusters_not_the_readers() {
                  cluster's region, expected {expected:?}, got {:?}",
                 answered.str("serviceName")
             );
-            // The ADDRESS follows this process and not the Region either call is signed
-            // for: both reads name the host this emulator is served at.
+            // The VPC host follows the CLUSTER's Region too, not the Region either call is
+            // signed for: both reads name the same host.
+            let want = format!("{identifier}.dsql-{suffix}.{home}.{ANNOUNCED_ZONE}");
             assert_eq!(
                 answered.str("clusterVpcEndpoint"),
-                ANNOUNCED_HOST,
-                "case {home}->{reader} read from {case}: clusterVpcEndpoint must be the host \
-                 this emulator answers on, got {:?}",
+                want,
+                "case {home}->{reader} read from {case}: clusterVpcEndpoint must be {want:?}, \
+                 got {:?}",
                 answered.str("clusterVpcEndpoint")
             );
         }
@@ -428,10 +431,10 @@ async fn a_malformed_identifier_is_refused_as_invalid() {
 }
 
 /// RULE: the endpoint service that fronts a cluster has a SHORT name of its OWN — a
-/// per-cluster suffix minted with the cluster and stored on it — so neither member of the
-/// reply renders the cluster's identifier as the endpoint service, distinct clusters name
-/// distinct endpoint services, and the `clusterVpcEndpoint` beside the name is the
-/// address this emulator answers on rather than a name built from either.
+/// per-cluster suffix minted with the cluster and stored on it — so the `serviceName` never
+/// renders the cluster's identifier as the endpoint service, distinct clusters name
+/// distinct endpoint services, and the `clusterVpcEndpoint` beside the name carries BOTH
+/// labels: the cluster it fronts and that same endpoint-service suffix.
 #[tokio::test]
 async fn the_endpoint_service_is_named_by_a_short_per_cluster_suffix() {
     // The rows span the request forms a cluster is created from — the minimum, tags, a
@@ -500,16 +503,14 @@ async fn the_endpoint_service_is_named_by_a_short_per_cluster_suffix() {
              cluster {identifier:?}, got {service_name:?}"
         );
         assert!(
-            is_this_emulators_host(&reported, &connection_endpoint),
-            "case {case:?}: clusterVpcEndpoint must be the host this emulator is served \
-             at ({ANNOUNCED_HOST:?}, which the cluster's endpoint reports as \
-             {connection_endpoint:?}), got {reported:?}"
+            is_this_clusters_vpc_host(&reported, &identifier, &suffix, region),
+            "case {case:?}: clusterVpcEndpoint must be \
+             {identifier}.dsql-{suffix}.{region}.{ANNOUNCED_ZONE}, got {reported:?}"
         );
-        assert!(
-            !reported.contains(&identifier) && !reported.contains(&suffix),
-            "case {case:?}: clusterVpcEndpoint must be an address this emulator answers \
-             on, not a name built from the cluster {identifier:?} or its endpoint \
-             service {suffix:?}, got {reported:?}"
+        assert_ne!(
+            reported, connection_endpoint,
+            "case {case:?}: the VPC access path has a host of its own, not the cluster's \
+             data-plane endpoint {connection_endpoint:?}"
         );
         assert!(
             is_cluster_vpc_endpoint(&reported),

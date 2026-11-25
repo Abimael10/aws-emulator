@@ -5,16 +5,15 @@
 //!
 //! Two rules are under test, each over a set of inputs.
 //!
-//! **WHICH selector a `ListJobs` names decides whether a status is implied.**
-//! `ListJobsRequest$arrayJobId` is "the job ID for an array job. Specifying an array job ID
-//! with this parameter lists ALL CHILD JOBS from within the specified array", unconditionally,
-//! and `$multiNodeJobId` "lists all nodes that are associated with the specified job"; the
-//! implicit status belongs to the other selector — `$jobStatus` is "the job status used to
-//! filter jobs in the specified QUEUE … If you don't specify a status, only `RUNNING` jobs are
-//! returned". So a listing by parent id answers every child whatever status it is in, a listing
-//! of a queue that names no status answers its `RUNNING` jobs, and a status the caller DID name
-//! selects in either listing. That is what lets a client enumerate the children of an array job
-//! none of whose children is running.
+//! **WHETHER a `ListJobs` implies a status does not depend on WHICH selector it names.**
+//! `ListJobsRequest$jobStatus` is "the job status used to filter jobs in the specified queue
+//! … If you don't specify a status, only `RUNNING` jobs are returned", and the same member
+//! tells a caller listing an array to ask for the status it wants ("Array job parents are
+//! updated to PENDING … To view these jobs, filter by PENDING status until all child jobs
+//! reach a terminal state"). So a listing that names no status answers only the `RUNNING`
+//! jobs of whatever it selected — a queue's jobs or an array parent's children alike — and a
+//! status the caller DID name selects in either listing. A caller that wants every child of
+//! an array whose children have finished asks for their status.
 //!
 //! **A `SEQUENTIAL` dependency orders the array's own children.** `SubmitJob$dependsOn`: "you
 //! can specify a `SEQUENTIAL` type dependency without specifying a job ID for array jobs so
@@ -37,7 +36,8 @@ use service_com_amazonaws_batch_awsbatchv20160810::state;
 
 use crate::array_jobs_and_placement::managed_compute_environment;
 use crate::job_lifecycle::{
-    compute_environment, container_properties, job_definition, job_queue, until_status, Batch,
+    compute_environment, container_properties, describe_job, job_definition, job_queue,
+    until_status, Batch,
 };
 
 /// How many children the arrays below have.
@@ -78,11 +78,11 @@ fn indexes(listed: &[Value]) -> Vec<i64> {
     found
 }
 
-/// RULE: a listing by `arrayJobId` answers every child of that parent whatever status it is in,
-/// while a listing of a QUEUE that names no status answers only its `RUNNING` jobs; a status the
-/// caller names selects in either listing.
+/// RULE: a listing that names no `jobStatus` answers only the `RUNNING` jobs of whatever it
+/// selected — an array parent's children just as a queue's jobs — while a status the caller
+/// names selects in either listing.
 #[tokio::test]
-async fn a_listing_by_array_parent_answers_every_child_whatever_its_status() {
+async fn a_listing_that_names_no_status_answers_only_running_jobs() {
     let batch = Batch::new();
     let environment = managed_compute_environment(&batch, "ce-list-array", state::STATE_ENABLED).await;
     let queue_arn = job_queue(&batch, "q-list-array", &environment).await;
@@ -124,10 +124,10 @@ async fn a_listing_by_array_parent_answers_every_child_whatever_its_status() {
 
     let rows: &[Row] = &[
         Row {
-            case: "by arrayJobId with no status at all",
+            case: "by arrayJobId with no status at all, which answers its RUNNING children",
             request: |parent, _| json!({"arrayJobId": parent}),
-            indexes: &[0, 1, 2],
-            total: 3,
+            indexes: &[],
+            total: 0,
         },
         Row {
             case: "by arrayJobId naming the status every child is in",
@@ -183,6 +183,62 @@ async fn a_listing_by_array_parent_answers_every_child_whatever_its_status() {
             row.indexes
         );
     }
+}
+
+/// RULE (the same one, where the children are not TERMINAL): a listing that names no status
+/// answers only `RUNNING` jobs, so children resting in a pre-run status are absent from it
+/// too, while the status they ARE in lists them. The narrowing is the documented default and
+/// not an artefact of the children having finished.
+#[tokio::test]
+async fn a_listing_with_no_status_hides_children_that_have_not_run_either() {
+    // An UNMANAGED environment provides no capacity, so the children rest where the submit
+    // put them instead of running and ending.
+    let batch = Batch::new();
+    let environment = compute_environment(&batch, "ce-list-resting").await;
+    let queue_arn = job_queue(&batch, "q-list-resting", &environment).await;
+    let (definition, _) = job_definition(&batch, "jd-list-resting", container_properties()).await;
+    let parent_id = batch
+        .ok(
+            "/v1/submitjob",
+            json!({
+                "jobName": "resting",
+                "jobQueue": &queue_arn,
+                "jobDefinition": &definition,
+                "arrayProperties": {"size": SIZE},
+            }),
+        )
+        .await["jobId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case resting: expected the array parent's job id"))
+        .to_string();
+
+    // The status the children are actually resting in, read off the first of them, so the
+    // row below asks for what the service placed them in rather than assuming it.
+    let resting = describe_job(&batch, &state::array_child_job_id(&parent_id, 0)).await["status"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert_ne!(
+        resting, RUNNING,
+        "case resting: the children must rest in a status other than {RUNNING}, got {resting:?}"
+    );
+
+    let unfiltered = listed(&batch, "no status", json!({"arrayJobId": &parent_id})).await;
+    assert!(
+        unfiltered.is_empty(),
+        "case no status: a listing that names none answers only {RUNNING} jobs, got {unfiltered:?}"
+    );
+    let asked_for = listed(
+        &batch,
+        "the status they rest in",
+        json!({"arrayJobId": &parent_id, "jobStatus": &resting}),
+    )
+    .await;
+    assert_eq!(
+        indexes(&asked_for),
+        (0..SIZE).collect::<Vec<i64>>(),
+        "case the status they rest in: expected every child, got {asked_for:?}"
+    );
 }
 
 /// RULE: a `SEQUENTIAL` entry makes each child wait for the index before it, whatever job id the

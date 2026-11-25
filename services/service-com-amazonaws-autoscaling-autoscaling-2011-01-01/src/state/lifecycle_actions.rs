@@ -387,6 +387,11 @@ pub enum LifecycleActionRefusal {
     /// was already consumed, the hook the call named holds nothing for that instance, or
     /// neither the group nor the instance exists.
     NoActiveAction,
+    /// The INSTANCE the request named is still held by an outstanding action, but not by one
+    /// belonging to the hook the request named — that hook's own action was already
+    /// consumed, or the request names a hook the group does not carry at all. The hook is
+    /// then the half of the address that matched nothing, so the refusal names it.
+    NoActiveActionUnderHook,
 }
 
 impl LifecycleActionRefusal {
@@ -402,6 +407,14 @@ impl LifecycleActionRefusal {
                 (Some(token), _) => no_active_action_by_token_message(token),
                 (None, Some(instance_id)) => no_active_action_by_instance_message(instance_id),
                 (None, None) => not_addressed_message(),
+            },
+            // Only an instance-addressed lookup can tell a hook that holds nothing from an
+            // instance that is held by nothing, so this is the one spelling it reaches.
+            Self::NoActiveActionUnderHook => match key.instance_id {
+                Some(instance_id) => {
+                    no_active_action_under_hook_message(instance_id, key.hook_name)
+                }
+                None => not_addressed_message(),
             },
         }
     }
@@ -428,16 +441,35 @@ pub fn no_active_action_by_token_message(token: &str) -> String {
 /// The same, for a call that named the INSTANCE instead: the one variable part is the
 /// INSTANCE the caller addressed, because an instance holds the action a callback is about
 /// and that is the half of the address the caller has to correct. The hook the lookup was
-/// made under is NOT quoted — the refusal states that no active action is held for that
-/// instance, whichever hook the call named.
+/// made under is NOT quoted here — this is the sentence for an instance that is held by NO
+/// outstanding action at all, where the hook could not have been the half that matched
+/// nothing.
 ///
-/// ONE sentence for every way such a lookup can come up empty — the action was already
-/// consumed, the hook holds nothing for that instance, the group or the instance does not
-/// exist — because the caller is told the same thing in each: this group holds no active
-/// action for that instance.
+/// ONE sentence for every way an instance can come to hold nothing — the action was already
+/// consumed and the instance left its wait state, the hook that held it was removed, the
+/// group or the instance does not exist — because the caller is told the same thing in each:
+/// this group holds no active action for that instance. An instance that IS still waiting,
+/// at a hook other than the one the call named, is the other answer and is qualified by that
+/// hook ([`no_active_action_under_hook_message`]).
 #[must_use]
 pub fn no_active_action_by_instance_message(instance_id: &str) -> String {
     format!("No active Lifecycle Action found with instance ID {instance_id}")
+}
+
+/// The same, QUALIFIED by the hook, for an instance that IS still held by an outstanding
+/// action — just not one of the hook the call named.
+///
+/// The hook is then what the caller has to correct: the instance is genuinely waiting, and
+/// the call looked for its action under a hook holding none of it (that hook's action was
+/// already consumed, or the group carries no such hook). So the sentence states both halves
+/// of the address — the instance the call named and the hook it looked under — around the
+/// same fixed text, with the two variable parts taken verbatim from the request.
+#[must_use]
+pub fn no_active_action_under_hook_message(instance_id: &str, hook_name: &str) -> String {
+    format!(
+        "No active Lifecycle Action found with instance ID {instance_id} and HookName \
+         {hook_name}"
+    )
 }
 
 /// How one hold ENDED, which is what the step it was holding reports when the group gave up
@@ -778,26 +810,36 @@ impl AutoScalingState {
                         .filter(|action| action.hook_name == key.hook_name)
                         .map(|action| (instance.instance_id.clone(), action.token.clone()))
                 }),
-            (None, Some(instance_id)) => group
-                .instances
-                .iter()
-                .find(|instance| instance.instance_id == instance_id)
-                .and_then(|instance| {
+            (None, Some(instance_id)) => {
+                let held = group
+                    .instances
+                    .iter()
+                    .find(|instance| instance.instance_id == instance_id);
+                let under_hook = held.and_then(|instance| {
                     instance
                         .pending_lifecycle_actions
                         .iter()
                         .find(|action| action.hook_name == key.hook_name)
                         .map(|action| (instance.instance_id.clone(), action.token.clone()))
-                }),
+                });
+                // WHICH half of the address matched nothing is what the refusal states
+                // ([`LifecycleActionRefusal::message`]): an instance this group still holds
+                // at some other hook is waiting, so the hook the call named is the half that
+                // found nothing and the refusal names it; an instance held by no action at
+                // all is the other answer, and names only itself.
+                if under_hook.is_none()
+                    && held.is_some_and(StoredInstance::is_held_by_lifecycle_hook)
+                {
+                    return Err(LifecycleActionRefusal::NoActiveActionUnderHook);
+                }
+                under_hook
+            }
             (None, None) => return Err(LifecycleActionRefusal::NotAddressed),
         };
         match found {
             Some(found) => Ok(found),
-            // Nothing is held under the address the call named. The refusal states the
-            // address itself ([`LifecycleActionRefusal::message`]) rather than which half of
-            // it matched: an instance waiting at another hook of the group and one waiting at
-            // none are the same answer to the caller — no active action under the hook it
-            // named.
+            // Nothing is held under the address the call named, and nothing of that instance
+            // is held at all, so the refusal states the identifier the call addressed.
             None => Err(LifecycleActionRefusal::NoActiveAction),
         }
     }
