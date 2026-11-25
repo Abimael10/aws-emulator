@@ -10,15 +10,17 @@
 //! The rule under test: a clause about a member outside the `@pattern` of a THING-REGISTRY
 //! NAME states that name, single-quoted, beside the expression it had to match — `Value
 //! '<name>' at '<member>' failed to satisfy constraint: Member must satisfy regular
-//! expression pattern: <expression>` — while a member of any OTHER plane outside its own
-//! `@pattern` is stated with no value at all, the clause naming the expression alone. The
-//! registry's name types are one string type repeated (`ThingName`, `ThingGroupName`,
-//! `ThingTypeName`, `BillingGroupName`, each `length 1..128, pattern ^[a-zA-Z0-9:_-]+$`:
+//! expression pattern: <expression>` — while a member whose expression this service does NOT
+//! publish with the value that missed it is stated with no value at all, the clause naming
+//! the expression alone. The registry's name types are one string type repeated (`ThingName`,
+//! `ThingGroupName`, `ThingTypeName`, `BillingGroupName`, each
+//! `length 1..128, pattern ^[a-zA-Z0-9:_-]+$`:
 //! `smithy_query(query="shape",shape="ThingName,ThingGroupName,ThingTypeName,BillingGroupName")`),
 //! so the split is by the name TYPE the member targets and not by the operation: it holds for
 //! a create, a read and a delete alike, and for a name bound to the URI as much as one bound
 //! to the body. The expression a clause quotes is the model's with the whole-value anchors
-//! dropped.
+//! dropped; the sibling suite `tests/all/pattern_clause_expression.rs` pins the other
+//! published value half and the expression that keeps the anchors its own branches carry.
 //!
 //! The other classes of the same envelope are the sibling suites': `@length` in
 //! [`super::length_constraint_clauses`] and `@range` in

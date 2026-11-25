@@ -98,7 +98,9 @@
 //! paths, since the same member states its value for one requirement and withholds it for
 //! another. It passes the decision to [`aws_validation_refusal_withholding_violations`],
 //! which asks it about the VIOLATION; that is the only difference between the two, and both
-//! run the one body below.
+//! run the one body below. A service that ALSO quotes a `@pattern` other than
+//! [`crate::validation::unanchored`] passes both of those choices at once to
+//! [`aws_validation_refusal_withholding_violations_with`], which runs that same body.
 //!
 //! One rendering here is not a sentence but an ORDER: [`in_sorted_enum_order`] states an
 //! enumerated type's value set lexicographically, which is how AWS lists it where a model
@@ -1521,6 +1523,26 @@ pub fn aws_validation_refusal_withholding_violations(
     withholds_value: impl Fn(&Violation) -> bool,
 ) -> Option<Refused> {
     stated_refusal(refusal, unanchored, withholds_value)
+}
+
+/// [`aws_validation_refusal_withholding_violations`], with the `@pattern` rendering chosen by
+/// the caller too — the one entry point taking a VIOLATION-keyed value half and a rendering
+/// at once.
+///
+/// A service needs it when its recordings show BOTH of those: the value withheld for a whole
+/// constraint CLASS, which no set of member paths expresses, and a `@pattern` requirement
+/// quoted other than [`unanchored`] — the model's own text for an expression that anchors its
+/// own BRANCHES ([`crate::validation::unanchored_keeping_inner_anchors`]) is one such
+/// rendering. `withholds_value` is asked about each violation as it will be STATED, its
+/// `@pattern` requirement already requoted by `quote_pattern`, and everything neither choice
+/// covers is the same [`stated_refusal`] body every other entry point here runs, so no
+/// combination of the two can drift into a second envelope.
+pub fn aws_validation_refusal_withholding_violations_with(
+    refusal: &Refusal,
+    quote_pattern: impl Fn(&str) -> String,
+    withholds_value: impl Fn(&Violation) -> bool,
+) -> Option<Refused> {
+    stated_refusal(refusal, quote_pattern, withholds_value)
 }
 
 /// [`aws_validation_refusal_withholding`], with the `@pattern` rendering chosen by the

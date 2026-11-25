@@ -17,15 +17,15 @@
 //! * a member the request did not carry has no value to quote, and AWS states that clause
 //!   with none at all — `Value at '<member path>' failed to satisfy constraint: Member must
 //!   not be null` — where the framework writes the `null` it read;
-//! * a member outside the `@pattern` of a THING-REGISTRY NAME — the one expression the
-//!   registry's name types share ([`REGISTRY_NAME_EXPRESSION`]) — is stated WITH the name
-//!   the request submitted, quoted, beside the expression that name had to match: the
-//!   registry refuses a name it will not admit by naming it, which is the one thing such a
-//!   refusal exists to carry. Every OTHER member outside its `@pattern` is stated with no
-//!   value: the clause names the expression alone, which is what this service's recorded
-//!   refusals of a domain-configuration name and of a transfer's target account show. The
-//!   split is by the name TYPE the member targets, so it holds for every operation that
-//!   takes one of those names and for every plane that takes any other member;
+//! * a member outside a `@pattern` this service PUBLISHES with the value that missed it
+//!   ([`PATTERNS_STATED_WITH_THE_REJECTED_VALUE`]) is stated WITH that value, single-quoted,
+//!   beside the expression it had to match; every OTHER member outside its `@pattern` is
+//!   stated with no value at all, the clause naming the expression alone — which is what this
+//!   service's recorded refusals of a domain-configuration name, of a policy version id and
+//!   of a transfer's target account show. Which of the two a member takes is read off the
+//!   EXPRESSION, and an expression belongs to the SHAPE the member targets, so it holds for
+//!   every operation that takes a member of that shape and wherever in the request the value
+//!   was carried;
 //! * a member outside either end of its `@length` is stated with no value as well: the
 //!   clause names the member and the bound it broke, and the text that was too long or too
 //!   short — which is the whole of what the caller sent for that member — is not reflected
@@ -50,7 +50,18 @@
 //!   enumerated set is quoted beside the set it had to be in — which is what the framework
 //!   already states.
 //!
-//! The last thing chosen here is the ORDER an enumerated type's value set is listed in: the
+//! The second thing chosen here is how a `@pattern` requirement QUOTES its expression: the
+//! expression inside the whole-value anchors the model wraps it in, except where what those
+//! anchors enclose carries an anchor of its OWN — an alternation whose branches are each
+//! anchored — which is quoted as the model declares it, anchors included
+//! ([`::service_common::validation::unanchored_keeping_inner_anchors`], whose own docs carry
+//! the derivation: dropping that pair from such a text states a requirement of neither
+//! branch, so what a caller lifts out of the message would admit values this service
+//! refuses). It is decided from the expression's own syntax, so it belongs to the `@pattern`
+//! and covers every member of every operation that carries one; the CHECK always runs the
+//! model's pattern as written.
+//!
+//! The next thing chosen here is the ORDER an enumerated type's value set is listed in: the
 //! front door in front of this service holds a type's admissible values in a HASH TABLE
 //! keyed on each value's own text and enumerates that table, so the set is stated in
 //! ascending bucket order rather than in the order the model declares the type
@@ -62,8 +73,8 @@
 //! Nothing here is keyed to an operation, to a member path or to a submitted value, so one
 //! rule covers every `@required` member, every `@length` and `@range` bound, every
 //! `@pattern` and every enum of every operation alike — and the one split the classes make,
-//! the registry's names against every other member, is read off the name TYPE the model
-//! gives the member rather than off the request.
+//! the expressions published with the rejected value against every other member, is read off
+//! the `@pattern` of the SHAPE the model gives the member rather than off the request.
 //!
 //! The error-shape NAME this chooses is the bare one, because naming it on the wire is not
 //! this seam's: the shape name a chosen refusal carries is reduced by the framework to the
@@ -110,8 +121,9 @@ pub(crate) fn refused_under(
 ) -> Option<Refused> {
     let (stated, mut stating_collections) = as_this_service_states(refusal);
     stating_collections.extend(quoting_a_collection.iter().cloned());
-    ::service_common::validation_message::aws_validation_refusal_withholding_violations(
+    ::service_common::validation_message::aws_validation_refusal_withholding_violations_with(
         &stated,
+        quoted_expression,
         |violation| states_no_value(violation, &stating_collections),
     )
     .map(|stated| Refused {
@@ -154,6 +166,20 @@ fn as_this_service_states(refusal: &Refusal) -> (Refusal, HashSet<String>) {
     (Refusal::Invalid(stated), stating_collections)
 }
 
+/// How a clause of this service quotes the expression a `@pattern` requirement names.
+///
+/// The published `@pattern` is the expression this service advertises with the whole-value
+/// anchors written around it by the model, so a clause quotes it with that pair dropped —
+/// except where what the pair encloses carries an anchor of its OWN, which is already a
+/// whole-value expression before any wrapping and is quoted as the model declares it. The
+/// reading of the pair, and of an anchor, is the shared one
+/// ([`::service_common::validation::unanchored_keeping_inner_anchors`], whose docs carry the
+/// derivation), called rather than restated; only this RENDERING is chosen here, and the
+/// check a violation comes from always ran the model's pattern as written.
+fn quoted_expression(expression: &str) -> String {
+    ::service_common::validation::unanchored_keeping_inner_anchors(expression)
+}
+
 /// The expression every name type of the THING REGISTRY carries, as a clause quotes it:
 /// without the whole-value anchors the model writes around it.
 ///
@@ -162,8 +188,7 @@ fn as_this_service_states(refusal: &Refusal) -> (Refusal, HashSet<String>) {
 /// (`smithy_query(query="shape",shape="ThingName,ThingGroupName,ThingTypeName,BillingGroupName")`)
 /// — so recognising the expression recognises a member that carries a registry NAME, on any
 /// operation that takes one and wherever in the request it is bound. The anchors are already
-/// off by the time a clause is stated ([`::service_common::validation::unanchored`]), which
-/// is the form this names.
+/// off by the time a clause is stated ([`quoted_expression`]), which is the form this names.
 ///
 /// This text is the MODEL's, so it cannot be allowed to drift from it silently: the suite
 /// `tests/all/not_found_wording/clause_value_classes.rs` drives all four of those name types
@@ -172,21 +197,45 @@ fn as_this_service_states(refusal: &Refusal) -> (Refusal, HashSet<String>) {
 /// `@pattern` is requoted — fails there rather than quietly reclassifying the whole class.
 const REGISTRY_NAME_EXPRESSION: &str = "[a-zA-Z0-9:_-]+";
 
+/// The expression the DAY OF MONTH a Device Defender audit schedule runs on carries, as a
+/// clause quotes it: the model's own text, because its two branches each carry the anchors
+/// that make this a whole-value match ([`quoted_expression`]).
+///
+/// `com.amazonaws.iot#DayOfMonth` is `pattern ^([1-9]|[12][0-9]|3[01])$|^LAST$`
+/// (`smithy_query(query="shape",shape="DayOfMonth")`), the type of the `dayOfMonth` member of
+/// every operation that schedules an audit, so recognising the expression recognises such a
+/// member on each of them.
+const DAY_OF_MONTH_EXPRESSION: &str = "^([1-9]|[12][0-9]|3[01])$|^LAST$";
+
+/// The expressions whose `@pattern` clause this service states the REJECTED VALUE beside,
+/// each as [`quoted_expression`] quotes it.
+///
+/// Which half of such a clause is stated is reference data about the member's SHAPE rather
+/// than something readable off the request or off the requirement: this service's recorded
+/// refusals quote the submitted value beside some of its expressions (a thing-registry name,
+/// the day of month an audit schedule runs on) and name the expression alone beside others (a
+/// domain-configuration name, a policy version id, a transfer's target account). An
+/// expression belongs to the shape, and the shape to every member targeting it, so a row here
+/// holds for every operation that carries such a member, in whatever binding — and an
+/// expression no row names keeps the valueless clause.
+const PATTERNS_STATED_WITH_THE_REJECTED_VALUE: &[&str] =
+    &[REGISTRY_NAME_EXPRESSION, DAY_OF_MONTH_EXPRESSION];
+
 /// Whether the clause for `violation` states no value: the member was ABSENT, so there is
-/// no value to quote; it fell outside a `@pattern` that is not one of the registry's names,
-/// whose clause names the expression alone; it fell outside its `@length`, whose clause
-/// names the bound rather than the text that broke it; or it is one this service never
-/// discloses.
+/// no value to quote; it fell outside a `@pattern` this service does not publish with the
+/// value that missed it, whose clause names the expression alone; it fell outside its
+/// `@length`, whose clause names the bound rather than the text that broke it; or it is one
+/// this service never discloses.
 ///
 /// What those classes have in common is that the clause already states the REQUIREMENT the
 /// value broke — an expression, a length bound — so quoting the value says the same thing
 /// twice. The classes stated WITH a value are the one whose requirement is a SET of
 /// admissible values, which the framework already writes that way, a NUMERIC bound, which
-/// states the interval a value had to lie in rather than the value, and a THING-REGISTRY
-/// name outside its expression, which the registry names when it refuses it. That last one
-/// is why this is asked about the violation rather than about its member path: the same
-/// member path states its value for this requirement and withholds it for the `@length`
-/// bound of the very same type.
+/// states the interval a value had to lie in rather than the value, and a value outside one of
+/// the expressions this service publishes with it
+/// ([`PATTERNS_STATED_WITH_THE_REJECTED_VALUE`]). That last one is why this is asked about
+/// the violation rather than about its member path: the same member path states its value for
+/// this requirement and withholds it for the `@length` bound of the very same type.
 ///
 /// A `@length` broken by a COLLECTION is the third class stated WITH a value: the clause
 /// states the collection itself, because the walk's own rendering of one is a size no caller
@@ -196,7 +245,9 @@ const REGISTRY_NAME_EXPRESSION: &str = "[a-zA-Z0-9:_-]+";
 /// way.
 fn states_no_value(violation: &Violation, quoting_a_collection: &HashSet<String>) -> bool {
     let withheld_by_class = match &violation.kind {
-        ViolationKind::Pattern(expression) => expression != REGISTRY_NAME_EXPRESSION,
+        ViolationKind::Pattern(expression) => {
+            !PATTERNS_STATED_WITH_THE_REJECTED_VALUE.contains(&expression.as_str())
+        }
         ViolationKind::MissingRequiredMember => true,
         // A numeric bound states the INTERVAL the value had to lie in, so the number that
         // fell outside it is stated beside it.
@@ -231,19 +282,22 @@ mod tests {
         }
     }
 
-    /// RULE: a member the request did not carry, a member outside a `@pattern` that is not
-    /// a registry name's, and a member whose own TEXT is outside its `@length` are each
-    /// stated with NO value; a REGISTRY NAME outside its expression, a member outside its
-    /// `@range`, a COLLECTION outside its `@length` (stated with the collection itself where
-    /// the walk's summary determines it) and every other constraint class state the value the
-    /// request submitted; and a `@pattern` is quoted without the anchors a whole-value
-    /// pattern wraps it in.
+    /// RULE: a member the request did not carry, a member outside a `@pattern` this service
+    /// does not publish with the value that missed it, and a member whose own TEXT is outside
+    /// its `@length` are each stated with NO value; a value outside one of the expressions
+    /// this service DOES publish with it, a member outside its `@range`, a COLLECTION outside
+    /// its `@length` (stated with the collection itself where the walk's summary determines
+    /// it) and every other constraint class state the value the request submitted; and a
+    /// `@pattern` is quoted without the whole-value anchors a model wraps it in, unless what
+    /// they enclose carries an anchor of its own, in which case the model's own text is
+    /// quoted.
     #[test]
     fn an_absent_member_states_no_value_and_every_other_class_states_one() {
         // The rows span the classes the framework reports: an absent member, a value
-        // outside a pattern (a registry name's and another plane's), one past each end of a
-        // length bound, one past each end of a range bound and one outside an enumerated
-        // set.
+        // outside a pattern (one whose expression this service publishes with the value and
+        // one it does not, and an expression that anchors its own branches), one past each
+        // end of a length bound, one past each end of a range bound and one outside an
+        // enumerated set.
         let rows = [
             (
                 "a member the request did not carry",
@@ -275,6 +329,21 @@ mod tests {
                 "1 validation error detected: Value at 'policyName' \
                  failed to satisfy constraint: Member must satisfy regular expression \
                  pattern: [\\w+=,.@-]+",
+            ),
+            (
+                // An expression whose own BRANCHES carry the anchors: the pair at the two
+                // ends of the text belongs to those branches, so the expression is quoted as
+                // the model declares it, and this is the second shape whose clause states the
+                // value that missed it.
+                "a day of month outside its expression",
+                violation(
+                    "dayOfMonth",
+                    ViolationKind::Pattern(DAY_OF_MONTH_EXPRESSION.to_owned()),
+                    Some("99"),
+                ),
+                "1 validation error detected: Value '99' at 'dayOfMonth' failed to satisfy \
+                 constraint: Member must satisfy regular expression pattern: \
+                 ^([1-9]|[12][0-9]|3[01])$|^LAST$",
             ),
             (
                 "a member past its length maximum",

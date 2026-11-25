@@ -41,10 +41,12 @@
 //!
 //! * a member the request did not carry has no value to quote, and the clause states none;
 //! * a member outside the `@pattern` of a THING-REGISTRY NAME is stated WITH that name,
-//!   single-quoted, and every OTHER member outside its `@pattern` with no value at all; the
-//!   expression is quoted without the whole-value anchors the model wraps it in. The child
-//!   suite [`clause_value_classes`] pins that split over the name types, the bindings and
-//!   the operations that rule covers;
+//!   single-quoted, and a member whose expression this service does not publish with the
+//!   value that missed it with no value at all; the expression is quoted without the
+//!   whole-value anchors the model wraps it in, unless what they enclose carries an anchor of
+//!   its own. The child suite [`clause_value_classes`] pins that split over the name types,
+//!   the bindings and the operations that rule covers, and the suite
+//!   `tests/all/pattern_clause_expression.rs` the expression that keeps its anchors;
 //! * a member outside either end of its `@length` is stated with no value either — the
 //!   clause names the bound it broke, not the text that broke it — which the child suite
 //!   [`length_constraint_clauses`] pins over the operations and bounds that rule covers,
