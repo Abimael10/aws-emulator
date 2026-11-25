@@ -393,12 +393,13 @@ async fn an_illegal_legacy_argument_is_a_client_error_with_the_sentence_for_its_
                 "Key": {"pk": {"S": "k1"}, "sk": {"S": "s1"}},
                 "Expected": {"a": {"Exists": true, "ComparisonOperator": "NOT_NULL"}},
             }),
-            // A delete carries only the key its condition guards, so the clause about the
-            // entry's shape is stated on its own rather than inside the validation envelope
-            // the put above carries.
-            "One or more parameter values were invalid: Exists and ComparisonOperator cannot \
-             be used together for Attribute: a"
-                .to_string(),
+            // The clause about the entry's shape follows the MEMBER the condition was stated
+            // through, so the delete states it inside the same validation envelope the put
+            // above carries.
+            format!(
+                "{ENVELOPE}One or more parameter values were invalid: Exists and \
+                 ComparisonOperator cannot be used together for Attribute: a"
+            ),
         ),
     ];
 

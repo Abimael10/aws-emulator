@@ -75,15 +75,16 @@
 //! * `InvalidDBInstanceStateFault` (HTTP 400) — The DB instance isn't in a valid state.
 //! * `ResourceNotFoundFault` (HTTP 404) — The specified resource ID was not found.
 //!
-//! `ResourceIdentifier` carries the ARN of the resource this call ACTS ON, and Amazon RDS
-//! judges that member as a parameter VALUE rather than resolving it as a resource: a value
-//! that resolves to no resource of the account is refused with the Query API's
-//! `InvalidParameterValue` (HTTP 400) and the `Unknown resource: <resource-identifier>`
-//! sentence ([`unknown_resource_message`]), which echoes the value the member carried whole
-//! — the ARN itself, not the resource identifier inside it. The modelled
-//! `ResourceNotFoundFault` therefore reports no unresolvable identifier here; the two state
-//! faults need a maintenance action to be pending, and nothing in this service schedules
-//! one.
+//! `ResourceIdentifier` carries the ARN of the resource this call ACTS ON, and which refusal a
+//! value that resolves to no resource of the account earns follows the resource KIND it names:
+//! a DB CLUSTER no cluster of the account matches is reported ABSENT — the modelled
+//! `ResourceNotFoundFault` (HTTP 404, awsQuery code `ResourceNotFoundFault`) carrying the
+//! `Resource not found: <cluster identifier>` sentence ([`resource_not_found_message`]) — while
+//! every other value is judged as a parameter VALUE: the Query API's `InvalidParameterValue`
+//! (HTTP 400) and the `Unknown resource: <resource-identifier>` sentence
+//! ([`unknown_resource_message`]), which echoes the value the member carried whole — the ARN
+//! itself, not the resource identifier inside it. The two state faults need a maintenance action
+//! to be pending, and nothing in this service schedules one.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -163,6 +164,46 @@ fn unknown_resource_message(resource_identifier: &str) -> String {
     format!("Unknown resource: {resource_identifier}")
 }
 
+/// The message this front door reports an absent DB CLUSTER with: the fixed text
+/// `Resource not found: `, then the cluster identifier the request's ARN names.
+///
+/// The variable part is the IDENTIFIER rather than the whole ARN: the cluster is resolved as a
+/// resource here, so the report names the resource that could not be found — the identifier
+/// every other operation of this service answers about — rather than the value as a parameter.
+fn resource_not_found_message(identifier: &str) -> String {
+    format!("Resource not found: {identifier}")
+}
+
+/// The resource type an Amazon RDS ARN gives a DB cluster
+/// ([`crate::state::parse_rds_resource_arn`] reports it; `db` is the DB instance's), the one
+/// kind whose absence this operation REPORTS rather than refusing as a parameter value.
+const CLUSTER_RESOURCE_TYPE: &str = "cluster";
+
+/// What a `ResourceIdentifier` that resolved to no resource of the account earns.
+///
+/// Recorded behaviour, and it follows the resource KIND the value names rather than the
+/// operation or the account's contents: a DB CLUSTER ARN naming no cluster this request's
+/// region holds is reported ABSENT, with the modelled `ResourceNotFoundFault` (HTTP 404) and
+/// the cluster identifier the ARN carries; every other value — a DB instance ARN, an ARN of a
+/// resource type that carries no maintenance action, another vendor's ARN, a value that is no
+/// ARN at all — is judged as a parameter VALUE, with the Query API's `InvalidParameterValue`
+/// (HTTP 400) echoing the value whole. ONE answer per kind, whatever else the request carried.
+fn unresolved_resource(resource_identifier: &str) -> ApplyPendingMaintenanceActionError {
+    match crate::state::parse_rds_resource_arn(resource_identifier) {
+        Some(arn) if arn.resource_type == CLUSTER_RESOURCE_TYPE => {
+            ApplyPendingMaintenanceActionErrorModeled::ResourceNotFoundFault(
+                ResourceNotFoundFault {
+                    message: Some(resource_not_found_message(arn.identifier)),
+                },
+            )
+            .into()
+        }
+        _ => ApplyPendingMaintenanceActionError::invalid_parameter_value(unknown_resource_message(
+            resource_identifier,
+        )),
+    }
+}
+
 /// The `ApplyPendingMaintenanceAction` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -230,19 +271,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map(|record| record.arn()),
             )
             .find(|arn| *arn == resource);
-        // An identifier that resolves to no resource of this account is refused as a bad
-        // PARAMETER VALUE rather than reported absent: Amazon RDS validates
-        // `ResourceIdentifier` instead of resolving it, so the answer is the Query API's
-        // `InvalidParameterValue` (HTTP 400) carrying the `Unknown resource: <value>`
-        // sentence, which echoes the value the member carried. One answer for every value
-        // that names no resource, whatever shape it takes: a DB instance or cluster ARN this
-        // account does not hold, an ARN of another resource type or vendor, or a value that
-        // is no ARN at all. The resource is what this member selects, so nothing else about
-        // the request is judged first.
+        // An identifier that resolves to no resource of this account earns the refusal its
+        // resource KIND does ([`unresolved_resource`]): a DB cluster ARN naming no cluster is
+        // reported ABSENT with the modelled `ResourceNotFoundFault` (HTTP 404) and the cluster
+        // identifier it named, and every other value — a DB instance ARN this account does not
+        // hold, an ARN of another resource type or vendor, or a value that is no ARN at all —
+        // is refused as a bad PARAMETER VALUE with the Query API's `InvalidParameterValue`
+        // (HTTP 400) echoing the value the member carried. The resource is what this member
+        // selects, so nothing else about the request is judged first.
         let Some(resource_arn) = resolved else {
-            return Err(ApplyPendingMaintenanceActionError::invalid_parameter_value(
-                unknown_resource_message(&resource),
-            ));
+            return Err(unresolved_resource(&resource));
         };
 
         // Only once the resource is resolved: `ApplyAction` and `OptInType` say what to do

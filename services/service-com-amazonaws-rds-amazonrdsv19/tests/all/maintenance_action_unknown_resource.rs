@@ -4,11 +4,11 @@
 //! depends on nothing but the value: not on what the store holds, and not on how often it is
 //! asked.
 //!
-//! RULE: Amazon RDS judges `ResourceIdentifier` as a parameter VALUE rather than resolving it
-//! as a resource, so a value that resolves to no resource of the account is refused with
-//! `InvalidParameterValue` (HTTP 400) and `Unknown resource: ` followed by that value — a
-//! refusal, so it creates nothing, and the SAME refusal whether the account holds no resource
-//! at all or several.
+//! RULE: a value that is not a DB cluster ARN of this service and resolves to no resource of
+//! the account is refused with `InvalidParameterValue` (HTTP 400) and `Unknown resource: `
+//! followed by that value — a refusal, so it creates nothing, and the SAME refusal whether the
+//! account holds no resource at all or several. (The cluster-ARN half of the rule, which is
+//! reported absent instead, is the sibling suite's second test.)
 //!
 //! The shapes such a value can take are the sibling suite
 //! `all/maintenance_action_absent_resource.rs`; what this one varies is everything AROUND the

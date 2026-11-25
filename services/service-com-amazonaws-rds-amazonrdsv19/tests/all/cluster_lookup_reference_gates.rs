@@ -336,7 +336,7 @@ async fn a_stored_cluster_is_still_reported_through_either_form_of_the_member() 
 }
 
 /// One request that leaves a `@required` member out: the operation, the members it does
-/// carry, and the member path the validation sentence names.
+/// carry, the member path the validation sentence names, and which layer reports it.
 struct AbsentMemberCase {
     case: &'static str,
     action: &'static str,
@@ -344,6 +344,10 @@ struct AbsentMemberCase {
     /// The parameter the refusal names — the model's member name with its first character
     /// lowered, which is the casing a refusal of this front door spells a member in.
     member_path: &'static str,
+    /// Whether this input's absent members are reported by the request validator in front of
+    /// the operation, in the framework's clause for an absent member, rather than by naming
+    /// the parameter — the split `all/validator_enforced_absent_members.rs` owns.
+    reported_by_the_validator: bool,
 }
 
 #[tokio::test]
@@ -357,24 +361,28 @@ async fn an_absent_required_member_is_refused_as_a_parameter_value() {
             action: "CreateDBCluster",
             params: &[("DBClusterIdentifier", "emu-absent-engine")],
             member_path: "engine",
+            reported_by_the_validator: true,
         },
         AbsentMemberCase {
             case: "a cluster create with no DBClusterIdentifier",
             action: "CreateDBCluster",
             params: &[("Engine", ENGINE)],
             member_path: "dBClusterIdentifier",
+            reported_by_the_validator: true,
         },
         AbsentMemberCase {
             case: "a cluster delete with no DBClusterIdentifier",
             action: "DeleteDBCluster",
             params: &[("SkipFinalSnapshot", "true")],
             member_path: "dBClusterIdentifier",
+            reported_by_the_validator: false,
         },
         AbsentMemberCase {
             case: "a cluster parameter-group modification with no Parameters",
             action: "ModifyDBClusterParameterGroup",
             params: &[("DBClusterParameterGroupName", "emu-absent-parameters")],
             member_path: "parameters",
+            reported_by_the_validator: false,
         },
         AbsentMemberCase {
             case: "an instance create with no DBInstanceClass",
@@ -384,12 +392,14 @@ async fn an_absent_required_member_is_refused_as_a_parameter_value() {
                 ("Engine", "mysql"),
             ],
             member_path: "dBInstanceClass",
+            reported_by_the_validator: false,
         },
         AbsentMemberCase {
             case: "a tag read with no ResourceName",
             action: "ListTagsForResource",
             params: &[],
             member_path: "resourceName",
+            reported_by_the_validator: false,
         },
     ];
 
@@ -401,10 +411,18 @@ async fn an_absent_required_member_is_refused_as_a_parameter_value() {
             INVALID_PARAMETER_VALUE,
         );
         let message = text(&body, "Message");
-        let expected = format!(
-            "Please specify a value for parameter '{}'.",
-            row.member_path
-        );
+        let expected = if row.reported_by_the_validator {
+            format!(
+                "1 validation error detected: Value null at '{}' failed to satisfy constraint: \
+                 Member must not be null",
+                row.member_path
+            )
+        } else {
+            format!(
+                "Please specify a value for parameter '{}'.",
+                row.member_path
+            )
+        };
         assert_eq!(
             message, expected,
             "case {:?}: expected {expected:?}, got {message:?}",

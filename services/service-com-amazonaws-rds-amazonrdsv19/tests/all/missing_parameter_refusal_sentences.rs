@@ -12,8 +12,10 @@
 //! requirement.
 //!
 //! It is a rule of the front door rather than of any one operation: the refusal is raised
-//! before a handler runs, so every operation the model marks a member `@required` on
-//! answers it the same way. The table below therefore spans what the rule generalises
+//! before a handler runs, so every operation the model marks a member `@required` on answers
+//! it this way — bar the cluster create, whose absent members the request validator in front
+//! of it reports as the constraint they broke (`all/validator_enforced_absent_members.rs`).
+//! The table below therefore spans what the rule generalises
 //! over — reports, creates, modifications, a lifecycle call and a purchase; a first
 //! required member and a later one; a string member and a LIST member; and member names
 //! spelled plainly, with a leading acronym and with an interior one — and every row is one

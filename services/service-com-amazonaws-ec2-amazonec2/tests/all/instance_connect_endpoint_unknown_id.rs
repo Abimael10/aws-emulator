@@ -6,11 +6,13 @@
 //! (README.md / OPERATIONS.md "Wire protocol").
 //!
 //! RULE: a request naming a well-formed resource id this account holds no resource for is
-//! refused with that resource's own `Invalid<Kind>.NotFound` code and EC2's one sentence for
-//! that class — `The <resource type> ID '<id>' does not exist`, where `<resource type>` is the
-//! resource's modelled `ResourceType` spelling and `<id>` is the id the REQUEST named, quoted.
-//! The sentence is a fact of the service's template rather than of one operation, so every
-//! operation that cannot resolve such an id words it identically.
+//! refused with that resource's own `Invalid<Kind>.NotFound` code and the sentence EC2 words
+//! THAT resource's absence with. For an EC2 Instance Connect Endpoint that sentence names the
+//! resource by the display name AWS publishes it under, states the id UNQUOTED, and follows the
+//! verdict with the remedy: `The Instance Connect Endpoint <id> does not exist. Add an existing
+//! Instance Connect Endpoint ID and retry your request.`, where `<id>` is the id the REQUEST
+//! named and everything else is fixed text. The sentence belongs to the RESOURCE rather than to
+//! one operation, so every operation that cannot resolve such an id words it identically.
 //!
 //! The rows differ along what the rule generalises over: WHICH operation names the id (the
 //! modify, the delete, the describe and the tag plane, which refuses an id of this kind through
@@ -19,8 +21,7 @@
 //! other suite that asserts one of these refusals; this suite is about the one WORDING.
 
 use ec2::state::{
-    INVALID_INSTANCE_CONNECT_ENDPOINT_ID_NOT_FOUND, INSTANCE_CONNECT_ENDPOINT_ID_PREFIX,
-    RESOURCE_TYPE_INSTANCE_CONNECT_ENDPOINT,
+    INSTANCE_CONNECT_ENDPOINT_ID_PREFIX, INVALID_INSTANCE_CONNECT_ENDPOINT_ID_NOT_FOUND,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 
@@ -88,8 +89,12 @@ async fn an_unresolvable_endpoint_id_is_refused_in_ec2s_one_wording() {
                 "case {case:?}: expected the code \
                  {INVALID_INSTANCE_CONNECT_ENDPOINT_ID_NOT_FOUND}, got {code} with body {body}"
             );
-            let expected =
-                format!("The {RESOURCE_TYPE_INSTANCE_CONNECT_ENDPOINT} ID '{id}' does not exist");
+            // Written out here rather than read off the code under test: the wording is what
+            // this suite pins, so a drift away from it must fail.
+            let expected = format!(
+                "The Instance Connect Endpoint {id} does not exist. Add an existing Instance \
+                 Connect Endpoint ID and retry your request."
+            );
             let actual = error_message(&body);
             assert_eq!(
                 actual, expected,

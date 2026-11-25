@@ -2051,21 +2051,41 @@ pub fn require_known_instance_connect_endpoint<E>(
 
 /// Refuse a request that named an EC2 Instance Connect Endpoint id no endpoint of the
 /// account has: HTTP 400 `InvalidInstanceConnectEndpointId.NotFound`, worded as EC2 words
-/// every `Invalid<Kind>.NotFound` of a resource id — `The <resource type> ID '<id>' does not
-/// exist` ([`id_not_found_message`]) over this resource's modelled type
-/// ([`RESOURCE_TYPE_INSTANCE_CONNECT_ENDPOINT`]) — with the id taken from the REQUEST.
+/// this resource's absence — the resource's own display name and the id the REQUEST named,
+/// followed by the remedy sentence that tells the caller what to send instead
+/// ([`instance_connect_endpoint_not_found_message`]).
 pub fn invalid_instance_connect_endpoint_id_not_found<E>(
     endpoint_id: &str,
 ) -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_error(
         INVALID_INSTANCE_CONNECT_ENDPOINT_ID_NOT_FOUND,
         400,
-        id_not_found_message(
-            &format!("{RESOURCE_TYPE_INSTANCE_CONNECT_ENDPOINT} ID"),
-            endpoint_id,
-        ),
+        instance_connect_endpoint_not_found_message(endpoint_id),
     )
 }
+
+/// The sentence EC2 answers an EC2 Instance Connect Endpoint id that names no endpoint of
+/// the account with.
+///
+/// Recorded behaviour: this resource is named by the display name AWS publishes it under
+/// ([`INSTANCE_CONNECT_ENDPOINT_DISPLAY_NAME`]) rather than by its modelled `ResourceType`
+/// label, the id is stated UNQUOTED, and the verdict is followed by the remedy — what the
+/// caller has to send instead — so the whole message is `The <display name> <id> does not
+/// exist. Add an existing <display name> ID and retry your request.` with the id the only
+/// part taken from the request.
+pub fn instance_connect_endpoint_not_found_message(endpoint_id: &str) -> String {
+    format!(
+        "The {INSTANCE_CONNECT_ENDPOINT_DISPLAY_NAME} {endpoint_id} does not exist. Add an \
+         existing {INSTANCE_CONNECT_ENDPOINT_DISPLAY_NAME} ID and retry your request."
+    )
+}
+
+/// How AWS names an EC2 Instance Connect Endpoint in prose — the name its own API and
+/// documentation publish it under (`Ec2InstanceConnectEndpoint`, "Information about the EC2
+/// Instance Connect Endpoint"), which is what its refusals carry rather than the
+/// `instance-connect-endpoint` label the `ResourceType` enum spells for a tag specification
+/// ([`RESOURCE_TYPE_INSTANCE_CONNECT_ENDPOINT`]).
+pub const INSTANCE_CONNECT_ENDPOINT_DISPLAY_NAME: &str = "Instance Connect Endpoint";
 
 /// Refuse a create that would take the store past [`MAX_INSTANCE_CONNECT_ENDPOINTS`]: HTTP
 /// 400 `InstanceConnectEndpointLimitExceeded`.

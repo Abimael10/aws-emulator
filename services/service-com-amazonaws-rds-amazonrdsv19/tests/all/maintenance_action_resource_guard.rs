@@ -6,16 +6,18 @@
 //! The rules under test, each asserted over a table that spans the class rather than one
 //! request:
 //!
-//! * `ApplyPendingMaintenanceAction` acts on the resource its `ResourceIdentifier` names,
-//!   and Amazon RDS judges that member as a PARAMETER VALUE rather than resolving it as a
-//!   resource: a value that resolves to no resource of the account is refused with the Query
-//!   API's `InvalidParameterValue` (HTTP 400) and the fixed text `Unknown resource: `
-//!   followed by the value the member carried, whole. One answer for every value that
-//!   names no resource: a DB instance ARN, a DB cluster ARN, an ARN of another resource type
-//!   or vendor, a value that is no ARN at all. The identifier RESOLVES when it
-//!   is the ARN a DB cluster or a DB instance of the request's region reports for itself,
-//!   which is what the rows below vary: the resource kind, the ARN's account, region and
-//!   resource type, and a value that is no ARN at all.
+//! * `ApplyPendingMaintenanceAction` acts on the resource its `ResourceIdentifier` names, and
+//!   which answer a value that resolves to no resource of the account earns follows the
+//!   resource KIND it names: a DB CLUSTER ARN naming no cluster of the request's region is
+//!   REPORTED absent, with the modelled `ResourceNotFoundFault` (HTTP 404) and the fixed text
+//!   `Resource not found: ` followed by the cluster identifier the ARN carried, while every
+//!   other value is judged as a PARAMETER VALUE: the Query API's `InvalidParameterValue`
+//!   (HTTP 400) and the fixed text `Unknown resource: ` followed by the value the member
+//!   carried, whole. One answer per kind: a DB instance ARN, an ARN of another resource type
+//!   or vendor and a value that is no ARN at all all earn the parameter refusal. The
+//!   identifier RESOLVES when it is the ARN a DB cluster or a DB instance of the request's
+//!   region reports for itself, which is what the rows below vary: the resource kind, the
+//!   ARN's account, region and resource type, and a value that is no ARN at all.
 //! * `CreateDBSnapshot` refuses a source DB instance that is not in the `available` state
 //!   with `InvalidDBInstanceState` (HTTP 400) and the sentence the service words for that
 //!   class, whatever stage of its lifecycle the instance is in.
@@ -68,6 +70,21 @@ fn unknown_resource(value: &str) -> Refusal {
         status: 400,
         code: INVALID_PARAMETER_VALUE,
         message: format!("{UNKNOWN_RESOURCE}{value}"),
+    }
+}
+
+/// The code and the fixed text an absent DB CLUSTER is REPORTED with, written out here for
+/// the same reason [`UNKNOWN_RESOURCE`] is.
+const RESOURCE_NOT_FOUND_FAULT: &str = "ResourceNotFoundFault";
+const RESOURCE_NOT_FOUND: &str = "Resource not found: ";
+
+/// The answer a DB cluster ARN naming no cluster of this region earns: the modelled
+/// `ResourceNotFoundFault` at HTTP 404, naming the cluster identifier the ARN carried.
+fn resource_not_found(identifier: &str) -> Refusal {
+    Refusal {
+        status: 404,
+        code: RESOURCE_NOT_FOUND_FAULT,
+        message: format!("{RESOURCE_NOT_FOUND}{identifier}"),
     }
 }
 
@@ -125,7 +142,7 @@ async fn apply(
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn an_unknown_maintenance_action_resource_is_refused_as_a_parameter_value() {
+async fn an_unknown_maintenance_action_resource_earns_the_answer_its_kind_does() {
     let router = emulator();
 
     // One cluster and one instance that DO resolve, so every row below fails for the
@@ -134,14 +151,15 @@ async fn an_unknown_maintenance_action_resource_is_refused_as_a_parameter_value(
     create_available_instance(&router, "emu-maint-guard-instance").await;
 
     // The shapes an identifier that names no resource of this account can take, each with the
-    // refusal it earns. The `ApplyAction` / `OptInType` pairings rotate through the values
+    // answer it earns. The `ApplyAction` / `OptInType` pairings rotate through the values
     // those two members publish, so no row can pass on one pairing being special — and the
     // last row carries an action AWS does not publish, which pins that the identifier is
     // decided FIRST. The rows differ along the resource TYPE the identifier names, along the
     // ARN's account and region, and along whether the value is an ARN of this service at
-    // all; the value the refusal echoes is the one the request carried in every case.
+    // all: a cluster ARN is reported absent by the identifier it carries, and every other
+    // value is refused as the value the request carried.
     //
-    // (case, the identifier, ApplyAction, OptInType, the refusal)
+    // (case, the identifier, ApplyAction, OptInType, the answer)
     let rows: &[(&str, String, &str, &str, Refusal)] = &[
         (
             "a DB instance ARN for an instance that was never created",
@@ -155,7 +173,7 @@ async fn an_unknown_maintenance_action_resource_is_refused_as_a_parameter_value(
             cluster_arn("emu-maint-guard-absent-cluster"),
             "db-upgrade",
             "next-maintenance",
-            unknown_resource(&cluster_arn("emu-maint-guard-absent-cluster")),
+            resource_not_found("emu-maint-guard-absent-cluster"),
         ),
         (
             "a value that is no ARN at all",
@@ -169,9 +187,7 @@ async fn an_unknown_maintenance_action_resource_is_refused_as_a_parameter_value(
             format!("arn:aws:rds:{REGION}:{ACCOUNT}:cluster:emu-maint-guard-instance"),
             "hardware-maintenance",
             "immediate",
-            unknown_resource(&format!(
-                "arn:aws:rds:{REGION}:{ACCOUNT}:cluster:emu-maint-guard-instance"
-            )),
+            resource_not_found("emu-maint-guard-instance"),
         ),
         (
             "a DB snapshot ARN, which carries no maintenance action",
@@ -203,9 +219,7 @@ async fn an_unknown_maintenance_action_resource_is_refused_as_a_parameter_value(
             "arn:aws:rds:eu-west-1:000000000000:cluster:emu-maint-guard-cluster".to_string(),
             "db-upgrade",
             "immediate",
-            unknown_resource(
-                "arn:aws:rds:eu-west-1:000000000000:cluster:emu-maint-guard-cluster",
-            ),
+            resource_not_found("emu-maint-guard-cluster"),
         ),
         (
             "another service's ARN",
@@ -226,8 +240,8 @@ async fn an_unknown_maintenance_action_resource_is_refused_as_a_parameter_value(
     ];
 
     for (case, resource, action, opt_in, refusal) in rows {
-        // Every row names a resource this account does not hold, and the answer refuses the
-        // value the member carried as one the parameter does not accept.
+        // Every row names a resource this account does not hold, and the answer is the one
+        // that resource KIND earns.
         let body = expect_error(
             case,
             apply(&router, resource, action, opt_in).await,

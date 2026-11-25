@@ -9,11 +9,11 @@
 //! once, DynamoDB will return a ValidationException"), and an entry whose members cannot be
 //! read as an expectation is refused 400 `ValidationException` with the clause for the rule it
 //! broke, opening with the fixed `One or more parameter values were invalid: ` and naming the
-//! attribute whose entry carried it — the one part taken from the request. Whether that clause
-//! is stated inside the `<N> validation error(s) detected: ` envelope follows the OPERATION the
-//! map arrived on: the writes that carry the item or the update the condition guards state it
-//! inside the envelope, and `DeleteItem`, whose request carries only the key the condition
-//! guards, states the clause on its own.
+//! attribute whose entry carried it — the one part taken from the request. That clause is
+//! stated inside the `<N> validation error(s) detected: ` envelope on EVERY write that carries
+//! the map, because the envelope follows the MEMBER the condition was stated through — the
+//! legacy map a write guards its payload with — and not the operation that carried it, which
+//! is also how the operands and the values of the same entry are already stated.
 //!
 //! The rows span what the rule generalises over:
 //!
@@ -94,13 +94,6 @@ impl Write {
         }
     }
 
-    /// Does this write state a clause about an `Expected` entry's shape inside the
-    /// request-validation envelope? The two that carry a payload beside the key do; the
-    /// delete, which carries only the key, states the clause on its own.
-    fn states_the_envelope(self) -> bool {
-        self != Self::Delete
-    }
-
     /// The whole request this write sends with `expected` as its condition: the item it
     /// stores, the legacy update it applies, or the key alone — `Expected` and the expression
     /// members cannot be used in one request, so the update states its write the legacy way.
@@ -118,21 +111,18 @@ impl Write {
         request
     }
 
-    /// The whole message this write answers `clause` with.
+    /// The whole message this write answers `clause` with: the clause inside the
+    /// request-validation envelope, on every write that carries the map.
     fn message(self, clause: &str) -> String {
-        if self.states_the_envelope() {
-            format!("{ENVELOPE}{clause}")
-        } else {
-            clause.to_string()
-        }
+        format!("{ENVELOPE}{clause}")
     }
 }
 
 /// RULE: every clause of the `Expected`-entry shape family is stated inside the
-/// request-validation envelope by the writes that carry a payload beside the key, and on its
-/// own by the delete — with the attribute the entry was keyed by as the one variable part.
+/// request-validation envelope by every conditional write that carries the map — with the
+/// attribute the entry was keyed by as the one variable part.
 #[tokio::test]
-async fn an_expected_entrys_shape_clause_follows_the_operation_it_arrived_on() {
+async fn an_expected_entrys_shape_clause_is_stated_inside_the_envelope_on_every_write() {
     let router = seeded().await;
     let before = stored(&router).await;
 

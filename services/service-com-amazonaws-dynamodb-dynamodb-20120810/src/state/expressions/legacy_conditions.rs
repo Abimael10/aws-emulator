@@ -13,7 +13,7 @@ use super::*;
 /// condition that can hold for nothing. All three hold for every member a legacy condition
 /// arrives in — `Expected`, the legacy filters, `KeyConditions` — and `member` decides only
 /// whether the sentence is stated inside the validation envelope
-/// ([`ENVELOPED_LEGACY_MEMBERS`]).
+/// ([`envelopes_legacy_refusals`]).
 ///
 /// An entry naming NO comparison carries no operands of one, which is a defect of the
 /// entry itself ([`attribute_value_list_without_comparator`]) rather than of its list, so
@@ -23,7 +23,7 @@ pub fn check_legacy_operand_list(
     operator: &str,
     operands: &[AttributeValue],
 ) -> Result<(), RequestError> {
-    let enveloped = ENVELOPED_LEGACY_MEMBERS.contains(&member);
+    let enveloped = envelopes_legacy_refusals(member);
     let refusal = |clause: &str| {
         expression_refusal(enveloped, format!("{INVALID_PARAMETER_CLAUSE}: {clause}"))
     };
@@ -59,14 +59,11 @@ pub fn check_legacy_operand_list(
 /// `ExpectedAttributeValue` doc): the list is the operands of a comparison, so an entry
 /// stating one without naming a comparison states values nothing is compared against. AWS
 /// names the attribute whose entry carried it, like every other refusal about one entry of
-/// this map, and states it where every other refusal about the entry's SHAPE is stated
-/// ([`ExpectedShapeRefusals`]).
-pub(super) fn attribute_value_list_without_comparator(
-    name: &str,
-    shape_refusals: ExpectedShapeRefusals,
-) -> RequestError {
+/// this map, and states it where every other refusal about this map is stated
+/// ([`envelopes_legacy_refusals`]).
+pub(super) fn attribute_value_list_without_comparator(name: &str) -> RequestError {
     expression_refusal(
-        shape_refusals.states_the_envelope(),
+        envelopes_legacy_refusals(EXPECTED_MEMBER),
         format!(
             "{INVALID_PARAMETER_CLAUSE}: AttributeValueList can only be used with a \
              ComparisonOperator for Attribute: {name}"
@@ -85,12 +82,12 @@ pub(super) fn attribute_value_list_without_comparator(
 /// `AttributeValueList`, are values a request carries like any other.
 ///
 /// `member` is the map they arrived in, which decides only whether the clause is stated
-/// inside the validation envelope ([`ENVELOPED_LEGACY_MEMBERS`]).
+/// inside the validation envelope ([`envelopes_legacy_refusals`]).
 pub fn check_legacy_condition_values<'v>(
     member: &str,
     values: impl Iterator<Item = (&'v str, &'v AttributeValue)>,
 ) -> Result<(), RequestError> {
-    let enveloped = ENVELOPED_LEGACY_MEMBERS.contains(&member);
+    let enveloped = envelopes_legacy_refusals(member);
     for (name, value) in values {
         check_attribute_value(name, value).map_err(|error| {
             if enveloped {
@@ -142,7 +139,6 @@ pub fn write_condition_satisfied(
     conditional_operator: Option<&str>,
     substitutions: Substitutions<'_>,
     item: Option<&Item>,
-    shape_refusals: ExpectedShapeRefusals,
 ) -> Result<bool, RequestError> {
     // Every fact of the REQUEST its condition carries is settled first, by the same
     // check the handlers make before they look the table up, so one condition cannot be
@@ -152,16 +148,13 @@ pub fn write_condition_satisfied(
         expected,
         conditional_operator,
         substitutions,
-        shape_refusals,
     )?;
     let expected = expected.filter(|map| !map.is_empty());
     match (condition_expression, expected) {
         (Some(expression), None) => {
             ParsedCondition::parse("ConditionExpression", expression, substitutions)?.evaluate(item)
         }
-        (None, Some(expected)) => {
-            expected_satisfied(expected, conditional_operator, item, shape_refusals)
-        }
+        (None, Some(expected)) => expected_satisfied(expected, conditional_operator, item),
         // A request stating its condition both ways was refused above, and one stating
         // it neither way asks for nothing to be checked.
         (Some(_), Some(_)) | (None, None) => Ok(true),
@@ -183,7 +176,6 @@ pub fn check_write_condition(
     expected: Option<&HashMap<String, ExpectedAttributeValue>>,
     conditional_operator: Option<&str>,
     substitutions: Substitutions<'_>,
-    shape_refusals: ExpectedShapeRefusals,
 ) -> Result<(), RequestError> {
     let expected = expected.filter(|map| !map.is_empty());
     match (condition_expression, expected) {
@@ -213,7 +205,7 @@ pub fn check_write_condition(
             for (name, condition) in expected {
                 // Read against NO item: every refusal an entry earns is a fact of the
                 // entry, so the walk that evaluates one surfaces exactly those.
-                expected_entry_satisfied(name, condition, None, shape_refusals)?;
+                expected_entry_satisfied(name, condition, None)?;
             }
             Ok(())
         }
@@ -243,7 +235,6 @@ pub(super) fn expected_satisfied(
     expected: &HashMap<String, ExpectedAttributeValue>,
     conditional_operator: Option<&str>,
     item: Option<&Item>,
-    shape_refusals: ExpectedShapeRefusals,
 ) -> Result<bool, RequestError> {
     let any = conditional_operator_any(conditional_operator)?;
     let absent = Item::new();
@@ -251,7 +242,7 @@ pub(super) fn expected_satisfied(
     let mut satisfied = !any;
     for (name, condition) in expected {
         let held = item.get(name);
-        let holds = expected_entry_satisfied(name, condition, held, shape_refusals)?;
+        let holds = expected_entry_satisfied(name, condition, held)?;
         if any {
             satisfied |= holds;
         } else {
@@ -267,17 +258,16 @@ pub(super) fn expected_satisfied(
 /// Note that if you use both sets of parameters at once, DynamoDB will return a
 /// ValidationException"; with neither set, there is nothing to check.
 ///
-/// `shape_refusals` decides only whether a refusal about the entry's own SHAPE is stated
-/// inside the validation envelope ([`ExpectedShapeRefusals`]); the sentences themselves are
-/// the same on every write.
+/// Every refusal about the entry's own members is stated where every other refusal about
+/// this map is stated ([`envelopes_legacy_refusals`]); the sentences themselves are the same
+/// on every write.
 pub(super) fn expected_entry_satisfied(
     name: &str,
     condition: &ExpectedAttributeValue,
     held: Option<&AttributeValue>,
-    shape_refusals: ExpectedShapeRefusals,
 ) -> Result<bool, RequestError> {
     let shape_refusal =
-        |clause: String| expression_refusal(shape_refusals.states_the_envelope(), clause);
+        |clause: String| expression_refusal(envelopes_legacy_refusals(EXPECTED_MEMBER), clause);
     let comparison = condition.comparison_operator.as_deref();
     let operands = condition
         .attribute_value_list
@@ -307,10 +297,7 @@ pub(super) fn expected_entry_satisfied(
     // them states nothing this service can check
     // ([`attribute_value_list_without_comparator`]).
     if comparison.is_none() && operands.is_some() {
-        return Err(attribute_value_list_without_comparator(
-            name,
-            shape_refusals,
-        ));
+        return Err(attribute_value_list_without_comparator(name));
     }
     if let Some(operator) = comparison {
         // An operator that compares a value needs one to compare, and an `Expected`

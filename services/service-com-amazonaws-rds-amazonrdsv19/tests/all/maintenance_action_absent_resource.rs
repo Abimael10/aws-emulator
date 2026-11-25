@@ -3,23 +3,25 @@
 //! What `ApplyPendingMaintenanceAction` answers a `ResourceIdentifier` that names no
 //! resource of the account.
 //!
-//! RULE: Amazon RDS judges `ResourceIdentifier` as a PARAMETER VALUE rather than resolving
-//! it as a resource, so a value that resolves to no resource of the account is refused with
-//! the Query API's `InvalidParameterValue` at HTTP 400 and the fixed text
-//! `Unknown resource: ` followed by the value the member carried, WHOLE — the ARN itself,
-//! never the resource identifier parsed out of it. The answer does not depend on which
-//! resource TYPE the value names, nor on whether it is an ARN at all: one condition, one
-//! refusal. The not-found fault the operation's model declares
+//! RULE: which answer such a value earns follows the resource KIND it names. A value that is
+//! not a DB cluster ARN of this service is judged as a PARAMETER VALUE: the Query API's
+//! `InvalidParameterValue` at HTTP 400 and the fixed text `Unknown resource: ` followed by the
+//! value the member carried, WHOLE — the ARN itself, never the resource identifier parsed out
+//! of it. A DB CLUSTER ARN naming no cluster of the request's region is REPORTED absent
+//! instead, with the operation's modelled not-found fault
 //! (`smithy_query(query="operation",operation="ApplyPendingMaintenanceAction")` lists
-//! `ResourceNotFoundFault` at 404) therefore reports no unresolvable identifier here.
+//! `ResourceNotFoundFault` at 404) and the fixed text `Resource not found: ` followed by the
+//! cluster identifier the ARN carries — the cluster is resolved as a resource, so the report
+//! names the resource rather than the parameter. That half of the rule is the second test
+//! below.
 //!
-//! The rows span what the rule generalises over: the resource type the ARN names (a DB
-//! instance, a DB cluster, a snapshot, a reserved-instance id, a cluster snapshot), the
+//! The rows of the first test span what the parameter half generalises over: the resource type
+//! the ARN names (a DB instance, a snapshot, a reserved-instance id, a cluster snapshot), the
 //! partition, the account and the region the ARN names, the length and the case of the
-//! identifier inside it, another vendor's ARN, and values that are no ARN at all (a bare
-//! name, a near-miss of a stored identifier, a word of no identifier shape, a value carrying
-//! the error envelope's own metacharacters). Each row asserts both halves of the sentence:
-//! that it echoes the value whole, and that it is not the bare identifier an ARN carries.
+//! identifier inside it, another vendor's ARN, and values that are no ARN at all (a bare name,
+//! a near-miss of a stored identifier, a word of no identifier shape, a value carrying the
+//! error envelope's own metacharacters). Each row asserts both halves of the sentence: that it
+//! echoes the value whole, and that it is not the bare identifier an ARN carries.
 //!
 //! The refusal is also a REFUSAL: nothing it names comes into existence, so the store still
 //! reports exactly the one instance this suite created. A resolving identifier is the
@@ -105,11 +107,6 @@ async fn every_identifier_that_names_no_resource_is_refused_as_a_parameter_value
             "a DB instance ARN for an instance never created",
             format!("arn:aws:rds:{REGION}:{ACCOUNT}:db:emu-maint-absent-db"),
             Some("emu-maint-absent-db".to_string()),
-        ),
-        (
-            "a DB cluster ARN for a cluster never created",
-            format!("arn:aws:rds:{REGION}:{ACCOUNT}:cluster:emu-maint-absent-cluster"),
-            Some("emu-maint-absent-cluster".to_string()),
         ),
         (
             "a DB snapshot ARN, a resource type that carries no maintenance action",
@@ -250,5 +247,146 @@ async fn every_identifier_that_names_no_resource_is_refused_as_a_parameter_value
         texts(&page, "DBInstanceIdentifier"),
         vec![STORED.to_string()],
         "a refused maintenance action must store nothing, got {page}"
+    );
+}
+
+/// The code and the fixed text a DB CLUSTER ARN naming no cluster is REPORTED absent with,
+/// written out here rather than read off the crate under test.
+pub(crate) const RESOURCE_NOT_FOUND_FAULT: &str = "ResourceNotFoundFault";
+pub(crate) const RESOURCE_NOT_FOUND: &str = "Resource not found: ";
+
+/// The DB cluster this half of the suite stands up, so each row below is answered about the
+/// cluster it names rather than because the account holds no cluster at all.
+const STORED_CLUSTER: &str = "emu-maint-absent-live-cluster";
+
+/// RULE, the other half: a DB cluster ARN that names no cluster of the request's region is
+/// REPORTED absent — the modelled `ResourceNotFoundFault` at HTTP 404, naming the cluster
+/// IDENTIFIER the ARN carries rather than the whole value.
+///
+/// The rows span what that half generalises over: the identifier's length and case, the
+/// partition, account and region the ARN names, a near-miss of the stored cluster, and the
+/// identifier of a stored DB INSTANCE spelled under the cluster resource type — the kind the
+/// ARN names is what decides the answer, not what the account happens to hold.
+#[tokio::test]
+async fn a_db_cluster_arn_that_names_no_cluster_is_reported_absent() {
+    let router = emulator();
+    expect_ok(
+        "the one cluster the account holds",
+        call(
+            &router,
+            "CreateDBCluster",
+            &[
+                ("DBClusterIdentifier", STORED_CLUSTER),
+                ("Engine", "aurora-postgresql"),
+            ],
+        )
+        .await,
+    );
+    expect_ok(
+        "an instance of the account, under its own resource type",
+        call(
+            &router,
+            "CreateDBInstance",
+            &[
+                ("DBInstanceIdentifier", STORED),
+                ("Engine", "postgres"),
+                ("DBInstanceClass", "db.t3.micro"),
+            ],
+        )
+        .await,
+    );
+    wait_for_settle();
+
+    let long = longest_identifier();
+    // (case, the value the request carries, the cluster identifier the report must name)
+    let rows: Vec<(&str, String, String)> = vec![
+        (
+            "a cluster ARN for a cluster never created",
+            format!("arn:aws:rds:{REGION}:{ACCOUNT}:cluster:emu-maint-absent-cluster"),
+            "emu-maint-absent-cluster".to_string(),
+        ),
+        (
+            "a near-miss of the stored cluster",
+            format!("arn:aws:rds:{REGION}:{ACCOUNT}:cluster:{STORED_CLUSTER}-2"),
+            format!("{STORED_CLUSTER}-2"),
+        ),
+        (
+            "the stored cluster's ARN in another region",
+            format!("arn:aws:rds:eu-west-1:{ACCOUNT}:cluster:{STORED_CLUSTER}"),
+            STORED_CLUSTER.to_string(),
+        ),
+        (
+            "the stored cluster's ARN in another account",
+            format!("arn:aws:rds:{REGION}:210987654321:cluster:{STORED_CLUSTER}"),
+            STORED_CLUSTER.to_string(),
+        ),
+        (
+            "a cluster ARN in the China partition",
+            format!("arn:aws-cn:rds:cn-north-1:{ACCOUNT}:cluster:emu-maint-absent-cn"),
+            "emu-maint-absent-cn".to_string(),
+        ),
+        (
+            "a cluster ARN whose identifier is as long as the member admits",
+            format!("arn:aws:rds:{REGION}:{ACCOUNT}:cluster:{long}"),
+            long.clone(),
+        ),
+        (
+            "a cluster ARN whose identifier differs from the stored one only in case",
+            format!(
+                "arn:aws:rds:{REGION}:{ACCOUNT}:cluster:{}",
+                STORED_CLUSTER.to_ascii_uppercase()
+            ),
+            STORED_CLUSTER.to_ascii_uppercase(),
+        ),
+        (
+            "a stored DB instance's identifier under the cluster resource type",
+            format!("arn:aws:rds:{REGION}:{ACCOUNT}:cluster:{STORED}"),
+            STORED.to_string(),
+        ),
+    ];
+
+    for (case, resource, identifier) in &rows {
+        let body = expect_error(
+            case,
+            apply(&router, resource).await,
+            404,
+            RESOURCE_NOT_FOUND_FAULT,
+        );
+        let message = text(&body, "Message");
+        assert_eq!(
+            message,
+            format!("{RESOURCE_NOT_FOUND}{identifier}"),
+            "case {case:?}: expected the report to name the cluster {identifier:?}, got \
+             {message:?}"
+        );
+        // The report names the resource, so the whole value the member carried has no place
+        // in it.
+        assert_ne!(
+            message,
+            format!("{RESOURCE_NOT_FOUND}{resource}"),
+            "case {case:?}: expected the cluster identifier and not the whole value, got \
+             {message:?}"
+        );
+        let fault_type = text(&body, "Type");
+        assert_eq!(
+            fault_type, "Sender",
+            "case {case:?}: expected a Sender fault, got {fault_type:?} in {body}"
+        );
+    }
+
+    // The control: the stored cluster's own ARN resolves, and is answered with its
+    // pending-action report rather than reported absent.
+    let resolved = expect_ok(
+        "the stored cluster's ARN",
+        apply(
+            &router,
+            &format!("arn:aws:rds:{REGION}:{ACCOUNT}:cluster:{STORED_CLUSTER}"),
+        )
+        .await,
+    );
+    assert_eq!(
+        text(&resolved, "ResourceIdentifier"),
+        format!("arn:aws:rds:{REGION}:{ACCOUNT}:cluster:{STORED_CLUSTER}"),
+        "expected the report to name the resolved cluster, got {resolved}"
     );
 }

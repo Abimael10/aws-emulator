@@ -559,9 +559,9 @@ async fn a_refusal_of_what_the_request_carries_is_a_query_api_parameter_error() 
             wording: Wording::Says("OptInType"),
         },
         // `ApplyPendingMaintenanceAction`'s `ResourceIdentifier` is judged as a parameter
-        // VALUE rather than resolved as a resource, so a value that names no resource of the
-        // account belongs to rule 2: `InvalidParameterValue` at HTTP 400, echoing
-        // the value whole — whichever resource kind it names and whatever shape it takes.
+        // VALUE unless it names a DB cluster, so a DB instance ARN that names no resource of
+        // the account — and any value that is no ARN — belongs to rule 2:
+        // `InvalidParameterValue` at HTTP 400, echoing the value whole.
         Row {
             case: "ApplyPendingMaintenanceAction over an ARN of a resource never created",
             action: "ApplyPendingMaintenanceAction",

@@ -90,6 +90,7 @@ pub mod management_events;
 pub mod missing_parameter;
 pub mod query_error_envelope;
 pub mod unresolved_reference;
+pub mod validator_enforced_members;
 
 use api_version::UnsupportedApiVersionOperation;
 use aws_smithy_schema_server::{envelope, Violation};
