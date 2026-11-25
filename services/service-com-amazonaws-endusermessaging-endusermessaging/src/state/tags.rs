@@ -3,8 +3,8 @@
 //! The resource a `resourceArn` names, and the tags it carries.
 //!
 //! Every tagging operation of this service addresses its resource the same way: by
-//! the full ARN of a resource of this service's own namespace, in the Region the
-//! request was made in. Resolving that ARN lives here rather than in one handler, so
+//! the full ARN of a resource of this service's own namespace, in the partition and
+//! Region the request was made in. Resolving that ARN lives here rather than in one handler, so
 //! a tag read and a tag write cannot disagree about which resource an ARN names, or
 //! about how a value that names none is refused.
 //!
@@ -46,7 +46,7 @@ pub enum TaggedResource {
 pub enum UnreachableResource {
     /// The value cannot address a resource of this request at all: it is not an
     /// identifier or ARN of this resource, it names another vendor, or it is scoped to
-    /// another Region. `ValidationException`, HTTP 400.
+    /// another partition or Region. `ValidationException`, HTTP 400.
     Invalid(crate::ops::types::ValidationException),
     /// A well-formed identifier of this resource that names no stored record.
     /// `ResourceNotFoundException`, HTTP 404.
@@ -77,29 +77,44 @@ fn invalid_resource_arn(resource_arn: &str) -> crate::ops::types::ValidationExce
     }
 }
 
-/// `ValidationException` for an ARN of this service that names a resource of a Region
-/// other than the one the request was made in.
+/// The partition and Region a resource is scoped to: the pair a caller-supplied
+/// `resourceArn` has to agree with the request on.
 ///
-/// Worded as a sentence, the way this API words a refusal its model does not express
-/// (an unissued pagination token, an update carrying nothing to update), rather than
-/// in the boundary validator's constraint envelope, which states a modelled
-/// constraint this value does not break. The fixed text is this refusal's; the
-/// variable parts are the value the request gave and the Region it was made in.
-fn cross_region_resource_arn(
-    resource_arn: &str,
-    request_region: &str,
+/// Both sides of that comparison are the same two fields, so they travel together
+/// rather than as four loose strings a call could pass in the wrong order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArnScope<'a> {
+    /// The ARN partition (`aws`, `aws-cn`, `aws-us-gov`, …).
+    pub partition: &'a str,
+    /// The Region code, empty for a partition-global resource.
+    pub region: &'a str,
+}
+
+/// `ValidationException` for an ARN of this service whose partition or Region is not
+/// the scope the request was made in.
+///
+/// This API reports such an ARN as a MISMATCH of two scopes rather than as a sentence
+/// about the value: the partition and Region the request was made in, and the partition
+/// and Region the request's own ARN named, each as its own quoted token — so a caller
+/// reads the two facts it needs, which scope was expected and which the ARN named,
+/// straight off the message instead of re-parsing an ARN out of it. The fixed text is
+/// this refusal's; the variable parts are those four tokens. The `fieldList` entry names
+/// the member the value arrived on and states the same mismatch, so the two halves of
+/// one refusal cannot word it differently.
+fn arn_scope_mismatch(
+    expected: ArnScope<'_>,
+    named: ArnScope<'_>,
 ) -> crate::ops::types::ValidationException {
+    let stated = format!(
+        "ARN partition/region mismatch: expected partition '{}' region '{}', got partition \
+         '{}' region '{}'",
+        expected.partition, expected.region, named.partition, named.region
+    );
     crate::ops::types::ValidationException {
-        message: format!(
-            "Invalid ARN: {resource_arn} does not name a resource in Region \
-             {request_region}, the Region this request was made in"
-        ),
+        message: stated.clone(),
         field_list: Some(vec![crate::ops::types::ValidationExceptionField {
             path: RESOURCE_ARN_POINTER.to_string(),
-            message: format!(
-                "The resource ARN must name a resource in Region {request_region}, the Region \
-                 this request was made in"
-            ),
+            message: stated,
         }]),
     }
 }
@@ -119,12 +134,13 @@ impl ComAmazonawsEndusermessagingEndusermessagingState {
     /// `region`.
     ///
     /// An ARN addresses a resource of this service's own namespace, in the request's
-    /// own Region: a value that is not such an ARN, or one naming another Region, can
-    /// name no resource of this request and is refused as invalid input before any
-    /// lookup; an ARN of this service and Region that this emulator never minted — a
-    /// resource type it does not hold, an unknown identifier, a resource since
-    /// deleted — names nothing and is refused as not found. The scan is over maps
-    /// bounded by this state's own ceilings.
+    /// own scope — the partition this emulator serves and the Region the request was
+    /// made in: a value that is not such an ARN, or one whose partition or Region is
+    /// another scope's, can name no resource of this request and is refused as invalid
+    /// input before any lookup; an ARN of this service and scope that this emulator
+    /// never minted — a resource type it does not hold, an unknown identifier, a
+    /// resource since deleted — names nothing and is refused as not found. The scan is
+    /// over maps bounded by this state's own ceilings.
     pub fn resolve_tagged_resource(
         &self,
         resource_arn: &str,
@@ -135,10 +151,22 @@ impl ComAmazonawsEndusermessagingEndusermessagingState {
                 resource_arn,
             )));
         };
-        if arn.region != region {
-            return Err(UnreachableResource::Invalid(cross_region_resource_arn(
-                resource_arn,
-                region,
+        // A resource is addressed by its partition as much as by its Region, so both
+        // fields of the scope are compared: an ARN of another partition names no
+        // resource of this request either, and the refusal reports both halves of the
+        // pair the ARN disagreed with.
+        let serving = super::emulator_partition();
+        let expected = ArnScope {
+            partition: &serving,
+            region,
+        };
+        let named = ArnScope {
+            partition: arn.partition,
+            region: arn.region,
+        };
+        if named != expected {
+            return Err(UnreachableResource::Invalid(arn_scope_mismatch(
+                expected, named,
             )));
         }
         if let Some(profile) = self

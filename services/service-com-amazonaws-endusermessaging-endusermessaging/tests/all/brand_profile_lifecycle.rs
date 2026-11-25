@@ -30,10 +30,10 @@
 //!   type of this service;
 //! * a `resourceArn` that is not the ARN of a resource of this service's own
 //!   namespace — not an ARN at all, or one of another vendor — and one scoped to
-//!   another Region, are `ValidationException` (400), and an ARN of this service and
-//!   Region that names no stored resource — a resource type this service does not
-//!   hold, an unknown identifier, a deleted resource — is `ResourceNotFoundException`
-//!   (404).
+//!   another partition or Region, are `ValidationException` (400), and an ARN of this
+//!   service and scope that names no stored resource — a resource type this service
+//!   does not hold, an unknown identifier, a deleted resource — is
+//!   `ResourceNotFoundException` (404).
 
 use std::sync::Arc;
 
@@ -42,6 +42,12 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_endusermessaging_endusermessaging::EmulatedService;
+
+/// The SCOPE half of the same tagging contract: the partition and Region a
+/// `resourceArn` is read against, and the mismatch an ARN of another scope is refused
+/// with. A child module of this suite, declared the way `tag_writes` is.
+#[path = "brand_profile_lifecycle/arn_scope.rs"]
+mod arn_scope;
 
 /// The tag WRITE half of the same tagging contract, driven over the same wire:
 /// `TagResource`, and the tag sets no request may carry. A child module of this suite,

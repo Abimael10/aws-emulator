@@ -595,6 +595,20 @@ pub fn notify_code_configuration_arn(region: &str, notify_code_configuration_id:
     )
 }
 
+/// The ARN partition this emulator serves, read off an ARN [`::engine::emulator_arn`]
+/// builds rather than written here as a literal, so the partition every ARN of this
+/// service carries — and the one a caller-supplied ARN is held to — has one source of
+/// truth.
+///
+/// An ARN of another partition names a resource no call to this emulator can reach, so
+/// a request carrying one is refused on its input rather than looked up.
+pub fn emulator_partition() -> String {
+    let minted = brand_profile_arn("", "");
+    ::service_common::arn::parse(&minted)
+        .map(|arn| arn.partition.to_string())
+        .unwrap_or_default()
+}
+
 /// The region this request was signed for, or [`DEFAULT_REGION`] when it carries
 /// no SigV4 credential scope.
 pub fn request_region(parts: &::http::request::Parts) -> String {
