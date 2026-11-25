@@ -35,8 +35,10 @@ use super::ec2_instance_managed_nodes::{
 const RUN_SHELL_SCRIPT: &str = "AWS-RunShellScript";
 
 /// The step of that document a Linux node runs — the name its content declares, which is
-/// what `GetCommandInvocation`'s `PluginName` reports.
-const LINUX_STEP: &str = "runShellScriptOnLinux";
+/// what `GetCommandInvocation`'s `PluginName` reports. The document is published at schema
+/// 1.2, whose steps are its `runtimeConfig` plugin entries, so the step's name is the
+/// plugin's own.
+const LINUX_STEP: &str = "aws:runShellScript";
 
 /// The status a shell answers for a utility it could not find, which is what a guest with no
 /// such program answers (POSIX, and

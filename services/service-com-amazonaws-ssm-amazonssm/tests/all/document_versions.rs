@@ -16,18 +16,10 @@
 //! page the caller asks for, which member the request supplies and which it omits —
 //! rather than the single document a recorded unit happened to update.
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::parameter_store::{call, call_in_region, error_code, error_message, router, REGION};
-
-/// The transient window a version spends in `Creating`/`Updating`
-/// (`crate::state::DOCUMENT_TRANSITION_DELAY`), which the service stores as a due instant
-/// rather than sleeping for.
-const TRANSITION_DELAY: Duration =
-    service_com_amazonaws_ssm_amazonssm::state::DOCUMENT_TRANSITION_DELAY;
 
 /// How many versions of one document this store keeps
 /// (`crate::state::MAX_DOCUMENT_VERSIONS`), past which an update is refused with the
@@ -694,8 +686,15 @@ async fn a_version_name_another_version_carries_is_refused() {
     .await;
     assert_eq!(
         (status, error_code(&response).as_str()),
-        (400, "InvalidDocumentVersion"),
-        "a version name no version carries names no version, got {status} {response}"
+        (400, "InvalidDocument"),
+        "a version name no version carries addresses no document, got {status} {response}"
+    );
+    assert_eq!(
+        response["Message"],
+        json!(format!(
+            "Document with name {name} with version Release9.9 does not exist."
+        )),
+        "the refusal names the document and the version name asked for, got {response}"
     );
 }
 
@@ -758,10 +757,11 @@ async fn an_omitted_display_name_is_inherited_and_a_supplied_one_replaces_it() {
     );
 }
 
-/// An appended version is `Updating` until the clock makes its move to `Active` due, and
-/// `Active` after — materialised from the stored due instant, with nothing sleeping.
+/// An appended version reports the transient `Updating` status in the update's own
+/// response, and the version is registered by the update itself, so the next read —
+/// unpolled — reports `Active`, as does the version the create minted.
 #[tokio::test]
-async fn an_appended_version_becomes_active_once_the_transition_is_due() {
+async fn an_appended_version_is_active_on_the_next_read() {
     let router = router();
     let name = "TransitioningVersionDocument";
     create_ok(
@@ -770,35 +770,32 @@ async fn an_appended_version_becomes_active_once_the_transition_is_due() {
         &json!({ "Name": name, "Content": command_json("one") }),
     )
     .await;
-    let started = std::time::Instant::now();
-    let updated = update_ok(
-        &router,
-        "the appended version",
-        &json!({ "Name": name, "Content": command_json("two") }),
-    )
-    .await;
-    if started.elapsed() < TRANSITION_DELAY {
+    // One row per appended version, so the promotion is asserted of the update path
+    // rather than of the first update alone.
+    for (case, description, version) in [
+        ("the first appended version", "two", "2"),
+        ("the next appended version", "three", "3"),
+    ] {
+        let updated = update_ok(
+            &router,
+            case,
+            &json!({ "Name": name, "Content": command_json(description) }),
+        )
+        .await;
         assert_eq!(
             updated["Status"],
             json!("Updating"),
-            "an appended version starts Updating, got {updated}"
+            "case {case}: an appended version starts Updating, got {updated}"
         );
-        let described = describe_ok(&router, "before the move is due", name, Some("2")).await;
+        let described = describe_ok(&router, case, name, Some(version)).await;
         assert_eq!(
             described["Status"],
-            json!("Updating"),
-            "a read before the move is due still reports Updating, got {described}"
+            json!("Active"),
+            "case {case}: the read after the update reports Active, got {described}"
         );
     }
-    tokio::time::sleep(TRANSITION_DELAY + Duration::from_millis(50)).await;
-    let described = describe_ok(&router, "after the move is due", name, Some("2")).await;
-    assert_eq!(
-        described["Status"],
-        json!("Active"),
-        "the clock-owed move to Active is materialised, got {described}"
-    );
-    // The version the create minted made the same move, so both versions are Active.
-    let described = describe_ok(&router, "version 1 after the move", name, Some("1")).await;
+    // The version the create minted made the same move, so every version is Active.
+    let described = describe_ok(&router, "version 1 after the updates", name, Some("1")).await;
     assert_eq!(
         described["Status"],
         json!("Active"),

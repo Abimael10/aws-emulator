@@ -97,7 +97,8 @@ pub const STATUS_APPROVED: &str = "Approved";
 ///
 /// AWS publishes no span for it, so this is the emulator's CHOSEN transient window: three
 /// seconds, the same span this service gives every transition nobody documents
-/// ([`super::DOCUMENT_TRANSITION_DELAY`]). It is deliberately never zero: a caller that reads
+/// ([`super::associations::ASSOCIATION_CREATION_DELAY`]). It is deliberately never zero: a
+/// caller that reads
 /// an access request straight after raising it observes `Pending`, the way it would against
 /// the real service, and the move is materialised from the stored due instant
 /// ([`AccessRequestRecord::materialize_due`]) rather than by any call.

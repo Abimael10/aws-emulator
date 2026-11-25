@@ -13,7 +13,9 @@
 //! Both renderings go through the one parser this service reads document content with
 //! (`yaml_rust2`, whose YAML 1.2 is a superset of JSON), so the document tree a read
 //! re-renders is the same tree every other read derives its report from: nothing is
-//! re-written by hand and no value is invented along the way.
+//! re-written by hand and no value is invented along the way. The YAML text itself is
+//! written in the serializer style Systems Manager converts a document with
+//! ([`super::document_yaml`]).
 //!
 //! Two kinds of content are reported exactly as persisted, because no re-rendering is
 //! defined for them: content held in (or asked for in) the free-text format, which
@@ -68,15 +70,11 @@ fn as_json(content: &str) -> Option<String> {
 
 /// `content`'s document tree rendered as YAML, or `None` when the content is not one
 /// document tree this service can read.
+///
+/// The text is the one a format conversion answers with
+/// ([`super::document_yaml::rendered`]), which is written off the parsed tree rather than
+/// out of the stored bytes.
 fn as_yaml(content: &str) -> Option<String> {
     let document = super::load_single_document(content).ok()?;
-    let mut rendered = String::new();
-    ::yaml_rust2::emitter::YamlEmitter::new(&mut rendered)
-        .dump(&document)
-        .ok()?;
-    // The emitter opens what it writes with YAML's document-start marker; a document's
-    // content is the document itself, which is what the create of a YAML document
-    // supplies and what a read of one reports.
-    let body = rendered.strip_prefix("---\n").unwrap_or(&rendered);
-    Some(body.to_string())
+    super::document_yaml::rendered(&document)
 }

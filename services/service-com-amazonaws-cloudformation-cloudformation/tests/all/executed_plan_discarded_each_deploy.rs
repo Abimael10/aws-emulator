@@ -4,7 +4,8 @@
 //! name, execute the plan, wait for the stack to settle, then discard the change set it just
 //! executed — and plan the next deployment under that same name.
 //!
-//! RULE: `DeleteChangeSet` discards a change-set record whenever CloudFormation has no operation
+//! The rule every case here holds the service to: `DeleteChangeSet` discards a change-set record
+//! whenever CloudFormation has no operation
 //! of its own in flight on it, so a record in a TERMINAL execution status — one whose execution
 //! was carried out among them — is answered with the operation's own empty result: HTTP 200, the
 //! `DeleteChangeSetResponse` envelope carrying a `RequestId` and no member of its own (the

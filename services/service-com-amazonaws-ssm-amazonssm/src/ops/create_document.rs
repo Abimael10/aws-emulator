@@ -13,9 +13,10 @@
 //! Everything the response reports beyond the request's own members is derived from the
 //! content that was persisted (`crate::state::parse_document_content`): the schema
 //! version, the description, the parameters, the platform types and the Sha256 hash.
-//! The document is minted `Creating` and the clock owes its move to `Active`
-//! ([`crate::state::DOCUMENT_TRANSITION_DELAY`]), so a caller reading straight after
-//! this call still sees the transient status.
+//! The document is minted `Creating`, which is the status this call's own response
+//! reports, and the clock owes its move to `Active` from the instant the create completes
+//! ([`crate::state::document_active_due`]), so a read that comes after it reports a
+//! document that is ready to use.
 //!
 //! ## Shape of an operation
 //!
@@ -356,11 +357,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 attachment_names: crate::state::attachment_names(input.attachments.as_deref()),
                 created_date: now,
                 // "The status of the SSM document": a document Systems Manager is still
-                // registering is `Creating`, and the clock owes its move to `Active` at
-                // `active_due`, so a caller acting straight after this call still sees
-                // the transient status.
+                // registering is `Creating`, which is what this create's own response
+                // reports; the registration itself completes with this call, so the move
+                // to `Active` is owed from this instant
+                // ([`crate::state::document_active_due`]) and every read after it reports
+                // a document that is ready to use.
                 status: crate::state::DOCUMENT_STATUS_CREATING.to_string(),
-                active_due: Some(now + crate::state::DOCUMENT_TRANSITION_DELAY),
+                active_due: Some(crate::state::document_active_due(now)),
             }],
             // "The default version" of a document that holds one version is that
             // version; `UpdateDocumentDefaultVersion` is what moves it afterwards.

@@ -281,6 +281,8 @@ async fn a_delete_removes_only_the_version_its_selector_names() {
             "case {case}: version {removed} names nothing after the delete, got \
              {status} {response}"
         );
+        // ...and the NAME that version carried addresses no document now: a VersionName no
+        // version carries is a missing document rather than an invalid version.
         let (status, response) = describe(
             &router,
             REGION,
@@ -289,7 +291,7 @@ async fn a_delete_removes_only_the_version_its_selector_names() {
         .await;
         assert_eq!(
             (status, error_code(&response).as_str()),
-            (400, "InvalidDocumentVersion"),
+            (400, "InvalidDocument"),
             "case {case}: the version name {} names nothing after the delete, got \
              {status} {response}",
             version_name(row.removed)

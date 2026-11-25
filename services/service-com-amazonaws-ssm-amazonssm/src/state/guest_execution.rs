@@ -50,6 +50,16 @@ use super::{load_single_document, mapping_get, scalar_string};
 /// (the Systems Manager command document plugin reference).
 pub const COMMANDS_INPUT: &str = "commands";
 
+/// The same input under its schema 1.2 spelling: a schema 1.2 document declares its steps
+/// as `runtimeConfig` plugin entries, and the plugin property that carries the script
+/// there is `runCommand` (the "SSM document schema 1.2" plugin reference) — so both
+/// spellings name the script of the one step a node's agent performs.
+pub const RUN_COMMAND_PROPERTY: &str = "runCommand";
+
+/// Where a schema 1.2 plugin entry declares the properties one invocation of it runs
+/// with: "properties" holds either one property mapping or a list of them.
+const PLUGIN_PROPERTIES: &str = "properties";
+
 /// The step of `content` a node of `platform_type` runs, with its script resolved: the
 /// step's name and the lines the guest performs.
 #[derive(Debug, Clone)]
@@ -66,6 +76,13 @@ pub struct ShellStep {
 /// `supplied` are the parameter values the send carried and `declared` the document's own
 /// parameters, whose `DefaultValue` fills in for one the send left out — "If you don't
 /// specify a value, the default value is used" is what a document's default is for.
+///
+/// Both spellings of a step are read, the way every other reader of a document's steps
+/// reads them ([`super::documents::declared_step_names`],
+/// [`super::document_platforms::declared_platform_types`]): a schema 2.x document declares
+/// its steps as `mainSteps`, each with its own `action` and `inputs`, and a schema 1.2
+/// document declares them as the `runtimeConfig` plugin entries, whose keys are the plugin
+/// names and whose `properties` carry the script.
 pub fn shell_step(
     content: &str,
     platform_type: &str,
@@ -74,8 +91,20 @@ pub fn shell_step(
 ) -> Option<ShellStep> {
     let document = load_single_document(content).ok()?;
     let map = document.as_hash()?;
-    let steps = mapping_get(map, "mainSteps")?.as_vec()?;
     let values = parameter_values(supplied, declared);
+    if let Some(steps) = mapping_get(map, "mainSteps").and_then(::yaml_rust2::Yaml::as_vec) {
+        return main_steps_script(steps, platform_type, &values);
+    }
+    runtime_config_script(map, platform_type, &values)
+}
+
+/// The step of a schema 2.x document's `mainSteps` that a node of `platform_type` runs,
+/// with its script resolved.
+fn main_steps_script(
+    steps: &[::yaml_rust2::Yaml],
+    platform_type: &str,
+    values: &BTreeMap<String, Vec<String>>,
+) -> Option<ShellStep> {
     for step in steps {
         let step = step.as_hash()?;
         if !super::document_platforms::step_runs_on(step, platform_type) {
@@ -88,10 +117,7 @@ pub fn shell_step(
             // one.
             continue;
         };
-        // One budget for the whole script, spent across every level the content nests
-        // ([`MAX_SCRIPT_BYTES`]).
-        let mut budget = MAX_SCRIPT_BYTES;
-        let commands = resolved_script(script, &values, 0, &mut budget);
+        let commands = resolved_commands(script, values);
         if commands.is_empty() {
             continue;
         }
@@ -103,6 +129,76 @@ pub fn shell_step(
         });
     }
     None
+}
+
+/// The schema 1.2 plugin entry of `map` that a node of `platform_type` runs, with its
+/// script resolved.
+///
+/// A plugin entry carries no precondition, so the PLUGIN alone decides where it runs
+/// ([`super::document_platforms::plugin_platform_types`]), and the step's name — what
+/// `GetCommandInvocation`'s `PluginName` names for such a document — is the plugin's own
+/// name, which is the key it is declared under.
+fn runtime_config_script(
+    map: &::yaml_rust2::yaml::Hash,
+    platform_type: &str,
+    values: &BTreeMap<String, Vec<String>>,
+) -> Option<ShellStep> {
+    let plugins = mapping_get(map, "runtimeConfig").and_then(::yaml_rust2::Yaml::as_hash)?;
+    for (name, plugin) in plugins {
+        let Some(name) = name.as_str() else {
+            continue;
+        };
+        let runs_here = super::document_platforms::plugin_platform_types(name)
+            .is_none_or(|platforms| platforms.contains(&platform_type));
+        if !runs_here {
+            continue;
+        }
+        let Some(plugin) = plugin.as_hash() else {
+            continue;
+        };
+        for properties in plugin_properties(plugin) {
+            let Some(script) = mapping_get(properties, RUN_COMMAND_PROPERTY)
+                .or_else(|| mapping_get(properties, COMMANDS_INPUT))
+            else {
+                continue;
+            };
+            let commands = resolved_commands(script, values);
+            if commands.is_empty() {
+                continue;
+            }
+            return Some(ShellStep {
+                name: name.to_string(),
+                commands,
+            });
+        }
+    }
+    None
+}
+
+/// The property mappings one schema 1.2 plugin entry declares: `properties` is written
+/// either as one mapping or as a list of them, and a plugin that declares none runs
+/// nothing.
+fn plugin_properties(plugin: &::yaml_rust2::yaml::Hash) -> Vec<&::yaml_rust2::yaml::Hash> {
+    let Some(properties) = mapping_get(plugin, PLUGIN_PROPERTIES) else {
+        return Vec::new();
+    };
+    match properties {
+        ::yaml_rust2::Yaml::Array(entries) => {
+            entries.iter().filter_map(::yaml_rust2::Yaml::as_hash).collect()
+        }
+        other => other.as_hash().into_iter().collect(),
+    }
+}
+
+/// The lines of ONE step's script, resolved against `values` and held to the one budget
+/// the whole script is built against ([`MAX_SCRIPT_BYTES`], spent across every level the
+/// content nests).
+fn resolved_commands(
+    script: &::yaml_rust2::Yaml,
+    values: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut budget = MAX_SCRIPT_BYTES;
+    resolved_script(script, values, 0, &mut budget)
 }
 
 /// The value of every parameter the document has one for: the document's declared default

@@ -16,7 +16,8 @@
 //! The version served is the one the request names, by `DocumentVersion` selector or by
 //! `VersionName`; a request that names neither is served the document's DEFAULT version
 //! ([`crate::state::DocumentRecord::select_requested`]), which is not necessarily its
-//! latest one.
+//! latest one. A `VersionName` no version of the document carries addresses no document,
+//! so it is refused as a missing document rather than as an invalid version.
 //!
 //! ## Shape of an operation
 //!
@@ -237,12 +238,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(missing().into());
         };
 
-        // A version the document does not carry names nothing to report, whether the
-        // request named it by selector — a number or one of the two role selectors — or
-        // by version name, "unique across all versions of a document". Each refusal names
-        // what it was asked for, read from the request, beside the version the document
-        // actually holds, read from the store. A request that names neither is served the
-        // document's default version.
+        // A version the document does not carry names nothing to report. A `DocumentVersion`
+        // SELECTOR the document holds no version of is refused as the invalid version it is,
+        // naming the number asked for beside the version the document actually holds. A
+        // `VersionName` is "unique across all versions of a document", so a name no version
+        // of it carries addresses no document at all: that is a MISSING DOCUMENT, refused as
+        // `InvalidDocument` ("the specified SSM document doesn't exist") in the sentence this
+        // service reports a name-and-version miss with
+        // ([`crate::state::document_version_not_found_message`]), which names the document
+        // from the request beside the version name it asked for. A request that names
+        // neither is served the document's default version.
         let version = match record.select_requested(
             input.document_version.as_deref(),
             input.version_name.as_deref(),
@@ -260,11 +265,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
             Err(crate::state::DocumentVersionRejection::VersionName(requested)) => {
-                return Err(GetDocumentErrorModeled::InvalidDocumentVersion(
-                    InvalidDocumentVersion {
-                        message: Some(format!("Document version name: {requested} is invalid")),
-                    },
-                )
+                return Err(GetDocumentErrorModeled::InvalidDocument(InvalidDocument {
+                    message: Some(crate::state::document_version_not_found_message(
+                        &input.name,
+                        &requested,
+                    )),
+                })
                 .into());
             }
         };

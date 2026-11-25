@@ -229,6 +229,9 @@ pub mod provider_credentials;
 /// Rendering a persisted document's content in the `DocumentFormat` a read asks for.
 pub mod document_format;
 
+/// Writing a document tree back out as the YAML a format conversion answers with.
+pub mod document_yaml;
+
 /// The Change Calendar entry a document of that type carries, and the state it leaves a
 /// calendar in at one instant.
 pub mod change_calendar;
@@ -1757,22 +1760,26 @@ pub const DOCUMENT_STATUS_CREATING: &str = "Creating";
 /// See [`DOCUMENT_STATUS_CREATING`].
 pub const DOCUMENT_STATUS_ACTIVE: &str = "Active";
 
+/// When the clock owes a freshly minted document version its move to `Active`: AT THE
+/// INSTANT the call that minted it completes.
+///
+/// A document is registered by the call that writes it. RECORDED BEHAVIOUR: a
+/// `CreateDocument` answers with `Status` `Creating` — the transient status is what the
+/// minting call itself reports — and an UNPOLLED `GetDocument`/`DescribeDocument` straight
+/// after it reads `Active`, so the document is usable as an association or Run Command
+/// target without anybody waiting. The move is therefore owed from `minted`, the instant
+/// the mint happened, and is materialised by
+/// [`ComAmazonawsSsmAmazonssmState::materialize_due`] on the first read that comes after
+/// it rather than by any call doing the promotion for itself.
+pub fn document_active_due(minted: SystemTime) -> SystemTime {
+    minted
+}
+
 /// The `DocumentStatus` a version Systems Manager is still registering FOR AN EXISTING
 /// document carries, from the same modelled enum: "the document is being updated" is
 /// what `Updating` says, so a version `UpdateDocument` has just minted is `Updating`
 /// where a version `CreateDocument` minted is [`DOCUMENT_STATUS_CREATING`].
 pub const DOCUMENT_STATUS_UPDATING: &str = "Updating";
-
-/// How long a document version stays `Creating` or `Updating` before the clock owes its
-/// move to `Active`.
-///
-/// AWS publishes no span for it, so this is the emulator's CHOSEN transient window: three
-/// seconds, the span this emulator gives a transition nobody documents.
-/// It is deliberately never zero: a caller that reads a document straight after
-/// creating it observes `Creating`, the way it would against the real service, and the
-/// move is materialised by [`ComAmazonawsSsmAmazonssmState::materialize_due`] when the
-/// clock makes it due rather than by any call.
-pub const DOCUMENT_TRANSITION_DELAY: Duration = Duration::from_secs(3);
 
 /// How many nanoseconds a millisecond is, which is the resolution this service states an
 /// instant at: a finer reading of the clock than what goes on the wire states a precision
@@ -2759,7 +2766,7 @@ impl ComAmazonawsSsmAmazonssmState {
     }
 
     /// Materialise every transition the clock already owes at `now`, so a read reports
-    /// what was due whether or not anybody called (see [`DOCUMENT_TRANSITION_DELAY`]).
+    /// what was due whether or not anybody called (see [`document_active_due`]).
     pub fn materialize_due(&mut self, now: SystemTime) {
         for document in self.documents.values_mut() {
             document.materialize_due(now);

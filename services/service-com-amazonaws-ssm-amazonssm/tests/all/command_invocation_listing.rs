@@ -34,8 +34,10 @@ use super::run_command_in_the_guest::finish_due;
 /// The published command document every case runs.
 const RUN_SHELL_SCRIPT: &str = "AWS-RunShellScript";
 
-/// The step of that document a Linux node runs, which is what the per-step results name.
-const LINUX_STEP: &str = "runShellScriptOnLinux";
+/// The step of that document a Linux node runs, which is what the per-step results name:
+/// the document is published at schema 1.2, whose steps are its `runtimeConfig` plugin
+/// entries, so the step's name is the plugin's own.
+const LINUX_STEP: &str = "aws:runShellScript";
 
 /// How long a case looks for an invocation to finish, far longer than the span the clock owes
 /// that move after — so the case does not depend on how fast the host runs.

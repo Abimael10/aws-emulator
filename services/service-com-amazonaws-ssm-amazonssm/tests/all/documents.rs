@@ -14,18 +14,10 @@
 //! version selector, Region — rather than the single document a recorded unit happened
 //! to create.
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::parameter_store::{call, call_in_region, error_code, router, ACCOUNT, REGION};
-
-/// The transient window a created document spends in `Creating`
-/// (`crate::state::DOCUMENT_TRANSITION_DELAY`), which the service stores as a due
-/// instant rather than sleeping for.
-const TRANSITION_DELAY: Duration =
-    service_com_amazonaws_ssm_amazonssm::state::DOCUMENT_TRANSITION_DELAY;
 
 /// The `DocumentFormat` values the model's enum declares
 /// (`smithy_query(query="shape", shape="DocumentFormat")`).
@@ -521,48 +513,58 @@ async fn the_optional_members_of_a_create_round_trip() {
     .await;
     assert_eq!(
         (status, error_code(&response).as_str()),
-        (400, "InvalidDocumentVersion"),
-        "a VersionName the document doesn't carry names no version, got {status} {response}"
+        (400, "InvalidDocument"),
+        "a VersionName the document doesn't carry addresses no document, got {status} {response}"
     );
 }
 
-/// A created document is `Creating` until the clock makes its move to `Active` due, and
-/// `Active` after — materialised from the stored due instant, with nothing sleeping.
+/// A create reports the transient `Creating` status and the document is registered by the
+/// create itself, so the next read — unpolled — reports `Active`, materialised from the
+/// stored due instant with nothing sleeping.
 #[tokio::test]
-async fn a_created_document_becomes_active_once_the_transition_is_due() {
+async fn a_created_document_is_active_on_the_next_read() {
     let router = router();
-    let started = std::time::Instant::now();
-    let created = create_ok(
-        &router,
-        "the transient window",
-        &json!({ "Name": "TransitionDocument", "Content": COMMAND_JSON }),
-    )
-    .await;
-    assert_eq!(
-        created["Status"],
-        json!("Creating"),
-        "a create reports the transient status, got {created}"
-    );
-    let read = describe_ok(&router, "before the transition is due", "TransitionDocument").await;
-    // Only assert the pre-due status while the window is demonstrably still open: on a
-    // loaded machine the round trip above can itself outlast it, and the point of the
-    // case is the move, not how fast this process runs.
-    if started.elapsed() < TRANSITION_DELAY {
+    // One row per content shape a create may carry, so the promotion is asserted of the
+    // create path rather than of one document body.
+    let rows: [(&str, &str, Value); 3] = [
+        (
+            "a Command document",
+            "TransitionCommandDocument",
+            json!({ "Content": COMMAND_JSON }),
+        ),
+        (
+            "an Automation runbook written in YAML",
+            "TransitionAutomationDocument",
+            json!({
+                "Content": AUTOMATION_YAML,
+                "DocumentType": "Automation",
+                "DocumentFormat": "YAML",
+            }),
+        ),
+        (
+            "a document created with a version name",
+            "TransitionNamedDocument",
+            json!({ "Content": COMMAND_JSON, "VersionName": "release-one" }),
+        ),
+    ];
+    for (case, name, extra) in rows {
+        let mut request = json!({ "Name": name });
+        for (member, value) in extra.as_object().expect("the row's members") {
+            request[member] = value.clone();
+        }
+        let created = create_ok(&router, case, &request).await;
+        assert_eq!(
+            created["Status"],
+            json!("Creating"),
+            "case {case}: a create reports the transient status, got {created}"
+        );
+        let read = describe_ok(&router, case, name).await;
         assert_eq!(
             read["Status"],
-            json!("Creating"),
-            "a read before the transition is due still reports Creating, got {read}"
+            json!("Active"),
+            "case {case}: the read after the create reports Active, got {read}"
         );
     }
-
-    tokio::time::sleep(TRANSITION_DELAY + Duration::from_millis(250)).await;
-
-    let read = describe_ok(&router, "after the transition is due", "TransitionDocument").await;
-    assert_eq!(
-        read["Status"],
-        json!("Active"),
-        "a read past the due instant reports Active, got {read}"
-    );
 }
 
 /// A document name is unique within a Region: a second create of one name is refused

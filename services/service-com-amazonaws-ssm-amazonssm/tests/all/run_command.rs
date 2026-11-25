@@ -64,19 +64,23 @@ const UNREGISTERED: &str = "i-0dead999";
 /// nothing for it.
 const OTHER_ONLY: &str = "i-0eeee222";
 
-/// A command document Systems Manager publishes whose steps are restricted to Linux and
-/// macOS, and which declares one parameter with no default (`commands`).
+/// A command document Systems Manager publishes whose plugin runs on Linux and macOS,
+/// and which declares one parameter with no default (`commands`).
 const SHELL: &str = "AWS-RunShellScript";
 
-/// A command document Systems Manager publishes whose step is restricted to Windows.
+/// A command document Systems Manager publishes whose plugin runs on Windows.
 const POWERSHELL: &str = "AWS-RunPowerShellScript";
 
 /// A command document Systems Manager publishes that declares no step precondition, so it
 /// runs on every platform, and whose every parameter has a default.
 const AGENT: &str = "AWS-UpdateSSMAgent";
 
-/// A step of [`SHELL`], from that document's content (`mainSteps[].name`).
-const SHELL_STEP: &str = "runShellScriptOnLinux";
+/// A step of [`SHELL`], from that document's content: it is published at schema 1.2, whose
+/// steps are its `runtimeConfig` plugin entries, so the step's name is the plugin's own.
+const SHELL_STEP: &str = "aws:runShellScript";
+
+/// A step name [`SHELL`]'s content declares nothing of.
+const UNDECLARED_STEP: &str = "runShellScriptOnLinux";
 
 /// A router with just this service mounted, and the engine it was mounted on — the handle
 /// a case seeds the node inventory through.
@@ -1242,7 +1246,7 @@ async fn a_read_resolves_a_command_by_the_id_its_send_minted() {
         ),
         (
             "a step the document declares nothing of",
-            json!({"CommandId": first.clone(), "InstanceId": LINUX, "PluginName": "aws:runShellScript"}),
+            json!({"CommandId": first.clone(), "InstanceId": LINUX, "PluginName": UNDECLARED_STEP}),
             REGION,
             "InvalidPluginName",
         ),

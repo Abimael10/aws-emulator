@@ -22,18 +22,10 @@
 //! the alphabet the content is written in, the version selector, the name spelling and
 //! the endpoint Region — rather than the single document a recorded unit happened to get.
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::parameter_store::{call, call_in_region, error_code, router, ACCOUNT, REGION};
-
-/// The transient window a created document spends in `Creating`
-/// (`crate::state::DOCUMENT_TRANSITION_DELAY`), which the service stores as a due instant
-/// rather than sleeping for.
-const TRANSITION_DELAY: Duration =
-    service_com_amazonaws_ssm_amazonssm::state::DOCUMENT_TRANSITION_DELAY;
 
 /// The catalogue of documents Systems Manager publishes
 /// (`crate::state::PUBLISHED_DOCUMENTS`), so the published suite can be checked to cover
@@ -558,17 +550,18 @@ async fn a_version_selector_resolves_to_the_version_the_document_holds() {
             "InvalidDocumentVersion",
             "Document version: 42 is invalid, latest version is 1",
         ),
-        // A version NAME no version carries names no version of the document, and the
-        // refusal names the version name it was asked for.
+        // A version NAME no version carries addresses no document, so the read is refused
+        // as a missing document and the refusal names the document and the version name it
+        // was asked for.
         (
             json!({ "Name": "EchoUnicode", "VersionName": "2.0" }),
-            "InvalidDocumentVersion",
-            "Document version name: 2.0 is invalid",
+            "InvalidDocument",
+            "Document with name EchoUnicode with version 2.0 does not exist.",
         ),
         (
             json!({ "Name": "EchoUnicode", "DocumentVersion": "1", "VersionName": "9.9" }),
-            "InvalidDocumentVersion",
-            "Document version name: 9.9 is invalid",
+            "InvalidDocument",
+            "Document with name EchoUnicode with version 9.9 does not exist.",
         ),
     ] {
         let (status, response) = get(&router, &refused).await;
@@ -741,24 +734,17 @@ async fn a_read_reports_the_owed_status_and_changes_nothing_else() {
     let read = get_ok(&router, case, &json!({ "Name": "EchoUnicode" })).await;
     assert_eq!(
         read["Status"],
-        json!("Creating"),
-        "case {case}: a document Systems Manager is still registering is Creating, got {read}"
+        json!("Active"),
+        "case {case}: the document is registered by the create, so a read reports Active, \
+         got {read}"
     );
     let again = get_ok(&router, case, &json!({ "Name": "EchoUnicode" })).await;
     assert_eq!(
         again, read,
-        "case {case}: two reads inside the transient window must agree, got {again}"
-    );
-
-    tokio::time::sleep(TRANSITION_DELAY + Duration::from_millis(50)).await;
-    let settled = get_ok(&router, case, &json!({ "Name": "EchoUnicode" })).await;
-    assert_eq!(
-        settled["Status"],
-        json!("Active"),
-        "case {case}: the move to Active was due, got {settled}"
+        "case {case}: two reads of one document must agree, got {again}"
     );
     assert_eq!(
-        content_of(case, &settled),
+        content_of(case, &again),
         COMMAND_JSON,
         "case {case}: the content is unchanged by the status move"
     );

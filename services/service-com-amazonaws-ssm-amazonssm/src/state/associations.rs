@@ -92,8 +92,8 @@ pub const ASSOCIATION_DETAILED_STATUS_IN_PROGRESS: &str = "InProgress";
 ///
 /// AWS publishes no span for it — it is however long the agent on each node takes to poll,
 /// apply the document and report back — so this is the emulator's CHOSEN transient window:
-/// three seconds, the span this emulator gives a transition nobody documents (see
-/// [`super::DOCUMENT_TRANSITION_DELAY`]). It is deliberately never zero: a caller that reads
+/// three seconds, the span this emulator gives a transition nobody documents. It is
+/// deliberately never zero: a caller that reads
 /// the association straight after starting it sees the run still in progress, the way it
 /// would against the real service.
 pub const ASSOCIATION_EXECUTION_DELAY: Duration = Duration::from_secs(3);

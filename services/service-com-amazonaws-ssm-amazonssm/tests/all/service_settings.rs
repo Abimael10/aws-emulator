@@ -31,13 +31,10 @@ use super::parameter_store::{
     call, call_in_region, error_code, error_message as message, router, ACCOUNT, REGION,
 };
 
-/// The sentence `ServiceSettingNotFound` carries, spelled out here as the error shape's
-/// own documentation words it
-/// (`smithy_query(query="shape", shape="com.amazonaws.ssm#ServiceSettingNotFound")`), so a
-/// change to the wording the handler answers with fails this suite.
-const SETTING_NOT_FOUND: &str = "The specified service setting wasn't found. Either the service \
-                                name or the setting hasn't been provisioned by the Amazon Web \
-                                Services service team.";
+/// What `ServiceSettingNotFound` carries as its message: NOTHING. The error code alone
+/// states that the `SettingId` names no provisioned setting, so the refusal carries no
+/// `Message` member at all and a client reads an empty message for it.
+const SETTING_NOT_FOUND: &str = "";
 
 /// A second Region, so a suite can prove a setting is held at the endpoint it was set
 /// through rather than account-wide across every endpoint.
@@ -350,10 +347,21 @@ async fn a_setting_id_the_model_cannot_carry_is_refused_as_an_invalid_request() 
                 expected,
                 "case {case} / {operation}: expected {expected}, got {response}"
             );
-            assert!(
-                !message(&response).is_empty(),
-                "case {case} / {operation}: the refusal must say why, got {response}"
-            );
+            // A `ValidationException` says which member is wrong and why;
+            // `ServiceSettingNotFound` carries no message at all.
+            if expected == "ValidationException" {
+                assert!(
+                    !message(&response).is_empty(),
+                    "case {case} / {operation}: the refusal must say why, got {response}"
+                );
+            } else {
+                assert_eq!(
+                    message(&response),
+                    SETTING_NOT_FOUND,
+                    "case {case} / {operation}: an unprovisioned setting carries no message, \
+                     got {response}"
+                );
+            }
         }
     }
 
@@ -443,7 +451,8 @@ async fn a_setting_no_service_team_provisions_is_refused() {
             let refusal = message(&response);
             assert_eq!(
                 refusal, SETTING_NOT_FOUND,
-                "case {id:?} / {operation}: expected the error shape's own sentence, got {response}"
+                "case {id:?} / {operation}: an unprovisioned setting carries no message, got \
+                 {response}"
             );
         }
     }

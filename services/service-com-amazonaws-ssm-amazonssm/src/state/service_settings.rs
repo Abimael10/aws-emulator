@@ -184,18 +184,20 @@ pub fn definition(id: &str) -> Option<&'static SettingDefinition> {
 }
 
 /// The setting a request's `SettingId` names, by either of its documented spellings, or
-/// `None` when no service team provisions it ([`NOT_FOUND_MESSAGE`]).
+/// `None` when no service team provisions it, which is what `ServiceSettingNotFound`
+/// reports ([`NOT_FOUND_MESSAGE`]).
 #[must_use]
 pub fn resolve(setting_id: &str) -> Option<&'static SettingDefinition> {
     definition(parse_setting_id(setting_id)?)
 }
 
-/// What `ServiceSettingNotFound` reports for a `SettingId` the catalogue does not hold,
-/// in the error shape's own words — the whole sentence is fixed text, with no part of it
-/// taken from the request.
-pub const NOT_FOUND_MESSAGE: &str = "The specified service setting wasn't found. Either the \
-                                    service name or the setting hasn't been provisioned by the \
-                                    Amazon Web Services service team.";
+/// What `ServiceSettingNotFound` reports for a `SettingId` no service team provisions:
+/// NOTHING. The refusal carries no message at all — the error code alone states that the
+/// setting is not one Systems Manager holds — so the three operations that resolve a
+/// `SettingId` (`GetServiceSetting`, `UpdateServiceSetting`, `ResetServiceSetting`) leave
+/// the member unset rather than shipping the error shape's documentation as text the
+/// service never sends.
+pub const NOT_FOUND_MESSAGE: Option<String> = None;
 
 /// What `InternalServerError` reports when this service's store cannot be reached, so a
 /// request that can read nothing is answered as the server-side failure it is rather than

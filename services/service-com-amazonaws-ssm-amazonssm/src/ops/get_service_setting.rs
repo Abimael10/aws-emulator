@@ -167,11 +167,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some(crate::state::service_settings::STORE_UNAVAILABLE.to_string()),
             })
         })?;
-        let setting = crate::state::service_settings::resolve(&input.setting_id).ok_or_else(|| {
+        let setting = crate::state::service_settings::resolve(&input.setting_id).ok_or(
             GetServiceSettingErrorModeled::ServiceSettingNotFound(ServiceSettingNotFound {
-                message: Some(crate::state::service_settings::NOT_FOUND_MESSAGE.to_string()),
-            })
-        })?;
+                message: crate::state::service_settings::NOT_FOUND_MESSAGE,
+            }),
+        )?;
         let region = crate::state::request_region(ctx.parts());
         let held = state.lock().service_setting(&region, setting);
         Ok(GetServiceSettingOutput {

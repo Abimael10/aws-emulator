@@ -774,12 +774,16 @@ pub(super) const PUBLISH_SNS_NOTIFICATION: &str = r#"{
 
 /// The body of the command document that runs a shell script on a managed node.
 ///
-/// A command document's step actions and preconditions are what restrict it to a platform
+/// Published at schema 1.2 — the schema the two script documents Systems Manager has
+/// published since 2017 are written in — whose steps are the `runtimeConfig` PLUGIN
+/// ENTRIES rather than `mainSteps`: the map is keyed by the plugin Run Command invokes
+/// (`aws:runShellScript`) and that plugin's `properties` carry the script in
+/// `runCommand`. The plugin is what restricts the document to a platform
 /// ([`document_platforms::declared_platform_types`]), so the platforms the published
-/// document is reported
-/// compatible with are declared the same way a created document's are.
+/// document is reported compatible with are declared by its own content, the way a
+/// created document's are.
 pub(super) const RUN_SHELL_SCRIPT: &str = r#"{
-  "schemaVersion": "2.2",
+  "schemaVersion": "1.2",
   "description": "Run a shell script or specify the commands to run.",
   "parameters": {
     "commands": {
@@ -797,34 +801,25 @@ pub(super) const RUN_SHELL_SCRIPT: &str = r#"{
       "default": "3600"
     }
   },
-  "mainSteps": [
-    {
-      "name": "runShellScriptOnLinux",
-      "action": "aws:runShellScript",
-      "precondition": { "StringEquals": ["platformType", "Linux"] },
-      "inputs": {
-        "commands": "{{ commands }}",
-        "workingDirectory": "{{ workingDirectory }}",
-        "timeoutSeconds": "{{ executionTimeout }}"
-      }
-    },
-    {
-      "name": "runShellScriptOnMacOS",
-      "action": "aws:runShellScript",
-      "precondition": { "StringEquals": ["platformType", "MacOS"] },
-      "inputs": {
-        "commands": "{{ commands }}",
-        "workingDirectory": "{{ workingDirectory }}",
-        "timeoutSeconds": "{{ executionTimeout }}"
-      }
+  "runtimeConfig": {
+    "aws:runShellScript": {
+      "properties": [
+        {
+          "id": "0.aws:runShellScript",
+          "runCommand": "{{ commands }}",
+          "workingDirectory": "{{ workingDirectory }}",
+          "timeoutSeconds": "{{ executionTimeout }}"
+        }
+      ]
     }
-  ]
+  }
 }"#;
 
-/// The body of the command document that runs a PowerShell script on a managed node. See
-/// [`RUN_SHELL_SCRIPT`] for how the platforms are declared.
+/// The body of the command document that runs a PowerShell script on a managed node.
+/// Published at schema 1.2 as well — see [`RUN_SHELL_SCRIPT`] for how such a body
+/// declares its plugin and the platforms that plugin restricts it to.
 pub(super) const RUN_POWER_SHELL_SCRIPT: &str = r#"{
-  "schemaVersion": "2.2",
+  "schemaVersion": "1.2",
   "description": "Run a PowerShell script or specify the commands to run.",
   "parameters": {
     "commands": {
@@ -842,18 +837,18 @@ pub(super) const RUN_POWER_SHELL_SCRIPT: &str = r#"{
       "default": "3600"
     }
   },
-  "mainSteps": [
-    {
-      "name": "runPowerShellScript",
-      "action": "aws:runPowerShellScript",
-      "precondition": { "StringEquals": ["platformType", "Windows"] },
-      "inputs": {
-        "commands": "{{ commands }}",
-        "workingDirectory": "{{ workingDirectory }}",
-        "timeoutSeconds": "{{ executionTimeout }}"
-      }
+  "runtimeConfig": {
+    "aws:runPowerShellScript": {
+      "properties": [
+        {
+          "id": "0.aws:runPowerShellScript",
+          "runCommand": "{{ commands }}",
+          "workingDirectory": "{{ workingDirectory }}",
+          "timeoutSeconds": "{{ executionTimeout }}"
+        }
+      ]
     }
-  ]
+  }
 }"#;
 
 /// The body of the command document that updates the SSM Agent on a managed node. It

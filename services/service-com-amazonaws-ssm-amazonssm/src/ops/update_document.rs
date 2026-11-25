@@ -15,9 +15,10 @@
 //! Everything the new version reports beyond the request's own members is derived from the
 //! content it persisted (`crate::state::parse_document_content`): the schema version, the
 //! description, the parameters, the platform types and the Sha256 hash. A version is
-//! minted `Updating` and the clock owes its move to `Active`
-//! ([`crate::state::DOCUMENT_TRANSITION_DELAY`]), so a caller reading straight after this
-//! call still sees the transient status.
+//! minted `Updating`, which is the status this call's own response reports, and the clock
+//! owes its move to `Active` from the instant the update completes
+//! ([`crate::state::document_active_due`]), so a read that comes after it reports a
+//! version that is ready to use.
 //!
 //! ## Shape of an operation
 //!
@@ -414,11 +415,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             attachment_names: crate::state::attachment_names(input.attachments.as_deref()),
             created_date: now,
             // "The status of the SSM document": a version Systems Manager is still
-            // registering for an existing document is `Updating`, and the clock owes its
-            // move to `Active` at `active_due`, so a caller acting straight after this
-            // call still sees the transient status.
+            // registering for an existing document is `Updating`, which is what this
+            // update's own response reports; the registration itself completes with this
+            // call, so the move to `Active` is owed from this instant
+            // ([`crate::state::document_active_due`]) and every read after it reports a
+            // version that is ready to use.
             status: crate::state::DOCUMENT_STATUS_UPDATING.to_string(),
-            active_due: Some(now + crate::state::DOCUMENT_TRANSITION_DELAY),
+            active_due: Some(crate::state::document_active_due(now)),
         };
         record.versions.push(version);
 

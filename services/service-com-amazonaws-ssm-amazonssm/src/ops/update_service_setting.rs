@@ -187,11 +187,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let setting =
-            crate::state::service_settings::resolve(&input.setting_id).ok_or_else(|| {
+            crate::state::service_settings::resolve(&input.setting_id).ok_or(
                 UpdateServiceSettingErrorModeled::ServiceSettingNotFound(ServiceSettingNotFound {
-                    message: Some(crate::state::service_settings::NOT_FOUND_MESSAGE.to_string()),
-                })
-            })?;
+                    message: crate::state::service_settings::NOT_FOUND_MESSAGE,
+                }),
+            )?;
         // `SettingValue`'s length is a MODELLED constraint the centralized walk has
         // already refused anything outside; which values the setting itself accepts is
         // what the model cannot say, so it is checked here.

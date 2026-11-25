@@ -104,18 +104,21 @@ fn catalogue_rows() -> Vec<Published<'static>> {
             platforms: PLATFORM_TYPES,
         },
         Published {
-            case: "a command document restricted to two platforms",
+            // Published at schema 1.2, whose steps are the `runtimeConfig` plugin
+            // entries: the `aws:runShellScript` plugin is what restricts it to the
+            // Unix-like platforms.
+            case: "a schema 1.2 command document restricted to two platforms",
             name: "AWS-RunShellScript",
             document_type: "Command",
-            schema_version: "2.2",
+            schema_version: "1.2",
             parameters: &["commands", "workingDirectory", "executionTimeout"],
             platforms: &["Linux", "MacOS"],
         },
         Published {
-            case: "a command document restricted to one platform",
+            case: "a schema 1.2 command document restricted to one platform",
             name: "AWS-RunPowerShellScript",
             document_type: "Command",
-            schema_version: "2.2",
+            schema_version: "1.2",
             parameters: &["commands", "workingDirectory", "executionTimeout"],
             platforms: &["Windows"],
         },
@@ -818,10 +821,12 @@ async fn a_published_documents_versions_are_the_one_it_holds() {
             expected: Some("InvalidDocumentVersion"),
         },
         Selector {
+            // A version name no version of the document carries addresses no document at
+            // all, so the refusal is the missing-document one.
             case: "a version name it does not carry",
             version: None,
             version_name: Some("1.0"),
-            expected: Some("InvalidDocumentVersion"),
+            expected: Some("InvalidDocument"),
         },
     ];
     for Selector {

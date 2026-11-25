@@ -7,7 +7,7 @@
 //! It reports the document the request names, whether a caller created it or Systems
 //! Manager publishes it ([`crate::state::PUBLISHED_DOCUMENTS`]), from the one store in
 //! [`crate::state`]: the only write it makes is materialising the status move the clock
-//! already owes ([`crate::state::DOCUMENT_TRANSITION_DELAY`]), which was due at the same
+//! already owes ([`crate::state::document_active_due`]), which was due at the same
 //! instant even if nobody had called.
 //!
 //! "The document version for which you want information. Can be a specific version or the
@@ -186,8 +186,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The document version for which you want information. Can be a specific
         // version or the default version", and a `VersionName` is "unique across all
         // versions of a document": a read that names neither resolves to the default
-        // version, and a selector or a version name no version of the document answers
-        // to names nothing to report.
+        // version, a SELECTOR no version of the document answers to is the invalid version
+        // it is, and a version NAME no version carries addresses no document at all —
+        // which is a missing document, reported in the one sentence this service states a
+        // name-and-version miss with ([`crate::state::document_version_not_found_message`]).
         let version = match record.select_requested(
             input.document_version.as_deref(),
             input.version_name.as_deref(),
@@ -205,14 +207,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
             Err(crate::state::DocumentVersionRejection::VersionName(requested)) => {
-                return Err(DescribeDocumentErrorModeled::InvalidDocumentVersion(
-                    InvalidDocumentVersion {
-                        message: Some(format!(
-                            "Document {} has no version named '{requested}'",
-                            record.name
-                        )),
-                    },
-                )
+                return Err(DescribeDocumentErrorModeled::InvalidDocument(InvalidDocument {
+                    message: Some(crate::state::document_version_not_found_message(
+                        &input.name,
+                        &requested,
+                    )),
+                })
                 .into());
             }
         };
