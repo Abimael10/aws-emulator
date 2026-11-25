@@ -1,0 +1,47 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: cloudtrail__cognito-identity.identity-pool-data-events-are-delivered-only-once-a-selector-names-them
+Issue-Key: cloudtrail__cognito-identity.identity-pool-data-events-are-delivered-only-once-a-selector-names-them|run#65|Timeout|reader.refresh()
+Issue-Commit: 6651c87027da78b467298e3a28f696cadd44fc38
+
+# cloudtrail__cognito-identity: a live trail delivers no log file at all, so Cognito identity-pool GetId/GetOpenIdToken data events are never recorded and the logins redaction is unobservable
+
+> _Note: this issue was identified against the code base at commit `6651c87027da78b467298e3a28f696cadd44fc38`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+PutEventSelectors
+
+## Description
+One net-new root cause, grounded in the single surviving failing check under this service heading. Note: open issue 20261124T165729Z-cloudtrail-cognito-identity-an-advanced-event-selector-naming.md describes the same surface and carries this check id in its Issue-Trace-Ids, and open issue 20261029T173328Z-cloudtrail-records-and-delivers-no-audit-record-for.md covers trail delivery generally — but the replay report marks this check neither ALREADY FILED nor OWNED by either of them (their recorded replay keys no longer match the failing step), so the check is currently carried by no issue and is filed here. A fixer should close it together with 20261124T165729Z if that issue is still open.
+
+Cause 1 of 1: a trail that is created, started and reports IsLogging=true writes NOTHING to its S3 bucket, so neither management events nor selector-enabled Cognito identity-pool data events are ever delivered.
+
+AWS: Smithy (services/service-com-amazonaws-cloudtrail-cloudtrail-20131101) — PutEventSelectors takes TrailName (required) plus EventSelectors / AdvancedEventSelectors and echoes TrailARN + the stored selectors; GetTrailStatus returns IsLogging, LatestDeliveryTime, LatestDeliveryError, LatestNotificationError. The delivery and classification contract itself is recorded behavior only (CloudTrail log-file reference and the Cognito-identity CloudTrail page): while a trail is logging, CloudTrail writes gzipped objects (first two bytes 1f 8b) under AWSLogs/<account-id>/CloudTrail/<region>/<yyyy>/<mm>/<dd>/ whose inflated body is a JSON object with a top-level "Records" list; cognito-identity TagResource and the remaining control-plane calls are recorded with eventCategory "Management" and managementEvent true and also appear in LookupEvents; GetId / GetOpenIdToken are DATA events — withheld while no data selector exists, and captured once an advanced event selector of {Field: eventCategory, Equals: ["Data"]} + {Field: resources.type, Equals: ["AWS::Cognito::IdentityPool"]} is stored. A captured identity-pool record carries eventSource "cognito-identity.amazonaws.com", eventCategory "Data", managementEvent false, a resources entry of type "AWS::Cognito::IdentityPool" whose ARN is the pool addressed (arn:aws:cognito-identity:<region>:<account-id>:identitypool/<pool-id>) and whose accountId is the caller's account, and requestParameters.logins kept as a MAP whose provider-name KEY is preserved (the request's cognito-idp.<region>.amazonaws.com/<user-pool-id>) while its token VALUE is replaced by the fixed literal "HIDDEN_DUE_TO_SECURITY_REASONS"; the presented token must not appear anywhere in the delivered bytes. Data events must NOT appear in LookupEvents, which serves management events only, and after delivery GetTrailStatus must report LatestDeliveryTime at or past the last delivered record's instant with no LatestDeliveryError.
+
+Emulator: every call the check makes succeeds — CreateUserPool, CreateUserPoolClient, AdminCreateUser, AdminSetUserPassword, InitiateAuth, two CreateIdentityPool, CreateBucket, PutBucketTagging, PutBucketPolicy, CreateTrail, StartLogging (GetTrailStatus then reports IsLogging=true), GetEventSelectors (DataResources [] and no AdvancedEventSelectors on a fresh trail, as AWS does), PutEventSelectors and GetEventSelectors round-tripping the advanced selectors verbatim, TagResource, GetId, GetOpenIdToken — yet ZERO objects are ever listed under AWSLogs/<account>/CloudTrail/<region>/. The check never clears its warm-up barrier, which needs only ONE delivered cognito-identity:TagResource management record, and spins on its delivery poll until the harness kills it; the report records it as "Error: Check timed out after 60.0s". Nothing downstream is reachable: the Data classification, managementEvent=false, the resources entry and its ARN/accountId, the logins value redaction, the withheld-by-default partition, the LookupEvents exclusion and LatestDeliveryTime advancing are all unobservable because no log file exists.
+
+Why: a delivered log file is the only place a data event is observable, so a client cannot distinguish "my selector matched nothing" from "the delivery pipeline is dead". Security tooling that reads identity-pool activity out of a trail bucket sees an account with no federated activity at all; the token-redaction guarantee (that a live Cognito ID token is never written to an audit log) cannot be verified; and the default-off / selector-on partition that governs data-event billing has no observable effect.
+
+Fix: the CloudTrail trail delivery pipeline in the cloudtrail service crate — the S3 log-file writer that must gzip a Records batch to the trail's bucket under the dated AWSLogs prefix and advance GetTrailStatus.LatestDeliveryTime, and advanced-event-selector evaluation (eventCategory=Data matched against resources.type) — plus the cognito-identity side emitting GetId/GetOpenIdToken as data events with the AWS::Cognito::IdentityPool resources entry and the logins-value redaction, and the cognito-identity control-plane calls emitting management records that also surface in LookupEvents.
+
+Traces: cloudtrail__cognito-identity.identity-pool-data-events-are-delivered-only-once-a-selector-names-them
+
+## Evidence
+Replay report, suite simparity-behavioral-aws-v1, service heading `### cloudtrail__cognito-identity`:
+  [mismatch] cloudtrail__cognito-identity.identity-pool-data-events-are-delivered-only-once-a-selector-names-them — Error: Check timed out after 60.0s
+Not marked ALREADY FILED and not marked OWNED by any open issue.
+
+Expected (AWS): with the trail logging, a gzipped object appears under AWSLogs/<account>/CloudTrail/<region>/<yyyy>/<mm>/<dd>/ containing a cognito-identity.amazonaws.com TagResource record with eventCategory "Management" / managementEvent true; after PutEventSelectors with AdvancedEventSelectors [{eventCategory Equals [Data]}, {resources.type Equals [AWS::Cognito::IdentityPool]}] is stored and read back, further objects contain one record per GetId / GetOpenIdToken with eventCategory "Data", managementEvent false, resources[].type "AWS::Cognito::IdentityPool", resources[].ARN the pool addressed, resources[].accountId the caller's account, and requestParameters.logins[<provider-name>] == the literal "HIDDEN_DUE_TO_SECURITY_REASONS" with the ID token absent from the file; LookupEvents returns the management marker but none of those data events; GetTrailStatus reports LatestDeliveryTime advanced past the marker with no LatestDeliveryError.
+
+Actual (emulator): CreateTrail, StartLogging and PutEventSelectors/GetEventSelectors all behave (IsLogging=true, selectors echoed verbatim, fresh-trail defaults correct), and the bucket prefix stays EMPTY for the whole run — the check cannot clear the one-management-record warm-up barrier and is killed by the harness timeout. No non-2xx is returned by any operation, so the divergence is isolated to recording and delivery, not to the request handling of any single call.
+
+## Steps to Reproduce
+Against the booted emulator:
+1. Create a Cognito user pool, an app client with ALLOW_USER_PASSWORD_AUTH, a user with a permanent password, and InitiateAuth (USER_PASSWORD_AUTH) to obtain an IdToken.
+2. Create two identity pools with that user pool as a CognitoIdentityProvider (provider name cognito-idp.<region>.amazonaws.com/<user-pool-id>).
+3. Create an S3 bucket carrying the AWSCloudTrailAclCheck + AWSCloudTrailWrite bucket policy, then CreateTrail(Name, S3BucketName=<bucket>) and StartLogging; GetTrailStatus reports IsLogging=true.
+4. Call cognito-identity TagResource on pool B and poll ListObjectsV2 under AWSLogs/<account>/CloudTrail/<region>/ — no object is ever written (management delivery already fails here, which is where the check times out).
+5. Call GetId + GetOpenIdToken against pool A (no data selector yet) — these must stay withheld.
+6. PutEventSelectors(TrailName, AdvancedEventSelectors=[{Name, FieldSelectors=[{Field: eventCategory, Equals: [Data]}, {Field: resources.type, Equals: [AWS::Cognito::IdentityPool]}]}, {Name, FieldSelectors=[{Field: eventCategory, Equals: [Management]}]}]) and read it back with GetEventSelectors — accepted and echoed.
+7. Call GetId + GetOpenIdToken against pool B, then list and gunzip every object under AWSLogs/<account>/CloudTrail/<region>/: zero objects exist, so no Data record, no AWS::Cognito::IdentityPool resources entry and no "HIDDEN_DUE_TO_SECURITY_REASONS" redaction can be observed, and GetTrailStatus never reports a LatestDeliveryTime.
