@@ -389,15 +389,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 > crate::state::MAX_POLICY_BYTES_PER_STORE
             {
                 return Err(UpdatePolicyErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        message: format!(
+                    crate::ops::per_store_quota_exceeded(
+                        &store_id,
+                        crate::state::RESOURCE_TYPE_POLICY,
+                        format!(
                             "policy store {store_id} is at its limit of {} bytes of Cedar text",
                             crate::state::MAX_POLICY_BYTES_PER_STORE
                         ),
-                        resource_id: Some(store_id.clone()),
-                        resource_type: crate::state::RESOURCE_TYPE_POLICY.to_string(),
-                        ..Default::default()
-                    },
+                    ),
                 )
                 .into());
             }

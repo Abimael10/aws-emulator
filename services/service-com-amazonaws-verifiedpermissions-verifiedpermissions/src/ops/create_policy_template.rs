@@ -301,20 +301,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             || store.cedar_bytes() + input.statement.len()
                 > crate::state::MAX_POLICY_BYTES_PER_STORE
         {
+            // The quota is on this store's contents as a whole, so the resource
+            // the refusal names is the policy store that is at its limit — built
+            // in the one place every per-store quota refusal of this service goes
+            // through ([`crate::ops::per_store_quota_exceeded`]).
             return Err(
                 CreatePolicyTemplateErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        message: format!(
+                    crate::ops::per_store_quota_exceeded(
+                        &store_id,
+                        crate::state::RESOURCE_TYPE_POLICY_TEMPLATE,
+                        format!(
                             "policy store {store_id} is at its limit of {} policy templates / \
                              {} bytes of Cedar text",
                             crate::state::MAX_POLICY_TEMPLATES_PER_STORE,
                             crate::state::MAX_POLICY_BYTES_PER_STORE
                         ),
-                        // The quota is on the store's policy templates as a whole,
-                        // so there is no one template id to name here.
-                        resource_type: "POLICY_TEMPLATE".to_string(),
-                        ..Default::default()
-                    },
+                    ),
                 )
                 .into(),
             );

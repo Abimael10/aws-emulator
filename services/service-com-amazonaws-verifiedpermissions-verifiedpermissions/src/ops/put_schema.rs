@@ -160,21 +160,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stored schema is parsing text this check already bounded.
         if definition.len() > crate::state::cedar::MAX_SCHEMA_BYTES {
             return Err(PutSchemaErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: format!(
+                crate::ops::per_store_quota_exceeded(
+                    &store_id,
+                    crate::state::RESOURCE_TYPE_SCHEMA,
+                    format!(
                         "definition.cedarJson is {} bytes, more than the {} bytes a policy \
                          store's schema may hold",
                         definition.len(),
                         crate::state::cedar::MAX_SCHEMA_BYTES
                     ),
-                    resource_id: Some(store_id.clone()),
-                    resource_type: crate::state::RESOURCE_TYPE_SCHEMA.to_string(),
-                    // `serviceCode`/`quotaCode` name a quota registered with the
-                    // Service Quotas service. This bound is the emulator's own,
-                    // not a registered quota, so there is no code to report and
-                    // both optional members are left absent.
-                    ..Default::default()
-                },
+                ),
             )
             .into());
         }

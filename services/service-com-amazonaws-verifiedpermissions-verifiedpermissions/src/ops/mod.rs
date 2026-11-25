@@ -1014,6 +1014,40 @@ pub fn conflict(
     }
 }
 
+/// The modelled `ServiceQuotaExceededException` for a write refused because a
+/// quota on the CONTENTS OF ONE POLICY STORE is exhausted: `message` states which
+/// bound was reached, `resourceId` is `policy_store_id` and `resourceType` is the
+/// kind of resource the request was adding to it
+/// ([`crate::ops::types::RESOURCE_TYPE_VALUES`]).
+///
+/// `resourceId` is "the unique ID of the resource referenced in the failed
+/// request" (`smithy_query(query="shape",
+/// shape="ServiceQuotaExceededException")`), and for a quota on one store's
+/// contents that resource is the policy store: it is the resource the request
+/// referenced and the one that is at its limit, whatever kind of thing inside it
+/// the quota counts. Such a refusal mints nothing, so there is no id of the
+/// resource the caller asked for to report instead. This is the ONE place that
+/// builds the shape for those refusals, so a client that reads `resourceId` to
+/// learn WHICH policy store is full is answered the same way by every one of
+/// them, whichever kind of record it was adding. An ACCOUNT-wide quota
+/// references no single store and does not come through here.
+///
+/// `serviceCode`/`quotaCode` name a quota registered with the Service Quotas
+/// service. These bounds are the emulator's own, not registered quotas, so there
+/// is no code to report and both optional members are left absent.
+pub fn per_store_quota_exceeded(
+    policy_store_id: &str,
+    resource_type: &str,
+    message: String,
+) -> self::types::ServiceQuotaExceededException {
+    self::types::ServiceQuotaExceededException {
+        message,
+        resource_id: Some(policy_store_id.to_string()),
+        resource_type: resource_type.to_string(),
+        ..Default::default()
+    }
+}
+
 /// Whether a tag set of `tag_count` entries is MORE than one resource of this
 /// service may hold ([`crate::state::MAX_TAGS_PER_RESOURCE`]).
 ///

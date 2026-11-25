@@ -32,19 +32,31 @@
 //! * `TooManyTagsException` models `resourceName`, so the resource at the tag
 //!   limit is reported there and neither the count nor the offending key is in
 //!   the message.
+//! * `ServiceQuotaExceededException` models `resourceId` ("The unique ID of the
+//!   resource referenced in the failed request") beside the required
+//!   `resourceType`, so a refusal caused by a quota on ONE POLICY STORE's
+//!   contents reports that store there — the resource the request referenced and
+//!   the one that is at its limit — whatever kind of record the request was
+//!   adding to it.
 //!
 //! Every assertion goes over the wire through the same `MultiServiceRouter` the
 //! emulator binary serves, reusing the shared harness in [`crate::harness`].
 
+use std::sync::Arc;
+
 use serde_json::{json, Value};
+use service_com_amazonaws_verifiedpermissions_verifiedpermissions as service;
 use smithy_server_runtime::MultiServiceRouter;
+
+use service::state::cedar::{MAX_SCHEMA_BYTES, MAX_STATEMENT_BYTES};
+use service::state::{MAX_POLICY_BYTES_PER_STORE, MAX_POLICY_TEMPLATES_PER_STORE};
 
 // The wire harness (`router`, `call`, `ok`, `store_with_mode`, `error_code`)
 // lives once in `tests/all/harness.rs` and is shared with every suite in this
 // crate.
 use crate::harness::{
-    call, error_code, fault_message, ok, router, store_with_mode, user_pool, user_pool_arn,
-    SIGNING_REGION,
+    call, error_code, fault_message, ok, router, router_with_engine, store_with_mode, user_pool,
+    user_pool_arn, SIGNING_REGION,
 };
 
 /// The one message every `ResourceNotFoundException` of this service carries.
@@ -1265,5 +1277,335 @@ async fn the_tag_limit_refusal_carries_the_constant_message_and_names_the_resour
         distinct.len(),
         1,
         "the tag-limit refusal must be ONE constant across every merge, got {refusals:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ServiceQuotaExceededException: which resource a per-store quota names
+// ---------------------------------------------------------------------------
+
+/// One row of the per-store quota table: the request refused, the policy store
+/// the refusal is about, and the `resourceType` it must report.
+struct Quota {
+    case: &'static str,
+    operation: &'static str,
+    request: Value,
+    /// The id of the policy store at its limit, which the refusal must carry in
+    /// `resourceId` — the resolved id, even where the request referenced the
+    /// store by an alias.
+    store_id: String,
+    /// The `resourceType` the refusal must carry.
+    resource_type: &'static str,
+}
+
+/// [`STATEMENT`]'s scope with a padded condition clause, so the result is
+/// exactly `bytes` bytes of well-formed Cedar and two of these differ only in
+/// SIZE. The scope is the one `STATEMENT` carries, which is what lets an update
+/// replace one of these with another.
+fn statement_of(bytes: usize) -> String {
+    let prefix = "permit(principal, action, resource) when { context.tag == \"";
+    let suffix = "\" };";
+    let padding = bytes.saturating_sub(prefix.len() + suffix.len());
+    format!("{prefix}{}{suffix}", "x".repeat(padding))
+}
+
+/// A well-formed schema document of exactly `bytes` bytes, padded in the one
+/// entity type's NAME — a Cedar identifier carries no length bound of its own,
+/// so the document stays well formed at any size.
+fn schema_of(bytes: usize) -> String {
+    let prefix = "{\"PhotoApp\":{\"actions\":{},\"entityTypes\":{\"";
+    let suffix = "\":{}}}}";
+    let name_len = bytes.saturating_sub(prefix.len() + suffix.len());
+    format!("{prefix}{}{suffix}", "A".repeat(name_len))
+}
+
+/// The bytes of Cedar text `store_id` holds, read straight out of state: the
+/// quantity the store's text budget bounds.
+fn cedar_bytes(engine: &Arc<engine::InMemoryEngine>, store_id: &str) -> usize {
+    let state = engine.state::<service::ComAmazonawsVerifiedpermissionsVerifiedpermissionsState>();
+    let state = state.lock();
+    state
+        .policy_stores
+        .get(store_id)
+        .expect("the store this suite created is in state")
+        .cedar_bytes()
+}
+
+/// How many policy templates `store_id` holds, read straight out of state.
+fn template_count(engine: &Arc<engine::InMemoryEngine>, store_id: &str) -> usize {
+    let state = engine.state::<service::ComAmazonawsVerifiedpermissionsVerifiedpermissionsState>();
+    let state = state.lock();
+    state
+        .policy_stores
+        .get(store_id)
+        .expect("the store this suite created is in state")
+        .policy_templates
+        .len()
+}
+
+/// Bring `store_id` to EXACTLY its Cedar-text budget through `CreatePolicy` —
+/// the path a caller fills a store by — in steps of at most the bytes one
+/// statement may carry.
+async fn fill_the_cedar_budget(
+    router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+    store_id: &str,
+) {
+    let floor = statement_of(0).len();
+    loop {
+        let remaining = MAX_POLICY_BYTES_PER_STORE - cedar_bytes(engine, store_id);
+        if remaining == 0 {
+            break;
+        }
+        // Each step takes as much as one statement may carry, except where that
+        // would leave a tail too small to be a statement at all: then it leaves
+        // exactly one smallest statement's worth, so the last step lands on the
+        // bound.
+        let step = if remaining <= MAX_STATEMENT_BYTES {
+            remaining
+        } else if remaining - MAX_STATEMENT_BYTES < floor {
+            remaining - floor
+        } else {
+            MAX_STATEMENT_BYTES
+        };
+        assert!(
+            step >= floor,
+            "a fill step of {step} bytes is under the {floor}-byte minimum statement"
+        );
+        let statement = statement_of(step);
+        assert_eq!(
+            statement.len(),
+            step,
+            "a fill step must be exactly {step} bytes, got {}",
+            statement.len()
+        );
+        ok(
+            router,
+            "CreatePolicy",
+            &json!({
+                "policyStoreId": store_id,
+                "definition": { "static": { "statement": statement } },
+            }),
+        )
+        .await;
+    }
+    assert_eq!(
+        cedar_bytes(engine, store_id),
+        MAX_POLICY_BYTES_PER_STORE,
+        "a filled store should hold exactly its byte budget"
+    );
+}
+
+/// Bring `store_id` to the per-store policy-template COUNT bound, seeded
+/// straight into state: the bound is far more records than a suite can create
+/// one request at a time, and what the bound reads is how many templates the
+/// store holds. The records are shaped as the handler writes them, and their
+/// text is short enough that the store's byte budget stays well inside its own
+/// bound — which is what makes the row the COUNT dimension. Returns the bytes
+/// of Cedar text the seeded templates leave the store holding.
+fn seed_to_the_template_count_bound(
+    engine: &Arc<engine::InMemoryEngine>,
+    store_id: &str,
+) -> usize {
+    let state = engine.state::<service::ComAmazonawsVerifiedpermissionsVerifiedpermissionsState>();
+    let mut state = state.lock();
+    let store = state
+        .policy_stores
+        .get_mut(store_id)
+        .expect("the store this suite created is in state");
+    while store.policy_templates.len() < MAX_POLICY_TEMPLATES_PER_STORE {
+        let id = store.mint_policy_template_id();
+        let created = service::state::now();
+        store.policy_templates.insert(
+            id.clone(),
+            service::state::PolicyTemplate {
+                policy_template_id: id,
+                policy_store_id: store_id.to_string(),
+                name: None,
+                description: None,
+                statement: TEMPLATE_STATEMENT.to_string(),
+                created_date: created,
+                last_updated_date: created,
+            },
+        );
+    }
+    store.cedar_bytes()
+}
+
+/// Every refusal of a write because a quota on ONE POLICY STORE's contents is
+/// exhausted reports that store in the modelled `resourceId`, so a client
+/// learns WHICH store is full by reading a structured member rather than by
+/// regexing prose.
+///
+/// The rows differ along the operation (`CreatePolicyTemplate`, `CreatePolicy`,
+/// `UpdatePolicy`, `PutSchema`), the quota that ran out (the number of records
+/// of one kind the store may hold, the store's Cedar-text budget reached by a
+/// create and by an update, the bytes of schema text one store may hold), the
+/// `resourceType` reported (`POLICY_TEMPLATE`, `POLICY`, `SCHEMA`) and the FORM
+/// the request referenced the store by (its id, and an alias of it — where
+/// `resourceId` is still the resolved store id). The identity-source row of the
+/// same rule is pinned in [`super::identity_sources`]; an ACCOUNT-wide quota
+/// (`CreatePolicyStore`, `CreatePolicyStoreAlias`) references no single store
+/// and is not part of this rule.
+#[tokio::test]
+async fn every_per_store_quota_refusal_names_the_policy_store() {
+    let (router, engine) = router_with_engine();
+
+    // One store at its Cedar-text budget serves every row whose quota is that
+    // budget: these refusals store nothing, so the store is still exactly full
+    // for the row after them — which the closing assertion checks.
+    let full = store_with_mode(&router, "OFF").await;
+    // The policy the update row replaces: created before the fill, with text
+    // short enough that a replacement at the per-statement bound cannot fit.
+    let subject = ok(
+        &router,
+        "CreatePolicy",
+        &json!({
+            "policyStoreId": full,
+            "definition": { "static": { "statement": STATEMENT } },
+        }),
+    )
+    .await["policyId"]
+        .as_str()
+        .expect("CreatePolicy reports the minted id")
+        .to_string();
+    let alias_name = format!("{ALIAS_PREFIX}the-full-store");
+    ok(
+        &router,
+        "CreatePolicyStoreAlias",
+        &json!({ "aliasName": alias_name, "policyStoreId": full }),
+    )
+    .await;
+    fill_the_cedar_budget(&router, &engine, &full).await;
+
+    // A second store at its policy-template COUNT bound, with its byte budget
+    // left untouched.
+    let crowded = store_with_mode(&router, "OFF").await;
+    let crowded_bytes = seed_to_the_template_count_bound(&engine, &crowded);
+    assert!(
+        crowded_bytes + MAX_STATEMENT_BYTES <= MAX_POLICY_BYTES_PER_STORE,
+        "the count row must exercise the COUNT bound alone, but its store already holds \
+         {crowded_bytes} of its {MAX_POLICY_BYTES_PER_STORE} Cedar bytes"
+    );
+
+    // And a third holding nothing: the schema bound is on the document the
+    // request carries, not on what the store already holds.
+    let empty = store_with_mode(&router, "OFF").await;
+
+    let rows = [
+        Quota {
+            case: "CreatePolicyTemplate, the store's Cedar-text budget",
+            operation: "CreatePolicyTemplate",
+            request: json!({ "policyStoreId": full, "statement": TEMPLATE_STATEMENT }),
+            store_id: full.clone(),
+            resource_type: "POLICY_TEMPLATE",
+        },
+        Quota {
+            case: "CreatePolicyTemplate, the store's template count",
+            operation: "CreatePolicyTemplate",
+            request: json!({ "policyStoreId": crowded, "statement": TEMPLATE_STATEMENT }),
+            store_id: crowded.clone(),
+            resource_type: "POLICY_TEMPLATE",
+        },
+        Quota {
+            case: "CreatePolicyTemplate, the store referenced by an alias",
+            operation: "CreatePolicyTemplate",
+            request: json!({ "policyStoreId": alias_name, "statement": TEMPLATE_STATEMENT }),
+            store_id: full.clone(),
+            resource_type: "POLICY_TEMPLATE",
+        },
+        Quota {
+            case: "CreatePolicy, the store's Cedar-text budget",
+            operation: "CreatePolicy",
+            request: json!({
+                "policyStoreId": full,
+                "definition": { "static": { "statement": STATEMENT } },
+            }),
+            store_id: full.clone(),
+            resource_type: "POLICY",
+        },
+        Quota {
+            case: "UpdatePolicy, the store's Cedar-text budget",
+            operation: "UpdatePolicy",
+            request: json!({
+                "policyStoreId": full,
+                "policyId": subject,
+                "definition": { "static": { "statement": statement_of(MAX_STATEMENT_BYTES) } },
+            }),
+            store_id: full.clone(),
+            resource_type: "POLICY",
+        },
+        Quota {
+            case: "PutSchema, the bytes of schema text a store may hold",
+            operation: "PutSchema",
+            request: json!({
+                "policyStoreId": empty,
+                "definition": { "cedarJson": schema_of(MAX_SCHEMA_BYTES + 1) },
+            }),
+            store_id: empty.clone(),
+            resource_type: "SCHEMA",
+        },
+    ];
+
+    for Quota {
+        case,
+        operation,
+        request,
+        store_id,
+        resource_type,
+    } in &rows
+    {
+        let (status, body) = call(&router, operation, request).await;
+        assert_eq!(
+            status, 402,
+            "case {case:?}: expected the modelled quota refusal's HTTP 402, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ServiceQuotaExceededException",
+            "case {case:?}: expected a ServiceQuotaExceededException, got {body}"
+        );
+        assert_eq!(
+            body["resourceId"],
+            json!(store_id),
+            "case {case:?}: expected the refusal to name the store {store_id:?}, got {:?}",
+            body["resourceId"]
+        );
+        assert_eq!(
+            body["resourceType"],
+            json!(resource_type),
+            "case {case:?}: expected resourceType {resource_type:?}, got {:?}",
+            body["resourceType"]
+        );
+        assert!(
+            RESOURCE_TYPE_VALUES.contains(resource_type),
+            "case {case:?}: {resource_type:?} is not one of the modelled resource types \
+             {RESOURCE_TYPE_VALUES:?}"
+        );
+        // The refusal carries a message of its own, and the identity of the
+        // store is in the member that models it either way.
+        assert!(
+            !fault_message(&body).is_empty(),
+            "case {case:?}: the refusal must carry the required message, got {body}"
+        );
+    }
+
+    // Every refusal above stored nothing: the two seeded stores still hold
+    // exactly what they held before them.
+    assert_eq!(
+        cedar_bytes(&engine, &full),
+        MAX_POLICY_BYTES_PER_STORE,
+        "case \"nothing persisted\": a refused write must leave the full store's text alone"
+    );
+    assert_eq!(
+        template_count(&engine, &crowded),
+        MAX_POLICY_TEMPLATES_PER_STORE,
+        "case \"nothing persisted\": a refused create must add no policy template"
+    );
+    let fetched = ok(&router, "GetSchema", &json!({ "policyStoreId": empty })).await;
+    assert_eq!(
+        fetched["schema"].as_str(),
+        Some("{}"),
+        "case \"nothing persisted\": a refused put must leave the empty document, got {fetched}"
     );
 }
