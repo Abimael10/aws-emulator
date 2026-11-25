@@ -24,11 +24,20 @@
 //!   through the access point", so the mount is rooted at `RootDirectory$Path` — which confines
 //!   the function to that subtree — and the identity every request through it is made as is the
 //!   access point's `PosixUser`;
-//! * what the function may DO there follows from its execution role: an NFS client writes to
-//!   an Amazon EFS file system under `elasticfilesystem:ClientWrite` (Amazon EFS User Guide,
-//!   "Using IAM to control file system data access"), so a function whose role may not make
-//!   that call has the file system mounted READ-ONLY and a write under the mount point is
-//!   refused where it is made.
+//! * whether the function may MOUNT it at all follows from its execution role: an NFS client
+//!   mounts an Amazon EFS file system under `elasticfilesystem:ClientMount` (Amazon EFS User
+//!   Guide, "Using IAM to control file system data access"), so a function whose role may not
+//!   make that call mounts NOTHING — the environment cannot be built with that mount, and the
+//!   invocation is refused rather than served by a run that reached the file system anyway
+//!   ([`MountDenied`]);
+//! * what the function may then DO there follows from the same role: a client writes to one
+//!   under `elasticfilesystem:ClientWrite`, so a function whose role may not make that call
+//!   has the file system mounted READ-ONLY and a write under the mount point is refused where
+//!   it is made.
+//!
+//! Both are asked at every invocation, so the grants in force when the execution environment
+//! is built are what decide the mount: a role a grant was taken off mounts nothing from then
+//! on, and one it was put back on mounts again.
 //!
 //! The entry is resolved per INVOCATION, so a mount is backed by the access point and file
 //! system Amazon EFS holds at the instant the handler runs: a configuration naming an access
@@ -61,9 +70,41 @@ use super::FunctionConfig;
 /// is Amazon EFS's own.
 const ELASTIC_FILE_SYSTEM_NAMESPACE: &str = "elasticfilesystem";
 
+/// The call a client makes to MOUNT one, which is what a function short of it cannot reach the
+/// file system through at all.
+const CLIENT_MOUNT_ACTION: &str = "ClientMount";
+
 /// The call a client makes to WRITE to one, which is what a function short of it has the file
 /// system read-only under.
 const CLIENT_WRITE_ACTION: &str = "ClientWrite";
+
+/// The access point an invocation's execution environment MAY NOT MOUNT, because the
+/// function's execution role is not granted the call an NFS client makes to mount the file
+/// system behind it.
+///
+/// Nothing is mounted for such an invocation and no handler runs: the environment it would have
+/// run in could not be built, which is the condition the calling operation answers as its own
+/// modelled mount failure ([`mount_failure_message`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountDenied {
+    /// `FileSystemConfig$Arn` as the function's own configuration names it: the access point
+    /// that was not mounted, which is the only part of the refusal that varies.
+    pub access_point_arn: String,
+}
+
+/// How the refusal of an invocation whose execution environment could not mount the file
+/// system the function configured is worded, with `access_point_arn` — the function's own
+/// `FileSystemConfigs` entry — substituted.
+///
+/// The ONE rendering of that sentence in this crate, so every operation that answers the
+/// modelled mount failure words it alike.
+#[must_use]
+pub fn mount_failure_message(access_point_arn: &str) -> String {
+    format!(
+        "The function couldn't mount the Amazon EFS file system with access point \
+         {access_point_arn}."
+    )
+}
 
 /// ONE file system an invocation's execution environment mounts: where it is mounted, the view
 /// the access point enforces, what the function may do there, and the files themselves.
@@ -106,17 +147,20 @@ pub struct FileSystemMount {
 /// The file systems an invocation of a function configured by `config` mounts, in the order
 /// the configuration names them.
 ///
-/// An entry that resolves to no access point of this emulator's Amazon EFS, and one whose
-/// execution role may not mount the file system at all, mounts NOTHING and is left out: the
-/// path is then not a path of the execution environment, exactly as it is for a function that
-/// configures no file system. See the module docs for the lock order this is called under.
-#[must_use]
+/// An entry that resolves to no access point of this emulator's Amazon EFS mounts NOTHING and
+/// is left out: the path is then not a path of the execution environment, exactly as it is for
+/// a function that configures no file system.
+///
+/// An entry whose file system the function's execution role may not MOUNT is the
+/// [`MountDenied`] answer instead: there is no execution environment for such an invocation at
+/// all, so no run of it reaches the file system by another route. See the module docs for the
+/// lock order this is called under.
 pub fn mounted_file_systems<Eng: Send + Sync + 'static>(
     engine: &Eng,
     region: &str,
     config: &FunctionConfig,
     now: SystemTime,
-) -> Vec<FileSystemMount> {
+) -> Result<Vec<FileSystemMount>, MountDenied> {
     let mut mounted = Vec::new();
     for requested in &config.file_system_configs {
         // The member admits the access point of an Amazon S3 file system too, which is reached
@@ -136,7 +180,27 @@ pub fn mounted_file_systems<Eng: Send + Sync + 'static>(
             );
             continue;
         };
-        let writable = may_write(engine, region, &config.role, &access_point.file_system_id);
+        // The MOUNT itself first: a role that may not make the call a client mounts the file
+        // system with reaches nothing behind the access point, so the environment is not built
+        // and this invocation is refused rather than served without that path.
+        if !may_call(
+            engine,
+            region,
+            &config.role,
+            &access_point.file_system_id,
+            CLIENT_MOUNT_ACTION,
+        ) {
+            return Err(MountDenied {
+                access_point_arn: requested.arn.clone(),
+            });
+        }
+        let writable = may_call(
+            engine,
+            region,
+            &config.role,
+            &access_point.file_system_id,
+            CLIENT_WRITE_ACTION,
+        );
         let (uid, gid) = match access_point.posix_user {
             Some((uid, gid)) => (Some(uid), Some(gid)),
             None => (None, None),
@@ -157,7 +221,7 @@ pub fn mounted_file_systems<Eng: Send + Sync + 'static>(
             files: access_point.files,
         });
     }
-    mounted
+    Ok(mounted)
 }
 
 /// The permissions `written` states, as the mode bits a filesystem reading reports:
@@ -167,18 +231,19 @@ fn mode_of(written: &str) -> u32 {
     u32::from_str_radix(written.trim(), 8).unwrap_or(0) & 0o7777
 }
 
-/// Whether the execution role `role_arn` may WRITE to `file_system_id`, as the policies in
-/// force on that role say.
+/// Whether the execution role `role_arn` may make the Amazon EFS call `action` on
+/// `file_system_id`, as the policies in force on that role say.
 ///
 /// Nothing is withheld on evidence this emulator does not have, which is the reading this crate
 /// states for every question about an execution role ([`super::role_actions`]): an engine
 /// carrying no IAM store, and a role ARN that store holds no role for, show nothing about the
-/// role, so the file system is writable.
-fn may_write<Eng: Send + Sync + 'static>(
+/// role, so the call is left to it.
+fn may_call<Eng: Send + Sync + 'static>(
     engine: &Eng,
     region: &str,
     role_arn: &str,
     file_system_id: &str,
+    action: &str,
 ) -> bool {
     let Some(iam) = iam_state(engine) else {
         return true;
@@ -186,7 +251,7 @@ fn may_write<Eng: Send + Sync + 'static>(
     let withheld = super::event_source_authorization::withholds_call(
         &iam.lock(),
         role_arn,
-        &format!("{ELASTIC_FILE_SYSTEM_NAMESPACE}:{CLIENT_WRITE_ACTION}"),
+        &format!("{ELASTIC_FILE_SYSTEM_NAMESPACE}:{action}"),
         &file_system_resource(region, file_system_id),
     );
     !withheld.unwrap_or(false)

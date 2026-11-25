@@ -325,7 +325,9 @@ pub use file_system_attachment::unreachable_file_system_refusal;
 /// lives in [`file_system_mounts`], beside the gate above that admits the configuration, and is
 /// re-exported for the same reason: a handler names it as `crate::state::…`.
 pub mod file_system_mounts;
-pub use file_system_mounts::{mounted_file_systems, FileSystemMount};
+pub use file_system_mounts::{
+    mount_failure_message, mounted_file_systems, FileSystemMount, MountDenied,
+};
 
 /// The attachment itself — the elastic network interfaces Lambda stands up in the account's
 /// EC2 inventory for a function's configured subnets, and the VPC those subnets resolve to —

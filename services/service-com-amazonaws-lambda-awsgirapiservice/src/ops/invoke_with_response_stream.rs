@@ -782,6 +782,18 @@ fn unrunnable(why: crate::state::Unrunnable) -> InvokeWithResponseStreamError {
             })
             .into()
         }
+        // The execution role is not granted the call a client mounts an Amazon EFS file system
+        // with, so the execution environment could not be built at all and the modelled mount
+        // failure is what this invocation is answered (`crate::state::file_system_mounts`).
+        crate::state::Unrunnable::FileSystemUnmountable { access_point_arn } => {
+            InvokeWithResponseStreamErrorModeled::EFSMountFailureException(
+                EFSMountFailureException {
+                    r#type: None,
+                    message: Some(crate::state::mount_failure_message(&access_point_arn)),
+                },
+            )
+            .into()
+        }
         // The capacity that was full is the host's pool of run slots, which stands in for the
         // account's concurrent executions, so the throttle names that limit.
         crate::state::Unrunnable::Overloaded(message) => {

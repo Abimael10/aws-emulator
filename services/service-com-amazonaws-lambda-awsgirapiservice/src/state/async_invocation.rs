@@ -643,6 +643,10 @@ pub(crate) fn unrunnable_reason(why: &super::execution::Unrunnable, subject: &st
             "the deployment package of the version {subject} was addressed to could not be \
              read: {detail}"
         ),
+        super::execution::Unrunnable::FileSystemUnmountable { access_point_arn } => format!(
+            "the function's execution role may not mount the Amazon EFS file system with \
+             access point {access_point_arn}, so {subject} was never executed"
+        ),
         super::execution::Unrunnable::Overloaded(detail) => format!(
             "no capacity was found to run the function for {subject}: {detail}"
         ),

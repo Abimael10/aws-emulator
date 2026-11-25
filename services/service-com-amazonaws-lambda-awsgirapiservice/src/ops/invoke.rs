@@ -1320,6 +1320,18 @@ fn unrunnable(why: crate::state::Unrunnable) -> InvokeError {
             })
             .into()
         }
+        // "The Lambda function couldn't mount the configured file system due to a permission
+        // or configuration issue": the function's execution role is not granted the call a
+        // client mounts an Amazon EFS file system with, so the execution environment this
+        // invocation would have run in could not be built at all
+        // (`crate::state::file_system_mounts`).
+        crate::state::Unrunnable::FileSystemUnmountable { access_point_arn } => {
+            InvokeErrorModeled::EFSMountFailureException(EFSMountFailureException {
+                r#type: None,
+                message: Some(crate::state::mount_failure_message(&access_point_arn)),
+            })
+            .into()
+        }
         // "The request throughput limit was exceeded": the capacity that was full is the
         // host's pool of run slots, which stands in for the account's concurrent executions,
         // so the throttle names that limit the way the operation documents it.

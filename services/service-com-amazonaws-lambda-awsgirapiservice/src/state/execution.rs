@@ -787,7 +787,12 @@ pub struct Invocation {
     /// file system, and for one whose configuration names an access point this emulator's
     /// Amazon EFS does not hold — such a path is then no path of the execution environment at
     /// all.
-    pub file_systems: Vec<super::FileSystemMount>,
+    ///
+    /// [`super::MountDenied`] for a function whose execution role may not MOUNT the file
+    /// system it configured: no execution environment can be built for such an invocation, so
+    /// the run never happens and the mount failure is what the calling operation answers
+    /// ([`Unrunnable::FileSystemUnmountable`]).
+    pub file_systems: Result<Vec<super::FileSystemMount>, super::MountDenied>,
     /// The AWS/Lambda series this invocation is metered on once it has RUN — what its run
     /// took, and the failure it came to ([`super::metrics::InvocationMetrics`]) — or `None`
     /// for a run metered nowhere.
@@ -814,6 +819,13 @@ pub enum Unrunnable {
     NoHandler,
     /// The bytes it holds are not a readable archive.
     PackageUnreadable(String),
+    /// The function's execution role may not MOUNT the Amazon EFS file system its
+    /// `FileSystemConfigs` named, so the execution environment this invocation would have run
+    /// in could not be built at all ([`super::file_system_mounts`]).
+    FileSystemUnmountable {
+        /// The access point the configuration named, as the refusal names it.
+        access_point_arn: String,
+    },
     /// Too many handlers are already running, or too many runs have been abandoned.
     Overloaded(String),
     /// The run could not be started or driven at all. Never a guest failure.
@@ -906,6 +918,20 @@ pub async fn run_invocation(
     };
     let Some(handler) = invocation.handler.clone() else {
         return Err(Unrunnable::NoHandler);
+    };
+    // The file systems this invocation's environment MOUNTS, which is part of BUILDING that
+    // environment: a function whose execution role may not mount the file system it configured
+    // has no environment to run in at all, so nothing is run and the caller is answered the
+    // mount failure rather than a result no handler produced
+    // ([`super::file_system_mounts`]). Taken OUT of the invocation rather than copied out of
+    // it: the handles travel on to the run below, and nothing else reads the field.
+    let file_systems = match ::std::mem::replace(&mut invocation.file_systems, Ok(Vec::new())) {
+        Ok(mounts) => mounts,
+        Err(denied) => {
+            return Err(Unrunnable::FileSystemUnmountable {
+                access_point_arn: denied.access_point_arn,
+            })
+        }
     };
     // The AWS SDK a managed runtime ships reads the invocation's own tracing context out of
     // the environment and stamps it on every request it makes, so the seam the handler calls
@@ -1223,7 +1249,7 @@ pub async fn run_invocation(
                         budget,
                         aws: invocation.aws.clone(),
                         durable,
-                        file_systems: invocation.file_systems.clone(),
+                        file_systems,
                     },
                 ),
                 Engine::Node => node::run(&node::Run {
@@ -2563,7 +2589,7 @@ mod tests {
             initialization_type: crate::state::execution_slot::INITIALIZATION_TYPE_ON_DEMAND,
             aws: None,
             logs: None,
-            file_systems: Vec::new(),
+            file_systems: Ok(Vec::new()),
             metrics: None,
             streamed: false,
         }
