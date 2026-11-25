@@ -37,7 +37,7 @@ use x509_cert::Certificate;
 
 use crate::delete_certificate_authority::force_status;
 use crate::private_ca_lifecycle::{
-    active_ca, blob, own_ca_certificate, root_ca_request, string, wait_for_the_clock,
+    active_ca, blob, own_ca_certificate, root_ca_request, serial_in, string, wait_for_the_clock,
     Emulator, ACCOUNT, REGION,
 };
 use crate::resource_policy::error_message;
@@ -110,14 +110,6 @@ async fn certification_request(emulator: &Emulator, case: &str, common_name: &st
         )
         .await;
     string(&published, "Csr", case)
-}
-
-/// The serial a certificate ARN carries, which is the serial the issuing CA allocated.
-fn serial_in(certificate_arn: &str, case: &str) -> String {
-    certificate_arn
-        .rsplit_once("/certificate/")
-        .map(|(_, serial)| serial.to_string())
-        .unwrap_or_else(|| panic!("case {case:?}: no serial in {certificate_arn:?}"))
 }
 
 /// Have `ca_arn` issue a certificate over `csr`, and answer the serial it allocated.

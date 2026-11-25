@@ -190,37 +190,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found(crate::state::CA_NOT_FOUND_MESSAGE.to_string()));
         };
 
-        // "You can retrieve the certificate if it is in the ISSUED, EXPIRED, or REVOKED
-        // state" (this operation's docs): a certificate in any of those states is one the
-        // CA signed, so an authority whose key has signed NOTHING yet — it holds no
-        // certificate of its own and has issued none — could not have issued whatever
-        // certificate the request names, and what it owes the caller is the refusal about
-        // the AUTHORITY's state, judged before the certificate ARN is resolved on it. That
-        // is the one condition a caller fixes by finishing the CA's activation rather than
-        // by asking for another certificate, which is why it is not reported as a missing
-        // certificate.
-        if !record.could_have_issued_certificates() {
+        // A CA that was deleted is withdrawn from service: until it is restored nothing it
+        // holds is reached through it, which is why every operation of this service that
+        // reaches into a deleted CA refuses for its state before it touches what the
+        // request named. So that status — and only that one — is judged before the
+        // certificate the request names is resolved on the CA.
+        if record.is_deleted() {
             return Err(invalid_state(
                 crate::state::not_in_state_to_have_issued_message(&ca_arn),
             ));
         }
 
+        // A CA that still serves its certificates answers ABOUT the certificate the
+        // request names, so that certificate is resolved on the CA FIRST and an ARN this CA
+        // holds no record of is the absence of that CERTIFICATE, whatever status the
+        // authority rests in and whether or not it has signed anything yet. Serving a
+        // certificate the CA already holds needs no signing key, so nothing about the
+        // authority is judged past this point.
+        //
         // A certificate ARN carries the ARN of the CA that issued it as its prefix, so one
         // CA's certificate never resolves against another's: under the CA the request
-        // names, such an ARN is one more certificate that CA holds no record of, so it is
-        // answered with the service's one sentence for an absent certificate rather than
-        // with a sentence of its own built out of the request.
+        // names, such an ARN is one more certificate that CA holds no record of.
         if issuing_ca_arn != ca_arn {
             return Err(not_found(
                 crate::state::CERTIFICATE_NOT_FOUND_MESSAGE.to_string(),
             ));
         }
 
-        // Past that gate the CA has signed certificates, so this read is ABOUT the
-        // certificate the request names and that certificate is what it reports on: an ARN
-        // this CA holds no record of is the absence of that CERTIFICATE, whatever status
-        // the authority rests in and whether or not it holds a certificate of its OWN yet.
-        //
         // `RequestInProgressException` is kept for the one thing it says — a certificate
         // this CA really is minting, which a caller may retry for (below).
         let Some(certificate) = record.certificates.get(&certificate_arn) else {

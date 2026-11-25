@@ -284,8 +284,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
         // "Creates an audit report that lists every time that your CA private key is used
         // to issue a certificate." (this operation's docs.) A CA that has not been given a
         // certificate of its own has signed nothing with that key and has no audit
-        // information to report, which is the same state refusal `GetCertificate` answers
-        // for a CA that cannot have issued certificates.
+        // information to report, which is the state refusal this service answers about a
+        // CA that could not have issued the certificates a request is about.
         if record.ca_certificate_pem.is_none() {
             return Err(
                 CreateCertificateAuthorityAuditReportErrorModeled::InvalidStateException(

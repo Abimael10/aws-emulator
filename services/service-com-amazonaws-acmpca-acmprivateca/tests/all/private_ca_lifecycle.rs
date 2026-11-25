@@ -435,14 +435,23 @@ pub(crate) fn serial_as_integer(certificate: &Certificate) -> String {
         .to_str_radix(10)
 }
 
+/// The serial a certificate ARN carries, spelled as the ARN carries it: the hexadecimal
+/// value the issuing CA allocated.
+///
+/// `pub(crate)` so every suite that reaches for a certificate by the serial in its ARN
+/// splits one ARN the same way.
+pub(crate) fn serial_in(certificate_arn: &str, case: &str) -> String {
+    certificate_arn
+        .rsplit_once("/certificate/")
+        .map(|(_, serial)| serial.to_string())
+        .unwrap_or_else(|| panic!("case {case:?}: no serial in {certificate_arn:?}"))
+}
+
 /// The serial a certificate ARN names, as the integer the certificate carries: a DER
 /// integer carries no leading zero, and `SerialNumber` adds one only to keep the value
 /// positive, so the two compare equal once stripped.
 fn serial_from_arn(certificate_arn: &str) -> Vec<u8> {
-    let serial = certificate_arn
-        .rsplit_once("/certificate/")
-        .map(|(_, serial)| serial)
-        .unwrap_or_default();
+    let serial = serial_in(certificate_arn, "a certificate ARN");
     serial_value(&hex::decode(serial).expect("a certificate ARN carries a hex serial"))
 }
 
