@@ -22,11 +22,13 @@
 //! describe reports is a function of the stored due instant and what the export actually
 //! did ([`crate::state::terminal_status`]).
 //!
-//! The COLUMN names of what is written come from the half each row came from, never from
-//! the request: a bulk row was read out of an import file whose header names the dataset
-//! schema's fields, so it is exported under the schema's declared spelling, while a record
-//! the ingestion data plane put in is exported under the column names that record itself
-//! carries ([`export_rows`]).
+//! The COLUMN names of what is written come from the DATASET, never from the request or
+//! from how a record happened to arrive: a dataset "is associated with a dataset type and
+//! has a set of required field and keywords" through the schema `CreateDataset` named, so
+//! every exported value is written under the field spelling that schema declares for it,
+//! whether the record was read in by a dataset import job or put in by the ingestion data
+//! plane ([`export_rows`]). A value whose column the schema declares no field for keeps the
+//! name the record carries.
 
 use std::collections::BTreeSet;
 use std::time::SystemTime;
@@ -213,9 +215,9 @@ pub fn schema_fields(
         .unwrap_or_default()
 }
 
-/// The name an IMPORTED column is exported under: the schema's own spelling of the field
-/// it names, matched the way every field name in this crate is matched
-/// (case-insensitively), or the column's own name for one the schema does not declare.
+/// The name a column is exported under: the schema's own spelling of the field it names,
+/// matched the way every field name in this crate is matched (case-insensitively), or the
+/// column's own name for one the schema does not declare.
 fn exported_column(schema_fields: &[String], column: &str) -> String {
     schema_fields
         .iter()
@@ -224,7 +226,7 @@ fn exported_column(schema_fields: &[String], column: &str) -> String {
         .unwrap_or_else(|| column.to_string())
 }
 
-/// One imported row with each of its columns named as the dataset's schema spells it.
+/// One row with each of its columns named as the dataset's schema spells it.
 fn schema_named_row(schema_fields: &[String], row: &Row) -> Row {
     row.iter()
         .map(|(column, value)| (exported_column(schema_fields, column), value.clone()))
@@ -234,12 +236,13 @@ fn schema_named_row(schema_fields: &[String], row: &Row) -> Row {
 /// The rows `ingestion_mode` exports out of `dataset`: the bulk rows an import job read
 /// into it, the records the ingestion data plane put into it, or both.
 ///
-/// Each half is exported under the column names THAT half names its values by: a bulk row
-/// came out of an import file whose header names the schema's fields, so it is written
-/// under the schema's declared spelling ([`schema_fields`]), while a record the ingestion
-/// data plane put in is written under its own column names, which is how Amazon Personalize
-/// exports incrementally ingested data. An `ALL` export therefore carries both halves as
-/// each half names them.
+/// BOTH halves are exported under the column names the DATASET's schema declares
+/// ([`schema_fields`]): a dataset holds one set of fields whichever way its records
+/// arrived, so a client reading an export back addresses every row by the field names it
+/// wrote in the schema, and an `ALL` export carries its two halves under one set of
+/// columns. A column the schema declares no field for — a member of a streamed record the
+/// schema does not name, or a property put under a name no field matches — keeps the name
+/// the record carries.
 ///
 /// `Err` is the reason the export could not be carried out, ready for the job's failure
 /// state. A pure read of both stores.
@@ -264,7 +267,8 @@ pub fn export_rows(
         );
     }
     if exports_put(ingestion_mode) && rows.len() < budget {
-        rows.extend(ingested::put_rows(ingested_store, dataset, budget - rows.len()));
+        let put = ingested::put_rows(ingested_store, dataset, budget - rows.len());
+        rows.extend(put.iter().map(|row| schema_named_row(&schema_fields, row)));
     }
     if rows.len() > MAX_EXPORT_ROWS {
         return Err(too_many_rows_message(&dataset.dataset_arn));

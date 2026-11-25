@@ -18,18 +18,19 @@
 //! requested kind is refused with `InvalidInputException`, so nothing is ever reported
 //! exported that was not written.
 //!
-//! The second rule: each half is written under the COLUMN names that half uses — a row a
-//! dataset import job read out of a file whose header names the schema's fields is
-//! exported under the schema's declared spelling, and a record the ingestion data plane
-//! put in is exported under the column names that record itself carries — so a client
-//! reading an export back addresses it by the names the half it wants was written with.
+//! The second rule: every exported column is named as the DATASET's schema declares the
+//! field it holds, whichever way the record arrived — a row a dataset import job read in
+//! and a record the ingestion data plane put in are both written under the schema's
+//! declared spelling — so a client reading an export back addresses every row by the field
+//! names it wrote in the schema. A column the schema declares no field for keeps the name
+//! the record carries.
 //!
 //! The suites are TABLES: the rows vary what the rule generalises over (the dataset type,
 //! the ingestion mode including its default, which half of the dataset holds data, the
-//! spelling each half names its fields with, whether an optional member was sent at all,
-//! the record count and the destination folder's form), and the recorded case the issue
-//! cited — `PutEvents` followed by a `PUT` export read back by `event_type` — is one row
-//! among them.
+//! spelling the schema and the records name their fields with, whether an optional member
+//! was sent at all, the record count and the destination folder's form), and the recorded
+//! case the issue cited — `PutItems` followed by a `PUT` export read back by the schema's
+//! `ITEM_ID` — is one row among them.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -538,9 +539,9 @@ struct ExportCase {
     /// The columns the dataset's schema declares. The first is the one a record of this
     /// type is keyed by, which is what the expectations below name a record with.
     columns: &'static [&'static str],
-    /// The column names a record of this export is keyed by, most specific first: an
-    /// export carries each half of a dataset under the names THAT half uses, so a case
-    /// whose two halves spell the id field differently names both spellings.
+    /// The column names a record of this export is keyed by, most specific first: every
+    /// half of a dataset is carried under the schema's own spelling of the field, so a
+    /// case normally names one spelling.
     id_columns: &'static [&'static str],
     /// The CSV imported in bulk, when the case has bulk data.
     bulk: Option<&'static str>,
@@ -569,7 +570,8 @@ const BULK_USERS_UPPER: &str =
 
 /// The table: one row per (dataset type, ingestion mode, which half holds data, schema
 /// field spelling) the rule generalises over. The recorded case the issue cited —
-/// `PutItems` then a `PUT` export read back by its `item_id` — is the row named for it.
+/// `PutItems` then a `PUT` export read back by the schema's `ITEM_ID` — is the row named
+/// for it.
 const EXPORT_CASES: &[ExportCase] = &[
     ExportCase {
         case: "items, PUT by default, read back with its properties",
@@ -591,10 +593,10 @@ const EXPORT_CASES: &[ExportCase] = &[
         ],
     },
     ExportCase {
-        case: "items PUT under an upper-case schema keep the record's own id column",
+        case: "items PUT under an upper-case schema are exported under its spelling",
         dataset_type: "Items",
         columns: &["ITEM_ID", "GENRE"],
-        id_columns: &["item_id"],
+        id_columns: &["ITEM_ID"],
         bulk: None,
         ingested: Ingested::Items {
             property: "GENRE",
@@ -607,10 +609,10 @@ const EXPORT_CASES: &[ExportCase] = &[
         expected_values: &[("put-item-1", "GENRE", "drama")],
     },
     ExportCase {
-        case: "a property PUT in another case is exported in the case it was PUT in",
+        case: "a property PUT in another case is exported in the schema's case",
         dataset_type: "Items",
         columns: &["ITEM_ID", "GENRE"],
-        id_columns: &["item_id"],
+        id_columns: &["ITEM_ID"],
         bulk: None,
         ingested: Ingested::Items {
             property: "genre",
@@ -621,15 +623,15 @@ const EXPORT_CASES: &[ExportCase] = &[
         expected: &["put-item-1", "put-item-2"],
         unexpected: &[],
         expected_values: &[
-            ("put-item-1", "genre", "drama"),
-            ("put-item-2", "genre", "comedy"),
+            ("put-item-1", "GENRE", "drama"),
+            ("put-item-2", "GENRE", "comedy"),
         ],
     },
     ExportCase {
         case: "a property named like the id column cannot replace the record's own id",
         dataset_type: "Items",
         columns: &["ITEM_ID", "GENRE"],
-        id_columns: &["item_id"],
+        id_columns: &["ITEM_ID"],
         bulk: None,
         ingested: Ingested::Items {
             // What identifies a record comes from the record, so a property a caller
@@ -715,12 +717,12 @@ const EXPORT_CASES: &[ExportCase] = &[
         expected_values: &[("put-user-2", "age", "33")],
     },
     ExportCase {
-        case: "users, ALL carries each half under the names that half uses",
+        case: "users, ALL carries both halves under the schema's spelling",
         dataset_type: "Users",
         columns: &["USER_ID", "AGE"],
-        // The imported rows are addressed by the schema's spelling, the PUT record by the
-        // one the ingestion plane keys it with.
-        id_columns: &["USER_ID", "user_id"],
+        // Both halves are addressed by the schema's spelling, whichever way the record
+        // arrived.
+        id_columns: &["USER_ID"],
         bulk: Some(BULK_USERS_UPPER),
         ingested: Ingested::Users {
             property: "AGE",
@@ -752,7 +754,7 @@ const EXPORT_CASES: &[ExportCase] = &[
         case: "interactions, PUT exports the events a tracker of the group ingested",
         dataset_type: "Interactions",
         columns: &["USER_ID", "ITEM_ID", "TIMESTAMP"],
-        id_columns: &["user_id"],
+        id_columns: &["USER_ID"],
         bulk: None,
         ingested: Ingested::Events(&[
             (Some("put-user-1"), "put-item-1"),
@@ -763,11 +765,11 @@ const EXPORT_CASES: &[ExportCase] = &[
         expected: &["put-user-1", "put-user-2"],
         unexpected: &[],
         expected_values: &[
-            ("put-user-1", "item_id", "put-item-1"),
-            ("put-user-2", "item_id", "put-item-2"),
+            ("put-user-1", "ITEM_ID", "put-item-1"),
+            ("put-user-2", "ITEM_ID", "put-item-2"),
             // The instant the caller reported, in the Unix time an interaction record
             // carries it in.
-            ("put-user-1", "timestamp", "1764000000"),
+            ("put-user-1", "TIMESTAMP", "1764000000"),
         ],
     },
 ];
@@ -1351,14 +1353,14 @@ struct ColumnNamingCase {
     absent_columns: &'static [&'static str],
 }
 
-/// The table: one row per (which half holds data, how that half spells its fields,
-/// whether an optional member of a record was sent at all) the column-naming rule
-/// generalises over. The first row is the recorded shape the issue cited: one `PutEvents`
-/// event carrying no `userId`, exported with `ingestionMode=PUT` and read back by the
-/// record's own `event_type` column.
+/// The table: one row per (which half holds data, how the schema and the record spell
+/// their fields, whether an optional member of a record was sent at all) the column-naming
+/// rule generalises over. The first row is the recorded shape the issue cited: one
+/// `PutEvents` event carrying no `userId`, exported with `ingestionMode=PUT` and read back
+/// by the schema's own `EVENT_TYPE` column.
 const COLUMN_NAMING_CASES: &[ColumnNamingCase] = &[
     ColumnNamingCase {
-        case: "an event sent with no userId is exported under the record's own columns",
+        case: "an event sent with no userId is exported under the schema's columns",
         dataset_type: "Interactions",
         columns: &["USER_ID", "ITEM_ID", "TIMESTAMP", "EVENT_TYPE"],
         bulk: None,
@@ -1366,15 +1368,17 @@ const COLUMN_NAMING_CASES: &[ColumnNamingCase] = &[
         ingestion_mode: Some("PUT"),
         folder: "exports/naming-no-user/",
         rows: &[&[
-            ("event_type", "click"),
-            ("item_id", "put-item-1"),
+            ("EVENT_TYPE", "click"),
+            ("ITEM_ID", "put-item-1"),
+            // The visit a real-time interaction belongs to is part of the record but no
+            // field of this schema, so it keeps the name the record carries.
             ("session_id", "session-0"),
-            ("timestamp", "1764000000"),
-            // Sent by no one: the column is the record's, so the cell is empty rather
+            ("TIMESTAMP", "1764000000"),
+            // Sent by no one: the column is the schema's, so the cell is empty rather
             // than the column being left out of the file.
-            ("user_id", ""),
+            ("USER_ID", ""),
         ]],
-        absent_columns: &["USER_ID", "ITEM_ID", "TIMESTAMP", "EVENT_TYPE"],
+        absent_columns: &["user_id", "item_id", "timestamp", "event_type"],
     },
     ColumnNamingCase {
         case: "the PUT default exports both events, with and without a user",
@@ -1386,20 +1390,20 @@ const COLUMN_NAMING_CASES: &[ColumnNamingCase] = &[
         folder: "exports/naming-default/",
         rows: &[
             &[
-                ("user_id", "put-user-1"),
-                ("item_id", "put-item-1"),
+                ("USER_ID", "put-user-1"),
+                ("ITEM_ID", "put-item-1"),
                 ("session_id", "session-0"),
             ],
             &[
-                ("user_id", ""),
-                ("item_id", "put-item-2"),
+                ("USER_ID", ""),
+                ("ITEM_ID", "put-item-2"),
                 ("session_id", "session-1"),
             ],
         ],
-        absent_columns: &["USER_ID", "ITEM_ID"],
+        absent_columns: &["user_id", "item_id"],
     },
     ColumnNamingCase {
-        case: "action interactions keep their own columns as well",
+        case: "action interactions are renamed to the schema's spelling as well",
         dataset_type: "Action_Interactions",
         columns: &["USER_ID", "ACTION_ID", "TIMESTAMP", "EVENT_TYPE"],
         bulk: None,
@@ -1411,14 +1415,14 @@ const COLUMN_NAMING_CASES: &[ColumnNamingCase] = &[
         folder: "exports/naming-actions/",
         rows: &[
             &[
-                ("user_id", "put-user-1"),
-                ("action_id", "put-action-1"),
-                ("event_type", "Taken"),
-                ("timestamp", "1764000000"),
+                ("USER_ID", "put-user-1"),
+                ("ACTION_ID", "put-action-1"),
+                ("EVENT_TYPE", "Taken"),
+                ("TIMESTAMP", "1764000000"),
             ],
-            &[("user_id", ""), ("action_id", "put-action-2")],
+            &[("USER_ID", ""), ("ACTION_ID", "put-action-2")],
         ],
-        absent_columns: &["USER_ID", "ACTION_ID", "EVENT_TYPE"],
+        absent_columns: &["user_id", "action_id", "event_type"],
     },
     ColumnNamingCase {
         case: "a BULK export renames the imported rows to the schema's spelling",
@@ -1435,7 +1439,7 @@ const COLUMN_NAMING_CASES: &[ColumnNamingCase] = &[
         absent_columns: &["item_id", "genre"],
     },
     ColumnNamingCase {
-        case: "an ALL export carries each half under its own names",
+        case: "an ALL export carries both halves under one set of columns",
         dataset_type: "Items",
         columns: &["ITEM_ID", "GENRE"],
         bulk: Some(BULK_ITEMS),
@@ -1446,26 +1450,18 @@ const COLUMN_NAMING_CASES: &[ColumnNamingCase] = &[
         ingestion_mode: Some("ALL"),
         folder: "exports/naming-all/",
         rows: &[
-            &[
-                ("ITEM_ID", "bulk-item-1"),
-                ("GENRE", "history"),
-                // An imported row names no column of the PUT half, so its cells there
-                // are empty.
-                ("item_id", ""),
-            ],
+            &[("ITEM_ID", "bulk-item-1"), ("GENRE", "history")],
             &[("ITEM_ID", "bulk-item-2"), ("GENRE", "sci-fi")],
-            &[
-                ("item_id", "put-item-1"),
-                ("genre", "drama"),
-                ("ITEM_ID", ""),
-            ],
+            // The record the ingestion plane put in reads under the SAME columns as the
+            // imported rows, so one reader addresses the whole file.
+            &[("ITEM_ID", "put-item-1"), ("GENRE", "drama")],
         ],
-        absent_columns: &[],
+        absent_columns: &["item_id", "genre"],
     },
 ];
 
 #[tokio::test]
-async fn each_half_of_an_export_is_written_under_the_column_names_that_half_uses() {
+async fn an_export_names_every_column_as_the_datasets_schema_declares_it() {
     for case in COLUMN_NAMING_CASES {
         let emulator = Exporter::new();
         emulator.create_bucket().await;
@@ -1526,6 +1522,196 @@ async fn each_half_of_an_export_is_written_under_the_column_names_that_half_uses
                 "case {:?}: expected the header NOT to name {absent:?}, got {header:?}",
                 case.case
             );
+        }
+    }
+}
+
+/// One row of the re-PUT table: a metadata dataset whose records are PUT, exported, PUT
+/// again with new values and exported again.
+struct RePutCase {
+    case: &'static str,
+    /// `Items` or `Users` — the two metadata datasets a batch put addresses by the
+    /// dataset's own ARN.
+    dataset_type: &'static str,
+    /// The two fields the dataset's schema declares: the field a record of this type is
+    /// keyed by, then one property field. Source: the fields Amazon Personalize requires
+    /// of each dataset type's schema, which this crate states once in
+    /// `crate::state::REQUIRED_SCHEMA_FIELDS`.
+    columns: &'static [&'static str; 2],
+    /// The name the record's `properties` object writes the property under, which a case
+    /// can spell differently from the schema's field.
+    property: &'static str,
+    /// How many records one batch carries. `ItemList` and `UserList` are both `len 1..10`
+    /// (`smithy_query(query="operation", operation="PutItems,PutUsers")`), so ten is the
+    /// largest batch either admits.
+    records: usize,
+}
+
+/// The table: one row per (metadata dataset type, batch size including the largest the
+/// model admits, the spelling the schema declares its fields in, the spelling the record
+/// PUTs its property under) the column-naming rule generalises over.
+const RE_PUT_CASES: &[RePutCase] = &[
+    RePutCase {
+        case: "one item under an upper-case schema",
+        dataset_type: "Items",
+        columns: &["ITEM_ID", "GENRE"],
+        property: "GENRE",
+        records: 1,
+    },
+    RePutCase {
+        case: "ten items, the largest batch PutItems admits",
+        dataset_type: "Items",
+        columns: &["ITEM_ID", "GENRE"],
+        property: "GENRE",
+        records: 10,
+    },
+    RePutCase {
+        case: "ten items whose property is PUT in another case",
+        dataset_type: "Items",
+        columns: &["ITEM_ID", "GENRE"],
+        property: "genre",
+        records: 10,
+    },
+    RePutCase {
+        case: "one user under an upper-case schema",
+        dataset_type: "Users",
+        columns: &["USER_ID", "AGE"],
+        property: "AGE",
+        records: 1,
+    },
+    RePutCase {
+        case: "ten users, the largest batch PutUsers admits",
+        dataset_type: "Users",
+        columns: &["USER_ID", "AGE"],
+        property: "AGE",
+        records: 10,
+    },
+    RePutCase {
+        case: "items under a lower-case schema are exported in that spelling",
+        dataset_type: "Items",
+        columns: &["item_id", "genre"],
+        property: "GENRE",
+        records: 2,
+    },
+];
+
+/// The ingestion route, the list member and the id member of the batch put that writes
+/// records of `dataset_type`.
+fn metadata_put(dataset_type: &str) -> (&'static str, &'static str, &'static str) {
+    match dataset_type {
+        "Items" => ("/items", "items", "itemId"),
+        "Users" => ("/users", "users", "userId"),
+        other => panic!("{other:?} is not a metadata dataset type this table covers"),
+    }
+}
+
+#[tokio::test]
+async fn put_metadata_is_exported_under_the_schemas_field_names_and_replaced_in_place() {
+    for case in RE_PUT_CASES {
+        let emulator = Exporter::new();
+        emulator.create_bucket().await;
+        let suffix = short(case.case);
+        let group = emulator.active_group(case.case, &suffix).await;
+        let dataset = emulator
+            .dataset(case.case, &suffix, &group, case.dataset_type, case.columns)
+            .await;
+        let (route, list_member, id_member) = metadata_put(case.dataset_type);
+        let ids: Vec<String> = (0..case.records)
+            .map(|index| format!("record-{index}"))
+            .collect();
+        let id_column = case.columns[0];
+        let property_column = case.columns[1];
+
+        // Each round PUTs every id again with a new value, so the second export says
+        // whether a repeated id replaced its record or added a second one.
+        for (round, round_name) in ["first", "second"].into_iter().enumerate() {
+            let values: Vec<String> = (0..case.records)
+                .map(|index| format!("{round_name}-{index}"))
+                .collect();
+            let records: Vec<Value> = ids
+                .iter()
+                .zip(&values)
+                .map(|(id, value)| {
+                    json!({
+                        id_member: id,
+                        "properties": json!({case.property: value}).to_string(),
+                    })
+                })
+                .collect();
+            emulator
+                .ingest(
+                    route,
+                    &json!({"datasetArn": dataset, list_member: records}),
+                    case.case,
+                )
+                .await;
+
+            let job_name = format!("export-{suffix}-{round}");
+            let folder = format!("exports/re-put-{suffix}-{round}");
+            let arn = emulator
+                .export_ok(
+                    case.case,
+                    &job_name,
+                    &dataset,
+                    &format!("s3://{BUCKET}/{folder}/"),
+                    Some("PUT"),
+                )
+                .await;
+            let job = emulator.await_terminal(case.case, &arn).await;
+            assert_eq!(
+                job["status"].as_str().unwrap_or(""),
+                "ACTIVE",
+                "case {:?} ({round_name} export): expected the job to reach ACTIVE, got {job}",
+                case.case
+            );
+
+            let body = emulator
+                .object(&format!("{folder}/{job_name}.csv"), case.case)
+                .await;
+            let (header, rows) = exported_rows(&body);
+            for column in [id_column, property_column] {
+                assert!(
+                    header.contains(&column.to_string()),
+                    "case {:?} ({round_name} export): expected the header to name \
+                     {column:?}, got {header:?}",
+                    case.case
+                );
+                // The canonical spelling this crate matches a field by is not a column of
+                // the file when the schema declares the field otherwise.
+                let canonical = column.to_ascii_lowercase();
+                assert!(
+                    canonical == column || !header.contains(&canonical),
+                    "case {:?} ({round_name} export): expected the header NOT to name \
+                     {canonical:?} beside {column:?}, got {header:?}",
+                    case.case
+                );
+            }
+            assert_eq!(
+                rows.len(),
+                ids.len(),
+                "case {:?} ({round_name} export): expected {} exported records, got {rows:?}",
+                case.case,
+                ids.len()
+            );
+            for (id, value) in ids.iter().zip(&values) {
+                let row = rows
+                    .iter()
+                    .find(|row| row.get(id_column).map(String::as_str) == Some(id.as_str()))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "case {:?} ({round_name} export): expected an exported record \
+                             {id:?} in column {id_column:?}, got {rows:?}",
+                            case.case
+                        )
+                    });
+                assert_eq!(
+                    row.get(property_column).map(String::as_str),
+                    Some(value.as_str()),
+                    "case {:?} ({round_name} export): expected {id:?} to carry \
+                     {property_column}={value:?}, got {row:?}",
+                    case.case
+                );
+            }
         }
     }
 }

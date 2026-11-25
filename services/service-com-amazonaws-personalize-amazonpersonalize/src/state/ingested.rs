@@ -14,9 +14,9 @@
 //! of them instead of each walking the ingestion store its own way.
 //!
 //! Nothing is invented here: every value comes from a record the ingestion data plane
-//! actually stored, under the column names that record itself carries — a real-time
-//! record is exported as it was ingested, never renamed to the dataset schema's
-//! spellings, which name the rows a dataset import job read in
+//! actually stored, under this crate's canonical name for the field it belongs to — the
+//! name every reader of a dataset's rows matches a field by, case-insensitively, and which
+//! a dataset export renames to the spelling that dataset's own schema declares
 //! ([`crate::state::export::export_rows`]). A column of the record's own shape that the
 //! caller sent no value for is an EMPTY cell, so every record of one stream reads the
 //! same way for a client addressing the export by column name.
