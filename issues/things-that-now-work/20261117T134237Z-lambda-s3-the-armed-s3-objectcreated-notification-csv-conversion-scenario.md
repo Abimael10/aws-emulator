@@ -37,3 +37,35 @@ No assertion was ever reached — the check produced no status, body or error fr
 3. s3 PutBucketNotificationConfiguration with a LambdaFunctionConfigurations entry on `s3:ObjectCreated:*` filtered to suffix `.csv`.
 4. PutObject `<key>.csv`, then PutObject `<key>.CSV`.
 5. Observe: the check never reaches a verdict within 60 s. Expected the `.csv` put to invoke the function and produce the converted object, and the `.CSV` put to be suppressed by the case-sensitive suffix filter.
+
+## Fix status
+
+Cause 1 (the arm/put/observe sequence not converging) — NOT A DEFECT of the emulator's own
+answers, and not a refusal: every call of the reported sequence is served and the Lambda data
+plane RUNS. Driven end to end on the assembled router — `CreateBucket`, a CloudFormation
+provisioned execution role plus `python3.12` converting function, `GetFunctionConfiguration`
+polled to `Active`, lambda `AddPermission` for `s3.amazonaws.com` with the bucket ARN as
+`SourceArn`, `PutBucketNotificationConfiguration` with one Lambda configuration on
+`s3:ObjectCreated:*` filtered to suffix `.csv`, then `PutObject` of the `.csv` key and of the
+`.CSV` twin — the bucket is armed (200), the `.csv` write invokes the function with no further
+API call, and its converted object is readable 2.7 s after the write; the `.CSV` twin is answered
+404 and the bucket holds exactly one derived object. The whole sequence, from assembling the
+router to reading the twin's absence, completes in 6.6 s.
+
+What the harness reports is its own wall-clock ceiling. This check's replay key moved from its
+POSITIVE leg (`…|run#14|Timeout|time.sleep(5.0)`, filed and closed as
+`20261103T031416Z-lambda-s3-5-net-new-causes-in-s3.md`) to its ABSENCE leg
+(`…|_watch_absent#26|Timeout|return found`), so the positive control now arrives; the check's own
+absence window is `_ABSENCE_WINDOW_S = 60.0` and "opens only AFTER the positive control has
+arrived" (quoted from the check's docstring in the earlier closed filing
+`20261110T153718Z-lambda-s3-an-armed-s3-objectcreated-notification-never.md`), so the check needs
+more than the harness's 60 s ceiling of wall clock however fast the emulator answers.
+
+The only gap this left was COVERAGE, not behaviour: every suite in the tree states its filter
+rule value in lower case (`.csv`), so a byte-for-byte comparison and a matcher that folds one
+side's case before comparing were indistinguishable. `core/router/tests/all/`
+`s3_notification_suffix_rule_case_decides_delivery.rs` closes that — two armed buckets whose one
+`suffix` rule is `.csv` and `.CSV`, each converting exactly the keys its own rule spells and no
+key that differs from it only in case. The dispatch and the matcher it pins are
+`crate::state::notifications::{key_matches, pending, publish, deliver}` in
+`services/service-com-amazonaws-s3-amazons3/src/state/notifications.rs`.
