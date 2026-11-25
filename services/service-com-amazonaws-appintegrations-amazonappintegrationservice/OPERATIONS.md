@@ -150,14 +150,14 @@ contents — read that shape in the model above when you need its own members.
 
 ## TagResource
 
-- **Route:** `POST /tags/{resourceArn} -> 200`
+- **Route:** `POST /tags/{resourceArn} -> 204` (the model states no explicit success code, so it falls back to the protocol default 200; AWS answers this tagging mutation with 204 No Content)
 - **Input:** `resourceArn` (string, len 1..2048, pattern ^arn:aws:[A-Za-z0-9][A-Za-z0-9_/.-]{0,62}:[A-Za-z0-9_/.-]{0,63}:[A-Za-z0-9_/.-]{0,63}:[A-Za-z0-9][A-Za-z0-9:_/+=,@.-]{0, …, @httpLabel, required), `tags` (map<string,string>, len 1..200, required)
 - **Output:** (no members)
 - **Errors:** `InternalServiceError (HTTP 500)`, `InvalidRequestException (HTTP 400)`, `ResourceNotFoundException (HTTP 404)`, `ThrottlingException (HTTP 429)`
 
 ## UntagResource
 
-- **Route:** `DELETE /tags/{resourceArn} -> 200`
+- **Route:** `DELETE /tags/{resourceArn} -> 204` (the model states no explicit success code, so it falls back to the protocol default 200; AWS answers this tagging mutation with 204 No Content)
 - **Input:** `resourceArn` (string, len 1..2048, pattern ^arn:aws:[A-Za-z0-9][A-Za-z0-9_/.-]{0,62}:[A-Za-z0-9_/.-]{0,63}:[A-Za-z0-9_/.-]{0,63}:[A-Za-z0-9][A-Za-z0-9:_/+=,@.-]{0, …, @httpLabel, required), `tagKeys` (list<string>, len 1..200, @httpQuery(tagKeys), required)
 - **Output:** (no members)
 - **Errors:** `InternalServiceError (HTTP 500)`, `InvalidRequestException (HTTP 400)`, `ResourceNotFoundException (HTTP 404)`, `ThrottlingException (HTTP 429)`

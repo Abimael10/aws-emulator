@@ -12,6 +12,12 @@
 //! operation states which keys the resource must not carry afterwards, so repeating it
 //! leaves the same tag set. A key the request does not name is left alone.
 //!
+//! A successful call answers HTTP 204 with no content members, the status AWS answers on
+//! the tagging surface of this service for an operation whose output carries no members —
+//! including the idempotent call that names a key the resource does not carry; the model
+//! states no explicit success code for it, so the protocol default 200 the scaffold
+//! declared was the generic one and not this operation's.
+//!
 //! An ARN this account holds no taggable resource under is refused with
 //! `ResourceNotFoundException` (HTTP 404), worded by
 //! [`crate::state::tagged_resource_not_found`] — the ARN the request sent and no
@@ -140,7 +146,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "UntagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // `UntagResourceResponse` has no members and AWS answers this service's tagging
+    // mutations with 204 No Content, so the success status is 204 rather than the
+    // protocol default the model falls back to.
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,

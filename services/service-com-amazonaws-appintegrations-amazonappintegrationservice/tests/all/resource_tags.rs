@@ -17,6 +17,12 @@
 //! names (a subset, a key the resource does not carry, all of them). The recorded
 //! tag/list/untag round trip is one row.
 //!
+//! The success STATUS of the two tagging mutations is part of that rule: both declare an
+//! output with no members and AWS answers them with 204 No Content, so every successful
+//! `TagResource` and `UntagResource` answers 204 and nothing to parse, whatever resource
+//! type the ARN names and whatever the tag set or the key list is — while the other
+//! empty-output operations of this service keep the default success status.
+//!
 //! Every assertion goes over the wire through the same router the production emulator
 //! mounts (see `harness.rs`); nothing reaches into the service's state struct, so a
 //! response that is not computed from persisted state cannot pass.
@@ -38,6 +44,38 @@ const TAG_VALUE_MAX: usize = 256;
 /// The most tags one resource carries: the maximum the modelled `TagMap` admits
 /// (`smithy_query(query="shape", shape="TagMap")`: `len 1..200`).
 const MAX_TAGS_PER_RESOURCE: usize = 200;
+
+/// What a successful tagging mutation of this service answers: 204 No Content. Both
+/// tagging operations declare an output with no members
+/// (`smithy_query(query="operation", operation="TagResource,UntagResource")`) and AWS
+/// answers them with the no-content status rather than the protocol default the model
+/// falls back to when it states no explicit success code.
+const TAGGING_SUCCESS_STATUS: u16 = 204;
+
+/// The success status of an operation of this service whose output DOES carry members, and
+/// of the empty-output operations outside the tagging surface: the protocol default
+/// (`smithy_query(query="operation", ...)`: `http.code` 200 on every operation of this
+/// model).
+const DEFAULT_SUCCESS_STATUS: u16 = 200;
+
+/// Assert that one tagging mutation answered exactly as AWS answers a successful one: the
+/// no-content status, with no content members to parse.
+fn assert_no_content_success(case: &str, operation: &str, reply: &Reply) {
+    assert_eq!(
+        reply.status, TAGGING_SUCCESS_STATUS,
+        "case {case:?}: expected {operation} to answer HTTP {TAGGING_SUCCESS_STATUS}, \
+         got {} / {}",
+        reply.status, reply.body
+    );
+    assert!(
+        reply
+            .body
+            .as_object()
+            .is_none_or(serde_json::Map::is_empty),
+        "case {case:?}: expected {operation} to answer no content members, got {}",
+        reply.body
+    );
+}
 
 /// One taggable resource of this service, as the wire reports it: the ARN the tagging
 /// operations address it by, and the URI its own reader answers on.
@@ -318,11 +356,7 @@ async fn the_tag_set_tag_resource_wrote_is_what_every_reader_reports() {
             );
 
             let tagged = tag(&emulator, &resource.arn, tags_body(&entries)).await;
-            assert_eq!(
-                tagged.status, 200,
-                "case {case:?}: expected TagResource to answer HTTP 200, got {} / {}",
-                tagged.status, tagged.body
-            );
+            assert_no_content_success(&case, "TagResource", &tagged);
 
             let expected = expected_map(&entries);
             let listed = reported_tags(&emulator, &case, &resource).await;
@@ -384,11 +418,7 @@ async fn tagging_merges_keys_and_overwrites_the_value_of_a_key_already_carried()
             json!({ "env": "prod", "tier": "gold" }),
         )
         .await;
-        assert_eq!(
-            tagged.status, 200,
-            "case {case:?}: expected TagResource to answer HTTP 200, got {} / {}",
-            tagged.status, tagged.body
-        );
+        assert_no_content_success(&case, "TagResource", &tagged);
 
         let expected: BTreeMap<String, String> =
             [("owner", "team-a"), ("env", "prod"), ("tier", "gold")]
@@ -484,11 +514,7 @@ async fn untagging_removes_only_the_keys_it_names() {
                 .collect();
 
             let untagged = untag(&emulator, &resource.arn, &keys).await;
-            assert_eq!(
-                untagged.status, 200,
-                "case {case:?}: expected UntagResource to answer HTTP 200, got {} / {}",
-                untagged.status, untagged.body
-            );
+            assert_no_content_success(&case, "UntagResource", &untagged);
 
             let listed = reported_tags(&emulator, &case, &resource).await;
             assert_eq!(
@@ -717,11 +743,7 @@ async fn a_resource_cannot_be_tagged_past_the_tag_maps_maximum() {
         .map(|index| (format!("key-{index}"), format!("value-{index}")))
         .collect();
     let at_maximum = tag(&emulator, &resource.arn, tags_body(&full)).await;
-    assert_eq!(
-        at_maximum.status, 200,
-        "case \"exactly the maximum\": expected HTTP 200, got {} / {}",
-        at_maximum.status, at_maximum.body
-    );
+    assert_no_content_success("exactly the maximum", "TagResource", &at_maximum);
     let listed = reported_tags(&emulator, "exactly the maximum", &resource).await;
     assert_eq!(
         listed.len(),
@@ -736,10 +758,10 @@ async fn a_resource_cannot_be_tagged_past_the_tag_maps_maximum() {
         tags_body(&[("key-0".to_string(), "replaced".to_string())]),
     )
     .await;
-    assert_eq!(
-        repeated.status, 200,
-        "case \"a key already carried, at the maximum\": expected HTTP 200, got {} / {}",
-        repeated.status, repeated.body
+    assert_no_content_success(
+        "a key already carried, at the maximum",
+        "TagResource",
+        &repeated,
     );
 
     let past = tag(
@@ -813,4 +835,161 @@ async fn tags_survive_a_read_and_a_delete_removes_them_with_the_resource() {
         "case \"ListTagsForResource after the delete\": expected HTTP 404, got {} / {}",
         listed.status, listed.body
     );
+}
+
+/// One row of the success-status table: the label that names it in an assertion, the tag
+/// set one `TagResource` writes, and the keys the `UntagResource` after it names.
+#[derive(Debug, Clone)]
+struct StatusRow {
+    label: &'static str,
+    tags: Vec<(String, String)>,
+    untag_keys: Vec<String>,
+}
+
+/// The rows the success-status rule is asserted over. They differ along what that rule
+/// generalises over — how many tags the request carries (one, several, the maximum the
+/// modelled `TagMap` admits), the form of a value (a word, the empty string), and which
+/// keys the untag names (the only one, a subset, a key the resource does not carry at all,
+/// every key). The recorded tag/untag pair is the first row.
+fn status_rows() -> Vec<StatusRow> {
+    let full: Vec<(String, String)> = (0..MAX_TAGS_PER_RESOURCE)
+        .map(|index| (format!("key-{index}"), format!("value-{index}")))
+        .collect();
+    let every_key: Vec<String> = full.iter().map(|(key, _)| key.clone()).collect();
+    vec![
+        StatusRow {
+            label: "one tag, untagged by its own key",
+            tags: vec![("owner".to_string(), "team-a".to_string())],
+            untag_keys: vec!["owner".to_string()],
+        },
+        StatusRow {
+            label: "several tags, a subset untagged",
+            tags: vec![
+                ("owner".to_string(), "team-a".to_string()),
+                ("env".to_string(), "dev".to_string()),
+                ("tier".to_string(), "gold".to_string()),
+            ],
+            untag_keys: vec!["env".to_string(), "tier".to_string()],
+        },
+        StatusRow {
+            label: "an empty value, untagged by a key the resource does not carry",
+            tags: vec![("empty".to_string(), String::new())],
+            untag_keys: vec!["never-written".to_string()],
+        },
+        StatusRow {
+            label: "the maximum tag count the map admits, every key untagged",
+            tags: full,
+            untag_keys: every_key,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn both_tagging_mutations_answer_the_no_content_success_status() {
+    let emulator = Emulator::new();
+
+    for (row, StatusRow {
+        label,
+        tags,
+        untag_keys,
+    }) in status_rows().into_iter().enumerate()
+    {
+        for resource in taggable_resources(&emulator, row).await {
+            let case = format!("{label} on a {}", resource.kind);
+
+            let tagged = tag(&emulator, &resource.arn, tags_body(&tags)).await;
+            assert_no_content_success(&case, "TagResource", &tagged);
+
+            // A no-content answer is still the mutation: what it wrote is readable back,
+            // so the status assertion above cannot pass on a call that did nothing.
+            let expected = expected_map(&tags);
+            let listed = reported_tags(&emulator, &case, &resource).await;
+            assert_eq!(
+                listed, expected,
+                "case {case:?}: expected the no-content TagResource to have stored \
+                 {expected:?}, got {listed:?}"
+            );
+
+            let keys: Vec<&str> = untag_keys.iter().map(String::as_str).collect();
+            let untagged = untag(&emulator, &resource.arn, &keys).await;
+            assert_no_content_success(&case, "UntagResource", &untagged);
+
+            let remaining: BTreeMap<String, String> = tags
+                .iter()
+                .filter(|(key, _)| !untag_keys.contains(key))
+                .cloned()
+                .collect();
+            let listed = reported_tags(&emulator, &case, &resource).await;
+            assert_eq!(
+                listed, remaining,
+                "case {case:?}: expected the no-content UntagResource to leave \
+                 {remaining:?}, got {listed:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_no_content_status_is_the_tagging_surfaces_own() {
+    let emulator = Emulator::new();
+
+    // Every OTHER operation of this service whose output carries no members
+    // (`smithy_query(query="operation", operation="UpdateApplication,
+    // UpdateEventIntegration,UpdateDataIntegration,DeleteApplication,
+    // DeleteEventIntegration,DeleteDataIntegration")`: each `output` is empty) answers the
+    // default success status, so the no-content status belongs to the tagging mutations
+    // and is not a blanket rule about an empty output.
+    let application = application(&emulator, "statuses.application", None).await;
+    let event_integration =
+        event_integration(&emulator, "statuses.event-integration", None).await;
+    let data_integration = data_integration(&emulator, "statuses.data-integration", None).await;
+
+    let updated = json!({ "Description": "the description the update stored" });
+    let rows: Vec<(&str, &str, String, Option<Value>)> = vec![
+        (
+            "UpdateApplication",
+            "PATCH",
+            application.get_uri.clone(),
+            Some(updated.clone()),
+        ),
+        (
+            "UpdateEventIntegration",
+            "PATCH",
+            event_integration.get_uri.clone(),
+            Some(updated.clone()),
+        ),
+        (
+            "UpdateDataIntegration",
+            "PATCH",
+            data_integration.get_uri.clone(),
+            Some(updated),
+        ),
+        (
+            "DeleteApplication",
+            "DELETE",
+            application.get_uri.clone(),
+            None,
+        ),
+        (
+            "DeleteEventIntegration",
+            "DELETE",
+            event_integration.get_uri.clone(),
+            None,
+        ),
+        (
+            "DeleteDataIntegration",
+            "DELETE",
+            data_integration.get_uri.clone(),
+            None,
+        ),
+    ];
+
+    for (operation, method, uri, body) in rows {
+        let reply = emulator.send(method, &uri, REGION, body).await;
+        assert_eq!(
+            reply.status, DEFAULT_SUCCESS_STATUS,
+            "case {operation:?}: expected HTTP {DEFAULT_SUCCESS_STATUS}, got {} / {}",
+            reply.status, reply.body
+        );
+    }
 }
