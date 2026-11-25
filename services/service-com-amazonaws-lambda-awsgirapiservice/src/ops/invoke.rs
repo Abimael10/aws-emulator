@@ -533,8 +533,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The model documents the provisioning window on `CreateFunction` ("During this
         // time, you can't invoke or modify the function") and on `StateReasonCode`
         // ("When the code is Creating, you can't invoke or modify the function"), so an
-        // invocation that arrives inside it is refused rather than served.
-        if record.state != crate::state::STATE_ACTIVE {
+        // invocation that RUNS the function for its caller and arrives inside it is refused
+        // rather than served.
+        //
+        // An ASYNCHRONOUS invocation is not one of those. "For asynchronous invocation,
+        // Lambda adds events to a queue before sending them to your function"
+        // (`smithy_query(query="operation",operation="Invoke")`), and what its answer
+        // promises is that queueing alone — "a success response (202 Accepted) indicates
+        // that the request is queued for invocation" — so nothing is run for the caller
+        // here and the window refuses nothing: the event is QUEUED like any other, and the
+        // function is sent it once it is invocable
+        // (`crate::state::FunctionRecord::queue_async_invocation`). Answering the window
+        // with a refusal instead would lose an event to a state the clock was already about
+        // to clear.
+        if invocation_type != INVOCATION_TYPE_EVENT && record.state != crate::state::STATE_ACTIVE
+        {
             return Err(InvokeErrorModeled::ResourceConflictException(
                 ResourceConflictException {
                     r#type: None,

@@ -401,7 +401,16 @@ impl FunctionRecord {
             request_id: request_id.to_string(),
             payload,
             received: iso8601(now),
-            attempt_due: now + ASYNC_DELIVERY_DELAY,
+            // When Lambda sends this event to the function: after the queueing delay, and
+            // never before the function is INVOCABLE. "For asynchronous invocation, Lambda
+            // adds events to a queue before sending them to your function" (`Invoke`), and
+            // the function cannot be invoked while it is still being provisioned ("During
+            // this time, you can't invoke or modify the function", `CreateFunction`) — so an
+            // event accepted inside that window waits on the queue until the instant the
+            // clock already owes the move to `Active` ([`Self::active_due`]) and is sent to
+            // the function then. COMPARED, never arithmetic on a stored instant: both
+            // instants exist already.
+            attempt_due: (now + ASYNC_DELIVERY_DELAY).max(self.active_due),
             attempts: 0,
             // Whether an attempt is coming for this event is [`deliver`]'s to say, which the
             // accepting call asks it right after this: a queued event nothing is delivering

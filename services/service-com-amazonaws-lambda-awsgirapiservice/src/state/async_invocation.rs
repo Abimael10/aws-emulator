@@ -241,7 +241,7 @@ pub fn deliver(
         // The delay the accepting call recorded on the entry, waited for here rather than
         // inside the request that queued the event, so a caller that looks straight after
         // that call still sees the event queued. No store guard is held across it.
-        ::tokio::time::sleep(ASYNC_DELIVERY_DELAY).await;
+        ::tokio::time::sleep(first_attempt_in(&state, &function_name, &request_id)).await;
         // How many attempts RAN the handler, and how many found no capacity to run it at
         // all: the two are bounded by different published rules, so the attempts are counted
         // apart (`super::async_delivery`).
@@ -460,6 +460,29 @@ struct Claimed {
     /// The version label the event was addressed to, which is the qualifier that
     /// configuration belongs to.
     qualifier: String,
+}
+
+/// How long [`deliver`] waits before its FIRST attempt: until the instant the accepting
+/// call recorded on the entry ([`AsyncInvocationRecord::attempt_due`]).
+///
+/// That instant is the queueing delay for an event accepted for a function that was already
+/// invocable, and the instant the function BECOMES invocable for one accepted while it was
+/// still being provisioned ([`FunctionRecord::queue_async_invocation`]) — so this is the one
+/// place the wait is read, and a queued event is never handed to a function the model says
+/// cannot be invoked yet.
+///
+/// Zero once that instant has passed, and for an entry the store no longer holds, which the
+/// attempt's own claim then reports as nothing to deliver to.
+fn first_attempt_in(
+    state: &::engine::ServiceState<ComAmazonawsLambdaAwsgirapiserviceState>,
+    function: &str,
+    request_id: &str,
+) -> Duration {
+    let mut store = state.lock();
+    let due = entry_of(&mut store, function, request_id).map(|entry| entry.attempt_due);
+    drop(store);
+    due.and_then(|due| due.duration_since(SystemTime::now()).ok())
+        .unwrap_or_default()
 }
 
 /// Mark the entry `request_id` names on `function` as having a delivery attempt PENDING, so

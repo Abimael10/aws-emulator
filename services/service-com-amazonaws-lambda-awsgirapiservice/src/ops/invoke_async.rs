@@ -297,23 +297,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 })?;
 
-        // The model documents the provisioning window on `CreateFunction` ("During this
-        // time, you can't invoke or modify the function") and on `StateReasonCode`
-        // ("When the code is Creating, you can't invoke or modify the function"), so an
-        // invocation that arrives inside it is refused rather than queued.
-        if record.state != crate::state::STATE_ACTIVE {
-            return Err(InvokeAsyncErrorModeled::ResourceConflictException(
-                ResourceConflictException {
-                    r#type: None,
-                    message: Some(format!(
-                        "The operation cannot be performed at this time. The function is \
-                         currently in the following state: {}",
-                        record.state
-                    )),
-                },
-            )
-            .into());
-        }
+        // The provisioning window the model documents on `CreateFunction` ("During this
+        // time, you can't invoke or modify the function") refuses the invocations that RUN
+        // the function for their caller, and not the QUEUEING this entry point performs:
+        // "For asynchronous invocation, Lambda adds events to a queue before sending them
+        // to your function" (`Invoke`'s own documentation), and this operation's answer
+        // promises that queueing alone — "a success response (202 Accepted) indicates that
+        // the request is queued for invocation". So an event accepted while the function is
+        // still being provisioned is queued like any other, and the function is sent it
+        // once it is invocable (`crate::state::FunctionRecord::queue_async_invocation`).
 
         // "The payload limit is 256KB. For larger payloads, for up to 1MB, use Invoke."
         // `RequestTooLargeException` is not among this operation's modelled errors, and

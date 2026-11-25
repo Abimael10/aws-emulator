@@ -29,15 +29,20 @@
 //! What is NOT dead-lettered here is as much of the rule: EventBridge invokes a function
 //! target asynchronously ("Event – Invoke the function asynchronously",
 //! `Invoke$InvocationType`), so a function that ACCEPTS the queued event is a delivery
-//! EventBridge made, whatever the run then comes to. The granted-and-invocable row pins that
-//! boundary — its deployment package holds no handler for the run to execute, so the
-//! accepted event comes to nothing, and the target's dead-letter queue still holds nothing:
-//! a failed RUN belongs to Lambda's own asynchronous retry and to the function's
-//! `DestinationConfig.OnFailure` record, not to the queue this target names. That is why no
-//! row here dead-letters a handler that raised: the delivery that reaches the dead-letter
-//! queue is one EventBridge could not HAND OVER, which is what the row below publishing
-//! inside the function's creation transition ("During this time, you can't invoke or modify
-//! the function", `CreateFunction`) exercises.
+//! EventBridge made, whatever the run then comes to. Two rows pin that boundary. The
+//! granted-and-invocable one: its deployment package holds no handler for the run to
+//! execute, so the accepted event comes to nothing and the target's dead-letter queue still
+//! holds nothing — a failed RUN belongs to Lambda's own asynchronous retry and to the
+//! function's `DestinationConfig.OnFailure` record, not to the queue this target names. And
+//! the one handing the event over inside the function's creation transition: "Lambda adds
+//! events to a queue before sending them to your function" (`Invoke`), so that window —
+//! which refuses the invocations that RUN the function for their caller ("During this time,
+//! you can't invoke or modify the function", `CreateFunction`) — refuses no queued event,
+//! and the handover is one EventBridge made even though the function is not invocable yet.
+//! That is why no row here dead-letters a handler that raised: the delivery that reaches the
+//! dead-letter queue is one EventBridge could not HAND OVER, which is what the row whose
+//! function's own configuration requires of every invocation a member EventBridge's carries
+//! none of exercises.
 //!
 //! `core/router/tests/all/events_lambda_target_resource_policy.rs` is the suite for WHICH
 //! policies admit the invocation; this one is the suite for what the dead-lettered message
@@ -83,10 +88,20 @@ const NO_PERMISSIONS: &str = "NO_PERMISSIONS";
 /// `ERROR_MESSAGE` beside it carries. Spelled here for the same reason.
 const UNKNOWN: &str = "UNKNOWN";
 
-/// The error AWS Lambda answers an invocation of a function that is not invocable yet, which
-/// is the sentence such a delivery's `ERROR_MESSAGE` carries — its wire code is in that
-/// message too, where the whole of the service's answer is reported.
-const RESOURCE_CONFLICT: &str = "ResourceConflictException";
+/// The error AWS Lambda answers an invocation that carries nothing for a member the
+/// function's own configuration requires, and the sentence beside it: what such a delivery's
+/// `ERROR_MESSAGE` reports, wire code included, where the whole of the service's answer is
+/// carried. Spelled here rather than imported from the service, as the conditions above are.
+const INVALID_PARAMETER: &str = "InvalidParameterValueException";
+/// See [`INVALID_PARAMETER`].
+const ABSENT_TENANT_ID: &str =
+    "TenantId is required if the function is configured for tenant isolation";
+
+/// The `TenantIsolationMode` that dedicates an execution environment to one tenant, and so
+/// makes every invocation of the function name the tenant it is for
+/// (`smithy_query(query="shape",shape="TenantIsolationMode")`). EventBridge's handover names
+/// no tenant, so a target whose function carries this is one the function refuses.
+const PER_TENANT: &str = "PER_TENANT";
 
 /// A well-formed execution role ARN for the created functions.
 const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
@@ -285,9 +300,10 @@ enum Failure {
     /// reached the function's API: a function carrying no resource-based policy, and one
     /// that is not there at all, are the same absence.
     NoPolicyAdmitsIt,
-    /// The function's own service refused the invocation, because the function is still
-    /// inside the creation transition in which "you can't invoke or modify the function"
-    /// (`CreateFunction`).
+    /// The function's own service refused the invocation: the function is configured for
+    /// tenant isolation, so Lambda requires every invocation of it to name the tenant it is
+    /// for, and the one EventBridge makes names none — so the event is refused rather than
+    /// queued.
     TheFunctionRefusedIt,
 }
 
@@ -315,10 +331,7 @@ impl Failure {
                  resource: {arn} because no resource-based policy allows the \
                  {INVOKE_ACTION} action"
             ),
-            Self::TheFunctionRefusedIt => format!(
-                "{RESOURCE_CONFLICT}: The operation cannot be performed at this time. The \
-                 function is currently in the following state: Pending"
-            ),
+            Self::TheFunctionRefusedIt => format!("{INVALID_PARAMETER}: {ABSENT_TENANT_ID}"),
         }
     }
 }
@@ -337,6 +350,9 @@ struct Row {
     /// Whether the event is published past the function's creation transition, so the
     /// function is invocable when the handover is made.
     past_the_transition: bool,
+    /// Whether the function is configured for tenant isolation, which makes Lambda refuse an
+    /// invocation that names no tenant — and the handover EventBridge makes names none.
+    tenant_isolated: bool,
     /// Whether the target names a dead-letter queue at all.
     dead_letter_config: bool,
     /// What the dead-letter queue must hold: nothing, or the one message this describes.
@@ -351,6 +367,7 @@ fn rows() -> Vec<Row> {
             granted: false,
             delete_function: false,
             past_the_transition: true,
+            tenant_isolated: false,
             dead_letter_config: true,
             expected: Some(Expected {
                 delivered: Delivered::Envelope,
@@ -363,6 +380,7 @@ fn rows() -> Vec<Row> {
             granted: false,
             delete_function: false,
             past_the_transition: true,
+            tenant_isolated: false,
             dead_letter_config: true,
             expected: Some(Expected {
                 delivered: Delivered::Document(json!({ "fixed": "text" })),
@@ -375,6 +393,7 @@ fn rows() -> Vec<Row> {
             granted: false,
             delete_function: false,
             past_the_transition: true,
+            tenant_isolated: false,
             dead_letter_config: true,
             expected: Some(Expected {
                 delivered: Delivered::Document(json!("A-1")),
@@ -392,6 +411,7 @@ fn rows() -> Vec<Row> {
             granted: false,
             delete_function: false,
             past_the_transition: true,
+            tenant_isolated: false,
             dead_letter_config: true,
             expected: Some(Expected {
                 delivered: Delivered::Document(json!({ "n": 7 })),
@@ -404,6 +424,7 @@ fn rows() -> Vec<Row> {
             granted: true,
             delete_function: true,
             past_the_transition: true,
+            tenant_isolated: false,
             dead_letter_config: true,
             expected: Some(Expected {
                 delivered: Delivered::Envelope,
@@ -411,20 +432,37 @@ fn rows() -> Vec<Row> {
             }),
         },
         Row {
-            // The grant is in force here, so what stops the handover is the FUNCTION, and
-            // the dead letter reports the code that service answered rather than a
-            // permission condition.
-            case: "a target whose granted function is not invocable yet dead-letters under \
-                   the code that function answered",
+            // The grant is in force here, so what stops the handover is the FUNCTION: its
+            // own configuration requires every invocation of it to name the tenant it is
+            // for, and the one EventBridge makes names none. The dead letter reports the
+            // code that service answered rather than a permission condition.
+            case: "a target whose granted function refuses the invocation dead-letters \
+                   under the code that function answered",
             input: json!({}),
             granted: true,
             delete_function: false,
-            past_the_transition: false,
+            past_the_transition: true,
+            tenant_isolated: true,
             dead_letter_config: true,
             expected: Some(Expected {
                 delivered: Delivered::Envelope,
                 failure: Failure::TheFunctionRefusedIt,
             }),
+        },
+        Row {
+            // The handover is made INSIDE the function's creation transition. An
+            // asynchronous invocation is queued rather than run for its caller, so that
+            // window refuses nothing and the handover is one EventBridge made: the
+            // dead-letter queue stays empty even though the function is not invocable yet.
+            case: "a target whose granted function is not invocable yet dead-letters \
+                   nothing, because the queued event was accepted",
+            input: json!({}),
+            granted: true,
+            delete_function: false,
+            past_the_transition: false,
+            tenant_isolated: false,
+            dead_letter_config: true,
+            expected: None,
         },
         Row {
             case: "a target whose policy admits the invocation dead-letters nothing, even \
@@ -433,6 +471,7 @@ fn rows() -> Vec<Row> {
             granted: true,
             delete_function: false,
             past_the_transition: true,
+            tenant_isolated: false,
             dead_letter_config: true,
             expected: None,
         },
@@ -442,6 +481,7 @@ fn rows() -> Vec<Row> {
             granted: false,
             delete_function: false,
             past_the_transition: true,
+            tenant_isolated: false,
             dead_letter_config: false,
             expected: None,
         },
@@ -467,19 +507,22 @@ async fn an_undeliverable_function_target_dead_letters_what_it_would_have_receiv
             .unwrap_or_default()
             .to_string();
 
-        let (status, function) = lambda(
-            &router,
-            "POST",
-            "/2015-03-31/functions",
-            json!({
-                "FunctionName": function_name,
-                "Role": ROLE,
-                "Runtime": "python3.12",
-                "Handler": "index.handler",
-                "Code": { "ZipFile": ZIP_FILE },
-            }),
-        )
-        .await;
+        // The function every row wires as its target. A row whose refusal is the FUNCTION's
+        // own carries the configuration that refuses it: tenant isolation makes Lambda
+        // require every invocation to name the tenant it is for, and EventBridge's handover
+        // names none.
+        let mut create = json!({
+            "FunctionName": function_name,
+            "Role": ROLE,
+            "Runtime": "python3.12",
+            "Handler": "index.handler",
+            "Code": { "ZipFile": ZIP_FILE },
+        });
+        if row.tenant_isolated {
+            create["TenancyConfig"] = json!({ "TenantIsolationMode": PER_TENANT });
+        }
+        let (status, function) =
+            lambda(&router, "POST", "/2015-03-31/functions", create).await;
         assert_eq!(
             status, 201,
             "case {case:?}: expected HTTP 201 from Lambda CreateFunction, got {status} \

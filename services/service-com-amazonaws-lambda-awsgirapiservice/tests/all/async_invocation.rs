@@ -459,12 +459,15 @@ struct Refusal {
 
 /// The refusal table: a request naming no function, naming a version the function does
 /// not have, carrying a body that is not "the JSON that you want to provide to your
-/// Lambda function as input", carrying one byte past the published payload ceiling, and
-/// arriving while the function is still being provisioned.
+/// Lambda function as input", and carrying one byte past the published payload ceiling.
 ///
 /// A body whose FIRST value is complete is not among them: it carries JSON, so it is
 /// accepted and what follows that value is the runtime's to judge
-/// (`crate::python_runtime_invocation_envelope`).
+/// (`crate::python_runtime_invocation_envelope`). Neither is an event submitted while the
+/// function is still being PROVISIONED: this entry point queues the event rather than
+/// running the function for its caller — "Lambda adds events to a queue before sending them
+/// to your function" — so it is accepted and delivered once the function is invocable
+/// (`crate::invocation_inside_provisioning_window`).
 fn refusal_cases() -> Vec<Refusal> {
     vec![
         Refusal {
@@ -509,13 +512,6 @@ fn refusal_cases() -> Vec<Refusal> {
             status: 402,
             code: "ServiceQuotaExceededException",
         },
-        Refusal {
-            case: "a function that is still being provisioned",
-            reference: "provisioning".to_string(),
-            event: b"{}".to_vec(),
-            status: 409,
-            code: "ResourceConflictException",
-        },
     ]
 }
 
@@ -524,9 +520,6 @@ async fn invoke_async_refuses_what_it_cannot_accept_and_queues_nothing() {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = router_on(&engine);
     create_active_function(&router, &engine, "queued", true).await;
-    // Created last and left alone, so it is still inside the provisioning window the
-    // model documents: "During this time, you can't invoke or modify the function."
-    create_function(&router, "provisioning", false).await;
 
     for case in refusal_cases() {
         let answer = invoke_async(&router, &case.reference, case.event.clone()).await;
@@ -545,15 +538,12 @@ async fn invoke_async_refuses_what_it_cannot_accept_and_queues_nothing() {
             case.code,
             answer.error_code()
         );
-        for name in ["queued", "provisioning"] {
-            assert!(
-                queued(&engine, name).is_empty(),
-                "case {}: expected a refused invocation to queue nothing for {name}, got {} \
-                 queued",
-                case.case,
-                queued(&engine, name).len()
-            );
-        }
+        assert!(
+            queued(&engine, "queued").is_empty(),
+            "case {}: expected a refused invocation to queue nothing, got {} queued",
+            case.case,
+            queued(&engine, "queued").len()
+        );
     }
 }
 
