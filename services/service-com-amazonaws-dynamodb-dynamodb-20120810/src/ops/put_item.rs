@@ -416,14 +416,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for (attribute, value) in &input.item {
             crate::state::check_attribute_value(attribute, value).map_err(lift)?;
         }
-        // A value the condition compares against is held to the same limits, for the
-        // same reason: both terms bound the work this request can ask for. All THREE
-        // places one request carries a value are bounded here — the item, the values an
-        // expression binds, and the values the legacy `Expected` map compares against —
-        // so none of them reaches the walk that reads it unbounded.
+        // A value the condition compares against is held to the same limits EXCEPT the
+        // item ceiling, for the same reason: both terms bound the work this request can
+        // ask for. All THREE places one request carries a value are bounded here — the
+        // item, the values an expression binds, and the values the legacy `Expected` map
+        // compares against — so none of them reaches the walk that reads it unbounded. A
+        // value this request only COMPARES never becomes item bytes, so what bounds it is
+        // not the item ceiling ([`crate::state::check_substituted_value`]) but the
+        // substitution table's own total cap.
         for (placeholder, value) in input.expression_attribute_values.iter().flatten() {
-            crate::state::check_attribute_value(placeholder, value).map_err(lift)?;
+            crate::state::check_substituted_value(placeholder, value).map_err(lift)?;
         }
+        crate::state::check_substitution_total(input.expression_attribute_values.as_ref())
+            .map_err(lift)?;
         crate::state::check_expected_condition_values(input.expected.as_ref()).map_err(lift)?;
         // Every token the request DEFINES must be one an expression uses: an unused
         // entry of either substitution table makes the whole request invalid. It is asked

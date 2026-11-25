@@ -108,6 +108,27 @@ pub fn page_budget_spent(page_bytes: i64) -> bool {
     page_bytes > MAX_PAGE_BYTES
 }
 
+/// The most the values ONE request binds to its substitution tokens may add up to, 2 MB.
+///
+/// MEASURED behaviour rather than a modelled or published figure: the Smithy model
+/// constrains neither `ExpressionAttributeValues` nor the values it carries, and the
+/// Developer Guide's quotas state no total for that member — the recorded refusal
+/// boundary is what pins it, a request whose bound values total under two binary
+/// megabytes being evaluated and applied while one past it is refused.
+///
+/// It is a cap on the SUBSTITUTION TABLE and not on the item: bound values are compared,
+/// subtracted or stored depending on the expression that dereferences them, and only the
+/// ones a change STORES reach the item ceiling ([`MAX_ITEM_SIZE_BYTES`]).
+pub const MAX_EXPRESSION_ATTRIBUTE_VALUES_BYTES: i64 = 2 * 1024 * 1024;
+
+/// How a request whose `ExpressionAttributeValues` carry more than
+/// [`MAX_EXPRESSION_ATTRIBUTE_VALUES_BYTES`] in total is refused: AWS's fixed clause for
+/// that cap, which names the member and nothing of the total the request came to, inside
+/// the same validation envelope every other clause about a member of the request is
+/// stated in.
+pub const EXPRESSION_ATTRIBUTE_VALUES_TOO_LARGE_MESSAGE: &str =
+    "ExpressionAttributeValues exceeds max size";
+
 /// How a write of an item past [`MAX_ITEM_SIZE_BYTES`] is refused: AWS's FIXED
 /// sentence for that quota ("Item size has exceeded the maximum allowed size" —
 /// the Developer Guide's "Error handling" entry for `ValidationException`), with
@@ -4334,7 +4355,14 @@ fn duplicate_set_member(collection: String) -> RequestError {
     ))
 }
 
-/// The collection as the `SS` message echoes it: quoted members, `, `-separated.
+/// The collection as the `SS` message echoes it: quoted members, `, `-separated, in the
+/// order the request listed them.
+///
+/// The binary wording names the members in the order a BINARY set orders them rather than
+/// in the request's ([`binary_members_up_to_the_duplicate`]); a string set is echoed as it
+/// arrived, because that is what every recorded `SS` collection shows and none of them
+/// lists a repeat behind an out-of-order member, which is the only shape that would tell
+/// the two apart.
 fn echoed_strings(values: &[String]) -> String {
     format!(
         "[{}] ",
@@ -4343,6 +4371,29 @@ fn echoed_strings(values: &[String]) -> String {
             ", "
         )
     )
+}
+
+/// The members a duplicate-member refusal NAMES for a BINARY set, or `None` where the
+/// set lists every member once.
+///
+/// What the message reports is the collection DynamoDB had COLLECTED when it read the
+/// duplicate: the distinct members before it, in the order a binary set orders its
+/// members — ascending unsigned byte value, which is how DynamoDB compares binary
+/// ("For Binary, DynamoDB treats each byte of the binary data as unsigned" — the
+/// `AttributeValueList` doc) — and then the member that duplicated one of them. So the
+/// collection named is not the request's own listing order, and the duplicate is the
+/// one member that appears twice in it.
+fn binary_members_up_to_the_duplicate(members: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
+    let mut collected: BTreeSet<&[u8]> = BTreeSet::new();
+    for member in members {
+        if collected.insert(member.as_slice()) {
+            continue;
+        }
+        let mut named: Vec<Vec<u8>> = collected.iter().map(|member| member.to_vec()).collect();
+        named.push(member.clone());
+        return Some(named);
+    }
+    None
 }
 
 /// The collection as the `BS` message echoes it: base64 members, `,`-separated, and the
@@ -4418,8 +4469,8 @@ pub(crate) fn check_collection_rules(value: &AttributeValue) -> Result<(), Reque
             }
             AttributeValue::Bs(members) => {
                 check_set_not_empty(SetType::Binary, members.len())?;
-                if has_duplicate(members) {
-                    return Err(duplicate_set_member(echoed_blobs(members)));
+                if let Some(named) = binary_members_up_to_the_duplicate(members) {
+                    return Err(duplicate_set_member(echoed_blobs(&named)));
                 }
             }
             AttributeValue::L(members) => pending.extend(members.iter()),
@@ -4508,8 +4559,8 @@ pub(crate) fn canonicalize_attribute_value(
             }
             AttributeValue::Bs(members) => {
                 check_set_not_empty(SetType::Binary, members.len())?;
-                if has_duplicate(members) {
-                    return Err(duplicate_set_member(echoed_blobs(members)));
+                if let Some(named) = binary_members_up_to_the_duplicate(members) {
+                    return Err(duplicate_set_member(echoed_blobs(&named)));
                 }
             }
             AttributeValue::L(members) => pending.extend(members.iter_mut()),

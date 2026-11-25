@@ -904,7 +904,11 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                         // the statement spells is one the update path does not admit, so the
                         // request is refused on its own terms and none of the transaction is
                         // applied.
-                        if crate::state::update_size_exceeded(table, &item, 0) {
+                        if crate::state::update_size_exceeded(
+                            table,
+                            &item,
+                            crate::state::UpdateRequestShape::StatedWithoutAnExpression,
+                        ) {
                             return Err(crate::scaffolded::Scaffolded::validation(
                                 crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
                             ));

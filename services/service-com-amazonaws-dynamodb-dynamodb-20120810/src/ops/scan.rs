@@ -465,10 +465,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(lift)?;
         // A value a filter compares against is held to the documented rules for its
         // type, exactly as a value a write stores is: the rules belong to the value,
-        // not to the surface it arrived through.
+        // not to the surface it arrived through. A value a READ only compares becomes no
+        // item bytes at all, so the item ceiling is no bound on it
+        // ([`crate::state::check_bare_substituted_value`]); the substitution table's own
+        // total cap is.
         for (placeholder, value) in input.expression_attribute_values.iter().flatten() {
-            crate::state::check_bare_attribute_value(placeholder, value).map_err(lift)?;
+            crate::state::check_bare_substituted_value(placeholder, value).map_err(lift)?;
         }
+        crate::state::check_substitution_total(input.expression_attribute_values.as_ref())
+            .map_err(crate::state::unenveloped)
+            .map_err(lift)?;
         // Which member names the index is a fact of the request, so what each reported
         // item carries is decided here too: the defaults differ between a table scan
         // and an index scan ([`resolve_selection`]).

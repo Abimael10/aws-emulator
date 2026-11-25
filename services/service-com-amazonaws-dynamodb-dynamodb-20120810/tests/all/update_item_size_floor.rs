@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The item-size ceiling an UPDATE is held to, whose KEY PORTION is charged at a floor.
+//! The item-size ceiling an UPDATE is held to, whose KEY PORTION is charged at a floor where
+//! the change is stated as an expression.
 //!
 //! The rule under test: a change is refused when what the item it would leave behind is
 //! CHARGED crosses the documented 400 KB item ceiling, and what is charged is the bytes the
-//! item stores — its attribute names and values, the key attributes among them — with the
-//! primary-key portion charged at a minimum of `state::KEY_PORTION_FLOOR_BYTES` whatever it
-//! actually holds. So the largest change an item accepts is the ceiling less what the rest of
-//! the item already holds and less the part of that floor its key does not fill; one byte more
-//! is refused. A refused change leaves the stored item where it was, and the refusal states
-//! the sentence the update path words that quota with.
+//! item stores — its attribute names and values, the key attributes among them — plus what the
+//! SHAPE of the request stating the change costs: a change stated as an `UpdateExpression` is
+//! charged its primary-key portion at a minimum of `state::KEY_PORTION_FLOOR_BYTES` whatever
+//! it actually holds, while a change stated without an expression — a PartiQL `UPDATE` — is
+//! charged the item alone. So the largest change an item accepts is the ceiling less what the
+//! rest of the item already holds and less the part of that floor its key does not fill; one
+//! byte more is refused. A refused change leaves the stored item where it was, and the refusal
+//! states the sentence the update path words that quota with.
 //!
 //! The rows span what the rule generalises over: key portions of four different sizes (a
 //! one-byte name with a one-byte value, a longer short key, one landing exactly on the floor
@@ -32,8 +35,8 @@ use crate::table_items::create_active_table;
 /// The documented item ceiling, 400 KB.
 const MAX_ITEM_BYTES: usize = 400 * 1024;
 
-/// The least an item's primary-key portion is charged against that ceiling on the update
-/// path, as the service states it (`state::KEY_PORTION_FLOOR_BYTES`).
+/// The least an item's primary-key portion is charged against that ceiling when the change is
+/// stated as an expression, as the service states it (`state::KEY_PORTION_FLOOR_BYTES`).
 const KEY_PORTION_FLOOR: usize = 22;
 
 /// AWS's fixed sentence for a change that would grow the stored item past the ceiling.
@@ -94,6 +97,13 @@ impl Surface {
             Surface::BatchExecuteStatement => "b",
             Surface::ExecuteTransaction => "x",
         }
+    }
+
+    /// Whether a change stated on this surface is charged the key-portion floor: the two
+    /// surfaces that state their change as an `UpdateExpression` are, and the PartiQL ones,
+    /// which state no expression at all, are charged the item alone.
+    fn charges_the_key_floor(self) -> bool {
+        matches!(self, Surface::UpdateItem | Surface::TransactWriteItems)
     }
 
     /// The request that writes an operand of `operand` single-byte characters into `key`'s
@@ -262,9 +272,14 @@ async fn an_update_tops_out_at_the_floor_bound_item_ceiling() {
             // The key portion of THIS item: the surface's suffix makes its value one byte
             // longer than the shape's own.
             let key_bytes = shape.key_bytes() + surface.suffix().len();
-            // The key portion is charged at its floor while it holds less than that, so the
-            // headroom the written attribute has is the ceiling less what the key is CHARGED.
-            let key_charge = key_bytes.max(KEY_PORTION_FLOOR);
+            // The key portion is charged at its floor where the change is stated as an
+            // expression and it holds less than that, so the headroom the written attribute
+            // has is the ceiling less what the key is CHARGED on this surface.
+            let key_charge = if surface.charges_the_key_floor() {
+                key_bytes.max(KEY_PORTION_FLOOR)
+            } else {
+                key_bytes
+            };
             let largest = MAX_ITEM_BYTES - key_charge - WRITTEN.len();
             let case = format!("{} on {}", surface.operation(), shape.case);
 

@@ -919,23 +919,27 @@ fn check_element_shape(
     // same limits a stored value is: the documented nesting depth and this emulator's
     // ceiling on a collection's members. The values are this ELEMENT's members, so what
     // they are refused for is stated on its own, like every other refusal about one
-    // element's own members ([`crate::state::unenveloped`]) — and for an `Update` the
-    // documented item ceiling is worded as the UPDATE path words it, because a value it
-    // substitutes is one this change would leave in the stored item
-    // ([`crate::state::stated_for_an_update`]).
-    let updates = matches!(action, Requested::Update(_));
+    // element's own members ([`crate::state::unenveloped`]).
+    //
+    // BINDING a value stores nothing, so the documented item ceiling is not one of those
+    // limits here ([`crate::state::check_substituted_value`]): a value only compared, or
+    // one an action subtracts rather than stores, never becomes item bytes. The ceiling is
+    // stated over the values an `Update` would STORE, where its expression is parsed below,
+    // and over the item each action leaves behind. What bounds the element's substitution
+    // table as a whole is its own total cap.
     for (placeholder, value) in action.expression_attribute_values().into_iter().flatten() {
-        crate::state::check_attribute_value(placeholder, value)
-            .map_err(|error| {
-                if updates {
-                    crate::state::stated_for_an_update(error)
-                } else {
-                    error
-                }
-            })
+        crate::state::check_substituted_value(placeholder, value)
             .map_err(crate::state::unenveloped)
             .map_err(lift)?;
     }
+    // The cap on the MEMBER's total, which in a transaction is this element's own; what
+    // bounds the whole CALL is the documented 4 MB aggregate over every element's data, the
+    // values its expressions substitute among them
+    // ([`crate::state::MAX_TRANSACTION_SIZE_BYTES`], asked of the request once each element
+    // has been read).
+    crate::state::check_substitution_total(action.expression_attribute_values())
+        .map_err(crate::state::unenveloped)
+        .map_err(lift)?;
     // "For ReturnValuesOnConditionCheckFailure, the valid values are: NONE and ALL_OLD."
     if !matches!(
         action.return_values_on_condition_check_failure(),
@@ -1693,7 +1697,7 @@ fn resolve_element(
             // what its key portion is charged, plus the entry a local secondary index of
             // the table holds for it ([`crate::state::update_size_exceeded`]) plus the
             // frame each clause of the update costs
-            // ([`crate::state::ParsedUpdate::request_shape_charge`]).
+            // ([`crate::state::ParsedUpdate::request_shape`]).
             //
             // WHO answers for a crossing of that CHARGED ceiling follows whether the item
             // this change LEAVES is past the quota in its OWN bytes
@@ -1704,7 +1708,7 @@ fn resolve_element(
             // expression is refused. The item a `Put` CARRIES is the request's own and is
             // refused before any of the transaction is applied, worded for an item that was
             // carried.
-            if crate::state::update_size_exceeded(table, &item, applied.request_shape_charge()) {
+            if crate::state::update_size_exceeded(table, &item, applied.request_shape()) {
                 return Err(crossed_the_item_quota(table, &item));
             }
             table

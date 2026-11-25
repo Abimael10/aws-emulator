@@ -4,22 +4,23 @@
 //! condition can carry.
 //!
 //! THE RULE: a `KeyConditionExpression` defect that the REQUEST alone settles — the
-//! expression's syntax, a substitution token the expression uses but the request never
-//! defined, and an operand of a type the operator or function it was written with does not
-//! compare — is refused before the addressed table is resolved, so it is answered even for a
-//! table this account does not hold. Every other key-condition rule is about how the
-//! condition BINDS to the key attributes of the schema it is read against — how many
-//! comparisons that schema has key attributes for, which attributes they name, and the type
-//! that schema declares for each key — so it is only reached once the table has been found,
-//! and a `Query` naming an absent table is refused `ResourceNotFoundException` ("the
-//! operation tried to access a nonexistent table or index") however many clauses it states.
+//! expression's syntax, and a substitution token the expression uses but the request never
+//! defined — is refused before the addressed table is resolved, so it is answered even for a
+//! table this account does not hold. Every other key-condition rule is about the CONDITION
+//! itself — the types its operands can be compared with at all, and how it BINDS to the key
+//! attributes of the schema it is read against: how many comparisons that schema has key
+//! attributes for, which attributes they name, and the type that schema declares for each key
+//! — so each is only reached once the table has been found, and a `Query` naming an absent
+//! table is refused `ResourceNotFoundException` ("the operation tried to access a nonexistent
+//! table or index") however many clauses it states and however its operands are typed.
 //!
 //! The rows span what the rule generalises over: which KIND of defect the condition carries
 //! (syntax, an undefined value placeholder, an undefined name alias, an operand of a type no
-//! comparison orders, an operand of a type `begins_with` has no prefix for, more clauses than
-//! the schema has key attributes, and the combinations of a request-settled defect with a
-//! binding defect), whether the table is absent or present, and whether the read is a `Query`
-//! on the table itself or on one of its secondary indexes.
+//! comparison orders, an operand of a type `begins_with` has no prefix for, an equality
+//! operand of a type no schema declares, more clauses than the schema has key attributes, and
+//! the combinations of a request-settled defect with a condition one), whether the table is
+//! absent or present, and whether the read is a `Query` on the table itself or on one of its
+//! secondary indexes.
 //!
 //! The same rows against a table that IS there pin the other half: every row earns its own
 //! refusal, so the lookup only orders them.
@@ -140,7 +141,7 @@ fn rows() -> Vec<Row> {
             case: "a number where begins_with needs a prefix",
             condition: "pk = :p AND begins_with(sk, :n)",
             values: json!({":p": {"S": "p"}, ":n": {"N": "1"}}),
-            before_the_lookup: Some(incorrect_operand("begins_with", "N")),
+            before_the_lookup: None,
             against_the_table: incorrect_operand("begins_with", "N"),
         },
         Row {
@@ -153,19 +154,25 @@ fn rows() -> Vec<Row> {
                 .to_string(),
         },
         Row {
-            // The recorded case: a wrong-typed operand, which the request settles, beside a
-            // third clause, which only the schema can settle — so the operand answers first.
+            // The recorded case: an equality operand of a type no key schema declares,
+            // beside a clause only the schema can settle, with every placeholder defined —
+            // so the absent table answers and the operand is reported only where there is a
+            // schema to hold it to.
             case: "a wrong-typed operand and a third clause together",
-            condition: "pk = :p AND begins_with(sk, :n) AND pk3 = :o",
-            values: json!({":p": {"S": "p"}, ":n": {"N": "1"}, ":o": {"S": "o"}}),
-            before_the_lookup: Some(incorrect_operand("begins_with", "N")),
-            against_the_table: incorrect_operand("begins_with", "N"),
+            condition: "pk = :l AND sk = :s AND extra = :e",
+            values: json!({
+                ":l": {"L": [{"S": "x"}]},
+                ":s": {"S": "a"},
+                ":e": {"S": "e"},
+            }),
+            before_the_lookup: None,
+            against_the_table: incorrect_operand("=", "L"),
         },
         Row {
             case: "an operand written before its operator, of a type no comparison orders",
             condition: ":p >= pk",
             values: json!({":p": {"NULL": true}}),
-            before_the_lookup: Some(incorrect_operand(">=", "NULL")),
+            before_the_lookup: None,
             against_the_table: incorrect_operand(">=", "NULL"),
         },
     ]
@@ -248,7 +255,7 @@ async fn the_same_conditions_are_still_refused_once_the_table_is_there() {
 
 /// RULE: the same ordering holds for a read addressed to a secondary INDEX of an absent
 /// table — a defect the request settles is answered whichever schema the read names, while a
-/// BINDING defect cannot be reported for a schema that does not exist.
+/// defect of the CONDITION cannot be reported for a schema that does not exist.
 #[tokio::test]
 async fn an_absent_table_answers_before_an_index_key_schema_binds() {
     let router = emulator();
@@ -256,13 +263,23 @@ async fn an_absent_table_answers_before_an_index_key_schema_binds() {
     // the request-settled defect, or the table's own refusal.
     for (case, condition, values, expected) in [
         (
-            // An operand a comparison cannot ORDER is the request's own defect; an
-            // equality operand is held to the schema's type instead, so that one needs
-            // the schema ([`Operator::compares`]'s two rules).
+            // A token nothing defines is the request's own defect, so it is answered
+            // whichever schema the read names.
+            "an undefined token on an index read",
+            "gpk >= :undef",
+            json!({}),
+            (
+                "ValidationException",
+                "Invalid KeyConditionExpression: An expression attribute value used in \
+                 expression is not defined; attribute value: :undef"
+                    .to_string(),
+            ),
+        ),
+        (
             "an operand no comparison orders on an index read",
             "gpk >= :p",
             json!({":p": {"BOOL": false}}),
-            ("ValidationException", incorrect_operand(">=", "BOOL")),
+            ("ResourceNotFoundException", NOT_FOUND.to_string()),
         ),
         (
             "an equality operand of another type on an index read",

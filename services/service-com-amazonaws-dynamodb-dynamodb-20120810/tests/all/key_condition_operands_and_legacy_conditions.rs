@@ -343,7 +343,12 @@ async fn the_defect_a_key_condition_states_first_is_the_one_answered() {
 
     let undefined = "Invalid KeyConditionExpression: An expression attribute value used in \
                      expression is not defined; attribute value: :undef";
-    // Each row: a condition carrying TWO defects, and the one its text states first.
+    // Each row: a condition carrying TWO defects, and the one answered. A token the request
+    // never defined is a defect of the REQUEST — the expression cannot be read as a condition
+    // without it — so it is answered wherever the expression writes it, and it wins over an
+    // operand whose type its comparison cannot take, which is a defect of the CONDITION read
+    // where the condition binds to the key schema. A SYNTAX error is the request's too, and
+    // the parse stops at it.
     let cases: Vec<(&str, &str, Value, String)> = vec![
         (
             "the undefined value is written first",
@@ -355,15 +360,13 @@ async fn the_defect_a_key_condition_states_first_is_the_one_answered() {
             "the bad operand is written first",
             "begins_with(sk, :n) AND pk = :undef",
             json!({":n": {"N": "1"}}),
-            // Both defects are read off the OPERANDS, in the order the expression wrote
-            // them, so the one written first is the one answered whichever kind it is.
-            incorrect_operand("begins_with", "N"),
+            undefined.to_string(),
         ),
         (
             "the bad operand is written first, in a BETWEEN",
             "sk BETWEEN :n AND :undef",
             json!({":n": {"BOOL": true}}),
-            incorrect_operand("BETWEEN", "BOOL"),
+            undefined.to_string(),
         ),
         (
             "the undefined value is written first, in a BETWEEN",
@@ -375,7 +378,16 @@ async fn the_defect_a_key_condition_states_first_is_the_one_answered() {
             "the bad operand is written first, operand-first in its own comparison",
             ":n < sk AND pk = :undef",
             json!({":n": {"NULL": true}}),
-            incorrect_operand("<", "NULL"),
+            undefined.to_string(),
+        ),
+        (
+            // With every token DEFINED, the operand is the only defect left and it is the
+            // one answered — so the rows above are the undefined token winning and not the
+            // operand rule going unstated.
+            "the bad operand with every token defined",
+            "begins_with(sk, :n) AND pk = :p",
+            json!({":n": {"N": "1"}, ":p": {"S": "p"}}),
+            incorrect_operand("begins_with", "N"),
         ),
         (
             "a stray operator between the two operands",

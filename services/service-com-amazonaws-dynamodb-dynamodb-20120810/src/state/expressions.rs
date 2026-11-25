@@ -1841,6 +1841,20 @@ fn incorrect_update_operand_type() -> RequestError {
 /// refusals name the operator the expression wrote.
 const UPDATE_EXPRESSION_MEMBER: &str = "UpdateExpression";
 
+/// The member an update written as the LEGACY per-attribute map travels in.
+pub const ATTRIBUTE_UPDATES_MEMBER: &str = "AttributeUpdates";
+
+/// Whether an update stated through `member` is one whose `ADD` CONCATENATES a list
+/// operand onto the list the attribute holds.
+///
+/// Only the legacy per-attribute map does: its `ADD` is defined over "the data type of
+/// the attribute" (`AttributeValueUpdate$Action`) and recorded behaviour includes a list
+/// there, while the expression member states a closed operand domain of its own — "The
+/// ADD action only supports Number and set data types" (`UpdateItem$UpdateExpression`).
+fn appends_lists(member: &str) -> bool {
+    member == ATTRIBUTE_UPDATES_MEMBER
+}
+
 /// The data type an operand-type refusal names, in the vocabulary that family of
 /// messages spells types with: the `AttributeValue` member's own documented type name —
 /// "An attribute of type String Set" (`AttributeValue$SS`) is `STRING_SET` — rather than
@@ -2165,6 +2179,54 @@ fn check_value_within_the_item_limits(
 /// ([`check_attribute_value`]).
 pub fn check_bare_attribute_value(name: &str, value: &AttributeValue) -> Result<(), RequestError> {
     check_attribute_value(name, value).map_err(without_envelope)
+}
+
+/// The limits a value a request BINDS to a substitution token is held to: every rule
+/// [`check_attribute_value`] states EXCEPT the documented item ceiling.
+///
+/// Binding a value stores nothing. A `ConditionExpression` operand is only COMPARED
+/// against the stored item, an operand a `DELETE` names takes members away rather than
+/// adding any, and an action that resolves to a no-op writes no byte at all — so a bound
+/// value is not item bytes and the item ceiling is not a bound on it. Whether a bound
+/// value fits an item is decided where the item that would hold it is sized: over the
+/// values an update would STORE ([`ParsedUpdate::from_actions`]) and over the item the
+/// change leaves behind ([`update_size_exceeded`]). What bounds the table as a WHOLE is
+/// its own cap ([`check_substitution_total`]).
+pub fn check_substituted_value(name: &str, value: &AttributeValue) -> Result<(), RequestError> {
+    check_value_within_the_item_limits(name, value)
+}
+
+/// The same limits for a value an expression of a READ binds, stated as its own sentence
+/// ([`check_bare_attribute_value`] is where that split is explained).
+pub fn check_bare_substituted_value(
+    name: &str,
+    value: &AttributeValue,
+) -> Result<(), RequestError> {
+    check_substituted_value(name, value).map_err(without_envelope)
+}
+
+/// Hold one request's `ExpressionAttributeValues` to the cap on what the member may
+/// carry in TOTAL ([`MAX_EXPRESSION_ATTRIBUTE_VALUES_BYTES`]).
+///
+/// The cap is on the SUM over the table's entries, so it bounds a request that spreads
+/// its bytes over many tokens exactly as it bounds one that puts them all in a single
+/// value — which is what makes it the bound on the substitution work one request can ask
+/// for, whichever expressions dereference the tokens.
+pub fn check_substitution_total(
+    values: Option<&HashMap<String, AttributeValue>>,
+) -> Result<(), RequestError> {
+    let total = sum_of(
+        values
+            .into_iter()
+            .flatten()
+            .map(|(_token, value)| attribute_value_size(value)),
+    );
+    if total > MAX_EXPRESSION_ATTRIBUTE_VALUES_BYTES {
+        return Err(refused(
+            EXPRESSION_ATTRIBUTE_VALUES_TOO_LARGE_MESSAGE.to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// The same limits for a value a STATEMENT carries — a `?` parameter or a literal the
@@ -2882,6 +2944,23 @@ impl UpdateAction {
             }
         }
     }
+
+    /// Every value this action would STORE in the item, as the request stated it.
+    ///
+    /// An assignment stores what its operands evaluate to and an `ADD` stores the number
+    /// or the collection it leaves behind, so a value either of them carries becomes item
+    /// bytes. A `DELETE` SUBTRACTS the members its operand names — "those values are
+    /// subtracted from the old set" — and a `REMOVE` carries no operand at all, so
+    /// neither of them stores one.
+    fn stored_values(&self) -> Vec<&AttributeValue> {
+        let mut values = Vec::new();
+        match self {
+            Self::Set(_, value) => value.collect_values(&mut values),
+            Self::Add(_, value) => values.push(value),
+            Self::Remove(_) | Self::Delete(..) => {}
+        }
+        values
+    }
 }
 
 /// The right-hand side of one `SET`: one operand, or two joined by `+` or `-`.
@@ -2890,6 +2969,19 @@ enum SetValue {
     Single(SetOperand),
     Sum(SetOperand, SetOperand),
     Difference(SetOperand, SetOperand),
+}
+
+impl SetValue {
+    /// Every value this right-hand side carries, at any depth of the functions it nests.
+    fn collect_values<'a>(&'a self, into: &mut Vec<&'a AttributeValue>) {
+        match self {
+            Self::Single(operand) => operand.collect_values(into),
+            Self::Sum(left, right) | Self::Difference(left, right) => {
+                left.collect_values(into);
+                right.collect_values(into);
+            }
+        }
+    }
 }
 
 /// One operand of a `SET`: a path, a literal value, or one of the two documented
@@ -2905,6 +2997,24 @@ enum SetOperand {
     /// `list_append (operand, operand)` — "evaluates to a list with a new element
     /// added to it".
     ListAppend(Box<SetOperand>, Box<SetOperand>),
+}
+
+impl SetOperand {
+    /// Every value this operand carries, at any depth: a function's arguments are
+    /// operands of their own, and either of them may be a value.
+    ///
+    /// The nesting is bounded where the expression is parsed, so this walk is too.
+    fn collect_values<'a>(&'a self, into: &mut Vec<&'a AttributeValue>) {
+        match self {
+            Self::Path(_) => {}
+            Self::Value(value) => into.push(value),
+            Self::IfNotExists(_, operand) => operand.collect_values(into),
+            Self::ListAppend(left, right) => {
+                left.collect_values(into);
+                right.collect_values(into);
+            }
+        }
+    }
 }
 
 /// The update one request states, from `UpdateExpression` or from the legacy
@@ -2969,6 +3079,21 @@ impl ParsedUpdate {
         (charge - BASELINE_CLAUSE_CHARGE).max(0)
     }
 
+    /// What the SHAPE of the request that stated this update costs the item-size
+    /// accounting ([`UpdateRequestShape`]).
+    ///
+    /// Which is a fact of the MEMBER the update travelled in: an `UpdateExpression`
+    /// states clauses and is charged their frames and the key-portion floor beside them,
+    /// while the legacy per-attribute map states no clause at all and is charged the item
+    /// alone.
+    pub fn request_shape(&self) -> UpdateRequestShape {
+        if self.member == UPDATE_EXPRESSION_MEMBER {
+            UpdateRequestShape::StatedAsAnExpression(self.request_shape_charge())
+        } else {
+            UpdateRequestShape::StatedWithoutAnExpression
+        }
+    }
+
     /// Parse one `UpdateExpression`: the `SET`, `REMOVE`, `ADD` and `DELETE` sections,
     /// each at most once, each a comma-separated list of actions.
     pub fn parse(
@@ -3021,7 +3146,7 @@ impl ParsedUpdate {
                 }
             }
         }
-        Self::from_actions("AttributeUpdates", actions)
+        Self::from_actions(ATTRIBUTE_UPDATES_MEMBER, actions)
     }
 
     /// Hold the actions, refusing two that write overlapping document locations:
@@ -3044,6 +3169,23 @@ impl ParsedUpdate {
         }
         let paths: Vec<&DocumentPath> = actions.iter().map(UpdateAction::path).collect();
         check_paths_disjoint(member, &paths)?;
+        // A value an action would STORE has to fit the item that would have to hold it,
+        // so it is held to the documented item ceiling here — a fact of the request,
+        // settled before any table is looked up. The ceiling is worded as the UPDATE path
+        // words that quota, because the item that would cross it is the one this change
+        // leaves behind. A value the update only COMPARES or SUBTRACTS never becomes item
+        // bytes, which is why it is the action's stored values that are weighed and not
+        // every entry of the substitution table it was read from
+        // ([`UpdateAction::stored_values`]).
+        for action in &actions {
+            for value in action.stored_values() {
+                if attribute_value_size(value) > MAX_ITEM_SIZE_BYTES {
+                    return Err(RequestError::Validation(
+                        ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE.to_string(),
+                    ));
+                }
+            }
+        }
         Ok(Self { member, actions })
     }
 
@@ -3207,6 +3349,16 @@ fn required_update_value(
 /// Value is also a number, then Value is mathematically added to the existing
 /// attribute"; a set is unioned; and an attribute that is not there yet starts from
 /// `0` for a number, or from the empty set, so the value itself is the result.
+///
+/// The LEGACY per-attribute map reaches one operand the expression's `ADD` does not: a
+/// LIST, which is CONCATENATED onto the list the attribute holds — "If the attribute
+/// does not already exist, then the attribute and its values are added to the item. If
+/// the attribute does exist, then the behavior of ADD depends on the data type of the
+/// attribute" (`AttributeValueUpdate$Action`), and recorded behaviour shows that
+/// data type including a list. The expression member states its own operand domain —
+/// "The ADD action only supports Number and set data types"
+/// (`UpdateItem$UpdateExpression`) — so a list operand written there is outside the
+/// operator's domain and refused as such ([`ADD_OPERAND`]).
 fn apply_add(
     member: &str,
     path: &DocumentPath,
@@ -3219,6 +3371,21 @@ fn apply_add(
              set: {}",
             path.render()
         )));
+    }
+    if let (AttributeValue::L(appended), true) = (value, appends_lists(member)) {
+        return match path.get(before) {
+            None => Ok(value.clone()),
+            Some(AttributeValue::L(held)) => {
+                // Both lists are already bounded by [`MAX_COLLECTION_MEMBERS`] — the
+                // stored one at admission, the operand where this request's values were
+                // read — and the concatenation is held to that ceiling again where the
+                // result is checked ([`Self::apply`]), so what is built here is bounded.
+                let mut members = held.clone();
+                members.extend(appended.iter().cloned());
+                Ok(AttributeValue::L(members))
+            }
+            Some(_held) => Err(incorrect_update_operand_type()),
+        };
     }
     // The operand's own type is a fact of the REQUEST, so an operand outside what `ADD`
     // takes is refused before the item is read at all.

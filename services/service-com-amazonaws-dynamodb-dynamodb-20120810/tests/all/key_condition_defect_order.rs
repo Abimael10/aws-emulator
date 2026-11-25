@@ -3,19 +3,20 @@
 //! WHICH defect a `KeyConditionExpression` carrying TWO of them is refused for, driven end
 //! to end.
 //!
-//! THE RULE: the defects a key condition's OPERANDS carry — a `:placeholder` the request
-//! never defined, and a value of a type the operator or function it was written with does
-//! not compare — are read in the order the expression WROTE the operands, and the request is
-//! refused for the first of them. Both are settled by the request alone, so both are
-//! answered as a 400 `ValidationException` whether or not the addressed table exists; only
-//! the rules about how the condition BINDS to a key schema wait for the table
+//! THE RULE: a `:placeholder` the request never defined is a defect of the REQUEST — an
+//! expression that dereferences a token nothing defines cannot be read as a condition at all
+//! — so it is answered wherever the expression writes it, before the addressed table is
+//! resolved, and it wins over an operand of a type the operator or function it was written
+//! with does not compare: that one is a fact of the CONDITION, read where the condition binds
+//! to the key schema, so it needs the table to be there
 //! (`crate::absent_table_before_key_binding` states that half).
 //!
-//! The rows span what the rule generalises over: which defect the expression states first,
-//! which operator or function the defective operand was written with (`=`, `<`, `>=`,
-//! `BETWEEN`, `begins_with`), which side of the comparison carried it, which
-//! `AttributeValue` type it had (`N` where a prefix is needed, `BOOL`, `NULL`, `L`, `M`,
-//! `SS`), how many clauses the condition states, and whether the table is there at all.
+//! The rows span what the rule generalises over: whether the undefined token is written
+//! before or after the ill-typed operand, which operator or function the ill-typed operand
+//! was written with (`=`, `<`, `>=`, `BETWEEN`, `begins_with`), which side of the comparison
+//! carried it, which `AttributeValue` type it had (`N` where a prefix is needed, `BOOL`,
+//! `NULL`, `L`, `M`, `SS`), how many clauses the condition states, and whether the table is
+//! there at all.
 //!
 //! The wording helpers are this crate's own statements of the two sentences
 //! (`crate::key_condition_operands_and_legacy_conditions` and
@@ -77,16 +78,25 @@ async fn seeded() -> smithy_server_runtime::MultiServiceRouter {
     router
 }
 
-/// One row: the condition, the values it defines, and the message the rule requires.
+/// One row: the condition, the values it defines, and what the rule requires of it — the
+/// message against the table that is there, and the message against one that is not.
 struct Row {
     case: &'static str,
     condition: &'static str,
     values: Value,
     expected: String,
+    /// What the same request earns when the table it names does not exist: the same
+    /// sentence for a defect the REQUEST settles, and the not-found for one that needs the
+    /// condition to bind.
+    expected_without_the_table: String,
 }
 
-/// The rows: each condition carries BOTH defects, and the message is the one its text states
-/// first.
+/// AWS's fixed data-plane sentence for a table that is not there (`Query`'s
+/// `ResourceNotFoundException`).
+const NOT_FOUND: &str = "Requested resource not found";
+
+/// The rows: each condition carries BOTH defects — or only the ill-typed operand — and the
+/// message is the undefined token's wherever one is written, the operand's otherwise.
 fn rows() -> Vec<Row> {
     vec![
         Row {
@@ -94,60 +104,114 @@ fn rows() -> Vec<Row> {
             condition: "pk = :undef AND begins_with(sk, :n)",
             values: json!({":n": {"N": "1"}}),
             expected: undefined_value(),
+            expected_without_the_table: undefined_value(),
         },
         Row {
             case: "the bad prefix operand is written first, before the undefined placeholder",
             condition: "begins_with(sk, :n) AND pk = :undef",
             values: json!({":n": {"N": "1"}}),
-            expected: incorrect_operand("begins_with", "N"),
+            expected: undefined_value(),
+            expected_without_the_table: undefined_value(),
         },
         Row {
             case: "a list operand written first, before the undefined placeholder",
             condition: "sk >= :l AND pk = :undef",
             values: json!({":l": {"L": [{"S": "a"}]}}),
-            expected: incorrect_operand(">=", "L"),
+            expected: undefined_value(),
+            expected_without_the_table: undefined_value(),
         },
         Row {
             case: "a map operand on the partition key, before the undefined placeholder",
             condition: "pk = :m AND sk = :undef",
             values: json!({":m": {"M": {"a": {"S": "a"}}}}),
-            expected: incorrect_operand("=", "M"),
+            expected: undefined_value(),
+            expected_without_the_table: undefined_value(),
         },
         Row {
             case: "a string-set operand written OPERAND first, before the undefined one",
             condition: ":ss < sk AND pk = :undef",
             values: json!({":ss": {"SS": ["a", "b"]}}),
-            expected: incorrect_operand("<", "SS"),
+            expected: undefined_value(),
+            expected_without_the_table: undefined_value(),
         },
         Row {
             case: "the undefined placeholder as the low bound of a BETWEEN",
             condition: "sk BETWEEN :undef AND :b",
             values: json!({":b": {"BOOL": true}}),
             expected: undefined_value(),
+            expected_without_the_table: undefined_value(),
         },
         Row {
             case: "a bad low bound of a BETWEEN, before the undefined high bound",
             condition: "sk BETWEEN :b AND :undef",
             values: json!({":b": {"BOOL": false}}),
-            expected: incorrect_operand("BETWEEN", "BOOL"),
+            expected: undefined_value(),
+            expected_without_the_table: undefined_value(),
         },
         Row {
             case: "three clauses, the bad operand in the middle one",
             condition: "pk = :p AND begins_with(sk, :n) AND other = :undef",
             values: json!({":p": {"S": "p"}, ":n": {"N": "7"}}),
-            expected: incorrect_operand("begins_with", "N"),
+            expected: undefined_value(),
+            expected_without_the_table: undefined_value(),
         },
         Row {
             case: "three clauses, the undefined placeholder in the first one",
             condition: "pk = :undef AND sk = :nul AND other = :o",
             values: json!({":nul": {"NULL": true}, ":o": {"S": "o"}}),
             expected: undefined_value(),
+            expected_without_the_table: undefined_value(),
         },
         Row {
             case: "a parenthesised group whose operand is the first defect",
             condition: "(sk > :nul) AND pk = :undef",
             values: json!({":nul": {"NULL": true}}),
-            expected: incorrect_operand(">", "NULL"),
+            expected: undefined_value(),
+            expected_without_the_table: undefined_value(),
+        },
+        // The same ill-typed operands with every token DEFINED: with no request-settled
+        // defect left, each is refused for its operand — and only where the table is there.
+        Row {
+            case: "a bad prefix operand with every token defined",
+            condition: "pk = :p AND begins_with(sk, :n)",
+            values: json!({":p": {"S": "p"}, ":n": {"N": "1"}}),
+            expected: incorrect_operand("begins_with", "N"),
+            expected_without_the_table: NOT_FOUND.to_string(),
+        },
+        Row {
+            case: "a list operand under an ordering comparator, every token defined",
+            condition: "sk >= :l AND pk = :p",
+            values: json!({":p": {"S": "p"}, ":l": {"L": [{"S": "a"}]}}),
+            expected: incorrect_operand(">=", "L"),
+            expected_without_the_table: NOT_FOUND.to_string(),
+        },
+        Row {
+            case: "a map operand on the partition key, every token defined",
+            condition: "pk = :m AND sk = :s",
+            values: json!({":m": {"M": {"a": {"S": "a"}}}, ":s": {"S": "a"}}),
+            expected: incorrect_operand("=", "M"),
+            expected_without_the_table: NOT_FOUND.to_string(),
+        },
+        Row {
+            case: "a string-set operand written OPERAND first, every token defined",
+            condition: ":ss < sk AND pk = :p",
+            values: json!({":p": {"S": "p"}, ":ss": {"SS": ["a", "b"]}}),
+            expected: incorrect_operand("<", "SS"),
+            expected_without_the_table: NOT_FOUND.to_string(),
+        },
+        Row {
+            // The recorded shape: an equality operand of a type no key schema declares,
+            // beside a clause the schema has no key attribute for — and every placeholder
+            // defined, so the table's absence is what decides.
+            case: "an equality operand of a list type beside a third clause",
+            condition: "pk = :l AND sk = :s AND extra = :e",
+            values: json!({
+                ":l": {"L": [{"S": "x"}]},
+                ":s": {"S": "a"},
+                ":e": {"S": "e"},
+            }),
+            expected: incorrect_operand("=", "L"),
+            expected_without_the_table: NOT_FOUND.to_string(),
         },
     ]
 }
@@ -162,8 +226,8 @@ fn request_for(row: &Row, table: &str) -> Value {
     })
 }
 
-/// RULE: against a table that is there, the refusal is the defect the expression's text
-/// states first.
+/// RULE: against a table that is there, the undefined token is the refusal wherever it is
+/// written; with every token defined, the ill-typed operand is.
 #[tokio::test]
 async fn the_operand_defect_the_expression_states_first_is_the_one_answered() {
     let router = seeded().await;
@@ -186,26 +250,32 @@ async fn the_operand_defect_the_expression_states_first_is_the_one_answered() {
     }
 }
 
-/// RULE, the other half: both defects are settled by the REQUEST, so the same row earns the
-/// same sentence when the table it addresses does not exist at all.
+/// RULE, the other half: an undefined token is settled by the REQUEST, so the same row earns
+/// the same sentence when the table it addresses does not exist at all — while an operand
+/// whose type its comparison cannot take is a fact of the CONDITION, which an absent table
+/// answers before.
 #[tokio::test]
 async fn the_same_defect_is_answered_for_a_table_this_account_does_not_hold() {
     let router = emulator();
     for row in rows() {
         let (status, body) = call(&router, "Query", request_for(&row, ABSENT)).await;
+        let expected_code = if row.expected_without_the_table == NOT_FOUND {
+            "ResourceNotFoundException"
+        } else {
+            "ValidationException"
+        };
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (400, "ValidationException"),
-            "case {:?}: a defect the request alone settles is answered before the table is \
-             resolved, got {status} with {body}",
+            (400, expected_code),
+            "case {:?}: expected {expected_code} for an absent table, got {status} with {body}",
             row.case
         );
         assert_eq!(
             message(&body),
-            row.expected,
+            row.expected_without_the_table,
             "case {:?}: expected the message {:?} for an absent table, got {:?}",
             row.case,
-            row.expected,
+            row.expected_without_the_table,
             message(&body)
         );
     }

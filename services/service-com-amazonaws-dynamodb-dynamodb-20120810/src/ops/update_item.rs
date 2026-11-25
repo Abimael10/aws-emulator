@@ -388,9 +388,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A value a condition compares against, or a value the update writes, is held
         // to the same limits a stored value is: the documented nesting depth, and this
         // emulator's own ceiling on the members one set may carry. Both bound the work
-        // this request can ask for, and both come from the request. A value past the
-        // documented item ceiling is worded as the UPDATE path words that quota
-        // ([`crate::state::stated_for_an_update`]).
+        // this request can ask for, and both come from the request.
+        //
+        // BINDING a value stores nothing, so the documented item ceiling is not one of
+        // those limits here ([`crate::state::check_substituted_value`]): a value this
+        // request only compares, or one an action subtracts rather than stores, never
+        // becomes item bytes. The ceiling is stated over the values the update would
+        // STORE, where it is parsed, and over the item the change leaves behind, below.
+        // What bounds the substitution table as a whole is its own total cap
+        // ([`crate::state::check_substitution_total`]).
         //
         // Every value the request CARRIES is bounded BEFORE its expressions are held to
         // the substitution tables beside them: a value outside those limits is outside
@@ -399,16 +405,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is told about the value rather than about an entry it would still have to fix
         // the value of.
         for (placeholder, value) in input.expression_attribute_values.iter().flatten() {
-            crate::state::check_attribute_value(placeholder, value)
+            crate::state::check_substituted_value(placeholder, value)
                 .map_err(crate::state::stated_for_an_update)
                 .map_err(lift)?;
         }
+        crate::state::check_substitution_total(input.expression_attribute_values.as_ref())
+            .map_err(lift)?;
         for (attribute, value) in &input.key {
             crate::state::check_attribute_value(attribute, value).map_err(lift)?;
         }
         for update in input.attribute_updates.iter().flatten() {
             if let Some(value) = update.1.value.as_ref() {
-                crate::state::check_attribute_value(update.0, value)
+                crate::state::check_substituted_value(update.0, value)
                     .map_err(crate::state::stated_for_an_update)
                     .map_err(lift)?;
             }
@@ -616,13 +624,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             let table = store.active_table(&region, &name, now).map_err(lift)?;
             // What the update ASKED FOR is sized, not only what it leaves behind: the
-            // stored item plus the frame each clause of the request costs
-            // ([`crate::state::ParsedUpdate::request_shape_charge`]), so the largest
-            // operand one write may carry moves with the clauses stated beside it. The item
-            // itself is charged its non-key bytes plus what its key portion is charged
-            // ([`crate::state::update_size_exceeded`]), whose floor is why the boundary
-            // does not move between two items keyed by different numbers of bytes.
-            if crate::state::update_size_exceeded(table, &item, update.request_shape_charge()) {
+            // stored item plus what the SHAPE of the request stating the change costs
+            // ([`crate::state::ParsedUpdate::request_shape`]), so the largest operand one
+            // write may carry moves with the clauses stated beside it — while a change
+            // stated through the legacy map states no clause and is charged the item
+            // alone. The item itself is charged its non-key bytes plus what its key
+            // portion is charged ([`crate::state::update_size_exceeded`]), whose floor on
+            // the expression path is why that boundary does not move between two items
+            // keyed by different numbers of bytes.
+            if crate::state::update_size_exceeded(table, &item, update.request_shape()) {
                 return Err(crate::scaffolded::Scaffolded::validation(
                     crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
                 ));

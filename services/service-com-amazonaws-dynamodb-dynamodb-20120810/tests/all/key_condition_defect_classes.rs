@@ -13,9 +13,11 @@
 //! * two clauses about ONE attribute break the member's one-clause rule, whichever half of
 //!   the key they are about and however many clauses the condition states in all;
 //! * an operand its comparison cannot be made against AT ALL — a collection, or a
-//!   non-orderable value under a comparator that ORDERS — is a defect of the request, so it
-//!   is answered whichever table the query named, while an EQUALITY operand is held to the
-//!   type the SCHEMA declares for the key it binds to, which only the table can settle.
+//!   non-orderable value under a comparator that ORDERS — is its own sentence, naming the
+//!   operator as the expression wrote it, while an EQUALITY operand the comparison DOES take
+//!   is held to the type the SCHEMA declares for the key it binds to. Both are facts of the
+//!   CONDITION rather than of the request's text, so neither is answered for a table that is
+//!   not there: the existence check decides first.
 //!
 //! The CONTROL at the end drives the forms the member DOES take, including the
 //! operand-first spelling of a comparison, so the refusals above are this classification
@@ -218,11 +220,10 @@ async fn an_operand_is_held_to_its_comparison_first_and_to_the_schema_second() {
     let router = seeded().await;
 
     // Each row: the condition, the operand it compares the sort key with, and the class
-    // the refusal belongs to — the REQUEST's own (answered whichever table was named) or
-    // the SCHEMA's (which only a table that is there can settle). The rows span the
-    // comparators that order, the one function the member has, every collection type and
-    // the two single-valued types that are no key type.
-    for (case, condition, value, request_settled) in [
+    // the refusal belongs to — the COMPARISON's own domain, or the type the SCHEMA declares
+    // for the key. The rows span the comparators that order, the one function the member
+    // has, every collection type and the two single-valued types that are no key type.
+    for (case, condition, value, outside_the_comparison) in [
         (
             "a list under an ordering comparator",
             "pk = :p AND sk >= :v",
@@ -290,31 +291,32 @@ async fn an_operand_is_held_to_its_comparison_first_and_to_the_schema_second() {
             json!({":p": {"S": "p"}, ":v": value.clone()}),
         );
         let stated = refusal(&router, case, request).await;
-        let expected = request_settled.clone().unwrap_or(SCHEMA_TYPE.to_string());
+        let expected = outside_the_comparison
+            .clone()
+            .unwrap_or(SCHEMA_TYPE.to_string());
         assert_eq!(
             stated, expected,
             "case {case:?}: expected {expected:?}, got {stated:?}"
         );
 
-        // The SAME condition against a table this account does not hold: a defect the
-        // request settles is answered anyway, while one that needs the schema cannot be.
+        // The SAME condition against a table this account does not hold: BOTH classes are
+        // facts of the condition rather than of the request's text, so neither can be
+        // answered for a schema that does not exist — the existence check decides.
         let (status, answered) = call(
             &router,
             "Query",
             query(ABSENT, condition, json!({":p": {"S": "p"}, ":v": value})),
         )
         .await;
-        let want = match &request_settled {
-            Some(clause) => ("ValidationException", clause.clone()),
-            None => (
-                "ResourceNotFoundException",
-                "Requested resource not found".to_string(),
-            ),
-        };
         assert_eq!(
             (status, error_code(&answered), message(&answered)),
-            (400, want.0.to_string(), want.1.clone()),
-            "case {case:?} on the missing table: expected {want:?}, got {status} with {answered}"
+            (
+                400,
+                "ResourceNotFoundException".to_string(),
+                "Requested resource not found".to_string()
+            ),
+            "case {case:?} on the missing table: expected the existence check to decide, got \
+             {status} with {answered}"
         );
     }
 }

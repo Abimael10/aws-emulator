@@ -362,13 +362,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(lift)?;
 
         // A value a condition compares against is held to the same limits a stored
-        // value is: the documented nesting depth, and this emulator's own ceiling on
-        // the members one set may carry. Both bound the work this request can ask for,
-        // whichever generation the condition is stated in — the values an expression
-        // binds and the ones the legacy `Expected` map compares against alike.
+        // value is EXCEPT the item ceiling: the documented nesting depth, and this
+        // emulator's own ceiling on the members one set may carry. Both bound the work
+        // this request can ask for, whichever generation the condition is stated in — the
+        // values an expression binds and the ones the legacy `Expected` map compares
+        // against alike. A value this request only COMPARES never becomes item bytes, so
+        // the item ceiling is no bound on it ([`crate::state::check_substituted_value`]);
+        // what bounds the substitution table as a whole is its own total cap.
         for (placeholder, value) in input.expression_attribute_values.iter().flatten() {
-            crate::state::check_attribute_value(placeholder, value).map_err(lift)?;
+            crate::state::check_substituted_value(placeholder, value).map_err(lift)?;
         }
+        crate::state::check_substitution_total(input.expression_attribute_values.as_ref())
+            .map_err(lift)?;
         crate::state::check_expected_condition_values(input.expected.as_ref()).map_err(lift)?;
         // Every fact of the REQUEST the condition carries is settled before the table is
         // looked up ([`crate::state::check_write_condition`]).

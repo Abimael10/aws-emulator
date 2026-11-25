@@ -257,9 +257,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // looked up, the way the item writes order their validation.
         let search_vector = read_search_vector(&input.search_vector).map_err(lift)?;
         let requested_attributes = projected_attributes(&input)?;
+        // A value this read's condition compares against becomes no item bytes, so it is
+        // held to every value rule except the item ceiling, and the substitution table as
+        // a whole to its own total cap ([`crate::state::check_substituted_value`]).
         for (placeholder, value) in input.expression_attribute_values.iter().flatten() {
-            crate::state::check_attribute_value(placeholder, value).map_err(lift)?;
+            crate::state::check_substituted_value(placeholder, value).map_err(lift)?;
         }
+        crate::state::check_substitution_total(input.expression_attribute_values.as_ref())
+            .map_err(lift)?;
         let condition = input
             .search_condition_expression
             .as_deref()
