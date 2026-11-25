@@ -87,6 +87,9 @@ pub enum AttachRefusal {
         instance_id: String,
         /// The zone Amazon EC2 holds it in.
         availability_zone: String,
+        /// The zones the group IS configured for, which is the list the refusal states so
+        /// the caller can read a zone the attach would be admitted from out of it.
+        group_zones: Vec<String>,
     },
     /// Attaching the named instances would take the group's desired capacity past its own
     /// `MaxSize`, which the operation documents as a failure.
@@ -109,10 +112,12 @@ impl AttachRefusal {
     #[must_use]
     pub fn message(&self, group_name: &str) -> String {
         match self {
-            // The sentence Amazon EC2 itself states for an instance id nothing resolves,
-            // since resolving the id is what this service asked Amazon EC2 to do.
+            // THIS service's own sentence for an id it could resolve to no instance of the
+            // account: an attach names the instance it cannot take, bracketed, and states
+            // that the id is not one this operation can act on. Amazon EC2 resolved the id,
+            // but the refusal is Auto Scaling's, so its own wording is what a caller reads.
             Self::UnknownInstance(instance_id) => {
-                format!("The instance ID '{instance_id}' does not exist")
+                format!("Instance [{instance_id}] is invalid.")
             }
             Self::NotRunning { instance_id, state } => format!(
                 "Instance {instance_id} is in {state} state, not in {} state, and cannot be \
@@ -123,12 +128,21 @@ impl AttachRefusal {
                 instance_id,
                 group_name,
             } => super::instance_already_in_group_message(instance_id, group_name),
+            // The group's configured zone list is the actionable half of this refusal — it is
+            // what a caller picks a placeable instance from — so the sentence states that
+            // list, the group it belongs to, and the instance with the zone it occupies. The
+            // list is comma-separated the way every set of values this service states is
+            // ([`super::joined_values`]), and the zone the instance occupies is bracketed
+            // beside it.
             Self::ZoneNotConfigured {
                 instance_id,
                 availability_zone,
+                group_zones,
             } => format!(
-                "Instance {instance_id} is in Availability Zone {availability_zone}, which is \
-                 not one of the Availability Zones of Auto Scaling group {group_name}."
+                "The list of availability zones [{}] for the group {group_name} does not \
+                 contain the zone occupied by the instance {instance_id} \
+                 [{availability_zone}]",
+                super::joined_values(group_zones.iter().cloned())
             ),
             // The group's own sizes do not admit the attach, so the refusal is the one both
             // moves of a group's instances state ([`super::group_size_bounds`]): the sizes it
@@ -233,6 +247,7 @@ impl AutoScalingState {
                 return Err(AttachRefusal::ZoneNotConfigured {
                     instance_id: instance_id.clone(),
                     availability_zone: instance.availability_zone.clone(),
+                    group_zones: zones.clone(),
                 });
             }
         }

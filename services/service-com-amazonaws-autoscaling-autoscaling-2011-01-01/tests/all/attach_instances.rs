@@ -552,7 +552,7 @@ async fn an_attach_that_cannot_be_made_is_refused_whole() {
             case: "an instance id Amazon EC2 holds nothing for",
             group: name.to_string(),
             ids: vec![unknown.clone()],
-            message: format!("The instance ID '{unknown}' does not exist"),
+            message: format!("Instance [{unknown}] is invalid."),
         },
         RefusalRow {
             case: "an instance that is not running",
@@ -582,16 +582,16 @@ async fn an_attach_that_cannot_be_made_is_refused_whole() {
             group: name.to_string(),
             ids: vec![abroad.clone()],
             message: format!(
-                "Instance {abroad} is in Availability Zone {}, which is not one of the \
-                 Availability Zones of Auto Scaling group {name}.",
-                elsewhere.zone
+                "The list of availability zones [{}] for the group {name} does not contain \
+                 the zone occupied by the instance {abroad} [{}]",
+                home.zone, elsewhere.zone
             ),
         },
         RefusalRow {
             case: "an attachable instance named beside an unknown one",
             group: name.to_string(),
             ids: vec![spare.clone(), unknown.clone()],
-            message: format!("The instance ID '{unknown}' does not exist"),
+            message: format!("Instance [{unknown}] is invalid."),
         },
         RefusalRow {
             case: "an attach that would pass the group's maximum size",
