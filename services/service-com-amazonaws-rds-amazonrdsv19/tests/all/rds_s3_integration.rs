@@ -638,11 +638,12 @@ struct EngineNameRow {
     display: &'static str,
 }
 
-/// The engine-name table: the refusal names the ENGINE, under the description that engine
-/// publishes, so the rows span engines whose descriptions differ in form — an Aurora engine
-/// named for its product, one whose description parenthesises the dialect, and the community
-/// editions of the two provisioned engines — with a feature name published for ANOTHER
-/// engine beside one published in another case.
+/// The engine-name table: the refusal a DB INSTANCE gives names the ENGINE, under the
+/// description that engine publishes, so the rows span engines whose descriptions differ in
+/// form — an Aurora engine named for its product, one whose description parenthesises the
+/// dialect, and the community editions of the two provisioned engines — with a feature name
+/// published for ANOTHER engine beside one published in another case. The two CLUSTER rows
+/// span the same defect on the resource that words it as a role integration instead.
 const ENGINE_NAME_ROWS: &[EngineNameRow] = &[
     EngineNameRow {
         case: "Aurora MySQL does not publish the S3 import feature",
@@ -675,8 +676,10 @@ const ENGINE_NAME_ROWS: &[EngineNameRow] = &[
 ];
 
 /// Rule: a `FeatureName` the addressed resource's engine does not publish is refused with
-/// `InvalidParameterValue` and the sentence AWS words it in — the value the request named and
-/// the engine, under the description that engine publishes.
+/// `InvalidParameterValue` and the sentence AWS words it in for that RESOURCE — a DB instance
+/// names the value the request carried and its engine, under the description that engine
+/// publishes, while a DB CLUSTER words every defect of the role integration it was asked for
+/// in the integration's own fixed sentence ([`st::ROLE_NOT_TRUSTED_MESSAGE`]).
 #[tokio::test]
 async fn an_unpublished_feature_name_is_refused_naming_the_engine() {
     let (router, _engine) = emulator();
@@ -706,13 +709,16 @@ async fn an_unpublished_feature_name_is_refused_naming_the_engine() {
             "InvalidParameterValue",
         );
         let message = text(&body, "Message");
-        let expected = format!(
-            "The feature name {} is not valid for the engine {}.",
-            row.feature, row.display
-        );
+        let expected = match row.cluster {
+            true => st::ROLE_NOT_TRUSTED_MESSAGE.to_string(),
+            false => format!(
+                "The feature name {} is not valid for the engine {}.",
+                row.feature, row.display
+            ),
+        };
         assert_eq!(
             message, expected,
-            "case {:?}: expected the refusal to name the engine, got {message:?}",
+            "case {:?}: expected the refusal its resource words this defect in, got {message:?}",
             row.case
         );
     }

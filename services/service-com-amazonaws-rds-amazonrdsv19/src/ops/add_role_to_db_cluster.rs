@@ -255,8 +255,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // version this cluster runs names no feature of it, which is the Query API's
         // `InvalidParameterValue`. The member is optional, and a request that names no
         // feature associates the role with the cluster itself, which no catalogue entry
-        // gates. It is asked of a role that passed the gate above, which is why that
-        // sentence is the one a request carrying both defects gets.
+        // gates.
+        //
+        // The SENTENCE is the one a DB cluster words every unperformable role integration in
+        // ([`crate::state::ROLE_NOT_TRUSTED_MESSAGE`]): on this resource the role and the
+        // feature are the two halves of ONE integration — the role has to carry what the
+        // named feature needs — so a request whose feature the engine does not publish is
+        // refused in the same terms as one whose role the service cannot take on, and a
+        // client matching that sentence sees it for either defect. (A DB INSTANCE words the
+        // same refusal for itself, naming the feature and the engine:
+        // [`crate::state::unsupported_feature_name_message`].)
         if let Some(feature_name) = &input.feature_name {
             if !crate::state::feature_name_is_supported(
                 &engine,
@@ -264,7 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 feature_name,
             ) {
                 return Err(AddRoleToDBClusterError::invalid_parameter_value(
-                    crate::state::unsupported_feature_name_message(&engine, feature_name),
+                    crate::state::ROLE_NOT_TRUSTED_MESSAGE,
                 ));
             }
         }

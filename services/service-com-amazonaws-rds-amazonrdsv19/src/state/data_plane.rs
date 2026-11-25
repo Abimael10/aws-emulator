@@ -754,10 +754,14 @@ pub async fn open_engine_endpoint<Eng: Send + Sync + 'static>(
             )
         }
     };
-    // A MySQL server's own schema is on its disk before any client connects, so it is created
-    // with the server rather than when a statement first names it.
-    if starting && wire == EngineWire::MySql {
-        mysql_system_tables::start_system_schema(&database);
+    // What a server comes up WITH on disk is created where the server starts, rather than
+    // when a statement first names it: a MySQL-family server's own schema and its tables, and
+    // the database a PostgreSQL server's own initialisation creates.
+    if starting {
+        match wire {
+            EngineWire::MySql => mysql_system_tables::start_system_schema(&database),
+            EngineWire::Postgres => pg_server::start_server_database(&database),
+        }
     }
     let (generation, generation_rx) = watch::channel(0u64);
     let sessions = pg_sessions::SessionRegistry::default();

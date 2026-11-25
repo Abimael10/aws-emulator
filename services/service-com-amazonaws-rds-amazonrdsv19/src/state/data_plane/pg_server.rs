@@ -447,11 +447,44 @@ fn engine_port_parameter(family: &str, configured: &str) -> RunningParameter {
 
 /// Create the catalog tables if this database has not served one yet. Called once per
 /// session, before any statement of it runs.
+///
+/// The catalogs are what this server REBUILDS from its own state when a session reads them,
+/// so they are created where they are read rather than when the server starts: what a
+/// PostgreSQL server holds on disk from the moment its endpoint answers is its own DATABASE
+/// ([`start_server_database`]).
 pub fn ensure_catalogs(database: &InstanceDatabase, name: &str) -> Result<(), EngineError> {
     for schema in CATALOG_SCHEMA {
         database.execute(name, schema, &[])?;
     }
     Ok(())
+}
+
+/// Create what a PostgreSQL server comes up WITH on disk: the database its own initialisation
+/// creates ([`super::wire_session::POSTGRES_DEFAULT_DATABASE`]).
+///
+/// Called where a PostgreSQL engine is STARTED ([`super::open_engine_endpoint`]), so the
+/// server holds it from the moment its endpoint answers — which is when a real server's data
+/// directory already has it: initialising a PostgreSQL cluster "creates the database
+/// `postgres`", and it does not wait for a client to connect. That is what makes a snapshot
+/// taken of an instance no client has connected to carry a database at all, and an export of
+/// that snapshot report what that database held ([`crate::state::export_objects`]) instead of
+/// covering nothing. The MySQL-family sibling of this is
+/// [`super::mysql_system_tables::start_system_schema`], under the same contract — it creates
+/// that server's own schema with its TABLES, because a MySQL server keeps its grant and help
+/// tables on disk, while a PostgreSQL server's catalog is rebuilt from its own state when a
+/// session reads it ([`ensure_catalogs`]).
+///
+/// Idempotent, and what goes wrong is LOGGED rather than returned, exactly as that sibling
+/// is: a second call creates nothing, and a server whose database could not be created still
+/// serves every session (the login's own seeding creates the databases its record names).
+pub fn start_server_database(database: &InstanceDatabase) {
+    let name = super::wire_session::POSTGRES_DEFAULT_DATABASE;
+    if let Err(error) = database.create_database(name) {
+        ::tracing::warn!(
+            error = %error.message,
+            "the PostgreSQL server's own database could not be created"
+        );
+    }
 }
 
 /// Rebuild the catalogs `named` from the state `facts` carries, so a statement that reads

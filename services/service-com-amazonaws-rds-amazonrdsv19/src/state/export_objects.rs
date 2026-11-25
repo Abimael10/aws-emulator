@@ -16,7 +16,10 @@
 //! ordinary stored tables ([`super::data_plane::mysql_system_tables`]), so a snapshot of an
 //! instance no client has yet written to still carries them and the export writes them out.
 //! Left out are only the schemas a server MATERIALISES from its own state
-//! ([`MATERIALISED_SCHEMAS`]), which hold nothing on disk to export.
+//! ([`MATERIALISED_SCHEMAS`]) and the relations it rebuilds inside a database
+//! ([`is_engine_catalog_relation`]), which hold nothing on disk to export. A database the
+//! export COVERED that holds no table of its own is reported as skipped for being empty
+//! ([`SKIP_REASON_DATABASE_IS_EMPTY`]) rather than passed over in silence.
 //!
 //! The DATA is the source's own. A DB snapshot carries a copy of the source instance's
 //! storage, taken by the engine when the snapshot was taken
@@ -63,16 +66,19 @@ pub struct ExportedObject {
     pub body: Vec<u8>,
 }
 
-/// The schemas of a MySQL-family server an export leaves out: the two it MATERIALISES rather
-/// than stores.
+/// The schemas of a MySQL-family server an export leaves out: the three it MATERIALISES
+/// rather than stores.
 ///
-/// `information_schema`'s tables are "views" the server builds from its own state and
-/// `performance_schema`'s "tables use no persistent on-disk storage" (MySQL Reference
-/// Manual), so neither holds stored data for a snapshot to carry or an export to write. The
+/// `information_schema`'s tables are "views" the server builds from its own state,
+/// `performance_schema`'s "tables use no persistent on-disk storage" and the `sys` schema is
+/// "a set of objects that ... interpret data collected from the Performance Schema" — views
+/// over that same state (MySQL Reference Manual) — so none of them holds stored data for a
+/// snapshot to carry or an export to write, and none is a database an export covered. The
 /// server's OWN schema, `mysql`, is stored like any other — its grant and help tables are
 /// ordinary tables ([`super::data_plane::mysql_system_tables`]) — so it is exported with the
 /// rest of what the source holds.
-const MATERIALISED_SCHEMAS: [&str; 2] = ["information_schema", "performance_schema"];
+const MATERIALISED_SCHEMAS: [&str; 3] =
+    ["information_schema", "performance_schema", "sys"];
 
 /// The PostgreSQL schema the tables of a database created without one live in: `public`,
 /// the schema in every database's default `search_path`.
@@ -136,26 +142,29 @@ pub fn export_includes(
     })
 }
 
-/// Read every table the export covers out of `database` and write each one's rows as the
-/// Parquet object it is exported to.
+/// Read every table the export covers out of `database`, write each one's rows as the Parquet
+/// object it is exported to, and report the databases it covered that held no such table.
 ///
 /// `part_id` is the id this export's part files carry, so the objects of two exports of the
 /// same source do not collide. `prefix` is the export's own path — see [`export_prefix`].
 ///
 /// A table the engine will not read is SKIPPED rather than failing the whole export: the
-/// export reports the tables it wrote, and the file that says what was exported lists
-/// exactly those.
-pub fn exported_tables(
+/// export reports the tables it wrote, and the file that says what was exported lists exactly
+/// those — beside one entry per database that held nothing to write
+/// ([`ExportedSource::empty_databases`]).
+pub fn exported_source(
     database: &InstanceDatabase,
     wire: EngineWire,
     export_only: &[String],
     prefix: &str,
     part_id: &str,
-) -> Vec<ExportedTable> {
+) -> ExportedSource {
     let mut exported = Vec::new();
+    let mut empty = Vec::new();
     for database_name in database.database_names() {
         // A schema the server materialises from its own state holds no stored data, so it is
-        // not part of what an export writes.
+        // not part of what an export writes — and not a database it covered either, so
+        // nothing is reported for it.
         if MATERIALISED_SCHEMAS.contains(&database_name.as_str()) {
             continue;
         }
@@ -163,15 +172,23 @@ pub fn exported_tables(
             EngineWire::MySql => database_name.clone(),
             EngineWire::Postgres => POSTGRES_DEFAULT_SCHEMA.to_string(),
         };
+        let written_before = exported.len();
+        let mut holds_a_table = false;
         for table in table_names(database, &database_name) {
             if exported.len() >= MAX_EXPORTED_TABLES {
-                return exported;
+                return ExportedSource {
+                    tables: exported,
+                    empty_databases: empty,
+                };
             }
             // Nor is a relation the ENGINE owns inside a customer database: an export writes
             // the source's own data, and a system catalog is the server's.
             if is_engine_catalog_relation(wire, &table) {
                 continue;
             }
+            // The database holds a table of its own, whether or not THIS export was asked
+            // for it: it is not an empty database.
+            holds_a_table = true;
             if !export_includes(export_only, wire, &database_name, &schema, &table) {
                 continue;
             }
@@ -199,8 +216,46 @@ pub fn exported_tables(
                 }
             }
         }
+        // A database the export COVERED that holds no table of its own is reported as skipped
+        // for being empty: the export was asked for it and there was nothing in it, which is
+        // what a client reading the export's own file has to be told. A database the request's
+        // own `ExportOnly` left out was never covered, so nothing is reported for it.
+        if exported.len() == written_before
+            && !holds_a_table
+            && export_covers_database(export_only, &database_name)
+        {
+            empty.push(database_name.clone());
+        }
     }
-    exported
+    ExportedSource {
+        tables: exported,
+        empty_databases: empty,
+    }
+}
+
+/// What one export found in its source: the tables it WROTE, and the databases it covered
+/// that held none.
+#[derive(Debug, Clone, Default)]
+pub struct ExportedSource {
+    /// One entry per table written, in the order the objects were produced.
+    pub tables: Vec<ExportedTable>,
+    /// The databases the export covered that held no table to write, in name order — the
+    /// entries the export's own file reports as skipped for being empty.
+    pub empty_databases: Vec<String>,
+}
+
+/// Whether an export limited to `export_only` covers the database `database` at all.
+///
+/// The first segment of every `ExportOnly` entry names a database ("database - Export all the
+/// data from a specified database", and every other form begins with that database's name), so
+/// an entry whose first segment is this database covers it; an empty list covers every
+/// database of the source.
+#[must_use]
+pub fn export_covers_database(export_only: &[String], database: &str) -> bool {
+    export_only.is_empty()
+        || export_only
+            .iter()
+            .any(|entry| entry.split('.').next() == Some(database))
 }
 
 /// Whether the relation `table` of a database on the `wire` engine belongs to the ENGINE
@@ -373,10 +428,12 @@ pub fn export_info_document(
 }
 
 /// The JSON file that says what the export wrote: ONE object describing the export, carrying
-/// one entry per exported table under `perTableStatus` — naming the table it came from, the
-/// status it ended in, the size it wrote, the part files it was written to and the
-/// source-to-exported type mapping of each of its columns — which is the content the user
-/// guide describes for it.
+/// one entry per TARGET it covered under `perTableStatus` — for a table that was written, the
+/// table it came from, the status it ended in, the size it wrote, the part files it was
+/// written to and the source-to-exported type mapping of each of its columns; for a database
+/// the export covered that held no table, that database and the reason nothing was written
+/// for it ([`SKIP_REASON_DATABASE_IS_EMPTY`]) — which is the content the user guide describes
+/// for it.
 ///
 /// It is an OBJECT and not a bare list: the file describes the export whose tables it lists,
 /// so the export's own identity and destination are in it beside them, and a client reads one
@@ -387,11 +444,12 @@ pub fn export_info_document(
 #[must_use]
 pub fn tables_info_document(
     summary: &ExportSummary<'_>,
-    tables: &[ExportedTable],
+    source: &ExportedSource,
     started: SystemTime,
     ended: SystemTime,
 ) -> String {
-    let entries: Vec<::serde_json::Value> = tables
+    let tables = &source.tables;
+    let mut entries: Vec<::serde_json::Value> = tables
         .iter()
         .map(|table| {
             let bytes: u64 = table.body.len() as u64;
@@ -427,6 +485,20 @@ pub fn tables_info_document(
             })
         })
         .collect();
+    // And one entry per database the export covered that held no table: the target is the
+    // database itself, nothing was written for it, and the entry says why — so a client that
+    // reads this file to discover what the export covered is told about the database rather
+    // than left to infer its absence.
+    entries.extend(source.empty_databases.iter().map(|database| {
+        ::serde_json::json!({
+            "target": database,
+            "database": database,
+            "status": EXPORT_TARGET_STATUS_SKIPPED,
+            "skipReason": SKIP_REASON_DATABASE_IS_EMPTY,
+            "sizeGB": 0,
+            "files": Vec::<String>::new(),
+        })
+    }));
     ::serde_json::json!({
         "exportTaskIdentifier": summary.export_task_identifier,
         "sourceArn": summary.source_arn,
@@ -439,6 +511,17 @@ pub fn tables_info_document(
     })
     .to_string()
 }
+
+/// The `status` an entry of `perTableStatus` carries for a target the export wrote NOTHING
+/// for: `SKIPPED`, beside the `COMPLETE` of a target it wrote.
+pub const EXPORT_TARGET_STATUS_SKIPPED: &str = "SKIPPED";
+
+/// The `skipReason` of such an entry for a DATABASE that held no table to write:
+/// `DATABASE_IS_EMPTY`.
+///
+/// A fixed identifier, not a sentence: it names the reason the export wrote nothing for that
+/// database, which is what a client branches on.
+pub const SKIP_REASON_DATABASE_IS_EMPTY: &str = "DATABASE_IS_EMPTY";
 
 /// `SizeGB`-style whole gigabytes of `bytes`, which is the unit both the export's own JSON
 /// file and `ExportTask$TotalExtractedDataInGB` report in: an integer, so an export smaller

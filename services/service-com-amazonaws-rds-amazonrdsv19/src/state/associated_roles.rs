@@ -77,9 +77,12 @@ pub fn feature_name_is_supported(
     supported_feature_names(engine, engine_version).contains(&feature_name)
 }
 
-/// What a request naming a `FeatureName` the addressed resource's engine version does not
-/// publish is refused with: "The feature name &lt;FeatureName&gt; is not valid for the engine
-/// &lt;engine&gt;."
+/// What a request on a DB INSTANCE naming a `FeatureName` that instance's engine version does
+/// not publish is refused with: "The feature name &lt;FeatureName&gt; is not valid for the
+/// engine &lt;engine&gt;."
+///
+/// A DB CLUSTER words the same refusal differently — see [`ROLE_NOT_TRUSTED_MESSAGE`], the one
+/// sentence that resource gives every unperformable role integration.
 ///
 /// The sentence names the value that was rejected and the ENGINE it was rejected for, under
 /// the DESCRIPTION that engine is published with rather than its product name
@@ -165,11 +168,17 @@ pub fn invalid_role_arn_message(role_arn: &str) -> String {
 /// a role the service cannot take on is associable for no feature at all, so a request whose
 /// role AND feature name are both unusable is refused for the role.
 ///
+/// On a DB CLUSTER it is the sentence EVERY defect of the role integration carries, the
+/// unpublished `FeatureName` included ([`crate::ops::add_role_to_db_cluster`]): the role and
+/// the feature are the two halves of one integration there — the role has to carry what the
+/// named feature needs — and Amazon RDS reports that integration as unperformable rather than
+/// saying which half it was.
+///
 /// ONE fixed sentence, with no variable part: this refusal names neither the role ARN the
-/// request carried nor the principal the trust policy is missing — it reports only that the
-/// value does not carry what the role integration needs — so it is a constant rather than a
-/// `format!` over the request, and the cardinality of the text stays at one for a client
-/// matching on it.
+/// request carried, nor the principal the trust policy is missing, nor the feature that was
+/// named — it reports only that the value does not carry what the role integration needs — so
+/// it is a constant rather than a `format!` over the request, and the cardinality of the text
+/// stays at one for a client matching on it.
 pub const ROLE_NOT_TRUSTED_MESSAGE: &str = "IAM role ARN value is invalid or does not \
                                             include the required permissions for: \
                                             AWS_ROLE_INTEGRATION";

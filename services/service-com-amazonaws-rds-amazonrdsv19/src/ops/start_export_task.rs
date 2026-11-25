@@ -681,7 +681,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the file that says what was exported beside them. The objects are recorded in
         // Amazon S3's own store, so what this writes is what a caller's own `ListObjectsV2`
         // and `GetObject` then serve.
-        let tables = match source.database.clone() {
+        let read_source = match source.database.clone() {
             Some(database) => {
                 // Reading the source's tables and encoding them as Parquet is ENGINE work:
                 // blocking and CPU-bound, like the copy a snapshot takes
@@ -692,11 +692,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let under = prefix.clone();
                 let part = part_file.clone();
                 let read = ::tokio::task::spawn_blocking(move || {
-                    crate::state::exported_tables(&database, wire, &only, &under, &part)
+                    crate::state::exported_source(&database, wire, &only, &under, &part)
                 })
                 .await;
                 match read {
-                    Ok(tables) => tables,
+                    Ok(read) => read,
                     Err(error) => {
                         return failed_to_read(
                             &state,
@@ -708,8 +708,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // A source this emulator holds no database for has no table to export: the
             // export writes the file that says so rather than inventing data.
-            None => Vec::new(),
+            None => crate::state::ExportedSource::default(),
         };
+        let tables = &read_source.tables;
         let mut objects: Vec<crate::state::ExportedObject> = tables
             .iter()
             .map(|table| crate::state::ExportedObject {
@@ -737,7 +738,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             body: crate::state::tables_info_document(
                 &summary,
-                &tables,
+                &read_source,
                 started,
                 ::std::time::SystemTime::now(),
             )
@@ -750,7 +751,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             key: crate::state::export_info_key(&prefix, &input.export_task_identifier),
             body: crate::state::export_info_document(
                 &summary,
-                &tables,
+                tables,
                 started,
                 ::std::time::SystemTime::now(),
             )
