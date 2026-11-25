@@ -32,3 +32,26 @@ Actual (emulator): `Error: Check timed out after 600.0s` — no message was ever
 2. PutTargets: one target with an InputTransformer onto the first queue, one target configured to reject with a DeadLetterConfig naming the DLQ.
 3. RunInstances a t3.micro, wait for `running`, then StopInstances/TerminateInstances.
 4. ReceiveMessage on both queues — nothing arrives.
+
+## Resolution
+
+The reported cause does not hold in the current tree: every move of an instance IS published and
+IS fanned out to each target of a rule that matches it, in the form that target asked for, and a
+delivery the target's own service refuses IS written to the queue that target's `DeadLetterConfig`
+names. The emission the issue asks for was built since the commit it was filed against (the
+instance-lifecycle emitter now lives beside this service's state, and EventBridge's target delivery
+already applied a target's `InputTransformer` and dead-lettered a refused delivery), so nothing in
+the implementation had to change.
+
+The recorded check replays and passes against this tree.
+
+Pinned, so it cannot regress unnoticed, by
+core/router/tests/all/ec2_instance_state_change_transformed_delivery_and_dead_letters.rs: one rule
+on the default bus matching `aws.ec2` / `EC2 Instance State-change Notification` with four targets —
+one that asked for nothing of its own, one carrying an `InputTransformer`, and two whose delivery
+Amazon SQS refuses (a queue that granted this service nothing, and a queue ARN nothing was ever
+created for), both naming one dead-letter queue — driven over the whole lifecycle of one instance
+(a launch, a stop, a start and a termination). Each move's events are asserted on all four targets
+at once: the envelope on the plain target, the transformer's rendering on the transformed one,
+nothing on the refusing target's own queue, and one dead letter per refusing target carrying the
+SAME event id the plain target saw beside the rule, the target and the refusing service's answer.
