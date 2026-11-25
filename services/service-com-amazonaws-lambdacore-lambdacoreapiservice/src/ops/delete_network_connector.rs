@@ -252,8 +252,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // configuration, so there is none left to report.
                         configuration: None,
                         operator_role: None,
-                        // The connector itself was unaffected either time.
-                        state: Some(connector.state.clone()),
+                        // The acknowledged state is the one the deletion of
+                        // what this request targeted left it in, which the
+                        // earlier delete of the same version already reported
+                        // and a repeat of it answers unchanged.
+                        state: Some(crate::state::STATE_DELETING.to_string()),
                     });
                 }
                 return Err(DeleteNetworkConnectorErrorModeled::ResourceNotFoundException(
@@ -261,6 +264,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
+            // The deletion this call accepted is the deletion of the VERSION
+            // the identifier qualified, so that version is the resource whose
+            // state the answer reports — "the State field is typically DELETING
+            // after this call", the state of a resource "being deleted,
+            // cleaning up resources". The connector itself is unaffected and
+            // keeps its own state, which every report OF THE CONNECTOR carries.
             let output = DeleteNetworkConnectorOutput {
                 arn: connector.arn.clone(),
                 name: connector.name.clone(),
@@ -269,9 +278,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 version: Some(version.version),
                 configuration: Some(version.configuration.clone()),
                 operator_role: version.operator_role.clone(),
-                // The connector itself is unaffected, so its state is the one
-                // this answer reports.
-                state: Some(connector.state.clone()),
+                state: Some(crate::state::STATE_DELETING.to_string()),
             };
             let name = connector.name.clone();
             // A client token that produced the version just removed no longer

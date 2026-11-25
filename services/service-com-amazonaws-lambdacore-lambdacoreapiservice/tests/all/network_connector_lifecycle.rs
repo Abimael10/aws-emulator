@@ -223,7 +223,10 @@ fn listed_names(answer: &Answer) -> Vec<String> {
 }
 
 /// The version numbers `ListNetworkConnectorVersions` reported, in order.
-fn listed_versions(answer: &Answer) -> Vec<i64> {
+///
+/// `pub(crate)` with the rest of the harness: a sibling suite that has to say which versions
+/// a connector still holds reads them the same way rather than keeping a second copy.
+pub(crate) fn listed_versions(answer: &Answer) -> Vec<i64> {
     answer.body["NetworkConnectorVersions"]
         .as_array()
         .unwrap_or_else(|| {

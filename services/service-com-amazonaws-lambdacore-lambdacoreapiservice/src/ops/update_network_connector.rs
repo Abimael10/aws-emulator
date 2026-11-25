@@ -445,8 +445,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // it carries the connector's state once the update finishes.
                 state: crate::state::STATE_PENDING.to_string(),
                 // The event that put this version in that state is this
-                // configuration update, which is what `StateReason` explains.
-                state_reason: Some(crate::state::STATE_REASON_CONFIGURATION_UPDATE.to_string()),
+                // configuration update, which is what `StateReason` explains —
+                // the SAME event the connector's own `StateReason` states
+                // below, so one narrative explains both records.
+                state_reason: Some(crate::state::STATE_REASON_UPDATE_INITIATED.to_string()),
                 pending: Some(crate::state::PendingTransition {
                     due: settles_at,
                     change: crate::state::PendingChange::State(

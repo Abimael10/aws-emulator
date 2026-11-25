@@ -42,11 +42,12 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::lifecycle_convergence::{reschedule, ALREADY_DUE, NOT_YET_DUE};
 use super::network_connector_lifecycle::{
-    at, create, delete, emulator, emulator_with_engine, expected_arn, get, list,
-    minimal_configuration, minimal_create, provisioned, text, update, vpc_egress, Answer,
-    OPERATOR_ROLE,
+    at, create, delete, emulator, emulator_with_engine, expected_arn, get, list, list_versions,
+    listed_versions, minimal_configuration, minimal_create, provisioned, text, update, vpc_egress,
+    Answer, OPERATOR_ROLE,
 };
 use super::not_found_message::{expected_message, expected_update_message};
+use super::timestamp_and_state_reason_wire::NamedBy;
 
 /// The state `DeleteNetworkConnectorResponse$State` reports — "the State field is typically
 /// `DELETING` after this call" — and the state a connector whose deletion completed last
@@ -605,4 +606,140 @@ async fn the_first_read_after_a_transition_falls_due_reports_the_reached_state()
         &after_delete,
         "settling",
     );
+}
+
+/// What a row's delete addresses: the whole connector, or one historical version of it —
+/// "deleting with an unqualified identifier removes the connector and all of its versions.
+/// To remove a single historical version, supply its version-qualified ARN".
+#[derive(Clone, Copy, Debug)]
+enum Target {
+    Connector,
+    Version(i64),
+}
+
+/// The identifier a row sends: the connector spelled the way `form` names it (every form
+/// `NetworkConnectorIdentifier` accepts, from the shared [`NamedBy`] set), with the immutable
+/// version suffix appended when the row targets one version.
+fn addressed(form: NamedBy, name: &str, id: &str, arn: &str, target: Target) -> String {
+    let connector = match form {
+        NamedBy::Name => name.to_string(),
+        NamedBy::Id => id.to_string(),
+        NamedBy::Arn => arn.to_string(),
+    };
+    match target {
+        Target::Connector => connector,
+        Target::Version(version) => format!("{connector}:{version}"),
+    }
+}
+
+/// RULE 3: the `202` an accepted delete answers with acknowledges the state the deletion put
+/// the resource the request TARGETED in — `DELETING`, which
+/// `NetworkConnectorState$DELETING` documents as "being deleted, cleaning up resources" —
+/// never the state that resource, or the resource containing it, held before the call. A
+/// version-scoped delete therefore acknowledges `DELETING` for the version it removes while
+/// the connector itself is "unaffected" and goes on reporting its own state.
+///
+/// The rows span what the rule generalises over: what the delete targets (the whole
+/// connector, or one of its historical versions — the first, a middle one and the last
+/// historical one), how many versions the connector holds, and which identifier form
+/// addresses it. The repeat of each version-scoped row also goes through the idempotent arm,
+/// which acknowledges the same state.
+#[tokio::test]
+async fn an_accepted_delete_acknowledges_the_deleting_state_of_what_it_targeted() {
+    let rows: [(&str, usize, Target, NamedBy); 7] = [
+        ("the whole connector, one version, by name", 0, Target::Connector, NamedBy::Name),
+        ("the whole connector, two versions, by id", 1, Target::Connector, NamedBy::Id),
+        (
+            "the whole connector, four versions, by unqualified ARN",
+            3,
+            Target::Connector,
+            NamedBy::Arn,
+        ),
+        ("the first of three versions, by qualified ARN", 2, Target::Version(1), NamedBy::Arn),
+        ("the second of three versions, by qualified name", 2, Target::Version(2), NamedBy::Name),
+        ("the first of four versions, by qualified id", 3, Target::Version(1), NamedBy::Id),
+        ("the third of four versions, by qualified ARN", 3, Target::Version(3), NamedBy::Arn),
+    ];
+
+    for (index, (case, extra_versions, target, form)) in rows.iter().enumerate() {
+        let router = emulator();
+        let name = format!("acknowledged-{index}");
+        let id = active_connector(&router, &name, &["subnet-0123456789abcdef0"]).await;
+        let arn = expected_arn(&id);
+        append_versions(&router, &name, *extra_versions).await;
+
+        let identifier = addressed(*form, &name, &id, &arn, *target);
+        let accepted = delete(&router, &identifier).await;
+        assert_eq!(
+            accepted.status, 202,
+            "case {case:?}: deleting {identifier:?} is accepted, got {} with {:?}",
+            accepted.status, accepted.body
+        );
+        assert_eq!(
+            text(&accepted.body, "/State"),
+            DELETING,
+            "case {case:?}: the acknowledgement of the delete of {identifier:?} reports the \
+             state the deletion put it in, got {:?}",
+            at(&accepted.body, "/State")
+        );
+
+        match target {
+            // The whole connector is what the deletion is cleaning up, so every report of
+            // it carries that state too for as long as the record is there.
+            Target::Connector => {
+                let reported = get(&router, &name).await;
+                assert_eq!(
+                    text(&reported.body, "/State"),
+                    DELETING,
+                    "case {case:?}: the connector the delete accepted reports the same state \
+                     the acknowledgement did, got {:?}",
+                    at(&reported.body, "/State")
+                );
+            }
+            Target::Version(version) => {
+                assert_eq!(
+                    at(&accepted.body, "/Version"),
+                    json!(version),
+                    "case {case:?}: the answer reports the version the request addressed, \
+                     got {:?}",
+                    at(&accepted.body, "/Version")
+                );
+                // "The connector and its remaining versions are unaffected": the connector
+                // keeps the state it had, which is NOT the state the acknowledgement
+                // reported for the version it removed.
+                let reported = get(&router, &name).await;
+                assert_eq!(
+                    text(&reported.body, "/State"),
+                    "ACTIVE",
+                    "case {case:?}: a version-scoped delete leaves the connector unaffected, \
+                     got {:?}",
+                    at(&reported.body, "/State")
+                );
+                let remaining = list_versions(&router, &name, "").await;
+                let numbers = listed_versions(&remaining);
+                assert!(
+                    !numbers.contains(version),
+                    "case {case:?}: the version the delete removed is gone from the listing, \
+                     got {numbers:?}"
+                );
+                // The repeat, through the idempotent arm: "calling delete on a connector
+                // that is already deleting or has been deleted succeeds without error", and
+                // it acknowledges the same state as the delete it repeats.
+                let repeated = delete(&router, &identifier).await;
+                assert_eq!(
+                    repeated.status, 202,
+                    "case {case:?}: repeating the delete of {identifier:?} succeeds, got {} \
+                     with {:?}",
+                    repeated.status, repeated.body
+                );
+                assert_eq!(
+                    text(&repeated.body, "/State"),
+                    DELETING,
+                    "case {case:?}: the repeat acknowledges the same state the first delete \
+                     did, got {:?}",
+                    at(&repeated.body, "/State")
+                );
+            }
+        }
+    }
 }

@@ -455,15 +455,18 @@ const CHANGED_OPERATOR_ROLE: &str =
 
 /// How a case names the connector: every form `UpdateNetworkConnector` accepts ("you can
 /// specify the connector ID, name, or full ARN").
+///
+/// `pub(crate)` with [`EVERY_FORM`]: a sibling suite that varies which spelling addresses the
+/// connector uses this one rather than keeping a second copy of the form set.
 #[derive(Clone, Copy, Debug)]
-enum NamedBy {
+pub(crate) enum NamedBy {
     Name,
     Id,
     Arn,
 }
 
 /// Every form, so no row's shape can be special-cased.
-const EVERY_FORM: [NamedBy; 3] = [NamedBy::Name, NamedBy::Id, NamedBy::Arn];
+pub(crate) const EVERY_FORM: [NamedBy; 3] = [NamedBy::Name, NamedBy::Id, NamedBy::Arn];
 
 /// The connector's identity as the create reported it, in each form an identifier takes.
 struct Identity {
@@ -833,4 +836,219 @@ async fn an_update_narrative_is_reported_only_where_an_update_status_is() {
          got {:?}",
         at(&reported.body, "/LastUpdateStatusReason")
     );
+}
+
+/// The `State` and `StateReason` the versions listing reports for the version numbered
+/// `version`, found by its `Version` member rather than by a position a case assumed.
+fn listed_version(case: &str, versions: &Answer, version: i64) -> (String, String) {
+    assert_eq!(
+        versions.status, 200,
+        "case {case:?}: expected HTTP 200 from ListNetworkConnectorVersions, got {} with {:?}",
+        versions.status, versions.body
+    );
+    let entries = versions.body["NetworkConnectorVersions"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: ListNetworkConnectorVersions must return a list, got {:?}",
+                versions.body
+            )
+        });
+    let index = entries
+        .iter()
+        .position(|summary| summary["Version"].as_i64() == Some(version))
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: the listing must report version {version}, got {:?}",
+                versions.body
+            )
+        });
+    state_and_reason(
+        case,
+        &versions.body,
+        &format!("/NetworkConnectorVersions/{index}"),
+    )
+}
+
+/// RULE 2 across the resources ONE lifecycle event touches: an event has one narrative, so
+/// the version an update appends ("each configuration update creates a new immutable
+/// version") reports the same `StateReason` for it as the connector that update moved, and
+/// not a second, differently worded text.
+///
+/// The rows span what the rule generalises over: what the update changed (each member
+/// `UpdateNetworkConnector` takes, alone and together), which identifier form named the
+/// connector, which side of the instant the appended version's own provisioning falls due
+/// the listing is taken on, and how many times the listing is re-read (a read neither
+/// rewrites nor spends the narrative).
+#[tokio::test]
+async fn the_version_an_update_appends_reports_that_updates_narrative() {
+    for (change, request) in changing_requests() {
+        for form in EVERY_FORM {
+            let case = format!("{change}, named by {form:?}");
+            let (router, engine) = emulator_with_engine();
+            let connector =
+                connector_ready_to_update(&router, &engine, &case, "narrated-version").await;
+
+            // What version 1 carries before any update: the creation that minted it, which
+            // is the narrative the update must NOT leave on the version it appends.
+            let before = list_versions(&router, &connector.name, "").await;
+            let (_, creation_narrative) = listed_version(&case, &before, 1);
+
+            let updated = update(&router, connector.spelled(form), request.clone()).await;
+            assert_eq!(
+                updated.status, 202,
+                "case {case:?}: the update is accepted, got {} with {:?}",
+                updated.status, updated.body
+            );
+
+            for (phase, expected_state, due) in [
+                ("in flight", "PENDING", SystemTime::now() + NOT_YET_DUE),
+                ("settled", "ACTIVE", SystemTime::now() - ALREADY_DUE),
+            ] {
+                reschedule(&engine, &connector.name, &case, due);
+                for look in 1..=2 {
+                    let case = format!("{case}, {phase}, look {look}");
+                    let versions = list_versions(&router, &connector.name, "").await;
+                    let (state, appended_narrative) = listed_version(&case, &versions, 2);
+                    assert_eq!(
+                        state, expected_state,
+                        "case {case:?}: the appended version's own provisioning decides its \
+                         state, got {state:?}"
+                    );
+                    assert_eq!(
+                        appended_narrative, UPDATE_INITIATED_NARRATIVE,
+                        "case {case:?}: the version the update created is explained by that \
+                         update, not by {creation_narrative:?}, got {appended_narrative:?}"
+                    );
+                    let reported = get(&router, &connector.name).await;
+                    assert_eq!(
+                        appended_narrative,
+                        text(&reported.body, "/StateReason"),
+                        "case {case:?}: the update is one event, so the version it created \
+                         and the connector it moved report one narrative for it, got \
+                         {appended_narrative:?} and {:?}",
+                        at(&reported.body, "/StateReason")
+                    );
+                    // The update was not the event that put version 1 where it is, so that
+                    // version keeps the narrative of the event that did.
+                    let (_, first_narrative) = listed_version(&case, &versions, 1);
+                    assert_eq!(
+                        first_narrative, creation_narrative,
+                        "case {case:?}: a version the update did not touch keeps its own \
+                         narrative, got {first_narrative:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// RULE 2 over time: the narrative is a property of the RECORD, so every later listing
+/// reports the one stored for that version — through further updates, through the
+/// version-scoped delete of another version ("the connector and its remaining versions are
+/// unaffected") and through the connector's own move to `DELETING`, which restates the
+/// connector's narrative and leaves each version's alone.
+#[tokio::test]
+async fn a_versions_narrative_is_reported_unchanged_by_later_activity() {
+    let case = "later activity on the connector";
+    let (router, engine) = emulator_with_engine();
+    let connector = connector_ready_to_update(&router, &engine, case, "narrated-history").await;
+    let before = list_versions(&router, &connector.name, "").await;
+    let (_, creation_narrative) = listed_version(case, &before, 1);
+
+    // Three updates, each a configuration the connector does not already hold, so each
+    // appends a version of its own: versions 2, 3 and 4.
+    for subnet in [
+        "subnet-0fedcba9876543210",
+        "subnet-00112233445566778",
+        "subnet-0a1b2c3d4e5f60718",
+    ] {
+        let answered = update(
+            &router,
+            &connector.name,
+            json!({ "Configuration": vpc_egress(&[subnet], &[], None, None) }),
+        )
+        .await;
+        assert_eq!(
+            answered.status, 202,
+            "case {case:?}: the update to {subnet:?} is accepted, got {} with {:?}",
+            answered.status, answered.body
+        );
+    }
+    reschedule(&engine, &connector.name, case, SystemTime::now() - ALREADY_DUE);
+
+    // Every version an update appended is explained by an update; the one the create minted
+    // still by the creation.
+    let updated_versions = [2, 3, 4];
+    let listed = list_versions(&router, &connector.name, "").await;
+    for version in updated_versions {
+        let case = format!("{case}, version {version} after three updates");
+        let (_, narrative) = listed_version(&case, &listed, version);
+        assert_eq!(
+            narrative, UPDATE_INITIATED_NARRATIVE,
+            "case {case:?}: each version an update created reports that update, got \
+             {narrative:?}"
+        );
+    }
+    let (_, first_narrative) = listed_version(case, &listed, 1);
+    assert_eq!(
+        first_narrative, creation_narrative,
+        "case {case:?}: the version the create minted still reports the creation, got \
+         {first_narrative:?}"
+    );
+
+    // A version-scoped delete of two other versions is unrelated activity: what is left is
+    // reported exactly as it was stored.
+    for removed in [1, 2] {
+        let answered = delete(&router, &format!("{}:{removed}", connector.arn)).await;
+        assert_eq!(
+            answered.status, 202,
+            "case {case:?}: deleting version {removed} is accepted, got {} with {:?}",
+            answered.status, answered.body
+        );
+        let remaining = list_versions(&router, &connector.name, "").await;
+        for version in updated_versions.iter().filter(|left| **left > removed) {
+            let case = format!("{case}, version {version} after version {removed} was deleted");
+            let (_, narrative) = listed_version(&case, &remaining, *version);
+            assert_eq!(
+                narrative, UPDATE_INITIATED_NARRATIVE,
+                "case {case:?}: the narrative stored for a version survives a delete of \
+                 another version, got {narrative:?}"
+            );
+        }
+    }
+
+    // And the connector's own transition: it restates the CONNECTOR's narrative, while each
+    // remaining version keeps the one the event that created it stated.
+    let deleted = delete(&router, &connector.name).await;
+    assert_eq!(
+        deleted.status, 202,
+        "case {case:?}: deleting the connector is accepted, got {} with {:?}",
+        deleted.status, deleted.body
+    );
+    // The record is there for as long as the clock owes its removal, which the case holds
+    // open rather than racing.
+    reschedule(&engine, &connector.name, case, SystemTime::now() + NOT_YET_DUE);
+    let reported = get(&router, &connector.name).await;
+    let (connector_state, connector_narrative) =
+        state_and_reason(case, &reported.body, "");
+    assert_eq!(
+        connector_state, "DELETING",
+        "case {case:?}: the delete moved the connector, got {connector_state:?}"
+    );
+    assert_ne!(
+        connector_narrative, UPDATE_INITIATED_NARRATIVE,
+        "case {case:?}: the connector's latest event is its deletion, so its narrative \
+         states that instead, got {connector_narrative:?}"
+    );
+    let remaining = list_versions(&router, &connector.name, "").await;
+    for version in [3, 4] {
+        let case = format!("{case}, version {version} while the connector is DELETING");
+        let (_, narrative) = listed_version(&case, &remaining, version);
+        assert_eq!(
+            narrative, UPDATE_INITIATED_NARRATIVE,
+            "case {case:?}: the connector's own transition does not rewrite a version's \
+             narrative, got {narrative:?}"
+        );
+    }
 }

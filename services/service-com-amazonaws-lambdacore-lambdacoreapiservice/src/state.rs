@@ -65,19 +65,20 @@ pub const STATE_FAILED: &str = "FAILED";
 /// because the creation that started it finished.
 pub const STATE_REASON_INITIAL_CREATION: &str = "Initial creation";
 
-/// The `StateReason` a version appended by `UpdateNetworkConnector` carries: "each
-/// configuration update creates a new immutable version", so that update is the event
-/// that put the new version in its state.
-pub const STATE_REASON_CONFIGURATION_UPDATE: &str = "Configuration update";
-
 /// The `StateReason` a connector carries once `DeleteNetworkConnector` moved it to
 /// `DELETING`: the deletion is the event that put it there.
 pub const STATE_REASON_DELETION_REQUESTED: &str = "Deletion requested";
 
-/// The `StateReason` a connector carries once `UpdateNetworkConnector` accepted a
-/// configuration change: "each configuration update creates a new immutable version", so
-/// that update is the latest event in the connector's own lifecycle and therefore what its
-/// `StateReason` explains until another event sets a new state.
+/// The `StateReason` of the transition `UpdateNetworkConnector` accepts, recorded on EVERY
+/// resource that transition put in its state: the connector itself and the version the
+/// update appends ("each configuration update creates a new immutable version").
+///
+/// `StateReason` is "a human-readable explanation of the current state", so the text names
+/// the lifecycle EVENT behind the state — and one event has ONE narrative. The connector the
+/// update moved and the version that update created were both put where they are by the same
+/// accepted update, so each of them reports this text rather than a second, differently
+/// worded one. The narrative is a property of the record, so it survives unrelated later
+/// activity on the connector and changes only when another event sets a new state.
 pub const STATE_REASON_UPDATE_INITIATED: &str = "Update initiated";
 
 /// `NetworkConnectorLastUpdateStatus$InProgress`.
