@@ -410,13 +410,17 @@ async fn a_policy_granting_to_a_role_the_stack_creates_is_set_on_the_repository(
 /// Deploy `template` as stack `name` and answer the status it SETTLES on, through the
 /// suite-wide waiter: what a case asserts is the CONDITION, never how long the emulator
 /// took to reach it.
+///
+/// `extra` is whatever else the stack operation states beside its template — the stack's own
+/// `Tags`, for a case about what CloudFormation gives the resources it creates.
 async fn deploy_until_settled(
     case: &str,
     router: &MultiServiceRouter,
     name: &str,
     template: &str,
+    extra: &[(String, String)],
 ) -> (String, Option<String>) {
-    let (status, body) = create_stack(router, name, template, &[]).await;
+    let (status, body) = create_stack(router, name, template, extra).await;
     assert_eq!(status, 200, "CreateStack({name}) answered {status}: {body}");
     let settled = settled_stack_status(case, router, REGION, name).await;
     let (_, body) = describe_stack(router, name).await;
@@ -587,7 +591,7 @@ async fn a_declared_lifecycle_policy_is_put_on_the_created_repository() {
     for (index, (case, template, declared_name, expected)) in rows.iter().enumerate() {
         let router = router();
         let stack = format!("ecr-lifecycle-stack-{index}");
-        let (status, reason) = deploy_until_settled(case, &router, &stack, template).await;
+        let (status, reason) = deploy_until_settled(case, &router, &stack, template, &[]).await;
         assert_eq!(
             status, "CREATE_COMPLETE",
             "case {case:?}: expected the create to complete, got {status:?} ({reason:?})"
@@ -666,7 +670,8 @@ async fn a_lifecycle_policy_declaring_no_document_fails_the_deployment() {
 
         let router = router();
         let stack = format!("ecr-lifecycle-refused-stack-{index}");
-        let (status, reason) = deploy_until_settled(case, &router, &stack, &template).await;
+        let (status, reason) =
+            deploy_until_settled(case, &router, &stack, &template, &[]).await;
         assert_eq!(
             status, "ROLLBACK_COMPLETE",
             "case {case:?}: expected the failed create to be rolled back, got {status:?} \
@@ -724,7 +729,7 @@ async fn a_lifecycle_policy_naming_another_registry_is_refused_by_ecr() {
     let case = "a lifecycle policy named for another account's registry";
     let router = router();
     let stack = "ecr-foreign-registry-stack";
-    let (status, reason) = deploy_until_settled(case, &router, stack, &template).await;
+    let (status, reason) = deploy_until_settled(case, &router, stack, &template, &[]).await;
     assert_eq!(
         status, "ROLLBACK_COMPLETE",
         "case {case:?}: expected the failed create to be rolled back, got {status:?} \
@@ -779,19 +784,17 @@ async fn deleting_the_stack_deletes_the_repository_it_created() {
 
 /// Deploy `template` on the stack `name` as an UPDATE and answer the status it SETTLES on,
 /// through the suite-wide waiter — the companion of [`deploy_until_settled`] for the second
-/// deployment of one stack.
+/// deployment of one stack, taking the same `extra` members beside the template.
 async fn update_until_settled(
     case: &str,
     router: &MultiServiceRouter,
     name: &str,
     template: &str,
+    extra: &[(String, String)],
 ) -> (String, Option<String>) {
-    let (status, body) = call(
-        router,
-        "UpdateStack",
-        &[member("StackName", name), member("TemplateBody", template)],
-    )
-    .await;
+    let mut members = vec![member("StackName", name), member("TemplateBody", template)];
+    members.extend_from_slice(extra);
+    let (status, body) = call(router, "UpdateStack", &members).await;
     assert_eq!(status, 200, "UpdateStack({name}) answered {status}: {body}");
     let settled = settled_stack_status(case, router, REGION, name).await;
     let (_, body) = describe_stack(router, name).await;
@@ -881,14 +884,26 @@ async fn a_changed_lifecycle_policy_is_applied_to_the_repository_the_stack_alrea
     for (index, (case, name, created, updated, expected)) in rows.iter().enumerate() {
         let router = router();
         let stack = format!("ecr-lifecycle-update-stack-{index}");
-        let (status, reason) =
-            deploy_until_settled(case, &router, &stack, &declaration(name, created.as_ref())).await;
+        let (status, reason) = deploy_until_settled(
+            case,
+            &router,
+            &stack,
+            &declaration(name, created.as_ref()),
+            &[],
+        )
+        .await;
         assert_eq!(
             status, "CREATE_COMPLETE",
             "case {case:?}: expected the create to complete, got {status:?} ({reason:?})"
         );
-        let (status, reason) =
-            update_until_settled(case, &router, &stack, &declaration(name, updated.as_ref())).await;
+        let (status, reason) = update_until_settled(
+            case,
+            &router,
+            &stack,
+            &declaration(name, updated.as_ref()),
+            &[],
+        )
+        .await;
         assert_eq!(
             status, "UPDATE_COMPLETE",
             "case {case:?}: expected the update to complete, got {status:?} ({reason:?})"
@@ -915,5 +930,195 @@ async fn a_changed_lifecycle_policy_is_applied_to_the_repository_the_stack_alrea
                  {held:?}"
             ),
         }
+    }
+}
+
+/// The resource-based policy Amazon ECR holds for `name`, or the refusal code it answers
+/// with — the companion of [`lifecycle_policy`] for the type's other policy document.
+async fn repository_policy(router: &MultiServiceRouter, name: &str) -> Result<Value, String> {
+    let (status, body) = ecr(
+        router,
+        "GetRepositoryPolicy",
+        &json!({"repositoryName": name}),
+    )
+    .await;
+    if status == 200 {
+        let text = body["policyText"].as_str().unwrap_or_default();
+        return Ok(serde_json::from_str(text).unwrap_or(Value::Null));
+    }
+    Err(body["__type"]
+        .as_str()
+        .unwrap_or_default()
+        .rsplit('#')
+        .next()
+        .unwrap_or_default()
+        .to_string())
+}
+
+/// The value the repository `name` carries for the tag `key`, as Amazon ECR reports the tags
+/// of the repository's ARN, or `None` when it carries no such tag.
+async fn repository_tag(router: &MultiServiceRouter, name: &str, key: &str) -> Option<String> {
+    let arn = repository(router, name)
+        .await?
+        .get("repositoryArn")?
+        .as_str()?
+        .to_string();
+    let (status, body) = ecr(
+        router,
+        "ListTagsForResource",
+        &json!({"resourceArn": arn}),
+    )
+    .await;
+    if status != 200 {
+        return None;
+    }
+    body["tags"]
+        .as_array()?
+        .iter()
+        .find(|tag| tag["Key"].as_str() == Some(key))
+        .and_then(|tag| tag["Value"].as_str())
+        .map(str::to_string)
+}
+
+/// RULE: a later deployment states only what it CHANGES, so a nested settings document the
+/// owning service configures through a call of its own stays on the resource the stack
+/// already has when the new declaration does not restate it — a repository created with a
+/// `LifecyclePolicy` and a `RepositoryPolicyText` still answers a read of each after a
+/// deployment that changed something else, while the change that deployment DID state reaches
+/// the repository.
+#[tokio::test]
+async fn a_declared_lifecycle_policy_outlives_a_deployment_that_changes_something_else() {
+    // The policy an image-expiry declaration carries: one rule, counted in days since the
+    // image was pushed, which is the form the lifecycle policy format publishes for a
+    // repository that reaps untagged images ([`lifecycle_rule`]).
+    let lifecycle = json!({"rules": [lifecycle_rule(
+        1,
+        "Expire untagged images after 1 day",
+        json!({
+            "tagStatus": "untagged",
+            "countType": "sinceImagePushed",
+            "countUnit": "days",
+            "countNumber": 1,
+        }),
+    )]});
+    let access = json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "AllowPull",
+            "Effect": "Allow",
+            "Principal": {"AWS": format!("arn:aws:iam::{ACCOUNT_ID}:root")},
+            "Action": "ecr:BatchGetImage",
+        }],
+    });
+
+    // The declaration both deployments of a row share, with the properties the SECOND one
+    // states differently merged over it. The lifecycle document travels as the JSON TEXT a
+    // template usually writes it as, which is how the policy read answers it back.
+    let declaration = |name: &str, changed: &Value| {
+        let mut properties = json!({
+            "RepositoryName": name,
+            "ImageTagMutability": "IMMUTABLE",
+            "LifecyclePolicy": {"LifecyclePolicyText": lifecycle.to_string()},
+            "RepositoryPolicyText": access.clone(),
+        });
+        for (property, value) in changed.as_object().into_iter().flatten() {
+            properties[property.as_str()] = value.clone();
+        }
+        json!({
+            "Resources": {"Registry": {
+                "Type": "AWS::ECR::Repository",
+                "Properties": properties,
+            }},
+        })
+        .to_string()
+    };
+    // The key the stack's own tags are stated under, which CloudFormation propagates to the
+    // resources it creates.
+    let stack_tag_key = "Owner";
+    // (case, the repository's name, what the second deployment states differently in the
+    // declaration, the stack tag value each of the two deployments states)
+    let rows: Vec<(&str, &str, Value, (&str, &str))> = vec![
+        (
+            "the stack's own tags, the resource's declaration unchanged",
+            "cfn-retagged-lifecycle",
+            json!({}),
+            ("toolkit", "platform"),
+        ),
+        (
+            "the repository's tag mutability",
+            "cfn-remutable-lifecycle",
+            json!({"ImageTagMutability": "MUTABLE"}),
+            ("toolkit", "toolkit"),
+        ),
+        (
+            "the repository's scanning configuration",
+            "cfn-scanned-lifecycle",
+            json!({"ImageScanningConfiguration": {"ScanOnPush": true}}),
+            ("toolkit", "toolkit"),
+        ),
+        (
+            "the repository's own tags",
+            "cfn-tagged-lifecycle",
+            json!({"Tags": [{"Key": "team", "Value": "images"}]}),
+            ("toolkit", "toolkit"),
+        ),
+    ];
+
+    for (index, (case, name, changed, (created_tag, updated_tag))) in rows.iter().enumerate() {
+        let router = router();
+        let stack = format!("ecr-lifecycle-kept-stack-{index}");
+        let stack_tag = |value: &str| {
+            vec![
+                member("Tags.member.1.Key", stack_tag_key),
+                member("Tags.member.1.Value", value),
+            ]
+        };
+        let (status, reason) = deploy_until_settled(
+            case,
+            &router,
+            &stack,
+            &declaration(name, &json!({})),
+            &stack_tag(created_tag),
+        )
+        .await;
+        assert_eq!(
+            status, "CREATE_COMPLETE",
+            "case {case:?}: expected the create to complete, got {status:?} ({reason:?})"
+        );
+        let (status, reason) = update_until_settled(
+            case,
+            &router,
+            &stack,
+            &declaration(name, changed),
+            &stack_tag(updated_tag),
+        )
+        .await;
+        assert_eq!(
+            status, "UPDATE_COMPLETE",
+            "case {case:?}: expected the update to complete, got {status:?} ({reason:?})"
+        );
+
+        // Neither document was restated, so both are still the ones the create put there.
+        let held = lifecycle_policy(&router, name).await;
+        assert_eq!(
+            held.as_ref().ok(),
+            Some(&lifecycle),
+            "case {case:?}: expected {name} to keep the declared lifecycle policy, got {held:?}"
+        );
+        let held = repository_policy(&router, name).await;
+        assert_eq!(
+            held.as_ref().ok(),
+            Some(&access),
+            "case {case:?}: expected {name} to keep the declared repository policy, got {held:?}"
+        );
+        // ...and the one thing the deployment DID state reached the repository, so the kept
+        // documents are not a deployment that passed the resource by.
+        let carried = repository_tag(&router, name, stack_tag_key).await;
+        assert_eq!(
+            carried.as_deref(),
+            Some(*updated_tag),
+            "case {case:?}: expected {name} to carry the stack tag {updated_tag:?} the second \
+             deployment states, got {carried:?}"
+        );
     }
 }
