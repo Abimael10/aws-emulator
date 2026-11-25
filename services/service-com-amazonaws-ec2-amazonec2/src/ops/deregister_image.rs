@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeregisterImage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeregisterImage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: deregisters the AMI the request names — the image leaves the images the
+//! account can see, into the Recycle Bin for as long as a retention rule of the account
+//! retains it and permanently otherwise, with the snapshots its own Amazon EBS devices
+//! restore from deleted where the request asked for that and no other registered AMI still
+//! restores a device from them. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeregisterImage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every refusal is minted before the first write, so `DryRun` answers `DryRunOperation` only
+//! for a request that would otherwise have succeeded, and nothing this operation reports is a
+//! value the store does not back: `Return` is answered for a deregistration this store
+//! carried out, and each snapshot result for a snapshot this store held.
 //!
 //! ## Shape of an operation
 //!
@@ -156,10 +157,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; the image is named by id and resolved against
-        // the store the engine on `self` holds.
-        let _ = ctx;
         use crate::state;
+
+        // The Region of the request's credential scope: the AMI is named by id alone, so
+        // WHICH image this deregisters does not depend on it; it is read only to find the
+        // Recycle Bin retention rules in force, which exist in one Region each.
+        let region = state::request_region(ctx.parts());
 
         // "The ID of the AMI" (`ImageId`) is `@required` but modelled `clientOptional`, so a
         // request that left it out reaches this handler as an empty string rather than being
@@ -176,15 +179,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(state::invalid_ami_id_malformed(&input.image_id));
         }
 
-        // "Checks whether you have the required permissions for the action, WITHOUT
-        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
-        // required permissions, the error response is DryRunOperation. Otherwise, it is
-        // UnauthorizedOperation" (`DryRun`): a question about the CALLER, answered once the
-        // request's own form has been read and before anything is resolved or written.
-        if input.dry_run.unwrap_or(false) {
-            return Err(state::dry_run_operation());
-        }
-
         let handle = state::require_service_state(&*self.engine)?;
         let mut store = handle.lock();
         // A move the clock already owes a record of this store fell due whether or not
@@ -196,15 +190,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a well-formed AMI id the account holds no image under carries the malformed code,
         // so a caller cannot learn from it which AMI ids exist — and both halves say the same
         // thing about the same value, through the one place this crate words that refusal.
-        if !store.images.contains_key(&input.image_id) {
-            return Err(state::invalid_ami_id_malformed(&input.image_id));
+        let image = store
+            .images
+            .get(&input.image_id)
+            .ok_or_else(|| state::invalid_ami_id_malformed(&input.image_id))?;
+        // "Only the owner of an AMI can deregister it": an image the account can see but
+        // does not own — a public AMI another account published — exists and the caller
+        // simply has no permission on it, which is the refusal every image change of this
+        // crate answers for that ([`crate::state::not_authorized_for_image`]).
+        if image.owner_id.as_deref() != Some(::engine::emulator_account_id()) {
+            return Err(state::not_authorized_for_image(&input.image_id));
+        }
+        // "If `true`, enables deregistration protection" (`Image$DeregistrationProtection`)
+        // would refuse this call for an AMI whose owner turned it on, but nothing writes any
+        // value other than the disabled one every stored image carries
+        // ([`crate::state::IMAGE_DEREGISTRATION_PROTECTION_DISABLED`]):
+        // `EnableImageDeregistrationProtection` is still a scaffold, so the refusal belongs to
+        // the change that implements it rather than to a branch here nothing can reach.
+        // "If a deregistered EBS-backed AMI matches a Recycle Bin retention rule, it moves to
+        // the Recycle Bin for the specified retention period … If the deregistered AMI
+        // doesn't match a retention rule, it is permanently deleted immediately"
+        // (`DeregisterImage`): so the rules of the Region this request was signed for decide
+        // which of the two endings this deregistration has, asked of the `rbin` service's own
+        // store ([`crate::state::recycle_bin_retention_period`]) about the image's own tags.
+        // Only an EBS-backed AMI has that ending — an instance store-backed one is not a
+        // resource type a retention rule can name — so the rules are only asked about one.
+        let ebs_backed =
+            image.root_device_type.as_deref() == Some(state::IMAGE_ROOT_DEVICE_TYPE_EBS);
+        let tags = image.tags.clone().unwrap_or_default();
+        // ONE reading of the moment this call runs at: the rules in force are the rules as of
+        // it, for the image and for every snapshot below, and the instants a Recycle Bin entry
+        // reports are read off the same moment — so a retained resource's retention period
+        // cannot start before the rule that retained it was consulted.
+        let now = ::std::time::SystemTime::now();
+        let retention = ebs_backed
+            .then(|| {
+                state::recycle_bin_retention_period(
+                    &*self.engine,
+                    &region,
+                    state::RECYCLE_BIN_RESOURCE_TYPE_IMAGE,
+                    &tags,
+                    now,
+                )
+            })
+            .flatten();
+        // "Specifies whether to delete the snapshots associated with the AMI during
+        // deregistration" (`$DeleteAssociatedSnapshots`): the snapshots the delete is to take,
+        // each with the retention period the rules of this Region cover IT for — asked here,
+        // of the same rules and about each snapshot's own tags, because a snapshot deleted with
+        // its AMI is retained exactly as one `DeleteSnapshot` deletes is.
+        let associated_snapshots: Vec<state::AssociatedSnapshot> =
+            if input.delete_associated_snapshots.unwrap_or(false) {
+                store
+                    .image_associated_snapshot_ids(&input.image_id)
+                    .into_iter()
+                    .map(|snapshot_id| {
+                        let tags = store
+                            .snapshots
+                            .get(&snapshot_id)
+                            .and_then(|record| record.view.tags.clone())
+                            .unwrap_or_default();
+                        let retention_period = state::recycle_bin_retention_period(
+                            &*self.engine,
+                            &region,
+                            state::RECYCLE_BIN_RESOURCE_TYPE_SNAPSHOT,
+                            &tags,
+                            now,
+                        );
+                        state::AssociatedSnapshot {
+                            snapshot_id,
+                            retention_period,
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): the flag asks whether the request WOULD have
+        // succeeded, so it is answered once every refusal this request earns has been
+        // minted and before the first write.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
         }
 
-        // Deregistering the image itself — and what that does to the snapshots behind it — is
-        // still unwritten, so the operation answers the scaffold's 501 rather than a success
-        // it cannot back with state. Every refusal the request earns is minted above, before
-        // this point, so a client learns that its input is wrong from the code the real
-        // service answers rather than from this.
-        Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME))
+        // The deregistration itself, through its one writer: the image leaves the images the
+        // account can see — into the Recycle Bin for the period a rule retains it, or
+        // permanently — and the snapshots its own devices restore from are deleted where the
+        // request asked for that and no other registered AMI still restores a device from
+        // them.
+        let deregistered = store
+            .deregister_image(&input.image_id, retention, &associated_snapshots, now)
+            .ok_or_else(|| {
+                state::internal_error("the image checked a moment ago could not be deregistered")
+            })?;
+
+        Ok(DeregisterImageOutput {
+            // "Returns `true` if the request succeeds; otherwise, it returns an error"
+            // (`$Return`).
+            r#return: Some(true),
+            // "The deletion result for each snapshot associated with the AMI"
+            // (`$DeleteSnapshotResults`): reported for the deregistration that was asked to
+            // delete them, and by nothing else — a request that asked for no deletion has no
+            // results to report rather than an empty set of them.
+            delete_snapshot_results: input
+                .delete_associated_snapshots
+                .unwrap_or(false)
+                .then_some(deregistered.delete_snapshot_results),
+        })
     }
 }

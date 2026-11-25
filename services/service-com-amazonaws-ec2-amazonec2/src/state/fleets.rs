@@ -28,6 +28,13 @@ pub const FLEET_STATE_ACTIVE: &str = "active";
 /// first move, so the two cannot disagree about which fleets still owe it.
 pub const FLEET_STATE_SUBMITTED: &str = "submitted";
 
+/// The `termination` member of
+/// [`crate::ops::types::FLEET_EXCESS_CAPACITY_TERMINATION_POLICY_VALUES`]: running instances
+/// ARE terminated when the fleet's target capacity is decreased below its current size, which
+/// is the policy a fleet that asks for none is managed under — the effective policy the
+/// recorded `DescribeFleets` of a fleet created without one reports.
+pub const FLEET_EXCESS_CAPACITY_TERMINATION_POLICY_TERMINATION: &str = "termination";
+
 /// The `fulfilled` member of [`FLEET_ACTIVITY_STATUS_VALUES`]: "`fulfilled` when the fleet
 /// size meets or exceeds target capacity" (`FleetData$ActivityStatus`).
 pub const FLEET_ACTIVITY_STATUS_FULFILLED: &str = "fulfilled";

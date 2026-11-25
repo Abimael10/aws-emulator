@@ -24,11 +24,11 @@
 //! [`super::ComAmazonawsEc2Amazonec2State::has_image_capacity`] while it is held, so
 //! restoring it can never be refused for want of room.
 //!
-//! `RestoreImageFromRecycleBin` is the one operation wired to this store so far.
+//! `RestoreImageFromRecycleBin` and `DeregisterImage` are the operations wired to this store:
 //! [`ComAmazonawsEc2Amazonec2State::recycle_image`] is what puts an AMI in the bin and is
-//! called by `DeregisterImage`, and [`RecycledImageRecord::view`] is the projection
-//! `ListImagesInRecycleBin` reports; both operations are still scaffolds with their own
-//! stub issues, so they are what wires these two up.
+//! called by the deregistration writer ([`super::image_deregistration`]), and
+//! [`RecycledImageRecord::view`] is the projection `ListImagesInRecycleBin` reports, whose
+//! operation is still a scaffold with a stub issue of its own.
 
 use std::time::{Duration, SystemTime};
 

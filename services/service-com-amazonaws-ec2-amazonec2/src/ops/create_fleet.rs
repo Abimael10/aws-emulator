@@ -198,6 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             DEFAULT_TARGET_CAPACITY_TYPE_CAPACITY_BLOCK, DEFAULT_TARGET_CAPACITY_TYPE_ON_DEMAND,
             DEFAULT_TARGET_CAPACITY_TYPE_RESERVED_CAPACITY, DEFAULT_TARGET_CAPACITY_TYPE_SPOT,
             FLEET_ACTIVITY_STATUS_FULFILLED, FLEET_ACTIVITY_STATUS_PENDING_FULFILLMENT,
+            FLEET_EXCESS_CAPACITY_TERMINATION_POLICY_TERMINATION,
             FLEET_ON_DEMAND_ALLOCATION_STRATEGY_PRIORITIZED, FLEET_STATE_ACTIVE,
             FLEET_STATE_SUBMITTED, FLEET_TYPE_INSTANT, FLEET_TYPE_MAINTAIN,
             FleetPlacementSpec, FleetPoolPlacement, FleetSpec,
@@ -226,6 +227,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )?
         .unwrap_or(FLEET_TYPE_MAINTAIN);
         let instant = fleet_type == FLEET_TYPE_INSTANT;
+        // Whether this is a fleet of the ONE type the capacity and health policy members
+        // below are "supported only for" ([`FleetData$ExcessCapacityTerminationPolicy`] and
+        // `$ReplaceUnhealthyInstances`).
+        let maintain = fleet_type == FLEET_TYPE_MAINTAIN;
 
         // "The number of units to request" (`$TargetCapacitySpecification`). Every member of
         // it is a plain modelled `Integer` with no `@range`, so this handler is the only
@@ -352,9 +357,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The option structures, resolved to the members of their own modelled catalogs with
         // the documented defaults filled in, so what a describe reports is what EC2 read.
-        let spot_options = resolved_spot_options(input.spot_options.as_ref(), fleet_type)?;
-        let on_demand_options =
-            resolved_on_demand_options(input.on_demand_options.as_ref(), fleet_type)?;
+        let spot = resolved_spot_options(input.spot_options.as_ref(), fleet_type)?;
+        let on_demand = resolved_on_demand_options(input.on_demand_options.as_ref(), fleet_type)?;
         // "Defines EC2 Fleet preferences for utilizing reserved capacity when
         // `DefaultTargetCapacityType` is set to `reserved-capacity`"
         // (`$ReservedCapacityOptions`) — that capacity type is refused above, so the
@@ -449,10 +453,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // launch template override, launching the highest priority first", and the lower the
         // number the higher the priority (`OnDemandOptionsRequest$AllocationStrategy`,
         // `FleetLaunchTemplateOverridesRequest$Priority`).
-        let prioritized = on_demand_options
-            .as_ref()
-            .and_then(|options| options.allocation_strategy.as_deref())
-            == Some(FLEET_ON_DEMAND_ALLOCATION_STRATEGY_PRIORITIZED);
+        let prioritized =
+            on_demand.allocation_strategy == FLEET_ON_DEMAND_ALLOCATION_STRATEGY_PRIORITIZED;
         let mut on_demand_pools: Vec<&ResolvedPool> = resolved.pools.iter().collect();
         if prioritized {
             on_demand_pools.sort_by(|left, right| {
@@ -466,10 +468,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`SpotOptionsRequest$SingleInstanceType` / `$SingleAvailabilityZone`): either one
         // keeps the whole Spot capacity in ONE pool, whatever the allocation strategy says,
         // because every pool here is one instance type in one zone.
-        let single_pool = spot_options.as_ref().is_some_and(|options| {
-            options.single_instance_type == Some(true)
-                || options.single_availability_zone == Some(true)
-        });
+        let single_pool = spot.options.single_instance_type == Some(true)
+            || spot.options.single_availability_zone == Some(true);
         // "The number of Spot pools across which to allocate your target Spot capacity …
         // EC2 Fleet selects the cheapest Spot pools and evenly allocates your target Spot
         // capacity across the number of Spot pools that you specify"
@@ -478,9 +478,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so the pools it draws from are the FIRST that many the request gave — the order
         // every other member of a launch template configuration is read in, and the same
         // reading that decides which single pool an undiversified fleet draws from.
-        let spot_pools_to_use = spot_options
-            .as_ref()
-            .and_then(|options| options.instance_pools_to_use_count)
+        let spot_pools_to_use = spot
+            .options
+            .instance_pools_to_use_count
             .and_then(|count| usize::try_from(count).ok());
         let every_spot_pool: Vec<&ResolvedPool> = resolved.pools.iter().collect();
         let drawn_from = if single_pool {
@@ -496,10 +496,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // pool count from that many — and otherwise all of it is placed in the first.
         let spread_spot = !single_pool
             && (spot_pools_to_use.is_some()
-                || spot_options
-                    .as_ref()
-                    .and_then(|options| options.allocation_strategy.as_deref())
-                    == Some(SPOT_ALLOCATION_STRATEGY_DIVERSIFIED));
+                || spot.allocation_strategy == SPOT_ALLOCATION_STRATEGY_DIVERSIFIED);
 
         let mut pools: Vec<FleetPoolPlacement> = Vec::new();
         // The On-Demand capacity is allocated first and the Spot capacity gets the room it
@@ -538,16 +535,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .sum()
         };
         let below_minimum = [
+            (spot.options.min_target_capacity, INSTANCE_LIFECYCLE_SPOT),
             (
-                spot_options
-                    .as_ref()
-                    .and_then(|options| options.min_target_capacity),
-                INSTANCE_LIFECYCLE_SPOT,
-            ),
-            (
-                on_demand_options
-                    .as_ref()
-                    .and_then(|options| options.min_target_capacity),
+                on_demand.options.min_target_capacity,
                 INSTANCE_LIFECYCLE_ON_DEMAND,
             ),
         ]
@@ -620,9 +610,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             } else {
                 SPOT_INSTANCE_TYPE_ONE_TIME
             },
-            interruption_behavior: spot_options
-                .as_ref()
-                .and_then(|options| options.instance_interruption_behavior.as_deref())
+            interruption_behavior: spot
+                .options
+                .instance_interruption_behavior
+                .as_deref()
                 .unwrap_or(INSTANCE_INTERRUPTION_BEHAVIOR_TERMINATE),
             valid_until,
             instance_tags: &instance_tags,
@@ -678,16 +669,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }),
                 fulfilled_capacity: Some(fulfilled),
                 fulfilled_on_demand_capacity: Some(fulfilled_on_demand),
-                terminate_instances_with_expiration: input.terminate_instances_with_expiration,
-                replace_unhealthy_instances: input.replace_unhealthy_instances,
-                excess_capacity_termination_policy: excess_capacity_termination_policy
-                    .map(str::to_string),
+                // "Indicates whether running instances should be terminated when the EC2
+                // Fleet expires" (`$TerminateInstancesWithExpiration`): a setting EVERY
+                // fleet is managed under, so the fleet carries the one in force — what the
+                // request asked for, or the service's own where it asked for nothing — and
+                // not the absence that would read as "this fleet has no such setting". A
+                // fleet nobody asked to terminate its instances when it expires does not.
+                terminate_instances_with_expiration: Some(
+                    input.terminate_instances_with_expiration.unwrap_or(false),
+                ),
+                // "Supported only for fleets of type `maintain`"
+                // (`$ReplaceUnhealthyInstances`, and the same sentence on
+                // `$ExcessCapacityTerminationPolicy`): both name a behaviour only that type
+                // has, so a fleet OF it carries the setting in force and a fleet of another
+                // type carries neither, having no such behaviour to be managed under. A
+                // `maintain` fleet nobody asked to replace unhealthy Spot Instances does
+                // not, and one that named no excess-capacity policy terminates the running
+                // instances its decreased target capacity no longer covers.
+                replace_unhealthy_instances: maintain
+                    .then(|| input.replace_unhealthy_instances.unwrap_or(false)),
+                excess_capacity_termination_policy: maintain.then(|| {
+                    excess_capacity_termination_policy
+                        .unwrap_or(FLEET_EXCESS_CAPACITY_TERMINATION_POLICY_TERMINATION)
+                        .to_string()
+                }),
                 valid_from,
                 valid_until,
                 tags: fleet_tags,
                 context: input.context.clone(),
-                spot_options,
-                on_demand_options,
+                spot_options: Some(spot.options),
+                on_demand_options: Some(on_demand.options),
                 pools: pools.iter().map(|pool| pool.view.clone()).collect(),
                 instances: placed.clone(),
             })
@@ -1088,6 +1099,20 @@ fn pool_placements(
         .collect()
 }
 
+/// A fleet's option structure as it will be STORED, beside the member of the fleet's own
+/// modelled allocation-strategy catalog that structure's strategy names.
+///
+/// The two are kept apart because they answer different questions: the stored structure
+/// carries the token the fleet READS BACK — which may be the Spot Fleet spelling of the
+/// strategy ([`crate::state::fleet_allocation_strategy`]) — while every placement decision
+/// below is made on the modelled word.
+struct ResolvedOptions<T> {
+    /// The option structure the fleet is stored with.
+    options: T,
+    /// The member of the fleet's own modelled catalog the structure's strategy names.
+    allocation_strategy: &'static str,
+}
+
 /// The fleet's Spot configuration as it will be STORED: every word out of its own modelled
 /// catalog, with the documented defaults filled in, so a describe reports the configuration
 /// EC2 read rather than the request's text.
@@ -1098,18 +1123,21 @@ fn pool_placements(
 fn resolved_spot_options(
     request: Option<&SpotOptionsRequest>,
     fleet_type: &str,
-) -> Result<Option<SpotOptions>, CreateFleetError> {
+) -> Result<ResolvedOptions<SpotOptions>, CreateFleetError> {
     use crate::scaffolded::Scaffolded;
     use crate::state::{
+        DEFAULT_SPOT_ALLOCATION_STRATEGY, DEFAULT_SPOT_INSTANCE_POOLS_TO_USE_COUNT,
         INSTANCE_INTERRUPTION_BEHAVIOR_TERMINATE, SPOT_ALLOCATION_STRATEGY_LOWEST_PRICE,
-        modelled_catalog_word, validate_hourly_price,
+        fleet_allocation_strategy, modelled_catalog_word, validate_hourly_price,
     };
 
-    let allocation_strategy = modelled_catalog_word(
+    // "Default: `lowest-price`" (`SpotOptionsRequest$AllocationStrategy`), with the token the
+    // fleet reads it back as resolved beside it.
+    let allocation_strategy = fleet_allocation_strategy(
         request.and_then(|options| options.allocation_strategy.as_deref()),
         SPOT_ALLOCATION_STRATEGY_VALUES,
         "spotOptions.allocationStrategy",
-        Some(SPOT_ALLOCATION_STRATEGY_LOWEST_PRICE),
+        DEFAULT_SPOT_ALLOCATION_STRATEGY,
     )?;
     // "The behavior when a Spot Instance is interrupted. Default: `terminate`"
     // (`SpotOptionsRequest$InstanceInterruptionBehavior`).
@@ -1132,7 +1160,7 @@ fn resolved_spot_options(
         // (`$InstancePoolsToUseCount`): every other strategy decides which pools the
         // capacity is drawn from itself, so a count given beside one is refused rather than
         // accepted and left unapplied.
-        if allocation_strategy != Some(SPOT_ALLOCATION_STRATEGY_LOWEST_PRICE) {
+        if allocation_strategy.canonical != SPOT_ALLOCATION_STRATEGY_LOWEST_PRICE {
             return Err(Scaffolded::invalid_parameter_combination(format!(
                 "spotOptions.instancePoolsToUseCount is supported only when \
                  spotOptions.allocationStrategy is \
@@ -1179,17 +1207,28 @@ fn resolved_spot_options(
             })
         }
     };
-    Ok(Some(SpotOptions {
-        allocation_strategy: allocation_strategy.map(str::to_string),
-        maintenance_strategies,
-        instance_interruption_behavior: interruption_behavior.map(str::to_string),
-        instance_pools_to_use_count: request
-            .and_then(|options| options.instance_pools_to_use_count),
-        single_instance_type,
-        single_availability_zone,
-        min_target_capacity,
-        max_total_price: request.and_then(|options| options.max_total_price.clone()),
-    }))
+    Ok(ResolvedOptions {
+        options: SpotOptions {
+            allocation_strategy: Some(allocation_strategy.reported.to_string()),
+            maintenance_strategies,
+            instance_interruption_behavior: interruption_behavior.map(str::to_string),
+            // The number of Spot pools the capacity is allocated across, where the strategy
+            // in force allocates across a number of them at all: the count the request
+            // asked for, or the service's own where it asked for none.
+            instance_pools_to_use_count: (allocation_strategy.canonical
+                == SPOT_ALLOCATION_STRATEGY_LOWEST_PRICE)
+                .then(|| {
+                    request
+                        .and_then(|options| options.instance_pools_to_use_count)
+                        .unwrap_or(DEFAULT_SPOT_INSTANCE_POOLS_TO_USE_COUNT)
+                }),
+            single_instance_type,
+            single_availability_zone,
+            min_target_capacity,
+            max_total_price: request.and_then(|options| options.max_total_price.clone()),
+        },
+        allocation_strategy: allocation_strategy.canonical,
+    })
 }
 
 /// The fleet's On-Demand configuration as it will be STORED, on the same contract as
@@ -1197,17 +1236,19 @@ fn resolved_spot_options(
 fn resolved_on_demand_options(
     request: Option<&OnDemandOptionsRequest>,
     fleet_type: &str,
-) -> Result<Option<OnDemandOptions>, CreateFleetError> {
+) -> Result<ResolvedOptions<OnDemandOptions>, CreateFleetError> {
     use crate::state::{
-        FLEET_ON_DEMAND_ALLOCATION_STRATEGY_LOWEST_PRICE, modelled_catalog_word,
-        validate_hourly_price,
+        DEFAULT_FLEET_ON_DEMAND_ALLOCATION_STRATEGY, fleet_allocation_strategy,
+        modelled_catalog_word, validate_hourly_price,
     };
 
-    let allocation_strategy = modelled_catalog_word(
+    // "Default: `lowest-price`" (`OnDemandOptionsRequest$AllocationStrategy`), read the same
+    // way the Spot options' own strategy is.
+    let allocation_strategy = fleet_allocation_strategy(
         request.and_then(|options| options.allocation_strategy.as_deref()),
         FLEET_ON_DEMAND_ALLOCATION_STRATEGY_VALUES,
         "onDemandOptions.allocationStrategy",
-        Some(FLEET_ON_DEMAND_ALLOCATION_STRATEGY_LOWEST_PRICE),
+        DEFAULT_FLEET_ON_DEMAND_ALLOCATION_STRATEGY,
     )?;
     validate_hourly_price(
         "onDemandOptions.maxTotalPrice",
@@ -1251,14 +1292,17 @@ fn resolved_on_demand_options(
                 })
             }
         };
-    Ok(Some(OnDemandOptions {
-        allocation_strategy: allocation_strategy.map(str::to_string),
-        capacity_reservation_options,
-        single_instance_type,
-        single_availability_zone,
-        min_target_capacity,
-        max_total_price: request.and_then(|options| options.max_total_price.clone()),
-    }))
+    Ok(ResolvedOptions {
+        options: OnDemandOptions {
+            allocation_strategy: Some(allocation_strategy.reported.to_string()),
+            capacity_reservation_options,
+            single_instance_type,
+            single_availability_zone,
+            min_target_capacity,
+            max_total_price: request.and_then(|options| options.max_total_price.clone()),
+        },
+        allocation_strategy: allocation_strategy.canonical,
+    })
 }
 
 /// Hold the three option members both option structures document as "supported only for

@@ -71,6 +71,93 @@ pub const FLEET_ON_DEMAND_ALLOCATION_STRATEGY_LOWEST_PRICE: &str = "lowest-price
 /// first" (`OnDemandOptionsRequest$AllocationStrategy`).
 pub const FLEET_ON_DEMAND_ALLOCATION_STRATEGY_PRIORITIZED: &str = "prioritized";
 
+/// The number of Spot pools a fleet that names none allocates its target Spot capacity
+/// across.
+///
+/// "The number of Spot pools across which to allocate your target Spot capacity. Supported
+/// only when Spot `AllocationStrategy` is set to `lowest-price`. EC2 Fleet selects the
+/// cheapest Spot pools and evenly allocates your target Spot capacity across the number of
+/// Spot pools that you specify" (`SpotOptionsRequest$InstancePoolsToUseCount`): a fleet
+/// drawing its capacity from the cheapest pool draws it from ONE of them, which is the
+/// effective count the recorded `DescribeFleets` of a fleet that named none reports.
+pub const DEFAULT_SPOT_INSTANCE_POOLS_TO_USE_COUNT: i32 = 1;
+
+/// One EC2 Fleet allocation strategy as a `CreateFleet` resolved it: the member of the
+/// fleet's own modelled catalog, and the token the fleet READS BACK.
+///
+/// The two are kept apart because they answer different questions: every placement decision
+/// is made on the modelled word, while a report of the fleet answers the token its create
+/// recorded ([`fleet_allocation_strategy`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FleetAllocationStrategy {
+    /// The member of the fleet's own modelled catalog — `SpotAllocationStrategy` or
+    /// `FleetOnDemandAllocationStrategy` — the strategy names.
+    pub canonical: &'static str,
+    /// The token a report of the fleet answers with.
+    pub reported: &'static str,
+}
+
+/// What a fleet that named no Spot allocation strategy is managed under, and reads back.
+///
+/// "Default: `lowest-price`" (`SpotOptionsRequest$AllocationStrategy`) is the strategy; the
+/// token published for it is the Spot Fleet spelling of the same strategy
+/// ([`SPOT_FLEET_ALLOCATION_STRATEGY_LOWEST_PRICE`], a member of
+/// [`crate::ops::types::ALLOCATION_STRATEGY_VALUES`]), which is what the recorded
+/// `DescribeFleets` of a fleet created without a strategy reports.
+pub const DEFAULT_SPOT_ALLOCATION_STRATEGY: FleetAllocationStrategy = FleetAllocationStrategy {
+    canonical: SPOT_ALLOCATION_STRATEGY_LOWEST_PRICE,
+    reported: SPOT_FLEET_ALLOCATION_STRATEGY_LOWEST_PRICE,
+};
+
+/// What a fleet that named no On-Demand allocation strategy is managed under, and reads
+/// back — the sibling of [`DEFAULT_SPOT_ALLOCATION_STRATEGY`] over
+/// `FleetOnDemandAllocationStrategy` ("Default: `lowest-price`",
+/// `OnDemandOptionsRequest$AllocationStrategy`) and
+/// [`crate::ops::types::ON_DEMAND_ALLOCATION_STRATEGY_VALUES`], whose own `lowestPrice`
+/// member is the token the recording reports for it.
+pub const DEFAULT_FLEET_ON_DEMAND_ALLOCATION_STRATEGY: FleetAllocationStrategy =
+    FleetAllocationStrategy {
+        canonical: FLEET_ON_DEMAND_ALLOCATION_STRATEGY_LOWEST_PRICE,
+        reported: SPOT_FLEET_ALLOCATION_STRATEGY_LOWEST_PRICE,
+    };
+
+/// The allocation strategy a fleet's options asked for, or a refusal naming `member`.
+///
+/// `catalog` is the fleet's own GENERATED catalog and `default` what a request that names no
+/// strategy gets ([`DEFAULT_SPOT_ALLOCATION_STRATEGY`] /
+/// [`DEFAULT_FLEET_ON_DEMAND_ALLOCATION_STRATEGY`]).
+///
+/// What the fleet READS BACK is the token its create recorded: the word the request carried,
+/// where it carried one, and otherwise the default's published token — the Spot Fleet
+/// spelling of the same strategy, which is what the recorded `DescribeFleets` of a fleet
+/// created without a strategy reports for both its Spot and its On-Demand options. Every word
+/// answered is a `&'static str` out of a modelled catalog, so a request's own text never
+/// reaches the store.
+///
+/// The ONE place both of a fleet's strategies are read, so the Spot and the On-Demand options
+/// cannot answer this question two ways.
+pub fn fleet_allocation_strategy<E>(
+    requested: Option<&str>,
+    catalog: &'static [&'static str],
+    member: &str,
+    default: FleetAllocationStrategy,
+) -> Result<FleetAllocationStrategy, crate::scaffolded::Scaffolded<E>> {
+    // The word the fleet DECIDES by, read against its own catalog through the one lookup of
+    // that kind in the crate — so a strategy outside the catalog is refused there, with the
+    // catalog's members named.
+    let canonical = modelled_catalog_word(requested, catalog, member, Some(default.canonical))?
+        .unwrap_or(default.canonical);
+    let reported = if requested.is_some() {
+        canonical
+    } else {
+        default.reported
+    };
+    Ok(FleetAllocationStrategy {
+        canonical,
+        reported,
+    })
+}
+
 /// The priority a launch template override that names none is read with: "If no number is
 /// set, the launch template override has the lowest priority"
 /// (`FleetLaunchTemplateOverridesRequest$Priority`), and a lower number is a higher

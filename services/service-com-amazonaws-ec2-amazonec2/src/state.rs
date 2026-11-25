@@ -2047,6 +2047,11 @@ pub use image_deprecation::*;
 mod image_recycle_bin;
 pub use image_recycle_bin::{RecycledImageRecord, recycled_image, require_recycled_image};
 
+// Where a DEREGISTERED AMI goes, and what its deregistration does to the snapshots its block
+// device mappings restore from, in a module of its own.
+mod image_deregistration;
+pub use image_deregistration::*;
+
 // The Recycle Bin an EBS snapshot waits in between its deletion and its permanent deletion,
 // and every rule that moves one in or out of it, in a module of its own.
 mod snapshot_recycle_bin;
@@ -2059,8 +2064,8 @@ pub use snapshot_recycle_bin::{
 // service's resources and are read out of that service's own store.
 mod recycle_bin_rules;
 pub use recycle_bin_rules::{
-    RECYCLE_BIN_RESOURCE_TYPE_SNAPSHOT, RECYCLE_BIN_RESOURCE_TYPE_VOLUME,
-    recycle_bin_retention_period,
+    RECYCLE_BIN_RESOURCE_TYPE_IMAGE, RECYCLE_BIN_RESOURCE_TYPE_SNAPSHOT,
+    RECYCLE_BIN_RESOURCE_TYPE_VOLUME, recycle_bin_retention_period,
 };
 
 /// The account's KEY PAIRS: the record one is stored as, the bounds a create holds a
