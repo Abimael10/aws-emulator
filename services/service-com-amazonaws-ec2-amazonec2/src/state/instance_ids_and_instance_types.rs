@@ -1798,11 +1798,11 @@ pub(super) const PREVIOUS_GENERATION_FAMILIES: [&str; 16] = [
 /// The dense HDD storage family `d2` is on it beside the three the page names, as are the
 /// families the recorded catalog reports as previous generation while still reporting IPv6
 /// addresses per interface for them — the fourth generation general purpose and memory
-/// optimized families, the fifth generation general purpose one and the fifth generation
-/// graphics one: those two facts are read apart
-/// here the way the doc comment above says.
-pub(super) const IPV6_PREVIOUS_GENERATION_FAMILIES: [&str; 8] =
-    ["c3", "d2", "g5", "i2", "m4", "m5", "r3", "r4"];
+/// optimized families, the fifth generation general purpose one, the fifth generation
+/// graphics one and the sixth generation Intel general purpose one: those two facts are read
+/// apart here the way the doc comment above says.
+pub(super) const IPV6_PREVIOUS_GENERATION_FAMILIES: [&str; 9] =
+    ["c3", "d2", "g5", "i2", "m4", "m5", "m6i", "r3", "r4"];
 
 /// The families that run on the Nitro System from BEFORE their fifth generation, as the
 /// EC2 User Guide's list of "instances built on the Nitro System" names them. The

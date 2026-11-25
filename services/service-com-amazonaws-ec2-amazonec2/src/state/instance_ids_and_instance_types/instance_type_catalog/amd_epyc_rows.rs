@@ -472,4 +472,97 @@ pub(super) static AMD_EPYC_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = 
         .network("20 Gigabit")
         .processor("AMD", 2.5)
         .dedicated_hosts(false),
+    // M6a — general purpose on a 3rd generation AMD EPYC (7R13, Milan) at a sustained 3.6 GHz,
+    // with no local instance store, on the same host as the compute optimized family of the
+    // same generation: a 50 Gigabit, 192 vCPU host whose EBS rows the two families share. Those
+    // rows are the family's own of "Amazon EBS optimized instance types": the four sizes below
+    // the `8xlarge` publish a baseline they burst above, up to 10,000 Mbps and 40,000 IOPS, and
+    // the bandwidth is dedicated from that size up, reaching 40,000 Mbps on the `32xlarge` —
+    // where the host's EBS hardware is already at its figure, so the wider sizes publish it
+    // too — while the IOPS keep growing to the 240,000 of the sizes that hold the whole host.
+    // The network column is the published one: a quarter of the host bursting to 12.5 Gigabit
+    // below the `8xlarge`, then the size's own share of the 50. Its volumes come out of the
+    // pool shared with its interfaces, so every virtualized size leaves the limit the
+    // derivation above counts, while the bare metal size carries the 31 EBS volumes "Instance
+    // volume limits" publishes for a bare metal instance. ENA Express is offered from the
+    // `12xlarge` up — the sizes under it carry less dedicated network bandwidth than its
+    // transport needs — and on the bare metal size; the Elastic Fabric Adapter only on the
+    // largest virtualized size and that bare metal one, which hold the whole host's network
+    // share. The published core counts of a size up to the `4xlarge` are every one up to its
+    // own, the `8xlarge` publishes the even ones from four, and each size from the `12xlarge`
+    // up takes its cores ALL at once — so the one count it publishes is its default — while the
+    // size that holds the whole host takes any count.
+    // That bare metal size boots the legacy BIOS alone — UEFI reaches every x86 size built on
+    // the Nitro System except a bare metal one, which has no hypervisor to present it — is
+    // offered CloudWatch action based recovery, which the hypervisor-backed rule would deny it,
+    // and is migrated to another host on a user-initiated reboot, the move being the HOST's to
+    // make rather than the hypervisor's it has none of.
+    PublishedInstanceTypeFacts::of("m6a.large")
+        .ebs(650, 3_600, 10_000, 40_000)
+        .network("Up to 12.5 Gigabit")
+        .processor("AMD", MILAN_SUSTAINED_GHZ)
+        .ena_srd(false),
+    PublishedInstanceTypeFacts::of("m6a.xlarge")
+        .ebs(1_250, 6_000, 10_000, 40_000)
+        .network("Up to 12.5 Gigabit")
+        .processor("AMD", MILAN_SUSTAINED_GHZ)
+        .ena_srd(false),
+    PublishedInstanceTypeFacts::of("m6a.2xlarge")
+        .ebs(2_500, 12_000, 10_000, 40_000)
+        .network("Up to 12.5 Gigabit")
+        .processor("AMD", MILAN_SUSTAINED_GHZ)
+        .ena_srd(false),
+    PublishedInstanceTypeFacts::of("m6a.4xlarge")
+        .ebs(5_000, 20_000, 10_000, 40_000)
+        .network("Up to 12.5 Gigabit")
+        .processor("AMD", MILAN_SUSTAINED_GHZ)
+        .ena_srd(false),
+    PublishedInstanceTypeFacts::of("m6a.8xlarge")
+        .cores_in_steps_of(2)
+        .cores_from(4)
+        .ebs(10_000, 40_000, 10_000, 40_000)
+        .network("12.5 Gigabit")
+        .processor("AMD", MILAN_SUSTAINED_GHZ)
+        .ena_srd(false),
+    PublishedInstanceTypeFacts::of("m6a.12xlarge")
+        .cores_all_at_once()
+        .ebs(15_000, 60_000, 15_000, 60_000)
+        .network("18.75 Gigabit")
+        .processor("AMD", MILAN_SUSTAINED_GHZ),
+    PublishedInstanceTypeFacts::of("m6a.16xlarge")
+        .cores_all_at_once()
+        .ebs(20_000, 80_000, 20_000, 80_000)
+        .network("25 Gigabit")
+        .processor("AMD", MILAN_SUSTAINED_GHZ),
+    PublishedInstanceTypeFacts::of("m6a.24xlarge")
+        .cores_all_at_once()
+        .ebs(30_000, 120_000, 30_000, 120_000)
+        .network("37.5 Gigabit")
+        .processor("AMD", MILAN_SUSTAINED_GHZ),
+    PublishedInstanceTypeFacts::of("m6a.32xlarge")
+        .cores_all_at_once()
+        .ebs(40_000, 160_000, 40_000, 160_000)
+        .network("50 Gigabit")
+        .processor("AMD", MILAN_SUSTAINED_GHZ),
+    PublishedInstanceTypeFacts::of("m6a.48xlarge")
+        .cores_all_at_once()
+        .ebs(40_000, 240_000, 40_000, 240_000)
+        .network("50 Gigabit")
+        .efa(1)
+        .processor("AMD", MILAN_SUSTAINED_GHZ),
+    PublishedInstanceTypeFacts::of("m6a.metal")
+        .ebs(40_000, 240_000, 40_000, 240_000)
+        .ebs_attachments(31)
+        .network("50 Gigabit")
+        .efa(1)
+        .processor("AMD", MILAN_SUSTAINED_GHZ)
+        .ena_srd(true)
+        .auto_recovery(true)
+        .host_features(true, false)
+        .boot_modes(LEGACY_BIOS_BOOT_MODE),
 ];
+
+/// The sustained frequency, in GHz, of the 3rd generation AMD EPYC host: the all-core turbo
+/// its specification page publishes, which is what `ProcessorInfo$SustainedClockSpeedInGhz`
+/// reports for every size built on it.
+const MILAN_SUSTAINED_GHZ: f64 = 3.6;

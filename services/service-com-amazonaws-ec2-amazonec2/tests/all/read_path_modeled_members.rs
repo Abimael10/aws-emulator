@@ -244,7 +244,10 @@ async fn an_instance_type_reports_the_members_its_name_yields() {
         },
         TypeCase {
             case: "a sixth-generation AMD type",
-            instance_type: "m6a.2xlarge",
+            // The published rows of this family offer ENA Express from the `12xlarge` up: the
+            // sizes below it carry less dedicated network bandwidth than its transport needs,
+            // so the member is a fact of the SIZE rather than of the generation.
+            instance_type: "m6a.12xlarge",
             cards: 1,
             nitro_clock: "unsupported",
             hypervisor_feature: "supported",
