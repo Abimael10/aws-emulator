@@ -28,7 +28,7 @@
 //! 8. **`definitionHash` is the digest of the canonical definition document**: the SHA-512
 //!    hex of the definition rendered with every member of the shape, and of every element
 //!    of its three lists, in the order the model declares them, an absent list read as
-//!    empty and the document stamped with the canonical format version — so the digest a
+//!    empty and the document stating the canonical digest format token — so the digest a
 //!    create, a read, a write and a version report is the one a client recomputing it
 //!    from the definition gets, and it is accepted back as the concurrency token a
 //!    version is cut on.
@@ -695,11 +695,12 @@ async fn more_tags_than_one_resource_may_hold_is_refused() {
 // 8. The hash is the digest of the canonical definition document.
 // ---------------------------------------------------------------------------------------
 
-/// The format the canonical definition document is written in, which is what a revision
-/// holding no definition at all stands for too: the member's own modelled `@default`
-/// (`smithy_query(query="shape",shape="AutomatedReasoningPolicyDefinition")`:
-/// `version` targets `AutomatedReasoningPolicyFormatVersion`, `@default("1")`).
-const CANONICAL_FORMAT_VERSION: &str = "1";
+/// The format token the canonical definition document — the one the digest is taken OVER —
+/// states, whatever token the writing request spelled and whatever token a read of the
+/// definition publishes. The two are independent: this one belongs to the digest's
+/// canonical form alone (`automated_reasoning_policy_definition_digest.rs` pins the
+/// distinction).
+const CANONICAL_FORMAT_VERSION: &str = "1.0";
 
 /// The canonical document a `definitionHash` is the digest OF, built here beside the
 /// emulator rather than read out of it.

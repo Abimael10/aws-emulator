@@ -382,7 +382,7 @@ pub fn automated_reasoning_policy_test_result(
 /// over that canonical document rather than over the request bytes is what makes the same
 /// definition written two ways hash alike.
 ///
-/// An ABSENT definition hashes as the canonical EMPTY document — the format version this
+/// An ABSENT definition hashes as the canonical EMPTY document — the format token this
 /// service digests definitions under and three empty lists — so a policy created without a
 /// definition still reports a hash, and reports the same one until a definition is written
 /// to it.
@@ -410,7 +410,9 @@ pub fn policy_definition_hash(definition: Option<&AutomatedReasoningPolicyDefini
 /// writing request spelled — a request names no format this service publishes. The token is
 /// therefore not content: it is NOT what [`policy_definition_hash`] digests, so two
 /// definitions differing only in the token their writers spelled are one definition to the
-/// hash and read back alike.
+/// hash and read back alike. The token the DIGEST's canonical document states is a third
+/// value again ([`POLICY_DEFINITION_DIGEST_FORMAT_VERSION`]): what a definition is
+/// published with and what its digest is taken over are independent.
 #[must_use]
 pub fn policy_definition_content(
     definition: Option<&AutomatedReasoningPolicyDefinition>,
@@ -442,9 +444,10 @@ pub fn policy_definition_content(
 /// `smithy_query(query="shape",shape="AutomatedReasoningPolicyDefinition")` declares them
 /// (`version`, `types`, `rules`, `variables`; a type as `name`, `description`, `values`; a
 /// rule as `id`, `expression`, `alternateExpression`; a variable as `name`, `type`,
-/// `description`), an absent list as the empty list, and the document stamped with the
-/// format version this service digests definitions under
-/// ([`POLICY_DEFINITION_FORMAT_VERSION`]) rather than with the token its writer spelled.
+/// `description`), an absent list as the empty list, an absent optional member as null, and
+/// the document stating the format token this service digests definitions under
+/// ([`POLICY_DEFINITION_DIGEST_FORMAT_VERSION`]) rather than the token its writer spelled or
+/// the one a read of the definition publishes.
 ///
 /// So the digest depends on the definition's CONTENT and on nothing else: not on the order
 /// the members reached the handler in, not on the format token the request carried, and
@@ -497,7 +500,7 @@ pub(super) fn canonical_policy_definition(
         })
         .collect();
     ::serde_json::json!({
-        "version": POLICY_DEFINITION_FORMAT_VERSION,
+        "version": POLICY_DEFINITION_DIGEST_FORMAT_VERSION,
         "types": types,
         "rules": rules,
         "variables": variables,

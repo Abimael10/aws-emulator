@@ -19,8 +19,8 @@ use super::*;
 /// fresh regions, which is why the bound is over the whole store rather than per region.
 pub const MAX_AUTOMATED_REASONING_POLICIES_PER_ACCOUNT: usize = 100;
 
-/// The policy-definition FORMAT version this service digests every
-/// `AutomatedReasoningPolicyDefinition` under — the canonical form of that document. It is
+/// The policy-definition FORMAT version this service PUBLISHES every
+/// `AutomatedReasoningPolicyDefinition` under. It is
 /// the member's own modelled `@default`, which is what an omitted token means on the wire
 /// (`AutomatedReasoningPolicyDefinition$version`, a plain
 /// `AutomatedReasoningPolicyFormatVersion` string with `default: "1"`:
@@ -29,13 +29,28 @@ pub const MAX_AUTOMATED_REASONING_POLICIES_PER_ACCOUNT: usize = 100;
 ///
 /// The member describes the document's own FORMAT rather than the policy, and the format is
 /// this service's rather than a writing request's: every read of a definition states this
-/// token, so a request that spelled another one names no format this service publishes. It
-/// stamps the document [`super::policy_definition_hash`] digests, which is what keeps a
+/// token, so a request that spelled another one names no format this service publishes. The
+/// token is therefore not part of a definition's CONTENT, which is what keeps a
 /// `definitionHash` a function of the definition's content rather than of the format token
-/// its writer spelled, and it stamps the empty document a revision holding no definition at
-/// all stands for. It is NOT the policy's own resource version (that one is the
+/// its writer spelled; the canonical document that digest is taken over states its own
+/// token ([`POLICY_DEFINITION_DIGEST_FORMAT_VERSION`]) rather than this one. It is NOT the
+/// policy's own resource version (that one is the
 /// `:<version>` suffix of a versioned ARN).
 pub const POLICY_DEFINITION_FORMAT_VERSION: &str = "1";
+
+/// The definition-format token the CANONICAL document a `definitionHash` is taken over
+/// states ([`super::canonical_policy_definition`]).
+///
+/// RECORDED behaviour, not a modelled rule, and deliberately NOT
+/// [`POLICY_DEFINITION_FORMAT_VERSION`]: the digest is a function of this service's own
+/// canonical form of a definition document, and the `definitionHash` Amazon Bedrock
+/// publishes for a policy whose definition holds no type, rule or variable is the SHA-512 of
+/// that canonical form stating THIS token — a digest pins the bytes it was taken over, so
+/// the one definition whose content is known from its digest alone fixes the token too. The
+/// token a READ of a definition states is the other constant, which is the member's own
+/// modelled `@default`: one is what a definition is published WITH, this one is what its
+/// digest is taken OVER, and the two are independent.
+pub const POLICY_DEFINITION_DIGEST_FORMAT_VERSION: &str = "1.0";
 
 /// The most build workflows ONE Automated Reasoning policy may hold at once, past which a
 /// start is refused with `ServiceQuotaExceededException`.

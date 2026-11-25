@@ -15,7 +15,9 @@
 //! writes definitions in ([`crate::state::POLICY_DEFINITION_FORMAT_VERSION`], the member's
 //! own modelled default, rather than a token a writing request spelled) and each of its
 //! three lists, an absent one as the empty list — which is the same reading
-//! [`crate::state::policy_definition_hash`] digests, under the same format token. So a
+//! [`crate::state::policy_definition_hash`] digests, canonicalized under the digest's own
+//! format token ([`crate::state::POLICY_DEFINITION_DIGEST_FORMAT_VERSION`], which the
+//! published document does not state). So a
 //! revision that holds no definition exports the empty definition rather than refusing a
 //! read of a policy that is there, and the definition this operation exports always hashes
 //! to the `definitionHash` the same revision reports.
