@@ -76,7 +76,16 @@ const CRL_DATA_MAX_LENGTH: usize = 300_000;
 /// `Uuid` is `@length(36, 36)` with
 /// `@pattern("[a-f0-9]{8}-([a-z0-9]{4}-){3}[a-z0-9]{12}")`, and `crlId` targets it.
 const UUID_LENGTH: usize = 36;
-const UUID_PATTERN: &str = "[a-f0-9]{8}-([a-z0-9]{4}-){3}[a-z0-9]{12}";
+
+/// The expression a refusal of a `crlId` PUBLISHES: a member that addresses a resource by
+/// its id accepts either that id or a reference to the certificate revocation list it names
+/// — that list's own ARN, or an alias of it — so the clause quotes the grouped alternation
+/// of the two, whose first branch is the modelled `Uuid` expression above and whose second
+/// is this service's own ARN form for a CRL (`crate::state::crl_arn` mints
+/// `arn:aws:rolesanywhere:<region>:<account>:crl/<id>`).
+const PUBLISHED_CRL_ID_PATTERN: &str =
+    "([a-f0-9]{8}-([a-z0-9]{4}-){3}[a-z0-9]{12}|arn:aws(-[^:]+)?:rolesanywhere(:.*){2}\
+     :(crl|alias/crl)/.*)";
 
 /// The account every emulated ARN carries (`engine::emulator_account_id`).
 const ACCOUNT: &str = "000000000000";
@@ -826,7 +835,7 @@ async fn update_crl_refuses_input_outside_the_published_constraints_and_stores_n
             json!({"name": "renamed"}),
             format!(
                 "at 'crlId' failed to satisfy constraint: Member must satisfy regular expression \
-                 pattern: {UUID_PATTERN}"
+                 pattern: {PUBLISHED_CRL_ID_PATTERN}"
             ),
         ),
     ];

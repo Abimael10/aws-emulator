@@ -50,7 +50,16 @@ const UNMINTED_IDS: [(&str, &str); 3] = [
 /// `smithy_query(query="operation", operation="EnableProfile")`: `@length(36, 36)` and
 /// `@pattern("[a-f0-9]{8}-([a-z0-9]{4}-){3}[a-z0-9]{12}")`.
 const UUID_LENGTH: usize = 36;
-const UUID_PATTERN: &str = "[a-f0-9]{8}-([a-z0-9]{4}-){3}[a-z0-9]{12}";
+
+/// The expression a refusal of a `profileId` PUBLISHES: a member that addresses a resource
+/// by its id accepts either that id or a reference to the profile it names — the profile's
+/// own ARN, or an alias of it — so the clause quotes the grouped alternation of the two.
+/// The modelled `Uuid` expression above is its first branch; the ARN branch is this
+/// service's own profile ARN form (`smithy_query(query="shape", shape="ProfileArn")`:
+/// `^arn:aws(-[^:]+)?:rolesanywhere(:.*){2}(:profile.*)$`).
+const PUBLISHED_PROFILE_ID_PATTERN: &str =
+    "([a-f0-9]{8}-([a-z0-9]{4}-){3}[a-z0-9]{12}|arn:aws(-[^:]+)?:rolesanywhere(:.*){2}\
+     :(profile|alias/profile)/.*)";
 
 /// Ids OUTSIDE the modelled `Uuid` form, with the constraint clause the boundary refusal
 /// has to state: too short by one, too long by one, uppercase hex, no separators, and not a
@@ -66,7 +75,7 @@ fn malformed_ids() -> Vec<(&'static str, String)> {
     );
     let outside_pattern = format!(
         "at 'profileId' failed to satisfy constraint: Member must satisfy regular expression \
-         pattern: {UUID_PATTERN}"
+         pattern: {PUBLISHED_PROFILE_ID_PATTERN}"
     );
     vec![
         ("0123abcd-4567-89ef-0123-456789abcde", too_short.clone()),

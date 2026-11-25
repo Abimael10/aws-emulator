@@ -52,11 +52,14 @@
 //! X.509 signature are verified is in [`x509_signature`].
 
 pub mod create_session;
+/// The half of a constraint refusal [`validation`] cannot state — the LIST a clause about
+/// a list member is about; see the module's own header.
+mod submitted_collections;
 pub mod validation;
 pub mod x509_signature;
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, OperationRoutingTable, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
@@ -72,6 +75,12 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// operations, and it owns the shared engine so every answer is computed from the same
     /// store the control-plane handlers write.
     sessions: create_session::NativeCreateSession<Eng>,
+    /// The modelled operations whose constraint clauses quote the list the request carried
+    /// ([`submitted_collections`]), each the operation the generated table names for the
+    /// same key and built from the SAME shared engine. Held on the service because
+    /// [`Service::override_operation`] hands the router a BORROW of one of its own
+    /// operations.
+    quoting_submitted_lists: OperationRoutingTable,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -81,6 +90,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             sessions: create_session::NativeCreateSession::new(Arc::clone(&engine)),
+            quoting_submitted_lists: submitted_collections::quoting_submitted_lists(&engine),
             entry: crate::ServiceDefinition::new(engine),
         }
     }
@@ -123,16 +133,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         if self.sessions.claims(req) {
             return Some(&self.sessions);
         }
-        None
+        // NOT a re-route: the operation served here is the one the generated routing table
+        // names for this request, wrapped so that a constraint clause about a list member
+        // states the list the request carried (see [`submitted_collections`]). The routing
+        // DECISION stays the model's — the key is resolved by this service's own protocol,
+        // the one the generated table is read with too — and a key that table does not
+        // hold declines here, leaving the generated table and the router's routing-error
+        // path unchanged. The wrapper declares the wrapped operation's own auth schemes,
+        // so nothing about signing changes.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.quoting_submitted_lists.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
         // service word it the way this service words one: the framework's own
-        // envelope with the two renderings that are this service's — the
-        // expression a `@pattern` requirement quotes, and the order an
-        // enumerated type's admissible values are listed in. Both live in
+        // envelope with the three renderings that are this service's — the
+        // expression a `@pattern` requirement quotes, the wider expression a
+        // member that ADDRESSES a resource by its id publishes, and the order an
+        // enumerated type's admissible values are listed in. All three live in
         // [`validation`], with the code the chosen message travels with.
         validation::refused(refusal)
     }

@@ -37,13 +37,18 @@
 //!
 //! The harness below is local to this suite, as in each sibling suite.
 //!
-//! The last two suites here are about how a refusal of this service QUOTES the requirement
-//! a value failed, rather than about mappings: a `@pattern` is quoted as the expression the
-//! service publishes (the model's text without the whole-value anchors it wraps it in) and
-//! an enumerated type as the values it admits in the order this service states them. Both
-//! are properties of the SHAPE a member targets, so the tables span this model's patterned
-//! shapes and enumerated types — `PutAttributeMapping$certificateField`, the recorded one,
-//! among them — over several operations, bindings and depths.
+//! The last suites here are about how a refusal of this service QUOTES the requirement a
+//! value failed, and the value half of a clause about a LIST, rather than about mappings: a
+//! `@pattern` is quoted as the expression the service publishes (the model's text without
+//! the whole-value anchors it wraps it in), a member that ADDRESSES a resource by its id
+//! publishes the wider alternation the service accepts for such a reference (the id, or
+//! that resource's own ARN or an alias of it), an enumerated type is quoted as the values it
+//! admits in the order this service states them, and a clause about a list of scalars
+//! quotes the list the request submitted. The first three are properties of the SHAPE a
+//! member targets or of the RESOURCE it addresses, so the tables span this model's patterned
+//! shapes, addressed resources and enumerated types —
+//! `PutAttributeMapping$certificateField`, the recorded one, among them — over several
+//! operations, bindings and depths.
 
 use std::sync::Arc;
 
@@ -1278,11 +1283,35 @@ const PUBLISHED_RESOURCE_NAME_PATTERN: &str = "[ a-zA-Z0-9-_]*";
 const PUBLISHED_TRUST_ANCHOR_ARN_PATTERN: &str =
     r"arn:aws(-[^:]+)?:rolesanywhere(:.*){2}(:trust-anchor.*)";
 
-/// The expression `Uuid` publishes, which the model declares UNANCHORED
-/// (`@pattern("[a-f0-9]{8}-([a-z0-9]{4}-){3}[a-z0-9]{12}")`,
-/// `smithy_query(query="operation", operation="PutAttributeMapping")`): nothing to drop, so
-/// it is quoted exactly as declared.
-const PUBLISHED_UUID_PATTERN: &str = "[a-f0-9]{8}-([a-z0-9]{4}-){3}[a-z0-9]{12}";
+/// The id expression the model declares for every member that addresses one of this
+/// service's resources, which the model leaves UNANCHORED
+/// (`Uuid`, `@pattern("[a-f0-9]{8}-([a-z0-9]{4}-){3}[a-z0-9]{12}")`,
+/// `smithy_query(query="shape", shape="Uuid")`): nothing to drop from it.
+const MODELLED_UUID_PATTERN: &str = "[a-f0-9]{8}-([a-z0-9]{4}-){3}[a-z0-9]{12}";
+
+/// The expression `trustAnchorId` publishes, written out in full — one row of
+/// [`published_resource_id_pattern`] pinned literally, so the rule below is held to a text
+/// and not only to its own formatting.
+const PUBLISHED_TRUST_ANCHOR_ID_PATTERN: &str =
+    "([a-f0-9]{8}-([a-z0-9]{4}-){3}[a-z0-9]{12}|arn:aws(-[^:]+)?:rolesanywhere(:.*){2}\
+     :(trust-anchor|alias/trust-anchor)/.*)";
+
+/// The expression a member that ADDRESSES the resource whose ARNs carry `resource`
+/// publishes: the grouped alternation of the id expression the model declares for it
+/// ([`MODELLED_UUID_PATTERN`]) and a reference to the resource that id names — that
+/// resource's own ARN, or an alias of it, in any partition, Region and account the ARN form
+/// admits.
+///
+/// The ARN half is this service's own ARN form, as the model writes it for the ARN members
+/// that carry one (`smithy_query(query="shape", shape="TrustAnchorArn,ProfileArn")`:
+/// `^arn:aws(-[^:]+)?:rolesanywhere(:.*){2}(:trust-anchor.*)$` and `(:profile.*)`), with the
+/// resource and its alias spelled out.
+fn published_resource_id_pattern(resource: &str) -> String {
+    format!(
+        "({MODELLED_UUID_PATTERN}|arn:aws(-[^:]+)?:rolesanywhere(:.*){{2}}\
+         :({resource}|alias/{resource})/.*)"
+    )
+}
 
 /// A value outside the modelled `Uuid` form that no profile or trust anchor is created
 /// under: it breaks the pattern and nothing else, so a refusal of it states one clause.
@@ -1356,9 +1385,11 @@ struct RefusalCase {
 /// Every request whose refusal quotes a `@pattern` requirement.
 ///
 /// The rows differ along what the rule generalises over: which shape's expression is quoted
-/// (two the model anchors, one it leaves unanchored), which operation and member carried the
-/// value (a create, an update, a path label, a body member, an ARN member), and which end of
-/// the anchored expression the value broke.
+/// (two shapes the model anchors, each at a different end the value broke), which operation
+/// and member carried the value (a create, an update, a body member, an ARN member), and
+/// which end of the anchored expression the value broke. A member that ADDRESSES a resource
+/// by its id publishes a WIDER expression than its shape's, so those rows are their own
+/// table ([`resource_id_cases`]).
 fn pattern_cases() -> Vec<RefusalCase> {
     let crl_data = aws_smithy_types::base64::encode("x".as_bytes());
     let trust_anchor_arn =
@@ -1423,8 +1454,44 @@ fn pattern_cases() -> Vec<RefusalCase> {
             member_path: "trustAnchorArn",
             requirement: pattern_requirement(PUBLISHED_TRUST_ANCHOR_ARN_PATTERN),
         },
+    ]
+}
+
+/// Every request whose refusal quotes the expression a member that ADDRESSES one of this
+/// service's resources by its id publishes.
+///
+/// The rows differ along what the rule generalises over: WHICH resource the member addresses
+/// (every one this service's ids name — a trust anchor, a profile, a certificate revocation
+/// list, a subject), the binding the id arrived in (an `@httpLabel` on four of them, a body
+/// member on one), and the operation that addressed it (a read, an update, a write of
+/// another resource's settings).
+fn resource_id_cases() -> Vec<RefusalCase> {
+    vec![
         RefusalCase {
-            label: "a path label whose expression the model leaves unanchored",
+            label: "a trust anchor addressed by a path label",
+            method: "GET",
+            uri: format!("/trustanchor/{UPPERCASE_UUID}"),
+            body: None,
+            value: UPPERCASE_UUID.to_string(),
+            member_path: "trustAnchorId",
+            requirement: pattern_requirement(&published_resource_id_pattern("trust-anchor")),
+        },
+        RefusalCase {
+            label: "a trust anchor addressed by a BODY member",
+            method: "PATCH",
+            uri: "/put-notifications-settings".to_string(),
+            body: Some(json!({
+                "trustAnchorId": UPPERCASE_UUID,
+                "notificationSettings": [
+                    {"enabled": true, "event": "CA_CERTIFICATE_EXPIRY", "threshold": 10},
+                ],
+            })),
+            value: UPPERCASE_UUID.to_string(),
+            member_path: "trustAnchorId",
+            requirement: pattern_requirement(&published_resource_id_pattern("trust-anchor")),
+        },
+        RefusalCase {
+            label: "a profile addressed by a path label",
             method: "PUT",
             uri: format!("/profiles/{UPPERCASE_UUID}/mappings"),
             body: Some(json!({
@@ -1433,7 +1500,25 @@ fn pattern_cases() -> Vec<RefusalCase> {
             })),
             value: UPPERCASE_UUID.to_string(),
             member_path: "profileId",
-            requirement: pattern_requirement(PUBLISHED_UUID_PATTERN),
+            requirement: pattern_requirement(&published_resource_id_pattern("profile")),
+        },
+        RefusalCase {
+            label: "a certificate revocation list addressed by a path label",
+            method: "PATCH",
+            uri: format!("/crl/{UPPERCASE_UUID}"),
+            body: Some(json!({"name": "renamed crl"})),
+            value: UPPERCASE_UUID.to_string(),
+            member_path: "crlId",
+            requirement: pattern_requirement(&published_resource_id_pattern("crl")),
+        },
+        RefusalCase {
+            label: "a subject addressed by a path label",
+            method: "GET",
+            uri: format!("/subject/{UPPERCASE_UUID}"),
+            body: None,
+            value: UPPERCASE_UUID.to_string(),
+            member_path: "subjectId",
+            requirement: pattern_requirement(&published_resource_id_pattern("subject")),
         },
     ]
 }
@@ -1547,6 +1632,37 @@ async fn a_pattern_requirement_quotes_the_expression_without_the_whole_value_anc
     }
 }
 
+/// A member that ADDRESSES one of this service's resources by its id publishes the
+/// alternation the service accepts for that reference — the id, or the resource's own ARN
+/// or an alias of it — whichever resource it addresses, whichever operation addressed it
+/// and whichever binding carried the id.
+#[tokio::test]
+async fn a_resource_id_requirement_quotes_the_id_or_that_resources_arn() {
+    // The rule's own text, pinned once: the trust-anchor row is written out in full above,
+    // so the table below cannot pass on its own formatting alone.
+    assert_eq!(
+        published_resource_id_pattern("trust-anchor"),
+        PUBLISHED_TRUST_ANCHOR_ID_PATTERN,
+        "case \"the published expression of a trust anchor's id\": expected \
+         {PUBLISHED_TRUST_ANCHOR_ID_PATTERN:?}, got {:?}",
+        published_resource_id_pattern("trust-anchor")
+    );
+
+    let client = Client::new();
+    for case in resource_id_cases() {
+        assert_refused(&client, &case).await;
+        // The id half of the published expression is the model's own, unaltered: a caller
+        // reading the clause still sees the bare-id form it may send.
+        assert!(
+            case.requirement.contains(MODELLED_UUID_PATTERN),
+            "case {:?}: the published expression must carry the modelled id expression \
+             {MODELLED_UUID_PATTERN:?}, got {:?}",
+            case.label,
+            case.requirement
+        );
+    }
+}
+
 /// Every refusal of a value outside an enumerated type lists that type's admitted values in
 /// the order this service states them, whatever member, operation, binding or depth carried
 /// the value — and lists exactly the values the model declares, nothing added or dropped.
@@ -1641,6 +1757,340 @@ async fn a_refused_sensitive_member_states_the_published_pattern_without_its_val
         assert!(
             !said.contains(secretish),
             "case {case:?}: a sensitive member's value must not be disclosed, got {said:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// The VALUE half of a clause about a LIST member.
+//
+// The rule: a clause about a list member whose `@length` the request broke quotes the list
+// the request submitted, rendered as its bracketed, comma-and-space separated elements,
+// where the framework's own walk has only a count of them — the bound is checked on the
+// member, before the walk descends into the elements. Two classes keep the requirement
+// alone, which is the same half this service drops from every clause about a value it does
+// not disclose: a list whose elements the model marks `@sensitive`, and a list of
+// structures, which has no scalar rendering.
+// ---------------------------------------------------------------------------------------
+
+/// The `@length` maximum of each bounded list these rows submit
+/// (`smithy_query(query="shape", shape="RoleArnList,ManagedPolicyList,TagList,TagKeyList,NotificationSettings")`:
+/// `RoleArnList` 0..250, `ManagedPolicyList` 0..50, `TagList` and `TagKeyList` 0..200,
+/// `NotificationSettings` 0..50).
+const ROLE_ARN_LIST_MAXIMUM: usize = 250;
+const MANAGED_POLICY_LIST_MAXIMUM: usize = 50;
+const TAG_LIST_MAXIMUM: usize = 200;
+const NOTIFICATION_SETTINGS_MAXIMUM: usize = 50;
+
+/// The requirement clause a list longer than its `@length` maximum states.
+fn at_most_requirement(maximum: usize) -> String {
+    format!("Member must have length less than or equal to {maximum}")
+}
+
+/// `count` distinct IAM role ARNs, each one `RoleArn` admits
+/// (`^arn:aws(-[^:]+)?:iam(:.*){2}(:role.*)$`), so the only constraint a row can break is
+/// the list's own length.
+fn role_arns(count: usize) -> Vec<String> {
+    (0..count)
+        .map(|index| format!("arn:aws:iam::{ACCOUNT}:role/list-clause-role-{index}"))
+        .collect()
+}
+
+/// `count` distinct managed policy ARNs; `ManagedPolicyList`'s element is a plain `String`
+/// `@length(1, 200)`, so these too break only the list's own length.
+fn managed_policy_arns(count: usize) -> Vec<String> {
+    (0..count)
+        .map(|index| format!("arn:aws:iam::aws:policy/ListClausePolicy{index}"))
+        .collect()
+}
+
+/// The list as a clause quotes it: its elements, comma-and-space separated, in brackets.
+fn rendered_list(elements: &[String]) -> String {
+    format!("[{}]", elements.join(", "))
+}
+
+/// One refused request whose clause is about a LIST member: where it goes, what it carries
+/// beside the list, and the list and the bound the clause must state.
+struct ListCase {
+    label: &'static str,
+    method: &'static str,
+    uri: String,
+    /// The rest of the request body; the list below is set at `member` before it is sent.
+    body: Value,
+    member: &'static str,
+    submitted: Vec<String>,
+    maximum: usize,
+}
+
+/// A clause about a list of scalars quotes the list the request submitted, and the refused
+/// request stores nothing.
+///
+/// The rows differ along what the rule generalises over: WHICH list member carries the
+/// value (`roleArns`, `managedPolicyArns`), which operation carried it (a create, an
+/// update), and how far past the declared maximum the list reached (one element past it,
+/// and well past it).
+#[tokio::test]
+async fn a_clause_about_a_list_of_scalars_quotes_the_submitted_list() {
+    let client = Client::new();
+    let kept = profile_id(&client, "list clause neighbour").await;
+
+    let one_role = role_arns(1);
+    let cases = vec![
+        ListCase {
+            label: "roleArns one past its maximum on a create",
+            method: "POST",
+            uri: "/profiles".to_string(),
+            body: json!({"name": "role arns past the maximum"}),
+            member: "roleArns",
+            submitted: role_arns(ROLE_ARN_LIST_MAXIMUM + 1),
+            maximum: ROLE_ARN_LIST_MAXIMUM,
+        },
+        ListCase {
+            label: "roleArns far past its maximum on an update",
+            method: "PATCH",
+            uri: format!("/profile/{UNMINTED_UUID}"),
+            body: json!({}),
+            member: "roleArns",
+            submitted: role_arns(ROLE_ARN_LIST_MAXIMUM + 7),
+            maximum: ROLE_ARN_LIST_MAXIMUM,
+        },
+        ListCase {
+            label: "managedPolicyArns one past its maximum on a create",
+            method: "POST",
+            uri: "/profiles".to_string(),
+            body: json!({"name": "managed policies past the maximum", "roleArns": one_role}),
+            member: "managedPolicyArns",
+            submitted: managed_policy_arns(MANAGED_POLICY_LIST_MAXIMUM + 1),
+            maximum: MANAGED_POLICY_LIST_MAXIMUM,
+        },
+        ListCase {
+            label: "managedPolicyArns far past its maximum on an update",
+            method: "PATCH",
+            uri: format!("/profile/{UNMINTED_UUID}"),
+            body: json!({}),
+            member: "managedPolicyArns",
+            submitted: managed_policy_arns(MANAGED_POLICY_LIST_MAXIMUM + 13),
+            maximum: MANAGED_POLICY_LIST_MAXIMUM,
+        },
+    ];
+
+    for case in cases {
+        let label = case.label;
+        let mut body = case.body;
+        body[case.member] = json!(case.submitted);
+        let answer = client.send(case.method, &case.uri, Some(body)).await;
+        assert_eq!(
+            (answer.status, answer.error_code.as_str()),
+            (400, "ValidationException"),
+            "case {label:?}: a list past its declared maximum must be refused 400 \
+             ValidationException, got {answer:?}"
+        );
+        let expected = one_error_clause(
+            &rendered_list(&case.submitted),
+            case.member,
+            &at_most_requirement(case.maximum),
+        );
+        assert_eq!(
+            answer.message(),
+            Some(expected.as_str()),
+            "case {label:?}: expected {expected:?}, got {:?}",
+            answer.message()
+        );
+    }
+
+    // Nothing the refused creates named reached the store: the profile created before them
+    // is still the only one listed.
+    let listed = client.send("GET", "/profiles", None).await;
+    assert_eq!(
+        listed.status, 200,
+        "case \"the refused creates stored nothing\": expected ListProfiles 200, got {listed:?}"
+    );
+    let ids: Vec<String> = listed
+        .body
+        .get("profiles")
+        .and_then(Value::as_array)
+        .unwrap_or(&Vec::new())
+        .iter()
+        .filter_map(|profile| profile.get("profileId").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        ids,
+        vec![kept],
+        "case \"the refused creates stored nothing\": no refused create may have stored a \
+         profile, got {ids:?}"
+    );
+}
+
+/// A refusal carrying BOTH a clause about a list and a clause about another member states
+/// each in this service's own wording: the list is quoted and the `@pattern` is quoted as
+/// the expression the service publishes, in one envelope that counts both.
+#[tokio::test]
+async fn a_refusal_mixing_a_list_clause_with_a_pattern_clause_states_both_as_published() {
+    let client = Client::new();
+    let submitted = role_arns(ROLE_ARN_LIST_MAXIMUM + 1);
+    let answer = client
+        .send(
+            "POST",
+            "/profiles",
+            Some(json!({"name": "no!punctuation", "roleArns": submitted})),
+        )
+        .await;
+    assert_eq!(
+        (answer.status, answer.error_code.as_str()),
+        (400, "ValidationException"),
+        "case \"a name outside its pattern beside a list past its maximum\": expected 400 \
+         ValidationException, got {answer:?}"
+    );
+    let said = answer.message().unwrap_or_default().to_string();
+    assert!(
+        said.starts_with("2 validation errors detected: "),
+        "case \"a name outside its pattern beside a list past its maximum\": both clauses must \
+         be counted in one envelope, got {said:?}"
+    );
+    for expected in [
+        format!(
+            "Value '{}' at 'roleArns' failed to satisfy constraint: {}",
+            rendered_list(&submitted),
+            at_most_requirement(ROLE_ARN_LIST_MAXIMUM)
+        ),
+        format!(
+            "Value 'no!punctuation' at 'name' failed to satisfy constraint: {}",
+            pattern_requirement(PUBLISHED_RESOURCE_NAME_PATTERN)
+        ),
+    ] {
+        assert!(
+            said.contains(&expected),
+            "case \"a name outside its pattern beside a list past its maximum\": the refusal \
+             must state {expected:?}, got {said:?}"
+        );
+    }
+}
+
+/// A list at its declared maximum is not refused at all: the bound itself is admitted, so
+/// the clause above is about the list being PAST it and not about its size.
+#[tokio::test]
+async fn a_list_at_its_declared_maximum_is_served() {
+    let client = Client::new();
+    for (case, submitted, managed) in [
+        (
+            "roleArns at its maximum",
+            role_arns(ROLE_ARN_LIST_MAXIMUM),
+            managed_policy_arns(0),
+        ),
+        (
+            "managedPolicyArns at its maximum",
+            role_arns(1),
+            managed_policy_arns(MANAGED_POLICY_LIST_MAXIMUM),
+        ),
+    ] {
+        let answer = client
+            .send(
+                "POST",
+                "/profiles",
+                Some(json!({
+                    "name": format!("list bound {}", submitted.len()),
+                    "roleArns": submitted,
+                    "managedPolicyArns": managed,
+                })),
+            )
+            .await;
+        assert_eq!(
+            answer.status, 201,
+            "case {case:?}: a list at its declared maximum must be served, got {answer:?}"
+        );
+        let stored = answer
+            .profile()
+            .get("roleArns")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default();
+        assert_eq!(
+            stored,
+            submitted.len(),
+            "case {case:?}: the created profile must hold every role ARN submitted, got \
+             {stored}"
+        );
+    }
+}
+
+/// A clause about a list the request's own elements cannot be quoted from states the
+/// requirement and NO value: a list whose elements the model marks `@sensitive`, a list of
+/// structures holding such values, and a list of structures that have no scalar rendering.
+///
+/// The rows differ along what the rule generalises over: why the list is not quoted
+/// (sensitive elements, sensitive values inside a structure element, a structure element
+/// with no scalar rendering) and which operation carried it.
+#[tokio::test]
+async fn a_clause_about_a_list_that_is_not_quoted_states_the_requirement_alone() {
+    let client = Client::new();
+    let secretish = "list-clause-secret";
+    let tag_keys: Vec<Value> = (0..=TAG_LIST_MAXIMUM)
+        .map(|index| json!(format!("{secretish}-{index}")))
+        .collect();
+    let tags: Vec<Value> = (0..=TAG_LIST_MAXIMUM)
+        .map(|index| json!({"key": format!("{secretish}-{index}"), "value": "held"}))
+        .collect();
+    let settings: Vec<Value> = (0..=NOTIFICATION_SETTINGS_MAXIMUM)
+        .map(|_| json!({"enabled": true, "event": "CA_CERTIFICATE_EXPIRY", "threshold": 10}))
+        .collect();
+
+    for (case, method, uri, body, member, maximum) in [
+        (
+            "a list whose elements are sensitive",
+            "POST",
+            "/UntagResource".to_string(),
+            json!({
+                "resourceArn": profile_arn(REGION, UNMINTED_UUID),
+                "tagKeys": tag_keys,
+            }),
+            "tagKeys",
+            TAG_LIST_MAXIMUM,
+        ),
+        (
+            "a list of structures holding sensitive values",
+            "POST",
+            "/TagResource".to_string(),
+            json!({
+                "resourceArn": profile_arn(REGION, UNMINTED_UUID),
+                "tags": tags,
+            }),
+            "tags",
+            TAG_LIST_MAXIMUM,
+        ),
+        (
+            "a list of structures",
+            "PATCH",
+            "/put-notifications-settings".to_string(),
+            json!({
+                "trustAnchorId": UNMINTED_UUID,
+                "notificationSettings": settings,
+            }),
+            "notificationSettings",
+            NOTIFICATION_SETTINGS_MAXIMUM,
+        ),
+    ] {
+        let answer = client.send(method, &uri, Some(body)).await;
+        assert_eq!(
+            (answer.status, answer.error_code.as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: a list past its declared maximum must be refused 400 \
+             ValidationException, got {answer:?}"
+        );
+        let expected = format!(
+            "1 validation error detected: Value at '{member}' failed to satisfy constraint: {}",
+            at_most_requirement(maximum)
+        );
+        assert_eq!(
+            answer.message(),
+            Some(expected.as_str()),
+            "case {case:?}: expected {expected:?}, got {:?}",
+            answer.message()
+        );
+        assert!(
+            !answer.message().unwrap_or_default().contains(secretish),
+            "case {case:?}: a sensitive element must not be disclosed, got {:?}",
+            answer.message()
         );
     }
 }
