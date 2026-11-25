@@ -57,16 +57,29 @@ pub(super) const PARTIAL_UPFRONT_SHARE: f64 = 0.5;
 /// The node types are from `ReservedCacheNodesOffering$CacheNodeType`'s own list
 /// (`smithy_query(query="doc", shape="ReservedCacheNodesOffering",
 /// member="CacheNodeType")`), spanning the current-generation general purpose
-/// (T4g/T3, M7g/M6g/M5) and memory optimized (R7g/R6g/R5) families and the
-/// previous generation (M3, R3, T2) that list also names.
+/// (T4g/T3, M7g/M6g/M5/M4) and memory optimized (R7g/R6g/R5/R4) families and the
+/// previous generation (M3, R3, T2) that list also names; every name is one
+/// `crate::ops::list_allowed_node_type_modifications::NODE_TYPE_FAMILIES`
+/// publishes, and every one carries a published capacity in
+/// `crate::state::NODE_TYPE_CAPACITIES`, so a node type this service sells is a
+/// node type it both prices and publishes parameters for.
 ///
 /// The rates are the EMULATOR's own, not a claim about AWS's prices: AWS
 /// publishes its price list outside this API and no ElastiCache operation
-/// reports it. They are a deterministic scale — a family rate times the node
-/// size — so the prices this catalog reports are consistent between node types
-/// and stable across reads.
-pub const OFFERING_NODE_TYPES: [(&str, f64); 19] = [
+/// reports it. They are a deterministic scale — a family rate doubling with each
+/// step in node size — so the prices this catalog reports are consistent between
+/// node types and stable across reads.
+///
+/// The largest node types the capacity table carries are not stocked here: their
+/// published Memcached cache size is above the range `max_cache_memory` itself
+/// publishes, and this catalog states ONE consistent set of facts about every
+/// node type it sells.
+pub const OFFERING_NODE_TYPES: [(&str, f64); 25] = [
     ("cache.m3.medium", 0.08),
+    ("cache.m4.large", 0.16),
+    ("cache.m4.xlarge", 0.32),
+    ("cache.m4.2xlarge", 0.64),
+    ("cache.m4.4xlarge", 1.28),
     ("cache.m5.2xlarge", 0.64),
     ("cache.m5.large", 0.16),
     ("cache.m5.xlarge", 0.32),
@@ -75,6 +88,8 @@ pub const OFFERING_NODE_TYPES: [(&str, f64); 19] = [
     ("cache.m7g.large", 0.16),
     ("cache.m7g.xlarge", 0.32),
     ("cache.r3.large", 0.24),
+    ("cache.r4.large", 0.24),
+    ("cache.r4.xlarge", 0.48),
     ("cache.r5.2xlarge", 0.96),
     ("cache.r5.large", 0.24),
     ("cache.r5.xlarge", 0.48),

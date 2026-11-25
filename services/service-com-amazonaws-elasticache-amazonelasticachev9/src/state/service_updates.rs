@@ -75,10 +75,13 @@ const CATALOG_OPEN_END: &str = "2040-01-01T00:00:00Z";
 /// that creates, cancels or expires one — and neither the model nor the docs
 /// name any particular update, so this table is the emulator's OWN published
 /// catalog rather than a claim about what AWS has released. Every column of it,
-/// the DATES included, is fixed by the catalog: a published update is the same
-/// entry on every store this build brings up, so a client that read a name, a
-/// severity or a window once reads the same one on the next call and on the next
-/// boot.
+/// the DATES and the DESCRIPTION included, is fixed by the catalog: a published
+/// update is the same entry on every store this build brings up, so a client
+/// that read a name, a severity, a window or a description once reads the same
+/// one on the next call and on the next boot. Nothing about a row is composed
+/// when it is READ either — `ServiceUpdate$ServiceUpdateDescription` ("provides
+/// details of the service update") is the update's own published text, not a
+/// sentence assembled from the columns beside it.
 struct PublishedUpdate {
     /// The tail of this row's `ServiceUpdateName`: an update's identity is part
     /// of what the service publishes, so it is the same string on every store
@@ -88,6 +91,8 @@ struct PublishedUpdate {
     /// One of `ServiceUpdateSeverity`'s values (`critical | important | medium |
     /// low`).
     severity: &'static str,
+    /// This update's own `ServiceUpdateDescription`.
+    description: &'static str,
     /// "The date when the service update is initially available."
     release_date: &'static str,
     /// "The recommendend date to apply the service update in order to ensure
@@ -108,15 +113,21 @@ const PUBLISHED_UPDATES: [PublishedUpdate; 2] = [
     PublishedUpdate {
         slug: "security-update-001",
         severity: "critical",
+        description: "Addresses a critical security issue in the cache engine. Applying this \
+                      update replaces the engine binary the nodes run; it does not change the \
+                      engine version the cluster is configured with.",
         release_date: "2024-02-13T00:00:00Z",
-        recommended_apply_by_date: "2024-03-14T00:00:00Z",
         // Past: this is the entry the catalog publishes as no longer available.
         end_date: "2024-06-12T00:00:00Z",
+        recommended_apply_by_date: "2024-03-14T00:00:00Z",
         auto_update_after_recommended_apply_by_date: true,
     },
     PublishedUpdate {
         slug: "security-update-002",
         severity: "important",
+        description: "Addresses an important security issue in the cache engine. Applying this \
+                      update replaces the engine binary the nodes run; it does not change the \
+                      engine version the cluster is configured with.",
         release_date: "2025-09-09T00:00:00Z",
         recommended_apply_by_date: CATALOG_OPEN_APPLY_BY,
         end_date: CATALOG_OPEN_END,
@@ -258,18 +269,15 @@ pub fn published_service_updates() -> BTreeMap<String, ServiceUpdateRecord> {
         for engine in ENGINES {
             let name = format!("{ARN_NAMESPACE}-{engine}-{}", row.slug);
             let engine_version = default_engine_version(engine);
-            let severity = row.severity;
             catalog.insert(
                 name.clone(),
                 ServiceUpdateRecord {
                     service_update_name: name,
                     engine: engine.to_string(),
                     engine_version: engine_version.to_string(),
-                    severity: severity.to_string(),
+                    severity: row.severity.to_string(),
                     update_type: SERVICE_UPDATE_TYPE.to_string(),
-                    description: format!(
-                        "A {severity} security update for {engine} {engine_version}."
-                    ),
+                    description: row.description.to_string(),
                     release_date: published_date(row.release_date),
                     recommended_apply_by_date: published_date(row.recommended_apply_by_date),
                     end_date: published_date(row.end_date),

@@ -199,12 +199,10 @@ pub(super) fn version_rank(version: &str) -> (i32, i32) {
 /// of the parameter.") is a catalog FACT about the parameter rather than a
 /// sentence a read composes, so the published wording, with its own
 /// capitalisation and its own stop or lack of one, is what every read reports
-/// and what two reads of the same parameter report alike. A row whose published
-/// wording this crate has not transcribed yet carries this emulator's own
-/// summary of the parameter instead, which is the catalog-wide divergence
-/// `issues/things-that-do-not-work/20261116T175951Z-elasticache-reference-catalogs-are-emulator-authored-engine-defaults.md`
-/// owns; a row transcribed here must never be re-authored back into prose of
-/// this crate's own.
+/// and what two reads of the same parameter report alike. A row transcribed here
+/// must never be re-authored back into prose of this crate's own, and a row this
+/// crate has not transcribed yet is finished by transcribing the published
+/// wording for it, never by composing a sentence about the parameter.
 ///
 /// The allowed-values column is the `Parameter$AllowedValues` the catalog
 /// publishes, in the three forms ElastiCache writes it in: an enumeration of the
@@ -257,12 +255,26 @@ pub(super) struct ParameterRow(
 /// bounds wherever the engine publishes both.
 pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
+        "acllog-max-len",
+        "128",
+        // The published description of the parameter, verbatim.
+        "The maximum length of the ACL Log",
+        "integer",
+        "1-10000",
+        true,
+        // The ACL log arrived with the Redis OSS 6 generation, the same
+        // generation that introduced the ACL users it records.
+        "6.0.5",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
         "acl-pubsub-default",
-        "resetchannels",
+        "allchannels",
         // The published description of the parameter, verbatim.
         "Default pubsub channel permissions for ACL users deployed to this cluster",
         "string",
-        "allchannels,resetchannels",
+        "resetchannels,allchannels",
         true,
         "6.2.6",
         CHANGE_TYPE_IMMEDIATE,
@@ -271,7 +283,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "active-defrag-cycle-max",
         "75",
-        "The largest share of CPU, as a percentage, active defragmentation may use.",
+        "Maximal effort for defrag in CPU percentage",
         "integer",
         "1-75",
         true,
@@ -282,8 +294,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "active-defrag-cycle-min",
         "5",
-        "The smallest share of CPU, as a percentage, active defragmentation uses once it \
-         starts.",
+        "Minimal effort for defrag in CPU percentage",
         "integer",
         "1-75",
         true,
@@ -294,7 +305,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "active-defrag-ignore-bytes",
         "104857600",
-        "How much fragmentation, in bytes, is tolerated before active defragmentation starts.",
+        "Minimum amount of fragmentation waste to start active defrag",
         "integer",
         "1048576-",
         true,
@@ -305,8 +316,8 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "active-defrag-max-scan-fields",
         "1000",
-        "The largest number of fields of a hash, set, sorted set or list active \
-         defragmentation processes in one scan.",
+        "Maximum number of set/hash/zset/list fields that will be processed from the main \
+         dictionary scan",
         "integer",
         "1-1000000",
         true,
@@ -317,7 +328,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "active-defrag-threshold-lower",
         "10",
-        "The fragmentation, as a percentage, at which active defragmentation starts.",
+        "Minimum percentage of fragmentation to start active defrag",
         "integer",
         "1-100",
         true,
@@ -328,8 +339,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "active-defrag-threshold-upper",
         "100",
-        "The fragmentation, as a percentage, at which active defragmentation uses its \
-         largest share of CPU.",
+        "Maximum percentage of fragmentation at which we use maximum effort",
         "integer",
         "1-100",
         true,
@@ -351,7 +361,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "activedefrag",
         "no",
-        "Whether active memory defragmentation is enabled.",
+        "Enabled active defragmentation",
         "string",
         "yes,no",
         true,
@@ -362,7 +372,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "activerehashing",
         "yes",
-        "Whether the main dictionary is actively rehashed.",
+        "Apply rehashing or not.",
         "string",
         "yes,no",
         false,
@@ -373,8 +383,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "client-output-buffer-limit-normal-hard-limit",
         "0",
-        "The output buffer, in bytes, at which an ordinary client is disconnected, or 0 for \
-         no limit.",
+        "Normal client output buffer hard limit in bytes.",
         "integer",
         "",
         false,
@@ -385,8 +394,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "client-output-buffer-limit-normal-soft-limit",
         "0",
-        "The output buffer, in bytes, an ordinary client is disconnected for holding for \
-         longer than the soft seconds, or 0 for no limit.",
+        "Normal client output buffer soft limit in bytes.",
         "integer",
         "",
         false,
@@ -397,8 +405,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "client-output-buffer-limit-normal-soft-seconds",
         "0",
-        "How long, in seconds, an ordinary client may hold the soft-limit output buffer \
-         before it is disconnected.",
+        "Normal client output buffer soft limit in seconds.",
         "integer",
         "",
         false,
@@ -409,7 +416,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "client-output-buffer-limit-pubsub-hard-limit",
         "33554432",
-        "The output buffer size, in bytes, a pub/sub client is disconnected at.",
+        "Pubsub client output buffer hard limit in bytes.",
         "integer",
         "0-",
         true,
@@ -420,8 +427,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "client-output-buffer-limit-pubsub-soft-limit",
         "8388608",
-        "The output buffer size, in bytes, a pub/sub client may stay above only for \
-         client-output-buffer-limit-pubsub-soft-seconds.",
+        "Pubsub client output buffer soft limit in bytes.",
         "integer",
         "0-",
         true,
@@ -432,7 +438,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "client-output-buffer-limit-pubsub-soft-seconds",
         "60",
-        "How long, in seconds, a pub/sub client may stay above the soft limit.",
+        "Pubsub client output buffer soft limit in seconds.",
         "integer",
         "0-",
         true,
@@ -443,7 +449,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "client-output-buffer-limit-replica-hard-limit",
         "",
-        "The output buffer, in bytes, at which a replica is disconnected.",
+        "Replica client output buffer hard limit in bytes.",
         "integer",
         "0-",
         false,
@@ -455,8 +461,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "client-output-buffer-limit-replica-soft-limit",
         "",
-        "The output buffer, in bytes, a replica is disconnected for holding for longer than \
-         the soft seconds.",
+        "Replica client output buffer soft limit in bytes.",
         "integer",
         "0-",
         false,
@@ -468,8 +473,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "client-output-buffer-limit-replica-soft-seconds",
         "60",
-        "How long, in seconds, a replica may hold the soft-limit output buffer before it is \
-         disconnected.",
+        "Replica client output buffer soft limit in seconds.",
         "integer",
         "",
         false,
@@ -480,7 +484,8 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "close-on-replica-write",
         "yes",
-        "Whether a client writing to a read-only replica is disconnected.",
+        "If enabled, clients who attempt to write to a read-only replica will be \
+         disconnected. Applicable to 2.8.23 and higher.",
         "string",
         "yes,no",
         true,
@@ -529,7 +534,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "databases",
         "16",
-        "The number of logical databases a node holds.",
+        "Set the number of databases.",
         "integer",
         "1-",
         false,
@@ -540,7 +545,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "hash-max-listpack-entries",
         "128",
-        "The largest hash, in entries, kept in the memory-efficient listpack encoding.",
+        "The maximum number of hash entries in order for the dataset to be compressed",
         "integer",
         "0-",
         true,
@@ -551,7 +556,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "hash-max-listpack-value",
         "64",
-        "The largest hash value, in bytes, kept in the memory-efficient listpack encoding.",
+        "The threshold of biggest hash entries in order for the dataset to be compressed",
         "integer",
         "0-",
         true,
@@ -562,7 +567,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "hash-max-ziplist-entries",
         "512",
-        "The largest hash, in entries, kept in the memory-efficient ziplist encoding.",
+        "The maximum number of hash entries in order for the dataset to be compressed",
         "integer",
         "0-",
         true,
@@ -573,7 +578,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "hash-max-ziplist-value",
         "64",
-        "The largest hash value, in bytes, kept in the memory-efficient ziplist encoding.",
+        "The threshold of biggest hash entries in order for the dataset to be compressed",
         "integer",
         "0-",
         true,
@@ -584,8 +589,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "hll-sparse-max-bytes",
         "3000",
-        "The largest HyperLogLog, in bytes, kept in the memory-efficient sparse \
-         representation.",
+        "HyperLogLog sparse representation bytes limit",
         "integer",
         "1-16000",
         true,
@@ -607,7 +611,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "lazyfree-lazy-eviction",
         "no",
-        "Whether an evicted key is freed in a background thread.",
+        "Perform an asynchronous delete on evictions",
         "string",
         "yes,no",
         true,
@@ -618,7 +622,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "lazyfree-lazy-expire",
         "no",
-        "Whether an expired key is freed in a background thread.",
+        "Perform an asynchronous delete on expired keys",
         "string",
         "yes,no",
         true,
@@ -629,8 +633,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "lazyfree-lazy-server-del",
         "no",
-        "Whether a key the server replaces as a side effect of a command is freed in a \
-         background thread.",
+        "Perform an asynchronous delete on key updates",
         "string",
         "yes,no",
         true,
@@ -641,7 +644,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "lazyfree-lazy-user-del",
         "no",
-        "Whether a key a DEL deletes is freed in a background thread.",
+        "Specifies whether the default behavior of DEL command acts the same as UNLINK",
         "string",
         "yes,no",
         true,
@@ -663,8 +666,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "lfu-decay-time",
         "1",
-        "How long, in minutes, before a key's access counter is halved under an LFU \
-         eviction policy.",
+        "The time, in minutes, to decay the key counter for the LFU maxmemory-policy",
         "integer",
         "0-",
         true,
@@ -675,7 +677,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "lfu-log-factor",
         "10",
-        "How quickly a key's access counter saturates under an LFU eviction policy.",
+        "The log factor for incrementing the key counter for the LFU maxmemory-policy",
         "integer",
         "0-",
         true,
@@ -686,8 +688,9 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "list-compress-depth",
         "0",
-        "How many entries at each end of a list are left uncompressed, or 0 to compress \
-         none of it.",
+        "Number of quicklist ziplist nodes from each end of the list to exclude from \
+         compression. The head and tail of the list are always uncompressed for fast \
+         push/pop operations",
         "integer",
         "0-",
         true,
@@ -709,7 +712,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "list-max-ziplist-entries",
         "128",
-        "The largest list, in entries, kept in the memory-efficient ziplist encoding.",
+        "The maximum number of list entries in order for the dataset to be compressed",
         "integer",
         "0-",
         true,
@@ -720,7 +723,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "list-max-ziplist-value",
         "64",
-        "The largest list entry, in bytes, kept in the memory-efficient ziplist encoding.",
+        "The threshold of biggest list entries in order for the dataset to be compressed",
         "integer",
         "0-",
         true,
@@ -778,7 +781,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "maxmemory-policy",
         "volatile-lru",
-        "The eviction policy applied once the data stored reaches maxmemory.",
+        "Max memory policy",
         "string",
         "volatile-lru,allkeys-lru,volatile-lfu,allkeys-lfu,volatile-random,allkeys-random,\
          volatile-ttl,noeviction",
@@ -790,7 +793,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "maxmemory-samples",
         "3",
-        "How many keys an approximated eviction policy samples before it picks one.",
+        "Max memory samples",
         "integer",
         "1-64",
         true,
@@ -824,7 +827,8 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "notify-keyspace-events",
         "",
-        "The classes of keyspace event published to pub/sub.",
+        "The keyspace events for Redis to notify Pub/Sub clients about. By default all \
+         notifications are disabled",
         "string",
         "",
         true,
@@ -904,8 +908,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "set-max-intset-entries",
         "512",
-        "The largest set of integers, in entries, kept in the memory-efficient intset \
-         encoding.",
+        "The limit in the size of the set in order for the dataset to be compressed",
         "integer",
         "0-",
         true,
@@ -938,7 +941,8 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "slowlog-log-slower-than",
         "10000",
-        "How long, in microseconds, a command must take to be recorded in the slow log.",
+        "The execution time, in microseconds, which, if exceeded by a command, causes the \
+         command to be logged by the slow log",
         "integer",
         "0-",
         true,
@@ -949,7 +953,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "slowlog-max-len",
         "128",
-        "How many entries the slow log keeps.",
+        "The maximum length of the slow log",
         "integer",
         "0-",
         true,
@@ -982,7 +986,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "tcp-keepalive",
         "300",
-        "How often, in seconds, a TCP ACK is sent to an idle client, or 0 to send none.",
+        "If non-zero, send ACKs every given number of seconds",
         "integer",
         "0-",
         true,
@@ -1041,7 +1045,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "zset-max-ziplist-entries",
         "128",
-        "The largest sorted set, in entries, kept in the memory-efficient ziplist encoding.",
+        "The maximum number of sorted set entries in order for the dataset to be compressed",
         "integer",
         "0-",
         true,
@@ -1052,8 +1056,8 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "zset-max-ziplist-value",
         "64",
-        "The largest sorted set value, in bytes, kept in the memory-efficient ziplist \
-         encoding.",
+        "The threshold of biggest sorted set entries in order for the dataset to be \
+         compressed",
         "integer",
         "0-",
         true,
@@ -1359,37 +1363,69 @@ pub(super) const MEMCACHED_PARAMETERS: &[ParameterRow] = &[
     ),
 ];
 
-/// The memory, in mebibytes, and the vCPU count the emulator attributes to each
-/// cache node SIZE — the last segment of a `cache.<family>.<size>` node type.
+/// The memory a cache node makes available to the data it holds, in BYTES, and
+/// its vCPU count, per published cache node TYPE.
 ///
-/// Like [`OFFERING_NODE_TYPES`]' hourly rates these are the EMULATOR's own
-/// scale, not a claim about AWS's published node capacities: AWS publishes those
-/// outside this API and the values below are derived per node size rather than
-/// copied from it. They DO reach the wire — `DescribeEngineDefaultParameters`
-/// reports `maxmemory` / `max_cache_memory` / `num_threads` per cache node type
-/// from them — so read them as this emulator's approximations of those
-/// capacities, not as AWS's numbers. They rise with the
-/// node size, so the node-type-specific values this catalog reports keep the
+/// A node's capacity is a property of the node type — its family together with
+/// its size — and not of the size alone: two types of one size differ by what
+/// their family is built for, so a memory optimized `cache.r5.large` holds about
+/// twice what a general purpose `cache.m5.large` does, and a burstable
+/// `cache.t3.medium` less than either. Keying this table by the whole node type
+/// is what lets each one report its own capacity.
+///
+/// Source: the per-node-type memory the ElastiCache User Guide's
+/// node-type-specific parameter tables publish for `maxmemory` (and, for
+/// Memcached, `max_cache_memory`) — the capacity of the node type, which is why
+/// [`node_type_specific_value`] computes every node-type-specific parameter from
+/// it rather than from a second number: `maxmemory` IS this capacity, the
+/// replication and client output-buffer limits are published shares of it, and
+/// `max_cache_memory` is the same capacity in mebibytes. The rows rise with the
+/// node size inside a family, so the values this catalog reports keep the
 /// ordering a caller picks a node type for, and they are fixed, so every read
 /// reports the same ones.
-pub(super) const NODE_SIZES: [(&str, i64, i64); 7] = [
-    ("micro", 512, 2),
-    ("small", 1_024, 2),
-    ("medium", 3_072, 2),
-    ("large", 6_144, 2),
-    ("xlarge", 12_288, 4),
-    ("2xlarge", 24_576, 8),
-    ("4xlarge", 49_152, 16),
+///
+/// Every node type [`OFFERING_NODE_TYPES`] publishes carries a row here; the
+/// assertion in [`family_default_parameters`] is what holds the two lists
+/// together. The table also covers node types the offering catalog does not
+/// stock, because a cluster may RUN one and its data plane is held to the same
+/// published capacity.
+pub(super) const NODE_TYPE_CAPACITIES: [(&str, i64, i64); 27] = [
+    ("cache.m3.medium", 2_988_441_600, 1),
+    ("cache.m4.large", 6_892_290_048, 2),
+    ("cache.m4.xlarge", 14_281_408_512, 4),
+    ("cache.m4.2xlarge", 29_061_842_534, 8),
+    ("cache.m4.4xlarge", 60_532_555_776, 16),
+    ("cache.m4.10xlarge", 166_047_252_480, 40),
+    ("cache.m5.large", 6_854_542_745, 2),
+    ("cache.m5.xlarge", 13_891_534_134, 4),
+    ("cache.m5.2xlarge", 27_966_763_008, 8),
+    ("cache.m6g.large", 6_854_542_745, 2),
+    ("cache.m6g.xlarge", 13_891_534_134, 4),
+    ("cache.m7g.large", 6_854_542_745, 2),
+    ("cache.m7g.xlarge", 13_891_534_134, 4),
+    ("cache.r3.large", 14_260_633_600, 2),
+    ("cache.r4.large", 13_201_571_840, 2),
+    ("cache.r4.xlarge", 26_502_926_336, 4),
+    ("cache.r4.16xlarge", 437_021_573_120, 64),
+    ("cache.r5.large", 14_037_181_030, 2),
+    ("cache.r5.xlarge", 28_261_849_502, 4),
+    ("cache.r5.2xlarge", 56_763_875_328, 8),
+    ("cache.r6g.large", 14_037_181_030, 2),
+    ("cache.r7g.large", 14_037_181_030, 2),
+    ("cache.t2.micro", 581_959_680, 1),
+    ("cache.t3.micro", 536_870_912, 2),
+    ("cache.t3.small", 1_471_026_299, 2),
+    ("cache.t3.medium", 3_317_862_236, 2),
+    ("cache.t4g.micro", 536_870_912, 2),
 ];
 
-/// The memory (mebibytes) and vCPU count of `cache_node_type`, or `None` when
-/// its size is not one [`NODE_SIZES`] carries.
+/// The memory (bytes) and vCPU count of `cache_node_type`, or `None` when the
+/// published catalog carries no capacity for that node type.
 pub(super) fn node_type_capacity(cache_node_type: &str) -> Option<(i64, i64)> {
-    let size = cache_node_type.split('.').next_back()?;
-    NODE_SIZES
+    NODE_TYPE_CAPACITIES
         .iter()
-        .find(|(name, _, _)| *name == size)
-        .map(|(_, memory_mib, vcpus)| (*memory_mib, *vcpus))
+        .find(|(name, _, _)| *name == cache_node_type)
+        .map(|(_, memory_bytes, vcpus)| (*memory_bytes, *vcpus))
 }
 
 /// The value the parameter `name` takes on a node type of this capacity, or
@@ -1397,24 +1433,32 @@ pub(super) fn node_type_capacity(cache_node_type: &str) -> Option<(i64, i64)> {
 ///
 /// This is the one place a node-type-specific parameter's value is computed, so
 /// the two catalogs cannot derive it differently.
-pub(super) fn node_type_specific_value(name: &str, memory_mib: i64, vcpus: i64) -> Option<String> {
-    /// Mebibytes to bytes.
+pub(super) fn node_type_specific_value(
+    name: &str,
+    memory_bytes: i64,
+    vcpus: i64,
+) -> Option<String> {
+    /// Bytes in a mebibyte, the unit Memcached's cache size is published in.
     const BYTES_PER_MIB: i64 = 1024 * 1024;
     /// The share of a node's memory a REPLICA's output buffer may grow to
-    /// before the replica is disconnected, as a percentage.
-    ///
-    /// Like [`NODE_SIZES`], the emulator's own scale rather than a claim about
-    /// AWS's published default: what the published catalog states is that the
-    /// limit is a share of the node's own memory, which is what makes it a
-    /// `CacheNodeTypeSpecificParameter` at all.
+    /// before the replica is disconnected, as a percentage: the published
+    /// replication output-buffer limit is a tenth of the node's capacity, which
+    /// is what makes it a `CacheNodeTypeSpecificParameter` at all.
     const REPLICA_BUFFER_PERCENT: i64 = 10;
     /// The share of a node's memory the output buffers of all clients together
     /// may use, as a percentage; see [`REPLICA_BUFFER_PERCENT`].
     const CLIENT_BUFFER_PERCENT: i64 = 5;
-    let share = |percent: i64| (memory_mib * BYTES_PER_MIB / 100 * percent).to_string();
+    /// `value` scaled by `percent` and rounded to the nearest whole number of
+    /// the unit it is in, so a published share of a capacity that is not a
+    /// multiple of a hundred is the nearest byte rather than the one below it.
+    fn rounded_share(value: i64, percent: i64, whole: i64) -> i64 {
+        (value * percent + whole / 2) / whole
+    }
+    let share = |percent: i64| rounded_share(memory_bytes, percent, 100).to_string();
     match name {
-        // The data a Redis OSS / Valkey node may hold, in bytes.
-        "maxmemory" => Some((memory_mib * BYTES_PER_MIB).to_string()),
+        // The data a Redis OSS / Valkey node may hold, in bytes: the node's
+        // whole published capacity.
+        "maxmemory" => Some(memory_bytes.to_string()),
         // The replication output buffers, in bytes, which the node's own
         // capacity sizes.
         "client-output-buffer-limit-replica-hard-limit"
@@ -1422,8 +1466,9 @@ pub(super) fn node_type_specific_value(name: &str, memory_mib: i64, vcpus: i64) 
         // The client output buffers, in bytes, which the node's own capacity
         // sizes.
         "maxmemory-clients" => Some(share(CLIENT_BUFFER_PERCENT)),
-        // The cache a Memcached node may hold, in megabytes.
-        "max_cache_memory" => Some(memory_mib.to_string()),
+        // The cache a Memcached node may hold, in mebibytes — the same
+        // capacity in the unit that parameter is published in.
+        "max_cache_memory" => Some(rounded_share(memory_bytes, 1, BYTES_PER_MIB).to_string()),
         // One Memcached worker thread per vCPU.
         "num_threads" => Some(vcpus.to_string()),
         _ => None,
@@ -1557,9 +1602,19 @@ impl ParameterRecord {
 /// holding the record it is looking for
 /// ([`ComAmazonawsElasticacheAmazonelasticachev9State::family_parameter`]), and
 /// two spellings of one key would let a write land where no read finds it.
+///
+/// Inside one list the order is the parameter name's, compared with the HYPHENS
+/// that separate the words of a name ignored: a parameter name is a sequence of
+/// words, and ElastiCache orders the catalog by those words rather than by the
+/// punctuation between them, so the ACL-log row (`acllog-max-len`) precedes the
+/// ACL-pubsub row (`acl-pubsub-default`) and `activedefrag` precedes
+/// `active-defrag-cycle-max`, which comparing the raw names would reverse. The
+/// raw name follows the compared form in the key so two names that differ only
+/// in their hyphens still have distinct keys and a stable order.
 pub(super) fn parameter_page_key(name: &str, node_type_specific: bool) -> String {
     let list = if node_type_specific { 2 } else { 1 };
-    format!("{list}:{name}")
+    let words: String = name.chars().filter(|letter| *letter != '-').collect();
+    format!("{list}:{words}:{name}")
 }
 
 /// `Parameter$DataType`'s spellings in the catalogs this service publishes: the
@@ -1775,16 +1830,17 @@ pub fn family_default_parameters(family: &str) -> Option<BTreeMap<String, Parame
             let values: Vec<(String, String)> = OFFERING_NODE_TYPES
                 .iter()
                 .filter_map(|(cache_node_type, _)| {
-                    let (memory_mib, vcpus) = node_type_capacity(cache_node_type)?;
-                    let value = node_type_specific_value(name, memory_mib, vcpus)?;
+                    let (memory_bytes, vcpus) = node_type_capacity(cache_node_type)?;
+                    let value = node_type_specific_value(name, memory_bytes, vcpus)?;
                     Some(((*cache_node_type).to_string(), value))
                 })
                 .collect();
             // A row flagged node-type-specific that no node type has a value
             // for would be reported as a plain parameter with NO value at all,
             // so it is refused here instead: it means a catalog row and
-            // [`node_type_specific_value`] (or [`NODE_SIZES`] and a node type
-            // added to [`OFFERING_NODE_TYPES`]) disagree, which is a bug in this
+            // [`node_type_specific_value`] (or [`NODE_TYPE_CAPACITIES`] and a
+            // node type added to [`OFFERING_NODE_TYPES`]) disagree, which is a
+            // bug in this
             // module rather than anything a request can ask for — the same
             // reading as [`offering_rate_share`]'s `expect`s.
             assert!(
