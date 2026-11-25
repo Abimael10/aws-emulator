@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     ArchiveBooleanToEvaluate, ArchiveFilterCondition, ArchiveFilters, ArchiveRetention,
-    ArchiveStringToEvaluate, ExportStatus, Row, SearchStatus, Tag,
+    ArchiveStringToEvaluate, ExportStatus, Row, Rule, SearchStatus, Tag,
 };
 
 /// The two `ArchiveState` values this service's model declares; see
@@ -671,6 +671,51 @@ pub const SEARCH_NOT_COMPLETED: &str = "Search is not completed yet.";
 /// fault in the request.
 pub const SEARCH_NOT_FOUND: &str = "Search not found.";
 
+/// The most rule sets this emulator keeps, i.e. its per-account rule-set quota.
+///
+/// `CreateRuleSet` models `ServiceQuotaExceededException` ("Occurs when an operation exceeds
+/// a predefined service quota or limit") precisely because the real service caps the
+/// resource. The model does not state the number, so this value is CHOSEN on the same
+/// reasoning as [`MAX_ARCHIVES`]: large enough that ordinary use never reaches it, small
+/// enough that a caller cannot grow the process's memory without limit. It bounds the whole
+/// rule-set side of the store: `rule_sets` holds one entry per live rule set, and
+/// `rule_set_idempotency` is only written on a create that succeeded.
+pub const MAX_RULE_SETS: usize = 100;
+
+/// One stored rule set: "a list of rules that are evaluated in order. Each rule is evaluated
+/// sequentially for each email" (the model's `RuleSet` doc).
+///
+/// The single source of truth for every rule-set operation: `CreateRuleSet` writes it and
+/// `GetRuleSet` reads it back. The model declares no status member for a rule set, so a
+/// created one is immediately usable — there is no transition for the clock to owe.
+///
+/// [`Self::rules`] holds the modelled `Rule` values exactly as they were submitted, in the
+/// submitted ORDER, because the rules of a rule set are "evaluated in order": a read that
+/// reported them in any other order would describe a different rule set.
+#[derive(Debug, Clone)]
+pub struct RuleSetRecord {
+    pub rule_set_id: String,
+    pub rule_set_name: String,
+    pub rule_set_arn: String,
+    pub created_at_millis: i64,
+    /// The instant the rule set was last written, which is its creation instant until an
+    /// update rewrites it — what a rule-set read reports as `LastModificationDate`.
+    pub last_modified_at_millis: i64,
+    pub rules: Vec<Rule>,
+    pub tags: Vec<Tag>,
+}
+
+/// How a rule-set operation words the refusal of a `RuleSetId` that resolves to no stored
+/// rule set.
+///
+/// The fixed text is "Could not find RuleSet with id " and the one variable part is the id
+/// the request named, copied verbatim — the shape this service's resource lookups state a
+/// miss in (see [`address_list_not_found_message`]), carried by the modelled
+/// `ResourceNotFoundException` ("Occurs when a requested resource is not found").
+pub fn rule_set_not_found_message(rule_set_id: &str) -> String {
+    format!("Could not find RuleSet with id {rule_set_id}")
+}
+
 /// Per-service state for com-amazonaws-mailmanager-mailmanagersvc. A handler reaches it through [`service_state`].
 ///
 /// Every map is a `BTreeMap`, so `ListArchives` walks the archives in one stable,
@@ -746,6 +791,19 @@ pub struct ComAmazonawsMailmanagerMailmanagersvcState {
     /// The secret THIS store's pagination tokens are authenticated under; see
     /// [`encode_page_token`].
     pub page_token_key: PageTokenKey,
+    /// Rule sets by `RuleSetId`.
+    ///
+    /// A `BTreeMap`, so `ListRuleSets` walks them in one stable, deterministic order and a
+    /// continuation token can name the next key to resume from. Bounded by
+    /// [`MAX_RULE_SETS`].
+    pub rule_sets: BTreeMap<String, RuleSetRecord>,
+    /// `ClientToken` -> the `CreateRuleSet` it completed. Separate from the other token maps
+    /// so a token recorded for one resource is never read as a retry of a create of another.
+    pub rule_set_idempotency: BTreeMap<String, IdempotentCreate>,
+    /// Monotonic counter feeding
+    /// [`ComAmazonawsMailmanagerMailmanagersvcState::mint_rule_set_id`]; see
+    /// [`Self::archive_sequence`].
+    pub rule_set_sequence: u64,
 }
 
 impl ComAmazonawsMailmanagerMailmanagersvcState {
@@ -899,6 +957,14 @@ impl ComAmazonawsMailmanagerMailmanagersvcState {
         self.archive_search_sequence = self.archive_search_sequence.wrapping_add(1);
         mint_id(self.archive_search_sequence, now_millis)
     }
+
+    /// Mint a fresh `RuleSetId`, the same way [`Self::mint_archive_id`] mints an archive id:
+    /// 32 lowercase hex characters, well inside `RuleSetId`'s modelled 1..100 length (the
+    /// shape declares no pattern).
+    pub fn mint_rule_set_id(&mut self, now_millis: i64) -> String {
+        self.rule_set_sequence = self.rule_set_sequence.wrapping_add(1);
+        mint_id(self.rule_set_sequence, now_millis)
+    }
 }
 
 /// The identifier minted for the `sequence`-th resource of its kind: 32 lowercase hex
@@ -999,6 +1065,24 @@ pub fn create_address_list_fingerprint(address_list_name: &str, tags: Option<&[T
     format!("{address_list_name}\u{1e}{}", render_tags(tags))
 }
 
+/// A stable description of the members a rule set is created from; see
+/// [`create_archive_fingerprint`] for what it is compared against and why.
+///
+/// The rules are part of it because the record stores them, and they are rendered with the
+/// derived `Debug` formatting of the modelled shapes: a `Rule` is a tree of structures and
+/// unions over strings, numbers and enums, so that rendering is total, deterministic and
+/// injective enough that two different rule lists cannot describe each other.
+pub fn create_rule_set_fingerprint(
+    rule_set_name: &str,
+    rules: &[Rule],
+    tags: Option<&[Tag]>,
+) -> String {
+    format!(
+        "{rule_set_name}\u{1e}{rules:?}\u{1e}{}",
+        render_tags(tags)
+    )
+}
+
 /// A stable description of the members an address-list import job is created from; see
 /// [`create_archive_fingerprint`] for what it is compared against and why.
 pub fn create_import_job_fingerprint(
@@ -1094,6 +1178,19 @@ pub fn address_list_arn(region: &str, address_list_id: &str) -> String {
         "ses",
         region,
         &format!("mailmanager-address-list/{address_list_id}"),
+    )
+}
+
+/// The ARN of a rule set, in this service's ARN namespace.
+///
+/// `RuleSetArn` carries `@arnReference`
+/// (`smithy_query(query="shape",shape="RuleSetArn")`), and SES names the Mail Manager
+/// rule-set resource type `mailmanager-rule-set` in an ARN.
+pub fn rule_set_arn(region: &str, rule_set_id: &str) -> String {
+    ::engine::emulator_arn(
+        "ses",
+        region,
+        &format!("mailmanager-rule-set/{rule_set_id}"),
     )
 }
 
