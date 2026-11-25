@@ -140,6 +140,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // No IAM decision here, for the reason `GetSession` states: an Athena action is
         // scoped by the WORKGROUP the request names, and a session-addressed request names
         // none.
+        //
+        // The character constraint the service applies to a `SessionId`, measured BEFORE the
+        // id is resolved against anything this account holds
+        // (`crate::state::session_id_pattern_refusal`): a value that is no session id at all
+        // is the caller's own input to repair, and is stated as the constraint it broke
+        // rather than as the authorization refusal a well-formed id nothing was issued under
+        // keeps.
+        if let Some(refused) = crate::state::session_id_pattern_refusal(&input.session_id) {
+            return Err(refused);
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetSessionEndpointErrorModeled::InternalServerException(
                 InternalServerException {

@@ -875,6 +875,60 @@ pub fn session_not_authorized<E>() -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::invalid_request(ERROR_CODE_UNAUTHORIZED, SESSION_NOT_FOUND)
 }
 
+/// The member path a clause about the session a request addresses names: the lowerCamel of
+/// the `SessionId` member every session-addressed operation of this service declares, which
+/// is how a constraint clause spells a top-level member
+/// (`aws_smithy_schema_server::constraints::path::member`).
+const SESSION_ID_MEMBER: &str = "sessionId";
+
+/// The character constraint the service applies to the `SessionId` a request names, as it is
+/// quoted in the clause a value outside it is refused with.
+///
+/// RECORDED rather than modelled: `SessionId` declares only `@length 1..256`
+/// (`smithy_query(query="shape",shape="SessionId",model_path="services/service-com-amazonaws-athena-amazonathena/smithy-model/com-amazonaws-athena-amazonathena.json")`),
+/// and the service measures the value against this expression as well — one or more of a
+/// decimal digit, a lower-case ASCII letter, a hyphen and an underscore, which is the charset
+/// every id this service mints a session under is drawn from ([`new_session_id`]). It is
+/// published as written, anchors included
+/// ([`crate::service::input_validation::PATTERNS_PUBLISHED_AS_DECLARED`]).
+pub const SESSION_ID_PATTERN: &str = "^[0-9a-z-_]+$";
+
+/// Whether `ch` is a character [`SESSION_ID_PATTERN`] admits: the class that expression
+/// states, read off its own text.
+fn session_id_character(ch: char) -> bool {
+    ch.is_ascii_digit() || ch.is_ascii_lowercase() || matches!(ch, '-' | '_')
+}
+
+/// The refusal a request whose `SessionId` carries a value outside [`SESSION_ID_PATTERN`] is
+/// answered with, and `None` for a value that expression admits.
+///
+/// A rule about the REQUEST rather than about this account, so a handler applies it BEFORE
+/// resolving the id against anything the account holds, and it is stated in the constraint
+/// envelope every other broken input requirement of this service is stated in
+/// ([`crate::service::input_validation::pattern_refusal`]) under the class a refusal the
+/// caller's own input caused carries ([`ERROR_CODE_INVALID_INPUT`]): a client is told to
+/// repair the argument it built. A WELL-FORMED id this account holds no session under is a
+/// different class and keeps the sentence [`session_not_authorized`] states, which discloses
+/// nothing about which ids name sessions.
+///
+/// The class and the sentence are paired HERE, in the one place both are named, so every
+/// operation that takes a `SessionId` refuses the same values the same way. Generic over the
+/// operation's modeled error, so each handler returns it through its own error channel.
+pub fn session_id_pattern_refusal<E>(session_id: &str) -> Option<crate::scaffolded::Scaffolded<E>> {
+    if !session_id.is_empty() && session_id.chars().all(session_id_character) {
+        return None;
+    }
+    let message = crate::service::input_validation::pattern_refusal(
+        SESSION_ID_MEMBER,
+        SESSION_ID_PATTERN,
+        session_id,
+    )?;
+    Some(crate::scaffolded::Scaffolded::invalid_request(
+        ERROR_CODE_INVALID_INPUT,
+        message,
+    ))
+}
+
 /// The message a start that names a notebook version without the notebook it belongs to is
 /// refused with: the requirement `StartSessionRequest$NotebookVersion` states, "If you
 /// specify a value for NotebookVersion, you must also specify a value for NotebookId",

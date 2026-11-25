@@ -336,8 +336,11 @@ async fn an_unheld_session_or_calculation_reference_carries_the_unauthorized_cla
             "s".repeat(256),
         ),
         (
+            // Inside the charset the service measures a session id against, so the row is
+            // about an id that RESOLVES to nothing rather than about a malformed one
+            // (`tests/all/session_id_character_constraint.rs`).
             "an id of another shape".to_string(),
-            "sessions/none-of-ours_42".to_string(),
+            "sessions-none-of-ours_42".to_string(),
         ),
         ("the notebook's own id".to_string(), notebook_id.clone()),
         (

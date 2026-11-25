@@ -151,6 +151,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The character constraint the service applies to a `SessionId`, measured before any
+        // state is looked at (`crate::state::session_id_pattern_refusal`). The member is
+        // optional here, so only a request that NAMES a session is measured.
+        if let Some(refused) = input
+            .session_id
+            .as_deref()
+            .and_then(crate::state::session_id_pattern_refusal)
+        {
+            return Err(refused);
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal("Athena state is not reachable on this engine"));
         };

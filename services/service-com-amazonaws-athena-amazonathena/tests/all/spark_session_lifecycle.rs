@@ -549,15 +549,17 @@ async fn every_session_addressed_operation_refuses_an_unknown_id() {
     // carried rather than about an account holding no sessions at all.
     let live = given_session(&router, SPARK_WORK_GROUP, json!({})).await;
 
-    // The ids span the modelled `SessionId` (length 1 to 256, no pattern): the uuid form
-    // Athena mints, the shortest id the model admits, one of another shape entirely, and the
-    // longest the model admits.
+    // The ids span the modelled `SessionId` (length 1 to 256, no modelled pattern): the uuid
+    // form Athena mints, the shortest id the model admits, one of another shape entirely — and
+    // still inside the charset the service measures a session id against, so the row is about
+    // an id that RESOLVES to nothing rather than about a malformed one
+    // (`tests/all/session_id_character_constraint.rs`) — and the longest the model admits.
     let unknown_ids = [
         ("a uuid no start minted", ::uuid::Uuid::new_v4().to_string()),
         ("the shortest id the model admits", "x".to_string()),
         (
             "an id of another shape",
-            "session/not-one-of-ours_42".to_string(),
+            "session-not-one-of-ours_42".to_string(),
         ),
         ("the longest id the model admits", "s".repeat(256)),
     ];

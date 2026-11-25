@@ -249,17 +249,20 @@ async fn a_terminate_of_an_id_that_never_named_a_session_is_refused() {
     // carried rather than about an account holding no sessions at all.
     let live = given_session(&router).await;
 
-    // The ids span the modelled `SessionId` (length 1 to 256, no pattern — see
+    // The ids span the modelled `SessionId` (length 1 to 256, no modelled pattern — see
     // smithy_query(query="shape",shape="SessionId")): the uuid form a start mints, the
-    // shortest and the longest the model admits, one of another shape entirely, and the live
-    // session's own id with one character changed.
+    // shortest and the longest the model admits, one of another shape entirely — still inside
+    // the charset the service measures a session id against, so the row is about an id that
+    // RESOLVES to nothing rather than about a malformed one
+    // (`tests/all/session_id_character_constraint.rs`) — and the live session's own id with one
+    // character changed.
     let unknown_ids = [
         ("a uuid no start minted", ::uuid::Uuid::new_v4().to_string()),
         ("the shortest id the model admits", "x".to_string()),
         ("the longest id the model admits", "s".repeat(256)),
         (
             "an id of another shape",
-            "sessions/none-of-ours_42".to_string(),
+            "sessions-none-of-ours_42".to_string(),
         ),
         (
             "one character off a live session's id",

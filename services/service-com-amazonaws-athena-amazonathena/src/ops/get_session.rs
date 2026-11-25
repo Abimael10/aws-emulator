@@ -160,6 +160,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The character constraint the service applies to a `SessionId`, measured before the
+        // id is resolved against anything this account holds
+        // (`crate::state::session_id_pattern_refusal`).
+        if let Some(refused) = crate::state::session_id_pattern_refusal(&input.session_id) {
+            return Err(refused);
+        }
         let Some(session_state) = crate::state::service_state(&*self.engine) else {
             return Err(GetSessionErrorModeled::InternalServerException(
                 InternalServerException {

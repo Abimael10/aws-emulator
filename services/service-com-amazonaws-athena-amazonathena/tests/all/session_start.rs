@@ -770,8 +770,10 @@ async fn reading_a_session_that_was_never_started_is_refused() {
 
     // The rows differ along the SHAPE of the id: one of the form this service mints, the
     // shortest the model admits, the longest it admits, and one carrying no id-like text at
-    // all. The refusal quotes the id back for none of them, which only an id long enough not
-    // to occur inside the sentence itself can show.
+    // all — spelled inside the charset the service measures a session id against, so every row
+    // is about an id that RESOLVES to nothing rather than about a malformed one
+    // (`tests/all/session_id_character_constraint.rs`). The refusal quotes the id back for none
+    // of them, which only an id long enough not to occur inside the sentence itself can show.
     let ids = [
         (
             "an id of the minted form",
@@ -780,7 +782,11 @@ async fn reading_a_session_that_was_never_started_is_refused() {
         ),
         ("the shortest id the model admits", "a".to_string(), false),
         ("the longest id the model admits", "s".repeat(256), true),
-        ("text that is no session id", "not a session".to_string(), true),
+        (
+            "text that is no session id",
+            "not-a-session".to_string(),
+            true,
+        ),
     ];
 
     for (case, session_id, quotable) in &ids {

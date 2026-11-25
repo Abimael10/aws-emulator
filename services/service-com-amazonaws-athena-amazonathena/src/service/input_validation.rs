@@ -21,11 +21,15 @@
 //! The SENTENCE is AWS's own validation wording — `N validation error(s) detected: ` over one
 //! clause per broken constraint, each naming the member and the requirement — which
 //! `service_common::validation_message` renders from the violations the framework hands over,
-//! so neither the envelope nor any requirement is spelled here. Three renderings are this
+//! so neither the envelope nor any requirement is spelled here. Four renderings are this
 //! service's own, and they are all this file chooses:
 //!
 //! * a clause states NO value: the member and the requirement it broke, never the bytes the
 //!   request carried;
+//! * a character constraint is quoted as the expression the service PUBLISHES for the member's
+//!   shape ([`quoted_pattern`]), which for every expression this model declares is the
+//!   expression inside its whole-value anchors and for the ones listed in
+//!   [`PATTERNS_PUBLISHED_AS_DECLARED`] is the expression as written;
 //! * except for a member that was not there at all, which is stated as `Value null at
 //!   '<member>'` — there is a value to state for an absent member, and it is the absence;
 //! * the value set of an enumerated type is listed in the order the front door's own hash
@@ -152,10 +156,12 @@ pub fn stated_refusal(refusal: &Refusal) -> Option<Refused> {
                 message,
             });
     }
-    let stated = service_common::validation_message::aws_validation_refusal_withholding_violations(
-        &Refusal::Invalid(stated),
-        withholds_value,
-    )?;
+    let stated =
+        service_common::validation_message::aws_validation_refusal_withholding_violations_with(
+            &Refusal::Invalid(stated),
+            quoted_pattern,
+            withholds_value,
+        )?;
     Some(Refused {
         // The code travels with the message, as it must: a client branches on the code.
         code: INVALID_REQUEST_EXCEPTION.to_string(),
@@ -228,6 +234,31 @@ fn at_requested_capacity_bound(violation: Violation) -> Violation {
     }
 }
 
+/// The expressions this service PUBLISHES exactly as it writes them, whose clause therefore
+/// keeps the pair of anchors around the whole value.
+///
+/// Keyed by the EXPRESSION, because what is published belongs to the member's shape rather
+/// than to an operation: the character constraint the service applies to a `SessionId`
+/// ([`crate::state::SESSION_ID_PATTERN`]) is published with those anchors, while every
+/// expression this MODEL declares is published as the expression inside them — the two
+/// renderings a clause of this service can quote, and the only reference data either needs
+/// ([`service_common::validation::unanchored_unless_published_as_declared`]).
+pub const PATTERNS_PUBLISHED_AS_DECLARED: &[&str] = &[crate::state::SESSION_ID_PATTERN];
+
+/// The expression a clause quotes for the constraint `pattern`, whichever layer measured the
+/// value against it.
+///
+/// ONE rendering for this service, so the clause a framework violation is stated in and the
+/// clause a handler states for a constraint of the service's own quote an expression the same
+/// way. No expression of this service anchors its own branches, so what every pattern but the
+/// ones above is quoted as is the expression inside its whole-value pair.
+fn quoted_pattern(pattern: &str) -> String {
+    service_common::validation::unanchored_unless_published_as_declared(
+        pattern,
+        PATTERNS_PUBLISHED_AS_DECLARED,
+    )
+}
+
 /// Whether the clause for `violation` states no value at all.
 ///
 /// Every clause but one: a member that was ABSENT is stated as `Value null at '<member>'`,
@@ -238,20 +269,26 @@ fn withholds_value(violation: &Violation) -> bool {
     !matches!(violation.kind, ViolationKind::MissingRequiredMember)
 }
 
-/// The sentence a value that breaks the modelled `@pattern` at `member` is refused with,
+/// The sentence a value that breaks the character constraint at `member` is refused with,
 /// in the SAME envelope and clause the framework's own constraint refusal is stated in
 /// ([`stated_refusal`]) — one validation error, naming the member and quoting the expression
-/// the model declares for it.
+/// the constraint is stated as ([`quoted_pattern`]).
 ///
-/// It exists because a `@pattern` the framework's boundary DECLARES is not always one it
-/// APPLIES: its walk compiles an expression with the `regex` crate and treats one that does
-/// not compile as satisfied (`vendor/smithy-schema-server/src/constraints.rs`, read-only from
-/// here), and the expression every `CatalogNameString` of this model carries is one of those —
-/// it writes the astral plane as a surrogate pair, which that crate will not compile. So the
-/// requirement reaches no request at the boundary and the handlers that take such a member
-/// state it themselves ([`crate::state::catalog_name_pattern_error`]), in these words: the
-/// refusal a client sees is the constraint refusal it would have seen, whichever layer
-/// measured the value.
+/// It exists because a requirement the framework's boundary applies is not the only one a
+/// value is measured against, and two kinds of requirement reach a handler:
+///
+/// * a `@pattern` the boundary DECLARES but cannot APPLY: its walk compiles an expression with
+///   the `regex` crate and treats one that does not compile as satisfied
+///   (`vendor/smithy-schema-server/src/constraints.rs`, read-only from here), and the
+///   expression every `CatalogNameString` of this model carries is one of those — it writes the
+///   astral plane as a surrogate pair, which that crate will not compile
+///   ([`crate::state::catalog_name_pattern_error`]);
+/// * a character constraint the service applies that the model declares on no shape at all
+///   ([`crate::state::session_id_pattern_refusal`]).
+///
+/// Either way the requirement reaches no request at the boundary and the handler that takes
+/// the member states it in these words, so the refusal a client sees is the constraint refusal
+/// it would have seen, whichever layer measured the value.
 ///
 /// `value` is the value the member carried; the clause states the member and the requirement
 /// and never those bytes, exactly as [`withholds_value`] states it for every clause the
@@ -264,8 +301,9 @@ pub fn pattern_refusal(member: &str, pattern: &str, value: &str) -> Option<Strin
         value: Some(value.to_string()),
         sensitive: false,
     };
-    service_common::validation_message::aws_validation_refusal_withholding_violations(
+    service_common::validation_message::aws_validation_refusal_withholding_violations_with(
         &Refusal::Invalid(vec![violation]),
+        quoted_pattern,
         withholds_value,
     )
     .map(|stated| stated.message)
@@ -390,6 +428,17 @@ mod tests {
                 ),
                 "Value at 'statementName' failed to satisfy constraint: \
                  Member must satisfy regular expression pattern: [a-zA-Z_][a-zA-Z0-9_@:]{1,256}",
+            ),
+            (
+                "a string outside a constraint this service publishes as written, whose \
+                 anchors the clause keeps",
+                violation(
+                    "sessionId",
+                    ViolationKind::Pattern(crate::state::SESSION_ID_PATTERN.to_string()),
+                    Some("!! not-a-session-id ??"),
+                ),
+                "Value at 'sessionId' failed to satisfy constraint: \
+                 Member must satisfy regular expression pattern: ^[0-9a-z-_]+$",
             ),
             (
                 "a value outside an enumerated type, whose set the clause lists out of the \
