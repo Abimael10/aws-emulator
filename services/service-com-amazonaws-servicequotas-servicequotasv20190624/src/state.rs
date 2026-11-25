@@ -3375,6 +3375,11 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         service("backup", "AWS Backup", backup_quotas()),
         service("batch", "AWS Batch", batch_quotas()),
         service(
+            "bedrock-websearch",
+            "Amazon Bedrock Web Search",
+            bedrock_websearch_quotas(),
+        ),
+        service(
             "budgets",
             "AWS Budgets",
             vec![quota("Budgets", 20000.0).global()],

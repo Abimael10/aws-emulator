@@ -88,7 +88,7 @@ const ROWS: &[Row] = &[
         value: 50.0,
         unit: "Kilobytes",
         adjustable: true,
-        description: None,
+        description: Some("Maximum workflow definition size in kilobytes"),
     },
     Row {
         service_code: "airflow-serverless",
@@ -98,7 +98,7 @@ const ROWS: &[Row] = &[
         value: 100.0,
         unit: "None",
         adjustable: true,
-        description: None,
+        description: Some("Maximum number of concurrent workflow runs per account"),
     },
     // OpenSearch Serverless: a plain count of one capacity model's collections, and a
     // policy-document size published in bytes and as NOT adjustable.
@@ -133,7 +133,7 @@ const ROWS: &[Row] = &[
         value: 10_240.0,
         unit: "Bytes",
         adjustable: false,
-        description: None,
+        description: Some("The maximum size of a network policy in bytes."),
     },
     Row {
         service_code: "aoss",

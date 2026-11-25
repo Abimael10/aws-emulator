@@ -9,14 +9,17 @@ use super::*;
 /// running at once.
 ///
 /// Every member of such a row but the job type's own name and the value is the same
-/// across the class — a plain count, published as NOT adjustable — so one constructor
-/// fills it and two rows of the class cannot drift apart. The sentences this service
-/// publishes for the class are not among the data available here, so the rows publish
-/// none rather than wording of this catalog's own.
+/// across the class — a plain count, published as NOT adjustable, with the one sentence
+/// this service words the class with, which names the job type and states that the count
+/// is of jobs running at once for the account in the Region — so one constructor fills it
+/// and two rows of the class cannot drift apart.
 fn concurrent_jobs(code: &str, job_type: &str, jobs: f64) -> QuotaRow {
     quota(format!("Maximum concurrent {job_type}"), jobs)
         .code(code)
         .fixed()
+        .describe(&format!(
+            "The maximum number of total concurrent {job_type} per AWS account per region"
+        ))
 }
 
 /// The `axis` service code's published default-quota catalog.

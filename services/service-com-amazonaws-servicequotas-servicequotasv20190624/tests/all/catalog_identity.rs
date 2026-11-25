@@ -291,6 +291,7 @@ const CITED_AWS_QUOTA_CODES: &[(&str, &str)] = &[
     ("batch", "L-E985971C"),
     ("batch", "L-F8102809"),
     ("batch", "L-F9381E33"),
+    ("bedrock-websearch", "L-39158EC4"),
     ("cassandra", "L-0659E12E"),
     ("cassandra", "L-089904FB"),
     ("cassandra", "L-17766544"),

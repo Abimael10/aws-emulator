@@ -143,7 +143,7 @@ const ROWS: &[Row] = &[
         60.0,
         "None",
         true,
-        None,
+        Some("Maximum task execution timeout in minutes"),
     ),
     row(
         "airflow-serverless",
@@ -152,7 +152,7 @@ const ROWS: &[Row] = &[
         50.0,
         "None",
         true,
-        None,
+        Some("Maximum number of versions that can be created per workflow"),
     ),
     row(
         "airflow-serverless",
@@ -161,7 +161,7 @@ const ROWS: &[Row] = &[
         100.0,
         "None",
         true,
-        None,
+        Some("Maximum number of concurrent workflow runs per account"),
     ),
     row(
         "airflow-serverless",
@@ -170,7 +170,7 @@ const ROWS: &[Row] = &[
         50.0,
         "Kilobytes",
         true,
-        None,
+        Some("Maximum workflow definition size in kilobytes"),
     ),
     row(
         "airflow-serverless",
@@ -218,7 +218,7 @@ const ROWS: &[Row] = &[
         10_240.0,
         "Bytes",
         false,
-        None,
+        Some("The maximum size of a network policy in bytes."),
     ),
     row(
         "aoss",
@@ -238,7 +238,10 @@ const ROWS: &[Row] = &[
         3.0,
         "None",
         false,
-        None,
+        Some(
+            "The maximum number of total concurrent VectorEnrichmentJobs per AWS account per \
+             region",
+        ),
     ),
     row(
         "axis",
@@ -247,7 +250,10 @@ const ROWS: &[Row] = &[
         3.0,
         "None",
         false,
-        None,
+        Some(
+            "The maximum number of total concurrent EarthObservationJobs per AWS account per \
+             region",
+        ),
     ),
     // CloudShell: a gigabyte-measured directory size and a retention window published as
     // fixed, beside a monthly usage allowance and a concurrency that are adjustable.
@@ -296,7 +302,9 @@ const ROWS: &[Row] = &[
         value: 100_000.0,
         unit: "None",
         adjustable: false,
-        description: None,
+        description: Some(
+            "The maximum number of Omni agent credits per account per region per month.",
+        ),
         period: Some((1, "HOUR")),
         metric: Some((
             "ResourceCount",
@@ -305,14 +313,14 @@ const ROWS: &[Row] = &[
             "Resource",
         )),
     },
-    // CodeCatalyst's package and team planes.
+    // CodeCatalyst's package and team planes, every one of them published as FIXED.
     row(
         "codecatalyst",
         "L-861435F6",
         "Number of assets in a version",
         150.0,
         "None",
-        true,
+        false,
         None,
     ),
     row(
@@ -321,7 +329,7 @@ const ROWS: &[Row] = &[
         "Upstream package repositories searched",
         25.0,
         "None",
-        true,
+        false,
         None,
     ),
     row(
@@ -330,7 +338,7 @@ const ROWS: &[Row] = &[
         "Number of users in a team",
         1_000.0,
         "None",
-        true,
+        false,
         None,
     ),
     row(
@@ -339,7 +347,7 @@ const ROWS: &[Row] = &[
         "Number of direct upstream repositories",
         10.0,
         "None",
-        true,
+        false,
         None,
     ),
     // Cognito Sync: a dataset NAME bounded in bytes and a dataset bounded in megabytes,

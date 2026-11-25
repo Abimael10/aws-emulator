@@ -20,12 +20,15 @@ pub(in crate::state) fn cloudwatch_quotas() -> Vec<QuotaRow> {
         // The agent CREDITS an account may spend in a billing month: AWS publishes it as
         // not adjustable, metered by the credits-used series CloudWatch publishes for
         // this plane, over the window that series is published on — an hour, which this
-        // row states rather than the window a resource count is reported on. The sentence
-        // this service publishes for the row is not among the data available here, so it
-        // publishes none rather than wording of this catalog's own.
+        // row states rather than the window a resource count is reported on. Its sentence
+        // states the plane the credits are counted on — the account, in the Region, per
+        // month — which is the month the row's own name names.
         quota("Monthly Omni agent credits", 100000.0)
             .code("L-111E0C2D")
             .fixed()
+            .describe(
+                "The maximum number of Omni agent credits per account per region per month.",
+            )
             .period(1, "HOUR")
             .metric(usage_metric(
                 CLOUDWATCH_OMNI_USAGE_SERVICE,
