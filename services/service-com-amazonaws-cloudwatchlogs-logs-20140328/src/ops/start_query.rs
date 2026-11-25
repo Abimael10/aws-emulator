@@ -247,10 +247,17 @@ fn unexpected_symbol_message(
     query: &str,
     failure: &crate::state::query_compile::QueryCompileFailure,
 ) -> String {
+    unexpected_symbol_at(query, failure.start_char_offset, failure.end_char_offset)
+}
+
+/// That same diagnostic for a span the caller states itself, in CHARACTER offsets into
+/// `query` — for a compile failure this operation finds rather than one the compiler
+/// reported ([`log_groups_unnamed`]), so both read as one diagnostic.
+fn unexpected_symbol_at(query: &str, start_char_offset: usize, end_char_offset: usize) -> String {
     let symbol: String = query
         .chars()
-        .skip(failure.start_char_offset)
-        .take(failure.end_char_offset.saturating_sub(failure.start_char_offset))
+        .skip(start_char_offset)
+        .take(end_char_offset.saturating_sub(start_char_offset))
         .collect();
     let symbol = symbol.trim();
     let symbol = if symbol.is_empty() {
@@ -258,7 +265,7 @@ fn unexpected_symbol_message(
     } else {
         symbol
     };
-    let (line, position) = line_and_position(query, failure.start_char_offset);
+    let (line, position) = line_and_position(query, start_char_offset);
     format!("unexpected symbol found {symbol} at line {line} and position {position}")
 }
 
@@ -301,6 +308,71 @@ const LOG_GROUP_MEMBERS: [&str; 3] = ["logGroupName", "logGroupNames", "logGroup
 /// `StartQuery$logGroupName`), and `logGroupIdentifiers` is the member the statement's own
 /// clause overrides rather than one it conflicts with.
 const LEGACY_LOG_GROUP_MEMBERS: [&str; 2] = ["logGroupName", "logGroupNames"];
+
+/// Refuse a request that names the log groups to query NOWHERE: neither in one of the three
+/// members that may name them nor in the query string itself.
+///
+/// The query is what has to select the log groups it reads — "a StartQuery operation must
+/// include one of the following: Either exactly one of the following parameters:
+/// logGroupName, logGroupNames, or logGroupIdentifiers; Or the queryString must include a
+/// SOURCE command to select log groups for the query" — so a request naming none of the
+/// three leaves the QUERY STRING as the one place they can be selected, and the string is
+/// read as a query definition SNIPPET, whose opening command has to be the one that selects
+/// them. A string that opens with any other symbol is not such a snippet, so it does not
+/// compile: the fault is in the query rather than in a parameter outside its own range,
+/// which is what this operation models `MalformedQueryException` for.
+///
+/// The refusal is therefore the COMPILER'S diagnostic, not a sentence about the three
+/// members: the fixed text names the syntax that was being read, and then the symbol the
+/// compiler stopped on and where in the submitted string it sits
+/// ([`unexpected_symbol_at`]) — both taken from the query string itself, which is the whole
+/// value of the refusal, since a caller has to be able to tell WHERE its query is wrong. It
+/// is stated inside the SDK error envelope this service's refusals carry, so the status and
+/// the code stated in the text are the ones the response answers with, and it carries the
+/// `QueryCompileError` the model declares for the detail: the same account of what is wrong
+/// and the character range the offending symbol occupies.
+fn log_groups_unnamed(query: &str) -> StartQueryError {
+    let (start_char_offset, end_char_offset) = first_symbol_span(query);
+    let detail = unexpected_symbol_at(query, start_char_offset, end_char_offset);
+    StartQueryErrorModeled::MalformedQueryException(MalformedQueryException {
+        message: Some(crate::state::with_sdk_error_envelope(
+            &format!("{SNIPPET_SYNTAX_PREFIX}{detail}"),
+            ENVELOPE_MALFORMED_QUERY,
+        )),
+        query_compile_error: Some(QueryCompileError {
+            message: Some(detail),
+            location: Some(QueryCompileErrorLocation {
+                start_char_offset: Some(i32::try_from(start_char_offset).unwrap_or(i32::MAX)),
+                end_char_offset: Some(i32::try_from(end_char_offset).unwrap_or(i32::MAX)),
+            }),
+        }),
+    })
+    .into()
+}
+
+/// The fixed text that diagnostic opens with: which syntax was being read when the compiler
+/// stopped — the query definition snippet a query string that has to select its own log
+/// groups is read as.
+const SNIPPET_SYNTAX_PREFIX: &str = "Invalid syntax while using query definition snippets: ";
+
+/// The span of the FIRST symbol of `query`, in character offsets: the first run of
+/// non-whitespace characters, which is the symbol a snippet's opening command would be.
+///
+/// A query string that is blank has no symbol at all, and the span that holds no text is
+/// reported as the end of the query string ([`END_OF_QUERY_SYMBOL`]).
+fn first_symbol_span(query: &str) -> (usize, usize) {
+    let characters: Vec<char> = query.chars().collect();
+    let start = characters
+        .iter()
+        .position(|character| !character.is_whitespace())
+        .unwrap_or(0);
+    let end = characters
+        .iter()
+        .skip(start)
+        .position(|character| character.is_whitespace())
+        .map_or(characters.len(), |length| start.saturating_add(length));
+    (start, end)
+}
 
 /// Refuse a query asked over a time range that closes before a log group it reads was
 /// created: the range covers no instant of that group's lifetime, which is not a query this
@@ -619,11 +691,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect()
         } else {
             if named_members.is_empty() && !selects_own_sources {
-                return Err(invalid_parameter(format!(
-                    "Exactly one of {}, or a SOURCE command in the query string, must specify the \
-                     log groups to query.",
-                    LOG_GROUP_MEMBERS.join(", ")
-                )));
+                return Err(log_groups_unnamed(&input.query_string));
             }
             let identifiers: Vec<String> = input
                 .log_group_name

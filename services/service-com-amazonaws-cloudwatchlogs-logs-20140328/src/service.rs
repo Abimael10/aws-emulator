@@ -76,11 +76,12 @@
 //!
 //! The envelope is AWS's own — `N validation error(s) detected:` over one clause per
 //! violation, joined by `"; "` — and each clause names the INPUT POSITION that failed and
-//! the constraint it failed, and nothing of the value submitted there ([`SUBJECT`],
-//! [`requirement`]). Two parts of that clause are rules this service owns, and both are
-//! read off the recordings rather than copied from one of them:
+//! the constraint it failed ([`requirement`]). Three parts of that clause are rules this
+//! service owns, and all are read off the recordings rather than copied from one of them:
 //!
-//! * the subject is `Value at '<member path>'` whether a value reached the member or not:
+//! * the subject of a clause about a SCALAR member is `Value at '<member path>'` — the
+//!   position and nothing of the value submitted there ([`SUBJECT`]) — whether a value
+//!   reached the member or not:
 //!   the recorded refusal for an ABSENT `@required` member states
 //!   `Value at 'storageTier' failed to satisfy constraint: Member must not be null`,
 //!   with no `null` in the subject, exactly as a present-but-invalid value's clause reads.
@@ -90,6 +91,11 @@
 //!   `Value null at 'sourceType' failed to satisfy constraint: Member must not be null`,
 //!   so that absent-member subject is worded by [`absent_member_clause`] and belongs to
 //!   that surface alone;
+//! * a clause about a COLLECTION member states the collection the request submitted —
+//!   `Value '[<element>, …]' at '<member path>'` ([`collection_clause_at`]) — because a
+//!   collection has no scalar rendering and the elements it held are the only report a
+//!   caller gets of what it sent there. A collection whose elements are not in hand when
+//!   the clause is worded, and one that carries no element at all, keep the subject above;
 //! * an enum's admissible set is listed in the order AWS PUBLISHES for that enum
 //!   ([`PUBLISHED_ENUM_ORDERS`]) — the order its own documentation and its model
 //!   declaration state the values in — and, for an enum this service publishes no order
@@ -177,6 +183,8 @@
 
 use service_common::event_stream::EventStreamRoute;
 use service_common::query_error_envelope::RequestIdEnvelopeDefinition;
+use service_common::validation::SubmittedEcho;
+use service_common::validation_message::quoting_the_submitted_collection;
 use smithy_server_runtime::{
     http, BoxFuture, ErasedOperation, ErasedServiceDefinition, OperationContext, Refusal, Refused,
     Service, Violation, ViolationKind,
@@ -514,11 +522,45 @@ pub(crate) fn enum_value_set<'a>(declared: impl IntoIterator<Item = &'a str>) ->
     values
 }
 
+/// The COLLECTIONS one request submitted, keyed by the member path a clause about one is
+/// stated at and rendered as the value AWS quotes there — a list as `[<element>, …]`.
+///
+/// Built by `service_common::validation::submitted_lists` from the already-deserialized
+/// input, which is why only a refusal worded with that input in hand carries one (see
+/// [`constraint_envelope_quoting`]).
+pub(crate) type SubmittedCollections = std::collections::HashMap<String, String>;
+
 /// Render one constraint violation the way this service states it: the input position and
-/// the constraint it failed, and NOTHING of the value that was rejected.
-fn constraint_clause(violation: &Violation) -> Option<String> {
+/// the constraint it failed, over the subject the member's own kind earns — the collection
+/// it held where one of `submitted` restores it ([`collection_clause_at`]), and otherwise
+/// nothing of the value that was rejected ([`clause_at`]).
+///
+/// WHETHER a violation's stored value is the walk's SUMMARY of a collection, and so whether
+/// the clause about it states the collection the request carried instead, is the shared
+/// restoring rule's decision (`service_common::validation_message::
+/// quoting_the_submitted_collection`, the home for it): this service states the clause, not
+/// what counts as a restorable collection, so it cannot read that summary differently from
+/// any other service. A value the walk WITHHELD — a `@sensitive` collection member's — is
+/// restored by nothing and keeps the value-less subject.
+fn constraint_clause(violation: &Violation, submitted: &SubmittedCollections) -> Option<String> {
     let requirement = requirement(&violation.kind)?;
-    Some(clause_at(&violation.path, &requirement))
+    // `submitted` is keyed by COLLECTION member paths only — it is built out of the
+    // positions a collection's elements were read at — so a scalar member, and a clause
+    // stated at one ELEMENT of a collection (`<list>.<position>.member`), are offered no
+    // collection at all and keep this service's value-less subject.
+    let restored = match submitted.get(&violation.path) {
+        Some(collection) => quoting_the_submitted_collection(
+            violation.clone(),
+            SubmittedEcho::Rendered(collection.clone()),
+        ),
+        None => violation.clone(),
+    };
+    Some(match &restored.value {
+        Some(collection) if restored.value != violation.value => {
+            collection_clause_at(&violation.path, collection, &requirement)
+        }
+        _ => clause_at(&violation.path, &requirement),
+    })
 }
 
 /// The clause a member at `path` is refused with: the position and the requirement, with
@@ -531,6 +573,28 @@ fn constraint_clause(violation: &Violation) -> Option<String> {
 pub(crate) fn clause_at(path: &str, requirement: &str) -> String {
     format!("{SUBJECT} '{path}' failed to satisfy constraint: {requirement}")
 }
+
+/// How this service names the subject of a clause about a COLLECTION member: the collection
+/// the request submitted, quoted at the member it was submitted at.
+///
+/// A collection has no scalar rendering, and the framework's validating walk has none of it
+/// beyond the element count it checked the `@length` against (`<n> items`,
+/// `vendor/smithy-schema-server/src/constraints.rs`), which is no value any caller sent. So
+/// a clause about one states the collection ITSELF — a list as `[<element>, …]`, the
+/// elements in the order the request sent them, rendered by the shared walk that collects
+/// them ([`SubmittedCollections`]) — which is the only report a caller gets of what it
+/// submitted there. Nothing else of the request is interpolated.
+///
+/// This is the one subject this service quotes a value in: a SCALAR member's clause states
+/// the position alone ([`SUBJECT`]), and so does a collection the shared rule restores
+/// nothing for — one whose elements that walk could not collect in full, one the walk
+/// withheld as `@sensitive`, and an empty one, which has no element to state.
+fn collection_clause_at(path: &str, collection: &str, requirement: &str) -> String {
+    format!("{COLLECTION_SUBJECT} '{collection}' at '{path}' failed to satisfy constraint: {requirement}")
+}
+
+/// The subject of a clause that quotes the value a member held ([`collection_clause_at`]).
+const COLLECTION_SUBJECT: &str = "Value";
 
 /// How the newer S3-table-source surface names the subject of a clause about a member the
 /// request did not carry: `Value null at '<member path>'`, the ONE place this service states
@@ -657,6 +721,22 @@ fn is_query_id_length_breach(violation: &Violation) -> bool {
 /// request-to-response step itself), so it words the violations it finds through this
 /// one function and reads alike.
 pub(crate) fn constraint_envelope(violations: &[Violation]) -> Option<String> {
+    constraint_envelope_quoting(violations, &SubmittedCollections::new())
+}
+
+/// The same refusal message, with the COLLECTIONS the request submitted available to the
+/// clauses stated about them ([`collection_clause_at`]).
+///
+/// A caller that still holds the deserialized input — the hand-authored event-stream
+/// operations, which the framework's centralized walk does not deserialize or validate for —
+/// passes what the request carried, so a clause about a collection member states it. Every
+/// other refusal of this service is worded through [`Service::override_refusal`], which the
+/// framework hands the violations ALONE: there is no request there to read a collection out
+/// of, so those clauses state the position alone.
+pub(crate) fn constraint_envelope_quoting(
+    violations: &[Violation],
+    submitted: &SubmittedCollections,
+) -> Option<String> {
     // The TWO violation classes this service words as a sentence of its own rather than as a
     // clause. First: a log group or log stream name past the bound the service holds both to
     // ([`log_name_length_message`]), which it answers whatever else the request also broke.
@@ -671,7 +751,7 @@ pub(crate) fn constraint_envelope(violations: &[Violation]) -> Option<String> {
     }
     let clauses: Vec<String> = violations
         .iter()
-        .map(constraint_clause)
+        .map(|violation| constraint_clause(violation, submitted))
         .collect::<Option<Vec<_>>>()?;
     match clauses.len() {
         0 => None,
@@ -871,12 +951,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // failure; see "The code a refusal carries".
         //
         // THE MESSAGE states a member-constraint failure against the INPUT POSITION that
-        // failed and the constraint it failed — never the value that was submitted there,
-        // so a delivery id, a source name or a page size a caller sent is not reflected
-        // back into a 400 body. A `@pattern` is stated as AWS publishes the expression for
-        // that shape and an enum's value set is listed in ascending order — both rules
-        // stated once on `requirement` above, and shared with the handler-side refusal
-        // through `one_violation_message`.
+        // failed and the constraint it failed. For a SCALAR member it states nothing of the
+        // value that was submitted there, so a delivery id, a source name or a page size a
+        // caller sent is not reflected back into a 400 body; a clause about a COLLECTION
+        // member states the collection, which this seam cannot — the framework hands it the
+        // violations alone, with no request to read one out of (see
+        // `constraint_envelope_quoting`). A `@pattern` is stated as AWS publishes the
+        // expression for that shape and an enum's value set is listed in ascending order —
+        // both rules stated once on `requirement` above, and shared with the handler-side
+        // refusal through `one_violation_message`.
         //
         // An authentication refusal keeps the framework's wording: it is not an
         // input-constraint failure, and it is raised before any operation is served.
@@ -922,9 +1005,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 mod tests {
     use super::{
         constraint_clause, constraint_envelope, enum_value_set, published_enum_order,
-        published_pattern, refusal_code, served_refusal_code, INVALID_PARAMETER_EXCEPTION,
-        NO_REFUSAL_ERROR_OPERATIONS, PUBLISHED_ENUM_ORDERS, PUBLISHED_PATTERNS,
-        SERVED_REFUSAL_CODE, VALIDATION_EXCEPTION, VALIDATION_EXCEPTION_OPERATIONS,
+        published_pattern, refusal_code, served_refusal_code, SubmittedCollections,
+        INVALID_PARAMETER_EXCEPTION, NO_REFUSAL_ERROR_OPERATIONS, PUBLISHED_ENUM_ORDERS,
+        PUBLISHED_PATTERNS, SERVED_REFUSAL_CODE, VALIDATION_EXCEPTION,
+        VALIDATION_EXCEPTION_OPERATIONS,
     };
     use smithy_server_runtime::{Violation, ViolationKind};
 
@@ -1095,7 +1179,7 @@ mod tests {
     /// the one order this service lists its values in, a `@pattern` with the anchors the
     /// model writes, a bound, and an absent member with no `null` in the subject — and
     /// several violations take the plural envelope, counted and joined the way AWS counts
-    /// and joins them.
+    /// and joins them. A clause about a COLLECTION whose elements are in hand states them.
     #[test]
     fn a_clause_states_the_member_and_the_requirement_without_a_value() {
         let outside_enum = Violation {
@@ -1170,13 +1254,59 @@ mod tests {
             ),
         ];
         for (case, violation, expected) in cases {
-            let actual = constraint_clause(violation);
+            let actual = constraint_clause(violation, &SubmittedCollections::new());
             assert_eq!(
                 actual.as_deref(),
                 Some(expected),
                 "case {case}: expected {expected:?}, got {actual:?}"
             );
         }
+
+        // The collection subject: the same violation, worded with and without the elements
+        // the request submitted at that member.
+        let over_bound = Violation {
+            path: "logGroupIdentifiers".to_string(),
+            kind: ViolationKind::MaxLength(10),
+            // What the framework's walk renders for a collection: its size, not a value.
+            value: Some("11 items".to_string()),
+            sensitive: false,
+        };
+        let mut submitted = SubmittedCollections::new();
+        submitted.insert(
+            "logGroupIdentifiers".to_string(),
+            "[/one, /two]".to_string(),
+        );
+        assert_eq!(
+            constraint_clause(&over_bound, &submitted).as_deref(),
+            Some(
+                "Value '[/one, /two]' at 'logGroupIdentifiers' failed to satisfy constraint: \
+                 Member must have length less than or equal to 10"
+            ),
+            "a clause about a collection states the collection"
+        );
+        assert_eq!(
+            constraint_clause(&over_bound, &SubmittedCollections::new()).as_deref(),
+            Some(
+                "Value at 'logGroupIdentifiers' failed to satisfy constraint: Member must \
+                 have length less than or equal to 10"
+            ),
+            "with no elements in hand the position stands alone"
+        );
+        // A clause at one ELEMENT of that collection is not a clause about the collection.
+        let element = Violation {
+            path: "logGroupIdentifiers.1.member".to_string(),
+            kind: ViolationKind::Pattern("^[\\w#+=/:,.@-]*$".to_string()),
+            value: Some("nope:*".to_string()),
+            sensitive: false,
+        };
+        assert_eq!(
+            constraint_clause(&element, &submitted).as_deref(),
+            Some(
+                "Value at 'logGroupIdentifiers.1.member' failed to satisfy constraint: Member \
+                 must satisfy regular expression pattern: [\\w#+=/:,.@-]*"
+            ),
+            "an element's clause states its own position and no collection"
+        );
         assert_eq!(constraint_envelope(&[]), None, "nothing to state");
         assert_eq!(
             constraint_envelope(std::slice::from_ref(&above_bound)).as_deref(),

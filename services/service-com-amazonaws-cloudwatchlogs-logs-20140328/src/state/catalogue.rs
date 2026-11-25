@@ -414,14 +414,15 @@ pub const MALFORMED_POLICY_DOCUMENT_MESSAGE: &str = "Policy document contains in
 /// sentence answers every form of naming none.
 pub const EMPTY_INDEX_POLICY_DOCUMENT_MESSAGE: &str = "Policy document should contain at least 1 field.";
 
-/// The refusal the FIELD INDEX POLICY operations answer when the `logGroupIdentifier` they
-/// resolve names a log group the account does not hold.
+/// The refusal the FIELD INDEX operations answer when the log group they resolve is not one
+/// the account holds — the three index-policy operations and the field-index read, which
+/// report on the same resource.
 ///
 /// This surface words a missing log group its own way: it states the kind of resource that
 /// could not be found and nothing else — neither the identifier the request carried nor the
 /// account that would own the group — unlike the service-wide sentence
-/// ([`super::resource_not_found_message`]) and unlike the data protection READ, which names
-/// the group and its owner because such a policy is readable across accounts.
+/// ([`super::resource_not_found_message`]) and unlike the data protection operations, which
+/// name the group and its owner because such a policy is keyed by both.
 pub const INDEX_POLICY_LOG_GROUP_NOT_FOUND_MESSAGE: &str = "Log group cannot be found.";
 
 /// How many account-level policies of one type the account may hold when the policy being

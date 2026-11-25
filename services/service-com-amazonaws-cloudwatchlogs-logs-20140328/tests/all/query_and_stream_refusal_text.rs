@@ -14,8 +14,10 @@
 //!   is the request id;
 //! * ordering log streams by event time together with a name prefix is refused with the
 //!   service's fixed sentence for the combination;
-//! * a `nextToken` a read cannot resume from is refused with one fixed sentence, whichever
-//!   read and whichever way the token fails to place;
+//! * a `nextToken` a read cannot resume from is refused with the sentence that READ's own
+//!   surface words the condition with, whichever way the token fails to place — the
+//!   service's fixed sentence for its paginated reads, and the one a LIST CALL's token is
+//!   refused with for the log-stream listing;
 //! * a query string that does not compile is refused with the COMPILER'S diagnostic, so a
 //!   caller can tell where the query is wrong;
 //! * a SQL statement filtering its groups on an aggregate function expression is refused with
@@ -33,7 +35,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::{
-    INVALID_NEXT_TOKEN_MESSAGE, LOG_GROUP_NAME_REGEX_PATTERN,
+    INVALID_NEXT_TOKEN_MESSAGE, LOG_GROUP_NAME_REGEX_PATTERN, PAGINATION_TOKEN_INVALID_MESSAGE,
 };
 
 use crate::harness::{
@@ -336,9 +338,10 @@ async fn ordering_streams_by_event_time_with_a_prefix_is_refused_in_the_services
 }
 
 /// Every paginated read refuses a `nextToken` it cannot resume the request from with the
-/// service's ONE fixed sentence — whichever read, and whichever way the token fails to
+/// sentence its OWN surface words that condition with — whichever way the token fails to
 /// place: never minted here, not decodable, minted by another operation, or minted for a
-/// different enumeration of the same operation.
+/// different enumeration of the same operation. The log-stream listing states the sentence a
+/// list call's token is refused with; every other read here states the service's own.
 #[tokio::test]
 async fn a_nexttoken_a_read_cannot_resume_from_is_refused_with_one_sentence() {
     let logs = Logs::new();
@@ -378,25 +381,39 @@ async fn a_nexttoken_a_read_cannot_resume_from_is_refused_with_one_sentence() {
     ];
 
     // The reads that take a `nextToken`, each with the members it needs to get as far as
-    // the token.
-    let reads: Vec<(&str, Value)> = vec![
+    // the token, and the sentence that read's surface words an unusable one with.
+    let reads: Vec<(&str, Value, &str)> = vec![
         (
             "GetLogEvents",
             json!({"logGroupName": GROUP, "logStreamName": "stream-a"}),
+            INVALID_NEXT_TOKEN_MESSAGE,
         ),
-        ("DescribeLogStreams", json!({"logGroupName": GROUP})),
-        ("DescribeLogGroups", json!({})),
-        ("ListLogGroups", json!({})),
-        ("DescribeQueries", json!({})),
-        ("DescribeQueryDefinitions", json!({})),
-        ("DescribeExportTasks", json!({})),
+        (
+            "DescribeLogStreams",
+            json!({"logGroupName": GROUP}),
+            PAGINATION_TOKEN_INVALID_MESSAGE,
+        ),
+        ("DescribeLogGroups", json!({}), INVALID_NEXT_TOKEN_MESSAGE),
+        ("ListLogGroups", json!({}), INVALID_NEXT_TOKEN_MESSAGE),
+        ("DescribeQueries", json!({}), INVALID_NEXT_TOKEN_MESSAGE),
+        (
+            "DescribeQueryDefinitions",
+            json!({}),
+            INVALID_NEXT_TOKEN_MESSAGE,
+        ),
+        (
+            "DescribeExportTasks",
+            json!({}),
+            INVALID_NEXT_TOKEN_MESSAGE,
+        ),
         (
             "ListAggregateLogGroupSummaries",
             json!({"groupBy": "DATA_SOURCE_NAME_AND_TYPE"}),
+            INVALID_NEXT_TOKEN_MESSAGE,
         ),
     ];
 
-    for (operation, body) in &reads {
+    for (operation, body, expected) in &reads {
         for (form, token) in &unusable {
             let case = format!("{operation}: {form}");
             let mut request = body.clone();
@@ -408,8 +425,8 @@ async fn a_nexttoken_a_read_cannot_resume_from_is_refused_with_one_sentence() {
                  {code} {said:?}"
             );
             assert_eq!(
-                said, INVALID_NEXT_TOKEN_MESSAGE,
-                "case {case}: expected {INVALID_NEXT_TOKEN_MESSAGE:?}, got {said:?}"
+                said, *expected,
+                "case {case}: expected {expected:?}, got {said:?}"
             );
         }
     }
@@ -439,11 +456,12 @@ async fn a_nexttoken_a_read_cannot_resume_from_is_refused_with_one_sentence() {
         .unwrap_or_else(|| panic!("a page of events hands back a forward token, got {events}"))
         .to_string();
 
-    for (case, operation, request) in [
+    for (case, operation, request, expected) in [
         (
             "a streams token continued against another log group",
             "DescribeLogStreams",
             json!({"logGroupName": OTHER_GROUP, "limit": 1, "nextToken": streams_token}),
+            PAGINATION_TOKEN_INVALID_MESSAGE,
         ),
         (
             "an events token continued against another log stream",
@@ -453,6 +471,7 @@ async fn a_nexttoken_a_read_cannot_resume_from_is_refused_with_one_sentence() {
                 "logStreamName": "stream-b",
                 "nextToken": events_token,
             }),
+            INVALID_NEXT_TOKEN_MESSAGE,
         ),
     ] {
         let (code, said) = refusal(&logs, case, operation, &request).await;
@@ -462,8 +481,8 @@ async fn a_nexttoken_a_read_cannot_resume_from_is_refused_with_one_sentence() {
              {said:?}"
         );
         assert_eq!(
-            said, INVALID_NEXT_TOKEN_MESSAGE,
-            "case {case}: expected {INVALID_NEXT_TOKEN_MESSAGE:?}, got {said:?}"
+            said, expected,
+            "case {case}: expected {expected:?}, got {said:?}"
         );
     }
 }

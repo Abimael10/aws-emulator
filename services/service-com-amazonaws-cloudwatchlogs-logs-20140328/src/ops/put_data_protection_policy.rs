@@ -220,9 +220,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let log_group_name =
             crate::state::log_group_name_from_identifier(&input.log_group_identifier).to_string();
         let Some(group) = store.log_groups.get_mut(&log_group_name) else {
+            // The same key the read and the delete of this policy state for a log group the
+            // account does not hold: the group the request named and the account that would
+            // own the policy ([`crate::state::log_group_not_found_for_owner_message`]).
             return Err(PutDataProtectionPolicyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::resource_not_found_message("log group")),
+                    message: Some(crate::state::log_group_not_found_for_owner_message(
+                        &log_group_name,
+                        ::engine::emulator_account_id(),
+                    )),
                 },
             )
             .into());

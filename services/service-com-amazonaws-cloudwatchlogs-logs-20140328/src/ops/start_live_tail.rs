@@ -397,7 +397,15 @@ impl<Eng: Send + Sync + 'static> StartLiveTail<Eng> {
         drop(deserializer);
         let input = input?;
         let violations = validate(&input, &StartLiveTailInput::SCHEMA);
-        match refusal_message(&violations) {
+        if violations.is_empty() {
+            return Ok(input);
+        }
+        // The collections the request carried, read out of the input this operation holds —
+        // the one place a clause about a collection member can state what was submitted
+        // there ([`crate::service::constraint_envelope_quoting`]).
+        let submitted =
+            service_common::validation::submitted_lists(&input, &StartLiveTailInput::SCHEMA);
+        match refusal_message_quoting(&violations, &submitted) {
             Some(message) => Err(invalid(message)),
             None => Ok(input),
         }
@@ -432,12 +440,21 @@ fn session_update(update: &crate::state::live_tail::Update) -> LiveTailSessionUp
 /// framework's envelope for a class the service words no clause for. `None` when the
 /// request broke nothing.
 fn refusal_message(violations: &[Violation]) -> Option<String> {
+    refusal_message_quoting(violations, &crate::service::SubmittedCollections::new())
+}
+
+/// The same wording, with the COLLECTIONS the request submitted in hand, so a clause about
+/// a collection member states the collection rather than its position alone
+/// ([`crate::service::constraint_envelope_quoting`]).
+fn refusal_message_quoting(
+    violations: &[Violation],
+    submitted: &crate::service::SubmittedCollections,
+) -> Option<String> {
     if violations.is_empty() {
         return None;
     }
-    crate::service::constraint_envelope(violations).or_else(|| {
-        aws_smithy_schema_server::constraints::envelope(violations)
-    })
+    crate::service::constraint_envelope_quoting(violations, submitted)
+        .or_else(|| aws_smithy_schema_server::constraints::envelope(violations))
 }
 
 /// A member the request did not carry, worded as the service words an absent

@@ -181,10 +181,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
 
-        let group = store
-            .log_groups
-            .get_mut(&log_group_name)
-            .ok_or_else(|| not_found(&crate::state::resource_not_found_message("log group")))?;
+        let group = store.log_groups.get_mut(&log_group_name).ok_or_else(|| {
+            // The log group the policy would be attached to is resolved by the same key the
+            // policy is kept under — the group the request named and the account that would
+            // own it — so a group the account does not hold is refused with the sentence the
+            // data protection surface states that key with, the one its READ answers too
+            // ([`crate::state::log_group_not_found_for_owner_message`]).
+            not_found(&crate::state::log_group_not_found_for_owner_message(
+                &log_group_name,
+                ::engine::emulator_account_id(),
+            ))
+        })?;
         // The resource this operation deletes is the policy, which the account owns per log
         // group: so a group holding none has nothing to delete, and the refusal reports the
         // key nothing was found under — the account that would own the policy and the group

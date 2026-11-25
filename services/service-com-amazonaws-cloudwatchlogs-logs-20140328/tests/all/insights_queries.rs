@@ -324,7 +324,8 @@ async fn a_query_string_that_compiles_is_accepted_and_stored() {
 }
 
 /// The window and the log-group selection, which are judged as PARAMETERS rather than as
-/// query syntax.
+/// query syntax — except a request that selects the log groups NOWHERE, which is the
+/// malformed query it is.
 #[tokio::test]
 async fn the_window_and_the_log_group_selection_are_judged_as_parameters() {
     let logs = Logs::new();
@@ -370,13 +371,15 @@ async fn the_window_and_the_log_group_selection_are_judged_as_parameters() {
             INVALID_PARAMETER,
         ),
         (
+            // The query selects its log groups NOWHERE, which is a malformed query rather
+            // than a parameter outside its range: no parameter is at fault.
             "no log-group member and no SOURCE command",
             json!({
                 "startTime": start_time,
                 "endTime": end_time,
                 "queryString": VALID_QUERY,
             }),
-            INVALID_PARAMETER,
+            MALFORMED,
         ),
         (
             "one more log group than a query may include",

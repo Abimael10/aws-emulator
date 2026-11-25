@@ -359,9 +359,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // a log group the account does not hold is a missing resource rather than an
                 // empty answer.
                 let Some(group) = store.log_groups.get(name) else {
+                    // The field-index surface words a missing log group its own way: the
+                    // kind of resource that could not be found and nothing else — the same
+                    // sentence the index-policy write, delete and read of this surface state
+                    // ([`crate::state::INDEX_POLICY_LOG_GROUP_NOT_FOUND_MESSAGE`]).
                     return Err(DescribeFieldIndexesErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
-                            message: Some(crate::state::resource_not_found_message("log group")),
+                            message: Some(
+                                crate::state::INDEX_POLICY_LOG_GROUP_NOT_FOUND_MESSAGE.to_string(),
+                            ),
                         },
                     )
                     .into());

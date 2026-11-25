@@ -3754,7 +3754,24 @@ pub fn with_sdk_error_envelope(body: &str, facts: SdkEnvelopeFacts) -> String {
 /// decode, and one minted for a different enumeration than the request carrying it describes.
 /// AWS states one fixed sentence for the whole class, carrying neither the token nor the
 /// operation, so a paginating reader that keys on it restarts from the head of the stream.
+///
+/// A read whose own surface words that condition another way states ITS sentence instead:
+/// the delivery enumerations state theirs ([`deliveries::INVALID_DELIVERY_NEXT_TOKEN_MESSAGE`])
+/// and the log-stream listing states the one a LIST CALL's token is refused with
+/// ([`PAGINATION_TOKEN_INVALID_MESSAGE`]).
 pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "The specified nextToken is invalid.";
+
+/// The refusal the log-stream LISTING answers for a `nextToken` it cannot resume from.
+///
+/// `DescribeLogStreams` is `@paginated` on `nextToken` — "The token for the next set of
+/// items to return. (You received this token from a previous call.)" — and it states that
+/// contract back in the refusal: the token is declared invalid, and then WHICH tokens are
+/// valid at all, so a caller that built one itself, kept one from another listing, or
+/// replayed one against another log group learns that only the previous list call's token,
+/// or none, resumes this read. Fixed text for the class: it carries neither the token, nor
+/// the log group, nor anything else of the request.
+pub const PAGINATION_TOKEN_INVALID_MESSAGE: &str =
+    "Pagination token in request is invalid. Only token from previous list call or null is valid.";
 
 /// The refusal `CreateExportTask` answers when the S3 bucket its `destination` names is one
 /// the object store does not hold: an export that could never write anything mints no task.
@@ -4107,14 +4124,16 @@ pub fn transformer_not_found_message(log_group_name: &str) -> String {
     format!("Transformer does not exist on log group '{log_group_name}'")
 }
 
-/// The refusal the data protection policy READ answers when the `logGroupIdentifier` it
-/// resolves names a log group the account does not hold.
+/// The refusal the data protection policy operations answer when the `logGroupIdentifier`
+/// they resolve names a log group the account does not hold.
 ///
-/// A data protection policy is readable across accounts, so this refusal states both halves
-/// of what was looked for: the group name the request asked for, and the account that would
-/// own it — which is what makes the sentence usable when the group exists in another
-/// account. Both variable parts are taken from the request and from the emulator's own
-/// account identity; the sentence is otherwise fixed.
+/// A data protection policy is kept per ACCOUNT and log group — and is readable across
+/// accounts — so this surface's refusal states both halves of what was looked for: the group
+/// name the request asked for, and the account that would own it. That is what makes the
+/// sentence usable when the group exists in another account, and it is the one sentence the
+/// read, the write and the delete of such a policy state for a group that is not there.
+/// Both variable parts are taken from the request and from the emulator's own account
+/// identity; the sentence is otherwise fixed.
 pub fn log_group_not_found_for_owner_message(log_group_name: &str, owner_account_id: &str) -> String {
     format!("Log group '{log_group_name}' for owner '{owner_account_id}' cannot be found")
 }

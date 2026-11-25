@@ -388,12 +388,13 @@ async fn a_missing_log_group_is_still_named_in_the_refusal() {
 }
 
 /// The message an operation refuses a log group the account does not hold with: the
-/// service's sentence naming the resource kind, except the data protection policy READ,
-/// which \u2014 because such a policy is readable across accounts \u2014 names the group that was
-/// looked for and the account that would own it, and the field index policy operations,
-/// which word a missing group as their own surface does.
+/// service's sentence naming the resource kind, except the data protection policy
+/// operations, which — because such a policy is kept per account and log group, and is
+/// readable across accounts — name the group that was looked for and the account that would
+/// own it, and the field index operations, which word a missing group as their own surface
+/// does.
 fn missing_group_message(operation: &str, log_group_name: &str) -> String {
-    if operation == "GetDataProtectionPolicy" {
+    if operation.ends_with("DataProtectionPolicy") {
         return format!(
             "Log group '{log_group_name}' for owner '{}' cannot be found",
             engine::emulator_account_id()

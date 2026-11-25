@@ -303,17 +303,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let cursor = match input.next_token.as_deref() {
             Some(token) => {
+                // A token this listing cannot resume from, whichever way it fails to place:
+                // never minted here, undecodable, or minted for another enumeration — another
+                // log group, another ordering, another prefix. All of them are refused with
+                // the sentence this read states a list call's token with
+                // ([`crate::state::PAGINATION_TOKEN_INVALID_MESSAGE`]).
                 let Some(cursor) = Cursor::decode(token) else {
-                    return Err(invalid(crate::state::INVALID_NEXT_TOKEN_MESSAGE));
+                    return Err(invalid(crate::state::PAGINATION_TOKEN_INVALID_MESSAGE));
                 };
                 if cursor.log_group_name != log_group_name
                     || cursor.order_by != order_by
                     || cursor.descending != descending
                     || cursor.log_stream_name_prefix != input.log_stream_name_prefix
                 {
-                    return Err(invalid(
-                        crate::state::INVALID_NEXT_TOKEN_MESSAGE,
-                    ));
+                    return Err(invalid(crate::state::PAGINATION_TOKEN_INVALID_MESSAGE));
                 }
                 Some(cursor)
             }
