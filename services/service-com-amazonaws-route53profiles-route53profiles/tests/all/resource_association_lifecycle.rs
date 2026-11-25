@@ -19,6 +19,13 @@
 //! * both lifecycle timestamps are carried as epoch-seconds numbers at millisecond
 //!   resolution, and `ModificationTime` advances past `CreationTime` when the record
 //!   changes;
+//! * `UpdateProfileResourceAssociation` applies the members the request names to the
+//!   stored association, leaves every member it does not name as it stands, and
+//!   reports the record as an update of the Profile being applied, which settles to
+//!   `COMPLETE` once the move the clock owes falls due;
+//! * an update naming an id the store holds nothing for, a `Name` outside the modelled
+//!   pattern, or a DNS Firewall priority outside the documented range is refused with
+//!   the stored association left exactly as it was;
 //! * `DisassociateResourceFromProfile` removes the association, reports it in the
 //!   phase of being removed, and leaves its id naming nothing;
 //! * a DNS Firewall rule group's `priority` is accepted inside the documented
@@ -223,6 +230,25 @@ impl Emulator {
                 path_label(resource_arn)
             ),
             None,
+        )
+        .await
+    }
+
+    /// `UpdateProfileResourceAssociation`: the association id is a path label, and the
+    /// body carries ONLY the members this update names, so an omitted member is one the
+    /// request really left out rather than one sent as null.
+    async fn update(&self, id: &str, name: Option<&str>, properties: Option<&str>) -> Reply {
+        let mut body = json!({});
+        if let Some(name) = name {
+            body["Name"] = json!(name);
+        }
+        if let Some(properties) = properties {
+            body["ResourceProperties"] = json!(properties);
+        }
+        self.call(
+            "PATCH",
+            &format!("/profileresourceassociation/{id}"),
+            Some(body),
         )
         .await
     }
@@ -825,4 +851,333 @@ async fn an_unknown_profile_a_repeated_pair_and_an_unminted_id_are_refused() {
             "case id={unminted}: unexpected refusal message"
         );
     }
+}
+
+/// The expression a refusal of a `Name` ADVERTISES: the modelled `@pattern`
+/// (`smithy_query(query="shape",shape="Name")`) without the whole-value anchors it is
+/// written with. Transcribed, so this suite states the published expression
+/// independently of the code that renders it.
+const PUBLISHED_NAME_PATTERN: &str = r"(?!^[0-9]+$)([a-zA-Z0-9\-_' ']+)";
+
+/// The whole message a `Name` outside that pattern is refused with: the front door's
+/// one-violation envelope, blaming the `name` member and advertising the expression.
+fn name_refusal_message(value: &str) -> String {
+    format!(
+        "1 validation error detected: Value '{value}' at 'name' failed to satisfy constraint: \
+         Member must satisfy regular expression pattern: {PUBLISHED_NAME_PATTERN}"
+    )
+}
+
+#[tokio::test]
+async fn an_update_applies_only_the_members_it_names_and_leaves_the_rest_as_stored() {
+    let em = Emulator::new();
+
+    // One row per SHAPE of update: the rename the modelled input exists for, a fresh
+    // properties document, both at once, and an update that names neither. The names
+    // span what the modelled `Name` admits — a plain word, an underscore with an
+    // interior space, a digit-leading name.
+    let updates: [(Option<&str>, Option<&str>); 5] = [
+        (Some("renamed"), None),
+        (Some("My_Resource 2"), None),
+        (None, Some(r#"{"priority":9900}"#)),
+        (Some("0b"), Some(r#"{"priority":100}"#)),
+        (None, None),
+    ];
+
+    for (index, (name, properties)) in updates.into_iter().enumerate() {
+        for (resource_arn, resource_type, kind) in associable_resources() {
+            // Only a DNS Firewall rule group's properties carry a priority, so that is
+            // the one kind given a document to start from and to replace.
+            let is_rule_group = resource_type == "FIREWALL_RULE_GROUP";
+            let stored_properties = is_rule_group.then_some(r#"{"priority":200}"#);
+            let properties = properties.filter(|_| is_rule_group);
+            let case =
+                format!("arn={resource_arn} update name={name:?} properties={properties:?}");
+
+            let profile_id = em.profile(&format!("update{index} {resource_type}")).await;
+            let created = em
+                .associate(&profile_id, &resource_arn, "original", stored_properties)
+                .await;
+            assert_eq!(
+                created.status, 200,
+                "case {case}: associate expected 200, got {} / {:?}",
+                created.status, created.body
+            );
+            let id = created.field("Id");
+
+            // The update is applied to a SETTLED association, so the move back to the
+            // phase of being applied is this update's own.
+            em.settle(&id);
+            let settled_before = em.get_association(&id).await;
+            assert_eq!(
+                settled_before.field("Status"),
+                "COMPLETE",
+                "case {case}: the association must be settled before the update, got {:?}",
+                settled_before.association()
+            );
+
+            let updated = em.update(&id, name, properties).await;
+            assert_eq!(
+                updated.status, 200,
+                "case {case}: update expected 200, got {} / {:?}",
+                updated.status, updated.body
+            );
+            // A member the request named takes the value it named; one it did not name
+            // keeps the value the record already held.
+            assert_eq!(
+                updated.field("Name"),
+                name.unwrap_or("original"),
+                "case {case}: unexpected Name in {:?}",
+                updated.association()
+            );
+            assert_eq!(
+                updated.association()["ResourceProperties"],
+                properties
+                    .or(stored_properties)
+                    .map(Value::from)
+                    .unwrap_or(Value::Null),
+                "case {case}: unexpected ResourceProperties in {:?}",
+                updated.association()
+            );
+            // Nothing the update cannot name moves.
+            for (member, expected) in [
+                ("Id", id.clone()),
+                ("ProfileId", profile_id.clone()),
+                ("ResourceArn", resource_arn.clone()),
+                ("ResourceType", resource_type.to_string()),
+                ("OwnerId", ACCOUNT_ID.to_string()),
+            ] {
+                assert_eq!(
+                    updated.field(member),
+                    expected,
+                    "case {case}: {member} must be unchanged by the update, got {:?}",
+                    updated.association()
+                );
+            }
+            assert_eq!(
+                updated.association()["CreationTime"],
+                created.association()["CreationTime"],
+                "case {case}: the creation instant must be unchanged, got {:?}",
+                updated.association()
+            );
+            // Changing what a Profile pushes CHANGES that Profile, so the association
+            // is reported as an update of it, with the sentence that names this kind of
+            // resource.
+            assert_eq!(
+                updated.field("Status"),
+                "UPDATING",
+                "case {case}: an update still being applied is UPDATING, got {:?}",
+                updated.association()
+            );
+            assert_eq!(
+                updated.field("StatusMessage"),
+                being_applied_message(kind),
+                "case {case}: unexpected StatusMessage in {:?}",
+                updated.association()
+            );
+            for member in ["CreationTime", "ModificationTime"] {
+                assert_timestamp_form(&case, member, &updated.association()[member]);
+            }
+
+            // The read-back is the record the update left behind, member for member.
+            let fetched = em.get_association(&id).await;
+            assert_eq!(
+                fetched.association(),
+                updated.association(),
+                "case {case}: the read-back association differs from the one the update \
+                 reported"
+            );
+
+            // The update owes its own move to the settled phase, which reports the
+            // updated members and the record as modified after it was created.
+            em.settle(&id);
+            let settled = em.get_association(&id).await;
+            assert_eq!(
+                settled.field("Status"),
+                "COMPLETE",
+                "case {case}: the updated association must settle, got {:?}",
+                settled.association()
+            );
+            assert_eq!(
+                settled.field("StatusMessage"),
+                settled_message(kind),
+                "case {case}: unexpected settled StatusMessage in {:?}",
+                settled.association()
+            );
+            assert_eq!(
+                settled.field("Name"),
+                name.unwrap_or("original"),
+                "case {case}: the settled record must keep the updated Name, got {:?}",
+                settled.association()
+            );
+            let created_at = settled.association()["CreationTime"]
+                .as_f64()
+                .unwrap_or_else(|| panic!("case {case}: CreationTime is no number"));
+            let modified_at = settled.association()["ModificationTime"]
+                .as_f64()
+                .unwrap_or_else(|| panic!("case {case}: ModificationTime is no number"));
+            assert!(
+                modified_at > created_at,
+                "case {case}: an updated association must report a modification instant \
+                 past its creation one, got CreationTime {created_at} and ModificationTime \
+                 {modified_at}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_refused_update_leaves_the_stored_association_exactly_as_it_was() {
+    let em = Emulator::new();
+    let profile_id = em.profile("update refusals").await;
+    let rule_group = format!(
+        "arn:aws:route53resolver:{REGION}:{ACCOUNT_ID}:firewall-rule-group/rslvr-frg-0f0f0f0f0f0f0f0f"
+    );
+    let stored_name = "group";
+    let stored_properties = r#"{"priority":200}"#;
+
+    let created = em
+        .associate(&profile_id, &rule_group, stored_name, Some(stored_properties))
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "the association every refusal is aimed at must exist, got {} / {:?}",
+        created.status, created.body
+    );
+    let group_id = created.field("Id");
+
+    // An id the store holds nothing for names nothing to update. The members it does
+    // carry are valid, so the refusal can only be the id's.
+    for unminted in ["rpr-0000000000000000", "rpr-doesnotexist"] {
+        let case = format!("id={unminted}");
+        let refusal = em.update(unminted, Some("renamed"), None).await;
+        assert_eq!(
+            refusal.status, 400,
+            "case {case}: expected 400, got {} / {:?}",
+            refusal.status, refusal.body
+        );
+        assert_eq!(
+            refusal.error.as_deref(),
+            Some("ResourceNotFoundException"),
+            "case {case}: unexpected error code, got {:?}",
+            refusal.body
+        );
+        assert_eq!(
+            refusal.message(),
+            format!("[RSLVR-05007] Can't find the resource with ID \"{unminted}\"."),
+            "case {case}: unexpected refusal message"
+        );
+    }
+
+    // A `Name` outside the modelled pattern: the all-digit values its lookahead
+    // forbids, the empty value its `+` admits no match of, and values carrying a
+    // character its class does not list.
+    for name in ["0", "123456", "", "profile!", "caf\u{e9}", "profile\tname"] {
+        let case = format!("name={name:?}");
+        let refusal = em.update(&group_id, Some(name), None).await;
+        assert_eq!(
+            refusal.status, 400,
+            "case {case}: expected 400, got {} / {:?}",
+            refusal.status, refusal.body
+        );
+        assert_eq!(
+            refusal.error.as_deref(),
+            Some("ValidationException"),
+            "case {case}: unexpected error code, got {:?}",
+            refusal.body
+        );
+        assert_eq!(
+            refusal.message(),
+            name_refusal_message(name),
+            "case {case}: unexpected refusal message"
+        );
+        assert_stored_unchanged(&em, &group_id, &case, stored_name, stored_properties).await;
+    }
+
+    // The priorities outside the documented range are reserved for the service, so no
+    // update sets one — both published bounds are exceeded by one, and a value far
+    // below the range.
+    for priority in [MIN_FIREWALL_PRIORITY - 1, MAX_FIREWALL_PRIORITY + 1, 0] {
+        let case = format!("priority={priority}");
+        let properties = format!(r#"{{"priority": {priority}}}"#);
+        let refusal = em.update(&group_id, None, Some(&properties)).await;
+        assert_eq!(
+            refusal.status, 400,
+            "case {case}: expected 400, got {} / {:?}",
+            refusal.status, refusal.body
+        );
+        assert_eq!(
+            refusal.error.as_deref(),
+            Some("ValidationException"),
+            "case {case}: unexpected error code, got {:?}",
+            refusal.body
+        );
+        assert_eq!(
+            refusal.message(),
+            "[RSLVR-02017] The priority value you provided is reserved. Provide a number \
+             between \"100\" and \"9900\".",
+            "case {case}: unexpected refusal message"
+        );
+        assert_stored_unchanged(&em, &group_id, &case, stored_name, stored_properties).await;
+    }
+
+    assert_eq!(
+        em.stored_associations(),
+        1,
+        "case \"after every refused update\": a refused update must persist nothing new"
+    );
+
+    // Which properties are accepted follows from the kind of resource the association
+    // HOLDS: only a DNS Firewall rule group's carry a priority, so the same document
+    // is accepted for an association holding another kind of resource.
+    let zone = em
+        .associate(
+            &profile_id,
+            "arn:aws:route53:::hostedzone/Z0UPDATEREFUSALS001",
+            "zone",
+            None,
+        )
+        .await;
+    let zone_id = zone.field("Id");
+    let reserved = format!(r#"{{"priority": {}}}"#, MIN_FIREWALL_PRIORITY - 1);
+    let accepted = em.update(&zone_id, None, Some(&reserved)).await;
+    assert_eq!(
+        accepted.status, 200,
+        "case \"priority on a hosted zone\": expected 200, got {} / {:?}",
+        accepted.status, accepted.body
+    );
+    assert_eq!(
+        accepted.association()["ResourceProperties"],
+        Value::from(reserved.as_str()),
+        "case \"priority on a hosted zone\": the document given must be stored, got {:?}",
+        accepted.association()
+    );
+}
+
+/// Asserts that the association `id` still carries the `Name` and
+/// `ResourceProperties` it was created with: what a refused update must leave alone.
+///
+/// The status and the modification instant are deliberately not compared, because the
+/// CLOCK moves those on its own whether or not anybody calls.
+async fn assert_stored_unchanged(
+    em: &Emulator,
+    id: &str,
+    case: &str,
+    name: &str,
+    properties: &str,
+) {
+    let stored = em.get_association(id).await;
+    assert_eq!(
+        stored.field("Name"),
+        name,
+        "case {case}: a refused update must not rename the association, got {:?}",
+        stored.association()
+    );
+    assert_eq!(
+        stored.association()["ResourceProperties"],
+        Value::from(properties),
+        "case {case}: a refused update must not replace the stored ResourceProperties, \
+         got {:?}",
+        stored.association()
+    );
 }

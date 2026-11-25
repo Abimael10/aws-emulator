@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateProfileResourceAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateProfileResourceAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateProfileResourceAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: applies the members the request names to the stored resource
+//! association and leaves every member it does not name as it stands, refuses a `Name`
+//! outside the modelled pattern and a reserved DNS Firewall priority, and reports the
+//! record it persisted as an update of the Profile being applied.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +157,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateProfileResourceAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateProfileResourceAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateProfileResourceAssociation"))
+        // Nothing in this operation's input or output is region-scoped: a
+        // `ProfileResourceAssociation` reports no ARN of its own, and the resource's
+        // ARN is the one already on the record.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateProfileResourceAssociationErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some(crate::state::NO_STORE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        // `Name`'s modelled `@pattern` is applied here, before any lookup: the
+        // centralized walk cannot compile its look-around, so without this an update
+        // could rename an association to something the model forbids.
+        if let Some(message) = input
+            .name
+            .as_deref()
+            .and_then(crate::state::name_pattern_violation)
+        {
+            return Err(UpdateProfileResourceAssociationError::validation(message));
+        }
+
+        let mut store = state.lock();
+
+        // The update addresses the association by its own id, so an id the store holds
+        // nothing for names nothing to update.
+        let Some(association) = store
+            .profile_resource_associations
+            .get_mut(&input.profile_resource_association_id)
+        else {
+            return Err(
+                UpdateProfileResourceAssociationErrorModeled::ResourceNotFoundException(
+                    crate::state::profile_resource_association_not_found(
+                        &input.profile_resource_association_id,
+                    ),
+                )
+                .into(),
+            );
+        };
+
+        // Which properties the service accepts follows from the kind of resource the
+        // association HOLDS, which is the stored record's own `ResourceType` — this
+        // request names no ARN to read one from. Checked before anything is written, so
+        // a refused update leaves the record exactly as it stood.
+        if !crate::state::firewall_priority_accepted(
+            &association.resource_type,
+            input.resource_properties.as_deref(),
+        ) {
+            return Err(
+                UpdateProfileResourceAssociationErrorModeled::ValidationException(
+                    crate::state::reserved_firewall_priority(),
+                )
+                .into(),
+            );
+        }
+
+        // An update names only what it changes: a member the request omits keeps the
+        // value the record already holds.
+        if let Some(name) = input.name {
+            association.name = name;
+        }
+        if input.resource_properties.is_some() {
+            association.resource_properties = input.resource_properties;
+        }
+
+        // Changing what a Profile pushes CHANGES the Profile the resource belongs to,
+        // so the association is reported as an update of that Profile — the same phase
+        // the associate call reports — until the move to its settled phase the clock
+        // owes falls due.
+        let now = ::std::time::SystemTime::now();
+        let started = ::std::time::Instant::now();
+        let status_message = crate::state::resource_association_status_message(
+            crate::state::AssociationPhase::BeingApplied,
+            &association.resource_type,
+        );
+        association.status =
+            crate::state::resource_association_status(crate::state::AssociationPhase::BeingApplied)
+                .to_string();
+        association.status_message = Some(status_message);
+        association.modification_time = now;
+        association.owed_settle = Some(crate::state::OwedTransition::settle_after(started, now));
+        // Report from the record now in the store, so the answer is what every later
+        // read of it reports.
+        Ok(UpdateProfileResourceAssociationOutput {
+            profile_resource_association: Some(crate::state::profile_resource_association_shape(
+                association,
+            )),
+        })
     }
 }
