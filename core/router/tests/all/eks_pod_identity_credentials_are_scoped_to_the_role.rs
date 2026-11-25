@@ -42,8 +42,10 @@
 //!
 //! The AWS-side request harness (the SigV4 header and the EKS, EC2 and IAM drivers) is the
 //! test crate's own `eks_wire`; the XML element readers come from `query_wire`. The
-//! Kubernetes client below is this suite's own, because no other suite here dials a
-//! per-resource listener.
+//! Kubernetes client below is the one this crate owns for a per-resource listener, so the
+//! suite that reads a pod-identity refusal's authorization details back
+//! (`eks_pod_identity_denial_authorization_details_resolve.rs`) drives the pod through
+//! these helpers rather than through a second copy of them.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -66,7 +68,11 @@ const ACTION: &str = "iam:ListRoles";
 
 /// The Kubernetes namespace every association in this suite is written for — the one
 /// Kubernetes creates with the cluster.
-const NAMESPACE: &str = "default";
+///
+/// Reachable by the suite that reads a pod-identity refusal's authorization details back
+/// (`eks_pod_identity_denial_authorization_details_resolve.rs`), because the association it
+/// writes has to name the namespace [`pod_bound_token`] mints the token in.
+pub(crate) const NAMESPACE: &str = "default";
 
 /// The audience a projected token for the EKS Pod Identity Agent is issued to.
 const PODS_AUDIENCE: &str = "pods.eks.amazonaws.com";
@@ -197,14 +203,14 @@ fn rows() -> Vec<Row> {
 /// What a client reads out of `DescribeCluster` to build a kubeconfig: the address the
 /// cluster published for its API server, and the certificate authority published beside
 /// it.
-struct Kubeconfig {
+pub(crate) struct Kubeconfig {
     endpoint: String,
     certificate_authority_pem: String,
 }
 
 /// Create the role `name` with the pod identity trust policy, and embed `policy` in it
 /// when the row carries one.
-fn create_role(
+pub(crate) fn create_role(
     router: &MultiServiceRouter,
     runtime: &tokio::runtime::Runtime,
     case: &str,
@@ -249,7 +255,7 @@ fn create_role(
 ///
 /// The wait is on the CONDITION, re-read until it holds or a generous deadline passes, so
 /// a loaded host only makes it slower rather than failing it.
-fn provisioned_kubeconfig(
+pub(crate) fn provisioned_kubeconfig(
     router: &MultiServiceRouter,
     runtime: &tokio::runtime::Runtime,
     cluster: &str,
@@ -293,7 +299,7 @@ fn provisioned_kubeconfig(
 /// A Kubernetes client for `config`, trusting NOTHING but the certificate authority the
 /// cluster published — so a request below reaches the cluster exactly when the certificate
 /// served at the published endpoint was issued by that authority.
-fn kubernetes_client(config: &Kubeconfig) -> reqwest::blocking::Client {
+pub(crate) fn kubernetes_client(config: &Kubeconfig) -> reqwest::blocking::Client {
     let authority = reqwest::Certificate::from_pem(config.certificate_authority_pem.as_bytes())
         .unwrap_or_else(|error| {
             panic!("setup: the published CA must load as a trust anchor: {error}")
@@ -307,7 +313,7 @@ fn kubernetes_client(config: &Kubeconfig) -> reqwest::blocking::Client {
 /// Assert the published endpoint is an address this emulator serves — a loopback host and
 /// the port its own listener answers on — rather than a name under the service's
 /// production DNS zone, and answer its `https://` origin.
-fn served_origin(config: &Kubeconfig) -> String {
+pub(crate) fn served_origin(config: &Kubeconfig) -> String {
     let authority = config
         .endpoint
         .strip_prefix("https://")
@@ -375,7 +381,7 @@ fn kubernetes(
 /// Mint a pod-bound projected token over the cluster's OWN Kubernetes API, as a pod's
 /// kubelet does: the service account, then the Pod object, then the `TokenRequest` bound to
 /// that Pod — the only token class `AssumeRoleForPodIdentity` accepts.
-fn pod_bound_token(
+pub(crate) fn pod_bound_token(
     client: &reqwest::blocking::Client,
     origin: &str,
     case: &str,
@@ -440,7 +446,7 @@ fn pod_bound_token(
 
 /// Exchange `token` at `AssumeRoleForPodIdentity`, and answer the access key id of the
 /// session with the ARN that session is reported under.
-fn exchange(
+pub(crate) fn exchange(
     router: &MultiServiceRouter,
     runtime: &tokio::runtime::Runtime,
     case: &str,
