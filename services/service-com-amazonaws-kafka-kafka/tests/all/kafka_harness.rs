@@ -1626,6 +1626,55 @@ pub fn sleep_past_vpc_connection_rejection() {
     std::thread::sleep(VPC_CONNECTION_REJECTION_DELAY + Duration::from_millis(250));
 }
 
+/// How long [`poll_until_vpc_connection_reports`] waits for the state the clock
+/// owes a VPC connection before a suite calls it a failure: far longer than the span
+/// the service owes that transition, so the deadline says nothing about how fast the
+/// host runs.
+pub const VPC_CONNECTION_SETTLED_DEADLINE: Duration = Duration::from_secs(60);
+
+/// The cadence an unsettled connection is re-read at — a probing interval, not a
+/// bound on the transition.
+pub const VPC_CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Poll `DescribeVpcConnection` at `region`'s endpoint until `arn` reports `state`.
+///
+/// Waits for the CONDITION rather than for a span: every state a connection settles
+/// in is one the clock owes it, so the loop reads again until that state is reported
+/// or [`VPC_CONNECTION_SETTLED_DEADLINE`] passes. The shared counterpart of
+/// [`sleep_past_vpc_connection_activation`] and
+/// [`sleep_past_vpc_connection_rejection`] for a suite that would rather look again
+/// than wait a fixed time, held here beside [`poll_until_active`] so no suite writes
+/// a poll of its own; `std::thread::sleep` between probes for the same reason that
+/// poll uses it — the workspace's tokio carries no timer feature, and nothing else
+/// has to make progress here.
+pub async fn poll_until_vpc_connection_reports(
+    emulator: &Emulator,
+    region: &str,
+    case: &str,
+    arn: &str,
+    state: &str,
+) {
+    let deadline = Instant::now() + VPC_CONNECTION_SETTLED_DEADLINE;
+    loop {
+        let reply = emulator.describe_vpc_connection_in(region, arn).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case}: expected DescribeVpcConnection to return 200, got {} {}",
+            reply.status, reply.body
+        );
+        let reported = reply.at("/state").as_str().unwrap_or_default();
+        if reported == state {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case}: the connection never reported {state}, last read {}",
+            reply.body
+        );
+        std::thread::sleep(VPC_CONNECTION_POLL_INTERVAL);
+    }
+}
+
 /// Sleep past the emulator's own `UPDATING` -> `ACTIVE` span, so a later read
 /// sees the cluster update the clock now owes the cluster. Beside
 /// [`sleep_past_activation`] so every suite that drives an update operation

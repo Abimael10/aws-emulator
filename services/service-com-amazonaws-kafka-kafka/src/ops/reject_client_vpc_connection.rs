@@ -25,11 +25,15 @@
 //!
 //! The CLUSTER-scoped authorization decision is taken on the `ClusterArn` as
 //! submitted, before anything the request names is resolved and before the rest
-//! of the request is read ([`crate::state::authorization`]). What this endpoint
-//! holds under that ARN is then the operation's own to answer: a Region that holds
-//! no cluster under it leaves the call a reference it cannot resolve, and since
-//! this operation models no `NotFoundException` the answer is its own fixed
-//! parameter refusal — the same one an unresolvable connection reference earns.
+//! of the request is read ([`crate::state::authorization`]). Managing the client
+//! VPC connections made to a cluster is a call on that cluster's MULTI-VPC private
+//! connectivity — the surface its own resource-based policy is attached for — so a
+//! Region that holds no cluster under the submitted ARN holds no document for the
+//! decision to rest on either: the call reaches no grant and is refused as
+//! unauthorized ([`crate::state::authorization::no_resource_policy_for_cluster`]),
+//! which discloses nothing about what this registry holds. A reference this call
+//! cannot resolve for any other reason earns its own fixed parameter refusal, this
+//! operation modelling no `NotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -173,12 +177,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.cluster_arn,
         )?;
 
-        // The shape checks depend on the request alone, so they run before the
-        // state lock is taken. This is a cluster's client-VPC-connection
-        // surface, so a value that is not a cluster ARN is answered the
-        // cluster-ARN-specific wording its listing answers, while a value that
-        // is not a VPC-connection ARN earns the service's generic parameter
-        // sentence, as the connection's own reader and delete answer it.
+        // The CLUSTER's own shape first, and from the request alone, so it is
+        // decided before the state lock is taken: this is a cluster's
+        // client-VPC-connection surface, so a value that is not a cluster ARN is
+        // answered the cluster-ARN-specific wording its listing answers.
         if !crate::state::is_cluster_arn(&input.cluster_arn) {
             return Err(RejectClientVpcConnectionErrorModeled::BadRequestException(
                 crate::state::invalid_cluster_arn(),
@@ -200,33 +202,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        if !crate::state::is_vpc_connection_arn(&input.vpc_connection_arn) {
-            return Err(RejectClientVpcConnectionErrorModeled::BadRequestException(
-                crate::state::malformed_arn(crate::state::VPC_CONNECTION_ARN_MEMBER),
-            )
-            .into());
-        }
-
         let now = std::time::SystemTime::now();
         let mut state = state.lock();
 
-        // The CLUSTER first: its owner is who rejects a connection made to it,
-        // and what the cluster is doing decides whether its connections are
-        // managed at all. A regional endpoint knows only its own region's
-        // clusters, so an ARN from another region names nothing here; the
-        // settling lookup materialises the transitions the clock already owed
-        // THAT cluster, which were due at the same instant whether or not
-        // anybody called.
+        // The CLUSTER first, before the rest of the request is read: its owner is
+        // who rejects a connection made to it, the decision over that cluster is
+        // taken ahead of every parameter this call then acts on, and what the
+        // cluster is doing decides whether its connections are managed at all. A
+        // regional endpoint knows only its own region's clusters, so an ARN from
+        // another region names nothing here; the settling lookup materialises the
+        // transitions the clock already owed THAT cluster, which were due at the
+        // same instant whether or not anybody called.
         let Some(cluster) = state.settled_cluster_in(&region, &input.cluster_arn, now) else {
             // An ARN this endpoint's Region holds no cluster for — absent, or
-            // belonging to another Region — is a reference this call cannot
-            // resolve. This operation models no `NotFoundException`
-            // (`smithy_query(query="operation",operation="RejectClientVpcConnection")`),
-            // so the answer is its own fixed parameter refusal, the same one an
-            // unresolvable CONNECTION reference earns below.
-            return Err(bad_request(
-                crate::state::CLUSTER_ARN_MEMBER,
-                crate::state::UNRESOLVED_REFERENCE_MESSAGE.to_string(),
+            // belonging to another Region — carries no resource-based policy, and
+            // that document is what can grant a call on a cluster's multi-VPC
+            // private connectivity: the call reaches no grant, so it is refused as
+            // unauthorized rather than told whether the cluster is there.
+            return Err(crate::state::authorization::no_resource_policy_for_cluster(
+                &*self.engine,
+                ctx,
+                Self::NAME,
+                &input.cluster_arn,
             ));
         };
         // The cluster's OWN ARN, as the registry stores it on every connection
@@ -243,7 +240,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // Then the CONNECTION, through the write counterpart of the lookup the
+        // Then the CONNECTION the request names: a value that is not a
+        // VPC-connection ARN earns the service's generic parameter sentence, as the
+        // connection's own reader and delete answer it.
+        if !crate::state::is_vpc_connection_arn(&input.vpc_connection_arn) {
+            return Err(RejectClientVpcConnectionErrorModeled::BadRequestException(
+                crate::state::malformed_arn(crate::state::VPC_CONNECTION_ARN_MEMBER),
+            )
+            .into());
+        }
+
+        // Resolved through the write counterpart of the lookup the
         // readers use, so the rejection is applied to a connection this
         // endpoint also reports, and on the state the clock already owed it.
         let Some(connection) =
@@ -274,10 +281,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The modelled 400 for a request member this operation cannot act on, naming
 /// the member at fault by its wire name.
 ///
-/// This operation models no `NotFoundException`, so a reference it cannot resolve
-/// — the CONNECTION's, and the CLUSTER's — is a bad PARAMETER here, in the
-/// service's one fixed sentence for one, exactly as `ListClientVpcConnections` and
-/// `CreateVpcConnection` refuse an unusable reference.
+/// This operation models no `NotFoundException`, so a CONNECTION reference it
+/// cannot resolve is a bad PARAMETER here, in the service's one fixed sentence for
+/// one, exactly as `ListClientVpcConnections` and `CreateVpcConnection` refuse an
+/// unusable reference. The CLUSTER target is a different question, decided before
+/// any of this: a cluster this endpoint holds no record of carries no document that
+/// could grant the call, so it is refused as unauthorized
+/// ([`crate::state::authorization::no_resource_policy_for_cluster`]) rather than
+/// reported as an unusable parameter. What the resolved cluster's STATE refuses is
+/// this envelope again, in that condition's own sentence.
 fn bad_request(parameter: &str, message: String) -> RejectClientVpcConnectionError {
     RejectClientVpcConnectionErrorModeled::BadRequestException(BadRequestException {
         invalid_parameter: Some(parameter.to_string()),

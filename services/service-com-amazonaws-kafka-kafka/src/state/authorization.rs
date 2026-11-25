@@ -69,13 +69,23 @@
 //! OPERATION ([`authorize_cluster_operation_target`]), whose target is a resource
 //! of this service named by ARN just the same.
 //!
-//! An operation that CHANGES how clients reach the cluster its ARN names — the
-//! multi-VPC and public-access connectivity surface a cluster's own resource-based
-//! policy is attached for — takes no further step: the recorded answer for a cluster
-//! this endpoint holds no record of is the modelled `NotFoundException` with this
-//! service's fixed sentence, exactly as for the operations that change OTHER parts of
-//! a cluster and for every one that merely REPORTS on it, so an absence is answered as
-//! the absence it is whichever part of a cluster the call addresses.
+//! An operation that MANAGES one of the client VPC connections made to a cluster
+//! is decided one step further ([`no_resource_policy_for_cluster`]). Multi-VPC
+//! private connectivity is the surface a cluster's own resource-based policy is
+//! attached for, and the document that can grant such a call lives ON the target
+//! cluster: a cluster this endpoint holds no record of carries no document at all,
+//! so the call reaches no grant and the answer is the authorization refusal naming
+//! the ARN as submitted, rather than a report of what this registry holds —
+//! `RejectClientVpcConnection`'s recorded answer for such an ARN, and the one
+//! `CreateVpcConnection`'s target has always been decided by for a value it can
+//! hold no document on ([`authorize_target_cluster`]).
+//!
+//! A call that CHANGES or REPORTS any other part of a cluster — its connectivity
+//! configuration included — rests on the caller's own identity-based documents,
+//! which are in force whether or not the cluster exists, so an absence there is
+//! answered as the absence it is: the modelled `NotFoundException` with this
+//! service's fixed sentence, which is what this service's recorded answers for an
+//! absent cluster on those surfaces show.
 //!
 //! What the CALLER's own identity-based policies say about the action is the other
 //! half of the same question, and it is asked FIRST, inside
@@ -488,15 +498,33 @@ fn authorize_action<E>(
     if parsed.account.is_empty() || parsed.account == caller_account() {
         return Ok(());
     }
-    Err(crate::scaffolded::Scaffolded::unmodeled(
-        ACCESS_DENIED_CODE,
-        ACCESS_DENIED_STATUS,
-        ::service_common::iam_authorization::not_authorized_by_resource_policy(
-            &caller_principal(),
-            action,
-            target_arn,
-        ),
+    Err(no_resource_policy_refusal(
+        &caller_principal(),
+        action,
+        target_arn,
     ))
+}
+
+/// The ONE refusal of a request no RESOURCE-based policy allows: the code and
+/// status this service answers ([`access_denied`]) carrying the sentence AWS words
+/// that decision in
+/// ([`::service_common::iam_authorization::not_authorized_by_resource_policy`]).
+///
+/// Both decisions that reach it are built from here — the ARN of another account
+/// ([`authorize_action`]) and the target no document can be attached to
+/// ([`no_resource_policy_for_cluster`]) — so the two cannot drift apart on the
+/// wording; which PRINCIPAL each blames stays the caller's, since the two resolve
+/// it differently.
+fn no_resource_policy_refusal<E>(
+    principal: &str,
+    action: &str,
+    resource: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    access_denied(
+        ::service_common::iam_authorization::not_authorized_by_resource_policy(
+            principal, action, resource,
+        ),
+    )
 }
 
 /// BOTH authorization decisions, in AWS's own order, taken before the operation
@@ -592,6 +620,35 @@ fn no_grant_for_cluster<Eng: Send + Sync + 'static, E>(
             &principal, action, resource,
         ),
     )
+}
+
+/// The refusal a call on a cluster's MULTI-VPC private-connectivity surface earns
+/// when this endpoint holds no cluster under the ARN it named.
+///
+/// That surface is the one a cluster's own resource-based policy is attached for,
+/// so the grant for such a call can rest on a document that lives ON the target
+/// cluster — and a cluster this service holds no record of carries no document at
+/// all. There is therefore nothing for the decision to rest on: the call reaches no
+/// grant, and the answer is the authorization refusal in the sentence AWS words a
+/// decision no resource-based policy allowed
+/// ([`::service_common::iam_authorization::not_authorized_by_resource_policy`]),
+/// naming the ARN exactly as the request submitted it — so a caller it refuses
+/// learns nothing about what this registry holds.
+///
+/// `operation` is the caller's own `Operation::NAME`, so the action can never drift
+/// from the operation taking the decision, and the principal is the one the
+/// REQUEST's credential speaks for
+/// ([`crate::state::identity_authorization::calling_principal`]), as in every other
+/// refusal of this service.
+pub fn no_resource_policy_for_cluster<Eng: Send + Sync + 'static, E>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    operation: &str,
+    cluster_arn: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    let action = control_plane_action(operation);
+    let principal = crate::state::identity_authorization::calling_principal(engine, ctx);
+    no_resource_policy_refusal(&principal, &action, cluster_arn)
 }
 
 /// The IAM actions an MSK CLUSTER POLICY governs — the resource-based policy

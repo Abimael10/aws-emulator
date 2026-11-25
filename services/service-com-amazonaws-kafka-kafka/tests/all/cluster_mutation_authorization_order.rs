@@ -22,11 +22,12 @@
 //!   of this account that this endpoint's region holds no cluster for is
 //!   `NotFoundException` (HTTP 404) in the service's one sentence for a resource it
 //!   cannot resolve, and the cluster it DOES hold has the update accepted — except
-//!   where the mutation changes how clients REACH the cluster, the surface a
-//!   cluster's own resource-based policy is attached for: nothing can grant an action
-//!   on a cluster that carries no document, so there the permitted caller is refused
-//!   as unauthorized too, and learns nothing about the registry either
-//!   (`connectivity_absent_cluster_refusal.rs` drives that rule over its own table).
+//!   where the call MANAGES one of the cluster's client VPC connections, the
+//!   multi-VPC surface a cluster's own resource-based policy is attached for: only a
+//!   document attached to the target cluster can grant such a call, and a cluster
+//!   carrying none reaches no grant, so there the permitted caller is refused as
+//!   unauthorized too and learns nothing about the registry either
+//!   (`client_vpc_connection_target_grant.rs` drives that rule over its own table).
 //!
 //! The rows differ along what the rule generalises over: the document in force on
 //! the calling principal (a deny of exactly this action, a deny of every action of

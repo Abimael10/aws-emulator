@@ -9,20 +9,19 @@
 //! CHANGES how clients reach the cluster exactly as for every other cluster-addressed
 //! call of this service — `UpdateConnectivity` with the `NotFoundException` its model
 //! declares (HTTP 404) carrying this service's one fixed sentence for a resource it
-//! does not hold, which is the recorded answer, and `RejectClientVpcConnection`,
-//! whose model declares no `NotFoundException`, with its own fixed parameter refusal
-//! naming `clusterArn`. Whose ACCOUNT the ARN names is a different question, decided
-//! before this one.
+//! does not hold, which is the recorded answer. Whose ACCOUNT the ARN names is a
+//! different question, decided before this one; so is a call that MANAGES one of the
+//! client VPC connections made to the cluster, which rests on a document attached to
+//! that cluster and is pinned in `client_vpc_connection_rejection.rs`.
 //!
-//! The rows differ along what the rule generalises over: the OPERATION taking the
-//! decision (both mutations of that surface), the way this endpoint comes to hold no
-//! cluster under the submitted ARN (a name never created, an ARN of the shape this
-//! service mints with another name and id, a cluster id with a different revision
-//! suffix, a cluster that was created and then deleted, and a live cluster's own ARN
-//! seen from another region's endpoint), and — for `UpdateConnectivity` — the BODY the
-//! request carries (each connectivity member the operation can change, a version
-//! token the cluster would refuse, and a body naming nothing to change at all), since
-//! the target is resolved before any of the body is applied.
+//! The rows differ along what the rule generalises over: the way this endpoint comes
+//! to hold no cluster under the submitted ARN (a name never created, an ARN of the
+//! shape this service mints with another name and id, a cluster id with a different
+//! revision suffix, a cluster that was created and then deleted, and a live cluster's
+//! own ARN seen from another region's endpoint), and the BODY the request carries
+//! (each connectivity member the operation can change, a version token the cluster
+//! would refuse, and a body naming nothing to change at all), since the target is
+//! resolved before any of the body is applied.
 //!
 //! The boundaries are pinned too: a value that is no cluster ARN at all is left to the
 //! operation's own parameter refusal (HTTP 400), the REPORTING side of the same ARN
@@ -46,20 +45,13 @@ const NOT_FOUND_CODE: &str = "NotFoundException";
 /// request.
 const NOT_FOUND_MESSAGE: &str = "The requested resource doesn\u{2019}t exist.";
 
-/// The status, wire code and sentence of the parameter refusal
-/// `RejectClientVpcConnection` answers an unresolvable reference with, which is what
-/// it reports for an absent cluster as well, since its model declares no
-/// `NotFoundException`.
+/// The status and wire code of the parameter refusal `UpdateConnectivity` answers a
+/// value that is no cluster ARN at all with, which the control below pins.
 const BAD_REQUEST_STATUS: u16 = 400;
 const BAD_REQUEST_CODE: &str = "BadRequestException";
-const BAD_REQUEST_MESSAGE: &str = "One or more of the parameters are not valid.";
 
 /// The member each refusal names as the one at fault: the one that carried the ARN.
 const CLUSTER_ARN_MEMBER: &str = "clusterArn";
-
-/// A second region's endpoint, for the row that addresses a live cluster from an
-/// endpoint that does not hold it.
-const OTHER_REGION: &str = "eu-west-1";
 
 /// `UpdateConnectivity` against `target`, as the endpoint of `region` serves it.
 async fn update_connectivity_in(
@@ -97,24 +89,9 @@ fn assert_reported_absent(reply: &Reply, case: &str) {
     );
 }
 
-/// Assert `reply` is the fixed parameter refusal `RejectClientVpcConnection` answers
-/// a reference it cannot resolve with, naming the member that carried the ARN.
-fn assert_refused_as_unresolvable(reply: &Reply, case: &str) {
-    assert_eq!(
-        (reply.status, reply.error_code(), reply.error_message()),
-        (BAD_REQUEST_STATUS, BAD_REQUEST_CODE, BAD_REQUEST_MESSAGE),
-        "case {case:?}: expected {BAD_REQUEST_STATUS} {BAD_REQUEST_CODE} \
-         {BAD_REQUEST_MESSAGE:?}, got {} {}",
-        reply.status,
-        reply.body
-    );
-    assert_eq!(
-        reply.at("/invalidParameter").as_str(),
-        Some(CLUSTER_ARN_MEMBER),
-        "case {case:?}: expected {CLUSTER_ARN_MEMBER} as the member at fault, got {}",
-        reply.body
-    );
-}
+/// A second region's endpoint, for the row that addresses a live cluster from an
+/// endpoint that does not hold it.
+const OTHER_REGION: &str = "eu-west-1";
 
 /// Every body `UpdateConnectivity` can carry while the TARGET is resolved before any
 /// of it is applied: each member the operation can change, and a version token the
@@ -246,18 +223,6 @@ async fn an_absent_cluster_is_reported_absent_by_a_connectivity_mutation() {
             let reply = update_connectivity_in(&emulator, region, target, &body).await;
             assert_reported_absent(&reply, &format!("{case}/{body_case}"));
         }
-
-        // The OTHER mutation of the same surface answers the same absence in the
-        // vocabulary ITS model gives it, so the rule is the service's rather than
-        // one handler's.
-        let rejected = emulator
-            .reject_client_vpc_connection_in(
-                region,
-                target,
-                &format!("arn:aws:kafka:{REGION}:{ACCOUNT}:vpc-connection/{ACCOUNT}/absent/abc-1"),
-            )
-            .await;
-        assert_refused_as_unresolvable(&rejected, &format!("{case}/RejectClientVpcConnection"));
     }
 
     // CONTROL (the boundary below the rule): a value that is no cluster ARN at all
