@@ -44,14 +44,14 @@ pub(crate) struct TaggedResource {
     pub(crate) case: &'static str,
     marker: &'static str,
     pub(crate) arns: Vec<String>,
-    expected: BTreeMap<String, String>,
+    pub(crate) expected: BTreeMap<String, String>,
 }
 
 impl TaggedResource {
     /// This resource's value for the tag value `base` names: one resource's tag values are
     /// its own, so a value that leaked from another resource is a failure rather than a
     /// match.
-    fn value(&self, base: &str) -> String {
+    pub(crate) fn value(&self, base: &str) -> String {
         format!("{base}-{}", self.marker)
     }
 
@@ -63,7 +63,7 @@ impl TaggedResource {
 }
 
 /// What one step of the round trip does to a resource.
-enum Change {
+pub(crate) enum Change {
     /// `TagResource` with these key/value-base pairs.
     Tag(&'static [(&'static str, &'static str)]),
     /// `UntagResource` with these keys.
@@ -71,9 +71,103 @@ enum Change {
 }
 
 /// One step of the round trip: what it changes, run against every resource in turn.
-struct Step {
+pub(crate) struct Step {
     case: &'static str,
     change: Change,
+}
+
+/// The round trip every kind of taggable resource is put through, one step per row.
+///
+/// The rows differ along what one request changes: several new keys, a key the resource
+/// already carries, none at all, one of several removed, a key removed twice beside one never
+/// set, no keys at all, every key, and a key added back once the set was emptied. One table
+/// for every resource kind, so a collection, a project and a dataset are held to the same
+/// rule rather than to a copy of it.
+pub(crate) const ROUND_TRIP_STEPS: &[Step] = &[
+    Step {
+        case: "two new keys",
+        change: Change::Tag(&[("env", "sim2real"), ("owner", "behavioral")]),
+    },
+    Step {
+        case: "a key the resource already carries",
+        change: Change::Tag(&[("env", "prod")]),
+    },
+    Step {
+        case: "no tags at all",
+        change: Change::Tag(&[]),
+    },
+    Step {
+        case: "one of several keys removed",
+        change: Change::Untag(&["owner"]),
+    },
+    Step {
+        case: "the same key again, beside one never set",
+        change: Change::Untag(&["owner", "never-set"]),
+    },
+    Step {
+        case: "no keys at all",
+        change: Change::Untag(&[]),
+    },
+    Step {
+        case: "every key the step has added",
+        change: Change::Untag(&["env", "owner"]),
+    },
+    Step {
+        case: "a key added back after the set was emptied",
+        change: Change::Tag(&[("env", "test")]),
+    },
+];
+
+/// Put every resource of `resources` through [`ROUND_TRIP_STEPS`] over the wire, naming each
+/// one by a different form of its ARN as the steps go on, and assert after every step that
+/// each resource reports exactly the set the step leaves it with — and that every resource of
+/// `unchanged`, which no step touches, still reports its own.
+///
+/// One runner for every resource kind: what a step changed is applied to the test's own model
+/// of the set, so the expectation is the rule's rather than the implementation's.
+pub(crate) async fn run_round_trip(
+    router: &MultiServiceRouter,
+    resources: &mut [TaggedResource],
+    unchanged: &[TaggedResource],
+) {
+    for (index, Step { case, change }) in ROUND_TRIP_STEPS.iter().enumerate() {
+        for resource in resources.iter_mut() {
+            let arn = resource.arn(index).to_string();
+            let (operation, mut body) = match change {
+                Change::Tag(pairs) => {
+                    let tags: BTreeMap<String, String> = pairs
+                        .iter()
+                        .map(|(key, base)| ((*key).to_string(), resource.value(base)))
+                        .collect();
+                    ("TagResource", json!({ "Tags": as_json(&tags) }))
+                }
+                Change::Untag(keys) => ("UntagResource", json!({ "TagKeys": keys })),
+            };
+            body["ResourceArn"] = json!(arn);
+            let reply = call(router, operation, body).await;
+            assert_eq!(
+                reply.status, 200,
+                "case {case:?}/{}: {operation} on {arn} must succeed, got {:?}",
+                resource.case, reply.body
+            );
+            // The same change, applied to the test's own model of the set.
+            match change {
+                Change::Tag(pairs) => {
+                    for (key, base) in pairs.iter() {
+                        let value = resource.value(base);
+                        resource.expected.insert((*key).to_string(), value);
+                    }
+                }
+                Change::Untag(keys) => {
+                    for key in keys.iter() {
+                        resource.expected.remove(*key);
+                    }
+                }
+            }
+        }
+        assert_every_resource(router, case, resources).await;
+        assert_every_resource(router, case, unchanged).await;
+    }
 }
 
 /// A tag map as it comes back on the wire.
@@ -167,8 +261,50 @@ pub(crate) async fn project_resource(
     }
 }
 
+/// `CreateDataset` for one half of the project `project_arn` names, with `tags` attached, as
+/// a resource of the table: the `DatasetArn` the service minted, and the same ARN without its
+/// label.
+///
+/// A dataset is the third kind of resource this store holds a tag set on — `CreateDataset`
+/// carries a `TagMap` of its own
+/// (`smithy_query(query="operation",operation="CreateDataset")`) — so it goes through the same
+/// round trip as a collection and a project.
+pub(crate) async fn dataset_resource(
+    router: &MultiServiceRouter,
+    case: &'static str,
+    marker: &'static str,
+    project_arn: &str,
+    dataset_type: &str,
+    tags: &[(&str, &str)],
+) -> TaggedResource {
+    let expected: BTreeMap<String, String> = tags
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), format!("{value}-{marker}")))
+        .collect();
+    let mut body = json!({ "ProjectArn": project_arn, "DatasetType": dataset_type });
+    body["Tags"] = as_json(&expected);
+    let reply = call(router, "CreateDataset", body).await;
+    assert_eq!(
+        reply.status, 200,
+        "case {case:?}: creating the {dataset_type} dataset must succeed, got {:?}",
+        reply.body
+    );
+    let arn = reply.string("DatasetArn").unwrap_or_else(|| {
+        panic!(
+            "case {case:?}: a DatasetArn must come back, got {:?}",
+            reply.body
+        )
+    });
+    TaggedResource {
+        case,
+        marker,
+        arns: vec![arn.clone(), label_less(&arn)],
+        expected,
+    }
+}
+
 /// Every resource reports its own tag set, through every ARN form that names it.
-async fn assert_every_resource(
+pub(crate) async fn assert_every_resource(
     router: &MultiServiceRouter,
     step: &str,
     resources: &[TaggedResource],
@@ -227,78 +363,8 @@ async fn a_resources_tags_are_its_own_set_whatever_kind_of_resource_it_is() {
     // What each create attached is the set the round trip starts from.
     assert_every_resource(&router, "the tags the create attached", &resources).await;
 
-    let steps = [
-        Step {
-            case: "two new keys",
-            change: Change::Tag(&[("env", "sim2real"), ("owner", "behavioral")]),
-        },
-        Step {
-            case: "a key the resource already carries",
-            change: Change::Tag(&[("env", "prod")]),
-        },
-        Step {
-            case: "no tags at all",
-            change: Change::Tag(&[]),
-        },
-        Step {
-            case: "one of several keys removed",
-            change: Change::Untag(&["owner"]),
-        },
-        Step {
-            case: "the same key again, beside one never set",
-            change: Change::Untag(&["owner", "never-set"]),
-        },
-        Step {
-            case: "no keys at all",
-            change: Change::Untag(&[]),
-        },
-        Step {
-            case: "every key the step has added",
-            change: Change::Untag(&["env", "owner"]),
-        },
-        Step {
-            case: "a key added back after the set was emptied",
-            change: Change::Tag(&[("env", "test")]),
-        },
-    ];
-
-    for (index, Step { case, change }) in steps.iter().enumerate() {
-        for resource in resources.iter_mut() {
-            let arn = resource.arn(index).to_string();
-            let (operation, mut body) = match change {
-                Change::Tag(pairs) => {
-                    let tags: BTreeMap<String, String> = pairs
-                        .iter()
-                        .map(|(key, base)| ((*key).to_string(), resource.value(base)))
-                        .collect();
-                    ("TagResource", json!({ "Tags": as_json(&tags) }))
-                }
-                Change::Untag(keys) => ("UntagResource", json!({ "TagKeys": keys })),
-            };
-            body["ResourceArn"] = json!(arn);
-            let reply = call(&router, operation, body).await;
-            assert_eq!(
-                reply.status, 200,
-                "case {case:?}/{}: {operation} on {arn} must succeed, got {:?}",
-                resource.case, reply.body
-            );
-            // The same change, applied to the test's own model of the set.
-            match change {
-                Change::Tag(pairs) => {
-                    for (key, base) in pairs.iter() {
-                        let value = resource.value(base);
-                        resource.expected.insert((*key).to_string(), value);
-                    }
-                }
-                Change::Untag(keys) => {
-                    for key in keys.iter() {
-                        resource.expected.remove(*key);
-                    }
-                }
-            }
-        }
-        assert_every_resource(&router, case, &resources).await;
-    }
+    // Then the round trip every kind of taggable resource is held to.
+    run_round_trip(&router, &mut resources, &[]).await;
 
     // A tagged project is still the project `DescribeProjects` reports: tagging changes a
     // resource's tags and nothing else about it.

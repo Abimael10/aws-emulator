@@ -587,13 +587,24 @@ impl Project {
         }
     }
 
-    /// The dataset of this project whose ARN is `dataset_arn`, or `None` where it holds none
-    /// under it. A dataset is addressed by ARN alone by every operation on one, so the lookup
-    /// is over the project's own datasets rather than over the key they are held under.
-    pub fn dataset_by_arn(&self, dataset_arn: &str) -> Option<&datasets::Dataset> {
+    /// The dataset of this project whose ARN is `dataset_arn` and whose deletion the clock has
+    /// not completed by `now`, or `None` where it holds none under it. A dataset is addressed by
+    /// ARN alone by every operation on one, so the lookup is over the project's own datasets
+    /// rather than over the key they are held under.
+    ///
+    /// A dataset past the instant its deletion was due is one this account no longer has — "if
+    /// you try to access the dataset after it is deleted, you get a `ResourceNotFoundException`
+    /// exception" — so it is not one this resolves to, whether or not a call has dropped its
+    /// record yet. That is the same rule [`ComAmazonawsRekognitionRekognitionserviceState::live_projects_at`]
+    /// applies one level up.
+    pub fn dataset_by_arn(
+        &self,
+        dataset_arn: &str,
+        now: SystemTime,
+    ) -> Option<&datasets::Dataset> {
         self.datasets
             .values()
-            .find(|dataset| arn_names(&dataset.arn, dataset_arn))
+            .find(|dataset| !dataset.is_deleted_at(now) && arn_names(&dataset.arn, dataset_arn))
     }
 }
 
@@ -719,8 +730,12 @@ impl ComAmazonawsRekognitionRekognitionserviceState {
     /// [`Self::project_by_arn`] records: a dataset of a project this account no longer has is
     /// one nothing holds.
     pub fn dataset_by_arn(&self, dataset_arn: &str) -> Option<(&Project, &datasets::Dataset)> {
-        self.live_projects()
-            .find_map(|project| project.dataset_by_arn(dataset_arn).map(|held| (project, held)))
+        let now = SystemTime::now();
+        self.live_projects_at(now).find_map(|project| {
+            project
+                .dataset_by_arn(dataset_arn, now)
+                .map(|held| (project, held))
+        })
     }
 
     /// The project `project_arn` names, in either form of its ARN (see [`arn_names`]), or
@@ -751,7 +766,7 @@ impl ComAmazonawsRekognitionRekognitionserviceState {
         self.projects
             .values_mut()
             .filter(|project| !project.is_deleted_at(now))
-            .find(|project| project.dataset_by_arn(dataset_arn).is_some())
+            .find(|project| project.dataset_by_arn(dataset_arn, now).is_some())
     }
 
     /// The same resolution, for the operations that CHANGE the resource's tags.
@@ -777,7 +792,9 @@ impl ComAmazonawsRekognitionRekognitionserviceState {
                 project
                     .datasets
                     .values_mut()
-                    .find(|dataset| arn_names(&dataset.arn, resource_arn))
+                    .find(|dataset| {
+                        !dataset.is_deleted_at(now) && arn_names(&dataset.arn, resource_arn)
+                    })
                     .map(|dataset| &mut dataset.tags)
             })
     }
