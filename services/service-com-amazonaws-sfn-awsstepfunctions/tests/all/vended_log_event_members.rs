@@ -110,6 +110,23 @@ fn without_payload(details: &Value) -> Value {
     Value::Object(object)
 }
 
+/// Whether CloudWatch Logs holds the group `name`, read through its own reader.
+///
+/// `pub(crate)` for the reason [`delivered`] is: a suite that waits for a delivery, and one
+/// that grades the group a delivery created, ask the same question of the same reader.
+pub(crate) async fn holds_group(observed: &Observed, name: &str) -> bool {
+    let described = observed
+        .logs("DescribeLogGroups", &json!({ "logGroupNamePrefix": name }))
+        .await;
+    described
+        .get("logGroups")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .any(|held| held.get("logGroupName").and_then(Value::as_str) == Some(name))
+}
+
 /// Every event the group `name` holds, as the parsed JSON message of each, in the order
 /// CloudWatch Logs reports them — and NO event while CloudWatch Logs does not hold the
 /// group at all.

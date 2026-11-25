@@ -7,6 +7,11 @@
 //! to `STOPPING`"). Reaching `STOPPED` is owed by the clock — see `crate::state` — so a
 //! later `DescribeTasks` observes it.
 //!
+//! A task that has ALREADY reached its terminal `STOPPED` is not stopped again: the stop
+//! recorded on it — its `stopCode`, its `stoppedReason` and the instants it stopped at — is
+//! what happened to it, whoever asks afterwards, and what this call answers
+//! ([`terminal_stop_record`]).
+//!
 //! What the stop owes OUTSIDE this service is settled once the store's guard is released:
 //! the target this task held in the Elastic Load Balancing v2 groups its service binds is
 //! deregistered, so it drains and then leaves the group
@@ -262,6 +267,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `StopTask` has no `include` member to narrow the response with, so the task it
         // just mutated is reported with its tags.
         let view = task.view(true);
+        // "The task that was stopped" is what the output carries, so a task that had
+        // already STOPPED is answered as the stop that happened to it left it
+        // ([`terminal_stop_record`]).
+        let view = if task.last_status == crate::state::STATUS_STOPPED {
+            terminal_stop_record(view)
+        } else {
+            view
+        };
         // A task that is stopping serves no traffic: the target it held in the Elastic Load
         // Balancing v2 groups its service binds is deregistered, so it drains and then leaves
         // the group ([`crate::state::settle_load_balancer_targets`]). The status this stop put
@@ -274,5 +287,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::publish_task_state_changes(ctx, &self.engine, &region);
 
         Ok(StopTaskOutput { task: Some(view) })
+    }
+}
+
+/// The `Task` this operation answers for a task whose stop is ALREADY TERMINAL: the stop
+/// record alone, with none of the per-container or per-attachment detail the task carried
+/// while it was live.
+///
+/// `StopTask$task` is "the task that was stopped" and the operation itself is what is "issued
+/// to the containers running in the task" — so the response is an account of a stop, not of a
+/// running task. A task that has reached `STOPPED` holds nothing for this call to act on: its
+/// containers have exited and the resources Amazon ECS allocated for it are released, so
+/// there is no container to signal, no attachment to tear down and no per-container override
+/// to apply. What remains is the record of how the task stopped — its `lastStatus` and
+/// `desiredStatus`, the `stopCode` and `stoppedReason` it stopped with and the instants it
+/// stopped at, beside where and what it ran — which is what this reports, whether the stop it
+/// finds was a launch Amazon ECS could not make, a container that exited or an earlier stop a
+/// caller asked for.
+///
+/// What such a task HELD is read through the describe path, which reports every container it
+/// ran and every attachment it was allocated in the state the task left them in
+/// (`crate::ops::describe_tasks`).
+///
+/// Each of the three is reported as the EMPTY collection it is rather than left out, which is
+/// the shape every collection member of this service's records takes: a task holding none of
+/// something reports the member empty — `Task$attachments` of a task that was allocated no
+/// interface already does ([`crate::state::TaskRecord::view`]) — so a client may index it
+/// unconditionally whatever the task it read.
+fn terminal_stop_record(task: Task) -> Task {
+    Task {
+        attachments: Some(Vec::new()),
+        containers: Some(Vec::new()),
+        overrides: task.overrides.map(|overrides| TaskOverride {
+            container_overrides: Some(Vec::new()),
+            ..overrides
+        }),
+        ..task
     }
 }

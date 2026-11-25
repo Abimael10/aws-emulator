@@ -40,7 +40,7 @@ use service_com_amazonaws_sfn_awsstepfunctions::state::{
 
 use crate::execution_observability::{create, logging, Observed};
 use crate::state_machine_lifecycle::{string, HELLO_DEFINITION};
-use crate::vended_log_event_members::{delivered, PAYLOAD_MEMBERS};
+use crate::vended_log_event_members::{delivered, holds_group, PAYLOAD_MEMBERS};
 
 /// A definition whose run produces one state's entry and exit and then fails, so one
 /// execution carries an execution-level event, a pair of ordinary progress events and
@@ -234,20 +234,6 @@ async fn streams_of(observed: &Observed, group: &str) -> Vec<String> {
         .filter_map(|stream| stream.get("logStreamName").and_then(Value::as_str))
         .map(str::to_string)
         .collect()
-}
-
-/// Whether CloudWatch Logs holds the group `group`, read through its own reader.
-async fn holds_group(observed: &Observed, group: &str) -> bool {
-    let described = observed
-        .logs("DescribeLogGroups", &json!({ "logGroupNamePrefix": group }))
-        .await;
-    described
-        .get("logGroups")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .any(|held| held.get("logGroupName").and_then(Value::as_str) == Some(group))
 }
 
 /// The ids the history of `execution` gives the events of the types `selected`, as the
