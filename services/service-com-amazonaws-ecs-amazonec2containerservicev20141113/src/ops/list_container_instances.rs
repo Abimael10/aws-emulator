@@ -180,7 +180,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the ECS store is unavailable".to_string()),
             })
         })?;
-        let _ = ctx;
 
         // "This value can be between 1 and 100."
         if let Some(message) = input.max_results.and_then(|max_results| {
@@ -232,6 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        let region = crate::state::request_region(ctx);
         let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
 
         // The capacity the account's Amazon EC2 instances owe this cluster: an instance
@@ -312,6 +312,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let next_token = matching
             .get(end)
             .map(|arn| crate::state::encode_page_token(&token_key, &page_scope, arn));
+
+        // The capacity this listing has just settled changed state — an instance joined, or an
+        // agent's connection timed out behind a machine that stopped — and each such change is
+        // an `ECS Container Instance State Change` on the account's default event bus, owed by
+        // the clock and not by any call ([`crate::state::drive_capacity_clock`]). The guard is
+        // dropped first, so no lock of this store is held across the hop.
+        drop(guard);
+        crate::state::drive_capacity_clock(ctx, &self.engine, &region);
 
         Ok(ListContainerInstancesOutput {
             container_instance_arns: Some(container_instance_arns),

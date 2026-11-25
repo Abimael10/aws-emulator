@@ -286,9 +286,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             instance.version += 1;
         }
 
-        Ok(DeregisterContainerInstanceOutput {
-            container_instance: guard
-                .container_instance_view(&arn, crate::state::ContainerInstanceFields::all()),
-        })
+        let container_instance =
+            guard.container_instance_view(&arn, crate::state::ContainerInstanceFields::all());
+        // The `INACTIVE` this deregistration left the host in is an `ECS Container Instance
+        // State Change` on the account's default event bus, published as it falls due
+        // ([`crate::state::publish_task_state_changes`]). The guard is dropped first, so no
+        // lock of this store is held across the hop.
+        drop(guard);
+        crate::state::publish_task_state_changes(ctx, &self.engine, &region);
+
+        Ok(DeregisterContainerInstanceOutput { container_instance })
     }
 }

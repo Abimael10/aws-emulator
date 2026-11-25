@@ -307,9 +307,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `UpdateContainerAgent` has no `include` member to narrow the response with, so
         // the instance it just changed is reported with its tags.
-        Ok(UpdateContainerAgentOutput {
-            container_instance: guard
-                .container_instance_view(&arn, crate::state::ContainerInstanceFields::all()),
-        })
+        let container_instance =
+            guard.container_instance_view(&arn, crate::state::ContainerInstanceFields::all());
+        // The stage this update put the agent in is an `ECS Container Instance State Change`
+        // on the account's default event bus, and so is each later stage the clock materialises
+        // ([`crate::state::publish_task_state_changes`]). The guard is dropped first, so no
+        // lock of this store is held across the hop.
+        drop(guard);
+        crate::state::publish_task_state_changes(ctx, &self.engine, &region);
+
+        Ok(UpdateContainerAgentOutput { container_instance })
     }
 }

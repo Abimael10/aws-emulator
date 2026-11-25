@@ -383,6 +383,11 @@ pub use service_action_events::*;
 mod deployment_events;
 pub use deployment_events::*;
 
+/// The `ECS Container Instance State Change` events this service publishes as a CONTAINER
+/// INSTANCE changes — registered, drained, deregistered, its agent gone.
+mod container_instance_events;
+pub use container_instance_events::*;
+
 /// What a container's `command` DOES: the session one container's program runs in, and the
 /// output and exit status running it produces.
 mod container_shell;
@@ -4728,6 +4733,13 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// The service-deployment transitions this store has materialised and not published to
     /// EventBridge yet, oldest first — see [`deployment_events`].
     pending_deployment_state_changes: VecDeque<DeploymentStateChange>,
+    /// The container-instance changes this store has observed and not published to
+    /// EventBridge yet, oldest first — see [`container_instance_events`].
+    pending_container_instance_events: VecDeque<ContainerInstanceStateChange>,
+    /// `containerInstanceArn` -> the state last published for that instance, so a change is
+    /// recognised once however it was written and published exactly once
+    /// ([`Self::record_container_instance_state_changes`]).
+    published_container_instance_state: HashMap<String, ContainerInstanceReportedState>,
     /// `taskArn` -> the `(lastStatus, desiredStatus)` pair last published for that task, so
     /// a transition is recognised once however it was written and published exactly once
     /// ([`Self::record_task_state_changes`]).

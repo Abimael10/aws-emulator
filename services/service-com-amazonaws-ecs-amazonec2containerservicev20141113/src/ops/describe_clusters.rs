@@ -251,6 +251,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The capacity this read has just settled changed state — an instance joined, or an
+        // agent's connection timed out behind a machine that stopped — and each such change is
+        // an `ECS Container Instance State Change` on the account's default event bus, owed by
+        // the clock and not by any call ([`crate::state::drive_capacity_clock`]). The guard is
+        // dropped first, so no lock of this store is held across the hop.
+        drop(guard);
+        crate::state::drive_capacity_clock(ctx, &self.engine, &region);
+
         Ok(DescribeClustersOutput {
             clusters: Some(clusters),
             failures: Some(failures),

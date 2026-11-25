@@ -281,6 +281,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
+        // The version each attribute this call removed moved is an `ECS Container Instance
+        // State Change` on the account's default event bus, published as it falls due
+        // ([`crate::state::publish_task_state_changes`]). The guard is dropped first, so no
+        // lock of this store is held across the hop.
+        drop(guard);
+        crate::state::publish_task_state_changes(ctx, &self.engine, &region);
+
         Ok(DeleteAttributesOutput {
             attributes: Some(deleted),
         })

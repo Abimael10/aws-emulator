@@ -455,6 +455,14 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         // applied is what keeps the published stream the task's own history (see that
         // method's own documentation). Queueing only; the publication stays the pump's.
         self.record_task_state_changes(now);
+        // And every change a CONTAINER INSTANCE has experienced since the last comparison,
+        // under the same lock: the registration the agent on a launched instance made on its
+        // own ([`super::ec2_capacity`]), the agent update this pass has just materialised, the
+        // connection a stopped machine's agent lost, the drain a caller asked for and the
+        // tasks this pass placed on or stopped from the instance
+        // ([`super::container_instance_events`]). Queueing only; the publication stays the
+        // pump's.
+        self.record_container_instance_state_changes(now);
     }
 
     /// Materialise the SERVICE-level transitions the clock owes, as of `now`: the steady

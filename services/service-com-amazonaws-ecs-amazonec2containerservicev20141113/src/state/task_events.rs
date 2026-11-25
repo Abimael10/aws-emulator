@@ -306,6 +306,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         if !self.pending_task_events.is_empty()
             || self.has_pending_service_actions()
             || self.has_pending_deployment_state_changes()
+            // A container instance's change waiting on the bus keeps the pump awake for the
+            // same reason a task's does: the client watching that capacity makes no further
+            // Amazon ECS call ([`super::container_instance_events`]).
+            || self.has_pending_container_instance_state_changes()
         {
             return Some(now);
         }
@@ -428,7 +432,7 @@ pub(super) fn date_time_text(at: DateTime) -> Option<String> {
 /// Add `name` carrying `value` when the record holds one: a member the task does not carry
 /// is LEFT OUT rather than reported empty, exactly as the API's own projection leaves it
 /// out.
-fn insert_text(
+pub(super) fn insert_text(
     detail: &mut ::serde_json::Map<String, ::serde_json::Value>,
     name: &str,
     value: Option<String>,
@@ -439,7 +443,7 @@ fn insert_text(
 }
 
 /// Add `name` carrying the date-time text of `at`, when the record holds that instant.
-fn insert_instant(
+pub(super) fn insert_instant(
     detail: &mut ::serde_json::Map<String, ::serde_json::Value>,
     name: &str,
     at: Option<DateTime>,
@@ -640,7 +644,13 @@ pub fn publish_task_state_changes<Eng: Send + Sync + 'static>(
 /// Called with NO guard of this store held: it takes that lock itself.
 fn record_task_moves<Eng: Send + Sync + 'static>(engine: &::std::sync::Arc<Eng>) {
     if let Some(state) = service_state(&**engine) {
-        state.lock().record_task_state_changes(SystemTime::now());
+        let mut store = state.lock();
+        let now = SystemTime::now();
+        store.record_task_state_changes(now);
+        // The change the same write made to a CONTAINER INSTANCE travels the same hop: a
+        // drain, a deregistration or a registration is announced by the door that made it,
+        // exactly as a task's move is ([`super::container_instance_events`]).
+        store.record_container_instance_state_changes(now);
     }
 }
 
@@ -662,9 +672,10 @@ async fn publish_pending<Eng: Send + Sync + 'static>(
     };
     let client = ::service_common::eventbridge_client::eventbridge_client(callback, region);
     loop {
-        let (changes, actions, deployments) = {
+        let (changes, actions, deployments, instances) = {
             let mut store = state.lock();
             store.record_task_state_changes(SystemTime::now());
+            store.record_container_instance_state_changes(SystemTime::now());
             (
                 store.take_task_state_changes(MAX_PUBLISHED_PER_DRAIN),
                 // The actions this store's SERVICE scheduler has taken travel the same hop
@@ -675,14 +686,25 @@ async fn publish_pending<Eng: Send + Sync + 'static>(
                 // And so do the rollout states this store's service DEPLOYMENTS have moved
                 // into ([`super::deployment_events`]).
                 store.take_deployment_state_changes(MAX_PUBLISHED_PER_DRAIN),
+                // And so do the changes this store's CONTAINER INSTANCES have experienced
+                // ([`super::container_instance_events`]).
+                store.take_container_instance_state_changes(MAX_PUBLISHED_PER_DRAIN),
             )
         };
-        if changes.is_empty() && actions.is_empty() && deployments.is_empty() {
+        if changes.is_empty()
+            && actions.is_empty()
+            && deployments.is_empty()
+            && instances.is_empty()
+        {
             return;
         }
         publish_batch(&client, &changes).await;
         super::service_action_events::publish_service_actions(&client, &actions).await;
         super::deployment_events::publish_deployment_state_changes(&client, &deployments).await;
+        super::container_instance_events::publish_container_instance_state_changes(
+            &client, &instances,
+        )
+        .await;
     }
 }
 
@@ -757,6 +779,29 @@ pub(super) async fn publish_events(
 /// [`MAX_CLOCK_WAKE_UPS`] wake-ups, and it exits as soon as the store owes nothing. With no
 /// async runtime to spawn onto there is no pump, and the transitions are materialised and
 /// published by the next operation instead.
+/// Hand the CAPACITY a reporting operation has just materialised to the clock pump, so the
+/// events its changes earned reach the bus with no further call.
+///
+/// The registration an Amazon EC2 instance's own agent makes is owed by the CLOCK and by no
+/// call ([`super::ec2_capacity`]): a client watching a cluster's capacity through EventBridge
+/// polls the bus, not Amazon ECS, so a change announced only by the next WRITING door would
+/// never be announced at all. A reporting operation that settled that capacity therefore hands
+/// what it materialised to the same single pump every door shares.
+///
+/// Only the pump is started: a read decides nothing about a launch, so none of the steps
+/// [`drive_task_clock`] takes for a door that has just WRITTEN a task belongs here. The pump
+/// changes no answer this call gives and waits for nothing — it materialises only what the
+/// stored due instant has already made due, exactly as the reading door itself does.
+///
+/// Called with NO guard of this store held.
+pub fn drive_capacity_clock<Eng: Send + Sync + 'static>(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    engine: &::std::sync::Arc<Eng>,
+    region: &str,
+) {
+    spawn_task_clock_pump(ctx.callback(), engine, region);
+}
+
 pub fn drive_task_clock<Eng: Send + Sync + 'static>(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     engine: &::std::sync::Arc<Eng>,
