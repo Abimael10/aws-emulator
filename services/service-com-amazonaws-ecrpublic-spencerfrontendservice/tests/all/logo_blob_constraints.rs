@@ -30,7 +30,9 @@ use crate::harness::error_message;
 use crate::repository_image_lifecycle::{
     call, logo_url_on, ok, published_logo_origin, refused, service, text,
 };
-use crate::repository_logo_asset::{blob_member, bmp, gif, png, INVALID_DIMENSIONS, MIN_PIXELS};
+use crate::repository_logo_asset::{
+    blob_member, bmp, gif, jpeg, png, webp, INVALID_DIMENSIONS, MIN_PIXELS,
+};
 
 /// The largest logo payload the model admits, in bytes: `LogoImageBlob`'s `@length` max
 /// (`smithy_query(query="shape", shape="LogoImageBlob")`).
@@ -47,41 +49,6 @@ const LENGTH_RULE: &str =
 /// the other way round: the two constraints share an error code, so each message has to
 /// name its own rule.
 const DIMENSION_RULE_FRAGMENT: &str = "Invalid image dimensions.";
-
-/// A header-valid JPEG whose SOF0 segment states `width` x `height` (ISO/IEC 10918-1: the
-/// SOI marker, then the baseline frame header whose two 16-bit big-endian fields are the
-/// number of lines and the samples per line).
-fn jpeg(width: u16, height: u16) -> Vec<u8> {
-    let mut bytes = vec![0xff, 0xd8];
-    bytes.extend_from_slice(&[0xff, 0xc0]);
-    bytes.extend_from_slice(&17u16.to_be_bytes());
-    // Sample precision, then the frame's lines and samples-per-line.
-    bytes.push(8);
-    bytes.extend_from_slice(&height.to_be_bytes());
-    bytes.extend_from_slice(&width.to_be_bytes());
-    // Three components, each with its sampling factors and table selectors.
-    bytes.push(3);
-    bytes.extend_from_slice(&[1, 0x11, 0, 2, 0x11, 1, 3, 0x11, 1]);
-    bytes
-}
-
-/// A header-valid lossy WebP whose key-frame header states `width` x `height` (RFC 6386
-/// §9.1 inside the RIFF container: the `VP8 ` chunk, the 3-byte frame tag, the start code,
-/// then the two 14-bit little-endian dimension fields).
-fn webp(width: u16, height: u16) -> Vec<u8> {
-    let mut body = b"WEBP".to_vec();
-    body.extend_from_slice(b"VP8 ");
-    body.extend_from_slice(&10u32.to_le_bytes());
-    // A shown key frame, then the start code the frame header is identified by.
-    body.extend_from_slice(&[0x10, 0x00, 0x00]);
-    body.extend_from_slice(&[0x9d, 0x01, 0x2a]);
-    body.extend_from_slice(&width.to_le_bytes());
-    body.extend_from_slice(&height.to_le_bytes());
-    let mut bytes = b"RIFF".to_vec();
-    bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(&body);
-    bytes
-}
 
 /// `blob` grown to exactly `len` bytes with trailing padding.
 ///

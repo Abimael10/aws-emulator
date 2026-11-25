@@ -22,20 +22,21 @@
 use serde_json::json;
 
 use crate::repository_image_lifecycle::{ok, service, text};
-use crate::repository_logo_asset::{blob_member, gif, png};
+use crate::repository_logo_asset::{blob_member, bmp, gif, jpeg, png, webp};
 
-/// One `GET` of `path` written straight onto a socket, with everything the server answered
-/// read back as the bytes it was delivered as. No credential and no `X-Amz-Target`: exactly
-/// what a browser sends.
+/// One request of `method` for `path` written straight onto a socket, with everything the
+/// server answered read back as the bytes it was delivered as. No credential and no
+/// `X-Amz-Target`: exactly what a browser sends.
 ///
 /// `connection: close` so the server closes the socket after answering and the read below
 /// terminates on EOF rather than on a parse of the framing this probe is about.
-fn raw_get(port: u16, path: &str) -> Vec<u8> {
+fn raw_request(port: u16, method: &str, path: &str) -> Vec<u8> {
     use std::io::{Read, Write};
 
     let mut stream =
         std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect to the served port");
-    let request = format!("GET {path} HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: close\r\n\r\n");
+    let request =
+        format!("{method} {path} HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: close\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .expect("write the request");
@@ -44,6 +45,11 @@ fn raw_get(port: u16, path: &str) -> Vec<u8> {
         .read_to_end(&mut answer)
         .expect("read the whole answer");
     answer
+}
+
+/// One `GET` of `path`, which is what a browser `<img>` or a publish pipeline sends.
+fn raw_get(port: u16, path: &str) -> Vec<u8> {
+    raw_request(port, "GET", path)
 }
 
 /// The response's head as it was SENT, and its body as the bytes they were delivered as. An
@@ -169,21 +175,30 @@ async fn the_socket_delivers_a_published_logo_with_its_media_type_and_length() {
 
 /// RULE: the ADDRESS a published `logoUrl` names answers the asset with the media type the
 /// payload's own bytes announce, stated under the canonical, hyphen-separated spelling of
-/// the field name (`Content-Type`) — so a client that reads a response's field names AS
-/// RECEIVED, which is what a browser `<img>`, an image pipeline and a publish-time
-/// validator do, finds the type of what it fetched.
+/// the field name (`Content-Type`) beside the asset's own length — so a client that reads a
+/// response's field names AS RECEIVED, which is what a browser `<img>`, an image pipeline
+/// and a publish-time validator do, finds the type of what it fetched. A `HEAD` of the same
+/// address states those same facts and sends no body, as an HTTP asset host answers both
+/// methods.
 ///
 /// The rows differ in the payload's own format, so the type stated is the one THESE bytes
-/// announce; the field NAME is the fixed half of the rule and the same in every row. Each
-/// row is fetched at the address its own URL names, with no credential and no
-/// `X-Amz-Target`: exactly what a browser sends.
+/// announce: each image format that announces itself in its leading bytes (PNG, JPEG,
+/// GIF89a, the RIFF container WebP rides in, BMP), plus bytes that announce no format at all
+/// and are therefore served as unnamed binary rather than as an image they are not. Source
+/// for the type of each: that format's own signature, as
+/// `state::logo_asset::StoredLogo::media_type` reads it. The field NAME is the fixed half of
+/// the rule and the same in every row. Each row is fetched at the address its own URL names,
+/// by each method, with no credential and no `X-Amz-Target`: exactly what a browser sends.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_published_address_states_the_media_type_under_its_canonical_field_name() {
     let router = service();
 
-    let cases: [(&str, &str, Vec<u8>, &str); 3] = [
+    let cases: [(&str, &str, Vec<u8>, &str); 6] = [
         ("a PNG", "published/png-logo", png(64, 64), "image/png"),
+        ("a JPEG", "published/jpeg-logo", jpeg(120, 64), "image/jpeg"),
         ("a GIF", "published-gif-logo", gif(120, 90), "image/gif"),
+        ("a WebP", "published/webp-logo", webp(64, 96), "image/webp"),
+        ("a BMP", "published/bmp.logo", bmp(64, 64), "image/bmp"),
         (
             "bytes of no image format",
             "published/opaque-logo",
@@ -191,12 +206,12 @@ async fn the_published_address_states_the_media_type_under_its_canonical_field_n
             "application/octet-stream",
         ),
     ];
-    for (case, repository, blob, media_type) in cases {
+    for (published, repository, blob, media_type) in cases {
         ok(
             &router,
             "CreateRepository",
             json!({"repositoryName": repository}),
-            case,
+            published,
         )
         .await;
         let written = ok(
@@ -206,39 +221,51 @@ async fn the_published_address_states_the_media_type_under_its_canonical_field_n
                 "repositoryName": repository,
                 "catalogData": {"description": "a hosted logo", "logoImageBlob": blob_member(&blob)},
             }),
-            case,
+            published,
         )
         .await;
-        let url = text(&written, &["catalogData", "logoUrl"], case);
+        let url = text(&written, &["catalogData", "logoUrl"], published);
 
         // The published URL is dialled as it stands: its own port, its own path.
-        let (port, path) = address_of(&url, case);
-        let fetched = path.clone();
-        let answer = tokio::task::spawn_blocking(move || raw_get(port, &fetched))
-            .await
-            .expect("the socket exchange runs to completion");
-        let (head, body) = head_and_body(&answer, case);
-        assert!(
-            head.starts_with("HTTP/1.1 200"),
-            "case {case:?}: expected a 200 at the published address {url:?}, got {head:?}"
-        );
-        let stated = format!("Content-Type: {media_type}");
-        assert!(
-            head.contains(&stated),
-            "case {case:?}: expected the asset served as {stated:?} under that exact field \
-             name, got {head:?}"
-        );
-        let length = format!("Content-Length: {}", blob.len());
-        assert!(
-            head.contains(&length),
-            "case {case:?}: expected {length:?} under that exact field name, got {head:?}"
-        );
-        assert_eq!(
-            body, blob,
-            "case {case:?}: expected the {} uploaded bytes at {url:?}, got {} of them",
-            blob.len(),
-            body.len()
-        );
+        let (port, path) = address_of(&url, published);
+        // Both methods an asset host answers: the one that asks for the bytes, and the one
+        // that asks only what they are.
+        for method in ["GET", "HEAD"] {
+            let case = format!("{published} fetched by {method}");
+            let fetched = path.clone();
+            let asked = method.to_string();
+            let answer = tokio::task::spawn_blocking(move || raw_request(port, &asked, &fetched))
+                .await
+                .expect("the socket exchange runs to completion");
+            let (head, body) = head_and_body(&answer, &case);
+            assert!(
+                head.starts_with("HTTP/1.1 200"),
+                "case {case:?}: expected a 200 at the published address {url:?}, got {head:?}"
+            );
+            let stated = format!("Content-Type: {media_type}");
+            assert!(
+                head.contains(&stated),
+                "case {case:?}: expected the asset served as {stated:?} under that exact \
+                 field name, got {head:?}"
+            );
+            let length = format!("Content-Length: {}", blob.len());
+            assert!(
+                head.contains(&length),
+                "case {case:?}: expected {length:?} under that exact field name, got {head:?}"
+            );
+            // The bytes for a fetch, and none for a request that asked only what the asset
+            // is — the facts above are the same either way.
+            let delivered: &[u8] = match method {
+                "GET" => &blob,
+                _ => &[],
+            };
+            assert_eq!(
+                body, delivered,
+                "case {case:?}: expected the {} bytes of the asset at {url:?}, got {} of them",
+                delivered.len(),
+                body.len()
+            );
+        }
     }
 }
 
