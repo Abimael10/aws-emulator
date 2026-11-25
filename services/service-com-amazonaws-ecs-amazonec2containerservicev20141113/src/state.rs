@@ -845,6 +845,12 @@ pub const MIN_LIST_PAGE_SIZE: i32 = 1;
 /// count below the range.
 pub const MIN_RUN_TASK_COUNT: i32 = 1;
 
+/// The smallest `desiredCount` a service may be created or updated with: the member is
+/// "the desired number of instantiations of the task definition to keep running on the
+/// service", so a service that keeps none running is a service and anything below it is
+/// not a number of instantiations at all.
+pub const MIN_DESIRED_COUNT: i32 = 0;
+
 /// `ListServices`'s page size when the caller gives no `maxResults`. Its own
 /// `maxResults` doc differs from the sentence [`DEFAULT_LIST_PAGE_SIZE`] quotes: "This
 /// value can be between 1 and 100. If this parameter isn't used, then ListServices
@@ -1318,11 +1324,10 @@ pub fn integer_bound_message(member: &str, value: i32, min: i32, max: i32) -> Op
 /// its own doc states ("You can specify up to 10 tasks for each call"), or `None` when the
 /// count is inside it.
 ///
-/// Amazon ECS states a COUNT the way it states every other count of this API
-/// ([`DESIRED_COUNT_NEGATIVE_MESSAGE`]): the count named in words, the one bound the value
-/// crossed, and nothing of the value the request carried.
+/// Amazon ECS states this count by WHAT IT COUNTS ([`TASK_COUNT_SUBJECT`]): the count named
+/// in words, the one bound the value crossed, and nothing of the value the request carried.
 pub fn task_count_bound_message(count: i32, min: i32, max: i32) -> Option<String> {
-    let subject = "Task count";
+    let subject = TASK_COUNT_SUBJECT;
     if count < min {
         Some(below_minimum_message(subject, min))
     } else if count > max {
@@ -1346,8 +1351,8 @@ pub fn page_size_range_message(min: i32, max: i32) -> String {
 /// neither the value the request carried nor the other end of the range.
 ///
 /// Spelled once for every member of this API bounded from below, so the refusal cannot
-/// drift between them — [`DESIRED_COUNT_NEGATIVE_MESSAGE`] carries it for a service's
-/// task count, and a page's `maxResults` carries it for a list.
+/// drift between them — [`desired_count_negative_message`] carries it for a service's
+/// count of tasks, and a page's `maxResults` carries it for a list.
 pub fn below_minimum_message(subject: &str, min: i32) -> String {
     format!("{subject} can not be lesser than {min}")
 }
@@ -2992,14 +2997,29 @@ pub const MAX_CONTAINER_REASON_LENGTH: usize = 255;
 /// one agent the model names.
 pub const MAX_MANAGED_AGENTS: usize = 8;
 
+/// What a refusal of a count calls the count when it words it as WHAT THE COUNT COUNTS —
+/// the tasks the call would keep running or place — rather than as the member that carried
+/// it: the subject of an `UpdateService` `desiredCount` refusal and of a `RunTask` `count`
+/// refusal.
+pub const TASK_COUNT_SUBJECT: &str = "Task count";
+
+/// What a `CreateService` refusal of a `desiredCount` calls the count: that operation words
+/// its own refusal by the MEMBER the request carried, spelled as the shape names it with a
+/// leading capital, not by what the count counts.
+pub const CREATE_SERVICE_DESIRED_COUNT_SUBJECT: &str = "DesiredCount";
+
 /// `InvalidParameterException$message` for a `desiredCount` below the zero its own doc
 /// bounds it at ("The desired number of instantiations of the task definition to keep
-/// running on the service"). A fixed sentence: Amazon ECS names WHAT THE COUNT COUNTS —
-/// the tasks the service keeps running — rather than the member that carried it, and the
-/// bound the value crossed, echoing neither the number the request held nor how this
-/// emulator read it. Same sentence for the create and for the update of a service: the
-/// bound belongs to the count, not to the call.
-pub const DESIRED_COUNT_NEGATIVE_MESSAGE: &str = "Task count can not be lesser than 0";
+/// running on the service"), or `None` when the count is at the bound or above it.
+///
+/// A fixed sentence in the shape every value below a bound is refused in
+/// ([`below_minimum_message`]): the `subject` the refusing operation names the count by and
+/// the bound the value crossed, echoing neither the number the request held nor how this
+/// emulator read it. The bound belongs to the count, so it is one for every call; the
+/// subject belongs to the OPERATION, which is why each passes its own.
+pub fn desired_count_negative_message(subject: &str, count: i32) -> Option<String> {
+    (count < MIN_DESIRED_COUNT).then(|| below_minimum_message(subject, MIN_DESIRED_COUNT))
+}
 
 /// `InvalidParameterException$message` for a service whose `schedulingStrategy` needs a
 /// `desiredCount` the request left out — the member's own doc: "This is required if

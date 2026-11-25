@@ -335,10 +335,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        if input.desired_count.is_some_and(|count| count < 0) {
+        // A count below the bound is refused in this operation's OWN words: the update
+        // words it as the tasks the service keeps running
+        // ([`crate::state::TASK_COUNT_SUBJECT`]), the same subject a `RunTask` count carries.
+        if let Some(message) = input.desired_count.and_then(|count| {
+            crate::state::desired_count_negative_message(crate::state::TASK_COUNT_SUBJECT, count)
+        }) {
             return Err(UpdateServiceErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(crate::state::DESIRED_COUNT_NEGATIVE_MESSAGE.to_string()),
+                    message: Some(message),
                 },
             )
             .into());

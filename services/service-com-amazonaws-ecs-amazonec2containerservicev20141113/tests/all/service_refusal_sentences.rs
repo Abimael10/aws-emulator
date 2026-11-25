@@ -16,9 +16,12 @@
 //!    * a `serviceName` the cluster already holds a service under is the failed idempotent
 //!      CREATE it is (`clientToken`: "An identifier that you provide to ensure the
 //!      idempotency of the request"), and the SAME name is free in another cluster;
-//!    * a `desiredCount` below zero is refused in terms of the task count it is
-//!      (`CreateService$desiredCount`/`UpdateService$desiredCount` are `BoxedInteger` with
-//!      no `@range`, so the bound is the handler's);
+//!    * a count below the bound its member documents is refused in the words of the
+//!      OPERATION that refused it — the create of a service names the member it carried
+//!      (`DesiredCount`), while the update of a service and a `RunTask` name what the
+//!      count counts (`Task count`) — so one operation's sentence is never another's
+//!      (`CreateService$desiredCount`/`UpdateService$desiredCount`/`RunTask$count` are
+//!      `BoxedInteger` with no `@range`, so the bound is the handler's);
 //!    * a service whose scheduling strategy needs a `desiredCount` the request left out
 //!      ("This is required if schedulingStrategy is REPLICA or isn't specified") states the
 //!      member that is missing;
@@ -54,9 +57,18 @@ const BETA: &str = "sentences-beta";
 /// (`state`'s `SERVICE_CREATION_NOT_IDEMPOTENT_MESSAGE`).
 const NOT_IDEMPOTENT: &str = "Creation of service was not idempotent.";
 
-/// The sentence a `desiredCount` below zero carries (`state`'s
-/// `DESIRED_COUNT_NEGATIVE_MESSAGE`).
-const TASK_COUNT_NEGATIVE: &str = "Task count can not be lesser than 0";
+/// The sentence a CREATE of a service carries for a `desiredCount` below zero (`state`'s
+/// `CREATE_SERVICE_DESIRED_COUNT_SUBJECT` under `desired_count_negative_message`).
+const CREATE_DESIRED_COUNT_NEGATIVE: &str = "DesiredCount can not be lesser than 0";
+
+/// The sentence an UPDATE of a service carries for the same count (`state`'s
+/// `TASK_COUNT_SUBJECT` under `desired_count_negative_message`).
+const UPDATE_TASK_COUNT_NEGATIVE: &str = "Task count can not be lesser than 0";
+
+/// The sentence a `RunTask` carries for a `count` below ITS own bound of one — the same
+/// subject the update names, the bound its own member documents (`state`'s
+/// `task_count_bound_message` with `MIN_RUN_TASK_COUNT`).
+const RUN_TASK_COUNT_BELOW_ONE: &str = "Task count can not be lesser than 1";
 
 /// The sentence a service that needs a `desiredCount` and was given none carries
 /// (`state`'s `DESIRED_COUNT_MISSING_MESSAGE`).
@@ -272,7 +284,7 @@ async fn a_service_name_the_cluster_holds_is_refused_as_a_create_that_was_not_id
 }
 
 #[tokio::test]
-async fn a_task_count_below_zero_is_refused_in_terms_of_the_task_count() {
+async fn a_count_below_its_bound_is_refused_in_the_words_of_the_operation_that_refused_it() {
     let router = service();
     cluster_with_capacity(&router, ALPHA, "setup").await;
     register_definition(&router, "countsfamily", "setup").await;
@@ -290,22 +302,45 @@ async fn a_task_count_below_zero_is_refused_in_terms_of_the_task_count() {
     )
     .await;
 
-    // Rows differ along HOW FAR below the bound the count is, the smallest `BoxedInteger`
-    // included: the sentence states the bound, never the value, so every row earns the
-    // same text.
-    for count in [-1, -2, -1000, i32::MIN] {
-        for operation in ["CreateService", "UpdateService"] {
-            let case = format!("{operation} with desiredCount {count}");
-            let request = if operation == "CreateService" {
-                json!({
+    // Rows differ along the OPERATION that carries the count — each with its own subject
+    // and its own documented bound — and, within one operation, along HOW FAR below that
+    // bound the value is, the smallest `BoxedInteger` included: the sentence states the
+    // subject and the bound, never the value, so every row of one operation earns the
+    // same text and no row earns another operation's.
+    let operations: [(&str, &str, i32); 3] = [
+        ("CreateService", CREATE_DESIRED_COUNT_NEGATIVE, 0),
+        ("UpdateService", UPDATE_TASK_COUNT_NEGATIVE, 0),
+        ("RunTask", RUN_TASK_COUNT_BELOW_ONE, 1),
+    ];
+    // The counts are the operation's own bound less one, less two and less a thousand,
+    // plus the smallest value the member takes at all — which is below every bound, so it
+    // is reached by saturating rather than by a row of its own.
+    let mut observed: Vec<(&str, String)> = Vec::new();
+    for (operation, sentence, bound) in operations {
+        for count in [
+            bound - 1,
+            bound - 2,
+            bound - 1_000,
+            i32::MIN.saturating_add(bound),
+        ] {
+            let case = format!("{operation} with a count of {count}");
+            let request = match operation {
+                "CreateService" => json!({
                     "cluster": ALPHA,
                     "serviceName": "negative",
                     "taskDefinition": "countsfamily",
                     "desiredCount": count,
                     "launchType": "EC2",
-                })
-            } else {
-                json!({ "cluster": ALPHA, "service": "counted", "desiredCount": count })
+                }),
+                "UpdateService" => {
+                    json!({ "cluster": ALPHA, "service": "counted", "desiredCount": count })
+                }
+                _ => json!({
+                    "cluster": ALPHA,
+                    "taskDefinition": "countsfamily",
+                    "count": count,
+                    "launchType": "EC2",
+                }),
             };
             let (code, message) = refusal(&router, operation, request, &case).await;
             assert_eq!(
@@ -315,16 +350,53 @@ async fn a_task_count_below_zero_is_refused_in_terms_of_the_task_count() {
             );
             fixed_sentence(
                 &message,
-                TASK_COUNT_NEGATIVE,
-                &[&count.to_string(), "desiredCount"],
+                sentence,
+                &[&count.to_string(), "desiredCount", "countsfamily"],
                 &case,
             );
+            observed.push((operation, message));
         }
     }
 
-    // The bound itself is accepted on both calls — a service that keeps no task running is
-    // a service — so the rule refuses what is below zero and nothing else.
+    // What a client reads is the sentence the SERVICE answered, so the two operations AWS
+    // words differently must not answer the same one: the create of a service names the
+    // member it carried, the update names the task count.
+    let answered_by = |wanted: &str| -> String {
+        observed
+            .iter()
+            .find(|(operation, _)| *operation == wanted)
+            .map(|(_, message)| message.clone())
+            .unwrap_or_else(|| panic!("case \"the sentences\": expected a refusal from {wanted}"))
+    };
+    let by_create = answered_by("CreateService");
+    let by_update = answered_by("UpdateService");
+    assert_ne!(
+        by_create, by_update,
+        "case \"the sentences\": expected the create and the update of a service to word \
+         this refusal differently, got {by_create:?} from both"
+    );
+
+    // Each operation accepts the bound itself — a service that keeps no task running is a
+    // service, and a run that places one task places a task — so the rule refuses what is
+    // below the bound and nothing else.
     let case = "the bound itself";
+    let placed = ok(
+        &router,
+        "RunTask",
+        json!({
+            "cluster": ALPHA,
+            "taskDefinition": "countsfamily",
+            "count": 1,
+            "launchType": "EC2",
+        }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        list(&placed, "tasks", case).len(),
+        1,
+        "case {case:?}: expected the smallest run to place one task, got {placed}"
+    );
     ok(
         &router,
         "UpdateService",

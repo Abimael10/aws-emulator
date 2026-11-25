@@ -476,10 +476,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if input.desired_count.is_some_and(|count| count < 0) {
+        // A count below the bound is refused in this operation's OWN words: the create
+        // names the member it carried ([`crate::state::CREATE_SERVICE_DESIRED_COUNT_SUBJECT`]).
+        if let Some(message) = input.desired_count.and_then(|count| {
+            crate::state::desired_count_negative_message(
+                crate::state::CREATE_SERVICE_DESIRED_COUNT_SUBJECT,
+                count,
+            )
+        }) {
             return Err(CreateServiceErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(crate::state::DESIRED_COUNT_NEGATIVE_MESSAGE.to_string()),
+                    message: Some(message),
                 },
             )
             .into());
