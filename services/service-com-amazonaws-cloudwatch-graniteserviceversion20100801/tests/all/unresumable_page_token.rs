@@ -1,30 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What a `NextToken` naming no position of a listing's enumeration asks for: the page PAST its
-//! last item.
+//! What a `NextToken` a listing cannot read a position out of asks for, and what one naming a
+//! position past the last item asks for.
 //!
-//! The rule under test: **a continuation token is the mark a previous page left of how far it
-//! got, so a position no item of the selection sits at or after is the END of the enumeration:
-//! the listings of this service that SERVE such a token rather than refusing it answer the
-//! EXHAUSTED page — every item member present and EMPTY and no `NextToken` — never a restart
-//! that would hand back items the walk already delivered**
-//! (`DescribeAlarmsInput$NextToken` "The token returned by a previous call to indicate that
-//! there is more data available.", `DescribeAlarmsOutput$NextToken` "The token that marks the
-//! start of the next batch of returned results.", `ListAlarmMuteRulesInput$NextToken` "The token
-//! returned from a previous call to indicate where to continue retrieving results.",
-//! `ListAlarmMuteRulesOutput$NextToken` "If this field is absent, there are no more results to
-//! retrieve."). An EMPTY `NextToken` and an absent one are no token at all: they ask for the
-//! FIRST page, and a cursor the listing minted resumes at the item it names.
+//! THE RULE: a continuation token NAMES a position in a listing's enumeration — "The token
+//! returned by a previous call to indicate that there is more data available."
+//! (`DescribeAlarmsInput$NextToken`), "The token that marks the start of the next batch of
+//! returned results." (`DescribeAlarmsOutput$NextToken`), "The token returned from a previous call
+//! to indicate where to continue retrieving results." (`ListAlarmMuteRulesInput$NextToken`) — so
+//! for **the listings of this service that SERVE such a token rather than refusing it, a value no
+//! position can be read out of names none, and the request is answered as if it had carried no
+//! token at all: the FIRST page, still scoped by every other filter the request named**. A token
+//! that IS readable is answered at the position it names, which for a key no item sits at or after
+//! is the end of the enumeration: the exhausted page, every item member present and EMPTY with no
+//! `NextToken`.
 //!
 //! The rows span what the rule generalises over: both listings of this service that serve such a
-//! token, the FORM the value takes (a word, a hexadecimal cursor whose bytes are no text, a
-//! base64 blob of the form another service's cursor travels in, a minted cursor with a character
-//! cut off, one with text appended, and a READABLE cursor naming a key that sorts past every
-//! item the selection holds), the page size the request asks for (none at all, one, and more than
-//! the listing holds), and how many items the listing holds (one, and several) — beside the
-//! values that name a position the listing DOES hold: the empty string and an absent member,
-//! which ask for the first page, a cursor sorting before every item, which asks for it too, and
-//! a cursor this service really minted, which resumes where it points.
+//! token, the FORM an unreadable value takes (a word, a hexadecimal cursor whose bytes are no
+//! text, a base64 blob of the form another service's cursor travels in, a minted cursor with a
+//! character cut off, and one with text appended), the page size the request asks for (none at
+//! all, one, and more than the listing holds), and how many items the listing holds (one, and
+//! several) — beside the readable values: the empty string and an absent member, which are no
+//! token at all, a cursor sorting before every item, a cursor this service really minted, which
+//! resumes where it points, and a cursor naming a key past every item, which is the end.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -40,16 +38,13 @@ const PREFIX: &str = "cursor-page-alarm-";
 /// name, so this only decides where the rules sort relative to the cursors below.
 const RULE_PREFIX: &str = "cursor-page-rule-";
 
-/// The values a row offers as a `NextToken` that names no position of an enumeration whose items
-/// all sort under `item_prefix`.
+/// The values a row offers as a `NextToken` this service can read NO position out of.
 ///
-/// The first three are values this service cannot read a cursor out of at all; `cursor` is a token
-/// the listing really minted, so the next two are that cursor broken rather than a value written
-/// out by hand (they are offered only where the listing owed a cursor at all, since a listing that
-/// fits in one page mints none to break); the last is a perfectly READABLE cursor that names a key
-/// sorting past every item — the position an exhausted walk has reached, which is what the three
-/// unreadable forms are read as too.
-fn past_the_listing(item_prefix: &str, cursor: &str) -> Vec<(String, String)> {
+/// The first three are values of no form this service mints; `cursor` is a token the listing really
+/// minted, so the next two are that cursor broken rather than a value written out by hand (they are
+/// offered only where the listing owed a cursor at all, since a listing that fits in one page mints
+/// none to break).
+fn unreadable_tokens(cursor: &str) -> Vec<(String, String)> {
     let mut rows = vec![
         ("a word".to_string(), "not-a-cursor".to_string()),
         (
@@ -74,14 +69,14 @@ fn past_the_listing(item_prefix: &str, cursor: &str) -> Vec<(String, String)> {
             format!("{cursor}zz"),
         ));
     }
-    // A cursor of this service's own form (`state::encode_page_token` is hexadecimal) naming a
-    // key past every item: `~` is the last printable ASCII character, so no name this suite
-    // writes sorts at or after it.
-    rows.push((
-        "a readable cursor naming a key past every item".to_string(),
-        ::hex::encode(format!("{item_prefix}~").as_bytes()),
-    ));
     rows
+}
+
+/// A cursor of this service's own form (`state::encode_page_token` is hexadecimal) naming a key
+/// that sorts PAST every item under `item_prefix`: `~` is the last printable ASCII character, so
+/// no name this suite writes sorts at or after it.
+fn past_every_item(item_prefix: &str) -> String {
+    ::hex::encode(format!("{item_prefix}~").as_bytes())
 }
 
 /// A cursor of this service's own form naming a key that sorts BEFORE every item under
@@ -141,7 +136,7 @@ async fn given_rules(router: &MultiServiceRouter, count: usize) {
 }
 
 #[tokio::test]
-async fn a_token_past_the_alarm_listing_is_answered_the_exhausted_page() {
+async fn a_token_the_alarm_listing_cannot_read_is_answered_the_first_page() {
     // (case, how many alarms the prefix holds, the page size the rows ask for)
     let rows: [(&str, usize, Option<i64>); 4] = [
         ("one alarm, no page size asked for", 1, None),
@@ -155,8 +150,7 @@ async fn a_token_past_the_alarm_listing_is_answered_the_exhausted_page() {
         let names = given_alarms(&router, total).await;
 
         // The page this request is served when it carries NO token: the FIRST one, which is what
-        // a token naming a position the enumeration holds asks for and what a token past its end
-        // must NOT be answered with.
+        // a token naming no position at all asks for too.
         let mut baseline_request = json!({"AlarmNamePrefix": PREFIX});
         if let Some(page_size) = page_size {
             baseline_request["MaxRecords"] = json!(page_size);
@@ -175,35 +169,54 @@ async fn a_token_past_the_alarm_listing_is_answered_the_exhausted_page() {
         .await;
         let cursor = next_token(&minted).unwrap_or_default();
 
-        for (token_case, token) in past_the_listing(PREFIX, &cursor) {
+        for (token_case, token) in unreadable_tokens(&cursor) {
             let mut request = json!({"AlarmNamePrefix": PREFIX, "NextToken": token});
             if let Some(page_size) = page_size {
                 request["MaxRecords"] = json!(page_size);
             }
             let listed = ok(&router, "DescribeAlarms", &request).await;
             let case = format!("{case} with {token_case} ({token:?})");
-            // Every one of the three lists this read reports is present and EMPTY: the walk is
-            // over, so the page carries no alarm of any kind.
-            for member in ["MetricAlarms", "CompositeAlarms", "LogAlarms"] {
-                assert_eq!(
-                    listed.get(member).and_then(Value::as_array),
-                    Some(&Vec::new()),
-                    "case {case:?}: expected {member} present and empty on the exhausted page, \
-                     got {listed}"
-                );
-            }
+            assert_eq!(
+                listed_alarms(&listed),
+                baseline_alarms,
+                "case {case:?}: expected the first page {baseline_alarms:?}, got {listed}"
+            );
             assert_eq!(
                 next_token(&listed),
-                None,
-                "case {case:?}: an exhausted page owes no token, got {listed}"
+                baseline_token,
+                "case {case:?}: expected the first page's own token {baseline_token:?}, got \
+                 {listed}"
             );
             // Asking for it again answers the same page: a read of a position consumes nothing.
             let again = ok(&router, "DescribeAlarms", &request).await;
             assert_eq!(
-                again, listed,
-                "case {case:?}: expected the same exhausted page twice, got {again} then {listed}"
+                listed_alarms(&again),
+                baseline_alarms,
+                "case {case:?}: expected the same first page twice, got {again}"
             );
         }
+
+        // A READABLE cursor naming a key past every alarm is the position it says: the end, where
+        // every one of the three lists this read reports is present and EMPTY and no token is owed.
+        let mut request =
+            json!({"AlarmNamePrefix": PREFIX, "NextToken": past_every_item(PREFIX)});
+        if let Some(page_size) = page_size {
+            request["MaxRecords"] = json!(page_size);
+        }
+        let exhausted = ok(&router, "DescribeAlarms", &request).await;
+        for member in ["MetricAlarms", "CompositeAlarms", "LogAlarms"] {
+            assert_eq!(
+                exhausted.get(member).and_then(Value::as_array),
+                Some(&Vec::new()),
+                "case {case:?}: expected {member} present and empty past the last alarm, got \
+                 {exhausted}"
+            );
+        }
+        assert_eq!(
+            next_token(&exhausted),
+            None,
+            "case {case:?}: an exhausted page owes no token, got {exhausted}"
+        );
 
         // The alarms themselves are untouched: a request carrying no token still reports every
         // one of them, so the pages above answered the POSITION rather than a broken store.
@@ -275,7 +288,7 @@ async fn a_token_past_the_alarm_listing_is_answered_the_exhausted_page() {
 }
 
 #[tokio::test]
-async fn a_token_past_the_mute_rule_listing_is_answered_the_exhausted_page() {
+async fn a_token_the_mute_rule_listing_cannot_read_is_answered_the_first_page() {
     // The same rule through the other listing of this service that serves such a token.
     for (case, total) in [("one rule", 1_usize), ("three rules", 3)] {
         let router = build_router();
@@ -290,27 +303,49 @@ async fn a_token_past_the_mute_rule_listing_is_answered_the_exhausted_page() {
             "case {case:?}: the rules must be stored before they are paged, got {whole:?}"
         );
 
-        for (token_case, token) in past_the_listing(RULE_PREFIX, &cursor) {
+        for (token_case, token) in unreadable_tokens(&cursor) {
             let request = json!({"NextToken": token});
             let listed = ok(&router, "ListAlarmMuteRules", &request).await;
             let case = format!("{case} with {token_case} ({token:?})");
             assert_eq!(
-                listed.get("AlarmMuteRuleSummaries").and_then(Value::as_array),
-                Some(&Vec::new()),
-                "case {case:?}: expected AlarmMuteRuleSummaries present and empty on the \
-                 exhausted page, got {listed}"
+                listed_arns(&listed),
+                whole,
+                "case {case:?}: expected the first page {whole:?}, got {listed}"
             );
             assert_eq!(
                 next_token(&listed),
                 None,
-                "case {case:?}: an exhausted page owes no token, got {listed}"
+                "case {case:?}: the whole listing fits in one page, so no token is owed, got \
+                 {listed}"
             );
             let again = ok(&router, "ListAlarmMuteRules", &request).await;
             assert_eq!(
-                again, listed,
-                "case {case:?}: expected the same exhausted page twice, got {again} then {listed}"
+                listed_arns(&again),
+                whole,
+                "case {case:?}: expected the same first page twice, got {again}"
             );
         }
+
+        // A readable cursor past every rule is the end of this enumeration too.
+        let exhausted = ok(
+            &router,
+            "ListAlarmMuteRules",
+            &json!({"NextToken": past_every_item(RULE_PREFIX)}),
+        )
+        .await;
+        assert_eq!(
+            exhausted
+                .get("AlarmMuteRuleSummaries")
+                .and_then(Value::as_array),
+            Some(&Vec::new()),
+            "case {case:?}: expected AlarmMuteRuleSummaries present and empty past the last \
+             rule, got {exhausted}"
+        );
+        assert_eq!(
+            next_token(&exhausted),
+            None,
+            "case {case:?}: an exhausted page owes no token, got {exhausted}"
+        );
 
         // The positions this enumeration holds: the beginning, asked for by no token, by the
         // empty string and by a cursor sorting before every rule, and the rule a minted cursor

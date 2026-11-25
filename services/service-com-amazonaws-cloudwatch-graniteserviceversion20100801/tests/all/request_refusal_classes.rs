@@ -13,10 +13,10 @@
 //!   given, are values the service read and are answered under its own parameter faults;
 //! * **the Contributor Insights REPORT read states a required member it was not given in its
 //!   own coded sentence**, naming that member and the contributor query the read is served by;
-//! * **a paginated listing answers a `NextToken` it cannot resume from in ITS OWN terms**: the
-//!   alarm HISTORY refuses it naming the value at fault, the Contributor Insights listings
-//!   refuse it with their coded sentence, and the alarm listing refuses it not at all — such a
-//!   value names no position its enumeration holds, so the exhausted page is served;
+//! * **a paginated listing answers a `NextToken` it cannot read a cursor out of in ITS OWN
+//!   terms**: the alarm HISTORY refuses it naming the value at fault, the Contributor Insights
+//!   listings refuse it with their coded sentence, and the alarm listing refuses it not at all
+//!   — such a value names no position, so it is no token and the first page is served;
 //! * **`SetAlarmState` refuses a `StateReasonData` that is not a JSON document with
 //!   `InvalidFormat` and leaves the alarm's state untouched**, whatever the value is wrong
 //!   about;
@@ -218,7 +218,7 @@ async fn the_contributor_insights_report_names_the_member_it_lacks_and_the_reque
 }
 
 #[tokio::test]
-async fn a_next_token_a_listing_cannot_resume_from_is_answered_in_that_listings_own_terms() {
+async fn a_next_token_a_listing_cannot_read_is_answered_in_that_listings_own_terms() {
     let router = build_router();
     given_alarm(&router, "paged-alarm").await;
     ok(
@@ -280,7 +280,7 @@ async fn a_next_token_a_listing_cannot_resume_from_is_answered_in_that_listings_
         }
 
         // The alarm LISTING refuses no token: a value it cannot read a cursor out of names no
-        // position this enumeration holds, so the page served is the EXHAUSTED one
+        // position at all, so it is no token and the page served is the FIRST one
         // (`tests/all/paginated_read_cursor.rs` holds that rule over every listing of this
         // service that serves such a token).
         let listed = ok(&router, "DescribeAlarms", &json!({"NextToken": token})).await;
@@ -294,14 +294,14 @@ async fn a_next_token_a_listing_cannot_resume_from_is_answered_in_that_listings_
             .collect();
         assert_eq!(
             named,
-            Vec::<String>::new(),
-            "case {case:?}: a token the alarm listing cannot resume from must be answered the \
-             exhausted page, got {listed}"
+            vec!["paged-alarm".to_string()],
+            "case {case:?}: a token the alarm listing cannot read must be answered the first \
+             page, got {listed}"
         );
         assert_eq!(
             listed.get("NextToken"),
             None,
-            "case {case:?}: an exhausted page owes no token, got {listed}"
+            "case {case:?}: the one alarm fits in one page, so no token is owed, got {listed}"
         );
     }
 }

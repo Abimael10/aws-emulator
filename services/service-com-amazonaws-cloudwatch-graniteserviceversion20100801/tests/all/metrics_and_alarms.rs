@@ -534,18 +534,17 @@ async fn datapoints_bucket_into_period_windows_anchored_at_the_start_time() {
 /// the start time of your request is rounded down to the nearest time that corresponds to even
 /// 5-, 10-, 20-, or 30-second divisions of a minute." (`GetMetricStatisticsInput$StartTime`)
 ///
-/// The rounded instant is where the RANGE opens; the first WINDOW is the clock window of the
-/// period that instant falls inside, read whole, because a read is of whole periods and each
-/// datapoint is stamped with the start of the window it aggregates ("The time stamp used for the
-/// data point", `Datapoint$Timestamp`). So the stamp a row expects is the start of that window:
-/// the rounded start where the age band's interval already lands on a period boundary, and the
-/// period's own boundary where the period is wider than that interval — the same shape the
-/// sentence above states for a sub-minute period, whose example answers "data timestamped between
-/// 15:02:15 and 15:07:15" for a query made at 15:07:17.
+/// That rounding is the WHOLE of the alignment: the windows run in `Period`-long steps from the
+/// rounded instant, and each datapoint is stamped with the start of the window it aggregates
+/// ("The time stamp used for the data point", `Datapoint$Timestamp`) — so the stamp a row expects
+/// is the rounded start itself, which for a period wider than the age band's interval is no
+/// multiple of the period at all. The sentence above states the same shape for a sub-minute
+/// period, whose example answers "data timestamped between 15:02:15 and 15:07:15" for a query
+/// made at 15:07:17 — stamps a period apart from the rounded start.
 ///
 /// The rows span the three age bands, two periods wider than their band's interval and the
 /// sub-minute periods that round by themselves, each with a start time deliberately off the
-/// boundary of the window it opens in.
+/// interval its band rounds onto.
 #[tokio::test]
 async fn a_start_time_off_the_boundary_is_rounded_down_before_the_windows_are_laid() {
     let (router, engine) = build_router_with_engine();
@@ -563,10 +562,10 @@ async fn a_start_time_off_the_boundary_is_rounded_down_before_the_windows_are_la
     const INGEST_WINDOW_BEHIND: f64 = 14.0 * 24.0 * 60.0 * 60.0;
 
     // (case, the whole-boundary base, how far past it the request starts, the period, the
-    // clock interval the window this read opens in begins on)
+    // interval the age band — or the sub-minute period itself — rounds the start onto)
     let cases: Vec<(&str, f64, f64, i64, f64)> = vec![
-        ("a recent start at a five-minute period opens in the five-minute window", recent, 150.0, 300, 300.0),
-        ("a recent start at a two-minute period opens in the two-minute window", recent, 95.0, 120, 120.0),
+        ("a recent start at a five-minute period rounds to the whole minute", recent, 150.0, 300, 60.0),
+        ("a recent start at a two-minute period rounds to the whole minute", recent, 95.0, 120, 60.0),
         ("a recent start at a one-minute period rounds to the whole minute", recent, 95.0, 60, 60.0),
         (
             "between 15 and 63 days ago rounds to five minutes",

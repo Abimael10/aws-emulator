@@ -1,34 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The WHOLE PERIODS a `GetMetricStatistics` read answers with.
+//! The WHOLE PERIODS a `GetMetricStatistics` read answers with, and where their grid is anchored.
 //!
-//! THE RULE: a read is of whole periods. Each datapoint it answers aggregates one `Period`-long
-//! window of the clock and is stamped with that window's own start ("The time stamp used for the
-//! data point", `Datapoint$Timestamp`), so the window the range opens in is read WHOLE rather
-//! than cut off at an instant in the middle of it — its datapoint is answered even though the
-//! period began before the instant the caller named — and every stamp a read answers with is
-//! therefore the start of a clock window of that period.
+//! THE RULE: a read is of whole periods laid FROM the start time CloudWatch rounded the request's
+//! to. "CloudWatch rounds the specified time stamp as follows: Start time less than 15 days ago -
+//! Round down to the nearest whole minute. […] Start time between 15 and 63 days ago - Round down
+//! to the nearest 5-minute clock interval. […] Start time greater than 63 days ago - Round down to
+//! the nearest 1-hour clock interval. […] If you set Period to 5, 10, 20, or 30, the start time of
+//! your request is rounded down to the nearest time that corresponds to even 5-, 10-, 20-, or
+//! 30-second divisions of a minute. For example … If you make a query at 15:07:17 for the previous
+//! 5 minutes of data, using a period of 5 seconds, you receive data timestamped between 15:02:15
+//! and 15:07:15." (`GetMetricStatisticsInput$StartTime`) — that rounding is the WHOLE of the
+//! alignment: each datapoint aggregates one `Period`-long window of the grid that starts at the
+//! rounded instant and is stamped with that window's own start ("The time stamp used for the data
+//! point", `Datapoint$Timestamp`), as the example's stamps a period apart from 15:02:15 show. So a
+//! stamp is a whole number of periods from the rounded start, and NOT in general a multiple of the
+//! period measured from the epoch.
 //!
-//! Where the range opens is the documented rounding of the requested start: "CloudWatch rounds
-//! the specified time stamp as follows: Start time less than 15 days ago - Round down to the
-//! nearest whole minute. […] Start time between 15 and 63 days ago - Round down to the nearest
-//! 5-minute clock interval. […] Start time greater than 63 days ago - Round down to the nearest
-//! 1-hour clock interval. […] If you set Period to 5, 10, 20, or 30, the start time of your
-//! request is rounded down to the nearest time that corresponds to even 5-, 10-, 20-, or
-//! 30-second divisions of a minute. For example … If you make a query at 15:07:17 for the
-//! previous 5 minutes of data, using a period of 5 seconds, you receive data timestamped between
-//! 15:02:15 and 15:07:15." (`GetMetricStatisticsInput$StartTime`) — that example is this rule at a
-//! sub-minute period: the stamps are the starts of that period's own clock windows, the first of
-//! them before the instant the query named.
-//!
-//! What a client gets from it: a series published once per period is reported ON that period's
-//! boundaries whatever instant the read started from, which is what lets a 5-minute cadence be
-//! told from a 1-minute one, and the most recent period of a series is readable as soon as it has
-//! closed rather than only from a read that happens to begin on its boundary.
+//! What a client gets from it: the window a read reports is the window it asked for, so two reads
+//! of the same series over the same range agree, and a client that windows a series by its own
+//! `StartTime` reads aggregates split exactly on the boundaries it named rather than on boundaries
+//! the clock chose for it.
 //!
 //! The rows span what the rule generalises over: the period (a minute, five minutes, a quarter of
-//! an hour and an hour, plus the sub-minute periods the sentence above names), and how far into
-//! its window the requested start falls (the boundary itself, a quarter, the middle and
+//! an hour and an hour, plus the sub-minute periods the sentence above names), and how far past
+//! the rounding interval the requested start falls (the interval itself, a quarter, the middle and
 //! three-quarters of the way in).
 
 use serde_json::json;
@@ -130,17 +126,43 @@ async fn publish(router: &MultiServiceRouter, metric: &str, at: f64, period: f64
     .await;
 }
 
-/// The start of the `period`-wide clock window `at` falls in, computed here rather than imported
-/// so the expected grid is this suite's own.
-fn window_start(at: f64, period: f64) -> f64 {
-    (at / period).floor() * period
+/// The start of the `span`-wide clock window `at` falls in.
+fn floored(at: f64, span: f64) -> f64 {
+    (at / span).floor() * span
 }
 
-/// Rule: a datapoint is stamped with the start of the window it aggregates, so every stamp a
-/// read answers with is the start of a clock window of the period it asked for, whatever instant
-/// the request started from.
+/// The interval a requested start time of THIS suite's age is rounded down onto: the period
+/// itself for the four sub-minute periods the documented sentence names ("If you set Period to 5,
+/// 10, 20, or 30, the start time of your request is rounded down to the nearest time that
+/// corresponds to even 5-, 10-, 20-, or 30-second divisions of a minute"), else the whole minute
+/// its band rounds onto ("Start time less than 15 days ago - Round down to the nearest whole
+/// minute", `GetMetricStatisticsInput$StartTime`; every range here is an hour old).
+fn rounding_interval(period: f64) -> f64 {
+    if [5.0, 10.0, 20.0, 30.0].contains(&period) {
+        period
+    } else {
+        MINUTE
+    }
+}
+
+/// The instant an observation stamped `at` is AGGREGATED at, which is what the window grid holds:
+/// its own instant for the high-resolution series a sub-minute period needs, and the whole minute
+/// it was published in for a regular-resolution one ("Setting this to 60 specifies this metric as
+/// regular resolution, which CloudWatch stores at 1-minute resolution.",
+/// `MetricDatum$StorageResolution`).
+fn aggregated_at(at: f64, period: f64) -> f64 {
+    if period < MINUTE {
+        at
+    } else {
+        floored(at, MINUTE)
+    }
+}
+
+/// Rule: a datapoint is stamped with the start of the window it aggregates, and the windows run in
+/// `period`-long steps from the ROUNDED start — so the stamp is the rounded start plus a whole
+/// number of periods, whatever instant the request started from.
 #[tokio::test]
-async fn every_answered_window_is_stamped_on_a_multiple_of_the_period() {
+async fn every_answered_window_is_stamped_a_whole_number_of_periods_from_the_rounded_start() {
     let router = build_router();
     for (index, period) in PERIODS.iter().enumerate() {
         for (phase_index, phase) in START_PHASES.iter().enumerate() {
@@ -148,66 +170,89 @@ async fn every_answered_window_is_stamped_on_a_multiple_of_the_period() {
             let metric = format!("Stamped{index}x{phase_index}");
             // The observation sits in the middle of a window well inside the range, so the
             // window it lands in is neither the one the range opens in nor the one it closes in.
-            let boundary = window_start(now_secs() - AGE_SECS, *period);
+            let boundary = floored(now_secs() - AGE_SECS, *period);
             let at = boundary + period / 2.0;
             publish(&router, &metric, at, *period).await;
             let start = boundary - 2.0 * period + period * phase;
             let end = boundary + 3.0 * period;
+            let anchor = floored(start, rounding_interval(*period));
+            let expected_stamp = anchor + floored(aggregated_at(at, *period) - anchor, *period);
             let points = read_windows(&router, &case, &metric, *period, start, end).await;
             for (stamp, _) in &points {
                 assert_eq!(
-                    stamp.rem_euclid(*period),
+                    (stamp - anchor).rem_euclid(*period),
                     0.0,
-                    "case {case:?}: a window of {period} seconds begins on a multiple of \
-                     {period}, got {stamp} from {points:?}"
+                    "case {case:?}: a window of {period} seconds begins a whole number of \
+                     periods after the rounded start {anchor}, got {stamp} from {points:?}"
                 );
             }
             assert_eq!(
                 points,
-                vec![(boundary, 1.0)],
-                "case {case:?}: the observation at {at} belongs to the window at {boundary}, got \
-                 {points:?}"
+                vec![(expected_stamp, 1.0)],
+                "case {case:?}: the observation at {at} belongs to the window at \
+                 {expected_stamp} of the grid anchored at {anchor}, got {points:?}"
             );
         }
     }
 }
 
-/// Rule: a read is of whole periods, so the window the range opens in is read WHOLE — a request
-/// that begins after the observation but inside its period still answers that period's datapoint.
+/// Rule, read where it differs from a grid of clock multiples: the range opens at the ROUNDED
+/// start, so an observation of a minute BEFORE that instant is not answered at all, while the
+/// window that opens there answers its own — a read anchored on clock multiples of the period
+/// would have reported both under one earlier stamp.
 #[tokio::test]
-async fn the_window_the_requested_start_falls_inside_is_read_whole() {
+async fn the_grid_opens_at_the_rounded_start_rather_than_on_a_clock_multiple_of_the_period() {
     let router = build_router();
-    for (index, period) in PERIODS.iter().enumerate() {
-        let case = format!("a period of {period} seconds, started past the observation");
-        let metric = format!("Whole{index}");
-        let boundary = window_start(now_secs() - AGE_SECS, *period);
-        // The observation is in the first tenth of its window and the read begins in the last
-        // tenth of the same window — after the observation, inside its window.
-        let at = boundary + period / 10.0;
-        let start = boundary + period * 0.9;
-        publish(&router, &metric, at, *period).await;
-        let points = read_windows(&router, &case, &metric, *period, start, boundary + period).await;
+    // Periods WIDER than the minute the start rounds onto, so the rounded start falls strictly
+    // inside a clock window of the period and the two grids can be told apart.
+    for (index, period) in [300.0_f64, 900.0, 3_600.0].iter().enumerate() {
+        let case = format!("a period of {period} seconds opened two minutes past its boundary");
+        let metric = format!("Anchored{index}");
+        let boundary = floored(now_secs() - AGE_SECS, *period);
+        // Two observations: one in the first minute of the clock window, one in the third.
+        let before = boundary + 30.0;
+        let after = boundary + 2.0 * MINUTE + 30.0;
+        publish(&router, &metric, before, *period).await;
+        publish(&router, &metric, after, *period).await;
+
+        // A start two minutes into that window rounds to the whole minute, which is where the
+        // grid opens: the observation of the first minute is outside the range.
+        let start = boundary + 2.0 * MINUTE + 17.0;
+        let anchor = boundary + 2.0 * MINUTE;
+        let points = read_windows(&router, &case, &metric, *period, start, anchor + period).await;
         assert_eq!(
             points,
-            vec![(boundary, 1.0)],
-            "case {case:?}: the window [{boundary}, {}) is read whole, so the observation at \
-             {at} is answered for a read begun at {start}, got {points:?}",
-            boundary + period
+            vec![(anchor, 1.0)],
+            "case {case:?}: expected the single observation of [{anchor}, {}) stamped at the \
+             rounded start, got {points:?}",
+            anchor + period
+        );
+
+        // The other observation is answered when the range opens at or before its own minute,
+        // and the grid still opens at the rounded start.
+        let case = format!("{case}, read from the boundary itself");
+        let whole = read_windows(&router, &case, &metric, *period, boundary, boundary + period)
+            .await;
+        assert_eq!(
+            whole,
+            vec![(boundary, 2.0)],
+            "case {case:?}: expected both observations in the window stamped {boundary}, got \
+             {whole:?}"
         );
     }
 }
 
-/// Rule, read through the statistic itself: a series published once per period answers one
-/// observation per window of that period, and a read at a WIDER period folds the observations of
-/// every narrower window it covers into one — the windows being whole periods of the clock is
-/// what makes the two agree.
+/// Rule, read through the statistic itself: a series published once per minute answers one
+/// observation per minute window, and a read at a WIDER period folds the minutes of each of its
+/// windows into one — the windows being laid from the rounded start is what decides WHICH minutes
+/// land together.
 #[tokio::test]
 async fn a_wider_read_folds_the_windows_it_covers() {
     let router = build_router();
     let metric = "FoldedMinutes";
     // Ten minutes of one observation per minute, each stamped inside its own minute, published
     // into a span that begins on a 5-minute boundary.
-    let base = window_start(now_secs() - AGE_SECS, 300.0);
+    let base = floored(now_secs() - AGE_SECS, 300.0);
     for minute in 0..10 {
         publish(&router, metric, base + f64::from(minute) * MINUTE + 7.0, MINUTE).await;
     }
@@ -224,9 +269,9 @@ async fn a_wider_read_folds_the_windows_it_covers() {
         base + 10.0 * MINUTE
     );
 
-    // Read at five minutes, from an instant in the MIDDLE of the first of those windows: the
-    // same observations, folded five to a window, stamped on the 5-minute boundaries.
-    let case = "the same ten minutes read five minutes at a time";
+    // Read at five minutes, from an instant in the MIDDLE of the third minute: the grid opens on
+    // that whole minute, so the first window holds minutes 2..6 and the second the rest.
+    let case = "the same ten minutes read five minutes at a time from the third minute";
     let folded = read_windows(
         &router,
         case,
@@ -238,8 +283,9 @@ async fn a_wider_read_folds_the_windows_it_covers() {
     .await;
     assert_eq!(
         folded,
-        vec![(base, 5.0), (base + 300.0, 5.0)],
-        "case {case:?}: expected the minutes folded five to a 5-minute window stamped on the \
-         5-minute boundaries, got {folded:?}"
+        vec![(base + 2.0 * MINUTE, 5.0), (base + 7.0 * MINUTE, 3.0)],
+        "case {case:?}: expected the minutes folded five to a window laid from the rounded start \
+         {}, got {folded:?}",
+        base + 2.0 * MINUTE
     );
 }

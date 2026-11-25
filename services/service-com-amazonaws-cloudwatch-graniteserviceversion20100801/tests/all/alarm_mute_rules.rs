@@ -993,10 +993,9 @@ async fn a_listing_the_store_cannot_serve_is_refused() {
         );
     }
 
-    // A token this service cannot read a cursor out of names no position this listing's
-    // enumeration holds, so it marks a walk already carried past its rules: the EXHAUSTED page is
-    // served rather than the request refused. Rows differ along how the token misses: text that is
-    // no token at all, a truncated one, and one with text appended.
+    // A token this service cannot read a cursor out of names no position at all, so it is no
+    // token: the FIRST page is served rather than the request refused. Rows differ along how the
+    // token misses: text that is no token at all, a truncated one, and one with text appended.
     let minted = text(
         &ok(&router, "ListAlarmMuteRules", &json!({"MaxRecords": 1})).await,
         "NextToken",
@@ -1023,8 +1022,8 @@ async fn a_listing_the_store_cannot_serve_is_refused() {
         .await;
         assert_eq!(
             (status, listed_arns(&body), body.get("NextToken")),
-            (200, Vec::new(), None),
-            "case {case:?}: expected HTTP 200 with the exhausted page, got {status} with {body}"
+            (200, every_rule.clone(), None),
+            "case {case:?}: expected HTTP 200 with the first page, got {status} with {body}"
         );
     }
 
@@ -1300,13 +1299,12 @@ async fn deleting_a_mute_rule_is_idempotent_and_reaches_only_its_own_region() {
 }
 
 #[tokio::test]
-async fn a_next_token_this_listing_cannot_resume_from_is_answered_the_exhausted_page() {
+async fn a_next_token_this_listing_cannot_read_a_position_out_of_is_answered_the_first_page() {
     // The rule: a `NextToken` names a POSITION in the enumeration — "The token returned from a
     // previous call to indicate where to continue retrieving results."
     // (`ListAlarmMuteRulesInput$NextToken`) — and one this listing cannot read a cursor out of
-    // names no position it holds at all, so it marks a walk already carried past its rules: the
-    // EXHAUSTED page is served, not a refusal that aborts the walk and not a restart that hands
-    // back rules it already delivered.
+    // names no position at all, so it is no token: the FIRST page is served, exactly what a
+    // request carrying no token is served, rather than a refusal that aborts the walk.
     //
     // Rows differ along the FORM of the value offered: no token at all, the empty string, a token
     // this listing minted, and four shapes of value it cannot read a cursor out of (text that is
@@ -1343,18 +1341,18 @@ async fn a_next_token_this_listing_cannot_resume_from_is_answered_the_exhausted_
             Some(minted.clone()),
             every_rule.get(1..).unwrap_or_default().to_vec(),
         ),
-        ("text that is no cursor", Some("not-a-token".to_string()), vec![]),
+        ("text that is no cursor", Some("not-a-token".to_string()), every_rule.clone()),
         (
             "an opaque blob of another service's form",
             Some("eyJuZXh0Ijoibm90aGluZyJ9".to_string()),
-            vec![],
+            every_rule.clone(),
         ),
         (
             "a blob whose bytes are no text",
             Some("AAAA".to_string()),
-            vec![],
+            every_rule.clone(),
         ),
-        ("a minted cursor truncated", Some(truncated), vec![]),
+        ("a minted cursor truncated", Some(truncated), every_rule.clone()),
     ];
 
     for (case, token, expected) in cases {

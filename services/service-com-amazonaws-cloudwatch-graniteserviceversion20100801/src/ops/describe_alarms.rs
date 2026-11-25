@@ -241,11 +241,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Which POSITION of this enumeration the request's `NextToken` names, by the one rule
         // every listing of this service that SERVES such a token shares
-        // ([`crate::state::ResumedAt`]). This read refuses no token: a value this service
-        // cannot locate in this enumeration marks a walk it cannot resume, so the page served
-        // is the EXHAUSTED one — the three lists present and empty with no token, the answer
-        // this listing is recorded giving a token it cannot resume from, rather than a restart
-        // that would hand back alarms the walk already delivered.
+        // ([`crate::state::ResumedAt`]). This read refuses no token: a value this service cannot
+        // read a cursor out of names no position at all, so it is no token and the page served
+        // is the FIRST one — the answer this listing is recorded giving such a token, still
+        // scoped by the `AlarmNames`/`AlarmNamePrefix`/`StateValue`/`ActionPrefix` filtering
+        // below, rather than a page emptied by a token the walk cannot resume from.
         let start_at = crate::state::ResumedAt::of(input.next_token.as_deref());
 
         // One page size for every path below, so paging behaves the same whichever filter
@@ -431,8 +431,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The page the request asked for, cut out of the whole selection and resumed from the
         // position the inbound token names ([`crate::state::ResumedAt::page_of`]): a token is
-        // owed only while an alarm is left over beyond it, and a walk already carried past the
-        // selection is served the three lists present and EMPTY with no token.
+        // owed only while an alarm is left over beyond it, and a cursor naming a key past the
+        // whole selection is served the three lists present and EMPTY with no token.
         let crate::state::ListingPage { items, next_token } =
             start_at.page_of(&matching, limit, |(name, _)| name.as_str());
 

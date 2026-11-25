@@ -6,13 +6,13 @@
 //! The rule under test: **a `NextToken` names a POSITION in the enumeration, and a listing that
 //! serves such a token rather than refusing it resumes AT that position — never at the
 //! beginning** — so a continuation delivers only the items after the ones already delivered,
-//! while a value this service cannot read a cursor out of names no position the enumeration
-//! holds at all: such a value marks a walk this listing cannot resume, so the page it is served
-//! is the EXHAUSTED one — every item member present and empty, with no token
+//! while a value this service cannot read a cursor out of names no position at all: such a value
+//! is no token, so the page it is served is the FIRST one, exactly what a request carrying no
+//! token is served, still scoped by the request's other filters
 //! (`DescribeAlarmsInput$NextToken` "The token returned by a previous call to indicate that
 //! there is more data available.", `ListAlarmMuteRulesOutput$NextToken` "If this field is
-//! absent, there are no more results to retrieve."). An EMPTY `NextToken` is no token at all:
-//! the only page it can name is the first.
+//! absent, there are no more results to retrieve."). An EMPTY `NextToken` is no token at all
+//! either: the only page it can name is the first.
 //!
 //! The rows differ along what the rule generalises over: which listing is walked (the alarm
 //! listing narrowed by a name prefix, the same listing asked for a composite alarm's children,
@@ -38,9 +38,8 @@ const PREFIX: &str = "cursor-alarm-";
 /// A `NextToken` value the service did not mint, in each form one can take.
 ///
 /// The first is no cursor at all; the second reads as a hexadecimal cursor whose bytes are not
-/// text; the third is the padded base64 blob AWS carries its own tokens in. None of them names a
-/// position this service's enumerations hold, so a listing that serves such a value answers the
-/// page past its last item.
+/// text; the third is the padded base64 blob AWS carries its own tokens in. No position can be
+/// read out of any of them, so a listing that serves such a value answers the first page.
 const FOREIGN_TOKENS: [(&str, &str); 3] = [
     ("a value that is no cursor at all", "not-a-cursor"),
     ("a cursor whose bytes are not text", "fffe"),
@@ -129,7 +128,7 @@ async fn a_continued_alarm_listing_delivers_only_the_alarms_after_the_ones_alrea
 }
 
 #[tokio::test]
-async fn a_token_past_the_listing_is_answered_the_exhausted_alarm_page() {
+async fn a_token_the_alarm_listing_cannot_read_is_answered_the_first_alarm_page() {
     let router = build_router();
     let names = given_alarms(&router, 2).await;
     let first = ok(
@@ -153,23 +152,14 @@ async fn a_token_past_the_listing_is_answered_the_exhausted_alarm_page() {
         .await;
         assert_eq!(
             listed_alarms(&listed),
-            Vec::<String>::new(),
-            "case {case:?}: expected the exhausted page and no alarm delivered twice, got \
-             {listed}"
+            names,
+            "case {case:?}: expected the first page, got {listed}"
         );
-        // Every list this read reports is present and empty there, and the walk is over, so no
-        // token is owed.
-        for member in ["MetricAlarms", "CompositeAlarms", "LogAlarms"] {
-            assert_eq!(
-                listed.get(member).and_then(Value::as_array),
-                Some(&Vec::new()),
-                "case {case:?}: expected {member} present and empty, got {listed}"
-            );
-        }
+        // Both alarms fit in the page asked for, so the first page is the last and owes no token.
         assert_eq!(
             next_token(&listed),
             None,
-            "case {case:?}: an exhausted page owes no token, got {listed}"
+            "case {case:?}: the whole listing fits in one page, so no token is owed, got {listed}"
         );
     }
 
@@ -195,7 +185,7 @@ async fn a_token_past_the_listing_is_answered_the_exhausted_alarm_page() {
 }
 
 #[tokio::test]
-async fn a_token_past_a_relationship_walk_is_answered_the_exhausted_page() {
+async fn a_token_a_relationship_walk_cannot_read_is_answered_its_first_page() {
     let router = build_router();
     let children = given_alarms(&router, 2).await;
     let parent = "cursor-parent";
@@ -230,19 +220,19 @@ async fn a_token_past_a_relationship_walk_is_answered_the_exhausted_page() {
         .await;
         assert_eq!(
             listed_alarms(&listed),
-            Vec::<String>::new(),
-            "case {case:?}: expected the exhausted page of children, got {listed}"
+            children,
+            "case {case:?}: expected the first page of children, got {listed}"
         );
         assert_eq!(
             next_token(&listed),
             None,
-            "case {case:?}: an exhausted page owes no token, got {listed}"
+            "case {case:?}: both children fit in one page, so no token is owed, got {listed}"
         );
     }
 }
 
 #[tokio::test]
-async fn a_token_past_the_mute_rule_listing_is_answered_the_exhausted_page() {
+async fn a_token_the_mute_rule_listing_cannot_read_is_answered_its_first_page() {
     let router = build_router();
     // The same rule, read through the OTHER listing of this service that serves a token it
     // cannot read: one rule decides what such a token names for both.
@@ -258,8 +248,9 @@ async fn a_token_past_the_mute_rule_listing_is_answered_the_exhausted_page() {
         .await;
     }
     let first = ok(&router, "ListAlarmMuteRules", &json!({"MaxRecords": 2})).await;
+    let both = listed_arns(&first);
     assert_eq!(
-        listed_arns(&first).len(),
+        both.len(),
         2,
         "the first page must deliver both rules, got {first}"
     );
@@ -273,8 +264,8 @@ async fn a_token_past_the_mute_rule_listing_is_answered_the_exhausted_page() {
         .await;
         assert_eq!(
             listed_arns(&listed),
-            Vec::<String>::new(),
-            "case {case:?}: expected the exhausted page and no rule delivered twice, got {listed}"
+            both,
+            "case {case:?}: expected the first page {both:?}, got {listed}"
         );
     }
 }

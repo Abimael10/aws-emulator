@@ -11,12 +11,13 @@
 //! periods. All other metrics are available in 5-minute periods"), one minute for the same
 //! measurement while it is on ("Detailed monitoring | You can get metrics in 1-minute periods")
 //! and one minute for a status-check metric in either state (Amazon EC2 User Guide, instance
-//! monitoring). A reader sees that cadence because a read is of whole periods of the clock, each
-//! datapoint stamped with the start of the window it aggregates: HOW MANY observations one
-//! 300-second window holds is what tells the two cadences apart — one under the 5-minute cadence
-//! and one per minute under the 1-minute one — and the stamps are the boundaries of the windows
-//! whatever instant the read began at. A series that has been published into is a metric of the
-//! account, so `ListMetrics` reports it, under that one dimension and no other.
+//! monitoring). A reader sees that cadence because a read is of whole periods, laid from the start
+//! time CloudWatch rounded the request's to and each datapoint stamped with the start of the
+//! window it aggregates: HOW MANY observations one 300-second window holds is what tells the two
+//! cadences apart — one under the 5-minute cadence and one per minute under the 1-minute one — and
+//! every stamp is a whole number of periods from that rounded start, whatever instant the read
+//! began at. A series that has been published into is a metric of the account, so `ListMetrics`
+//! reports it, under that one dimension and no other.
 //!
 //! This is the reader's side of the cadence: the sibling suite `instance_metric_publication`
 //! asserts the periods each series carries, read one minute at a time; here the same publication
@@ -308,12 +309,15 @@ async fn a_five_minute_read_window_holds_one_observation_per_period_of_the_caden
     }
 }
 
-/// Rule: a read is of whole periods, so a client reading from ANY instant sees the cadence — a
-/// 5-minute read begun in the middle of a period answers that period whole, stamped with its own
-/// start, while the same window read a minute at a time shows the 1-minute publication at minutes
-/// that are not multiples of five.
+/// Rule: a client reading from ANY instant sees the cadence — a 5-minute read begun in the middle
+/// of a period lays its windows from the start time rounded down to the whole minute ("Start time
+/// less than 15 days ago - Round down to the nearest whole minute",
+/// `GetMetricStatisticsInput$StartTime`), so the window that opens there holds the one reading of
+/// the 5-minute cadence and the reading of the period before it, which the read did not ask for,
+/// is not answered — while the same range read a minute at a time shows the 1-minute publication
+/// at minutes that are not multiples of five.
 #[tokio::test]
-async fn a_read_begun_inside_a_period_answers_that_period_whole() {
+async fn a_read_begun_inside_a_period_lays_its_windows_from_the_rounded_start() {
     let case = "two instances, read from the middle of a period";
     let (router, engine) = emulator();
     let ids = launch(&router, case, 2).await;
@@ -344,24 +348,26 @@ async fn a_read_begun_inside_a_period_answers_that_period_whole() {
         end,
     )
     .await;
+    // Where the grid opens: the requested start rounded down to the whole minute, the first
+    // window of the read running the 5 minutes from there.
+    let anchor = off_grid_start - off_grid_start.rem_euclid(MINUTE);
     assert_eq!(
         basic_read
             .iter()
             .map(|window| (window.at, window.sample_count))
             .collect::<Vec<(i64, f64)>>(),
-        vec![
-            (base, ONE_PER_FIVE_MINUTES),
-            (base + FIVE_MINUTES, ONE_PER_FIVE_MINUTES)
-        ],
-        "case {case:?}: a read begun at {off_grid_start} answers the 5-minute period it begins \
-         inside whole, got {basic_read:?}"
+        vec![(anchor, ONE_PER_FIVE_MINUTES)],
+        "case {case:?}: a read begun at {off_grid_start} lays its 5-minute windows from \
+         {anchor}, so the one reading of the cadence inside [{anchor}, {}) is answered there and \
+         the reading of the period before it is not answered at all, got {basic_read:?}",
+        anchor + FIVE_MINUTES
     );
     for window in &basic_read {
         assert_eq!(
-            window.at.rem_euclid(FIVE_MINUTES),
+            (window.at - anchor).rem_euclid(FIVE_MINUTES),
             0,
-            "case {case:?}: a window is stamped with its own start, which for a 5-minute period \
-             is a 5-minute boundary, got {window:?}"
+            "case {case:?}: a window is stamped with its own start, which is a whole number of \
+             5-minute periods from the rounded start {anchor}, got {window:?}"
         );
         assert_eq!(
             window.unit, "Percent",

@@ -1252,7 +1252,7 @@ pub fn windows_by_unit<'a>(
     now: f64,
 ) -> BTreeMap<(i64, &'a str), Vec<&'a StoredDatum>> {
     // The window width, guarded exactly as the sibling that lays the same windows out guards
-    // it ([`first_window_start`]): a non-positive period is refused at the request boundary
+    // it ([`rounded_start`]): a non-positive period is refused at the request boundary
     // before any read reaches here, and the guard keeps the two helpers' notion of a window's
     // width one notion rather than an invariant each assumes separately.
     let span = f64::from(period.max(1));
@@ -1359,8 +1359,8 @@ const SIXTY_THREE_DAYS_SECS: f64 = 63.0 * 24.0 * 60.0 * 60.0;
 /// [`SUB_MINUTE_PERIODS`] admits.
 const START_TIME_ROUNDING_PERIODS: [i32; 4] = [5, 10, 20, 30];
 
-/// The start of the first window a read searches: the requested start time rounded DOWN to the
-/// boundary its age and its period put it on.
+/// The start of the first window a read lays over the range a request named: the requested start
+/// time rounded DOWN to the boundary its age and its period put it on.
 ///
 /// "CloudWatch rounds the specified time stamp as follows: Start time less than 15 days ago -
 /// Round down to the nearest whole minute. […] Start time between 15 and 63 days ago - Round
@@ -1369,6 +1369,14 @@ const START_TIME_ROUNDING_PERIODS: [i32; 4] = [5, 10, 20, 30];
 /// the start time of your request is rounded down to the nearest time that corresponds to even
 /// 5-, 10-, 20-, or 30-second divisions of a minute." (`GetMetricDataInput$StartTime`, in the
 /// same words as `GetMetricStatisticsInput$StartTime`)
+///
+/// That is the WHOLE of the alignment, and the windows a read answers run in `Period`-long steps
+/// FROM it: each datapoint aggregates one such window and is stamped with its own start ("The
+/// time stamp used for the data point", `Datapoint$Timestamp`), so a stamp need not fall on a
+/// multiple of the period measured from the epoch. The model's own example is that grid: a query
+/// "at 15:07:17 for the previous 5 minutes of data, using a period of 5 seconds" receives "data
+/// timestamped between 15:02:15 and 15:07:15" — stamps one period apart from the rounded start
+/// 15:02:15.
 ///
 /// Shared by every read that lays period windows over a range, so the windows of one instant
 /// are the same whichever operation reads them.
@@ -1386,30 +1394,6 @@ pub fn rounded_start(requested_start: f64, period: i32, now: f64) -> f64 {
         }
     };
     (requested_start / interval).floor() * interval
-}
-
-/// The start of the FIRST window a read lays over the range a request named: the start of the
-/// `period`-long clock window that the request's rounded start time falls INSIDE.
-///
-/// A read is of whole PERIODS. Each datapoint it answers aggregates one `period`-long window and
-/// is stamped with that window's own start ("The time stamp used for the data point",
-/// `Datapoint$Timestamp`), so the window the range opens in is read WHOLE rather than cut off at
-/// an instant in the middle of it: the datapoint of that period is answered even though the
-/// period began before the instant the caller named, and — because a window is stamped with its
-/// own start — every stamp a read answers with is the start of a clock window of that period.
-///
-/// The documented rounding of the requested start is applied first and unchanged
-/// ([`rounded_start`]: the whole minute, the 5-minute or the 1-hour clock interval the age of the
-/// range puts it on, and its own division of a minute for a sub-minute period). It decides the
-/// instant the range opens at; this is the window that instant falls inside. For a sub-minute
-/// period the two coincide, which is the case the model spells out: a query "at 15:07:17 for the
-/// previous 5 minutes of data, using a period of 5 seconds" receives "data timestamped between
-/// 15:02:15 and 15:07:15" (`GetMetricStatisticsInput$StartTime`) — each stamp the start of one of
-/// that period's own clock windows, the first of them before the instant the query named.
-pub fn first_window_start(requested_start: f64, period: i32, now: f64) -> f64 {
-    let rounded = rounded_start(requested_start, period, now);
-    let interval = f64::from(period.max(1));
-    (rounded / interval).floor() * interval
 }
 
 /// One series ONE write stored datapoints into: its identity, and the unit each of those
@@ -2988,44 +2972,40 @@ pub fn requested_page(token: Option<&str>) -> Option<&str> {
 /// returned from a previous call to indicate where to continue retrieving results."
 /// (`ListAlarmMuteRulesInput$NextToken`), "The token that marks the start of the next batch of
 /// returned results." (`DescribeAlarmsOutput$NextToken`) — so a request asks for the beginning
-/// of the enumeration, for the item a cursor names, or for the position PAST its last item,
-/// which is the page a walk that has already delivered everything asks for.
+/// of the enumeration, or for the item a cursor names, which may be a key no item of the
+/// selection sits at or after and therefore its end.
 ///
 /// Shared by every listing of this service that SERVES a token it cannot read instead of
-/// refusing one, so one rule decides what such a token does: a token is the mark a previous
-/// page left of how far it got, and one this listing cannot locate in its own enumeration is
-/// the mark of a walk it cannot resume — the recorded answer is the EXHAUSTED page, no items
-/// and no token, rather than a restart that would deliver items a second time and never
-/// terminate. A listing that refuses such a token instead reads the cursor itself
+/// refusing one, so one rule decides what such a token does: a token NAMES a position, and a
+/// value a listing cannot read a position out of names none — so the request is answered as if
+/// it had carried no token at all, the FIRST page, still scoped by every other filter the
+/// request named. A listing that refuses such a token instead reads the cursor itself
 /// ([`decode_page_token`]) and words the refusal its own model declares
 /// ([`invalid_next_token_message`]).
 pub enum ResumedAt {
-    /// The beginning: what a request carrying no token at all asks for.
+    /// The beginning: what a request carrying no token at all asks for, and what one carrying a
+    /// token no position can be read out of asks for too.
     TheFirstItem,
     /// The item the token's cursor names — the one the page that minted it stopped before, so
-    /// the continuation delivers that item and what follows it.
+    /// the continuation delivers that item and what follows it. A cursor naming a key past every
+    /// item of the selection names its end, which holds no item and owes no token
+    /// ([`ResumedAt::page_of`]).
     TheItemNamed(String),
-    /// The position past the last item: the page a walk this listing cannot resume asks for,
-    /// which holds no item and owes no token ([`ResumedAt::page_of`]).
-    TheEndOfTheListing,
 }
 
 impl ResumedAt {
-    /// Which of the three `token` asks for.
+    /// Which of the two `token` asks for.
     ///
     /// An EMPTY `NextToken` is no token at all and asks for the first page, the one rule every
     /// paginated read of this service shares ([`requested_page`]). A value this listing did not
-    /// mint carries no cursor of this enumeration ([`decode_page_token`]), so it cannot be
-    /// located in it: what it marks is a walk already carried past the items this listing
-    /// holds, which is its end.
+    /// mint carries no cursor of this enumeration ([`decode_page_token`]) and so names no
+    /// position in it: a listing that serves such a token rather than refusing it is served the
+    /// page a request naming no position is served, which is the first one.
     #[must_use]
     pub fn of(token: Option<&str>) -> Self {
-        match requested_page(token) {
+        match requested_page(token).and_then(decode_page_token) {
+            Some(cursor) => Self::TheItemNamed(cursor),
             None => Self::TheFirstItem,
-            Some(token) => match decode_page_token(token) {
-                Some(cursor) => Self::TheItemNamed(cursor),
-                None => Self::TheEndOfTheListing,
-            },
         }
     }
 
@@ -3052,7 +3032,6 @@ impl ResumedAt {
             Self::TheItemNamed(cursor) => {
                 selected.partition_point(|item| key(item) < cursor.as_str())
             }
-            Self::TheEndOfTheListing => selected.len(),
         };
         let remainder = selected.get(from..).unwrap_or_default();
         let items = remainder.get(..page_size).unwrap_or(remainder);
@@ -3085,8 +3064,8 @@ pub struct ListingPage<'a, T> {
 /// sentence its own recordings show (`crate::ops::list_metric_streams`), the Contributor Insights
 /// listings their coded one ([`insight_rule_records::invalid_page_token_message`]), and two reads
 /// refuse such a token not at all because they serve a page instead: the alarm listing and the
-/// alarm mute rule listing both read it as the position past their last item and serve the
-/// exhausted page ([`ResumedAt`]). So this
+/// alarm mute rule listing both read a token naming no position as no token at all and serve the
+/// FIRST page ([`ResumedAt`]). So this
 /// is the sentence of the reads recorded quoting
 /// the token — the alarm HISTORY listing and the alarm CONTRIBUTOR read
 /// (`crate::ops::describe_alarm_contributors`) — not a fourth wording of one class.

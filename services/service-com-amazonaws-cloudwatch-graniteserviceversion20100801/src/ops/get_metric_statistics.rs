@@ -305,11 +305,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // still readable at, and the datapoints inside it are all judged at the same instant.
         let now = crate::state::now_secs();
         // "CloudWatch rounds the specified time stamp" (`GetMetricStatisticsInput$StartTime`):
-        // the range opens at the ROUNDED start time rather than at the requested instant, and a
-        // read is of whole PERIODS — so the first window is the clock window of this period that
-        // the rounded start falls inside, read whole rather than cut off at an instant in the
-        // middle of it ([`crate::state::first_window_start`]).
-        let start = crate::state::first_window_start(requested_start, input.period, now);
+        // the range opens at the ROUNDED start time rather than at the requested instant, and the
+        // windows this read answers run in whole PERIODS FROM that instant — the one anchor rule
+        // every read of this service that lays period windows uses
+        // ([`crate::state::rounded_start`], shared with `GetMetricData`'s fold), so the same
+        // window over the same range is stamped alike whichever operation asked for it.
+        let start = crate::state::rounded_start(requested_start, input.period, now);
         // How many data points this call ASKED for: the periods of the window the caller named,
         // at the period the caller named — the two numbers the refusal states come from the
         // request and the cap, and nothing else ("The maximum number of data points returned
@@ -350,10 +351,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
 
         // `StartTime` inclusive, `EndTime` exclusive; windows are `Period` seconds wide and laid
-        // from the FIRST of them — the clock window the rounded start falls inside — folded by
-        // the one shared helper every reader of a series uses
-        // ([`crate::state::windows_by_unit`]), which also decides, by the one retention rule,
-        // what a read at this period can still see.
+        // from the rounded start time, folded by the one shared helper every reader of a series
+        // uses ([`crate::state::windows_by_unit`]), which also decides, by the one retention
+        // rule, what a read at this period can still see.
         let buckets = crate::state::windows_by_unit(
             series,
             start,

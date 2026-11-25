@@ -98,8 +98,8 @@ pub enum ListAlarmMuteRulesErrorModeled {
     // answer with rather than the scaffold's 501.
     InternalServiceFault(InternalServiceFault),
     // Declared because the model declares it, and not answered by the handler below: a
-    // `NextToken` this listing cannot resume from marks a walk already carried past the rules it
-    // holds, so the exhausted page is served rather than the request refused ([`ResumedAt`]).
+    // `NextToken` this listing cannot read a cursor out of names no position at all, so it is no
+    // token and the first page is served rather than the request refused ([`ResumedAt`]).
     InvalidNextToken(InvalidNextToken),
     ResourceNotFoundException(ResourceNotFoundException),
 }
@@ -182,8 +182,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Where this page resumes from, read off the token the request offered
         // ([`crate::state::ResumedAt`], the one rule every listing of this service that SERVES an
         // unreadable token shares): a value this listing can read a cursor out of names the rule
-        // the page starts at, and one it cannot marks a walk this listing cannot resume — the
-        // position past its last rule, which is the exhausted page.
+        // the page starts at, and one it cannot names no position — so the page served is the
+        // first, as for a request carrying no token.
         let resume = crate::state::ResumedAt::of(input.next_token.as_deref());
 
         let now = crate::state::now_secs();
@@ -215,9 +215,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // name the rule the next page starts at: a page boundary keeps naming the same rule even
         // when rules are created or deleted between two calls.
         //
-        // Every rule of the Region is selected before the page is cut out of it, so the end of
-        // the selection is a position this listing can resume AT: that is the empty page an
-        // exhausted walk asks for.
+        // Every rule of the Region is selected before the page is cut out of it, so a cursor
+        // naming a key past its last rule is a position this listing can resume AT: that is the
+        // empty page an exhausted walk asks for.
         let mut selected: Vec<(&String, &crate::state::StoredAlarmMuteRule)> = store
             .alarm_mute_rules
             .iter()
