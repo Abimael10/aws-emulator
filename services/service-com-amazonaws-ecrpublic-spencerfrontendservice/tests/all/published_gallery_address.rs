@@ -40,6 +40,14 @@
 //! tests are what the rule is FOR: the authority the published URI names is dialled and this
 //! emulator answers the registry API there, and an image pushed to a repository is pulled
 //! back through a container reference composed on the `repositoryUri` the API handed out.
+//!
+//! A PAGE of repositories is where the composition is read element by element: every element
+//! of `DescribeRepositories$repositories` carries the registry's URI followed by THAT
+//! element's own `repositoryName`, so a client that enumerates push targets and then pushes
+//! to each one reaches the repository it meant rather than its neighbour. That is asserted
+//! over the page a registry holding several repositories answers with, over each page of a
+//! `maxResults` walk, over a named subset asked for in another order, and over what is left
+//! after one repository is deleted.
 
 use std::sync::Arc;
 
@@ -739,6 +747,227 @@ async fn a_reference_composed_on_a_published_uri_pulls_the_image_pushed_to_it() 
         assert!(
             gallery_pull::parse_gallery_reference(&foreign).is_none(),
             "case {foreign:?}: expected no reference into this gallery"
+        );
+    }
+}
+
+/// The page sizes a paginated read of the repositories is driven at.
+///
+/// `DescribeRepositories$maxResults` is modelled `range 1..1000` (source:
+/// `smithy_query(query="operation", operation="DescribeRepositories")`), so the rows span its
+/// published lower bound, sizes that split the stored repositories unevenly, the size that is
+/// exactly the number held, and the published upper bound, which holds them all in one page.
+const PAGE_SIZES: [usize; 5] = [1, 2, 3, REPOSITORY_NAMES.len(), 1000];
+
+/// Every `(repositoryName, repositoryUri)` pair one `DescribeRepositories` page carries, in
+/// the order the page carries them — the two members a client has to read TOGETHER, since the
+/// URI is the address of the repository the same element names.
+fn page_pairs(case: &str, answered: &Value) -> Vec<(String, String)> {
+    answered["repositories"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: expected a page of repositories, got {answered}")
+        })
+        .iter()
+        .map(|repository| {
+            (
+                string_at(case, &repository["repositoryName"], "repositoryName"),
+                string_at(case, &repository["repositoryUri"], "repositoryUri"),
+            )
+        })
+        .collect()
+}
+
+/// Assert that each pair of `page` publishes the URI of its OWN repository under
+/// `registry_uri`, and that the page names exactly `expected`, in that order.
+fn assert_page_publishes_each_repositorys_own_uri(
+    case: &str,
+    registry_uri: &str,
+    expected: &[&str],
+    page: &[(String, String)],
+) {
+    assert_eq!(
+        page.len(),
+        expected.len(),
+        "case {case:?}: expected {} repositories on the page, got {page:?}",
+        expected.len()
+    );
+    for (position, (wanted, (listed_name, listed_uri))) in
+        expected.iter().zip(page.iter()).enumerate()
+    {
+        assert_eq!(
+            listed_name, wanted,
+            "case {case:?}: expected {wanted:?} at index {position} of the page, got \
+             {listed_name:?}"
+        );
+        assert_eq!(
+            listed_uri,
+            &format!("{registry_uri}/{listed_name}"),
+            "case {case:?}: expected index {position} to publish the registry URI followed by \
+             its own repository name, got {listed_uri:?}"
+        );
+        // The authority half is still an address this emulator answers on, and never one AWS
+        // serves — read element by element, because a page is a list of addresses.
+        dialled(case, listed_uri);
+    }
+}
+
+#[tokio::test]
+async fn every_element_of_a_repository_page_publishes_its_own_repositorys_uri() {
+    // RULE read element by element. A page is a list of ADDRESSES, so element i carries the
+    // registry's own URI followed by element i's `repositoryName` — never a neighbour's —
+    // whatever endpoint the read was answered at, however many repositories the registry
+    // holds, however the page is split, and whichever of them are still there. The rows span
+    // the endpoint forms a caller reaches this emulator by, crossed with the repository-name
+    // forms the modelled `RepositoryName` pattern admits, the page sizes `maxResults` admits,
+    // and the three read shapes a client enumerates push targets through (the whole page, a
+    // `maxResults` walk, a named subset). No row is the recorded request.
+    for endpoint in endpoints() {
+        let router = emulator();
+        // The registry's own URI, taken from `DescribeRegistries` on this very endpoint, is
+        // what every element of every page below has to extend.
+        let registry_uri = published_registry_uri(&router, &endpoint).await;
+        for name in REPOSITORY_NAMES {
+            call_at(
+                &router,
+                &endpoint,
+                "CreateRepository",
+                json!({"repositoryName": name}),
+            )
+            .await;
+        }
+        // The listing walks one stable `repositoryName` order — which is what makes a page
+        // token resume exactly after the page it came with — so that is the order a page
+        // carries its elements in.
+        let mut ordered: Vec<&str> = REPOSITORY_NAMES.to_vec();
+        ordered.sort_unstable();
+
+        let whole_case = format!("{}, the whole page", endpoint.case);
+        let whole = page_pairs(
+            &whole_case,
+            &call_at(&router, &endpoint, "DescribeRepositories", json!({})).await,
+        );
+        assert_page_publishes_each_repositorys_own_uri(
+            &whole_case,
+            &registry_uri,
+            &ordered,
+            &whole,
+        );
+
+        for page_size in PAGE_SIZES {
+            let case = format!("{}, maxResults {page_size}", endpoint.case);
+            let mut walked: Vec<(String, String)> = Vec::new();
+            let mut next_token: Option<String> = None;
+            // One request per repository at the smallest page size, plus the request that
+            // finds the walk already finished: a token that fails to advance ends the loop
+            // with repositories still unseen, which the comparison below then reports, rather
+            // than spinning here.
+            for _ in 0..=ordered.len() {
+                let mut request = json!({"maxResults": page_size});
+                if let Some(token) = next_token.as_deref() {
+                    request["nextToken"] = json!(token);
+                }
+                let answered =
+                    call_at(&router, &endpoint, "DescribeRepositories", request).await;
+                let pairs = page_pairs(&case, &answered);
+                assert!(
+                    pairs.len() <= page_size,
+                    "case {case:?}: expected at most {page_size} elements on a page, got {}",
+                    pairs.len()
+                );
+                for (name, uri) in &pairs {
+                    assert_eq!(
+                        uri,
+                        &format!("{registry_uri}/{name}"),
+                        "case {case:?}: expected the page element {name:?} to publish its own \
+                         URI, got {uri:?}"
+                    );
+                    dialled(&case, uri);
+                }
+                walked.extend(pairs);
+                next_token = answered["nextToken"].as_str().map(str::to_string);
+                if next_token.is_none() {
+                    break;
+                }
+            }
+            assert!(
+                next_token.is_none(),
+                "case {case:?}: expected the walk to end, got the token {next_token:?} after \
+                 {walked:?}"
+            );
+            // Split into pages or served whole, the walk hands back the same repositories in
+            // the same order, each with the same address: nothing is published twice and
+            // nothing is dropped at a page boundary.
+            assert_eq!(
+                walked, whole,
+                "case {case:?}: expected the paginated walk to publish every repository \
+                 exactly once in the page's order, got {walked:?}"
+            );
+        }
+
+        // A named subset is answered for exactly the repositories asked for, each carrying
+        // its own URI, whatever order the request listed them in.
+        let requested: Vec<&str> = ordered.iter().rev().copied().take(3).collect();
+        let mut wanted = requested.clone();
+        wanted.sort_unstable();
+        let named_case = format!("{}, a named subset", endpoint.case);
+        let named = page_pairs(
+            &named_case,
+            &call_at(
+                &router,
+                &endpoint,
+                "DescribeRepositories",
+                json!({"repositoryNames": requested}),
+            )
+            .await,
+        );
+        assert_page_publishes_each_repositorys_own_uri(
+            &named_case,
+            &registry_uri,
+            &wanted,
+            &named,
+        );
+
+        // The repository a delete echoes carries its own URI, and the page that is left
+        // publishes each remaining repository's own URI — the address does not shift onto a
+        // neighbour when the registry's contents change.
+        let removed = ordered
+            .first()
+            .copied()
+            .unwrap_or_else(|| panic!("case {:?}: the table names repositories", endpoint.case));
+        let deleted_case = format!("{}, after deleting {removed}", endpoint.case);
+        let deleted = call_at(
+            &router,
+            &endpoint,
+            "DeleteRepository",
+            json!({"repositoryName": removed}),
+        )
+        .await;
+        let deleted_uri = string_at(
+            &deleted_case,
+            &deleted["repository"]["repositoryUri"],
+            "repository.repositoryUri",
+        );
+        assert_eq!(
+            deleted_uri,
+            format!("{registry_uri}/{removed}"),
+            "case {deleted_case:?}: expected the echoed repository to publish its own URI, got \
+             {deleted_uri:?}"
+        );
+        let remaining: Vec<&str> = ordered
+            .iter()
+            .copied()
+            .filter(|name| *name != removed)
+            .collect();
+        let left = page_pairs(
+            &deleted_case,
+            &call_at(&router, &endpoint, "DescribeRepositories", json!({})).await,
+        );
+        assert_page_publishes_each_repositorys_own_uri(
+            &deleted_case,
+            &registry_uri,
+            &remaining,
+            &left,
         );
     }
 }
