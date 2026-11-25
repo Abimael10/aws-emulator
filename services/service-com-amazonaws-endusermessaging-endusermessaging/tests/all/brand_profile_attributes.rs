@@ -33,7 +33,8 @@
 //! * a `category` outside the set the service supports is `ValidationException` (400) on
 //!   both the create and the update, and every supported value round-trips;
 //! * a repeated `clientToken` reports the attributes the first call created instead of
-//!   creating a second set;
+//!   creating a second set, while the same token beside OTHER parameters — of the request
+//!   or of the profile it addresses — is `ValidationException` (400) and creates nothing;
 //! * `DeleteBrandProfileAttribute` removes exactly the attribute named, with the media it
 //!   held, and leaves the profile's other attributes alone; being `@idempotent`, a name the
 //!   profile does not hold is reported as done rather than refused, while the readers of
@@ -1405,6 +1406,233 @@ async fn a_repeated_client_token_creates_one_set_of_attributes() {
             "case {case}: another token must not re-create a stored name, got {} / {:?}",
             conflicted.status,
             conflicted.body
+        );
+    }
+}
+
+/// The sentence this API refuses a reuse of an `@idempotencyToken` beside other parameters
+/// with, written out here rather than read off the crate so the test pins the wording.
+const IDEMPOTENCY_MISMATCH: &str =
+    "The idempotency token and parameters presented do not match";
+
+/// A reuse of a `clientToken` beside PARAMETERS other than the ones it served is refused,
+/// whatever it is that differs, and creates nothing.
+#[tokio::test]
+async fn a_client_token_reused_for_other_parameters_is_refused() {
+    let em = Emulator::new();
+
+    // The rows differ in WHICH parameter the second request changed: the name of the one
+    // attribute, its value, an optional member, how many entries the batch holds, the
+    // order they are listed in, the type of an entry, the bytes uploaded for it, and an
+    // omitted value sent as an empty one.
+    let cases: Vec<(&str, Vec<Attribute>, Vec<Attribute>)> = vec![
+        (
+            "another attribute name",
+            vec![Attribute::text("Note", Some("v"))],
+            vec![Attribute::text("Other Note", Some("v"))],
+        ),
+        (
+            "another value for the same name",
+            vec![Attribute::text("Value", Some("first"))],
+            vec![Attribute::text("Value", Some("second"))],
+        ),
+        (
+            "an optional member dropped",
+            vec![Attribute::text("Optional", Some("v")).described("Why", "OTHER")],
+            vec![Attribute::text("Optional", Some("v"))],
+        ),
+        (
+            "one more entry in the batch",
+            vec![Attribute::text("Alpha", Some("a"))],
+            vec![
+                Attribute::text("Alpha", Some("a")),
+                Attribute::text("Beta", Some("b")),
+            ],
+        ),
+        (
+            "the same entries in another order",
+            vec![
+                Attribute::text("One", Some("1")),
+                Attribute::text("Two", Some("2")),
+            ],
+            vec![
+                Attribute::text("Two", Some("2")),
+                Attribute::text("One", Some("1")),
+            ],
+        ),
+        (
+            "another attribute type",
+            vec![Attribute::media("Asset", "IMAGE", Some(PNG))],
+            vec![Attribute::media("Asset", "DOCUMENT", Some(PNG))],
+        ),
+        (
+            "other uploaded bytes",
+            vec![Attribute::media("Picture", "IMAGE", Some(PNG))],
+            vec![Attribute::media("Picture", "IMAGE", Some(JPEG))],
+        ),
+        (
+            "an omitted value sent as an empty one",
+            vec![Attribute::text("Blank", None)],
+            vec![Attribute::text("Blank", Some(""))],
+        ),
+    ];
+
+    for (case, first, second) in cases {
+        let profile = em.profile("Token owner").await;
+        let token = format!("token-{case}").replace(' ', "-");
+        let mut body = batch(&first);
+        body["clientToken"] = json!(token);
+
+        let created = em.create_attributes(&profile, body.clone()).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case}: the first call must be served, got {} / {:?}",
+            created.status, created.body
+        );
+        let after_first = em.listed_names(&profile).await;
+
+        // A repeat of the very same request is served what that request created ...
+        let repeat = em.create_attributes(&profile, body).await;
+        assert_eq!(
+            repeat.status, 200,
+            "case {case}: a repeat of the same request must be served, got {} / {:?}",
+            repeat.status, repeat.body
+        );
+        let reported: Vec<Value> = repeat
+            .attributes()
+            .iter()
+            .map(|entry| entry["attributeName"].clone())
+            .collect();
+        assert_eq!(
+            reported,
+            first.iter().map(|held| json!(held.name)).collect::<Vec<_>>(),
+            "case {case}: a repeat must report the attributes the first call created, got {:?}",
+            repeat.body
+        );
+
+        // ... while the same token beside other parameters is refused, before any
+        // state-conflict the repeated names would otherwise meet.
+        let mut other = batch(&second);
+        other["clientToken"] = json!(token);
+        let refused = em.create_attributes(&profile, other).await;
+        assert_eq!(
+            (refused.status, refused.error.as_deref()),
+            (400, Some("ValidationException")),
+            "case {case}: a reuse of the token for other parameters must be refused, got {} / \
+             {:?}",
+            refused.status,
+            refused.body
+        );
+        assert_eq!(
+            refused.string("message"),
+            IDEMPOTENCY_MISMATCH,
+            "case {case}: unexpected refusal message, got {:?}",
+            refused.body
+        );
+        assert_eq!(
+            refused.member("fieldList"),
+            &Value::Null,
+            "case {case}: the refusal is about the request as a whole, so it names no member, \
+             got {:?}",
+            refused.body
+        );
+
+        // The refused request created nothing: an attribute only IT named is not there.
+        for requested in &second {
+            if first.iter().any(|held| held.name == requested.name) {
+                continue;
+            }
+            let read = em.get_attribute(&profile, requested.name).await;
+            assert_eq!(
+                (read.status, read.error.as_deref()),
+                (404, Some("ResourceNotFoundException")),
+                "case {case}: {:?} must not have been created, got {} / {:?}",
+                requested.name,
+                read.status,
+                read.body
+            );
+        }
+
+        // And what the first call created is untouched: still listed exactly once each,
+        // still holding the value it was created with.
+        assert_eq!(
+            em.listed_names(&profile).await,
+            after_first,
+            "case {case}: a refused reuse must leave the profile's attributes as they were"
+        );
+        for requested in &first {
+            let occurrences = after_first
+                .iter()
+                .filter(|name| name.as_str() == requested.name)
+                .count();
+            assert_eq!(
+                occurrences, 1,
+                "case {case}: {:?} must be listed exactly once, got {occurrences} in \
+                 {after_first:?}",
+                requested.name
+            );
+            let read = em.get_attribute(&profile, requested.name).await;
+            assert_eq!(
+                read.member("attributeValue"),
+                &requested.value.map_or(Value::Null, |value| json!(value)),
+                "case {case}: {:?} must keep the value the first call stored, got {:?}",
+                requested.name,
+                read.body
+            );
+        }
+    }
+}
+
+/// The profile the attributes are created under is one of the request's parameters, so the
+/// same token carrying the same list against ANOTHER profile is a reuse of it too.
+#[tokio::test]
+async fn a_client_token_reused_against_another_profile_is_refused() {
+    let em = Emulator::new();
+    let attributes = vec![
+        Attribute::text("Shared Note", Some("v")),
+        Attribute::media("Shared Logo", "IMAGE", Some(PNG)),
+    ];
+    let owner = em.profile("Token owner").await;
+    let other_owner = em.profile("Another owner").await;
+
+    let mut body = batch(&attributes);
+    body["clientToken"] = json!("token-for-one-profile");
+    let created = em.create_attributes(&owner, body.clone()).await;
+    assert_eq!(
+        created.status, 200,
+        "the first call must be served, got {} / {:?}",
+        created.status, created.body
+    );
+
+    let refused = em.create_attributes(&other_owner, body).await;
+    assert_eq!(
+        (refused.status, refused.error.as_deref()),
+        (400, Some("ValidationException")),
+        "the same token against another profile must be refused, got {} / {:?}",
+        refused.status,
+        refused.body
+    );
+    assert_eq!(
+        refused.string("message"),
+        IDEMPOTENCY_MISMATCH,
+        "unexpected refusal message, got {:?}",
+        refused.body
+    );
+    for requested in &attributes {
+        let read = em.get_attribute(&other_owner, requested.name).await;
+        assert_eq!(
+            (read.status, read.error.as_deref()),
+            (404, Some("ResourceNotFoundException")),
+            "{:?} must not have been created under the other profile, got {} / {:?}",
+            requested.name,
+            read.status,
+            read.body
+        );
+        let held = em.get_attribute(&owner, requested.name).await;
+        assert_eq!(
+            held.status, 200,
+            "{:?} must still be held by the profile the token served, got {} / {:?}",
+            requested.name, held.status, held.body
         );
     }
 }

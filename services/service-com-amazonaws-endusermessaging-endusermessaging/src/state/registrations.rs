@@ -382,7 +382,6 @@ impl ComAmazonawsEndusermessagingEndusermessagingState {
                             description: None,
                             category: None,
                             media: None,
-                            client_token: None,
                             created_at: at,
                             updated_at: at,
                         },

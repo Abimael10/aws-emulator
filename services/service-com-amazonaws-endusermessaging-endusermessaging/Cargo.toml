@@ -24,6 +24,10 @@ tracing = { workspace = true }
 # Opaque pagination tokens: hex-encodes the continuation key so the token stays
 # inside `NextToken`'s modelled pattern whatever a resource id contains.
 hex = { workspace = true }
+# Fingerprints the parameters an idempotency token served, so a replay carrying other
+# parameters is told apart from a repeat of the request itself without keeping a copy of
+# the uploaded attachment bytes.
+sha2 = { workspace = true }
 # Draws the characters of a one-time passcode uniformly from the character set the
 # resolved code type names.
 rand = "0.9"
@@ -42,7 +46,6 @@ service-common = { path = "../common" }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
 # Encodes an attachment body the way restJson1 carries a blob member, so the tests
 # upload media over the same wire an SDK client does.
 base64 = "0.22"

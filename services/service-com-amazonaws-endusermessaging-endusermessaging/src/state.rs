@@ -235,6 +235,15 @@ pub struct ComAmazonawsEndusermessagingEndusermessagingState {
     /// The order [`Self::create_tokens`] was written in, so the cap evicts the
     /// oldest token rather than an arbitrary one.
     create_token_order: VecDeque<String>,
+    /// `CreateBrandProfileAttributes` idempotency: `clientToken` -> the attributes it
+    /// created and the fingerprint of the request it served
+    /// ([`CreatedBrandProfileAttributes`]). Bounded by
+    /// [`MAX_ATTRIBUTE_CREATE_TOKENS`]; write it through
+    /// [`Self::record_attribute_create_token`], never directly.
+    pub attribute_create_tokens: HashMap<String, CreatedBrandProfileAttributes>,
+    /// The order [`Self::attribute_create_tokens`] was written in, so the cap evicts
+    /// the oldest token rather than an arbitrary one.
+    attribute_create_token_order: VecDeque<String>,
 }
 
 impl ComAmazonawsEndusermessagingEndusermessagingState {
@@ -282,33 +291,44 @@ impl ComAmazonawsEndusermessagingEndusermessagingState {
         brand_profile_id: &str,
         request: BrandProfileCreate,
     ) {
-        while self.create_tokens.len() >= MAX_CREATE_TOKENS {
-            match self.create_token_order.pop_front() {
-                Some(oldest) => {
-                    self.create_tokens.remove(&oldest);
-                }
-                // The order queue and the map are written together, so this is
-                // unreachable; clearing rather than looping forever keeps the cap
-                // an invariant even if they ever drift.
-                None => {
-                    self.create_tokens.clear();
-                    break;
-                }
-            }
-        }
-        if self
-            .create_tokens
-            .insert(
-                token.clone(),
-                CreatedBrandProfile {
-                    brand_profile_id: brand_profile_id.to_string(),
-                    request,
-                },
-            )
-            .is_none()
-        {
-            self.create_token_order.push_back(token);
-        }
+        record_bounded_token(
+            &mut self.create_tokens,
+            &mut self.create_token_order,
+            MAX_CREATE_TOKENS,
+            token,
+            CreatedBrandProfile {
+                brand_profile_id: brand_profile_id.to_string(),
+                request,
+            },
+        );
+    }
+
+    /// Record `token` as having created `created`'s attributes from the request that
+    /// fingerprint names, evicting the oldest token first if that would push the ledger
+    /// past [`MAX_ATTRIBUTE_CREATE_TOKENS`].
+    pub fn record_attribute_create_token(
+        &mut self,
+        token: String,
+        created: CreatedBrandProfileAttributes,
+    ) {
+        record_bounded_token(
+            &mut self.attribute_create_tokens,
+            &mut self.attribute_create_token_order,
+            MAX_ATTRIBUTE_CREATE_TOKENS,
+            token,
+            created,
+        );
+    }
+
+    /// What a previous `CreateBrandProfileAttributes` recorded for `token`: the attributes
+    /// it created and the fingerprint of the request it served, or `None` for a token this
+    /// state has no record of.
+    #[must_use]
+    pub fn brand_profile_attributes_created_by(
+        &self,
+        token: &str,
+    ) -> Option<&CreatedBrandProfileAttributes> {
+        self.attribute_create_tokens.get(token)
     }
 
     /// What a previous `CreateBrandProfile` recorded for `token`: the profile it minted
@@ -317,13 +337,19 @@ impl ComAmazonawsEndusermessagingEndusermessagingState {
         self.create_tokens.get(token)
     }
 
-    /// Drop every idempotency token that minted `brand_profile_id`, so a token
-    /// never outlives the profile it names.
+    /// Drop every idempotency token that names `brand_profile_id` — the one that minted
+    /// the profile, and those that created attributes under it — so a token never
+    /// outlives the profile it names.
     pub fn forget_create_tokens_for(&mut self, brand_profile_id: &str) {
         self.create_tokens
             .retain(|_, minted| minted.brand_profile_id != brand_profile_id);
         let live = &self.create_tokens;
         self.create_token_order.retain(|token| live.contains_key(token));
+        self.attribute_create_tokens
+            .retain(|_, created| created.brand_profile_id != brand_profile_id);
+        let live = &self.attribute_create_tokens;
+        self.attribute_create_token_order
+            .retain(|token| live.contains_key(token));
     }
 
     /// Resolve a `BrandProfileIdOrArn` to the id of a stored profile.
@@ -387,6 +413,37 @@ impl ComAmazonawsEndusermessagingEndusermessagingState {
         self.notify_code_configurations
             .values()
             .find(|record| record.client_token.as_deref() == Some(token))
+    }
+}
+
+/// Record `token` as naming `value` in an idempotency ledger, evicting the oldest token
+/// first if that would push the ledger past `cap`.
+///
+/// One eviction rule for every idempotency ledger of this service, so no ledger can
+/// accumulate caller-chosen strings without bound whatever operation writes it.
+fn record_bounded_token<T>(
+    recorded: &mut HashMap<String, T>,
+    order: &mut VecDeque<String>,
+    cap: usize,
+    token: String,
+    value: T,
+) {
+    while recorded.len() >= cap {
+        match order.pop_front() {
+            Some(oldest) => {
+                recorded.remove(&oldest);
+            }
+            // The order queue and the map are written together, so this is
+            // unreachable; clearing rather than looping forever keeps the cap
+            // an invariant even if they ever drift.
+            None => {
+                recorded.clear();
+                break;
+            }
+        }
+    }
+    if recorded.insert(token.clone(), value).is_none() {
+        order.push_back(token);
     }
 }
 

@@ -192,6 +192,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             })?;
 
+        // `clientToken` is `@idempotencyToken`: a repeat of a request already served
+        // reports the attributes that request created instead of creating a second
+        // set — and only a repeat of THAT request does. A caller that reused the token
+        // beside OTHER parameters is told so, rather than handed a second, different
+        // set of attributes created under a token that was meant to make the retry
+        // safe. The parameters a repeat is compared against are the profile the
+        // request addresses, by the id it resolved to, and every member of every entry
+        // it lists; they are fingerprinted only where a token makes the comparison
+        // possible at all.
+        let idempotency = input.client_token.clone().map(|token| {
+            let fingerprint = crate::state::brand_profile_attributes_fingerprint(
+                &brand_profile_id,
+                &input.attributes,
+            );
+            (token, fingerprint)
+        });
+        let mut recorded = None;
+        if let Some((token, fingerprint)) = &idempotency {
+            if let Some(created) = store.brand_profile_attributes_created_by(token) {
+                if created.request_fingerprint != *fingerprint {
+                    return Err(
+                        CreateBrandProfileAttributesErrorModeled::ValidationException(
+                            crate::state::idempotency_mismatch(),
+                        )
+                        .into(),
+                    );
+                }
+                recorded = Some(created.clone());
+            }
+        }
+
         // How much media the store already holds, read before the profile is borrowed
         // for writing: the ceiling it is compared against is a ceiling on the whole
         // store, not on one profile.
@@ -212,24 +243,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // `clientToken` is `@idempotencyToken`: a repeat of a request already served
-        // reports the attributes that request created instead of creating a second
-        // set. A request naming an attribute this token did not create is not a
-        // repeat of it, and takes the ordinary path below.
-        if let Some(token) = input.client_token.as_deref() {
-            let replayed: Option<Vec<ReportedAttribute>> = input
-                .attributes
+        // The token served this very request, so what it created is what this call
+        // reports: read back off the records the store holds now, rather than from a
+        // remembered answer. An attribute a delete has since removed is no longer there
+        // to report, so such a request is served as the create it is.
+        if let Some(recorded) = recorded {
+            let replayed: Option<Vec<ReportedAttribute>> = recorded
+                .attribute_names
                 .iter()
-                .map(|requested| {
-                    profile
-                        .attributes
-                        .get(&requested.attribute_name)
-                        .filter(|held| held.client_token.as_deref() == Some(token))
-                        .map(|held| ReportedAttribute {
-                            name: held.name.clone(),
-                            attribute_type: held.attribute_type.clone(),
-                            holds_media: held.media.is_some(),
-                        })
+                .map(|name| {
+                    profile.attributes.get(name).map(|held| ReportedAttribute {
+                        name: held.name.clone(),
+                        attribute_type: held.attribute_type.clone(),
+                        holds_media: held.media.is_some(),
+                    })
                 })
                 .collect();
             if let Some(created) = replayed {
@@ -358,7 +385,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 description: requested.description.clone(),
                 category: requested.category.clone(),
                 media,
-                client_token: input.client_token.clone(),
                 created_at: now,
                 updated_at: now,
             });
@@ -403,6 +429,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 reported
             })
             .collect();
+        // Record what this token served, so a repeat of this request is answered from
+        // the attributes it created and a reuse of the token beside other parameters is
+        // refused. Written only for a create that was ADMITTED: a refused request
+        // created nothing for a later call to be served.
+        if let Some((token, fingerprint)) = idempotency {
+            store.record_attribute_create_token(
+                token,
+                crate::state::CreatedBrandProfileAttributes {
+                    brand_profile_id: brand_profile_id.clone(),
+                    attribute_names: created
+                        .iter()
+                        .map(|attribute| attribute.name.clone())
+                        .collect(),
+                    request_fingerprint: fingerprint,
+                },
+            );
+        }
         Ok(output_for(ctx, &brand_profile_id, created))
     }
 }

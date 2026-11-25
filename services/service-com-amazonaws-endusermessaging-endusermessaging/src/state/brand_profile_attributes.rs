@@ -42,10 +42,6 @@ pub struct BrandProfileAttribute {
     /// which carries its value inline, and for a media attribute nothing has
     /// supplied media for yet: no bytes are invented for one.
     pub media: Option<BrandProfileAttributeMedia>,
-    /// The `clientToken` of the request that created this attribute, when it carried
-    /// one. Kept on the record rather than in a map beside it, so the token lives and
-    /// dies with the attribute it names and is bounded by the same ceiling.
-    pub client_token: Option<String>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
 }
@@ -115,6 +111,104 @@ pub fn carries_media(attribute_type: &str) -> bool {
 /// attributes can page back. `CreateBrandProfileAttributes` models
 /// `ServiceQuotaExceededException`, which is the refusal once a profile is full.
 pub const MAX_BRAND_PROFILE_ATTRIBUTES: usize = 100;
+
+/// The most `clientToken` entries kept for `CreateBrandProfileAttributes` idempotency.
+///
+/// A ceiling on this emulator's heap, not a guess at AWS's published quota. The ledger is
+/// store-WIDE — one entry per token-bearing create, whichever profile it addressed, and the
+/// entries naming a profile are dropped with that profile — so it is bounded the way the
+/// attributes themselves are: at as many entries as every profile the store holds could
+/// hold attributes ([`super::MAX_BRAND_PROFILES`] times
+/// [`MAX_BRAND_PROFILE_ATTRIBUTES`]), which covers every create that can have added one.
+/// Past that the OLDEST token is evicted, so a retry carrying an evicted token is answered
+/// as the create it is rather than as a repeat of its request — a conflict where the names
+/// it asks for are still held.
+pub const MAX_ATTRIBUTE_CREATE_TOKENS: usize =
+    super::MAX_BRAND_PROFILES * MAX_BRAND_PROFILE_ATTRIBUTES;
+
+/// What a recorded `CreateBrandProfileAttributes` idempotency token created: the profile it
+/// created attributes under, which attributes it created there, and the fingerprint of the
+/// request it served.
+#[derive(Debug, Clone)]
+pub struct CreatedBrandProfileAttributes {
+    /// The stored `brandProfileId` the attributes were created under.
+    pub brand_profile_id: String,
+    /// The names created, in the order the request listed them, so a repeat of that
+    /// request reports those attributes back off the store in the order it asked for.
+    pub attribute_names: Vec<String>,
+    /// The fingerprint of the parameters this token served
+    /// ([`brand_profile_attributes_fingerprint`]), which is what tells a repeat of the
+    /// request from a reuse of the token alone.
+    pub request_fingerprint: String,
+}
+
+/// The fingerprint of the parameters a `CreateBrandProfileAttributes` request asks for: the
+/// profile it addresses, and every member of every entry of its `attributes` list in the
+/// order the list gives them.
+///
+/// `clientToken` is `@idempotencyToken`, so a repeat of a request already served reports
+/// what that request created, while a reuse of the token alone — the same token beside
+/// OTHER parameters — is refused ([`super::idempotency_mismatch`]) rather than served as a
+/// fresh create. Telling the two apart needs the parameters the token served to still be
+/// known when the second request arrives, and they are kept as a digest rather than as a
+/// copy of the request because `attachmentBody` admits 5 MiB of uploaded media per entry: a
+/// fingerprint is the same size whatever the request carried.
+///
+/// Every part is absorbed with its own length in front of it, so no two different requests
+/// run together into the same digest, and an absent optional member is absorbed as absent
+/// rather than as an empty value — a request that omits one asks for something different
+/// from one that sends it empty.
+#[must_use]
+pub fn brand_profile_attributes_fingerprint(
+    brand_profile_id: &str,
+    attributes: &[crate::ops::types::BrandProfileAttributeInput],
+) -> String {
+    use ::sha2::Digest as _;
+
+    let mut digest = ::sha2::Sha256::new();
+    absorb(&mut digest, brand_profile_id.as_bytes());
+    absorb_count(&mut digest, attributes.len());
+    for entry in attributes {
+        absorb(&mut digest, entry.attribute_name.as_bytes());
+        absorb(&mut digest, entry.attribute_type.as_bytes());
+        absorb_optional(&mut digest, entry.attribute_value.as_deref().map(str::as_bytes));
+        absorb_optional(&mut digest, entry.attachment_body.as_deref());
+        absorb_optional(&mut digest, entry.description.as_deref().map(str::as_bytes));
+        absorb_optional(&mut digest, entry.category.as_deref().map(str::as_bytes));
+    }
+    ::hex::encode(digest.finalize())
+}
+
+/// Absorb one value into `digest`, length first, so the boundary between two values is
+/// part of what is digested.
+fn absorb(digest: &mut ::sha2::Sha256, value: &[u8]) {
+    use ::sha2::Digest as _;
+
+    absorb_count(digest, value.len());
+    digest.update(value);
+}
+
+/// Absorb a count into `digest`, in a fixed width so one count is never read as part of
+/// the value beside it.
+fn absorb_count(digest: &mut ::sha2::Sha256, count: usize) {
+    use ::sha2::Digest as _;
+
+    digest.update(u64::try_from(count).unwrap_or(u64::MAX).to_be_bytes());
+}
+
+/// Absorb an optional value into `digest`: whether it is there at all, and then the value
+/// where it is.
+fn absorb_optional(digest: &mut ::sha2::Sha256, value: Option<&[u8]>) {
+    use ::sha2::Digest as _;
+
+    match value {
+        Some(value) => {
+            digest.update([1u8]);
+            absorb(digest, value);
+        }
+        None => digest.update([0u8]),
+    }
+}
 
 /// The most attribute media this emulator holds across the whole store, in bytes.
 ///
@@ -593,7 +687,6 @@ pub fn default_brand_profile_attributes(
                     description: None,
                     category: Some(slot.category.to_string()),
                     media: None,
-                    client_token: None,
                     created_at,
                     updated_at: created_at,
                 },
