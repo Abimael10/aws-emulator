@@ -666,6 +666,42 @@ pub fn user_properties_document(properties: &[(String, String)]) -> Option<Strin
     ::serde_json::to_string(&entries).ok()
 }
 
+/// The `userProperties` document an `x-amz-mqtt5-user-properties` HTTP HEADER carries.
+///
+/// The member is a `@mediaType("application/json")` string bound to a header
+/// (`PublishRequest$userProperties`, `SendDirectMessageRequest$userProperties`), and such a
+/// value travels BASE64-encoded on the wire — "If you don't use Amazon Web Services SDK or
+/// CLI, you must encode the JSON string to base64 format before adding it to the HTTP
+/// header", which is the encoding an SDK applies for the caller. So the document is the
+/// base64-DECODED text when the header carries base64 of one, and the header's own text
+/// when it carries the document itself, which is what a caller that encoded none sent.
+///
+/// A value that spells no user-property document either way is kept exactly as it arrived:
+/// nothing a caller sent is thrown away here, and [`user_property_pairs`] reads no property
+/// out of it.
+#[must_use]
+pub fn user_properties_of_header(value: &str) -> String {
+    if spells_user_properties(value) {
+        return value.to_string();
+    }
+    use ::base64::Engine as _;
+    let decoded = ::base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .ok()
+        .and_then(|decoded| String::from_utf8(decoded).ok())
+        .filter(|decoded| spells_user_properties(decoded));
+    decoded.unwrap_or_else(|| value.to_string())
+}
+
+/// Whether `text` spells a `userProperties` document at all: "A JSON string that contains an
+/// array of JSON objects" (`PublishRequest$userProperties`), so only a JSON array is one.
+fn spells_user_properties(text: &str) -> bool {
+    matches!(
+        ::serde_json::from_str::<::serde_json::Value>(text),
+        Ok(::serde_json::Value::Array(_))
+    )
+}
+
 /// The user properties a `userProperties` document spells, in the order it wrote them: one
 /// name and value pair per entry of the array, and nothing at all for a document that is no
 /// array of objects of strings.
@@ -729,6 +765,15 @@ mod tests {
         &'static str,
         &'static [(&'static str, &'static str)],
         Option<&'static str>,
+    );
+
+    /// One row of the user-property HEADER cases: what it is, the header's own text, the
+    /// document read out of it, and the pairs that document spells.
+    type UserPropertyHeaderRow = (
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static [(&'static str, &'static str)],
     );
 
     /// RULE: the protocol level sits at a fixed position in the CONNECT's own variable
@@ -1243,6 +1288,69 @@ mod tests {
             assert!(
                 read.is_empty(),
                 "case {case:?}: expected no user property, got {read:?}"
+            );
+        }
+    }
+
+    /// RULE: the `userProperties` HEADER carries the document base64-encoded — the encoding
+    /// an SDK applies to a `@mediaType("application/json")` header value — so the document
+    /// read out of it is the decoded text; a header carrying the document itself is read as
+    /// it stands, and a value that spells no document either way is kept verbatim.
+    ///
+    /// The rows span what the rule generalises over: the document in the clear, the same
+    /// document base64-encoded, base64 of a document with several properties, base64 of text
+    /// that is no document, a value that is neither, and the empty header. The base64 is
+    /// written out rather than computed, so the case states the encoding instead of
+    /// borrowing it from the code under test.
+    #[test]
+    fn a_user_properties_header_is_read_whether_or_not_it_is_base64() {
+        let rows: &[UserPropertyHeaderRow] = &[
+            (
+                "the document in the clear",
+                r#"[{"deviceName": "alpha"}]"#,
+                r#"[{"deviceName": "alpha"}]"#,
+                &[("deviceName", "alpha")],
+            ),
+            (
+                "the same document base64-encoded",
+                "W3siZGV2aWNlTmFtZSI6ICJhbHBoYSJ9XQ==",
+                r#"[{"deviceName": "alpha"}]"#,
+                &[("deviceName", "alpha")],
+            ),
+            (
+                "base64 of two properties",
+                "W3siYSI6ICJhbHBoYSJ9LCB7ImIiOiAiYmV0YSJ9XQ==",
+                r#"[{"a": "alpha"}, {"b": "beta"}]"#,
+                &[("a", "alpha"), ("b", "beta")],
+            ),
+            (
+                "base64 of text that is no document",
+                "ZGV2aWNlTmFtZT1hbHBoYQ==",
+                "ZGV2aWNlTmFtZT1hbHBoYQ==",
+                &[],
+            ),
+            (
+                "a value that is neither",
+                "deviceName=alpha",
+                "deviceName=alpha",
+                &[],
+            ),
+            ("the empty header", "", "", &[]),
+        ];
+        for (case, header, expected, expected_pairs) in rows {
+            let document = user_properties_of_header(header);
+            assert_eq!(
+                document, *expected,
+                "case {case:?}: expected {expected:?}, got {document:?}"
+            );
+            let pairs = user_property_pairs(&document);
+            let expected_pairs: Vec<(String, String)> = expected_pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect();
+            assert_eq!(
+                pairs, expected_pairs,
+                "case {case:?}: expected the pairs {expected_pairs:?}, got {pairs:?}"
             );
         }
     }

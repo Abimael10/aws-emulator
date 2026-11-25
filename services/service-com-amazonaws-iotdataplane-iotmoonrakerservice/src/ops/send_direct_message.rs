@@ -277,7 +277,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 qos: delivery_qos(input.confirmation),
                 content_type: input.content_type.clone(),
                 response_topic: input.response_topic.clone(),
-                user_properties: input.user_properties.clone(),
+                // The `userProperties` header carries the document base64-encoded — the
+                // encoding an SDK applies to a `@mediaType("application/json")` header —
+                // so the document is read out of it rather than stored as the header's own
+                // text, which carries no property at all
+                // ([`::service_common::iot_mqtt_broker::wire::protocol::user_properties_of_header`]).
+                user_properties: input
+                    .user_properties
+                    .as_deref()
+                    .map(::service_common::iot_mqtt_broker::wire::protocol::user_properties_of_header),
                 payload_format_indicator: input.payload_format_indicator.clone(),
                 correlation_data: input.correlation_data.clone(),
                 // `SendDirectMessage` models no message expiry, so a direct message

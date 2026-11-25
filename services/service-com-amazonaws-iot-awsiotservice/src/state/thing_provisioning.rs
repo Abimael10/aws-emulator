@@ -38,7 +38,9 @@ use std::time::SystemTime;
 
 use ::serde_json::{Map, Value};
 
-use super::thing_registration::{render_text, unresolved_reference, ProvisioningTemplate, REF_FUNCTION};
+use super::thing_registration::{
+    render_text, unresolved_reference, ProvisioningTemplate, Substitutions, REF_FUNCTION,
+};
 use super::ComAmazonawsIotAwsiotserviceState;
 use crate::ops::types::CERTIFICATE_STATUS_VALUES;
 
@@ -247,6 +249,21 @@ pub fn settable_certificate_statuses() -> Vec<&'static str> {
         .collect()
 }
 
+/// The settable `CertificateStatus` value `declared` names, in the MODELLED spelling, and
+/// `None` for a value that names none.
+///
+/// Matched without regard to case: a provisioning template declares the status as text and
+/// AWS's own fleet provisioning templates spell it `Active`, while the record carries a
+/// modelled `CertificateStatus` value — so the declaration is read case-insensitively and
+/// what is recorded is the model's own spelling.
+#[must_use]
+pub fn settable_certificate_status(declared: &str) -> Option<String> {
+    settable_certificate_statuses()
+        .into_iter()
+        .find(|status| status.eq_ignore_ascii_case(declared))
+        .map(str::to_string)
+}
+
 /// How this service states that a policy resource names no policy and describes none
 /// either: without a `PolicyName` or a `PolicyDocument` the declaration provisions nothing.
 pub fn unnamed_policy_message(logical_id: &str) -> String {
@@ -303,6 +320,14 @@ pub struct ProvisionedResources {
     /// reports and what `DescribeCertificate` reads are one value. `None` for a template
     /// that declares no certificate.
     pub certificate_pem: Option<String>,
+    /// The `thingName` of the thing the template's thing resource registered — the name the
+    /// thing registry now holds it under.
+    ///
+    /// Reported beside the ARNs because a caller that provisions a device and then tells it
+    /// its own name needs the NAME and not only the ARN
+    /// ([`super::mqtt_provisioning`], whose accepted answer carries it); `RegisterThing`
+    /// itself models no member for it and leaves it unread.
+    pub thing_name: String,
 }
 
 /// One resource of a template's `Resources` section, as the body declares it.
@@ -421,6 +446,7 @@ pub fn provision_template(
     let mut provisioned = ProvisionedResources {
         resource_arns: BTreeMap::from([(thing_logical_id, registered.thing_arn)]),
         certificate_pem: None,
+        thing_name: thing_name.clone(),
     };
 
     if let Some(policy) = &policy {
@@ -556,21 +582,29 @@ struct PlannedCertificate {
 fn planned_certificate(
     store: &ComAmazonawsIotAwsiotserviceState,
     resource: &DeclaredResource,
-    substitutions: &BTreeMap<String, String>,
+    substitutions: &Substitutions,
 ) -> Result<PlannedCertificate, ProvisioningRefusal> {
     // A status no caller may set is a fact about the BODY, independent of what the account
-    // holds, so it is refused before the store is consulted at all.
-    let status = resource
+    // holds, so it is refused before the store is consulted at all. The value is matched
+    // WITHOUT regard to case and recorded in the modelled spelling: AWS's own fleet
+    // provisioning templates declare the device certificate's status as `Active`, and the
+    // record carries a `CertificateStatus` value, so one template body cannot be readable to
+    // the provisioning paths and unreadable to the registry.
+    let declared = resource
         .properties
         .get(CERTIFICATE_STATUS_PROPERTY)
         .and_then(|property| render_text(property, substitutions));
-    if let Some(status) = &status {
-        if !settable_certificate_statuses().contains(&status.as_str()) {
-            return Err(ProvisioningRefusal::Template(
-                unmodeled_certificate_status_message(&resource.logical_id, status),
-            ));
-        }
-    }
+    let status = match &declared {
+        None => None,
+        Some(declared) => Some(
+            settable_certificate_status(declared).ok_or_else(|| {
+                ProvisioningRefusal::Template(unmodeled_certificate_status_message(
+                    &resource.logical_id,
+                    declared,
+                ))
+            })?,
+        ),
+    };
 
     let named_id = resource
         .properties
@@ -661,7 +695,7 @@ enum PolicyProvision {
 fn planned_policy(
     store: &ComAmazonawsIotAwsiotserviceState,
     resource: &DeclaredResource,
-    substitutions: &BTreeMap<String, String>,
+    substitutions: &Substitutions,
 ) -> Result<PlannedPolicy, ProvisioningRefusal> {
     // A template may state the document as the JSON object it is, or as the text of one;
     // either way the policy is created from the document text the registry keeps.

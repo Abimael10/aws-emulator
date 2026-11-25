@@ -1223,6 +1223,20 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// `ListManagedJobTemplates` and `DescribeManagedJobTemplate` read the one
     /// collection, exactly as the registries above are read.
     pub managed_job_templates: ManagedJobTemplateCatalog,
+    /// The certificate OWNERSHIP TOKENS the fleet-provisioning MQTT exchange has minted,
+    /// keyed by the token itself — see [`mqtt_provisioning`].
+    ///
+    /// A device that creates its certificate over the reserved provisioning topics is
+    /// handed a `certificateOwnershipToken` with it, and it proves ownership of that
+    /// certificate with the token when it then provisions its thing, so the token has to
+    /// resolve to the certificate it was minted for.
+    ///
+    /// Bounded by the certificate store's own ceiling
+    /// ([`MAX_CERTIFICATES`]): one token is minted per certificate created over that
+    /// exchange, and a token that proves nothing any more — one past its own validity, or one
+    /// whose certificate the account no longer holds — is released
+    /// ([`mqtt_provisioning::released_ownership_tokens`]).
+    pub certificate_ownership_tokens: BTreeMap<String, CertificateOwnership>,
 }
 
 impl ComAmazonawsIotAwsiotserviceState {
@@ -3754,6 +3768,16 @@ pub use provisioning_templates::{
 pub mod thing_provisioning;
 pub use thing_provisioning::{
     provision_template, ProvisionedResources, ProvisioningRefusal,
+};
+
+// FLEET PROVISIONING over the broker's reserved MQTT topics — the certificate a device
+// creates for itself, the ownership token it proves that certificate with, and the template
+// run that registers its thing — lives in `state/mqtt_provisioning.rs`, beside the one
+// provisioning walk it shares with `RegisterThing`.
+pub mod mqtt_provisioning;
+pub use mqtt_provisioning::{
+    served_provisioning_request, CertificateOwnership, Exchange as ProvisioningExchange,
+    Refusal as ProvisioningMqttRefusal,
 };
 
 // What a STREAM is — the record one holds, the files it streams and what every reader of

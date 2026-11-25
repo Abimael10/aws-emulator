@@ -180,6 +180,25 @@ const ROWS: &[Row] = &[
         expected_payload_format: None,
         correlation_data: None,
     },
+    Row {
+        // The `userProperties` member is a `@mediaType("application/json")` string bound to
+        // a header, so an SDK sends the document BASE64-encoded ("you must encode the JSON
+        // string to base64 format before adding it to the HTTP header"). The base64 is
+        // written out rather than computed, so the case states the encoding instead of
+        // borrowing it from the code under test: it is `[{"a": "alpha"}, {"b": "beta"}]`.
+        case: "user properties sent base64-encoded, as an SDK sends them",
+        topic: "devices/mqtt5/sensor-7/telemetry",
+        payload: r#"{"temperature":19.5}"#,
+        qos: 1,
+        message_expiry: 0,
+        content_type: None,
+        response_topic: None,
+        user_properties: Some("W3siYSI6ICJhbHBoYSJ9LCB7ImIiOiAiYmV0YSJ9XQ=="),
+        expected_user_properties: &[("a", "alpha"), ("b", "beta")],
+        payload_format_indicator: None,
+        expected_payload_format: None,
+        correlation_data: None,
+    },
 ];
 
 /// A SigV4 credential scope naming `signing_name` in [`REGION`] — the signal the router

@@ -58,6 +58,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PublicationSink
         publication: Publication,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'sink>> {
         Box::pin(async move {
+            // A publication a device made on one of the broker's reserved FLEET PROVISIONING
+            // topics is SERVED as well as evaluated: the certificate it asks for is created,
+            // or the template it names is carried out, and the device is answered on that
+            // topic's own `accepted` or `rejected` topic
+            // ([`crate::state::mqtt_provisioning`]). Every other topic reaches the rules
+            // below and nothing else, and a provisioning request reaches them too — a rule
+            // whose statement covers a reserved topic is a rule about that topic either way,
+            // and nothing of the exchange is reported to the publisher.
+            let _served = crate::state::served_provisioning_request(
+                &*self.engine,
+                &self.region,
+                &publication.topic,
+                &publication.payload,
+            )
+            .await;
             // The parts a context is built over name nothing: a publication on the broker's
             // wire serves no request, so there is no caller, no credential and no body — the
             // Region the actions run in is the one this sink was installed for, and the calls

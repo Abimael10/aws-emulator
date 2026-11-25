@@ -102,6 +102,13 @@ const RESOURCES_MEMBER: &str = "Resources";
 const TYPE_MEMBER: &str = "Type";
 const PROPERTIES_MEMBER: &str = "Properties";
 
+/// The section a template declares the tables [`FIND_IN_MAP_FUNCTION`] reads under, which
+/// AWS IoT's own documented provisioning template carries beside its parameters.
+const MAPPINGS_MEMBER: &str = "Mappings";
+
+/// The section a template declares what a provisioned device is told about itself under.
+const DEVICE_CONFIGURATION_MEMBER: &str = "DeviceConfiguration";
+
 /// The intrinsic function a template property substitutes a parameter value with:
 /// `{"Ref": "<parameter name>"}`.
 ///
@@ -109,6 +116,22 @@ const PROPERTIES_MEMBER: &str = "Properties";
 /// ([`super::thing_provisioning`]) names the function in the refusal it states a reference it
 /// could not resolve with.
 pub(super) const REF_FUNCTION: &str = "Ref";
+
+/// The intrinsic function a template property COMPOSES a value with: `{"Fn::Join": ["<the
+/// delimiter>", [<the values>]]}`, each value rendered as the text it means and the whole
+/// joined by the delimiter.
+///
+/// AWS IoT's own documented provisioning template composes the thing's name and its thing
+/// type with it (`"ThingName": {"Fn::Join": ["", ["ThingPrefix_", {"Ref": "SerialNumber"}]]}`,
+/// AWS IoT Core Developer Guide, "Provisioning templates"), so a property that states one is
+/// a property this reading renders rather than one it cannot read.
+pub(super) const JOIN_FUNCTION: &str = "Fn::Join";
+
+/// The intrinsic function a template property LOOKS UP a value with:
+/// `{"Fn::FindInMap": ["<table>", "<top-level key>", "<second-level key>"]}`, read out of the
+/// template's own `Mappings` section — the function AWS IoT's documented provisioning
+/// template builds a device's configuration with.
+pub(super) const FIND_IN_MAP_FUNCTION: &str = "Fn::FindInMap";
 
 /// The properties of the `AWS::IoT::Thing` resource this registry can provision: the thing's
 /// name, its attributes, its thing type and its billing group — which is exactly the
@@ -225,9 +248,16 @@ pub struct ProvisioningTemplate {
     /// `Parameters`: the declared name of each parameter that carries a `Default`, and that
     /// default — what a line which does not supply the parameter provisions with.
     defaults: BTreeMap<String, String>,
+    /// `Mappings`: the tables [`FIND_IN_MAP_FUNCTION`] reads a value out of, as the template
+    /// declares them.
+    mappings: Map<String, Value>,
     /// The `Properties` of the template's thing resource, with their `Ref`s unsubstituted:
     /// the same properties serve every line of the file.
     thing_properties: Map<String, Value>,
+    /// `DeviceConfiguration`: what a provisioned device is told about itself, with its `Ref`s
+    /// unsubstituted — the section the fleet-provisioning exchange answers a device with
+    /// ([`super::mqtt_provisioning`]), empty for a template that declares none.
+    device_configuration: Map<String, Value>,
 }
 
 impl ProvisioningTemplate {
@@ -240,6 +270,16 @@ impl ProvisioningTemplate {
             .get(PARAMETERS_MEMBER)
             .and_then(Value::as_object)
             .map(declared_defaults)
+            .unwrap_or_default();
+        let mappings = template
+            .get(MAPPINGS_MEMBER)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let device_configuration = template
+            .get(DEVICE_CONFIGURATION_MEMBER)
+            .and_then(Value::as_object)
+            .cloned()
             .unwrap_or_default();
         let Some(resources) = template.get(RESOURCES_MEMBER).and_then(Value::as_object) else {
             return Err(TemplateRejection::NoResources);
@@ -254,8 +294,17 @@ impl ProvisioningTemplate {
             .clone();
         Ok(Self {
             defaults,
+            mappings,
             thing_properties,
+            device_configuration,
         })
+    }
+
+    /// The template's `DeviceConfiguration` section, with its `Ref`s unsubstituted: an empty
+    /// map for a template that declares none, which is a device told nothing about itself.
+    #[must_use]
+    pub(super) fn declared_device_configuration(&self) -> &Map<String, Value> {
+        &self.device_configuration
     }
 
     /// The thing ONE line of the input file provisions: this template's thing properties with
@@ -296,23 +345,22 @@ impl ProvisioningTemplate {
     /// every resource a template declares, not only to its thing: the single-device
     /// provisioning path ([`super::thing_provisioning`]) renders the certificate and policy
     /// resources with these, so the two paths read one template the same way.
-    pub(super) fn substitutions(&self, parameters: &Map<String, Value>) -> BTreeMap<String, String> {
-        let mut substitutions = self.defaults.clone();
+    pub(super) fn substitutions(&self, parameters: &Map<String, Value>) -> Substitutions {
+        let mut values = self.defaults.clone();
         for (name, value) in parameters {
             if let Some(text) = scalar_text(value) {
-                substitutions.insert(name.clone(), text);
+                values.insert(name.clone(), text);
             }
         }
-        substitutions
+        Substitutions {
+            values,
+            mappings: self.mappings.clone(),
+        }
     }
 
     /// The property `name` rendered for one line, or `None` when the template states none or
     /// states one this reading cannot render.
-    fn rendered(
-        &self,
-        name: &str,
-        substitutions: &BTreeMap<String, String>,
-    ) -> Option<String> {
+    fn rendered(&self, name: &str, substitutions: &Substitutions) -> Option<String> {
         render_text(self.thing_properties.get(name)?, substitutions)
     }
 
@@ -329,7 +377,7 @@ impl ProvisioningTemplate {
     /// that provisions nothing rather than a thing with an attribute left out.
     fn rendered_attributes(
         &self,
-        substitutions: &BTreeMap<String, String>,
+        substitutions: &Substitutions,
     ) -> Option<BTreeMap<String, String>> {
         let Some(payload) = self.thing_properties.get(ATTRIBUTE_PAYLOAD_PROPERTY) else {
             return Some(BTreeMap::new());
@@ -366,23 +414,141 @@ fn declared_defaults(parameters: &Map<String, Value>) -> BTreeMap<String, String
         .collect()
 }
 
-/// One template property rendered for one line: the parameter a `{"Ref": "<name>"}` names,
-/// or the literal value the template states.
+/// What a template's properties are rendered against: the value each parameter resolves to
+/// for one device, and the tables [`FIND_IN_MAP_FUNCTION`] reads out of.
+///
+/// One value rather than two, because every property is rendered against both: a template's
+/// own `Mappings` are as much part of what a property means as its parameters are.
+#[derive(Debug, Clone, Default)]
+pub(super) struct Substitutions {
+    /// The value each parameter resolves to: the values the call supplied over the `Default`s
+    /// the template declares.
+    values: BTreeMap<String, String>,
+    /// The template's `Mappings` section, as it declares it.
+    mappings: Map<String, Value>,
+}
+
+impl Substitutions {
+    /// The value `parameter` resolves to, and `None` for one nothing gives a value for.
+    #[must_use]
+    pub(super) fn value(&self, parameter: &str) -> Option<&str> {
+        self.values.get(parameter).map(String::as_str)
+    }
+
+    /// Whether `parameter` resolves to a value at all.
+    #[must_use]
+    pub(super) fn resolves(&self, parameter: &str) -> bool {
+        self.values.contains_key(parameter)
+    }
+
+    /// The text `table[top][second]` of the template's `Mappings` spells, and `None` when the
+    /// tables hold no such entry or the entry is no scalar.
+    #[must_use]
+    fn in_map(&self, table: &str, top: &str, second: &str) -> Option<String> {
+        scalar_text(
+            self.mappings
+                .get(table)?
+                .as_object()?
+                .get(top)?
+                .as_object()?
+                .get(second)?,
+        )
+    }
+}
+
+/// How many BYTES one template property may render to.
+///
+/// CHOSEN as a process bound, not a template limit: [`JOIN_FUNCTION`] renders every value it
+/// lists, so a body whose property is a chain of joins each listing the next level more than
+/// once multiplies the rendered bytes per level — a body well inside the modelled
+/// `TemplateBody` length would render to more text than any registry could hold. A property
+/// that would render past this renders NOTHING, which makes the line unprovisionable
+/// ([`UNPROVISIONABLE_LINE_MESSAGE`]) instead of an allocation. It is far above every value a
+/// thing's own properties can carry: the modelled `ThingName` is 128 characters and an
+/// attribute value 800.
+const MAX_RENDERED_BYTES: usize = 64 * 1024;
+
+/// How deeply one template property's own intrinsic functions may nest.
+///
+/// CHOSEN as a process bound for the same reason, stated explicitly rather than left to the
+/// depth at which a JSON parser stops: the rendering walks a function's arguments, so the
+/// nesting a body states is what bounds the recursion.
+const MAX_RENDER_DEPTH: usize = 32;
+
+/// One template property rendered for one line: the parameter a `{"Ref": "<name>"}` names, the
+/// text an `Fn::Join` composes, or the entry an `Fn::FindInMap` reads out of the template's own
+/// `Mappings` — otherwise the literal value the template states.
 ///
 /// `None` when the value is one this reading cannot render as the text the property means: a
-/// `Ref` to a parameter with no value, any other intrinsic function, and a structure or list
-/// where a property's value is a scalar.
-pub(super) fn render_text(
+/// `Ref` to a parameter with no value, a function whose arguments are not the ones it takes or
+/// one of whose arguments renders nothing, any other intrinsic function, a structure or list
+/// where a property's value is a scalar, and a property that renders past the bounds above.
+pub(super) fn render_text(value: &Value, substitutions: &Substitutions) -> Option<String> {
+    rendered_within(value, substitutions, MAX_RENDER_DEPTH, MAX_RENDERED_BYTES)
+}
+
+/// [`render_text`] with the bounds it holds to carried down the walk: `depth` levels of
+/// nesting left, and `budget` BYTES left for the text this value renders to.
+///
+/// Every arm answers text no longer than `budget`, and a value that cannot be rendered inside
+/// the bounds renders nothing — so what one property costs is the budget times the depth, and
+/// not the product of the lists a body nested.
+fn rendered_within(
     value: &Value,
-    substitutions: &BTreeMap<String, String>,
+    substitutions: &Substitutions,
+    depth: usize,
+    budget: usize,
 ) -> Option<String> {
-    match value {
-        Value::Object(function) if function.len() == 1 => {
-            let parameter = function.get(REF_FUNCTION)?.as_str()?;
-            substitutions.get(parameter).cloned()
-        }
-        scalar => scalar_text(scalar),
+    let depth = depth.checked_sub(1)?;
+    let Value::Object(function) = value else {
+        return within(scalar_text(value)?, budget);
+    };
+    if function.len() != 1 {
+        return None;
     }
+    if let Some(parameter) = function.get(REF_FUNCTION) {
+        let resolved = substitutions.value(parameter.as_str()?)?;
+        return within(resolved.to_string(), budget);
+    }
+    if let Some(Value::Array(arguments)) = function.get(JOIN_FUNCTION) {
+        // `Fn::Join` takes the delimiter and the list of values to join, and every value is
+        // itself rendered — which is what makes a reference inside one resolve. Each value is
+        // rendered into what is LEFT of the budget, so the join cannot outgrow it.
+        let [delimiter, Value::Array(values)] = arguments.as_slice() else {
+            return None;
+        };
+        let delimiter = rendered_within(delimiter, substitutions, depth, budget)?;
+        let mut joined = String::new();
+        for (index, value) in values.iter().enumerate() {
+            if index > 0 {
+                if joined.len() + delimiter.len() > budget {
+                    return None;
+                }
+                joined.push_str(&delimiter);
+            }
+            let left = budget.checked_sub(joined.len())?;
+            joined.push_str(&rendered_within(value, substitutions, depth, left)?);
+        }
+        return Some(joined);
+    }
+    if let Some(Value::Array(arguments)) = function.get(FIND_IN_MAP_FUNCTION) {
+        // `Fn::FindInMap` takes the table and its two keys, each of which may itself be a
+        // reference.
+        let [table, top, second] = arguments.as_slice() else {
+            return None;
+        };
+        let table = rendered_within(table, substitutions, depth, budget)?;
+        let top = rendered_within(top, substitutions, depth, budget)?;
+        let second = rendered_within(second, substitutions, depth, budget)?;
+        return within(substitutions.in_map(&table, &top, &second)?, budget);
+    }
+    None
+}
+
+/// `text` when it fits `budget` BYTES, and `None` when it does not — the one place a rendered
+/// value is weighed against what is left of [`MAX_RENDERED_BYTES`].
+fn within(text: String, budget: usize) -> Option<String> {
+    (text.len() <= budget).then_some(text)
 }
 
 /// The parameter named by a reference inside `value` that `substitutions` gives no value
@@ -399,7 +565,7 @@ pub(super) fn render_text(
 /// own length the modelled `TemplateBody` caps.
 pub(super) fn unresolved_reference<'a>(
     value: &'a Value,
-    substitutions: &BTreeMap<String, String>,
+    substitutions: &Substitutions,
 ) -> Option<&'a str> {
     let mut pending = VecDeque::from([value]);
     while let Some(value) = pending.pop_front() {
@@ -408,7 +574,7 @@ pub(super) fn unresolved_reference<'a>(
         if let Value::Object(function) = value {
             if function.len() == 1 {
                 if let Some(parameter) = function.get(REF_FUNCTION).and_then(Value::as_str) {
-                    if substitutions.contains_key(parameter) {
+                    if substitutions.resolves(parameter) {
                         continue;
                     }
                     return Some(parameter);
@@ -845,8 +1011,9 @@ pub(super) fn s3_client(
 #[cfg(test)]
 mod tests {
     use super::{
-        planned_things, register_planned, too_many_lines_message, PlannedLine, ProvisionedThing,
-        ProvisioningTemplate, TemplateRejection, MAX_INPUT_FILE_LINES,
+        planned_things, register_planned, render_text, too_many_lines_message, PlannedLine,
+        ProvisionedThing, ProvisioningTemplate, TemplateRejection, MAX_INPUT_FILE_LINES,
+        MAX_RENDERED_BYTES, MAX_RENDER_DEPTH,
     };
     use crate::state::{
         ComAmazonawsIotAwsiotserviceState, RegisteredThing, ThingConfiguration,
@@ -857,6 +1024,195 @@ mod tests {
     /// The parameter values of one line of an input file.
     fn line(values: Value) -> Map<String, Value> {
         values.as_object().expect("an object of values").clone()
+    }
+
+    /// RULE: a template property is rendered through the intrinsic functions a provisioning
+    /// template may state it with — the parameter a `Ref` names, the text an `Fn::Join`
+    /// composes out of its own values, and the entry an `Fn::FindInMap` reads out of the
+    /// template's `Mappings` — and a value this reading cannot render as text renders
+    /// nothing.
+    ///
+    /// The rows span what the rule generalises over: a literal, each function, a reference
+    /// nested inside a function and a function nested inside one, a delimiter that joins
+    /// several values, keys that are themselves references, a lookup that names no entry,
+    /// an argument list that is not the one the function takes, another intrinsic function
+    /// altogether, and a structure where a scalar belongs.
+    #[test]
+    fn a_property_is_rendered_through_the_intrinsic_functions_a_template_may_state() {
+        let template = ProvisioningTemplate::read(
+            &json!({
+                "Parameters": {
+                    "SerialNumber": { "Type": "String" },
+                    "DeviceLocation": { "Type": "String", "Default": "Seattle" },
+                },
+                "Mappings": {
+                    "LocationTable": {
+                        "Seattle": { "LocationUrl": "https://example.aws" },
+                        "Dublin": { "LocationUrl": "https://eu.example.aws" },
+                    },
+                },
+                "Resources": {
+                    "thing": {
+                        "Type": "AWS::IoT::Thing",
+                        "Properties": { "ThingName": { "Ref": "SerialNumber" } },
+                    },
+                },
+            })
+            .to_string(),
+        )
+        .expect("the template reads");
+        let substitutions = template.substitutions(&line(json!({ "SerialNumber": "sn-1" })));
+
+        let rows: Vec<(&str, Value, Option<&str>)> = vec![
+            ("a literal", json!("ThingPrefix_"), Some("ThingPrefix_")),
+            ("a reference", json!({ "Ref": "SerialNumber" }), Some("sn-1")),
+            (
+                "a reference to a defaulted parameter",
+                json!({ "Ref": "DeviceLocation" }),
+                Some("Seattle"),
+            ),
+            (
+                "a reference to a parameter with no value",
+                json!({ "Ref": "Absent" }),
+                None,
+            ),
+            (
+                "a join over a literal and a reference",
+                json!({ "Fn::Join": ["", ["ThingPrefix_", { "Ref": "SerialNumber" }]] }),
+                Some("ThingPrefix_sn-1"),
+            ),
+            (
+                "a join whose delimiter joins three values",
+                json!({ "Fn::Join": ["-", ["fleet", { "Ref": "DeviceLocation" }, "1"]] }),
+                Some("fleet-Seattle-1"),
+            ),
+            (
+                "a join over no value at all",
+                json!({ "Fn::Join": ["-", []] }),
+                Some(""),
+            ),
+            (
+                "a join over a join",
+                json!({
+                    "Fn::Join": [
+                        "/",
+                        ["things", { "Fn::Join": ["_", ["sn", { "Ref": "SerialNumber" }]] }],
+                    ],
+                }),
+                Some("things/sn_sn-1"),
+            ),
+            (
+                "a join carrying a reference with no value",
+                json!({ "Fn::Join": ["", ["ThingPrefix_", { "Ref": "Absent" }]] }),
+                None,
+            ),
+            (
+                "a join whose arguments are not the two it takes",
+                json!({ "Fn::Join": ["-"] }),
+                None,
+            ),
+            (
+                "a lookup with a literal key",
+                json!({ "Fn::FindInMap": ["LocationTable", "Dublin", "LocationUrl"] }),
+                Some("https://eu.example.aws"),
+            ),
+            (
+                "a lookup whose key is a reference",
+                json!({
+                    "Fn::FindInMap": ["LocationTable", { "Ref": "DeviceLocation" }, "LocationUrl"],
+                }),
+                Some("https://example.aws"),
+            ),
+            (
+                "a lookup naming no table",
+                json!({ "Fn::FindInMap": ["Absent", "Dublin", "LocationUrl"] }),
+                None,
+            ),
+            (
+                "a lookup naming no entry of a table it names",
+                json!({ "Fn::FindInMap": ["LocationTable", "Oslo", "LocationUrl"] }),
+                None,
+            ),
+            (
+                "another intrinsic function altogether",
+                json!({ "Fn::Sub": "${SerialNumber}" }),
+                None,
+            ),
+            ("a list where a scalar belongs", json!(["sn-1"]), None),
+        ];
+
+        for (case, property, expected) in rows {
+            let rendered = render_text(&property, &substitutions);
+            assert_eq!(
+                rendered.as_deref(),
+                expected,
+                "case {case:?}: expected {expected:?} for {property}, got {rendered:?}"
+            );
+        }
+    }
+
+    /// RULE: a property renders only within the bounds the rendering holds to — the BYTES one
+    /// property may render to and the levels its functions may nest — so a body that would
+    /// amplify into far more text than it carries renders nothing and the line provisions
+    /// nothing, instead of sizing this process.
+    ///
+    /// The rows span what the bounds generalise over: a chain of joins each listing the next
+    /// level twice (the amplification), a chain nested past the depth bound, a single join
+    /// whose own values exceed the byte bound, and the largest value a thing's own properties
+    /// carry, which must still render.
+    #[test]
+    fn a_property_renders_only_within_the_rendering_bounds() {
+        let template = ProvisioningTemplate::read(
+            &json!({
+                "Parameters": { "SerialNumber": { "Type": "String" } },
+                "Resources": {
+                    "thing": {
+                        "Type": "AWS::IoT::Thing",
+                        "Properties": { "ThingName": { "Ref": "SerialNumber" } },
+                    },
+                },
+            })
+            .to_string(),
+        )
+        .expect("the template reads");
+        let substitutions = template.substitutions(&line(json!({ "SerialNumber": "sn-1" })));
+
+        // Each level lists the next one TWICE, so the rendered bytes double per level: ten
+        // levels over a 256-byte leaf render 256 KiB, four times the ceiling, and a body a
+        // few levels deeper would render gigabytes if nothing bounded it.
+        let mut doubling = json!("x".repeat(256));
+        for _ in 0..10 {
+            doubling = json!({ "Fn::Join": ["", [doubling.clone(), doubling]] });
+        }
+        // One value per level, so nothing amplifies: what this row crosses is the DEPTH bound.
+        let mut deep = json!("x");
+        for _ in 0..(MAX_RENDER_DEPTH + 1) {
+            deep = json!({ "Fn::Join": ["", [deep]] });
+        }
+        // A single join whose values together are larger than one property may render to.
+        let wide = json!({
+            "Fn::Join": ["", vec![Value::String("y".repeat(1024)); (MAX_RENDERED_BYTES / 1024) + 1]],
+        });
+
+        let rows: Vec<(&str, Value, Option<usize>)> = vec![
+            ("a chain of joins that doubles per level", doubling, None),
+            ("a chain nested past the depth bound", deep, None),
+            ("a join wider than the byte bound", wide, None),
+            (
+                "a value of the largest size a property carries, which still renders",
+                json!({ "Fn::Join": ["", ["sn-", { "Ref": "SerialNumber" }]] }),
+                Some("sn-sn-1".len()),
+            ),
+        ];
+        for (case, property, expected) in rows {
+            let rendered = render_text(&property, &substitutions);
+            assert_eq!(
+                rendered.as_ref().map(String::len),
+                expected,
+                "case {case:?}: expected a rendering of {expected:?} bytes, got {:?}",
+                rendered.as_ref().map(String::len)
+            );
+        }
     }
 
     /// A template's thing properties are rendered per line: a `Ref` takes the line's value,
