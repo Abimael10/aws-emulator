@@ -184,7 +184,13 @@ async fn signed_call(
 
 /// A .zip deployment package holding `source` as the handler's module, written in memory the
 /// way a caller uploads one.
-fn package(source: &str) -> Vec<u8> {
+///
+/// `pub(crate)` because every suite that gives this service a Lambda backend uploads its
+/// handler this way, and a second copy of the archive writer is a second statement of how a
+/// package is laid out: the suite that drives a stage's deployment snapshot
+/// (`stage_pinned_deployment_snapshot`) creates its functions with an `Environment` of their
+/// own and reaches the archive through this.
+pub(crate) fn package(source: &str) -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);

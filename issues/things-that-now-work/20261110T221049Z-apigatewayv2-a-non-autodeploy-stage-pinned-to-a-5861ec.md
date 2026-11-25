@@ -45,3 +45,33 @@ Actual (emulator): no verdict — the check consumes the entire 60 s harness bud
 5. UpdateIntegration(ApiId, IntegrationId, IntegrationUri=<B arn>). Poll both URLs: $default must converge on B's marker and GetStage($default).DeploymentId must change; the pinned URL must keep returning A's marker for a hold window of >= 5 samples and GetStage('pinned').DeploymentId must stay d1.
 6. CreateDeployment(ApiId, StageName='pinned') -> d2 (!= d1). The pinned URL must converge on B's marker and GetStage('pinned').DeploymentId must equal d2.
 7. After fixing, re-replay the id in trace_ids.
+
+## Resolution
+
+The sequence above is served at this commit, and two new suites drive it end to end so it
+cannot regress unnoticed:
+
+- `services/service-com-amazonaws-apigatewayv2-apigatewayv2/tests/all/stage_pinned_deployment_snapshot.rs`
+  — in process: two Lambda functions whose only difference is the MARKER variable their handler
+  returns as a `200 text/plain` body, the grant to `apigateway.amazonaws.com`, the auto-deploying
+  `$default` stage, an explicit deployment, the stage pinned to it, `UpdateIntegration`, the hold
+  on the pinned stage, then `CreateDeployment(StageName=…)`; each stage read at both addressings
+  this plane serves.
+- `core/router/tests/all/apigatewayv2_pinned_stage_snapshot_on_a_started_emulator.rs`
+  — the same sequence against the STARTED emulator binary over real sockets, unsigned, dialling
+  the address the api publishes as its `ApiEndpoint` as well as its own
+  `{api-id}.execute-api.{region}.amazonaws.com` host at the front door, with a multi-sample hold
+  window on the pinned stage.
+
+Every leg answers `200` with the body of the backend the serving deployment froze; measured while
+diagnosing, a request costs about 55 ms at either addressing on the started binary, fresh TLS
+connection included.
+
+The recorded check still reports `Check timed out after 60.0s`, now raised at its hold-window
+assertion (`run#45 assert not wrong`) rather than in the first stability wait (`_http#45
+urlopen`), so it reaches the stability gate and the hold window and then runs out of harness
+budget. The per-request cost that consumes that budget in the replay environment is the cause
+open issue `20261110T170829Z-apigatewayv2-9-net-new-causes-aws-iam-routes.md` owns (its cause 7,
+"measured per-request latency of 4.18 s", filed against
+`apigatewayv2.deep-apigatewayv2-3-stagesem-request-authorizer-cache-expires-after-ttl`); it is
+not re-filed here.
