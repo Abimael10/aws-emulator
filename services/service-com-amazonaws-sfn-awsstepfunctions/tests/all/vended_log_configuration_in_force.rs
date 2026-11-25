@@ -188,13 +188,21 @@ async fn delivered_for(
 ) -> Vec<Value> {
     let deadline = Instant::now() + DEADLINE;
     loop {
-        let messages: Vec<Value> = delivered(observed, case, group)
-            .await
-            .into_iter()
-            .filter(|message| {
-                message.get("execution_arn").and_then(Value::as_str) == Some(execution)
-            })
-            .collect();
+        // The group is CREATED by the first delivery into it, so a look taken before that
+        // delivery has landed finds no group at all — which a read of a log group answers
+        // as a missing resource rather than as an empty group. What this wait is for is the
+        // DELIVERY, so it starts at the group coming into existence.
+        let messages: Vec<Value> = if holds_group(observed, group).await {
+            delivered(observed, case, group)
+                .await
+                .into_iter()
+                .filter(|message| {
+                    message.get("execution_arn").and_then(Value::as_str) == Some(execution)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         if messages.len() >= wanted {
             return messages;
         }

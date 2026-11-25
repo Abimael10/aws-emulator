@@ -434,7 +434,11 @@ async fn poll_until_running(mq: &Mq, broker_id: &str) -> Value {
 }
 
 /// The `host:port` a published endpoint names.
-fn authority_of(case: &str, endpoint: &str) -> (String, u16) {
+///
+/// `pub(crate)`, not private: `tests/all/main.rs` is this binary's crate root, so a sibling
+/// suite reading a published endpoint parses it through this one reader rather than
+/// carrying a second copy of it.
+pub(crate) fn authority_of(case: &str, endpoint: &str) -> (String, u16) {
     let authority = endpoint
         .split_once("://")
         .map(|(_scheme, rest)| rest.to_string())
