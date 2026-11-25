@@ -3,11 +3,12 @@
 //! @op CreateEventSourceMapping
 //! Persists ONE event source mapping in [`crate::state`]: the event source the request
 //! names, the function it resolves, and every polling, filtering, destination and
-//! logging setting the request stated, under a UUID and an ARN minted once. A mapping
-//! asked to be active answers `Creating`, and the move to `Enabled` is owed by the CLOCK
-//! (see [`crate::state::EventSourceMappingRecord::materialize`]); a mapping asked for
-//! with polling paused has no poller to stand up and so is created already `Disabled`
-//! (see [`crate::state::created_event_source_mapping_state`]).
+//! logging setting the request stated, under a UUID and an ARN minted once. The operation
+//! answers 202, so every mapping it accepts answers `Creating`, and the move to the state
+//! its `Enabled` setting asks for — `Enabled` for one asked to be active, `Disabled` for
+//! one asked for with polling paused — is owed by the CLOCK (see
+//! [`crate::state::created_event_source_mapping_state`] and
+//! [`crate::state::EventSourceMappingRecord::materialize`]).
 //!
 //! The event source has to be one `EventSourceArn` names: a resource of one of the
 //! vendors and resource types that member enumerates (see
@@ -58,7 +59,10 @@
 //! — the position a stream is read from, and the instant a position stated as a timestamp
 //! starts at — are required for the sources and the position that need them, and a request
 //! that leaves one out is refused as the request validation error it is (see
-//! [`absent_required_member`]).
+//! [`absent_required_member`]). A position STATED is held to the source too: one the source
+//! cannot be read from is refused with that same modelled 400, keyed on the kind of
+//! resource the ARN names (see [`crate::state::supports_starting_position`] and
+//! [`crate::state::unsupported_starting_position_message`]).
 //!
 //! What the mapping may be asked to MEASURE is held to that same source:
 //! `EventSourceMappingMetricsConfig$Metrics` is "the metrics you want your event source
@@ -652,27 +656,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 STARTING_POSITION_MEMBER,
             )));
         }
-        if input.starting_position.as_deref() == Some(crate::state::STARTING_POSITION_AT_TIMESTAMP)
-        {
-            // "AT_TIMESTAMP is supported only for Amazon Kinesis streams, Amazon
-            // DocumentDB, Amazon MSK, and self-managed Apache Kafka."
-            if !crate::state::supports_at_timestamp(vendor, self_managed) {
-                return Err(invalid_parameter(format!(
-                    "StartingPosition AT_TIMESTAMP is not supported for the event source '{}'",
-                    event_source_arn.as_deref().unwrap_or_default()
-                )));
-            }
-            // "With StartingPosition set to AT_TIMESTAMP, the time from which to start
-            // reading. StartingPositionTimestamp cannot be in the future."
-            let Some(timestamp) = input.starting_position_timestamp else {
-                return Err(invalid_parameter(absent_required_member(
-                    STARTING_POSITION_TIMESTAMP_MEMBER,
-                )));
-            };
-            if timestamp.as_secs_f64() > ::aws_smithy_types::DateTime::from(now).as_secs_f64() {
+        if let Some(position) = input.starting_position.as_deref() {
+            // The position has to be one the event source can be READ from — the
+            // restriction the member's own documentation states, over every source (see
+            // [`crate::state::supports_starting_position`]). A pairing no poller could open
+            // is refused with the modelled 400 keyed on the kind of resource the ARN names
+            // (see [`crate::state::unsupported_starting_position_message`]) rather than
+            // stored as a position nothing could read from.
+            if !crate::state::supports_starting_position(vendor, self_managed, position) {
                 return Err(invalid_parameter(
-                    "StartingPositionTimestamp cannot be in the future".to_string(),
+                    crate::state::unsupported_starting_position_message(
+                        event_source_arn.as_deref(),
+                    ),
                 ));
+            }
+            if position == crate::state::STARTING_POSITION_AT_TIMESTAMP {
+                // "With StartingPosition set to AT_TIMESTAMP, the time from which to start
+                // reading. StartingPositionTimestamp cannot be in the future."
+                let Some(timestamp) = input.starting_position_timestamp else {
+                    return Err(invalid_parameter(absent_required_member(
+                        STARTING_POSITION_TIMESTAMP_MEMBER,
+                    )));
+                };
+                if timestamp.as_secs_f64() > ::aws_smithy_types::DateTime::from(now).as_secs_f64() {
+                    return Err(invalid_parameter(
+                        "StartingPositionTimestamp cannot be in the future".to_string(),
+                    ));
+                }
             }
         }
 
@@ -1014,13 +1024,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_default()
                 .into_iter()
                 .collect(),
-            // A mapping asked to be active only has its poller STARTED here — the
-            // operation answers 202 Accepted — so it is `Creating` and the move to
-            // `Enabled` is owed by the clock at `settled_due`; nothing waits for it. A
-            // mapping asked for with polling paused has no poller to stand up, so it is
-            // created already `Disabled` (see
+            // This call only STARTS what the mapping needs — it answers 202 Accepted — so
+            // the mapping is `Creating` whichever polling setting it was asked for with,
+            // and the move to the state that setting asks for is owed by the clock at
+            // `settled_due`; nothing waits for it (see
             // [`crate::state::created_event_source_mapping_state`]).
-            state: crate::state::created_event_source_mapping_state(enabled).to_string(),
+            state: crate::state::created_event_source_mapping_state().to_string(),
             state_transition_reason: crate::state::event_source_mapping_transition_reason(
                 event_source_arn.as_deref(),
             )

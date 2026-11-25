@@ -74,22 +74,6 @@ pub(crate) const STATE_ENABLED: &str = "Enabled";
 /// See [`STATE_CREATING`].
 pub(crate) const STATE_DISABLED: &str = "Disabled";
 
-/// The `State` a create answers for a request carrying `extras`: `Creating` while the
-/// poller of a mapping asked to be active is stood up, and `Disabled` for one asked for
-/// with polling paused, which has no poller to stand up and so is created in the terminal
-/// state its setting asks for ("When false, Lambda pauses polling and invocation").
-///
-/// Stated here from the REQUEST, independently of the store's own resolution of the same
-/// rule, so that these assertions check the emulator rather than restate it: keep the two
-/// apart rather than collapsing this into the production helper.
-pub(crate) fn created_state_for(extras: &Value) -> &'static str {
-    if extras.get("Enabled").and_then(Value::as_bool) == Some(false) {
-        STATE_DISABLED
-    } else {
-        STATE_CREATING
-    }
-}
-
 /// `StateTransitionReason` for a change a caller asked for, as a mapping on a QUEUE (and on
 /// every source whose poller is not a shard reader) reports it.
 pub(crate) const USER_INITIATED: &str = "USER_INITIATED";
@@ -1517,10 +1501,9 @@ async fn a_created_event_source_mapping_is_persisted_and_reported() {
              {MAPPING_ARN_MAX_LEN} length, got {} in {arn:?}",
             arn.len()
         );
-        // A mapping asked to be active is `Creating` while its poller is stood up; one
-        // asked for with polling paused has no poller to stand up, so it is created
-        // already in the terminal state its setting asks for.
-        let created_state = created_state_for(&case.request_extras);
+        // The create is ACCEPTED rather than applied (202), so the mapping it answers
+        // with is the one being stood up, whichever polling setting was asked for.
+        let created_state = STATE_CREATING;
         // Which of the two sentences the change is worded with, and whether the mapping
         // reports a processing result before its poller has attempted anything, is the
         // source's own.
@@ -1646,9 +1629,9 @@ async fn a_mapping_settles_into_the_state_its_enabled_setting_asks_for() {
             &create_request(function, Some(&source), extras),
         )
         .await;
-        // Only a mapping with a poller to stand up starts transitional; a paused one is
-        // created in the terminal state it asked for.
-        let created_state = created_state_for(extras);
+        // Every accepted create answers the transitional state, and the terminal state is
+        // the clock's to bring.
+        let created_state = STATE_CREATING;
         assert_eq!(
             (created.status, created.string("State")),
             (202, Some(created_state.to_string())),

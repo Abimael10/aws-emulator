@@ -30,9 +30,8 @@ use service_com_amazonaws_lambda_awsgirapiservice::state::ComAmazonawsLambdaAwsg
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::event_source_mappings::{
-    await_mapping_state, call, create_function, create_mapping, create_request, created_state_for,
-    get_mapping, router_on, Answer, DYNAMODB_SOURCE, KINESIS_SOURCE, MAPPINGS_URI, QUEUE_SOURCE,
-    STATE_CREATING,
+    await_mapping_state, call, create_function, create_mapping, create_request, get_mapping,
+    router_on, Answer, DYNAMODB_SOURCE, KINESIS_SOURCE, MAPPINGS_URI, QUEUE_SOURCE, STATE_CREATING,
 };
 
 /// The `State` a mapping whose accepted update changed its CONFIGURATION carries, from
@@ -54,6 +53,20 @@ const STATE_ENABLED: &str = "Enabled";
 
 /// See [`STATE_UPDATING`].
 const STATE_DISABLED: &str = "Disabled";
+
+/// The terminal `State` the clock settles a mapping created with `extras` into, from the
+/// polling setting the request stated: "When true, the event source mapping is active. When
+/// false, Lambda pauses polling and invocation. Default: True".
+///
+/// Stated here from the REQUEST, independently of the store's own resolution of the same
+/// rule, so that these assertions check the emulator rather than restate it.
+fn created_settles_into(extras: &Value) -> &'static str {
+    if extras.get("Enabled").and_then(Value::as_bool) == Some(false) {
+        STATE_DISABLED
+    } else {
+        STATE_ENABLED
+    }
+}
 
 /// A UUID of the length `UUIDString` requires (`@length(min: 36, max: 36)`) that no mapping
 /// is held under.
@@ -221,35 +234,28 @@ async fn an_update_replaces_the_members_it_states_and_settles_by_the_clock() {
             .unwrap_or_else(|| panic!("case {label:?}: the create answers an ARN"));
 
         // The mapping is not available while it is still being created, which is the
-        // model's own example of `ResourceInUseException`.
-        // A mapping created with polling PAUSED was never in that window — it is created
-        // in the terminal state its setting asks for — so there is no create window to be
-        // refused inside for such a row.
-        if created_state_for(&case.create_extras) == STATE_CREATING {
-            let too_early = update_mapping(&router, &uuid, &case.update).await;
-            assert_eq!(
-                too_early.status,
-                400,
-                "case {label:?}: an update inside the create window is refused, got {} {}",
-                too_early.status,
-                too_early.text()
-            );
-            assert!(
-                too_early.error_code().contains("ResourceInUseException"),
-                "case {label:?}: expected ResourceInUseException, got {}",
-                too_early.error_code()
-            );
-        } else {
-            let settled = get_mapping(&router, &uuid).await;
-            assert_eq!(
-                (settled.status, settled.string("State")),
-                (200, Some(STATE_DISABLED.to_string())),
-                "case {label:?}: a mapping created paused is already {STATE_DISABLED}, got \
-                 {} {}",
-                settled.status,
-                settled.text()
-            );
-        }
+        // model's own example of `ResourceInUseException`. The create is ACCEPTED rather
+        // than applied, so every mapping has that window whichever polling setting it was
+        // asked for, and the create answered it as `STATE_CREATING`.
+        assert_eq!(
+            created.string("State"),
+            Some(STATE_CREATING.to_string()),
+            "case {label:?}: the create must answer {STATE_CREATING}, got {}",
+            created.text()
+        );
+        let too_early = update_mapping(&router, &uuid, &case.update).await;
+        assert_eq!(
+            too_early.status,
+            400,
+            "case {label:?}: an update inside the create window is refused, got {} {}",
+            too_early.status,
+            too_early.text()
+        );
+        assert!(
+            too_early.error_code().contains("ResourceInUseException"),
+            "case {label:?}: expected ResourceInUseException, got {}",
+            too_early.error_code()
+        );
 
         // The settle out of the create window is owed by the CLOCK, so this waits for the
         // mapping to REPORT the state its create asked for rather than for a span of its own.
@@ -257,11 +263,7 @@ async fn an_update_replaces_the_members_it_states_and_settles_by_the_clock() {
             &router,
             label,
             &uuid,
-            if created_state_for(&case.create_extras) == STATE_CREATING {
-                STATE_ENABLED
-            } else {
-                STATE_DISABLED
-            },
+            created_settles_into(&case.create_extras),
         )
         .await;
         let updated = update_mapping(&router, &uuid, &case.update).await;

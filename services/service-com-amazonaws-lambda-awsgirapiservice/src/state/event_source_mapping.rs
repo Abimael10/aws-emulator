@@ -60,23 +60,20 @@ pub const EVENT_SOURCE_MAPPING_STATE_ENABLING: &str = "Enabling";
 /// turns polling OFF — the PAUSE, which is in force once the mapping reports `Disabled`.
 pub const EVENT_SOURCE_MAPPING_STATE_DISABLING: &str = "Disabling";
 
-/// The `State` a mapping `CreateEventSourceMapping` has just accepted is in, from the
-/// `Enabled` setting the request asked for: "When true, the event source mapping is
-/// active. When false, Lambda pauses polling and invocation."
+/// The `State` a mapping `CreateEventSourceMapping` has just accepted is in.
 ///
-/// A mapping asked to be ACTIVE has a poller to stand up before it reads anything, which
-/// is the transitional `Creating` window the clock closes
-/// ([`EventSourceMappingRecord::materialize`]). A mapping asked for with polling PAUSED
-/// has nothing to stand up, so it is already in the terminal state its settings ask for
-/// at the instant it is created, and a caller waiting for it to leave a transitional
-/// state has nothing to wait for.
+/// `CreateEventSourceMapping` is ACCEPTED rather than applied — it answers 202 — so what
+/// it answers with is the mapping Lambda is standing up, whichever polling setting the
+/// request asked for: the mapping is `Creating` until the stand-up is finished, and the
+/// move to the terminal state its `Enabled` setting asks for ("When true, the event
+/// source mapping is active. When false, Lambda pauses polling and invocation") is owed by
+/// the CLOCK ([`EventSourceMappingRecord::materialize`]), which settles it into `Enabled`
+/// or `Disabled`. So a client that polls a mapping it has just created until the state
+/// leaves `Creating` sees that window whether it asked for an active mapping or a paused
+/// one, and never a terminal state the record has not reached yet.
 #[must_use]
-pub fn created_event_source_mapping_state(enabled: bool) -> &'static str {
-    if enabled {
-        EVENT_SOURCE_MAPPING_STATE_CREATING
-    } else {
-        EVENT_SOURCE_MAPPING_STATE_DISABLED
-    }
+pub fn created_event_source_mapping_state() -> &'static str {
+    EVENT_SOURCE_MAPPING_STATE_CREATING
 }
 
 /// `StateTransitionReason`: "Indicates whether a user or Lambda made the last change to
@@ -437,6 +434,34 @@ pub fn supports_at_timestamp(vendor: Option<&str>, self_managed: bool) -> bool {
                     | EVENT_SOURCE_VENDOR_DOCUMENT_DB
             )
         )
+}
+
+/// Whether a mapping on this event source can be read from `position`.
+///
+/// `StartingPosition` is "the position in a stream from which to start reading", and the one
+/// restriction its documentation states is on reading from a stated INSTANT: "AT_TIMESTAMP is
+/// supported only for Amazon Kinesis streams, Amazon DocumentDB, Amazon MSK, and self-managed
+/// Apache Kafka" ([`supports_at_timestamp`]). A source outside that set paired with that
+/// position is a pairing no poller could open, and is refused with
+/// [`unsupported_starting_position_message`].
+#[must_use]
+pub fn supports_starting_position(vendor: Option<&str>, self_managed: bool, position: &str) -> bool {
+    position != STARTING_POSITION_AT_TIMESTAMP || supports_at_timestamp(vendor, self_managed)
+}
+
+/// What a `CreateEventSourceMapping` asking for a position the event source it names cannot
+/// be read from is refused with, inside the modelled `InvalidParameterValueException`.
+///
+/// The model states no text for it, so the wording is the service's own, as observed: the
+/// refusal is keyed on the KIND of resource the ARN names rather than on the position asked
+/// for, and names that ARN bare. The single variable part is the `EventSourceArn` the
+/// request sent.
+#[must_use]
+pub fn unsupported_starting_position_message(event_source_arn: Option<&str>) -> String {
+    format!(
+        "Unsupported starting position for arn type: {}",
+        event_source_arn.unwrap_or_default()
+    )
 }
 
 /// `BatchSize` when the request states none: see [`DEFAULT_BATCH_SIZE_QUEUE`].

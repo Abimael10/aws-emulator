@@ -8,12 +8,12 @@
 //! Two rules under test, over the one `EventSourceMappingConfiguration` every mapping
 //! operation answers:
 //!
-//! 1. A mapping has a transitional `State` only while something is being stood up for it:
-//!    one asked to be ACTIVE answers `Creating` and reaches `Enabled` when the clock makes
-//!    that due, while one asked for with polling PAUSED ("When false, Lambda pauses polling
-//!    and invocation") has no poller to stand up and so is already in the terminal
-//!    `Disabled` state the instant it is created — so a caller waiting for it to leave a
-//!    transitional state has nothing to wait for.
+//! 1. A mapping has a transitional `State` while it is being stood up: `CreateEventSourceMapping`
+//!    is ACCEPTED rather than applied (202), so every mapping it answers is `Creating`,
+//!    whichever polling setting the request asked for, and the clock then settles it into
+//!    the terminal state that setting asks for — `Enabled` for one asked to be active,
+//!    `Disabled` for one asked for with polling paused ("When false, Lambda pauses polling
+//!    and invocation").
 //! 2. `FunctionResponseTypes` is "a list of CURRENT response type enums applied to the
 //!    event source mapping": the types applied to a mapping are always known, so the member
 //!    is reported as the EMPTY list when none were requested rather than left out.
@@ -54,7 +54,7 @@ struct Row {
     event_source: &'static str,
     /// What the create states beside the function and the event source.
     extras: Value,
-    /// The `State` the create must answer.
+    /// The `State` the create must answer, which is the transitional one for every row.
     created_state: &'static str,
     /// The `State` the mapping must be in once the create's settle is due.
     settles_into: &'static str,
@@ -70,7 +70,7 @@ fn rows() -> Vec<Row> {
             function: "esm-paused-queue",
             event_source: QUEUE_SOURCE,
             extras: json!({ "Enabled": false, "ScalingConfig": { "MaximumConcurrency": 2 } }),
-            created_state: STATE_DISABLED,
+            created_state: STATE_CREATING,
             settles_into: STATE_DISABLED,
             response_types: json!([]),
         },
@@ -83,7 +83,7 @@ fn rows() -> Vec<Row> {
                 "StartingPosition": "LATEST",
                 "FunctionResponseTypes": [REPORT_BATCH_ITEM_FAILURES],
             }),
-            created_state: STATE_DISABLED,
+            created_state: STATE_CREATING,
             settles_into: STATE_DISABLED,
             response_types: json!([REPORT_BATCH_ITEM_FAILURES]),
         },
@@ -96,7 +96,7 @@ fn rows() -> Vec<Row> {
                 "Topics": ["orders"],
                 "FunctionResponseTypes": [],
             }),
-            created_state: STATE_DISABLED,
+            created_state: STATE_CREATING,
             settles_into: STATE_DISABLED,
             response_types: json!([]),
         },
@@ -137,20 +137,16 @@ fn response_types(configuration: &Value) -> Value {
 /// Whether `state` is one this row's mapping may report BEFORE the instant its create
 /// made a transition due.
 ///
-/// A mapping created PAUSED is in the terminal state its setting asks for and in no other,
-/// which is the rule under test; a mapping created ACTIVE is `Creating` until its poller is
-/// stood up, and the clock may have made that move due before the next read reached the
-/// store, so `Enabled` is admissible there too (the terminal state is asserted on its own
-/// once the move is certainly due).
+/// Every mapping is `Creating` when its create answers, and the clock may have made the
+/// move to its terminal state due before the next read reached the store, so that state is
+/// admissible here too (the terminal state is asserted on its own once the move is
+/// certainly due).
 fn state_before_settle_is_admissible(row: &Row, state: Option<&str>) -> bool {
-    state.is_some_and(|reported| {
-        reported == row.created_state
-            || (row.created_state != row.settles_into && reported == row.settles_into)
-    })
+    state.is_some_and(|reported| reported == row.created_state || reported == row.settles_into)
 }
 
 #[tokio::test]
-async fn a_paused_mapping_is_created_disabled_and_every_mapping_reports_its_response_types() {
+async fn every_mapping_is_created_transitional_and_reports_its_response_types() {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = router_on(&engine);
 
@@ -257,9 +253,7 @@ async fn a_paused_mapping_is_created_disabled_and_every_mapping_reports_its_resp
     // Each mapping is read once the transition its create owed is IN FORCE: the transition
     // is the CLOCK's, so this waits for the state it brings — looking again until it holds
     // or the crate's own budget for clock-owed work passes ([`await_mapping_state`]) —
-    // rather than for a span of wall clock. A mapping created paused was already in its
-    // terminal state, so that wait has nothing to wait for and the instant it was last
-    // modified has not moved.
+    // rather than for a span of wall clock.
     for (row, uuid, created_at) in created_rows {
         let label = row.name;
         await_mapping_state(&router, label, &uuid, row.settles_into).await;
@@ -272,28 +266,17 @@ async fn a_paused_mapping_is_created_disabled_and_every_mapping_reports_its_resp
             settled.status,
             settled.text()
         );
+        // The transition moves the date to the instant the clock owed it at, which is a
+        // FRACTION of a second after the create (the state-settle span this crate chooses),
+        // while the member is reported at whole-second resolution (see
+        // `crate::event_source_mapping_instant_and_attempt`): so the date the transition
+        // stamps is the creation's own second or the one after it, and never any other.
         let settled_at = settled.json().get("LastModified").and_then(Value::as_f64);
-        if row.created_state == row.settles_into {
-            assert_eq!(
-                settled_at,
-                Some(created_at),
-                "case {label:?}: a mapping created {} owes no transition, so LastModified \
-                 stays at {created_at}, got {settled_at:?}",
-                row.settles_into
-            );
-        } else {
-            // The transition moves the date to the instant the clock owed it at, which is a
-            // FRACTION of a second after the create (the state-settle span this crate
-            // chooses), while the member is reported at whole-second resolution (see
-            // `crate::event_source_mapping_instant_and_attempt`): so the date the transition
-            // stamps is the creation's own second or the one after it, and never any other.
-            assert!(
-                settled_at
-                    .is_some_and(|modified| modified == created_at || modified == created_at + 1.0),
-                "case {label:?}: LastModified must move with the transition to the second the \
-                 clock owed it in, {created_at} or the next, got {settled_at:?}"
-            );
-        }
+        assert!(
+            settled_at.is_some_and(|modified| modified == created_at || modified == created_at + 1.0),
+            "case {label:?}: LastModified must move with the transition to the second the \
+             clock owed it in, {created_at} or the next, got {settled_at:?}"
+        );
         assert_eq!(
             response_types(&settled.json()),
             row.response_types,

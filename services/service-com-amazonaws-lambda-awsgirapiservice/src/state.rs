@@ -2859,7 +2859,7 @@ pub use event_source_mapping::{
     event_source_mapping_transition_reason, event_source_vendor, is_kafka_source, is_shard_source,
     is_stream_source, metrics_config_refusal, mint_event_source_mapping_uuid, names_event_source,
     queue_visibility_refusal, queue_visibility_timeout_seconds, scaling_config_sets_no_limit,
-    supports_at_timestamp,
+    supports_at_timestamp, supports_starting_position, unsupported_starting_position_message,
     DEFAULT_BATCHING_WINDOW_SECONDS,
     DEFAULT_BATCH_SIZE_QUEUE, DEFAULT_BATCH_SIZE_STREAM, DEFAULT_PARALLELIZATION_FACTOR,
     DYNAMODB_STREAM_SEGMENT, EVENT_SOURCE_MAPPING_DELETE_DELAY,
