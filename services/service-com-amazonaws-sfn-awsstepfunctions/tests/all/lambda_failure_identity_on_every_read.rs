@@ -246,7 +246,11 @@ async fn paged(chain: &Chain, case: &str, execution: &str) -> Vec<Value> {
 
 /// The `(error, cause)` pair every event of type `event_type` carries under `member`, in
 /// the order those events are answered in.
-fn identities(
+///
+/// `pub(crate)`, not private: `tests/all/main.rs` is this binary's crate root, so the
+/// sibling suite whose rule is about the same pair on every PAGE of the same history reads
+/// it through this rather than carrying a second copy of it.
+pub(crate) fn identities(
     events: &[Value],
     event_type: &str,
     member: &str,

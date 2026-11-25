@@ -256,19 +256,18 @@ impl Chain {
         )
     }
 
-    /// One `awsJson` RPC call to the service whose signing name is `signing_name`, requiring
-    /// a 200: the shape every such service's calls share — the root as the request-target,
-    /// the protocol version in the content type, and `<target prefix>.<operation>` as the
-    /// target — stated once rather than per service.
-    async fn json_rpc(
+    /// One `awsJson` RPC call to the service whose signing name is `signing_name`, as the
+    /// status and the parsed body it ANSWERED: the shape every such service's calls share —
+    /// the root as the request-target, the protocol version in the content type, and
+    /// `<target prefix>.<operation>` as the target — stated once rather than per service.
+    async fn json_rpc_answered(
         &self,
-        case: &str,
         signing_name: &str,
         target_prefix: &str,
         json_version: &str,
         operation: &str,
         body: &Value,
-    ) -> Value {
+    ) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -283,7 +282,22 @@ impl Chain {
             .expect("a well-formed request");
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
-        let parsed = parsed(response.into_body());
+        (status, parsed(response.into_body()))
+    }
+
+    /// [`Self::json_rpc_answered`], requiring a 200.
+    async fn json_rpc(
+        &self,
+        case: &str,
+        signing_name: &str,
+        target_prefix: &str,
+        json_version: &str,
+        operation: &str,
+        body: &Value,
+    ) -> Value {
+        let (status, parsed) = self
+            .json_rpc_answered(signing_name, target_prefix, json_version, operation, body)
+            .await;
         assert_eq!(
             status, 200,
             "case {case:?}: {operation} must answer 200, got {status} with {parsed}"
@@ -295,6 +309,21 @@ impl Chain {
     pub(crate) async fn sfn(&self, case: &str, operation: &str, body: &Value) -> Value {
         self.json_rpc(
             case,
+            SFN_SIGNING_NAME,
+            SFN_TARGET_PREFIX,
+            SFN_JSON_VERSION,
+            operation,
+            body,
+        )
+        .await
+    }
+
+    /// One Step Functions call as the status and the parsed body it ANSWERED, for a suite
+    /// whose rule is about a request this service REFUSES.
+    ///
+    /// `pub(crate)` for the reason [`Self::sfn`] is.
+    pub(crate) async fn sfn_answered(&self, operation: &str, body: &Value) -> (u16, Value) {
+        self.json_rpc_answered(
             SFN_SIGNING_NAME,
             SFN_TARGET_PREFIX,
             SFN_JSON_VERSION,
