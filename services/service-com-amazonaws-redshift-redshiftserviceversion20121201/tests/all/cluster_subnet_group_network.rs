@@ -65,13 +65,21 @@ const UNCONFIRMED_SUBNETS_REFUSAL: &str =
 /// One subnet of the account as EC2 reports it: the VPC that contains it and the
 /// zone it lies in. ASKED, never assumed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Placement {
+pub(crate) struct Placement {
     vpc_id: String,
     zone: String,
 }
 
 /// Where each of `subnet_ids` is, as EC2 answers — in the order asked.
-async fn placements(emulator: &Emulator, case: &str, subnet_ids: &[String]) -> Vec<Placement> {
+///
+/// `pub(crate)` with the request builders and assertions below so a sibling suite
+/// about one of these operations drives it through THIS copy rather than writing a
+/// second one.
+pub(crate) async fn placements(
+    emulator: &Emulator,
+    case: &str,
+    subnet_ids: &[String],
+) -> Vec<Placement> {
     let described = emulator
         .ec2()
         .describe_subnets()
@@ -115,7 +123,7 @@ async fn create_group(emulator: &Emulator, name: &str, subnet_ids: &[String]) ->
 }
 
 /// `ModifyClusterSubnetGroup` over `subnet_ids`, with `description` when given.
-async fn modify_group(
+pub(crate) async fn modify_group(
     emulator: &Emulator,
     name: &str,
     description: Option<&str>,
@@ -136,7 +144,7 @@ async fn modify_group(
 }
 
 /// `DescribeClusterSubnetGroups` for one group by name.
-async fn describe_group(emulator: &Emulator, name: &str) -> Answer {
+pub(crate) async fn describe_group(emulator: &Emulator, name: &str) -> Answer {
     emulator
         .call(
             "DescribeClusterSubnetGroups",
@@ -146,7 +154,7 @@ async fn describe_group(emulator: &Emulator, name: &str) -> Answer {
 }
 
 /// POST one action with owned parameters.
-async fn call(emulator: &Emulator, action: &str, params: &[(String, String)]) -> Answer {
+pub(crate) async fn call(emulator: &Emulator, action: &str, params: &[(String, String)]) -> Answer {
     let borrowed: Vec<(&str, &str)> = params
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
@@ -155,7 +163,7 @@ async fn call(emulator: &Emulator, action: &str, params: &[(String, String)]) ->
 }
 
 /// Assert one answer is a refusal with this status and `<Code>`.
-fn assert_refused(case: &str, answer: &Answer, status: u16, code: &str) {
+pub(crate) fn assert_refused(case: &str, answer: &Answer, status: u16, code: &str) {
     assert_eq!(
         answer.status, status,
         "case {case}: expected status {status}, got {} with body {}",
@@ -172,7 +180,12 @@ fn assert_refused(case: &str, answer: &Answer, status: u16, code: &str) {
 
 /// Assert `answer` reports a group over exactly `subnet_ids`, placed where EC2
 /// says those subnets are.
-fn assert_network(case: &str, answer: &Answer, subnet_ids: &[String], placed: &[Placement]) {
+pub(crate) fn assert_network(
+    case: &str,
+    answer: &Answer,
+    subnet_ids: &[String],
+    placed: &[Placement],
+) {
     assert_eq!(
         answer.text("VpcId").as_deref(),
         Some(placed[0].vpc_id.as_str()),
