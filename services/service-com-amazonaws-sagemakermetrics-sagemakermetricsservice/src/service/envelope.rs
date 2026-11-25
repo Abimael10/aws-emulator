@@ -15,10 +15,13 @@
 //! What this service does refuse is a request whose envelope it cannot serve at all, and
 //! each such refusal has its OWN status, body member and constant sentence:
 //!
-//! * a value whose JSON type the member it is bound to cannot be read from never became a
-//!   value, which is a DESERIALIZATION failure: HTTP 400 [`SERIALIZATION_EXCEPTION`], with
-//!   the sentence in the body member spelled `Message`, naming the CLASS of JSON that
-//!   arrived ([`UNEXPECTED_JSON_TYPE`]);
+//! * a value the member it is bound to cannot be read from never became a value, which is a
+//!   DESERIALIZATION failure: HTTP 400 [`SERIALIZATION_EXCEPTION`], with the sentence in the
+//!   body member spelled `Message`, naming the CLASS of JSON that arrived
+//!   ([`UNEXPECTED_JSON_TYPE`]). Which values those are is the codec's own reading, so for
+//!   the two kinds of member whose wire form decides it — a float, which reads a quoted
+//!   non-finite number, and a timestamp, which reads only text its own `@timestampFormat`
+//!   parses — this layer asks what the codec asks ([`reads_into`]);
 //! * a `BatchPutMetrics` that names no trial component to associate the metrics with:
 //!   HTTP 400 with the constant [`INVALID_RESOURCE`] in the body member spelled `message`;
 //! * a `BatchPutMetrics` that carries no metric data to ingest: HTTP 500 with the constant
@@ -67,7 +70,10 @@
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
+use aws_smithy_schema::traits::TimestampFormat;
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
+use aws_smithy_types::date_time::Format;
+use aws_smithy_types::DateTime;
 use serde_json::Value;
 use smithy_server_runtime::{
     BoxFuture, ErasedOperation, ErasedServiceDefinition, OperationContext, Service,
@@ -399,12 +405,24 @@ const NON_FINITE_TEXTS: &[&str] = &["NaN", "Infinity", "-Infinity"];
 /// then resolved per item.
 ///
 /// It is the workspace's one statement of that question
-/// (`service_common::json_wire_values::reads_as`) plus the one form THIS protocol's codec
-/// reads that the general rule does not: a float member reads from a quoted non-finite
-/// number ([`NON_FINITE_TEXTS`]). Such a point IS read — and then reported at its own index,
-/// because no finite measurement came of it — while a float member holding any other text
-/// never became a value at all.
+/// (`service_common::json_wire_values::reads_as`), which answers it from the JSON CLASS and
+/// the member's shape type alone, corrected for the two KINDS of member whose WIRE FORM
+/// decides it and which that rule therefore leaves to the protocol:
+///
+/// * a float member reads from a quoted non-finite number ([`NON_FINITE_TEXTS`]) and from no
+///   other text. Such a point IS read — and then reported at its own index, because no
+///   finite measurement came of it — while a float member holding any other text never
+///   became a value at all.
+/// * a timestamp member reads from a string only when that string parses in the format bound
+///   to that member ([`reads_as_instant`]); the general rule admits every string, because
+///   `@timestampFormat` decides which, and this is where that format is read.
+///
+/// Both corrections ask what this protocol's codec asks, so a value this layer calls
+/// readable is one the codec goes on to read.
 fn reads_into(member: &Schema, held: &Value) -> bool {
+    if matches!(member.shape_type(), ShapeType::Timestamp) {
+        return reads_as_instant(member, held);
+    }
     if ::service_common::json_wire_values::reads_as(member.shape_type(), held) {
         return true;
     }
@@ -416,8 +434,39 @@ fn reads_into(member: &Schema, held: &Value) -> bool {
         .is_some_and(|text| NON_FINITE_TEXTS.contains(&text))
 }
 
-/// The first value of the body whose JSON class the modelled type of the member it is
-/// bound to cannot be read from, as the refusal it earns.
+/// Whether a JSON value became an INSTANT in the timestamp member it is bound to.
+///
+/// JSON `null` is absence rather than a class, and a number is the epoch a timestamp reads
+/// from whatever format is bound to it. A string became an instant exactly when it PARSES in
+/// that format — the same call the codec makes to read it
+/// (`vendor/smithy-schema-server/src/json.rs`'s `read_timestamp`), so the two cannot
+/// disagree about which text is an instant and a string the codec never turned into one is
+/// refused here as the deserialization failure it is rather than inside the operation.
+fn reads_as_instant(member: &Schema, held: &Value) -> bool {
+    match held {
+        Value::Null | Value::Number(_) => true,
+        Value::String(text) => DateTime::from_str(text, instant_format(member)).is_ok(),
+        _ => false,
+    }
+}
+
+/// The form a timestamp member's text is read in: the `@timestampFormat` the model binds to
+/// the member, and for a member the model binds none to, this protocol's default for a
+/// timestamp in a JSON body — the epoch second it falls in.
+///
+/// Resolved off the member SCHEMA, the one thing the codec itself reads the format out of,
+/// so a member the model later gives a format to is judged in that format without a change
+/// here.
+fn instant_format(member: &Schema) -> Format {
+    match member.timestamp_format().map(|carried| carried.format()) {
+        Some(TimestampFormat::DateTime) => Format::DateTime,
+        Some(TimestampFormat::HttpDate) => Format::HttpDate,
+        Some(TimestampFormat::EpochSeconds) | None => Format::EpochSeconds,
+    }
+}
+
+/// The first value of the body the member it is bound to cannot be read from, as the refusal
+/// it earns.
 ///
 /// The body's own top level is read first, then the members of each ITEM of a batch, which
 /// is as deep as this service's inputs nest. A key naming no member of the shape it is read
@@ -694,11 +743,21 @@ mod tests {
         assert_eq!(
             unreadable_member(
                 put,
-                &object(json!({"MetricData": [{"MetricName": "loss", "Timestamp": "2026-01-01T00:00:00Z", "Value": 1.0, "Unmodelled": []}]}))
+                &object(json!({"MetricData": [{"MetricName": "loss", "Timestamp": "1700000000", "Value": 1.0, "Unmodelled": []}]}))
             ),
             None,
-            "an instant reads from a string, a value from a number, and an unmodelled key \
-             is ignored"
+            "an instant reads from text its bound format parses, a value from a number, and \
+             an unmodelled key is ignored"
+        );
+        assert_eq!(
+            unreadable_member(
+                put,
+                &object(json!({"MetricData": [{"MetricName": "loss", "Timestamp": "2026-01-01T00:00:00Z", "Value": 1.0}]}))
+            ),
+            Some(Refusal::Unreadable(format!(
+                "STRING_VALUE{UNEXPECTED_JSON_TYPE}"
+            ))),
+            "text the format bound to the member does not parse never became an instant"
         );
         assert_eq!(
             unreadable_member(put, &object(json!({"MetricData": [], "Unmodelled": 7}))),
@@ -736,6 +795,126 @@ mod tests {
             None,
             "a put carrying both is served, however little the point says"
         );
+    }
+
+    /// A timestamp member carrying `format`, built as a model-driven member schema is, so
+    /// the question under test is read off the SCHEMA rather than off this service's one
+    /// model.
+    const fn timestamp_member(format: Option<TimestampFormat>) -> Schema {
+        let member = Schema::new_member(
+            ShapeId::from_static("smithy.framework#Probe$Instant", "smithy.framework", "Instant"),
+            ShapeType::Timestamp,
+            "Instant",
+            0,
+        );
+        match format {
+            Some(format) => member.with_timestamp_format(format),
+            None => member,
+        }
+    }
+
+    /// RULE: a value became an instant in a timestamp member when the codec can read it
+    /// there — a number or `null` whatever format is bound to the member, and text only in
+    /// the format that IS bound to it (the protocol's epoch second when the model binds
+    /// none).
+    ///
+    /// The rows span every format a member can carry against each class of value and each
+    /// published spelling of an instant, so the rule is keyed to the member's format rather
+    /// than to the one timestamp this service's model declares.
+    #[test]
+    fn a_timestamp_reads_the_text_the_format_bound_to_it_parses() {
+        // The three spellings, one per `@timestampFormat` the trait admits
+        // (`aws_smithy_schema::traits::TimestampFormat`), of one instant.
+        let epoch_seconds = "1700000000";
+        let date_time = "2023-11-14T22:13:20Z";
+        let http_date = "Tue, 14 Nov 2023 22:13:20 GMT";
+        // (case, the format bound to the member, the value held, reads into it)
+        let rows: [(&str, Option<TimestampFormat>, Value, bool); 21] = [
+            ("no format: a number is the epoch", None, json!(7), true),
+            ("no format: a fraction of a second", None, json!(7.5), true),
+            ("no format: null is absence", None, json!(null), true),
+            ("no format: epoch text", None, json!(epoch_seconds), true),
+            ("no format: date-time text", None, json!(date_time), false),
+            ("no format: http-date text", None, json!(http_date), false),
+            ("no format: text that is no instant", None, json!("not-a-time"), false),
+            ("no format: a flag", None, json!(true), false),
+            ("no format: a list", None, json!([7]), false),
+            ("no format: an object", None, json!({"secs": 7}), false),
+            (
+                "epoch-seconds: epoch text",
+                Some(TimestampFormat::EpochSeconds),
+                json!(epoch_seconds),
+                true,
+            ),
+            (
+                "epoch-seconds: date-time text",
+                Some(TimestampFormat::EpochSeconds),
+                json!(date_time),
+                false,
+            ),
+            (
+                "date-time: date-time text",
+                Some(TimestampFormat::DateTime),
+                json!(date_time),
+                true,
+            ),
+            (
+                "date-time: epoch text",
+                Some(TimestampFormat::DateTime),
+                json!(epoch_seconds),
+                false,
+            ),
+            (
+                "date-time: http-date text",
+                Some(TimestampFormat::DateTime),
+                json!(http_date),
+                false,
+            ),
+            (
+                "date-time: a number is still the epoch",
+                Some(TimestampFormat::DateTime),
+                json!(7),
+                true,
+            ),
+            (
+                "http-date: http-date text",
+                Some(TimestampFormat::HttpDate),
+                json!(http_date),
+                true,
+            ),
+            (
+                "http-date: date-time text",
+                Some(TimestampFormat::HttpDate),
+                json!(date_time),
+                false,
+            ),
+            (
+                "http-date: epoch text",
+                Some(TimestampFormat::HttpDate),
+                json!(epoch_seconds),
+                false,
+            ),
+            (
+                "http-date: a number is still the epoch",
+                Some(TimestampFormat::HttpDate),
+                json!(7),
+                true,
+            ),
+            (
+                "http-date: null is absence",
+                Some(TimestampFormat::HttpDate),
+                json!(null),
+                true,
+            ),
+        ];
+        for (case, format, held, expected) in rows {
+            let member = timestamp_member(format);
+            let actual = reads_into(&member, &held);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected reads_into == {expected}, got {actual}"
+            );
+        }
     }
 
     /// RULE: one call serves at most [`crate::state::MAX_ITEMS_PER_REQUEST`] items of a

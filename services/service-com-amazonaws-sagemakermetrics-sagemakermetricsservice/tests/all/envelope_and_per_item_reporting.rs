@@ -938,3 +938,163 @@ async fn an_item_that_states_less_than_the_model_requires_is_still_served() {
         }
     }
 }
+
+/// The width of the `OneMinute` period, in seconds: a bucket is keyed by its own start,
+/// `floor(epoch_second / width) * width`, so the instant a point was stored at is what a
+/// read on the `Timestamp` axis reports it under.
+const ONE_MINUTE: i64 = 60;
+
+/// The measurement each point of the instant-text table carries.
+const MEASUREMENT: f64 = 1.5;
+
+/// RULE: a string bound to a timestamp member became an instant only when it PARSES in the
+/// format bound to that member — this protocol's epoch second for a member the model binds
+/// no `@timestampFormat` to, which is every timestamp this service declares
+/// (`smithy_query(query="shape",shape="RawMetricData,Timestamp")` reports no format on the
+/// member or on the shape it targets). Text that parses is read, and the point is stored at
+/// the instant it names; text that does not never became a value at all, so it earns the
+/// deserialization refusal of this class — HTTP 400, the sentence naming the CLASS of JSON
+/// that arrived under `Message`, nothing under the lowercase member, and an error type that
+/// is not the constraint one — and nothing is ingested.
+///
+/// The rows span each published spelling of an instant (epoch seconds, ISO-8601 date-time,
+/// HTTP date) and the text classes around them, so the rule is pinned to the format bound to
+/// the member rather than to one spelling.
+#[tokio::test]
+async fn a_points_instant_reads_from_text_only_in_the_format_bound_to_the_member() {
+    let router = emulator();
+    let component = "tc-instant-text";
+
+    // case, the text a point states its instant as, the epoch second that text names —
+    // `None` for text the bound format does not parse.
+    let rows: [(&str, &str, Option<i64>); 7] = [
+        ("epoch seconds", "1700000000", Some(1_700_000_000)),
+        ("the epoch itself", "0", Some(0)),
+        (
+            "a fraction of a second past an epoch second",
+            "1700000000.5",
+            Some(1_700_000_000),
+        ),
+        ("an ISO-8601 date-time", "2023-11-14T22:13:20Z", None),
+        ("an HTTP date", "Tue, 14 Nov 2023 22:13:20 GMT", None),
+        ("text that is no instant at all", "not-a-time", None),
+        ("text with nothing in it", "", None),
+    ];
+
+    for (index, (case, text, instant)) in rows.into_iter().enumerate() {
+        // Its own series per row, so what a row stored is read back on its own.
+        let metric = format!("instant-{index}");
+        let answer = send(
+            &router,
+            "PUT",
+            "/BatchPutMetrics",
+            &json!({
+                "TrialComponentName": component,
+                "MetricData": [{
+                    "MetricName": metric,
+                    "Timestamp": text,
+                    "Step": 0,
+                    "Value": MEASUREMENT,
+                }],
+            }),
+        )
+        .await;
+
+        match instant {
+            Some(_) => {
+                assert_eq!(
+                    answer.status, 200,
+                    "case {case:?}: text the bound format parses is read, got {} ({:?})",
+                    answer.status, answer.body
+                );
+                assert_eq!(
+                    answer.body["Errors"].as_array().map(Vec::len),
+                    Some(0),
+                    "case {case:?}: the point was ingested, got {:?}",
+                    answer.body
+                );
+            }
+            None => {
+                assert_eq!(
+                    answer.status, 400,
+                    "case {case:?}: text no format reads never became a value, got {} ({:?})",
+                    answer.status, answer.body
+                );
+                assert_eq!(
+                    answer.member("Message"),
+                    Some("STRING_VALUE is not an expected Json type"),
+                    "case {case:?}: expected the class under Message, got {:?}",
+                    answer.body
+                );
+                assert_eq!(
+                    answer.member("message"),
+                    None,
+                    "case {case:?}: this class states nothing under the lowercase member, \
+                     got {:?}",
+                    answer.body
+                );
+                assert_ne!(
+                    answer.error_type.as_deref(),
+                    Some("ValidationException"),
+                    "case {case:?}: a value that never became a value is not a constraint \
+                     violation, got {:?}",
+                    answer.body
+                );
+                assert_eq!(
+                    answer.header_error_type, answer.error_type,
+                    "case {case:?}: the header and the body must name one error type, got \
+                     {:?} / {:?}",
+                    answer.header_error_type, answer.error_type
+                );
+            }
+        }
+
+        // What the series holds now: the point at the instant the text named, or nothing at
+        // all for a call that never became an input. The read is on the `Timestamp` axis, so
+        // the bucket it reports is computed from the stored instant rather than from the
+        // request.
+        let read = send(
+            &router,
+            "POST",
+            "/BatchGetMetrics",
+            &json!({"MetricQueries": [query(&metric, component, "OneMinute", "Timestamp")]}),
+        )
+        .await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: the read-back must be served, got {} ({:?})",
+            read.status, read.body
+        );
+        let result = &read.body["MetricQueryResults"][0];
+        match instant {
+            Some(epoch_second) => {
+                let bucket = epoch_second.div_euclid(ONE_MINUTE) * ONE_MINUTE;
+                assert_eq!(
+                    result["XAxisValues"].as_array().map(Vec::len),
+                    Some(1),
+                    "case {case:?}: one point is stored, got {result:?}"
+                );
+                assert_eq!(
+                    result["XAxisValues"][0].as_i64(),
+                    Some(bucket),
+                    "case {case:?}: expected the point at the minute of epoch second \
+                     {epoch_second}, got {result:?}"
+                );
+                assert_eq!(
+                    result["MetricValues"][0].as_f64(),
+                    Some(MEASUREMENT),
+                    "case {case:?}: the measurement reads back, got {result:?}"
+                );
+            }
+            None => {
+                for member in ["XAxisValues", "MetricValues"] {
+                    assert_eq!(
+                        result[member].as_array().map(Vec::len),
+                        Some(0),
+                        "case {case:?}: a refused call ingested nothing, got {result:?}"
+                    );
+                }
+            }
+        }
+    }
+}
