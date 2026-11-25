@@ -258,7 +258,7 @@ async fn deleting_the_configuration_leaves_the_repositories_and_images_alone() {
         .collect();
     assert_eq!(
         names,
-        vec![json!("other/app"), json!("signed-app")],
+        vec![json!("signed-app"), json!("other/app")],
         "case {case:?}: deleting the signing configuration must leave the repositories, \
          got {names:?}"
     );

@@ -2,8 +2,10 @@
 
 //! @op DescribeRepositories
 //! Reports the stored repositories: each `Repository` is exactly what
-//! `CreateRepository` persisted, in a deterministic order, one page at a time. A name
-//! in `repositoryNames` that no repository carries is refused.
+//! `CreateRepository` persisted. A read that names the repositories to report answers
+//! one entry per element of `repositoryNames`, in the order the request listed them; a
+//! read that names none walks the registry's own repositories in name order, one page at
+//! a time. A name in `repositoryNames` that no repository carries is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -220,17 +222,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let published_endpoint = crate::state::announced_registry_endpoint(ctx);
         let store = state.lock();
 
+        // A read that ENUMERATES the repositories to report PROJECTS that list onto the
+        // response: one `Repository` per requested ELEMENT, in the order the request listed
+        // them, so a client that zips its own name list against `repositories` pairs each
+        // name with its repository and a client that counts entries sees every name it
+        // asked about answered. The modelled list carries no `@uniqueItems` and the output
+        // is a plain list, so a name listed twice is reported twice — the response answers
+        // the request's elements rather than filtering the store with them, which would
+        // make its length and its order functions of the stored set.
+        //
         // Every requested name must name a repository OF THIS REGION's registry: ECR
-        // refuses the whole call rather than reporting the ones it could find.
-        for name in &wanted {
-            store.repository(&region, name).map_err(fault_error)?;
+        // refuses the whole call rather than reporting the ones it could find, on the first
+        // name it cannot resolve.
+        if !wanted.is_empty() {
+            let repositories = wanted
+                .iter()
+                .map(|name| {
+                    store
+                        .repository(&region, name)
+                        .map(|repo| repo.to_repository(&published_endpoint))
+                })
+                .collect::<Result<Vec<Repository>, _>>()
+                .map_err(fault_error)?;
+            // Such a read may not also be paged (`check_pagination_excluded` above), so the
+            // one answer carries every requested element and no token follows it.
+            return Ok(DescribeRepositoriesOutput {
+                repositories: Some(repositories),
+                next_token: None,
+            });
         }
 
-        // Keyed by name, which is the order the store holds one Region's repositories in,
-        // so a page boundary means the same thing on the next call.
+        // A read that enumerates nothing reports the registry's own repositories, keyed by
+        // name, which is the order the store holds one Region's repositories in, so a page
+        // boundary means the same thing on the next call.
         let candidates: Vec<(String, Repository)> = store
             .repositories_in(&region)
-            .filter(|repo| wanted.is_empty() || wanted.contains(&repo.name))
             .map(|repo| (repo.name.clone(), repo.to_repository(&published_endpoint)))
             .collect();
 
