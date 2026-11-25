@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFolderMembership
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFolderMembership`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFolderMembership::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds one asset — a dashboard, an analysis, a data set, a data source or a Q topic —
+//! to the folder `(AwsAccountId, FolderId)`, and persists that membership under the
+//! `(MemberType, MemberId)` the call named, so the folder's member listing reports it
+//! afterwards.
+//!
+//! The member is reported by the ARN of the asset it names, because a membership has no
+//! address of its own: adding the same asset twice is a conflict rather than a second
+//! membership, and a folder the account does not hold is nothing to add an asset to.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +165,151 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFolderMembership` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFolderMembershipErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFolderMembership"))
+        // `ctx` carries the region the member's and the folder's ARNs are scoped to.
+        let region = crate::state::request_region(ctx.parts());
+        let request_id = crate::state::next_request_id();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateFolderMembershipErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        // A member is addressed by the ARN of the asset it names, and that ARN is built
+        // from the kind of asset the `MemberType` label names: a type that is no member
+        // of that enum names no kind of asset, so it names no member either.
+        let Some(member_arn) = crate::state::folder_member_arn(
+            &region,
+            &input.aws_account_id,
+            &input.member_type,
+            &input.member_id,
+        ) else {
+            return Err(
+                CreateFolderMembershipErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "MemberType must be one of {}; got {}.",
+                            MEMBER_TYPE_VALUES.join(", "),
+                            input.member_type
+                        )),
+                        request_id: Some(request_id),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        // The membership is held inside the folder, so an id the account holds no folder
+        // under is nothing to add an asset to.
+        let Some(folder) = store.folder(&input.aws_account_id, &input.folder_id) else {
+            return Err(CreateFolderMembershipErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::folder_not_found_message(
+                        &region,
+                        &input.aws_account_id,
+                        &input.folder_id,
+                    )),
+                    // `ExceptionResourceType` declares no member for a folder, so this
+                    // refusal reports none rather than an unmodelled value.
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+        let folder_arn = folder.arn.clone();
+
+        // An asset the folder already holds is already a member of it, so adding it
+        // again is the conflict this operation models rather than a second membership.
+        if store
+            .folder_member(
+                &input.aws_account_id,
+                &input.folder_id,
+                &input.member_type,
+                &input.member_id,
+            )
+            .is_some()
+        {
+            return Err(CreateFolderMembershipErrorModeled::ResourceExistsException(
+                ResourceExistsException {
+                    message: Some(crate::state::folder_member_exists_message(
+                        &member_arn,
+                        &folder_arn,
+                    )),
+                    // `ExceptionResourceType` declares no member for a folder or for an
+                    // asset held in one, so this refusal reports none.
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        // Every part of a membership's key comes from the request, so naming another
+        // folder or another account resets one folder's allowance: the total this
+        // process holds is what bounds it, and the per-folder allowance is the fidelity
+        // limit on top of that.
+        if store.folder_members.len() >= crate::state::MAX_FOLDER_MEMBERS {
+            return Err(CreateFolderMembershipErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "This QuickSight emulator holds the maximum of {} folder \
+                         memberships.",
+                        crate::state::MAX_FOLDER_MEMBERS
+                    )),
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+        // The exhausted resource is the folder the members hang on, so the refusal names
+        // that folder and its allowance.
+        if store.folder_member_count(&input.aws_account_id, &input.folder_id)
+            >= crate::state::MAX_FOLDER_MEMBERS_PER_FOLDER
+        {
+            return Err(CreateFolderMembershipErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Folder {folder_arn} already holds the maximum of {} members.",
+                        crate::state::MAX_FOLDER_MEMBERS_PER_FOLDER
+                    )),
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        let record = crate::state::FolderMemberRecord {
+            member_id: input.member_id.clone(),
+            member_type: input.member_type.clone(),
+            arn: member_arn,
+        };
+        // The response reports the membership that now stands, so a caller sees exactly
+        // what the folder's next member listing will answer with.
+        let folder_member = record.to_folder_member();
+        store.folder_members.insert(
+            (
+                input.aws_account_id,
+                input.folder_id,
+                input.member_type,
+                input.member_id,
+            ),
+            record,
+        );
+
+        Ok(CreateFolderMembershipOutput {
+            folder_member: Some(folder_member),
+            request_id: Some(request_id),
+            // The model declares `Status` as the HTTP status of the request, which this
+            // create answers with 200.
+            status: 200,
+        })
     }
 }

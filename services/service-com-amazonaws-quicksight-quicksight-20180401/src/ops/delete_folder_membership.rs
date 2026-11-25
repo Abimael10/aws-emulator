@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteFolderMembership
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteFolderMembership`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteFolderMembership::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one asset from the folder `(AwsAccountId, FolderId)`: the membership held
+//! under the `(MemberType, MemberId)` the call named goes, so the folder's member
+//! listing no longer reports it, while the asset itself and the folder both stay.
+//!
+//! A folder the account does not hold, and an asset that folder does not hold, are both
+//! nothing to remove, so each is reported as the miss this operation models.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +158,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteFolderMembership` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteFolderMembershipErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteFolderMembership"))
+        // `ctx` carries the region the member's and the folder's ARNs are scoped to.
+        let region = crate::state::request_region(ctx.parts());
+        let request_id = crate::state::next_request_id();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteFolderMembershipErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        // A member is addressed by the ARN of the asset it names, built from the kind of
+        // asset the `MemberType` label names: a type that is no member of that enum names
+        // no kind of asset, so it names no member either.
+        let Some(member_arn) = crate::state::folder_member_arn(
+            &region,
+            &input.aws_account_id,
+            &input.member_type,
+            &input.member_id,
+        ) else {
+            return Err(
+                DeleteFolderMembershipErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "MemberType must be one of {}; got {}.",
+                            MEMBER_TYPE_VALUES.join(", "),
+                            input.member_type
+                        )),
+                        request_id: Some(request_id),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        // The membership is held inside the folder, so an id the account holds no folder
+        // under holds no membership to remove.
+        let Some(folder) = store.folder(&input.aws_account_id, &input.folder_id) else {
+            return Err(DeleteFolderMembershipErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::folder_not_found_message(
+                        &region,
+                        &input.aws_account_id,
+                        &input.folder_id,
+                    )),
+                    // `ExceptionResourceType` declares no member for a folder, so this
+                    // refusal reports none rather than an unmodelled value.
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+        let folder_arn = folder.arn.clone();
+
+        // An asset the folder does not hold is not a member of it, so there is nothing
+        // for this call to remove.
+        if store
+            .remove_folder_member(
+                &input.aws_account_id,
+                &input.folder_id,
+                &input.member_type,
+                &input.member_id,
+            )
+            .is_none()
+        {
+            return Err(DeleteFolderMembershipErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::folder_member_not_found_message(
+                        &member_arn,
+                        &folder_arn,
+                    )),
+                    // `ExceptionResourceType` declares no member for a folder or for an
+                    // asset held in one, so this refusal reports none.
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        Ok(DeleteFolderMembershipOutput {
+            request_id: Some(request_id),
+            // The model declares `Status` as the HTTP status of the request, which this
+            // deletion answers with 200.
+            status: 200,
+        })
     }
 }

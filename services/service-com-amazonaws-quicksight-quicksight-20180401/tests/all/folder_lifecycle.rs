@@ -1190,3 +1190,628 @@ async fn updating_a_folder_id_no_folder_is_held_under_is_not_found() {
         "a refused update must not change another folder: {body}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Folder membership: the assets a folder holds.
+//
+// The rule under test: a folder membership is identified by
+// `(AwsAccountId, FolderId, MemberType, MemberId)`; `CreateFolderMembership` persists it
+// under the folder it names, reporting the member's id and type, so the folder's member
+// listing reports that member — by the ARN of the asset it names — until
+// `DeleteFolderMembership` removes it; adding an asset a folder already holds is a
+// conflict, and a folder the account does not hold holds no members to add, list or
+// remove. The rows below vary what the rule generalises over (the kind of asset, the
+// id's form and length, the page size, the folder and the account) rather than
+// re-running one recorded call.
+// ---------------------------------------------------------------------------
+
+/// The folder the membership cases put their assets in.
+const MEMBER_FOLDER: &str = "reports-with-members";
+
+/// One member a folder is given: the `MemberType` the call names, the id under it, and
+/// the resource word the ARN of that kind of asset carries.
+///
+/// Source: smithy_query(query="shape", shape="MemberType") for the member names — the
+/// rows are one per member of that enum — and the ARN of each kind of asset for the
+/// resource word a member is reported by.
+struct MemberRow {
+    /// The case label every assertion names.
+    case: &'static str,
+    member_type: &'static str,
+    /// The `MemberId` the call names; the model admits len 1..2048 over the pattern
+    /// `^[\w\-]+$`.
+    /// Source: smithy_query(query="operation", operation="CreateFolderMembership").
+    member_id: String,
+    arn_resource: &'static str,
+}
+
+impl MemberRow {
+    /// The ARN the folder's member listing must report this member by.
+    fn arn(&self, account: &str) -> String {
+        format!(
+            "arn:aws:quicksight:{REGION}:{account}:{}/{}",
+            self.arn_resource, self.member_id
+        )
+    }
+
+    /// This member as the `(MemberId, MemberArn)` pair a listing reports.
+    fn reported(&self, account: &str) -> (String, String) {
+        (self.member_id.clone(), self.arn(account))
+    }
+}
+
+fn member_rows() -> Vec<MemberRow> {
+    vec![
+        MemberRow {
+            case: "dataset",
+            member_type: "DATASET",
+            member_id: "sales-2024".to_string(),
+            arn_resource: "dataset",
+        },
+        MemberRow {
+            case: "dashboard-underscored-id",
+            member_type: "DASHBOARD",
+            member_id: "exec_overview".to_string(),
+            arn_resource: "dashboard",
+        },
+        MemberRow {
+            // The shortest id the pattern admits.
+            case: "analysis-single-character-id",
+            member_type: "ANALYSIS",
+            member_id: "a".to_string(),
+            arn_resource: "analysis",
+        },
+        MemberRow {
+            case: "datasource",
+            member_type: "DATASOURCE",
+            member_id: "warehouse-athena".to_string(),
+            arn_resource: "datasource",
+        },
+        MemberRow {
+            // A long id, well inside len 1..2048.
+            case: "topic-long-id",
+            member_type: "TOPIC",
+            member_id: format!("topic-{}", "t".repeat(300)),
+            arn_resource: "topic",
+        },
+        MemberRow {
+            // The id of the dataset row, under another type: an id names an asset only
+            // together with the kind of asset it is, so this is a second member.
+            case: "same-id-other-type",
+            member_type: "DASHBOARD",
+            member_id: "sales-2024".to_string(),
+            arn_resource: "dashboard",
+        },
+    ]
+}
+
+/// The address of one membership, as the model binds both the create and the delete:
+/// `.../folders/{FolderId}/members/{MemberType}/{MemberId}`.
+/// Source: smithy_query(query="operation",
+/// operation="CreateFolderMembership,DeleteFolderMembership").
+fn membership_path(account: &str, folder_id: &str, member_type: &str, member_id: &str) -> String {
+    format!("/accounts/{account}/folders/{folder_id}/members/{member_type}/{member_id}")
+}
+
+/// `CreateFolderMembership`: `PUT` on the membership's own address. Every member of the
+/// input is a path label, so the request carries no body.
+async fn add_folder_member(
+    harness: &Harness,
+    account: &str,
+    folder_id: &str,
+    member_type: &str,
+    member_id: &str,
+) -> (u16, Value) {
+    harness
+        .call(
+            "PUT",
+            &membership_path(account, folder_id, member_type, member_id),
+            None,
+        )
+        .await
+}
+
+/// `DeleteFolderMembership`: `DELETE` on that same address.
+async fn remove_folder_member(
+    harness: &Harness,
+    account: &str,
+    folder_id: &str,
+    member_type: &str,
+    member_id: &str,
+) -> (u16, Value) {
+    harness
+        .call(
+            "DELETE",
+            &membership_path(account, folder_id, member_type, member_id),
+            None,
+        )
+        .await
+}
+
+/// `ListFolderMembers`: `GET /accounts/{AwsAccountId}/folders/{FolderId}/members`, with
+/// `query` appended as the request's query string (`max-results`, `next-token`).
+/// Source: smithy_query(query="operation", operation="ListFolderMembers").
+async fn list_folder_members(
+    harness: &Harness,
+    account: &str,
+    folder_id: &str,
+    query: &str,
+) -> (u16, Value) {
+    harness
+        .call(
+            "GET",
+            &format!("/accounts/{account}/folders/{folder_id}/members{query}"),
+            None,
+        )
+        .await
+}
+
+/// The `(MemberId, MemberArn)` pairs one `FolderMemberList` reports, in the order the
+/// response carries them.
+fn reported_members(body: &Value) -> Vec<(String, String)> {
+    body["FolderMemberList"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the response must carry a FolderMemberList: {body}"))
+        .iter()
+        .map(|member| {
+            (
+                member["MemberId"].as_str().unwrap_or_default().to_string(),
+                member["MemberArn"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// `members` in the order a listing reports them: a folder's members are ordered by the
+/// member's ARN, which is the whole address of the asset inside the folder.
+fn in_listing_order(mut members: Vec<(String, String)>) -> Vec<(String, String)> {
+    members.sort_by(|left, right| left.1.cmp(&right.1));
+    members
+}
+
+#[tokio::test]
+async fn folder_members_added_and_removed_are_reflected_in_the_member_listing() {
+    let harness = Harness::new();
+    let (status, body) =
+        create_folder(&harness, ACCOUNT, MEMBER_FOLDER, json!({ "Name": "Reports" })).await;
+    assert_eq!(
+        status, 200,
+        "the folder the members go in expected 200, got {status} with {body}"
+    );
+
+    // A folder nothing has been added to holds no members.
+    let (status, body) = list_folder_members(&harness, ACCOUNT, MEMBER_FOLDER, "").await;
+    assert_eq!(
+        status, 200,
+        "listing a new folder's members expected 200, got {status} with {body}"
+    );
+    assert_eq!(
+        reported_members(&body),
+        Vec::new(),
+        "a folder nothing was added to holds no members: {body}"
+    );
+
+    let rows = member_rows();
+    let mut held: Vec<(String, String)> = Vec::new();
+
+    for row in &rows {
+        let case = row.case;
+        let (status, body) =
+            add_folder_member(&harness, ACCOUNT, MEMBER_FOLDER, row.member_type, &row.member_id)
+                .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: adding the member expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            body["FolderMember"]["MemberId"],
+            json!(row.member_id),
+            "case {case:?}: the create must report the member it added: {body}"
+        );
+        assert_eq!(
+            body["FolderMember"]["MemberType"],
+            json!(row.member_type),
+            "case {case:?}: the create must report the member's type: {body}"
+        );
+        assert_eq!(
+            body["Status"],
+            json!(200),
+            "case {case:?}: Status is the HTTP status of the request: {body}"
+        );
+        assert!(
+            body["RequestId"].as_str().is_some_and(|id| !id.is_empty()),
+            "case {case:?}: the create must report a request id: {body}"
+        );
+
+        held.push(row.reported(ACCOUNT));
+        let (status, body) = list_folder_members(&harness, ACCOUNT, MEMBER_FOLDER, "").await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the member listing expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            reported_members(&body),
+            in_listing_order(held.clone()),
+            "case {case:?}: the listing must report every member added so far, each by \
+             the ARN of the asset it names: {body}"
+        );
+        assert_eq!(
+            body["NextToken"],
+            Value::Null,
+            "case {case:?}: one page holds every member, so there is no next page: {body}"
+        );
+    }
+
+    // Removing a membership takes exactly that member out of the listing and leaves the
+    // rest of them where they were.
+    for row in &rows {
+        let case = row.case;
+        let (status, body) = remove_folder_member(
+            &harness,
+            ACCOUNT,
+            MEMBER_FOLDER,
+            row.member_type,
+            &row.member_id,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: removing the member expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            body["Status"],
+            json!(200),
+            "case {case:?}: Status is the HTTP status of the request: {body}"
+        );
+
+        held.retain(|member| *member != row.reported(ACCOUNT));
+        let (status, body) = list_folder_members(&harness, ACCOUNT, MEMBER_FOLDER, "").await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the member listing expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            reported_members(&body),
+            in_listing_order(held.clone()),
+            "case {case:?}: a removed member is gone from the listing and the others \
+             stay: {body}"
+        );
+    }
+
+    // The folder itself outlives its memberships.
+    let (status, body) = describe_folder(&harness, ACCOUNT, MEMBER_FOLDER).await;
+    assert_eq!(
+        status, 200,
+        "removing every member must leave the folder itself, got {status} with {body}"
+    );
+}
+
+#[tokio::test]
+async fn adding_an_asset_a_folder_already_holds_is_a_conflict() {
+    let harness = Harness::new();
+    let (status, body) =
+        create_folder(&harness, ACCOUNT, MEMBER_FOLDER, json!({ "Name": "Reports" })).await;
+    assert_eq!(status, 200, "the create expected 200, got {status} with {body}");
+
+    for row in member_rows() {
+        let case = row.case;
+        let (status, body) =
+            add_folder_member(&harness, ACCOUNT, MEMBER_FOLDER, row.member_type, &row.member_id)
+                .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the first add expected 200, got {status} with {body}"
+        );
+
+        let (status, body) =
+            add_folder_member(&harness, ACCOUNT, MEMBER_FOLDER, row.member_type, &row.member_id)
+                .await;
+        assert_eq!(
+            status, 409,
+            "case {case:?}: adding the same asset twice expected 409, got {status} with \
+             {body}"
+        );
+        assert_eq!(
+            body["__type"],
+            json!("ResourceExistsException"),
+            "case {case:?}: an asset the folder already holds already exists in it: \
+             {body}"
+        );
+        assert_eq!(
+            body["Message"],
+            json!(format!(
+                "Member {} already exists in Folder {}",
+                row.arn(ACCOUNT),
+                folder_arn(ACCOUNT, MEMBER_FOLDER)
+            )),
+            "case {case:?}: the conflict must name the member and the folder holding it \
+             by their ARNs: {body}"
+        );
+
+        // And the refused add left one membership, not two.
+        let (_status, body) = list_folder_members(&harness, ACCOUNT, MEMBER_FOLDER, "").await;
+        let reported = reported_members(&body);
+        assert_eq!(
+            reported
+                .iter()
+                .filter(|member| **member == row.reported(ACCOUNT))
+                .count(),
+            1,
+            "case {case:?}: a refused add must not add a second membership: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn membership_calls_naming_what_is_not_held_are_not_found() {
+    let harness = Harness::new();
+    let (status, body) =
+        create_folder(&harness, ACCOUNT, MEMBER_FOLDER, json!({ "Name": "Reports" })).await;
+    assert_eq!(status, 200, "the create expected 200, got {status} with {body}");
+    let (status, body) =
+        add_folder_member(&harness, ACCOUNT, MEMBER_FOLDER, "DATASET", "sales-2024").await;
+    assert_eq!(status, 200, "the add expected 200, got {status} with {body}");
+
+    // An unknown id of an account that holds folders, the id of this account's folder in
+    // another account, and an id of an account that holds no folder at all: none of them
+    // reaches a folder, so none of them has members.
+    for (case, account, folder_id) in [
+        ("unknown-id", ACCOUNT, "never-created"),
+        ("other-account", OTHER_ACCOUNT, MEMBER_FOLDER),
+        ("account-with-nothing", "123456789012", MEMBER_FOLDER),
+    ] {
+        let expected_message = format!("Folder: {} not found", folder_arn(account, folder_id));
+        for (call, status, body) in [
+            (
+                "add",
+                add_folder_member(&harness, account, folder_id, "DATASET", "sales-2024").await,
+            ),
+            (
+                "remove",
+                remove_folder_member(&harness, account, folder_id, "DATASET", "sales-2024").await,
+            ),
+            (
+                "list",
+                list_folder_members(&harness, account, folder_id, "").await,
+            ),
+        ]
+        .map(|(call, (status, body))| (call, status, body))
+        {
+            assert_eq!(
+                status, 404,
+                "case {case:?}/{call}: a folder that is not held expected 404, got \
+                 {status} with {body}"
+            );
+            assert_eq!(
+                body["__type"],
+                json!("ResourceNotFoundException"),
+                "case {case:?}/{call}: an id no folder is held under is not found: {body}"
+            );
+            assert_eq!(
+                body["Message"],
+                json!(expected_message),
+                "case {case:?}/{call}: the refusal must name the folder by its ARN: \
+                 {body}"
+            );
+        }
+    }
+
+    // An asset the folder does not hold is no member of it: the member type, the id, or
+    // both, can be the part that names nothing.
+    for (case, member_type, member_id) in [
+        ("unknown-member-id", "DATASET", "never-added"),
+        ("held-id-other-type", "DASHBOARD", "sales-2024"),
+        ("nothing-of-that-type", "TOPIC", "never-added"),
+    ] {
+        let (status, body) =
+            remove_folder_member(&harness, ACCOUNT, MEMBER_FOLDER, member_type, member_id).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: removing a member the folder does not hold expected 404, got \
+             {status} with {body}"
+        );
+        assert_eq!(
+            body["__type"],
+            json!("ResourceNotFoundException"),
+            "case {case:?}: an asset the folder does not hold is not found: {body}"
+        );
+        let arn_resource = match member_type {
+            "DATASET" => "dataset",
+            "DASHBOARD" => "dashboard",
+            "TOPIC" => "topic",
+            other => panic!("case {case:?}: unexpected member type {other}"),
+        };
+        assert_eq!(
+            body["Message"],
+            json!(format!(
+                "Member arn:aws:quicksight:{REGION}:{ACCOUNT}:{arn_resource}/{member_id} \
+                 is not found in Folder {}",
+                folder_arn(ACCOUNT, MEMBER_FOLDER)
+            )),
+            "case {case:?}: the miss must name the member and the folder by their ARNs: \
+             {body}"
+        );
+    }
+
+    // The membership that is held survived every refusal.
+    let (status, body) = list_folder_members(&harness, ACCOUNT, MEMBER_FOLDER, "").await;
+    assert_eq!(status, 200, "the listing expected 200, got {status} with {body}");
+    assert_eq!(
+        reported_members(&body),
+        vec![(
+            "sales-2024".to_string(),
+            format!("arn:aws:quicksight:{REGION}:{ACCOUNT}:dataset/sales-2024")
+        )],
+        "a refused call must not change what the folder holds: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_member_listing_pages_through_every_member() {
+    let harness = Harness::new();
+    let (status, body) =
+        create_folder(&harness, ACCOUNT, MEMBER_FOLDER, json!({ "Name": "Reports" })).await;
+    assert_eq!(status, 200, "the create expected 200, got {status} with {body}");
+
+    let rows = member_rows();
+    for row in &rows {
+        let (status, body) =
+            add_folder_member(&harness, ACCOUNT, MEMBER_FOLDER, row.member_type, &row.member_id)
+                .await;
+        assert_eq!(
+            status,
+            200,
+            "case {:?}: the add expected 200, got {status} with {body}",
+            row.case
+        );
+    }
+    let everything = in_listing_order(rows.iter().map(|row| row.reported(ACCOUNT)).collect());
+
+    // Every page size from one member per page up to more than the folder holds: the
+    // pages are the whole member list, in order, cut at that size.
+    for page_size in [1usize, 2, 5, rows.len(), rows.len() + 3] {
+        let case = format!("max-results={page_size}");
+        let mut walked: Vec<(String, String)> = Vec::new();
+        let mut query = format!("?max-results={page_size}");
+        loop {
+            let (status, body) = list_folder_members(&harness, ACCOUNT, MEMBER_FOLDER, &query).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the page expected 200, got {status} with {body}"
+            );
+            let page = reported_members(&body);
+            assert!(
+                page.len() <= page_size,
+                "case {case:?}: a page must hold at most the page size asked for, got {} \
+                 entries: {body}",
+                page.len()
+            );
+            walked.extend(page);
+            match body["NextToken"].as_str() {
+                Some(token) => {
+                    assert!(
+                        walked.len() < everything.len(),
+                        "case {case:?}: a next page is only offered while members are \
+                         left, after {} of {}: {body}",
+                        walked.len(),
+                        everything.len()
+                    );
+                    query = format!("?max-results={page_size}&next-token={token}");
+                }
+                None => break,
+            }
+        }
+        assert_eq!(
+            walked, everything,
+            "case {case:?}: walking the pages must report every member exactly once, in \
+             listing order"
+        );
+    }
+
+    // A token this service did not issue names no position in that walk.
+    for (case, token) in [
+        ("not-a-token", "never-issued"),
+        ("wrong-prefix", "qs2-6162"),
+        ("not-hex", "qs1-zzzz"),
+    ] {
+        let (status, body) =
+            list_folder_members(&harness, ACCOUNT, MEMBER_FOLDER, &format!("?next-token={token}"))
+                .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a token this service did not issue expected 400, got {status} \
+             with {body}"
+        );
+        assert_eq!(
+            body["__type"],
+            json!("InvalidNextTokenException"),
+            "case {case:?}: an unreadable token is an invalid next token: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_membership_belongs_to_one_folder_of_one_account() {
+    let harness = Harness::new();
+    // The same folder id in two accounts, and a second folder beside it in the first:
+    // a membership is held under exactly one of them.
+    for (account, folder_id) in [
+        (ACCOUNT, MEMBER_FOLDER),
+        (ACCOUNT, "second-folder"),
+        (OTHER_ACCOUNT, MEMBER_FOLDER),
+    ] {
+        let (status, body) =
+            create_folder(&harness, account, folder_id, json!({ "Name": "Reports" })).await;
+        assert_eq!(
+            status, 200,
+            "the folder {folder_id} of {account} expected 200, got {status} with {body}"
+        );
+    }
+
+    let (status, body) =
+        add_folder_member(&harness, ACCOUNT, MEMBER_FOLDER, "DATASET", "sales-2024").await;
+    assert_eq!(status, 200, "the add expected 200, got {status} with {body}");
+
+    for (case, account, folder_id) in [
+        ("other-folder-same-account", ACCOUNT, "second-folder"),
+        ("same-folder-other-account", OTHER_ACCOUNT, MEMBER_FOLDER),
+    ] {
+        let (status, body) = list_folder_members(&harness, account, folder_id, "").await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the listing expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            reported_members(&body),
+            Vec::new(),
+            "case {case:?}: a membership is held under one folder of one account only: \
+             {body}"
+        );
+
+        // And it cannot be removed through that other address either.
+        let (status, body) =
+            remove_folder_member(&harness, account, folder_id, "DATASET", "sales-2024").await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: removing another folder's member expected 404, got {status} \
+             with {body}"
+        );
+    }
+
+    // Deleting the folder releases the memberships it held: a folder created again under
+    // the same id starts empty.
+    let (status, body) = harness
+        .call(
+            "DELETE",
+            &format!("/accounts/{ACCOUNT}/folders/{MEMBER_FOLDER}"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "deleting the folder expected 200, got {status} with {body}"
+    );
+    assert_eq!(
+        {
+            let state = qs_state::service_state(&*harness.engine).expect("the QuickSight store");
+            let store = state.lock();
+            store.folder_member_count(ACCOUNT, MEMBER_FOLDER)
+        },
+        0,
+        "a membership does not outlive the folder holding it"
+    );
+
+    let (status, body) =
+        create_folder(&harness, ACCOUNT, MEMBER_FOLDER, json!({ "Name": "Reports" })).await;
+    assert_eq!(
+        status, 200,
+        "re-creating the folder expected 200, got {status} with {body}"
+    );
+    let (status, body) = list_folder_members(&harness, ACCOUNT, MEMBER_FOLDER, "").await;
+    assert_eq!(status, 200, "the listing expected 200, got {status} with {body}");
+    assert_eq!(
+        reported_members(&body),
+        Vec::new(),
+        "a folder created under the id of a deleted one starts empty: {body}"
+    );
+}

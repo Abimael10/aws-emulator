@@ -11,7 +11,9 @@
 //!   that ARN — `"<Kind> <arn> already exists"` for a conflict and
 //!   `"<Kind> <arn> is not found"` for a miss, neither ending in a period; a folder,
 //!   whose miss the service words differently, is named by its ARN after a colon —
-//!   `"Folder: <arn> not found"`;
+//!   `"Folder: <arn> not found"`. A resource that joins two others, such as a folder's
+//!   membership, has no ARN of its own, so it is named by the ARNs of both — the
+//!   member's first, then the folder's;
 //! * a namespace is named by the name the request carried; the refusal a namespace WRITE
 //!   reports closes with a clause naming the call that failed — its operation's verb, the
 //!   namespace and the account — so a client can tell which call failed apart from a plain
@@ -39,6 +41,10 @@ use super::{data_set_arn, data_source_arn, folder_arn, theme_arn};
 
 /// The resource kind a folder refusal names.
 const FOLDER: &str = "Folder";
+
+/// The resource kind a folder-membership refusal names: the asset held in the folder, as
+/// the service's own `FolderMember` shape names it.
+const MEMBER: &str = "Member";
 
 /// The resource kind a theme refusal names, as the service's own `Theme` shape spells
 /// it.
@@ -79,6 +85,27 @@ pub fn folder_not_found_message(region: &str, aws_account_id: &str, folder_id: &
     format!(
         "{FOLDER}: {} not found",
         folder_arn(region, aws_account_id, folder_id)
+    )
+}
+
+/// The conflict `CreateFolderMembership` reports for an asset the folder already holds.
+///
+/// A membership has no address of its own — nothing names one but the two resources it
+/// joins — so it is named by the member's own ARN, the address a member listing reports
+/// it by, and then by the folder holding it.
+pub fn folder_member_exists_message(member_arn: &str, folder_arn: &str) -> String {
+    format!(
+        "{} in {FOLDER} {folder_arn}",
+        arn_exists_message(MEMBER, member_arn)
+    )
+}
+
+/// The miss a folder-membership operation reports for an asset the folder does not hold:
+/// the member named the same way the conflict above names it.
+pub fn folder_member_not_found_message(member_arn: &str, folder_arn: &str) -> String {
+    format!(
+        "{} in {FOLDER} {folder_arn}",
+        arn_not_found_message(MEMBER, member_arn)
     )
 }
 

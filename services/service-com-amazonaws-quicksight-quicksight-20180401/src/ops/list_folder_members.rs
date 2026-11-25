@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFolderMembers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFolderMembers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFolderMembers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the assets the folder `(AwsAccountId, FolderId)` holds, one page at a time:
+//! each entry is a member's id together with the ARN of the asset it names, read from
+//! the memberships the folder's membership creates persisted.
+//!
+//! A report on stored state: it writes nothing. A folder the account does not hold has
+//! no members to report, so it is reported as the miss this operation models.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +164,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFolderMembers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFolderMembersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFolderMembers"))
+        // `ctx` carries the region a refusal's ARN is scoped to; nothing here writes to
+        // the store.
+        let region = crate::state::request_region(ctx.parts());
+        let request_id = crate::state::next_request_id();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListFolderMembersErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        // A token this service did not issue names no position, so it is refused rather
+        // than read as "from the beginning".
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(after) => Some(after),
+                None => {
+                    return Err(ListFolderMembersErrorModeled::InvalidNextTokenException(
+                        InvalidNextTokenException {
+                            message: Some("The NextToken value isn't valid.".to_string()),
+                            request_id: Some(request_id),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => None,
+        };
+
+        let store = state.lock();
+        // The members are held inside the folder, so an id the account holds no folder
+        // under has no member list to report.
+        if store.folder(&input.aws_account_id, &input.folder_id).is_none() {
+            return Err(ListFolderMembersErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::folder_not_found_message(
+                        &region,
+                        &input.aws_account_id,
+                        &input.folder_id,
+                    )),
+                    // `ExceptionResourceType` declares no member for a folder, so this
+                    // refusal reports none rather than an unmodelled value.
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        let records = store.folder_members_in(&input.aws_account_id, &input.folder_id);
+        // A member's ARN is its whole address inside the folder, so it is what the page
+        // is ordered and resumed by.
+        let (page, next_token) = crate::state::page_of(
+            &records,
+            |record| record.arn.as_str(),
+            resume_after.as_deref(),
+            input.max_results,
+        );
+        let folder_member_list = page
+            .into_iter()
+            .map(crate::state::FolderMemberRecord::to_member_id_arn_pair)
+            .collect();
+
+        Ok(ListFolderMembersOutput {
+            folder_member_list: Some(folder_member_list),
+            next_token,
+            request_id: Some(request_id),
+            // `Status` is this response's `@httpResponseCode` member, so it IS the call's
+            // HTTP status.
+            status: 200,
+        })
     }
 }

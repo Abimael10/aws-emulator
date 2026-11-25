@@ -213,6 +213,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         store.remove_folder(&input.aws_account_id, &input.folder_id);
+        // A membership is held inside the folder, so the assets this folder held are
+        // members of nothing once it is gone: a folder later created under the same id
+        // starts empty rather than inheriting them.
+        store.remove_folder_members_of(&input.aws_account_id, &input.folder_id);
 
         Ok(DeleteFolderOutput {
             arn: Some(arn),

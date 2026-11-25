@@ -14,6 +14,7 @@ mod authorization;
 mod connection_target;
 mod connection_test;
 mod external_login;
+mod folder_members;
 mod group_members;
 /// The impl block in this module adds the account's identity-store reading to the state
 /// struct, so it exports no name of its own and needs no re-export.
@@ -27,6 +28,7 @@ pub use authorization::*;
 pub use connection_target::*;
 pub use connection_test::*;
 pub use external_login::*;
+pub use folder_members::*;
 pub use group_members::*;
 pub use refusals::*;
 pub use role_memberships::*;
@@ -82,6 +84,12 @@ pub struct ComAmazonawsQuicksightQuicksight20180401State {
     /// Nesting is held on the record as the ancestors' ARNs rather than as a tree of
     /// its own, so a folder is reached by its id in one lookup however deep it sits.
     pub folders: HashMap<(String, String), FolderRecord>,
+    /// Folder memberships by `(AwsAccountId, FolderId, MemberType, MemberId)`.
+    ///
+    /// A membership is a child of one folder and names one asset of the account, so its
+    /// key is that folder's own key with the member's type and id under it; see
+    /// [`FolderMemberRecord`].
+    pub folder_members: HashMap<(String, String, String, String), FolderMemberRecord>,
     /// IAM policy assignments by `(AwsAccountId, AssignmentName)`.
     ///
     /// The name alone identifies the assignment inside its account: the model states
@@ -1720,6 +1728,16 @@ pub fn iam_policy_assignment_arn(aws_account_id: &str, assignment_name: &str) ->
 /// The ARN of a folder: `.../folder/<FolderId>`.
 pub fn folder_arn(region: &str, aws_account_id: &str, folder_id: &str) -> String {
     quicksight_arn(region, aws_account_id, &format!("folder/{folder_id}"))
+}
+
+/// The ARN of an analysis: `.../analysis/<AnalysisId>`.
+pub fn analysis_arn(region: &str, aws_account_id: &str, analysis_id: &str) -> String {
+    quicksight_arn(region, aws_account_id, &format!("analysis/{analysis_id}"))
+}
+
+/// The ARN of a dashboard: `.../dashboard/<DashboardId>`.
+pub fn dashboard_arn(region: &str, aws_account_id: &str, dashboard_id: &str) -> String {
+    quicksight_arn(region, aws_account_id, &format!("dashboard/{dashboard_id}"))
 }
 
 /// The ARN of a theme: `.../theme/<ThemeId>`.
