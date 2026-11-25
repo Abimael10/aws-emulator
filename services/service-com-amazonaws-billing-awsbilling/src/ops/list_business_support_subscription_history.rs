@@ -402,11 +402,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(token) => Some(resume_key(&page_key, Self::NAME, token, &scope)?),
             None => None,
         };
-        let limit = input
-            .max_results
-            .and_then(|max| usize::try_from(max).ok())
-            .unwrap_or(DEFAULT_MAX_RESULTS)
-            .clamp(MIN_MAX_RESULTS, MAX_MAX_RESULTS);
+        let limit = crate::state::page_limit(
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            MIN_MAX_RESULTS,
+            MAX_MAX_RESULTS,
+        );
 
         // A date filter can leave a period of no length (an `endDate` at or
         // before the start the request asks from); nothing runs for no time at

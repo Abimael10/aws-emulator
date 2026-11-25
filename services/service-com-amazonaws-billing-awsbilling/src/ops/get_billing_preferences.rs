@@ -145,6 +145,11 @@ const FILTER_PREFERENCE_KEY: &str = "PREFERENCE_KEY";
 /// records to return per page. Range: 1 to 50. Default: 50." (`maxResults` doc).
 const DEFAULT_MAX_RESULTS: usize = 50;
 
+/// The smallest and largest page this read serves, the bounds of the modelled
+/// `maxResults` range (`@range(min: 1, max: 50)`) the same doc states.
+const MIN_MAX_RESULTS: usize = 1;
+const MAX_MAX_RESULTS: usize = 50;
+
 /// Refuse a request member as invalid, in the modeled `ValidationException`
 /// shape (HTTP 400) this operation declares.
 fn invalid_field(member: &str, why: &str) -> GetBillingPreferencesError {
@@ -443,10 +448,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        let limit = input
-            .max_results
-            .and_then(|max| usize::try_from(max).ok())
-            .unwrap_or(DEFAULT_MAX_RESULTS);
+        // The size the walk below takes is held inside the bounds the modelled
+        // `maxResults` range states, as it is for this service's other
+        // paginated reads: no answer carries more entries than the surface
+        // allows, and no size leaves a stored preference unreachable — an empty
+        // page is how this read says a feature has nothing stored under it.
+        let limit = crate::state::page_limit(
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            MIN_MAX_RESULTS,
+            MAX_MAX_RESULTS,
+        );
 
         let mut page: Vec<crate::state::PreferenceEntry> = Vec::new();
         let mut more_to_come = false;

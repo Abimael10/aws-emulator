@@ -161,8 +161,10 @@ pub struct ListBillingViewSegments<Eng> {
 /// range from 1 to 100. The default is 100."
 const DEFAULT_MAX_RESULTS: usize = 100;
 
-/// The smallest page the same member admits (its modelled `range` minimum).
+/// The smallest page the same member admits (its modelled `range` minimum), and
+/// the largest (its maximum, the documented default page).
 const MIN_MAX_RESULTS: usize = 1;
+const MAX_MAX_RESULTS: usize = DEFAULT_MAX_RESULTS;
 
 /// Refuse a request member as invalid, in the modeled `ValidationException`
 /// shape (HTTP 400) this operation declares.
@@ -493,11 +495,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // handler runs; the page size is held inside those bounds here as well,
         // so no answer can carry more entries than the surface states whatever
         // reaches the member.
-        let limit = input
-            .max_results
-            .and_then(|max| usize::try_from(max).ok())
-            .unwrap_or(DEFAULT_MAX_RESULTS)
-            .clamp(MIN_MAX_RESULTS, DEFAULT_MAX_RESULTS);
+        let limit = crate::state::page_limit(
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            MIN_MAX_RESULTS,
+            MAX_MAX_RESULTS,
+        );
         let next_token = if matched.len() > limit {
             matched.truncate(limit);
             matched.last().map(|(key, _)| {

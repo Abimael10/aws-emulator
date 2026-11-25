@@ -116,6 +116,11 @@ mod health;
 
 pub use health::*;
 
+/// The page size every paginated read of this service holds its answer to.
+mod page_size;
+
+pub use page_size::*;
+
 /// `CUSTOM`, the `BillingViewType` a view created through `CreateBillingView`
 /// carries (one of `BILLING_VIEW_TYPE_VALUES` in `ops::types`).
 pub const BILLING_VIEW_TYPE_CUSTOM: &str = "CUSTOM";

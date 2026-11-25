@@ -557,11 +557,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(token) => Some(resume_key(&page_key, Self::NAME, token, &scope)?),
             None => None,
         };
-        let limit = input
-            .max_results
-            .and_then(|max| usize::try_from(max).ok())
-            .unwrap_or(DEFAULT_MAX_RESULTS)
-            .clamp(MIN_MAX_RESULTS, MAX_MAX_RESULTS);
+        let limit = crate::state::page_limit(
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            MIN_MAX_RESULTS,
+            MAX_MAX_RESULTS,
+        );
 
         // Every account the month holds a Business/Developer/Basic Support bill
         // for is priced, whichever one the request asked about: the month's

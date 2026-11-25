@@ -413,11 +413,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `maxResults` is the page size; a request that names none gets the
         // largest page this read serves, so the answer is always a page and the
         // walk continues through `nextToken` whenever entries remain.
-        let limit = input
-            .max_results
-            .and_then(|max| usize::try_from(max).ok())
-            .unwrap_or(DEFAULT_MAX_RESULTS)
-            .clamp(MIN_MAX_RESULTS, MAX_MAX_RESULTS);
+        let limit = crate::state::page_limit(
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            MIN_MAX_RESULTS,
+            MAX_MAX_RESULTS,
+        );
         let (page, next_token) = if remaining.len() > limit {
             let page = &remaining[..limit];
             // The next token carries everything the walk has reported and the

@@ -566,11 +566,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `maxResults` is the page size; a request that names none asks for the
         // documented default, not for every view the account holds, so the walk
         // continues through `nextToken` whenever views remain past the page.
-        let limit = input
-            .max_results
-            .and_then(|max| usize::try_from(max).ok())
-            .unwrap_or(DEFAULT_MAX_RESULTS)
-            .clamp(MIN_MAX_RESULTS, MAX_MAX_RESULTS);
+        let limit = crate::state::page_limit(
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            MIN_MAX_RESULTS,
+            MAX_MAX_RESULTS,
+        );
         let next_token = if matched.len() > limit {
             matched.truncate(limit);
             matched.last().map(|view| {
