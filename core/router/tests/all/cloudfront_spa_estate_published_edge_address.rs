@@ -52,7 +52,7 @@ use crate::cloudformation_firehose_stream_stabilisation::wait_for_stack_status;
 // client can dial": both written by the sibling dialled-address suite, which this suite dials
 // the same way with a method and an entity of its own.
 use crate::cloudfront_dialled_edge_address_over_a_private_s3_origin::{dial_with, is_dialable};
-use crate::cloudfront_oac_s3_origin_edge::{edge_listener_authority, is_assigned_edge_domain};
+use crate::cloudfront_oac_s3_origin_edge::{edge_listener_authority, is_published_edge_address};
 use crate::query_wire::{form_encode, physical_ids_of};
 
 /// The Region every call is signed for, and the Region the origin hosts name.
@@ -881,13 +881,12 @@ async fn the_published_domain_name_serves_the_spa_shell_and_carries_its_api_writ
     let (id, domain, arn) = create_distribution(&router, &control, &api).await;
     grant_shell_reads(&router, &arn).await;
 
-    // The published name is the DNS name CloudFront assigns a distribution, and the address
-    // below is where a client on this machine reaches it — or there is nothing for a viewer to
-    // dial at all.
+    // The published value is the address a client on this machine reaches the edge at — or
+    // there is nothing for a viewer to dial at all.
     assert!(
-        is_assigned_edge_domain(&domain),
-        "expected the DNS name CloudFront assigns a distribution (d<label>.cloudfront.net) as \
-         the published DomainName, got {domain:?}"
+        is_published_edge_address(&domain),
+        "expected an address this emulator answers on (host:port) as the published DomainName, \
+         got {domain:?}"
     );
     let address = edge_listener_authority(&engine, &id)
         .expect("this emulator opened an address for the distribution");

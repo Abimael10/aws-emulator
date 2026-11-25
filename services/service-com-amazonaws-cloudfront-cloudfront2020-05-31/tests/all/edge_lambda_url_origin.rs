@@ -74,7 +74,7 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::EmulatedService;
 use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 
 use crate::distribution_lifecycle::{
-    edge_listener_address, is_assigned_edge_domain, API_VERSION, AUTHORIZATION, HOST,
+    edge_listener_address, is_published_edge_address, API_VERSION, AUTHORIZATION, HOST,
     POLL_INTERVAL, READY_DEADLINE,
 };
 use crate::edge_request_metrics::{cloudwatch, now_secs, window, PERIOD};
@@ -574,9 +574,9 @@ impl Topology {
             "setup {case}: the created distribution reports no Id or ARN: {raw}"
         );
         assert!(
-            is_assigned_edge_domain(&domain),
-            "setup {case}: expected the DNS name CloudFront assigns a distribution \
-             (d<label>.cloudfront.net), got {domain:?}"
+            is_published_edge_address(&domain),
+            "setup {case}: expected an address this emulator answers on \
+             (host:port), got {domain:?}"
         );
         let address = self.edge_address(&id);
         (

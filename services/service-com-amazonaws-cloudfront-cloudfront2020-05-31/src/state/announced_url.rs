@@ -60,14 +60,17 @@ pub fn announced_base(ctx: &::smithy_server_runtime::OperationContext<'_>) -> St
 /// address every value this service announces for a caller to dial is rooted at — or `None`
 /// for a request this emulator has no address of its own to name to.
 ///
-/// The one reading behind [`announced_base`] and the one a distribution's published
-/// `DomainName` follows ([`crate::state::published_edge_address`]), so a `Location` header and
-/// an edge domain minted by the same call cannot name two different endpoints: the endpoint
-/// the request REALLY reached first (a client configured with one local endpoint URL resolves
-/// nothing else, so it is handed back the very address it is already talking to, port
-/// included), and the address this process is served at behind it, so a resource created
-/// through an in-process call of another service is announced an address that caller's own
-/// client can reach too.
+/// The one reading behind [`announced_base`], so every URI this service announces for a caller
+/// to follow is rooted at one endpoint: the endpoint the request REALLY reached first (a client
+/// configured with one local endpoint URL resolves nothing else, so it is handed back the very
+/// address it is already talking to, port included), and the address this process is served at
+/// behind it, so a resource created through an in-process call of another service is announced
+/// an address that caller's own client can reach too.
+///
+/// A distribution's `DomainName` is NOT rooted here: it is a DNS name rather than a URI, so it
+/// names no address of this emulator at all, and what decides whether a listener is opened for
+/// that distribution to be dialled at is read here only for that
+/// ([`crate::state::opened_edge_endpoint`]).
 ///
 /// `None` is the one case where there is no endpoint of this process to name: a caller that
 /// resolves AWS's own hostnames, reaching an emulator served on no port at all

@@ -39,7 +39,6 @@ use std::time::Duration;
 use bytes::Bytes;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::cloudfront_oac_s3_origin_edge::is_assigned_edge_domain;
 use super::query_wire::{element, elements, opt_element};
 
 /// The Region every call of this suite is signed for.
@@ -236,9 +235,9 @@ async fn minted_distribution(
         "case {case:?}: the created distribution reports no Id: {created}"
     );
     assert!(
-        is_assigned_edge_domain(&domain),
-        "case {case:?}: expected the DNS name CloudFront assigns a distribution \
-         (d<label>.cloudfront.net) as the published DomainName, got {domain:?}"
+        !domain.contains('/') && domain.parse::<::std::net::SocketAddr>().is_ok(),
+        "case {case:?}: expected an address this emulator answers on (host:port) as the \
+         published DomainName, got {domain:?}"
     );
     (id, domain)
 }

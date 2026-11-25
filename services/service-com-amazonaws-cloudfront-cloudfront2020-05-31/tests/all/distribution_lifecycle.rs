@@ -181,32 +181,23 @@ pub(crate) async fn awaited_deployment(router: &MultiServiceRouter, case: &str, 
     }
 }
 
-/// Whether `domain` is a DNS name CloudFront ASSIGNS a distribution: one label under
-/// CloudFront's own zone, `d<label>.cloudfront.net`.
+/// Whether `domain` is the address a distribution publishes as its `DomainName`: an address
+/// this emulator ANSWERS on — a host carrying the port it answers on and nothing else, which
+/// here is the authority of the listener that distribution's edge is served on
+/// ([`is_reachable_authority`]).
 ///
 /// `Distribution$DomainName` is "the distribution's CloudFront domain name. For example:
-/// `d111111abcdef8.cloudfront.net`" — a domain NAME, so what the member carries is labels and
-/// nothing else: no address of this emulator, no port, no path. A client takes that name as a
-/// host — a Route 53 alias target, a `CNAME` value, a TLS server name, a `Host` header — and
-/// every one of those consumers rejects a value carrying any of the three.
-///
-/// What makes the name reach this emulator is that the emulator ANSWERS on it: the edge
-/// resolves a viewer request by the name the distribution published, in the `Host` a client
-/// states or in the first path segment where a client carries what its host cannot.
+/// `d111111abcdef8.cloudfront.net`" — the value a client DIALS: it composes
+/// `https://<DomainName>/<object>` from it, points a DNS record at it, hands it to a TLS client
+/// as the name to present. So the value is a HOST, optionally carrying a port, and never one
+/// with a URI path inside it; and a name in a zone this emulator does not serve resolves to
+/// nothing on the machine it runs on, so what is published is the one address a client here can
+/// dial as given.
 ///
 /// `pub(crate)` so every suite that reads a published domain name holds it to the one rule.
-pub(crate) fn is_assigned_edge_domain(domain: &str) -> bool {
-    let Some(label) = domain.strip_suffix(CLOUDFRONT_ZONE) else {
-        return false;
-    };
-    !label.is_empty()
-        && label
-            .chars()
-            .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
+pub(crate) fn is_published_edge_address(domain: &str) -> bool {
+    !domain.contains('/') && is_reachable_authority(domain)
 }
-
-/// The zone CloudFront assigns a distribution's domain name in, with the separating dot.
-pub(crate) const CLOUDFRONT_ZONE: &str = ".cloudfront.net";
 
 /// Whether `domain` is an address a client on the machine this emulator runs on can DIAL:
 /// the `host:port` of a listener this emulator opened, which is what a CONNECTION GROUP
@@ -1013,9 +1004,9 @@ async fn create_persists_the_configuration_every_read_then_reports() {
             .unwrap_or_default()
             .to_string();
         assert!(
-            is_assigned_edge_domain(&domain),
-            "case {case}: expected the DNS name CloudFront assigns a distribution \
-             (d<label>.cloudfront.net), got {domain:?}"
+            is_published_edge_address(&domain),
+            "case {case}: expected an address this emulator answers on \
+             (host:port), got {domain:?}"
         );
         assert!(
             seen_domains.insert(domain.clone()),

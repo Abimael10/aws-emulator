@@ -36,7 +36,7 @@
 //! published address rather than a request dispatched in process.
 
 use crate::distribution_lifecycle::{
-    awaited_deployment, edge_listener_authority, is_assigned_edge_domain, API_VERSION,
+    awaited_deployment, edge_listener_authority, is_published_edge_address, API_VERSION,
 };
 use crate::edge_realtime_logs::{
     assert_record, awaited_active, data_stream, delivery_role, distribution,
@@ -181,8 +181,8 @@ async fn a_viewer_dialling_the_published_domain_delivers_a_record_through_each_p
     // address below is where a viewer handed that name dials it — which is what makes the
     // dialled requests the thing a viewer does.
     assert!(
-        is_assigned_edge_domain(&subject.domain),
-        "expected the DNS name CloudFront assigns a distribution (d<label>.cloudfront.net), \
+        is_published_edge_address(&subject.domain),
+        "expected an address this emulator answers on (host:port), \
          got {:?}",
         subject.domain
     );

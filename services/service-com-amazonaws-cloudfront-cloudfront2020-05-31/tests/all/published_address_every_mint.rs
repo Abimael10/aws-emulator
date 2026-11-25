@@ -35,7 +35,7 @@ use crate::connection_mode_immutable::get_distribution_config;
 use crate::distribution_copy::copy_distribution;
 use crate::distribution_lifecycle::{
     awaited_deployment, config, create_distribution, edge_listener_authority,
-    emulator_with_engine, get_distribution, is_assigned_edge_domain, list_distributions,
+    emulator_with_engine, get_distribution, is_published_edge_address, list_distributions,
     update_distribution, Config, HOST,
 };
 use crate::distribution_tags::create_distribution_with_tags;
@@ -164,9 +164,9 @@ async fn mint_distribution(
         .unwrap_or_default()
         .to_string();
     assert!(
-        is_assigned_edge_domain(&domain),
-        "case {case}: expected the DNS name CloudFront assigns a distribution \
-         (d<label>.cloudfront.net), got {domain:?}"
+        is_published_edge_address(&domain),
+        "case {case}: expected an address this emulator answers on \
+         (host:port), got {domain:?}"
     );
     if let Some(primary_domain) = minted_from {
         assert_ne!(

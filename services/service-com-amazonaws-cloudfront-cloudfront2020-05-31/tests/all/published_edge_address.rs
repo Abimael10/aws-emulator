@@ -42,7 +42,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::distribution_lifecycle::{
     awaited_deployment, call, create_distribution, edge_listener_authority, emulator,
-    emulator_with_engine, get_distribution, is_assigned_edge_domain, update_distribution, Answer,
+    emulator_with_engine, get_distribution, is_published_edge_address, update_distribution, Answer,
     API_VERSION, CUSTOM_VIEWER_CERTIFICATE, HOST,
 };
 use crate::function_lifecycle::{create_table, Create};
@@ -562,9 +562,9 @@ async fn published_domain(
         .unwrap_or_default()
         .to_string();
     assert!(
-        is_assigned_edge_domain(&domain),
-        "case {case}: expected the DNS name CloudFront assigns a distribution \
-         (d<label>.cloudfront.net), got {domain:?}"
+        is_published_edge_address(&domain),
+        "case {case}: expected an address this emulator answers on \
+         (host:port), got {domain:?}"
     );
     let address = edge_listener_authority(engine, case, &id);
     awaited_deployment(router, case, &id).await;

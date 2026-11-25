@@ -6,9 +6,9 @@
 //!
 //! RULE: **`Distribution$DomainName` is "the domain name that CloudFront assigns when you
 //! create a distribution", so it names an address THIS emulator answers at for the client that
-//! read it — the host of the endpoint that client reached, with the distribution named in the
-//! reserved data-plane path beneath it — and a viewer composing `https://<DomainName>/<object>`
-//! from that value reaches THAT distribution's edge.** What the edge then does is the
+//! read it — a host, optionally carrying the port it answers on, and never a value with a URI
+//! path inside it — and a viewer composing `https://<DomainName>/<object>` from that value
+//! reaches THAT distribution's edge.** What the edge then does is the
 //! distribution's own configuration: `Origin$CustomHeaders` is "a header that you want
 //! CloudFront to send to your origin", so every origin request carries it, and an internal load
 //! balancer whose listener rule matches that header answers the edge with the rule's own fixed
@@ -40,7 +40,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 // The ONE percent-encoder and element readers this test crate keeps for the wire suites
 // (`all/query_wire.rs`: "Nothing new should write another one — call this module").
-use crate::cloudfront_oac_s3_origin_edge::is_assigned_edge_domain;
+use crate::cloudfront_oac_s3_origin_edge::is_published_edge_address;
 use crate::query_wire::{element, form_encode, opt_element};
 
 /// The Region every setup call is signed for.
@@ -554,12 +554,12 @@ async fn the_published_edge_reaches_a_vpc_origin_whose_rule_requires_the_origin_
     let vpc_origin = deployed_vpc_origin(&router, &load_balancer_arn).await;
     let domain = deployed_distribution(&router, &published, &vpc_origin).await;
 
-    // The published name is the DNS name CloudFront assigns a distribution — labels and nothing
-    // else, whatever address the create was reached at — and this emulator answers on it.
+    // The published value is an address this emulator answers on — a host carrying the port
+    // its edge answers on, whatever address the create was reached at — and a viewer composes
+    // its URL from it.
     assert!(
-        is_assigned_edge_domain(&domain),
-        "expected the DNS name CloudFront assigns a distribution (d<label>.cloudfront.net), got \
-         {domain:?}"
+        is_published_edge_address(&domain),
+        "expected an address this emulator answers on (host:port), got {domain:?}"
     );
 
     for row in ROWS {

@@ -11,7 +11,7 @@
 //!   `TenantConfig` "only supports multi-tenant distributions"; a tenant-only
 //!   distribution's viewers reach it through a connection group's routing endpoint, so
 //!   the distribution reports the placeholder `DomainName` rather than an edge domain of
-//!   its own — while a standard distribution reports the `d<label>.cloudfront.net` one
+//!   its own — while a standard distribution reports an address this emulator answers on
 //!   allocated to it. Whatever a distribution reports, EVERY projection of it reports the
 //!   same value, and the configuration it was created with (`TenantConfig` included)
 //!   comes back with it.
@@ -32,7 +32,7 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
 };
 
 use crate::distribution_lifecycle::{
-    create_distribution, emulator, get_distribution, is_assigned_edge_domain, list_distributions,
+    create_distribution, emulator, get_distribution, is_published_edge_address, list_distributions,
     update_distribution, Answer, Node, API_VERSION,
 };
 
@@ -570,9 +570,9 @@ async fn a_multi_tenant_distribution_reports_no_domain_of_its_own() {
             );
         } else {
             assert!(
-                is_assigned_edge_domain(&domain),
-                "case {label}: expected the DNS name CloudFront assigns a distribution \
-                 (d<label>.cloudfront.net), got {domain:?}"
+                is_published_edge_address(&domain),
+                "case {label}: expected an address this emulator answers on \
+                 (host:port), got {domain:?}"
             );
         }
 

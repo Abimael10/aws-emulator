@@ -1626,13 +1626,17 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         }
 
         let id = self.allocate_distribution_id();
-        // The domain name a VIEWER is handed: the DNS name CloudFront assigns the
-        // distribution — a generated label under `cloudfront.net` — which is what the member
-        // carries and all it carries, no address of this emulator's own, no port and no path.
-        // The emulator ANSWERS on that name rather than naming itself in it
-        // ([`crate::state::edge_endpoint`]), and a multi-tenant distribution reports no domain
-        // of its own at all ([`StoredDistribution::reported_domain_name`]).
-        let domain_name = self.allocate_domain_name();
+        // The domain name a VIEWER is handed: the authority of the listener this distribution's
+        // edge is served on ([`EdgeEndpoint`]) — a host carrying the port it answers on — so a
+        // client that composes `https://<DomainName>/<object>` from it, or points a DNS record
+        // at it, reaches this distribution. A distribution this emulator has no address to give
+        // — a multi-tenant one, which reports no domain of its own at all
+        // ([`StoredDistribution::reported_domain_name`]), and a create on an engine that vends
+        // no listeners — carries the name CloudFront's own zone would give it.
+        let domain_name = match &edge_endpoint {
+            Some(endpoint) => endpoint.authority().to_string(),
+            None => self.allocate_domain_name(),
+        };
         let etag = self.next_etag();
         let stored = StoredDistribution {
             arn: distribution_arn(&id),
@@ -1669,9 +1673,8 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         };
         self.caller_references.insert(caller_reference, id.clone());
         // A listener this distribution was given now has a distribution to serve, and its
-        // handle is held for as long as that distribution is: dropping it closes the port. A
-        // distribution created through the emulator's own endpoint holds no socket at all —
-        // the edge is served at that endpoint, under the name the distribution published.
+        // handle is held for as long as that distribution is: dropping it closes the port, and
+        // with it the address that distribution published.
         if let Some(endpoint) = edge_endpoint {
             endpoint.serves(&id);
             self.edge_endpoints.insert(id.clone(), endpoint);

@@ -45,7 +45,7 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::service::edge_metrics
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::distribution_lifecycle::{
-    awaited_deployment, edge_listener_authority, is_assigned_edge_domain,
+    awaited_deployment, edge_listener_authority, is_published_edge_address,
 };
 use crate::edge_additional_metric_reconciliation::{Outcome, CACHE_ERROR, CACHE_HIT, CACHE_MISS};
 use crate::edge_additional_metrics::{created, subscribe};
@@ -85,9 +85,9 @@ async fn subject(
 ) -> Subject {
     let (id, domain) = created(router, caller_reference).await;
     assert!(
-        is_assigned_edge_domain(&domain),
-        "case {case:?}: expected the DNS name CloudFront assigns a distribution \
-         (d<label>.cloudfront.net), got {domain:?}"
+        is_published_edge_address(&domain),
+        "case {case:?}: expected an address this emulator answers on \
+         (host:port), got {domain:?}"
     );
     let address = edge_listener_authority(engine, case, &id);
     Subject {

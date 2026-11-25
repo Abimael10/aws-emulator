@@ -28,7 +28,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::distribution_lifecycle::{
     awaited_deployment, create_distribution, edge_listener_authority, emulator_with_engine,
-    is_assigned_edge_domain, API_VERSION, HOST,
+    is_published_edge_address, API_VERSION, HOST,
 };
 use crate::published_edge_address::dial_as;
 
@@ -113,9 +113,9 @@ async fn deployed(
         .unwrap_or_default()
         .to_string();
     assert!(
-        is_assigned_edge_domain(&domain),
-        "case {case}: expected the DNS name CloudFront assigns a distribution \
-         (d<label>.cloudfront.net), got {domain:?}"
+        is_published_edge_address(&domain),
+        "case {case}: expected an address this emulator answers on \
+         (host:port), got {domain:?}"
     );
     // A configuration that has not reached the edge locations serves no viewer.
     awaited_deployment(router, case, &id).await;

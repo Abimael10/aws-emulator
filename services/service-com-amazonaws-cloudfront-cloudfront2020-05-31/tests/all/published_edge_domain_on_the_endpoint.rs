@@ -1,35 +1,41 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The name a distribution publishes as its `DomainName`, against the address the create that
-//! minted it was REACHED at.
+//! The address a distribution publishes as its `DomainName`, against the address the create
+//! that minted it was REACHED at.
 //!
 //! RULE: `Distribution$DomainName` is "the distribution's CloudFront domain name. For example:
-//! `d111111abcdef8.cloudfront.net`" — the DNS NAME CloudFront assigns the distribution. So the
-//! value is one label under CloudFront's own zone whatever address the create was reached at,
-//! and it carries nothing else: no address of this emulator, no port, no URL path. What makes
-//! that name reach the distribution is that the emulator ANSWERS on it — a viewer request is
-//! resolved by the name the distribution published, stated as the `Host` it addressed or
-//! carried in the first path segment where a client cannot carry it in the host — and every
-//! read of the distribution reports that one value.
+//! `d111111abcdef8.cloudfront.net`" — the value a client DIALS: it composes
+//! `https://<DomainName>/<object>` from it, points a DNS record at it, hands it to a TLS client
+//! as the name to present. So the published value is a HOST, optionally carrying the port it
+//! answers on, and never one with a URI path inside it; and it has to be an address THIS
+//! emulator answers on, because a name in a zone this emulator does not serve resolves to
+//! nothing on the machine it runs on. The one such value a client here can dial as given,
+//! without resolving a name, is the loopback `host:port` of the listener that distribution's
+//! edge is served on — so every create publishes that authority, whatever address the create
+//! itself was reached at, the edge answers a viewer that dials it, and every read of the
+//! distribution reports the same value.
 //!
 //! The rows span what the rule generalises over — the address the create was reached at: the
 //! emulator's own endpoint as a loopback LITERAL and as a loopback NAME, each on a port of its
 //! own, and this service's published host in its global and its regional spelling, which is
-//! the caller that resolves AWS's own hostnames. Each row holds the published name to the form
-//! CloudFront assigns, serves an object through it both ways a client can address it, and reads
-//! the same value back through `GetDistribution` and `ListDistributions`.
+//! the caller that resolves AWS's own hostnames. Each row holds its published value to that
+//! form, DIALS it over a socket of its own and reads an object through it, carries the value as
+//! the host of a request placed in process as well, and reads the same value back through
+//! `GetDistribution` and `ListDistributions`.
 //!
 //! The hosts are the shared table [`crate::announced_location_uri::addressed_hosts`] hands
-//! out, which HOLDS the loopback ports its own-endpoint rows address, and the wire harness is
-//! [`crate::distribution_lifecycle`]'s.
+//! out, which HOLDS the loopback ports its own-endpoint rows address, the wire harness is
+//! [`crate::distribution_lifecycle`]'s and the viewer dial [`crate::published_edge_address`]'s
+//! — each reused rather than copied.
 
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::announced_location_uri::addressed_hosts;
 use crate::distribution_lifecycle::{
-    awaited_deployment, call_from_host, emulator, get_distribution, is_assigned_edge_domain,
+    awaited_deployment, call_from_host, emulator, get_distribution, is_published_edge_address,
     list_distributions, Answer, API_VERSION, HOST,
 };
+use crate::published_edge_address::dial_as;
 
 /// A viewer path the origin these distributions point at — this service's own control-plane
 /// endpoint, reached over the in-process transport — answers with a `DistributionList`.
@@ -97,10 +103,12 @@ async fn created(
     (id, domain)
 }
 
-/// Every distribution publishes, as its `DomainName`, the DNS name CloudFront assigned it —
-/// whatever address the create came from — and the emulator answers on that name.
+/// Every distribution publishes, as its `DomainName`, an address this emulator answers on — a
+/// host carrying the port it answers on, which is the authority of the listener its edge is
+/// served on — whatever address the create that minted it was reached at, and a viewer that
+/// dials that value is served by that distribution's edge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_distribution_publishes_the_name_cloudfront_assigned_it() {
+async fn a_distribution_publishes_a_dialable_address_whatever_the_create_reached() {
     let router = emulator();
     // Held for the whole test: the ports the own-endpoint rows address stay this process's
     // own, so no listener this engine opens can be given one of them.
@@ -117,66 +125,57 @@ async fn a_distribution_publishes_the_name_cloudfront_assigned_it() {
         )
         .await;
 
-        // The name CloudFront assigns, and nothing of the address the create was reached at:
-        // the value is the same FORM whichever address that was.
+        // A host carrying the port it answers on and nothing else: no URI path inside the
+        // member, and an address a client dials as given. The FORM is the same whichever
+        // address the create was reached at, and each distribution publishes one of its own.
         assert!(
-            is_assigned_edge_domain(&domain),
-            "case {case}: expected the DNS name CloudFront assigns a distribution \
-             (d<label>.cloudfront.net), got {domain:?}"
+            is_published_edge_address(&domain),
+            "case {case}: expected an address this emulator answers on (host:port), got \
+             {domain:?}"
         );
         assert!(
             !published.contains(&domain),
-            "case {case}: expected a name of this distribution's own, got {domain:?} again"
+            "case {case}: expected an address of this distribution's own, got {domain:?} again"
         );
         published.push(domain.clone());
 
         awaited_deployment(&router, case, &id).await;
 
-        // The whole point of the published name: the emulator ANSWERS on it. A viewer that
-        // states it as the host it addressed is served by THAT distribution's edge, and an
-        // answer the edge served states what it did with the request in `X-Cache`; a
+        // The whole point of the published value: a viewer DIALS it — over a socket of its
+        // own, as a client handed that value does — and the edge of THAT distribution answers.
+        // An answer the edge served states what it did with the request in `X-Cache`; a
         // control-plane answer states nothing there.
-        let served = call_from_host(&router, &domain, "GET", SERVED_PATH, None, &[]).await;
-        assert_eq!(
-            served.status, 200,
-            "case {case}: expected the edge to serve the object for a viewer addressing \
-             {domain:?}, got {} with {}",
-            served.status, served.raw
-        );
-        assert_eq!(
-            served.header("x-cache"),
-            "Miss from cloudfront",
-            "case {case}: expected the answer for {domain:?} to come from the edge, got \
-             X-Cache {:?}",
-            served.header("x-cache")
-        );
-
-        // And a client that cannot carry the name in the host carries it in the first path
-        // segment instead, reaching the same distribution's edge.
-        let in_the_path = call_from_host(
-            &router,
-            &addressed.host,
-            "GET",
-            &format!("/{domain}{SERVED_PATH}"),
-            None,
-            &[],
-        )
-        .await;
-        assert_eq!(
-            in_the_path.status, 200,
-            "case {case}: expected the edge to serve the object for {domain:?} carried in the \
-             path, got {} with {}",
-            in_the_path.status, in_the_path.raw
+        let served = dial_as(&domain, "GET", SERVED_PATH, &domain).await;
+        let lowercase = served.to_ascii_lowercase();
+        assert!(
+            lowercase.starts_with("http/1.1 200"),
+            "case {case}: expected the edge to serve the object through {domain:?}, got \
+             {served:?}"
         );
         assert!(
-            in_the_path.header("x-cache").ends_with("from cloudfront"),
-            "case {case}: expected the answer for {domain:?} in the path to come from the \
-             edge, got X-Cache {:?}",
-            in_the_path.header("x-cache")
+            lowercase.contains("x-cache: miss from cloudfront"),
+            "case {case}: expected the answer through {domain:?} to come from the edge, got \
+             {served:?}"
+        );
+
+        // And a client that states that value as the host it addressed reaches the same
+        // distribution's edge, which is the addressing a request placed in process carries.
+        let as_the_host = call_from_host(&router, &domain, "GET", SERVED_PATH, None, &[]).await;
+        assert_eq!(
+            as_the_host.status, 200,
+            "case {case}: expected the edge to serve the object for a viewer addressing \
+             {domain:?}, got {} with {}",
+            as_the_host.status, as_the_host.raw
+        );
+        assert!(
+            as_the_host.header("x-cache").ends_with("from cloudfront"),
+            "case {case}: expected the answer for {domain:?} to come from the edge, got X-Cache \
+             {:?}",
+            as_the_host.header("x-cache")
         );
 
         // And every read of the distribution reports that one value, so a client that read it
-        // back from any of them holds the same name.
+        // back from any of them dials the same address.
         let read = get_distribution(&router, &id).await;
         let read_domain = read
             .root()

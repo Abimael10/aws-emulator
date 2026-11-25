@@ -42,7 +42,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::announced_location_uri::addressed_hosts;
 use crate::distribution_lifecycle::{
     awaited_deployment, create_distribution, edge_listener_address, emulator_with_engine,
-    get_distribution, is_assigned_edge_domain, API_VERSION, HOST,
+    get_distribution, is_published_edge_address, API_VERSION, HOST,
 };
 use crate::edge_lambda_url_origin::{Answered, Edge};
 use crate::edge_request_shaping::cache_policy;
@@ -145,9 +145,9 @@ async fn deployed(
         .unwrap_or_default()
         .to_string();
     assert!(
-        is_assigned_edge_domain(&domain),
-        "case {case}: expected the DNS name CloudFront assigns a distribution \
-         (d<label>.cloudfront.net), got {domain:?}"
+        is_published_edge_address(&domain),
+        "case {case}: expected an address this emulator answers on \
+         (host:port), got {domain:?}"
     );
     let read = get_distribution(router, &id).await;
     assert_eq!(

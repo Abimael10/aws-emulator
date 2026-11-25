@@ -46,7 +46,7 @@ use super::cloudfront_access_log_deliveries_carry_each_edge_request::{
     FROM_CLOUDFRONT, PRIMARY_FIELDS,
 };
 use super::cloudfront_dialled_edge_address_over_a_private_s3_origin::{dial, is_dialable};
-use super::cloudfront_oac_s3_origin_edge::is_assigned_edge_domain;
+use super::cloudfront_oac_s3_origin_edge::is_published_edge_address;
 use super::logs_delivery_source_cloudfront_resource::logs;
 
 /// The bucket this suite's distribution takes its origin from, and the object it holds.
@@ -170,12 +170,12 @@ async fn a_viewer_dialling_the_published_address_is_vended_to_every_live_deliver
     )
     .await;
 
-    // There is nothing for a viewer to dial unless the name the distribution published is the
-    // one CloudFront assigns and this emulator opened an address it resolves to.
+    // There is nothing for a viewer to dial unless the value the distribution published is an
+    // address this emulator answers on.
     assert!(
-        is_assigned_edge_domain(&pipeline.domain),
-        "expected the DNS name CloudFront assigns a distribution (d<label>.cloudfront.net) as \
-         the published DomainName, got {:?}",
+        is_published_edge_address(&pipeline.domain),
+        "expected an address this emulator answers on (host:port) as the published DomainName, \
+         got {:?}",
         pipeline.domain
     );
     let address = pipeline

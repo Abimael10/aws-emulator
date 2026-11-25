@@ -50,7 +50,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::service::edge_metrics;
 
 use crate::cloudfront_dialled_edge_address_over_a_private_s3_origin::is_dialable;
-use crate::cloudfront_oac_s3_origin_edge::{edge_listener_authority, is_assigned_edge_domain};
+use crate::cloudfront_oac_s3_origin_edge::{edge_listener_authority, is_published_edge_address};
 use crate::cloudfront_edge_metrics_drive_the_alarm_chain::{emulator, now_secs};
 use crate::cloudfront_oac_s3_origin_edge::{
     awaited_deployment, call, create_bucket, create_distribution, create_origin_access_control,
@@ -583,9 +583,9 @@ async fn a_viewer_dialling_either_half_of_the_published_address_fills_the_series
         let case = row.case;
         awaited_deployment(&setup, case, id).await;
         assert!(
-            is_assigned_edge_domain(domain),
-            "case {case:?}: expected the DNS name CloudFront assigns a distribution \
-             (d<label>.cloudfront.net), got {domain:?}"
+            is_published_edge_address(domain),
+            "case {case:?}: expected an address this emulator answers on \
+             (host:port), got {domain:?}"
         );
         let address = edge_listener_authority(&engine, id).unwrap_or_else(|| {
             panic!("case {case:?}: this emulator opened no address for the distribution {id}")

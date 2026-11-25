@@ -41,7 +41,7 @@ use std::sync::Arc;
 use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 
 use crate::distribution_lifecycle::{
-    awaited_deployment, call, edge_listener_address, is_assigned_edge_domain, API_VERSION,
+    awaited_deployment, call, edge_listener_address, is_published_edge_address, API_VERSION,
 };
 use crate::edge_lambda_url_origin::{Answered, Edge};
 use crate::edge_signed_access::CACHING_DISABLED;
@@ -253,8 +253,8 @@ async fn staged(reference: &str, bucket: &str, granted: &[&str]) -> Staged {
         .await
         .unwrap_or_else(|error| panic!("the policy of {bucket} must be stored, got {error:?}"));
     assert!(
-        is_assigned_edge_domain(&domain),
-        "expected the DNS name CloudFront assigns a distribution (d<label>.cloudfront.net), \
+        is_published_edge_address(&domain),
+        "expected an address this emulator answers on (host:port), \
          got {domain:?}"
     );
     // A configuration that has not reached the edge locations serves no viewer, and the CLOCK

@@ -42,7 +42,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::cloudfront_apigateway_origin_edge::{
     apigw, cloudfront, dispatch, member, view, Answer, API_VERSION, REGION, STAGE,
 };
-use super::cloudfront_oac_s3_origin_edge::{edge_listener_authority, is_assigned_edge_domain};
+use super::cloudfront_oac_s3_origin_edge::{edge_listener_authority, is_published_edge_address};
 
 /// The resource path of the api's one method, and the key the bucket's one object sits at.
 const ECHO_PATH: &str = "echo";
@@ -120,13 +120,13 @@ fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// Where a viewer reaches the distribution `id`: the `host:port` this emulator opened for its
-/// edge, which is what a client dials, with the name the distribution published — held to the
-/// one CloudFront assigns — stated as the host it addressed.
+/// edge, which is what a client dials — the address the distribution published, held to being
+/// one this emulator answers on — stated as the host it addressed.
 fn dialled_edge(engine: &Arc<engine::InMemoryEngine>, case: &str, id: &str, domain: &str) -> String {
     assert!(
-        is_assigned_edge_domain(domain),
-        "case {case:?}: expected the DNS name CloudFront assigns a distribution \
-         (d<label>.cloudfront.net), got {domain:?}"
+        is_published_edge_address(domain),
+        "case {case:?}: expected an address this emulator answers on \
+         (host:port), got {domain:?}"
     );
     edge_listener_authority(engine, id).unwrap_or_else(|| {
         panic!("case {case:?}: this emulator opened no address for the distribution {id}")

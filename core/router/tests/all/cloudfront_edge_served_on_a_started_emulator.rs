@@ -16,13 +16,13 @@
 //! distribution's monitoring subscription carries `RealtimeMetricsSubscriptionStatus`
 //! `Enabled`.**
 //!
-//! A name under CloudFront's own zone is resolved by DNS, which a client of this started
-//! emulator cannot ask of the host it runs on: so the viewer rows below reach the endpoint they
-//! already hold — the one the control-plane calls go to — and carry the published NAME in the
-//! first path segment, the addressing the edge reads for a client that cannot carry it in the
-//! host. The core terminates TLS on that endpoint, as it does on every endpoint this emulator
-//! publishes, so the rows dial it over `https`; the plaintext half of a per-resource listener's
-//! address is pinned by [`crate::cloudfront_dialled_edge_scheme_publishes_its_series`].
+//! The address a distribution created THROUGH a started emulator publishes is the authority of
+//! the listener that emulator opened for its edge: a loopback `host:port` a client of that
+//! process dials AS GIVEN, which is what a published address has to be here — a name in
+//! CloudFront's own zone is resolved by DNS, which a client of this process cannot ask of the
+//! host it runs on. The core terminates the TLS on that address too, negotiated in band, so the
+//! viewer rows below dial it over `https`; both halves of such an address are pinned by
+//! [`crate::cloudfront_dialled_edge_scheme_publishes_its_series`].
 //!
 //! The sibling suites pin that rule on a router a test assembles in its own process
 //! ([`crate::cloudfront_dialled_edge_scheme_publishes_its_series`], whose vocabulary for a
@@ -64,7 +64,7 @@ use crate::cloudfront_dialled_edge_scheme_publishes_its_series::{
 };
 use crate::cloudfront_edge_metrics_drive_the_alarm_chain::now_secs;
 use crate::cloudfront_oac_s3_origin_edge::{
-    is_assigned_edge_domain, policy, API_VERSION, CLOUDFRONT_PRINCIPAL, REGION,
+    is_published_edge_address, policy, API_VERSION, CLOUDFRONT_PRINCIPAL, REGION,
 };
 use crate::query_wire::element;
 
@@ -150,30 +150,29 @@ fn cloudwatch(started: &Started, case: &str, operation: &str, body: &Value) -> V
     serde_json::from_str(&text).unwrap_or(Value::Null)
 }
 
-/// Whether `domain` is the DNS name CloudFront assigns a distribution, which is what the
-/// published member carries whatever address the create was reached at
-/// ([`crate::cloudfront_oac_s3_origin_edge::is_assigned_edge_domain`]).
-fn is_the_assigned_domain_name(domain: &str) -> bool {
-    is_assigned_edge_domain(domain)
+/// Whether `domain` is the address a distribution publishes as its `DomainName`: one this
+/// emulator answers on, a host carrying the port it answers on
+/// ([`crate::cloudfront_oac_s3_origin_edge::is_published_edge_address`]).
+fn is_the_published_address(domain: &str) -> bool {
+    is_published_edge_address(domain)
 }
 
 /// The authority a viewer DIALS to reach the published `domain`, and the path it asks `key`
 /// for.
 ///
-/// A domain name is resolved by DNS, which a client of this started emulator cannot ask of the
-/// host it runs on: so the viewer dials the endpoint it already reached the emulator at and
-/// carries the published NAME in the first path segment, which is the addressing the edge reads
-/// for a client that cannot carry it in the host.
-fn viewer_authority(started: &Started, domain: &str) -> (String, String) {
-    (started.authority(), format!("/{domain}"))
+/// The published value IS the address: a client handed it dials it as given, carrying only the
+/// object in the path — which is what a customer of this emulator does with the value its
+/// control plane answered.
+fn viewer_authority(domain: &str) -> (String, String) {
+    (domain.to_string(), String::new())
 }
 
-/// One viewer request made by DIALLING the address the distribution published — at the endpoint
-/// this client reached the emulator on ([`viewer_authority`]) — over `scheme`, carrying no
-/// credential of any kind, which is what a client handed a domain name sends. It goes over the
-/// client that trusts the certificate this start published.
+/// One viewer request made by DIALLING the address the distribution published
+/// ([`viewer_authority`]) over `scheme`, carrying no credential of any kind, which is what a
+/// client handed a domain name sends. It goes over the client that trusts the certificate this
+/// start published.
 fn dial(started: &Started, case: &str, scheme: &str, domain: &str, key: &str) -> Served {
-    let (authority, path) = viewer_authority(started, domain);
+    let (authority, path) = viewer_authority(domain);
     let url = format!("{scheme}://{authority}{path}/{key}");
     let answered = started
         .client()
@@ -458,12 +457,12 @@ fn the_started_emulators_published_edge_serves_and_fills_its_series() {
     for (row, (id, domain, _arn)) in table.iter().zip(subjects.iter()) {
         let case = row.case;
         awaited_deployment(&started, case, id);
-        // The published name is the DNS name CloudFront assigns a distribution, which the
-        // rows below carry in the path of the endpoint this client reached the emulator on.
+        // The published value is an address this client dials as given: a host carrying the
+        // port that distribution's edge answers on, which is what the rows below dial.
         assert!(
-            is_the_assigned_domain_name(domain),
-            "case {case:?}: expected the DNS name CloudFront assigns a distribution \
-             (d<label>.cloudfront.net), got {domain:?}"
+            is_the_published_address(domain),
+            "case {case:?}: expected an address this emulator answers on (host:port), got \
+             {domain:?}"
         );
         if row.subscribed {
             subscribe(&started, case, id);

@@ -7,7 +7,7 @@
 //! — an `OutputKey` AND its resolved `OutputValue` — and that value is the return value
 //! the resource TYPE publishes, in the identifier form the OWNING service produces,
 //! including the identifiers and endpoint names that service ASSIGNS (a distribution id
-//! and its `cloudfront.net` domain name, a REST API's id and its root resource id, a
+//! and the address its edge is published at, a REST API's id and its root resource id, a
 //! bucket's four DNS names). A resource type whose published attribute this service cannot
 //! compute still reports its output with a key and no value — never an invented one — so
 //! the two halves of the rule are asserted side by side.
@@ -63,21 +63,18 @@ fn is_cloudfront_id(value: &str) -> bool {
     })
 }
 
-/// Whether `value` is the DNS name CloudFront ASSIGNS a distribution.
+/// Whether `value` is the address a distribution PUBLISHES as its `DomainName`.
 ///
 /// `Distribution$DomainName` is documented as "the domain name that corresponds to the
-/// distribution … such as `d111111abcdef8.cloudfront.net`" — a domain NAME, so the member
-/// carries labels and nothing else: no address of this emulator, no port and no path. A client
-/// takes it as a host (a `Host` header, a TLS server name, a Route 53 alias target), and the
-/// emulator answers on the name it published rather than naming itself in the member. So the
-/// FORM asserted here is one label under CloudFront's own zone.
-fn is_assigned_edge_domain(value: &str) -> bool {
-    value.strip_suffix(".cloudfront.net").is_some_and(|label| {
-        !label.is_empty()
-            && label
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-    })
+/// distribution … such as `d111111abcdef8.cloudfront.net`" — the value a client DIALS: it
+/// composes a URL from it, points a DNS record at it, hands it to a TLS client as the name to
+/// present. So the member carries a HOST, optionally with the port it answers on, and never one
+/// with a URI path inside it; and it has to be an address THIS emulator answers on, because a
+/// name in a zone this emulator does not serve resolves to nothing on the machine it runs on.
+/// So the FORM asserted here is the loopback `host:port` of the listener CloudFront opened for
+/// that distribution's edge — a value a client dials as given, without resolving a name.
+fn is_published_edge_address(value: &str) -> bool {
+    !value.contains('/') && value.parse::<::std::net::SocketAddr>().is_ok()
 }
 
 /// Whether `value` is an identifier of the shape API Gateway assigns one in: `width`
@@ -314,8 +311,8 @@ fn cases() -> Vec<Case> {
                 (
                     "DistributionDomainName",
                     form(
-                        "the DNS name CloudFront assigns (d<label>.cloudfront.net)",
-                        is_assigned_edge_domain,
+                        "an address this emulator answers on (host:port)",
+                        is_published_edge_address,
                     ),
                 ),
                 (
@@ -324,7 +321,7 @@ fn cases() -> Vec<Case> {
                         value
                             .strip_prefix("https://")
                             .and_then(|rest| rest.strip_suffix("/index.html"))
-                            .is_some_and(is_assigned_edge_domain)
+                            .is_some_and(is_published_edge_address)
                     }),
                 ),
                 (
@@ -447,15 +444,15 @@ fn cases() -> Vec<Case> {
                 (
                     "FirstDomainName",
                     form(
-                        "the DNS name CloudFront assigns (d<label>.cloudfront.net)",
-                        is_assigned_edge_domain,
+                        "an address this emulator answers on (host:port)",
+                        is_published_edge_address,
                     ),
                 ),
                 (
                     "SecondDomainName",
                     form(
-                        "the DNS name CloudFront assigns (d<label>.cloudfront.net)",
-                        is_assigned_edge_domain,
+                        "an address this emulator answers on (host:port)",
+                        is_published_edge_address,
                     ),
                 ),
             ],

@@ -49,7 +49,7 @@ use super::cloudfront_apigateway_origin_edge::{
     apigw, authorization, cloudfront, dispatch, emulator, emulator_with_engine, member, view,
     wait_until_deployed, Answer, API_VERSION, POLL, POLLS, REGION, STAGE,
 };
-use super::cloudfront_oac_s3_origin_edge::{edge_listener_authority, is_assigned_edge_domain};
+use super::cloudfront_oac_s3_origin_edge::{edge_listener_authority, is_published_edge_address};
 
 /// The two resources the reflecting api carries: the one a viewer reaches through the
 /// behaviour that names an origin request policy, and the one it reaches through the default
@@ -1113,9 +1113,9 @@ async fn the_published_address_tells_the_origin_the_scheme_the_viewer_dialled() 
     .await;
     wait_until_deployed(&router, case, &id).await;
     assert!(
-        is_assigned_edge_domain(&domain),
-        "setup {case:?}: expected the DNS name CloudFront assigns a distribution \
-         (d<label>.cloudfront.net), got {domain:?}"
+        is_published_edge_address(&domain),
+        "setup {case:?}: expected an address this emulator answers on \
+         (host:port), got {domain:?}"
     );
     let address = edge_listener_authority(&engine, &id).unwrap_or_else(|| {
         panic!("setup {case:?}: this emulator opened no address for the distribution {id}")

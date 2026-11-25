@@ -44,7 +44,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // The awsQuery form encoder and the XML element readers this test crate writes ONCE
 // (`tests/all/query_wire.rs`): "Nothing new should write another one — call this module."
-use super::cloudfront_oac_s3_origin_edge::{edge_listener_authority, is_assigned_edge_domain};
+use super::cloudfront_oac_s3_origin_edge::{edge_listener_authority, is_published_edge_address};
 use super::query_wire::{elements, form_encode, opt_element, outputs_of};
 
 /// The Region every call here is signed for, and so the Region the stack's resources belong
@@ -562,16 +562,15 @@ fn yaml_template(row: &Row) -> String {
     .join("\n")
 }
 
-/// Whether `value` is the DNS name CloudFront ASSIGNS a distribution, which is what the
-/// `DomainName` the stack publishes carries — one label under CloudFront's own zone, and no
-/// address, port or path
-/// ([`crate::cloudfront_oac_s3_origin_edge::is_assigned_edge_domain`] is the whole rule).
+/// Whether `value` is the address a distribution PUBLISHES as its `DomainName`, which is what
+/// the `DomainName` the stack publishes carries — a host carrying the port this emulator answers
+/// it on, and no URI path
+/// ([`crate::cloudfront_oac_s3_origin_edge::is_published_edge_address`] is the whole rule).
 ///
-/// A name in that zone resolves to nothing on this machine, so the viewer below dials the
-/// address this emulator opened for the distribution and carries the published name as the host
-/// it addressed — which is what a client that resolved the name sends.
-fn is_the_assigned_domain_name(value: &str) -> bool {
-    is_assigned_edge_domain(value)
+/// The viewer below dials exactly that value, which is what a client handed a published address
+/// does.
+fn is_the_published_address(value: &str) -> bool {
+    is_published_edge_address(value)
 }
 
 #[tokio::test]
@@ -628,13 +627,13 @@ async fn a_deployed_distribution_is_reached_at_the_domain_name_its_stack_publish
              {bucket:?}"
         );
 
-        // The published name is the one CloudFront ASSIGNS, and it is the one the OWNING
-        // service holds for this distribution: a stack publishes what CloudFront assigned,
-        // not a second value of its own.
+        // The published value is the address this emulator answers the distribution's edge on,
+        // and it is the one the OWNING service holds for this distribution: a stack publishes
+        // what CloudFront published, not a second value of its own.
         assert!(
-            is_the_assigned_domain_name(&domain),
-            "case {case:?}: expected the DomainName output to be the DNS name CloudFront \
-             assigns a distribution (d<label>.cloudfront.net), got {domain:?}"
+            is_the_published_address(&domain),
+            "case {case:?}: expected the DomainName output to be an address this emulator \
+             answers on (host:port), got {domain:?}"
         );
         let distribution = wait_until_deployed(&router, case, &distribution_id).await;
         assert_eq!(

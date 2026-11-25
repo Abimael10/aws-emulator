@@ -62,39 +62,31 @@ const CACHING_DISABLED: &str = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad";
 /// The service principal an origin access control makes CloudFront's origin request as.
 pub(crate) const CLOUDFRONT_PRINCIPAL: &str = "cloudfront.amazonaws.com";
 
-/// The zone CloudFront assigns a distribution's domain name in, with the separating dot.
-pub(crate) const CLOUDFRONT_ZONE: &str = ".cloudfront.net";
-
-/// Whether `domain` is a DNS name CloudFront ASSIGNS a distribution: one label under
-/// CloudFront's own zone, `d<label>.cloudfront.net`.
+/// Whether `domain` is the address a distribution publishes as its `DomainName`: an address
+/// this emulator ANSWERS on — a host carrying the port it answers on and nothing else, the
+/// authority of the listener that distribution's edge is served on.
 ///
 /// `Distribution$DomainName` is "the distribution's CloudFront domain name. For example:
-/// `d111111abcdef8.cloudfront.net`" — a domain NAME, so what the member carries is labels and
-/// nothing else: no address of this emulator, no port, no path. A client takes that name as a
-/// host — a `Host` header, a TLS server name, a Route 53 alias target — and every one of those
-/// consumers rejects a value carrying any of the three. What makes the name reach this
-/// emulator is that the emulator ANSWERS on it: the edge resolves a viewer request by the name
-/// the distribution published, stated as the `Host` it addressed or carried in the first path
-/// segment where a client cannot carry it in the host.
+/// `d111111abcdef8.cloudfront.net`" — the value a client DIALS: it composes
+/// `https://<DomainName>/<object>` from it, points a DNS record at it, hands it to a TLS client
+/// as the name to present. So the value is a HOST, optionally carrying a port, and never one
+/// with a URI path inside it; and a name in a zone this emulator does not serve resolves to
+/// nothing on the machine it runs on, so what is published is the one address a client here can
+/// dial as given, without resolving a name. `SocketAddr` is exactly that set of values (an IPv6
+/// literal included, which carries brackets).
 ///
 /// `pub(crate)` so every suite that reads a published domain name holds it to the one rule.
-pub(crate) fn is_assigned_edge_domain(domain: &str) -> bool {
-    let Some(label) = domain.strip_suffix(CLOUDFRONT_ZONE) else {
-        return false;
-    };
-    !label.is_empty()
-        && label
-            .chars()
-            .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
+pub(crate) fn is_published_edge_address(domain: &str) -> bool {
+    !domain.contains('/') && domain.parse::<::std::net::SocketAddr>().is_ok()
 }
 
 /// The `host:port` of the listener the distribution `id`'s edge is served on, as the store the
-/// create wrote it to reports it — `None` for a distribution created through the emulator's own
-/// endpoint, where the edge is served at that endpoint and no port of its own was opened.
+/// create wrote it to reports it — `None` for a distribution this emulator opened no listener
+/// for, which is the engine that vends none.
 ///
-/// The address a client with no other address of this emulator DIALS. It is not the
-/// distribution's `DomainName`: that is the DNS name CloudFront assigned, which a viewer
-/// carries as the host it addressed, and no modelled member carries an address.
+/// The same value the distribution PUBLISHES as its `DomainName`, read from the store rather
+/// than from a response, for a suite that holds the published value to the address this
+/// emulator really opened.
 ///
 /// `pub(crate)` so every suite whose viewer dials a published name dials the one address this
 /// emulator opened for that distribution.

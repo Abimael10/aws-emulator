@@ -48,7 +48,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::cloudfront_oac_s3_origin_edge::{
     call, create_bucket, create_origin_access_control, edge_listener_authority, emulator,
-    is_assigned_edge_domain, origin_domain, policy, put_bucket_policy, put_object,
+    is_published_edge_address, origin_domain, policy, put_bucket_policy, put_object,
     regional_endpoint, view, API_VERSION, CLOUDFRONT_HOST, CLOUDFRONT_PRINCIPAL,
 };
 
@@ -225,7 +225,7 @@ impl Served {
 /// `host:port`, which is exactly the set of values a client reaches without resolving a name.
 ///
 /// What a distribution PUBLISHES is a domain name
-/// ([`crate::cloudfront_oac_s3_origin_edge::is_assigned_edge_domain`]); this is the address
+/// ([`crate::cloudfront_oac_s3_origin_edge::is_published_edge_address`]); this is the address
 /// that name resolves to for a client on this machine — the listener this emulator opened for
 /// the distribution — which is what a viewer opens its connection to.
 pub(crate) fn is_dialable(authority: &str) -> bool {
@@ -516,13 +516,12 @@ async fn the_published_domain_name_dialled_on_a_socket_serves_a_private_s3_origi
             row.root_object,
         )
         .await;
-        // The published name is the DNS name CloudFront assigns a distribution, and the
-        // address below is where a client on this machine reaches it — or there is nothing for
-        // a viewer to dial at all.
+        // The published value is the address a client on this machine reaches the edge at — or
+        // there is nothing for a viewer to dial at all.
         assert!(
-            is_assigned_edge_domain(&domain),
-            "case {:?}: expected the DNS name CloudFront assigns a distribution \
-             (d<label>.cloudfront.net) as the published DomainName, got {domain:?}",
+            is_published_edge_address(&domain),
+            "case {:?}: expected an address this emulator answers on (host:port) as the \
+             published DomainName, got {domain:?}",
             row.case
         );
         let address = edge_listener_authority(&engine, &id).unwrap_or_else(|| {

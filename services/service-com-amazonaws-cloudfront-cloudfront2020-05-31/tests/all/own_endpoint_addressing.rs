@@ -27,7 +27,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::announced_location_uri::{addressed_hosts, created_id, origin_access_identity_xml};
 use crate::distribution_lifecycle::{
-    call_from_host, config, create_distribution, emulator, is_assigned_edge_domain, API_VERSION,
+    call_from_host, config, create_distribution, emulator, is_published_edge_address, API_VERSION,
     AUTHORIZATION,
 };
 
@@ -113,9 +113,9 @@ async fn an_addressed_own_endpoint_is_a_port_no_edge_listener_can_take() {
             .unwrap_or_else(|| panic!("round {round}: the create carries no DomainName"))
             .to_string();
         assert!(
-            is_assigned_edge_domain(&domain),
-            "round {round}: expected the distribution to publish the DNS name CloudFront \
-             assigns it (d<label>.cloudfront.net), got {domain:?}"
+            is_published_edge_address(&domain),
+            "round {round}: expected the distribution to publish an address this emulator \
+             answers on (host:port), got {domain:?}"
         );
         for row in hosts.rows.iter() {
             assert!(

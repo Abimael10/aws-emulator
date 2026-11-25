@@ -47,7 +47,7 @@ use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 
 use crate::distribution_lifecycle::{
     awaited_deployment, create_distribution, edge_listener_authority, get_distribution,
-    is_assigned_edge_domain, list_distributions, API_VERSION, POLL_INTERVAL, READY_DEADLINE,
+    is_published_edge_address, list_distributions, API_VERSION, POLL_INTERVAL, READY_DEADLINE,
 };
 use crate::lambda_edge_association::{refusal_message, reported_arns};
 use crate::published_edge_address::dial_as;
@@ -568,8 +568,8 @@ async fn the_edge_association_lifecycle_refuses_then_serves_the_functions_own_an
         .unwrap_or_default()
         .to_string();
     assert!(
-        !id.is_empty() && is_assigned_edge_domain(&domain),
-        "case {case:?}: expected an id and the DNS name CloudFront assigns a distribution, got \
+        !id.is_empty() && is_published_edge_address(&domain),
+        "case {case:?}: expected an id and an address this emulator answers on (host:port), got \
          {}",
         created.raw
     );
