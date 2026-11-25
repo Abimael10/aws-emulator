@@ -29,6 +29,7 @@
 
 use serde_json::{json, Value};
 
+use service_com_amazonaws_batch_awsbatchv20160810::state;
 use service_com_amazonaws_batch_awsbatchv20160810::state::{
     limits, CONFLICT_STATUS, CONSUMABLE_RESOURCE_TYPES,
 };
@@ -412,13 +413,13 @@ async fn a_create_the_service_cannot_accept_is_refused_and_stores_nothing() {
         (
             "totalQuantity one past its lower bound",
             json!({"consumableResourceName": "negative-1", "totalQuantity": -1}),
-            "totalQuantity",
+            state::NEGATIVE_QUANTITY,
             400,
         ),
         (
             "totalQuantity at the smallest Long",
             json!({"consumableResourceName": "negative-min", "totalQuantity": i64::MIN}),
-            "totalQuantity",
+            state::NEGATIVE_QUANTITY,
             400,
         ),
         (

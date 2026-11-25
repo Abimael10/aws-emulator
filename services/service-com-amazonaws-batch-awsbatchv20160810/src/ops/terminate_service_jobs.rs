@@ -181,13 +181,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "An array of up to 50 service job IDs of the service jobs to terminate" (`jobs`):
         // a request past the bound is refused whole, so one call can never end an unbounded
         // number of service jobs — the same bound the job plane's bulk calls hold
-        // (`state::limits::MAX_BULK_JOBS`).
+        // (`state::limits::MAX_BULK_JOBS`), stated in the same sentence
+        // ([`batch::bulk_jobs_bound_message`]).
         if input.jobs.len() > batch::limits::MAX_BULK_JOBS {
             return Err(TerminateServiceJobsErrorModeled::ClientException(
-                batch::client_exception(batch::quota_message(
-                    "service job IDs for one TerminateServiceJobs request",
-                    batch::limits::MAX_BULK_JOBS,
-                )),
+                batch::client_exception_enveloped(batch::bulk_jobs_bound_message()),
             )
             .into());
         }

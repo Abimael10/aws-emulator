@@ -171,13 +171,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         // `totalQuantity`: "Must be non-negative." The model types it as a plain `Long`,
-        // so the framework admits a negative one and the rule is applied here.
+        // so the framework admits a negative one and the rule is applied here — stated as
+        // the rule ([`batch::NEGATIVE_QUANTITY`]), echoing nothing of the value, in the
+        // envelope every pre-lookup refusal of this service carries.
         let total_quantity = input.total_quantity.unwrap_or_default();
         if total_quantity < 0 {
             return Err(CreateConsumableResourceErrorModeled::ClientException(
-                batch::client_exception(format!(
-                    "totalQuantity must be non-negative, not {total_quantity}"
-                )),
+                batch::client_exception_enveloped(batch::NEGATIVE_QUANTITY),
             )
             .into());
         }

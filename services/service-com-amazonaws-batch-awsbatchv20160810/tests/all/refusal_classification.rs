@@ -405,7 +405,10 @@ async fn a_value_outside_a_closed_set_the_service_applies_states_the_member_and_
 
     let type_detail = "resourceType needs to be one of the following values: \
                        [REPLENISHABLE, NON_REPLENISHABLE]";
-    let operation_detail = "operation needs to be one of the following values: [SET, ADD, REMOVE]";
+    // `UpdateConsumableResource$operation` is refused by the noun AWS names it with in that
+    // sentence ("Update operation"), not by the member's spelling.
+    let operation_detail =
+        "Update operation needs to be one of the following values: [SET, ADD, REMOVE]";
 
     // (case, the operation's URI, the request, the detail the envelope must state)
     let rows: Vec<(String, &str, Value, &str)> = vec![

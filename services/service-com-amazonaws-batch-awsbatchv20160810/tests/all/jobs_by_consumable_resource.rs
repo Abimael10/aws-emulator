@@ -34,7 +34,8 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_batch_awsbatchv20160810::state::{
-    MAX_LIST_JOBS_BY_CONSUMABLE_RESOURCE_FILTERS, MAX_LIST_JOBS_BY_CONSUMABLE_RESOURCE_FILTER_VALUES,
+    DEFAULT_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS, MAX_LIST_JOBS_BY_CONSUMABLE_RESOURCE_FILTERS,
+    MAX_LIST_JOBS_BY_CONSUMABLE_RESOURCE_FILTER_VALUES,
     MAX_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS, MIN_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS,
 };
 
@@ -585,11 +586,12 @@ async fn paging_sees_every_job_exactly_once() {
     );
 
     // Page sizes differ: one at a time, a size that does not divide the total, the exact
-    // total, and both published bounds of `maxResults` (1 and 100).
+    // total, the documented default, and both bounds of the window this operation accepts.
     for page_size in [
         MIN_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS,
         3,
         i32::try_from(expected.len()).expect("the fixture fits in an i32"),
+        DEFAULT_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS,
         MAX_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS,
     ] {
         let case = format!("maxResults {page_size}");
@@ -660,7 +662,7 @@ async fn a_listing_that_names_no_page_size_is_bounded_at_the_documented_default(
         .unwrap_or_default()
         .to_string();
 
-    let default = usize::try_from(MAX_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS)
+    let default = usize::try_from(DEFAULT_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS)
         .expect("the documented default is positive");
     // One past the default, so the first page cannot hold them all.
     let total = default + 1;
@@ -724,7 +726,7 @@ async fn a_listing_that_names_no_page_size_is_bounded_at_the_documented_default(
 
 /// RULE: a request this operation cannot answer is the modelled `ClientException` (HTTP
 /// 400): a `consumableResource` nothing answers to (by name or by ARN), a filter name it
-/// does not document, a `maxResults` outside the published 1..100, and a `nextToken` that
+/// does not document, a `maxResults` outside the window it accepts, and a `nextToken` that
 /// resumes nothing.
 #[tokio::test]
 async fn a_listing_refuses_what_it_cannot_answer() {

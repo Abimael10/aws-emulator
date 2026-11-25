@@ -24,6 +24,7 @@
 
 use serde_json::{json, Value};
 
+use service_com_amazonaws_batch_awsbatchv20160810::state;
 use service_com_amazonaws_batch_awsbatchv20160810::state::CONSUMABLE_RESOURCE_UPDATE_OPERATIONS;
 
 use crate::job_lifecycle::{arn, error_code, error_message, Batch};
@@ -371,17 +372,17 @@ async fn an_update_the_service_cannot_apply_is_refused_and_changes_nothing() {
         (
             "quantity one past its lower bound",
             json!({"consumableResource": "guarded", "operation": "SET", "quantity": -1}),
-            "quantity".to_string(),
+            state::NEGATIVE_QUANTITY.to_string(),
         ),
         (
             "quantity at the smallest Long",
             json!({"consumableResource": "guarded", "operation": "ADD", "quantity": i64::MIN}),
-            "quantity".to_string(),
+            state::NEGATIVE_QUANTITY.to_string(),
         ),
         (
             "a negative quantity with no operation",
             json!({"consumableResource": "guarded", "quantity": -5}),
-            "quantity".to_string(),
+            state::NEGATIVE_QUANTITY.to_string(),
         ),
         (
             "ADD past the largest Long",

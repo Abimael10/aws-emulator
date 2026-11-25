@@ -15,6 +15,12 @@
 //! keeps the `consumableResourceProperties` it was submitted with, which `DescribeJobs`
 //! still replays.
 //!
+//! `maxResults` is held to the window the SERVICE accepts — up to
+//! [`crate::state::MAX_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS`], which is wider than the
+//! default page size the member's doc states — so a paginator written against that ceiling
+//! runs here, and a page the request leaves unsized is bounded at that documented default
+//! ([`crate::state::DEFAULT_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -229,19 +235,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `maxResults`: "This value can be between 1 and 100." A plain `Integer` in the
-        // model, so the published bound is applied here — and refused the way this service
-        // words every page-size bound ([`batch::max_results_bound_message`]).
+        // `maxResults`: the window this operation accepts (1 to
+        // `batch::MAX_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS`), applied here because the
+        // model types the member as a plain `Integer` — and refused with THIS operation's
+        // own sentence, which states that ceiling
+        // ([`batch::list_jobs_by_consumable_resource_max_results_message`]).
         if input.max_results.is_some_and(|requested| {
             !(batch::MIN_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS
                 ..=batch::MAX_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS)
                 .contains(&requested)
         }) {
             return Err(ListJobsByConsumableResourceErrorModeled::ClientException(
-                batch::client_exception_enveloped(batch::max_results_bound_message(
-                    batch::MIN_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS,
-                    batch::MAX_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS,
-                )),
+                batch::client_exception_enveloped(
+                    batch::list_jobs_by_consumable_resource_max_results_message(),
+                ),
             )
             .into());
         }
@@ -359,10 +366,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "If this parameter isn't used, then ListJobsByConsumableResource returns up to
         // 100 results and a nextToken value if applicable": the page is bounded even when
-        // the request names no size.
+        // the request names no size, at the DOCUMENTED default rather than at the ceiling
+        // the member accepts (`batch::DEFAULT_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS`).
         let page_size = input
             .max_results
-            .unwrap_or(batch::MAX_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS);
+            .unwrap_or(batch::DEFAULT_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS);
         let (page, next_token) =
             batch::paginate(jobs, Some(page_size), input.next_token.as_deref()).map_err(
                 |message| {

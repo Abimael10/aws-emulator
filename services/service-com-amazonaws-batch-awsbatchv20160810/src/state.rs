@@ -118,6 +118,7 @@ mod job_retries;
 mod job_variables;
 mod placement;
 mod queue_snapshot;
+mod request_bounds;
 mod service_job_dispatch;
 mod service_linked_role;
 mod share_selection;
@@ -141,6 +142,7 @@ pub use job_retries::*;
 pub use job_variables::*;
 pub use placement::*;
 pub use queue_snapshot::*;
+pub use request_bounds::*;
 pub use service_job_dispatch::*;
 pub use service_linked_role::*;
 
@@ -343,16 +345,19 @@ pub const MIN_SCHEDULING_POLICY_ARNS: usize = 1;
 /// The bounds are interpolated from the ones this operation enforces
 /// ([`MIN_SCHEDULING_POLICY_ARNS`] and [`MAX_DESCRIBE_FILTER_ENTRIES`], the latter "a list
 /// of up to 100 … entries" from the member's own doc), so the sentence and the check it
-/// reports cannot drift apart.
+/// reports cannot drift apart. The template is the one every `Describe*` list count of this
+/// model states ([`describe_entries_bound_message`]); this names its own kind.
 pub fn scheduling_policy_arns_bound_message() -> String {
-    format!(
-        "Number of scheduling policies should be between {MIN_SCHEDULING_POLICY_ARNS} and \
-         {MAX_DESCRIBE_FILTER_ENTRIES}."
+    describe_entries_bound_message(
+        "scheduling policies",
+        MIN_SCHEDULING_POLICY_ARNS,
+        MAX_DESCRIBE_FILTER_ENTRIES,
     )
 }
 
-/// The detail every `maxResults` page-size refusal of this service carries: the RANGE the
-/// member admits, with nothing from the request in it.
+/// The detail a `maxResults` page-size refusal of this service carries where AWS's own
+/// wording for that operation is not recorded: the RANGE the member admits, with nothing
+/// from the request in it.
 ///
 /// Every `maxResults` member here is a plain `Integer` in the model (each operation is
 /// `@paginated` with `pageSize` `maxResults`), so the bound is recorded behaviour: Batch's
@@ -361,6 +366,13 @@ pub fn scheduling_policy_arns_bound_message() -> String {
 /// offending value. Worded as the sibling count rule of `DescribeSchedulingPolicies` is
 /// ([`scheduling_policy_arns_bound_message`]), and answered in the same input-validation
 /// envelope ([`client_exception_enveloped`]).
+///
+/// AWS words this refusal PER OPERATION — the recorded sentences differ in their
+/// comparatives, their terminator and their maximum — so an operation whose own sentence is
+/// recorded states that one instead ([`request_bounds`]: `ListSchedulingPolicies`,
+/// `ListConsumableResources`, `ListJobsByConsumableResource`). This sentence is what the
+/// remaining page-size checks answer, where normalising three recorded sentences into one
+/// would be the only alternative to inventing a fourth.
 ///
 /// The bounds are interpolated from the ones the operation enforces, so the sentence and the
 /// check it reports cannot drift apart.
@@ -701,12 +713,20 @@ pub const MAX_LIST_CONSUMABLE_RESOURCES_RESULTS: i32 = 100;
 /// doc: "This value can be between 1 and 100." The model types it as a plain `Integer`, so
 /// the bound is applied in the handler.
 pub const MIN_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS: i32 = 1;
-/// The most results `ListJobsByConsumableResource$maxResults` accepts; see
-/// [`MIN_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS`]. Also the page size of a request that
-/// names none, from the same doc: "If this parameter isn't used, then
+/// The most results `ListJobsByConsumableResource$maxResults` accepts.
+///
+/// A THOUSAND, which is what the service accepts: the operation is recorded serving a
+/// `maxResults` of 1000 and refusing 1001, stating that ceiling in the refusal itself
+/// ([`list_jobs_by_consumable_resource_max_results_message`]), where the member's doc still
+/// reads "between 1 and 100" — so the doc's 100 is the DEFAULT page size
+/// ([`DEFAULT_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS`]) and this is the window's ceiling.
+/// Told apart because a paginator written against the service's own maximum must run here.
+pub const MAX_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS: i32 = 1_000;
+/// The page size `ListJobsByConsumableResource` uses for a request that names no
+/// `maxResults`, from the member's doc: "If this parameter isn't used, then
 /// `ListJobsByConsumableResource` returns up to 100 results and a `nextToken` value if
 /// applicable."
-pub const MAX_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS: i32 = 100;
+pub const DEFAULT_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS: i32 = 100;
 
 /// The most `ListJobsByConsumableResource$filters` entries this emulator applies to one
 /// request, and the most values any one of them may carry.
@@ -2064,7 +2084,7 @@ pub fn enum_membership_detail<S: AsRef<str>>(member_path: &str, allowed: &[S]) -
 }
 
 /// How AWS Batch words the refusal of a value outside a closed set the SERVICE holds a
-/// member to: the member as the request spells it, then the set it enforced.
+/// member to: the SUBJECT the service names that member by, then the set it enforced.
 ///
 /// The rejected value is not echoed, for the same reason [`enum_membership_detail`] does
 /// not echo it. The two differ in LAYER, and AWS words them differently: a member the
@@ -2074,10 +2094,15 @@ pub fn enum_membership_detail<S: AsRef<str>>(member_path: &str, allowed: &[S]) -
 /// `CreateConsumableResource$resourceType`, and raised for every closed set a handler of
 /// this service applies ([`CONSUMABLE_RESOURCE_TYPES`],
 /// [`CONSUMABLE_RESOURCE_UPDATE_OPERATIONS`]).
-pub fn closed_set_detail<S: AsRef<str>>(member: &str, allowed: &[S]) -> String {
+///
+/// `subject` is what AWS calls the member in that sentence, which is the member name for
+/// one it names by its spelling (`resourceType`) and the noun it publishes for one it does
+/// not (`UpdateConsumableResource$operation`, refused as "Update operation"), so each call
+/// site passes the subject its own refusal is recorded with rather than deriving it here.
+pub fn closed_set_detail<S: AsRef<str>>(subject: &str, allowed: &[S]) -> String {
     let values: Vec<&str> = allowed.iter().map(AsRef::as_ref).collect();
     format!(
-        "{member} needs to be one of the following values: [{}]",
+        "{subject} needs to be one of the following values: [{}]",
         values.join(", ")
     )
 }

@@ -173,19 +173,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `maxResults`: "This value can be between 1 and 100." A plain `Integer` in the
-        // model, so the published bound is applied here — and refused the way this service
-        // words every page-size bound ([`batch::max_results_bound_message`]).
+        // `maxResults`: the published page-size window, applied here because the model types
+        // the member as a plain `Integer` — and refused with THIS operation's own sentence
+        // ([`batch::list_consumable_resources_max_results_message`]), which is how AWS
+        // words its own bound.
         if input.max_results.is_some_and(|requested| {
             !(batch::MIN_LIST_CONSUMABLE_RESOURCES_RESULTS
                 ..=batch::MAX_LIST_CONSUMABLE_RESOURCES_RESULTS)
                 .contains(&requested)
         }) {
             return Err(ListConsumableResourcesErrorModeled::ClientException(
-                batch::client_exception_enveloped(batch::max_results_bound_message(
-                    batch::MIN_LIST_CONSUMABLE_RESOURCES_RESULTS,
-                    batch::MAX_LIST_CONSUMABLE_RESOURCES_RESULTS,
-                )),
+                batch::client_exception_enveloped(
+                    batch::list_consumable_resources_max_results_message(),
+                ),
             )
             .into());
         }

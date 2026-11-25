@@ -10,7 +10,10 @@
 //! A request the model admits but the service does not accept is refused with the
 //! modelled `ClientException` (HTTP 400), inside the frontend envelope AWS is recorded to
 //! wrap THIS operation's refusals in ([`crate::state::client_exception_enveloped`]), and
-//! nothing is stored. The rules
+//! nothing is stored. The first of those rules is the published SIZE ceiling
+//! ([`crate::state::MAX_JOB_DEFINITION_BYTES`]): a definition past it is refused before
+//! anything else is looked at, so nothing a later `DescribeJobDefinitions` could report is
+//! registered. The remaining rules
 //! applied are the ones this service's own model documents — among them the
 //! `executionRoleArn` doc, "For jobs that run on Fargate resources, you must provide
 //! an execution role", which is checked for EVERY container-properties object a job
@@ -232,6 +235,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let region = crate::state::request_region(ctx);
+
+        // THE SIZE CEILING. AWS Batch publishes a maximum job-definition size
+        // (`crate::state::MAX_JOB_DEFINITION_BYTES`), and a registration past it is refused
+        // before anything is validated or stored: the definition is MEASURED as the compact
+        // JSON document it amounts to on this protocol's wire
+        // (`crate::state::serialized_byte_length`), and the refusal states the limit and
+        // that measured size in whole kilobytes
+        // (`crate::state::job_definition_size_message`). A request the codec cannot render
+        // has no measurable size and is left to the rules below.
+        if let Some(bytes) = crate::state::serialized_byte_length(
+            super::types::REGISTER_JOB_DEFINITION_INPUT_SCHEMA,
+            &input,
+        ) {
+            if bytes >= crate::state::MAX_JOB_DEFINITION_BYTES {
+                return Err(client_exception(&crate::state::job_definition_size_message(
+                    bytes,
+                )));
+            }
+        }
 
         // The model types `jobDefinitionName` as a plain `String`, so the framework admits
         // any text; the service applies the pattern the member documents and refuses a

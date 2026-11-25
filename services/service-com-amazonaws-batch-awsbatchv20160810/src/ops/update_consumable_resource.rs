@@ -190,26 +190,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(batch::UPDATE_OPERATION_SET);
         if !batch::CONSUMABLE_RESOURCE_UPDATE_OPERATIONS.contains(&operation) {
             // The same rule, in the same words, as every other closed set this service
-            // applies itself ([`batch::closed_set_detail`]).
+            // applies itself ([`batch::closed_set_detail`]), named by the noun AWS names
+            // this member by in that refusal rather than by the member's spelling.
             return Err(UpdateConsumableResourceErrorModeled::ClientException(
                 batch::client_exception_enveloped(batch::closed_set_detail(
-                    "operation",
+                    "Update operation",
                     &batch::CONSUMABLE_RESOURCE_UPDATE_OPERATIONS,
                 )),
             )
             .into());
         }
         // `quantity`: "Must be a non-negative value." Also a plain `Long`, so the
-        // framework admits a negative one and the rule is applied here.
-        if let Some(quantity) = input.quantity {
-            if quantity < 0 {
-                return Err(UpdateConsumableResourceErrorModeled::ClientException(
-                    batch::client_exception(format!(
-                        "quantity must be non-negative, not {quantity}"
-                    )),
-                )
-                .into());
-            }
+        // framework admits a negative one and the rule is applied here — stated as the rule
+        // ([`batch::NEGATIVE_QUANTITY`]), echoing nothing of the value, inside the same
+        // envelope the sibling `operation` check above answers in.
+        if input.quantity.is_some_and(|quantity| quantity < 0) {
+            return Err(UpdateConsumableResourceErrorModeled::ClientException(
+                batch::client_exception_enveloped(batch::NEGATIVE_QUANTITY),
+            )
+            .into());
         }
 
         // `clientToken`: "If this parameter is specified and two update requests with

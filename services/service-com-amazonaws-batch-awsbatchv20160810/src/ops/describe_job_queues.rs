@@ -165,6 +165,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let now = batch::now_millis();
+        // "A list of up to 100 queue names or full queue Amazon Resource Name (ARN)
+        // entries" (`jobQueues`): the same list-count rule its compute-environment sibling
+        // holds, refused before any lookup ([`batch::job_queues_bound_message`]). An empty
+        // list is this member's "every one of them", not a request past the bound.
+        if input.job_queues.as_deref().unwrap_or_default().len()
+            > batch::MAX_DESCRIBE_FILTER_ENTRIES
+        {
+            return Err(DescribeJobQueuesErrorModeled::ClientException(
+                batch::client_exception_enveloped(batch::job_queues_bound_message()),
+            )
+            .into());
+        }
         let mut state = state.lock();
         state.materialize_due(now);
 

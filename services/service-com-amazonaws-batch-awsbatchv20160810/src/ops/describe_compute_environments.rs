@@ -173,6 +173,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let now = batch::now_millis();
+        // "A list of up to 100 compute environment names or full Amazon Resource Name (ARN)
+        // entries" (`computeEnvironments`): a request naming more than the documented
+        // maximum is refused BEFORE any lookup, so a caller that must chunk its describe is
+        // told so rather than being answered an empty describe of nothing
+        // ([`batch::compute_environments_bound_message`]). An empty list is not past the
+        // bound — it is this member's "every one of them".
+        if input
+            .compute_environments
+            .as_deref()
+            .unwrap_or_default()
+            .len()
+            > batch::MAX_DESCRIBE_FILTER_ENTRIES
+        {
+            return Err(DescribeComputeEnvironmentsErrorModeled::ClientException(
+                batch::client_exception_enveloped(batch::compute_environments_bound_message()),
+            )
+            .into());
+        }
         // The store's guard lives in this block alone: the cluster a removal that has already
         // fallen due leaves behind is deleted where Amazon ECS holds it, which is an
         // in-process request and so is made with no lock held (`state::ecs_cluster`).

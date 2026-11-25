@@ -176,11 +176,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // "An array of up to 50 Batch job IDs of the jobs to cancel" (`jobs`): a request
         // past the bound is refused whole, so one call can never touch an unbounded number
-        // of jobs.
+        // of jobs. The sentence states the documented per-request maximum, so a caller
+        // learns it must chunk its batch ([`batch::bulk_jobs_bound_message`]).
         if input.jobs.len() > batch::limits::MAX_BULK_JOBS {
-            return Err(CancelJobsErrorModeled::ClientException(batch::client_exception(
-                batch::quota_message("job IDs for one CancelJobs request", batch::limits::MAX_BULK_JOBS),
-            ))
+            return Err(CancelJobsErrorModeled::ClientException(
+                batch::client_exception_enveloped(batch::bulk_jobs_bound_message()),
+            )
             .into());
         }
         let now = batch::now_millis();
