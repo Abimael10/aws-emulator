@@ -16,9 +16,12 @@
 //! `ConflictException`, answered with HTTP 400 rather than the 409 its `@httpError` names;
 //! see [`crate::state::namespace_already_exists`].
 //!
-//! `manageAdminPassword` is recorded but mints no Secrets Manager secret, so
-//! `adminPasswordSecretArn` stays absent: the secret belongs to this emulator's Secrets
-//! Manager integration, not to this operation.
+//! `manageAdminPassword` has the service manage the namespace's admin credentials: the
+//! create mints the Secrets Manager secret that holds them — a secret this service OWNS,
+//! named under the prefix AWS reserves for it — and reports its ARN as the stored
+//! namespace's `adminPasswordSecretArn`. See
+//! [`crate::state::managed_admin_secret`]. A namespace whose password the caller supplied
+//! has no such secret and reports no such member.
 //!
 //! The store this inserts into is bounded by the account's documented quota
 //! ([`crate::state::MAX_NAMESPACES`]); past it the create is refused rather than growing
@@ -184,8 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // two members describe the same secret, so naming both is contradictory.
         if input.manage_admin_password.unwrap_or(false) && input.admin_user_password.is_some() {
             return Err(CreateNamespaceErrorModeled::ValidationException(ValidationException {
-                message: "adminUserPassword cannot be set when manageAdminPassword is true"
-                    .to_string(),
+                message: crate::state::admin_user_password_with_managed_password(),
             })
             .into());
         }
@@ -198,26 +200,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let mut state = state.lock();
-        state.settle_due_transitions();
-        // The store grows one record per create, so the account's quota bounds it. Read
-        // before the `entry` below takes the borrow; it bounds only a NEW record.
-        let stored_namespaces = state.namespaces.len();
+
+        // Phase 1, under the state guard: every refusal this create owes. The guard is
+        // RELEASED at the end of this block, because minting the admin credentials secret
+        // below is a call to ANOTHER service over the emulator's own in-process callback,
+        // and this service's lock may not be held across it.
+        {
+            let mut state = state.lock();
+            state.settle_due_transitions();
+            if let Some(taken) = state.namespaces.get_key_value(&input.namespace_name) {
+                // A name already taken is the modelled `ConflictException`, answered with
+                // the status this service answers a namespace-name refusal with — 400, not
+                // the 409 the shape's `@httpError` names. See
+                // [`crate::state::namespace_already_exists`].
+                return Err(crate::scaffolded::Scaffolded::restated(
+                    crate::state::RESOURCE_NAME_REFUSAL_STATUS,
+                    CreateNamespaceErrorModeled::ConflictException(ConflictException {
+                        message: crate::state::namespace_already_exists(taken.0),
+                    }),
+                ));
+            }
+            // The store grows one record per create, so the account's quota bounds it.
+            if state.namespaces.len() >= crate::state::MAX_NAMESPACES {
+                return Err(CreateNamespaceErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "this account has reached its quota of {} namespaces in this Region",
+                            crate::state::MAX_NAMESPACES
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
 
         let region = crate::state::request_region(ctx);
         let namespace_id = crate::state::new_resource_id();
+        let namespace_arn = crate::state::namespace_arn(&region, &namespace_id);
+        // The namespace always has an administrator for its first database, so the service
+        // names one even when the request does not: see
+        // [`crate::state::DEFAULT_ADMIN_USERNAME`].
+        let admin_username = input
+            .admin_username
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_ADMIN_USERNAME.to_string());
+
+        // Phase 2, with no state guard held: the admin credentials secret, for a create
+        // that hands the admin password to the service. The namespace's only handle to
+        // those credentials is the ARN of that secret, so the secret is created BEFORE the
+        // namespace is stored — a namespace reporting an ARN no secret answers for would
+        // promise credentials nothing holds.
+        let admin_password_secret_arn = if input.manage_admin_password.unwrap_or(false) {
+            let minted = crate::state::managed_admin_secret::mint_namespace_admin_secret(
+                &*self.engine,
+                ctx,
+                &region,
+                &crate::state::managed_admin_secret::AdminSecretRequest {
+                    namespace_arn: &namespace_arn,
+                    namespace_id: &namespace_id,
+                    admin_username: Some(&admin_username),
+                    kms_key_id: input.admin_password_secret_kms_key_id.as_deref(),
+                },
+            )
+            .await;
+            match minted {
+                Ok(secret_arn) => Some(secret_arn),
+                Err(message) => {
+                    return Err(CreateNamespaceErrorModeled::InternalServerException(
+                        InternalServerException { message },
+                    )
+                    .into());
+                }
+            }
+        } else {
+            None
+        };
+
         let namespace = Namespace {
-            namespace_arn: Some(crate::state::namespace_arn(&region, &namespace_id)),
+            namespace_arn: Some(namespace_arn.clone()),
             namespace_id: Some(namespace_id),
             namespace_name: Some(input.namespace_name.clone()),
-            // The namespace always has an administrator for its first database, so the
-            // service names one even when the request does not: see
-            // [`crate::state::DEFAULT_ADMIN_USERNAME`].
-            admin_username: Some(
-                input
-                    .admin_username
-                    .unwrap_or_else(|| crate::state::DEFAULT_ADMIN_USERNAME.to_string()),
-            ),
+            admin_username: Some(admin_username),
             db_name: Some(
                 input
                     .db_name
@@ -243,6 +306,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             lakehouse_registration_status: Some(
                 crate::state::LAKEHOUSE_NOT_REGISTERED.to_string(),
             ),
+            // The handle to the credentials the service manages, for a namespace whose
+            // admin password it manages — and absent for one whose password the caller
+            // supplied, which has no such secret.
+            admin_password_secret_arn,
+            // Reported only for a managed-password namespace: the key is the one its
+            // credentials secret is encrypted under, and a namespace with no such secret is
+            // encrypted under nothing.
+            admin_password_secret_kms_key_id: input
+                .admin_password_secret_kms_key_id
+                .filter(|_| input.manage_admin_password.unwrap_or(false)),
             ..Namespace::default()
         };
         let record = crate::state::NamespaceRecord {
@@ -254,39 +327,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             pending_status: None,
         };
 
-        // One lookup decides both the conflict and the insert: the name is the
-        // namespace's identity, so an occupied slot IS the conflict. The answer comes out
-        // of the STORED record, so what the caller reads is what a later GetNamespace
-        // reads.
-        match state.namespaces.entry(input.namespace_name) {
-            ::std::collections::btree_map::Entry::Occupied(occupied) => {
-                // A name already taken is the modelled `ConflictException`, answered with
-                // the status this service answers a namespace-name refusal with — 400, not
-                // the 409 the shape's `@httpError` names. See
-                // [`crate::state::namespace_already_exists`].
-                Err(crate::scaffolded::Scaffolded::restated(
-                    crate::state::RESOURCE_NAME_REFUSAL_STATUS,
-                    CreateNamespaceErrorModeled::ConflictException(ConflictException {
-                        message: crate::state::namespace_already_exists(occupied.key()),
-                    }),
-                ))
-            }
-            ::std::collections::btree_map::Entry::Vacant(slot) => {
-                if stored_namespaces >= crate::state::MAX_NAMESPACES {
-                    return Err(CreateNamespaceErrorModeled::ValidationException(
-                        ValidationException {
-                            message: format!(
-                                "this account has reached its quota of {} namespaces in this Region",
-                                crate::state::MAX_NAMESPACES
-                            ),
-                        },
-                    )
-                    .into());
+        // Phase 3, under the state guard again: the insert. One lookup decides both the
+        // conflict and the insert — the name is the namespace's identity, so an occupied
+        // slot IS the conflict — and the answer comes out of the STORED record, so what the
+        // caller reads is what a later GetNamespace reads. The guard lives only for this
+        // block: the refusal below reaches Secrets Manager again, which this service's lock
+        // may not be held across.
+        let orphaned_secret_arn = record.namespace.admin_password_secret_arn.clone();
+        let taken_name = {
+            let mut state = state.lock();
+            match state.namespaces.entry(input.namespace_name) {
+                ::std::collections::btree_map::Entry::Vacant(slot) => {
+                    return Ok(CreateNamespaceOutput {
+                        namespace: Some(slot.insert(record).namespace.clone()),
+                    });
                 }
-                Ok(CreateNamespaceOutput {
-                    namespace: Some(slot.insert(record).namespace.clone()),
-                })
+                ::std::collections::btree_map::Entry::Occupied(occupied) => {
+                    occupied.key().clone()
+                }
             }
+        };
+
+        // Only reached when another request took this name while the secret above was being
+        // minted: that secret belongs to a namespace that will never exist, so it goes with
+        // the refusal rather than being left behind
+        // ([`crate::state::managed_admin_secret::release_orphaned_namespace_admin_secret`]).
+        if let Some(secret_arn) = orphaned_secret_arn {
+            crate::state::managed_admin_secret::release_orphaned_namespace_admin_secret(
+                &*self.engine,
+                ctx,
+                &region,
+                &namespace_arn,
+                &secret_arn,
+            )
+            .await;
         }
+        // A name already taken is the modelled `ConflictException`, answered with the status
+        // this service answers a namespace-name refusal with — 400, not the 409 the shape's
+        // `@httpError` names. See [`crate::state::namespace_already_exists`].
+        Err(crate::scaffolded::Scaffolded::restated(
+            crate::state::RESOURCE_NAME_REFUSAL_STATUS,
+            CreateNamespaceErrorModeled::ConflictException(ConflictException {
+                message: crate::state::namespace_already_exists(&taken_name),
+            }),
+        ))
     }
 }

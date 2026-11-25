@@ -32,11 +32,13 @@
 //! `MODIFYING` or `DELETING`) is the modelled `ConflictException`: two changes to one
 //! namespace cannot both be in flight.
 //!
-//! `manageAdminPassword` and `adminPasswordSecretKmsKeyId` are recorded on the namespace
-//! exactly as `CreateNamespace` records them, and mint no Secrets Manager secret here
-//! either. `maintainIntegration` names data-sharing, zero-ETL and S3-event integrations,
-//! none of which this emulator serves, so there is nothing for either value of it to keep
-//! or drop; it is accepted and changes nothing.
+//! `manageAdminPassword` has the service manage the restored namespace's admin credentials:
+//! the restore mints the Secrets Manager secret that holds them, exactly as
+//! `CreateNamespace` does, unless the snapshot already carries the ARN of the one the
+//! namespace had when it was taken — which the restored namespace inherits with the rest of
+//! those credentials. `maintainIntegration` names data-sharing, zero-ETL and S3-event
+//! integrations, none of which this emulator serves, so there is nothing for either value of
+//! it to keep or drop; it is accepted and changes nothing.
 //!
 //! The restored namespace reports `MODIFYING` and reaches `AVAILABLE` on its own a moment
 //! later, with nobody calling — the data is already materialised when the call returns, so
@@ -240,7 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // blocking engine work: holding the store's lock across it would stall every other
         // request to this service. See [`crate::state::restore_namespace_data`].
         let region = crate::state::request_region(ctx);
-        let (snapshot, data, minted) = {
+        let (snapshot, data, minted, admin_secret_owner) = {
             let mut state = state.lock();
             state.settle_due_transitions();
 
@@ -336,8 +338,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     minted_namespace(&input, &snapshot, &region),
                 );
             }
-            (snapshot, data, minted)
+            // A restored namespace that has the service manage its admin password needs the
+            // secret holding those credentials, unless the snapshot already carries one it
+            // inherits. Read off the namespace this restore writes into — the one the block
+            // above has just reserved, when it minted one — so the secret is named and owned
+            // by the namespace that will report it.
+            let admin_secret_owner = (input.manage_admin_password.unwrap_or(false)
+                && snapshot.admin_password_secret_arn.is_none())
+                .then(|| state.namespaces.get(&input.namespace_name))
+                .flatten()
+                .map(|record| AdminSecretOwner {
+                    namespace_arn: record.namespace.namespace_arn.clone().unwrap_or_default(),
+                    namespace_id: record.namespace.namespace_id.clone().unwrap_or_default(),
+                    admin_username: snapshot
+                        .admin_username
+                        .clone()
+                        .or_else(|| record.namespace.admin_username.clone()),
+                });
+            (snapshot, data, minted, admin_secret_owner)
         };
+
+        // The admin credentials secret the restored namespace is to report, minted the way
+        // `CreateNamespace` mints one and BEFORE any data is copied, so a restore this
+        // emulator cannot complete moves nothing: a namespace carrying
+        // `manageAdminPassword` with no secret behind it would promise credentials nothing
+        // holds. See [`crate::state::managed_admin_secret`].
+        let mut restored_secret_arn = None;
+        if let Some(owner) = &admin_secret_owner {
+            match crate::state::managed_admin_secret::mint_namespace_admin_secret(
+                &*self.engine,
+                ctx,
+                &region,
+                &crate::state::managed_admin_secret::AdminSecretRequest {
+                    namespace_arn: &owner.namespace_arn,
+                    namespace_id: &owner.namespace_id,
+                    admin_username: owner.admin_username.as_deref(),
+                    kms_key_id: input.admin_password_secret_kms_key_id.as_deref(),
+                },
+            )
+            .await
+            {
+                Ok(secret_arn) => restored_secret_arn = Some(secret_arn),
+                Err(message) => {
+                    if minted {
+                        state.lock().namespaces.remove(&input.namespace_name);
+                    }
+                    return Err(RestoreFromSnapshotErrorModeled::InternalServerException(
+                        InternalServerException { message },
+                    )
+                    .into());
+                }
+            }
+        }
 
         // Phase 2, with no state guard held: the restore itself, the snapshot's databases
         // replacing the workgroup's. The copy either replaces them all or leaves them all
@@ -357,6 +409,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             if minted {
                 state.lock().namespaces.remove(&input.namespace_name);
+            }
+            // The namespace this restore was for is not there to report the secret this
+            // call minted for it, so that secret goes with the refusal rather than being
+            // left behind holding credentials nothing can reach.
+            if let (Some(owner), Some(secret_arn)) = (&admin_secret_owner, &restored_secret_arn) {
+                crate::state::managed_admin_secret::release_orphaned_namespace_admin_secret(
+                    &*self.engine,
+                    ctx,
+                    &region,
+                    &owner.namespace_arn,
+                    secret_arn,
+                )
+                .await;
             }
             let message = format!("the snapshot's databases could not be restored: {failure}");
             // The emulator cannot hold another open database: a capacity limit, which
@@ -394,7 +459,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(admin_username) = snapshot.admin_username.clone() {
             target.namespace.admin_username = Some(admin_username);
         }
-        target.namespace.admin_password_secret_arn = snapshot.admin_password_secret_arn.clone();
+        target.namespace.admin_password_secret_arn = restored_secret_arn
+            .or_else(|| snapshot.admin_password_secret_arn.clone());
         target.namespace.admin_password_secret_kms_key_id = input
             .admin_password_secret_kms_key_id
             .clone()
@@ -416,6 +482,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             namespace,
         })
     }
+}
+
+/// The namespace a restore mints an admin credentials secret FOR: the resource the secret
+/// belongs to, as the namespace this restore writes into reports it.
+#[derive(Debug)]
+struct AdminSecretOwner {
+    /// The namespace's ARN, the resource the Secrets Manager call is made on behalf of.
+    namespace_arn: String,
+    /// The namespace's `namespaceId`, which the secret is named from.
+    namespace_id: String,
+    /// The admin user whose credentials the secret holds.
+    admin_username: Option<String>,
 }
 
 /// The refusal a restore that would mint a namespace past the account's documented

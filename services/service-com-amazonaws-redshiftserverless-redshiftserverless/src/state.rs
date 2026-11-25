@@ -28,6 +28,17 @@ use crate::ops::types::{
 /// that asks it, and nothing else about it, lives in its own module beside this one.
 pub mod managed_vpc_endpoint;
 
+/// The Secrets Manager secret this service MANAGES for a namespace whose admin password the
+/// caller handed to it (`manageAdminPassword`), which lives in the service that owns secrets
+/// rather than in this store — so the minting and the release of it, and nothing else about
+/// it, live in their own module beside this one.
+pub mod managed_admin_secret;
+
+/// The identity the calls above are made as: a secret this service manages is created and
+/// deleted as this service's OWN principal, never as the caller.
+mod service_principal_call;
+pub use service_principal_call::{ServicePrincipalCall, REDSHIFT_SERVICE_PRINCIPAL};
+
 /// This service's ARN namespace, from the model's `aws.api#service` trait
 /// (`smithy_query(query="service_info")` -> `awsService.arnNamespace`). Also its SigV4
 /// signing name and the host label its endpoints carry.
@@ -339,6 +350,21 @@ pub fn workgroup_not_found(name: &str) -> String {
 /// [`RESOURCE_NAME_REFUSAL_STATUS`] for the status.
 pub fn namespace_already_exists(name: &str) -> String {
     format!("The namespace {name} already exists.")
+}
+
+/// How this service refuses a request that BOTH hands the namespace's admin password to the
+/// service and supplies one of its own.
+///
+/// `adminUserPassword` is documented "You can't use adminUserPassword if manageAdminPassword
+/// is true", and the refusal is the modelled `ValidationException` at its `@httpError` 400
+/// carrying entirely fixed text: the sentence names the two parameters in the API-parameter
+/// capitalization AWS words this refusal in and carries nothing of the request. Every
+/// operation that publishes both members refuses the combination this way, so the sentence
+/// lives here once.
+#[must_use]
+pub fn admin_user_password_with_managed_password() -> String {
+    "The AdminUserPassword parameter cannot be provided if ManagedAdminPassword is true."
+        .to_string()
 }
 
 /// How this service states that a workgroup name is already taken: the modelled

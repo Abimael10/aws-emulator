@@ -15,11 +15,16 @@
 //! The pairings the operation documents are enforced before anything is written:
 //! `adminUsername` with `adminUserPassword`, `iamRoles` with `defaultIamRoleArn`,
 //! `kmsKeyId` not with `logExports`, and `adminUserPassword` not with
-//! `manageAdminPassword`. A refused request leaves the stored namespace untouched.
+//! `manageAdminPassword`. A refused request leaves the stored namespace untouched. The
+//! first of them is a rule about supplying a password of the CALLER's own, so it asks
+//! nothing of a request that hands the password to the service instead
+//! (`manageAdminPassword` true, which carries no password at all).
 //!
 //! The admin password is stored and never returned — `Namespace` models no password
-//! member — and `manageAdminPassword` mints no Secrets Manager secret, so
-//! `adminPasswordSecretArn` stays absent, exactly as on `CreateNamespace`.
+//! member. Turning `manageAdminPassword` ON mints the Secrets Manager secret holding the
+//! namespace's admin credentials and reports its ARN as `adminPasswordSecretArn`, exactly
+//! as `CreateNamespace` does; turning it OFF releases that secret and leaves the member
+//! absent again. See [`crate::state::managed_admin_secret`].
 //!
 //! The Amazon S3 Tables log-publishing update (`logDestinationType` `s3table`) is NOT
 //! served: publishing system tables needs the S3 Tables resource this emulator does not
@@ -209,8 +214,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
-
         // The S3 Tables log-publishing update is its own request and its own resource,
         // neither of which this emulator serves; see the module note.
         const S3_TABLE_DESTINATION: &str = "s3table";
@@ -241,7 +244,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The pairings the operation documents. Each names the two members that describe
         // one setting, so naming one without the other, or two settings that cannot
         // travel together, is refused before anything is written.
-        if input.admin_username.is_some() != input.admin_user_password.is_some() {
+        //
+        // Either the caller supplies the admin password or the service manages it; the two
+        // members describe the same secret, so naming both is contradictory.
+        let manage_admin_password = input.manage_admin_password.unwrap_or(false);
+        if manage_admin_password && input.admin_user_password.is_some() {
+            return Err(UpdateNamespaceErrorModeled::ValidationException(ValidationException {
+                message: crate::state::admin_user_password_with_managed_password(),
+            })
+            .into());
+        }
+        // `adminUserPassword` "must be updated together with adminUsername" — a rule about
+        // supplying a password of the caller's OWN. A request that hands the password to the
+        // service supplies none at all, so the pairing has nothing left to ask for and the
+        // username may stand on its own.
+        if !manage_admin_password
+            && input.admin_username.is_some() != input.admin_user_password.is_some()
+        {
             return Err(UpdateNamespaceErrorModeled::ValidationException(ValidationException {
                 message: "adminUsername and adminUserPassword must be updated together"
                     .to_string(),
@@ -261,15 +280,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
-        // Either the caller supplies the admin password or the service manages it; the two
-        // members describe the same secret, so naming both is contradictory.
-        if input.manage_admin_password.unwrap_or(false) && input.admin_user_password.is_some() {
-            return Err(UpdateNamespaceErrorModeled::ValidationException(ValidationException {
-                message: "adminUserPassword cannot be set when manageAdminPassword is true"
-                    .to_string(),
-            })
-            .into());
-        }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateNamespaceErrorModeled::InternalServerException(
@@ -279,63 +289,221 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let mut state = state.lock();
-        state.settle_due_transitions();
 
-        let Some(record) = state.namespaces.get_mut(&input.namespace_name) else {
-            // The name resolves to nothing: the modelled `ResourceNotFoundException`,
-            // answered with the status this service answers a namespace-name refusal
-            // with. See [`crate::state::namespace_not_found`].
+        // Phase 1, under the state guard: the namespace this update addresses, and what the
+        // change to who manages its admin password asks of Secrets Manager. NOTHING is
+        // written here — a refused request leaves the stored namespace untouched — and the
+        // guard is RELEASED at the end of the block, because that Secrets Manager call goes
+        // to ANOTHER service over the emulator's own in-process callback and this service's
+        // lock may not be held across it.
+        let region = crate::state::request_region(ctx);
+        let (namespace_arn, secret_change) = {
+            let mut state = state.lock();
+            state.settle_due_transitions();
+
+            let Some(record) = state.namespaces.get(&input.namespace_name) else {
+                // The name resolves to nothing: the modelled `ResourceNotFoundException`,
+                // answered with the status this service answers a namespace-name refusal
+                // with. See [`crate::state::namespace_not_found`].
+                return Err(crate::scaffolded::Scaffolded::restated(
+                    crate::state::RESOURCE_NAME_REFUSAL_STATUS,
+                    UpdateNamespaceErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: crate::state::namespace_not_found(&input.namespace_name),
+                            resource_name: Some(input.namespace_name.clone()),
+                        },
+                    ),
+                ));
+            };
+            let namespace_arn = record.namespace.namespace_arn.clone().unwrap_or_default();
+            let held_secret = record.namespace.admin_password_secret_arn.clone();
+            let change = match (input.manage_admin_password, held_secret) {
+                // The namespace hands its admin password to the service and holds no secret
+                // for it yet: this call is what mints the one that holds the credentials.
+                (Some(true), None) => SecretChange::Mint {
+                    namespace_id: record.namespace.namespace_id.clone().unwrap_or_default(),
+                    admin_username: input
+                        .admin_username
+                        .clone()
+                        .or_else(|| record.namespace.admin_username.clone()),
+                    kms_key_id: input
+                        .admin_password_secret_kms_key_id
+                        .clone()
+                        .or_else(|| record.namespace.admin_password_secret_kms_key_id.clone()),
+                },
+                // The caller takes the admin password back: the service manages no
+                // credentials for the namespace any more, so the secret that held them goes.
+                (Some(false), Some(secret_arn)) => SecretChange::Release { secret_arn },
+                _ => SecretChange::None,
+            };
+            (namespace_arn, change)
+        };
+
+        // Phase 2, with no state guard held: the secret the change above asks for. A failure
+        // here has written nothing, so the stored namespace is still the one this call found.
+        let minted_secret_arn = match &secret_change {
+            SecretChange::Mint {
+                namespace_id,
+                admin_username,
+                kms_key_id,
+            } => {
+                let minted = crate::state::managed_admin_secret::mint_namespace_admin_secret(
+                    &*self.engine,
+                    ctx,
+                    &region,
+                    &crate::state::managed_admin_secret::AdminSecretRequest {
+                        namespace_arn: &namespace_arn,
+                        namespace_id,
+                        admin_username: admin_username.as_deref(),
+                        kms_key_id: kms_key_id.as_deref(),
+                    },
+                )
+                .await;
+                match minted {
+                    Ok(secret_arn) => Some(secret_arn),
+                    Err(message) => {
+                        return Err(UpdateNamespaceErrorModeled::InternalServerException(
+                            InternalServerException { message },
+                        )
+                        .into());
+                    }
+                }
+            }
+            SecretChange::Release { secret_arn } => {
+                if let Err(message) =
+                    crate::state::managed_admin_secret::release_namespace_admin_secret(
+                        &*self.engine,
+                        ctx,
+                        &region,
+                        &namespace_arn,
+                        secret_arn,
+                    )
+                    .await
+                {
+                    return Err(UpdateNamespaceErrorModeled::InternalServerException(
+                        InternalServerException { message },
+                    )
+                    .into());
+                }
+                None
+            }
+            SecretChange::None => None,
+        };
+
+        // Phase 3, under the state guard and with no refusal left to make: the members the
+        // request named are applied to the stored namespace. The guard lives only for this
+        // block, because the release below reaches Secrets Manager again.
+        let updated = {
+            let mut state = state.lock();
+            state.settle_due_transitions();
+            match state.namespaces.get_mut(&input.namespace_name) {
+                None => None,
+                Some(record) => {
+                    // Every member of `Namespace` this operation models, applied only when
+                    // the request names it.
+                    if let Some(admin_username) = input.admin_username {
+                        record.namespace.admin_username = Some(admin_username);
+                    }
+                    if let Some(admin_user_password) = input.admin_user_password {
+                        // Stored, never returned: `Namespace` models no password member.
+                        record.admin_user_password = Some(admin_user_password);
+                    }
+                    if let Some(manage_admin_password) = input.manage_admin_password {
+                        record.manage_admin_password = manage_admin_password;
+                    }
+                    if let Some(secret_kms_key_id) = input.admin_password_secret_kms_key_id {
+                        record.namespace.admin_password_secret_kms_key_id =
+                            Some(secret_kms_key_id);
+                    }
+                    // The handle to the credentials the service manages: the secret this
+                    // call minted, or nothing at all once the caller has taken the password
+                    // back — a namespace whose password the service does not manage has no
+                    // such secret and reports no ARN for one.
+                    match secret_change {
+                        SecretChange::Mint { .. } => {
+                            record.namespace.admin_password_secret_arn =
+                                minted_secret_arn.clone();
+                        }
+                        SecretChange::Release { .. } => {
+                            record.namespace.admin_password_secret_arn = None;
+                            record.namespace.admin_password_secret_kms_key_id = None;
+                        }
+                        SecretChange::None => {}
+                    }
+                    if let Some(kms_key_id) = input.kms_key_id {
+                        record.namespace.kms_key_id = Some(kms_key_id);
+                    }
+                    if let Some(default_iam_role_arn) = input.default_iam_role_arn {
+                        record.namespace.default_iam_role_arn = Some(default_iam_role_arn);
+                    }
+                    if let Some(iam_roles) = input.iam_roles {
+                        record.namespace.iam_roles = Some(iam_roles);
+                    }
+                    if let Some(log_exports) = input.log_exports {
+                        record.namespace.log_exports = Some(log_exports);
+                    }
+
+                    // `NamespaceStatus` models `MODIFYING` beside `AVAILABLE`, and the
+                    // recorded `UpdateNamespace` answers in it: the namespace is being
+                    // changed when the call returns, and is available again on its own a
+                    // moment later with nobody calling. See
+                    // [`crate::state::NamespaceRecord::begin_transition`].
+                    record.begin_transition(
+                        crate::state::NAMESPACE_MODIFYING,
+                        crate::state::NAMESPACE_AVAILABLE,
+                    );
+                    // The answer comes out of the STORED record, so what the caller reads is
+                    // what a later `GetNamespace` reads.
+                    Some(record.namespace.clone())
+                }
+            }
+        };
+
+        let Some(namespace) = updated else {
+            // Only reached when another request deleted the namespace while the secret above
+            // was being minted: that secret belongs to a namespace that no longer exists, so
+            // it goes with the refusal rather than being left behind.
+            if let Some(secret_arn) = minted_secret_arn {
+                crate::state::managed_admin_secret::release_orphaned_namespace_admin_secret(
+                    &*self.engine,
+                    ctx,
+                    &region,
+                    &namespace_arn,
+                    &secret_arn,
+                )
+                .await;
+            }
             return Err(crate::scaffolded::Scaffolded::restated(
                 crate::state::RESOURCE_NAME_REFUSAL_STATUS,
-                UpdateNamespaceErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: crate::state::namespace_not_found(&input.namespace_name),
-                        resource_name: Some(input.namespace_name.clone()),
-                    },
-                ),
+                UpdateNamespaceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: crate::state::namespace_not_found(&input.namespace_name),
+                    resource_name: Some(input.namespace_name.clone()),
+                }),
             ));
         };
 
-        // Every member of `Namespace` this operation models, applied only when the request
-        // names it.
-        if let Some(admin_username) = input.admin_username {
-            record.namespace.admin_username = Some(admin_username);
-        }
-        if let Some(admin_user_password) = input.admin_user_password {
-            // Stored, never returned: `Namespace` models no password member.
-            record.admin_user_password = Some(admin_user_password);
-        }
-        if let Some(manage_admin_password) = input.manage_admin_password {
-            record.manage_admin_password = manage_admin_password;
-        }
-        if let Some(secret_kms_key_id) = input.admin_password_secret_kms_key_id {
-            record.namespace.admin_password_secret_kms_key_id = Some(secret_kms_key_id);
-        }
-        if let Some(kms_key_id) = input.kms_key_id {
-            record.namespace.kms_key_id = Some(kms_key_id);
-        }
-        if let Some(default_iam_role_arn) = input.default_iam_role_arn {
-            record.namespace.default_iam_role_arn = Some(default_iam_role_arn);
-        }
-        if let Some(iam_roles) = input.iam_roles {
-            record.namespace.iam_roles = Some(iam_roles);
-        }
-        if let Some(log_exports) = input.log_exports {
-            record.namespace.log_exports = Some(log_exports);
-        }
-
-        // `NamespaceStatus` models `MODIFYING` beside `AVAILABLE`, and the recorded
-        // `UpdateNamespace` answers in it: the namespace is being changed when the call
-        // returns, and is available again on its own a moment later with nobody calling.
-        // See [`crate::state::NamespaceRecord::begin_transition`].
-        record.begin_transition(
-            crate::state::NAMESPACE_MODIFYING,
-            crate::state::NAMESPACE_AVAILABLE,
-        );
-
-        Ok(UpdateNamespaceOutput {
-            namespace: record.namespace.clone(),
-        })
+        Ok(UpdateNamespaceOutput { namespace })
     }
+}
+
+/// What this call has to do about the secret holding the namespace's admin credentials,
+/// decided from the stored namespace before anything is written.
+#[derive(Debug)]
+enum SecretChange {
+    /// Management is being turned ON for a namespace that holds no such secret yet: mint it.
+    Mint {
+        /// The namespace's `namespaceId`, which the secret is named from.
+        namespace_id: String,
+        /// The admin user the credentials belong to, as this call leaves it.
+        admin_username: Option<String>,
+        /// The key the secret is encrypted under, as this call leaves it.
+        kms_key_id: Option<String>,
+    },
+    /// Management is being turned OFF for a namespace that holds one: release it.
+    Release {
+        /// The ARN of the secret the namespace holds.
+        secret_arn: String,
+    },
+    /// Nothing about who manages the admin password changes.
+    None,
 }

@@ -34,13 +34,21 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      SignedHeaders=host, Signature=deadbeef";
 
 /// One emulator with an empty store: the shared engine the router builds in production,
-/// carrying only this service.
+/// carrying this service and the Amazon Web Services Secrets Manager service beside it. A
+/// namespace whose admin password this service MANAGES holds those credentials in a secret of
+/// THAT service, so the owner of secrets is mounted here the way the assembled emulator
+/// mounts it.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
-        service_com_amazonaws_redshiftserverless_redshiftserverless::EmulatedService::new(engine),
+        service_com_amazonaws_redshiftserverless_redshiftserverless::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    router.register_service(
+        service_com_amazonaws_secretsmanager_secretsmanager::EmulatedService::new(engine),
     );
     router
 }

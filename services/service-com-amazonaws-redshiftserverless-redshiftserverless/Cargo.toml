@@ -43,6 +43,12 @@ service-common = { path = "../common" }
 # VPC endpoint with one network interface per subnet, and a VPC endpoint, a subnet and a
 # network interface are all EC2's resources (`state::managed_vpc_endpoint`).
 aws-sdk-ec2 = { version = "1", default-features = false }
+# `manageAdminPassword` has Amazon Redshift manage the namespace's admin credentials in
+# Amazon Web Services Secrets Manager: this is the Secrets Manager client the create and
+# the release of that secret go out over the in-process callback with
+# (`src/state/managed_admin_secret.rs`). Only the generated client is needed — the emulator
+# supplies the transport.
+aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -58,6 +64,12 @@ sha2 = { workspace = true }
 # own API and reads the interfaces back from it. A workspace member this repository already
 # locks.
 service-com-amazonaws-ec2-amazonec2 = { workspace = true }
+# The managed admin-credentials suite mounts Amazon Web Services Secrets Manager beside
+# Redshift Serverless on one engine, because the secret a managed-password namespace reports
+# is ITS resource: the suite reads that secret back through this service's own API, and
+# checks that a caller's own delete of it is refused. A workspace member this repository
+# already locks.
+service-com-amazonaws-secretsmanager-secretsmanager = { workspace = true }
 
 [lints]
 workspace = true

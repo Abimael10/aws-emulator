@@ -15,6 +15,11 @@
 //! 501 rather than silently dropping the snapshot the caller asked for. `CreateSnapshot`
 //! serves the caller-driven snapshot.
 //!
+//! The Secrets Manager secret holding the admin credentials of a managed-password namespace
+//! goes with the namespace: it exists for that namespace alone, and one left behind would
+//! hold the credentials of a database nothing can reach. See
+//! [`crate::state::managed_admin_secret`].
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -151,7 +156,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // The final snapshot is a resource this emulator does not serve yet. Answering
         // 501 is honest; deleting the namespace and dropping the snapshot would not be.
         if input.final_snapshot_name.is_some() {
@@ -168,46 +172,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let mut state = state.lock();
-        state.settle_due_transitions();
+        // Under the state guard: the refusals the delete owes and the removal itself. The
+        // guard lives only for this block, because the secret released below is another
+        // service's resource — reached over the emulator's own in-process callback — and
+        // this service's lock may not be held across that call.
+        let namespace = {
+            let mut state = state.lock();
+            state.settle_due_transitions();
 
-        let Some(record) = state.namespaces.get(&input.namespace_name) else {
-            // The name resolves to nothing: the modelled `ResourceNotFoundException`,
-            // answered with the status this service answers a namespace-name refusal
-            // with. See [`crate::state::namespace_not_found`].
-            return Err(crate::scaffolded::Scaffolded::restated(
-                crate::state::RESOURCE_NAME_REFUSAL_STATUS,
-                DeleteNamespaceErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: crate::state::namespace_not_found(&input.namespace_name),
-                        resource_name: Some(input.namespace_name.clone()),
-                    },
-                ),
-            ));
+            let Some(record) = state.namespaces.get(&input.namespace_name) else {
+                // The name resolves to nothing: the modelled `ResourceNotFoundException`,
+                // answered with the status this service answers a namespace-name refusal
+                // with. See [`crate::state::namespace_not_found`].
+                return Err(crate::scaffolded::Scaffolded::restated(
+                    crate::state::RESOURCE_NAME_REFUSAL_STATUS,
+                    DeleteNamespaceErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: crate::state::namespace_not_found(&input.namespace_name),
+                            resource_name: Some(input.namespace_name.clone()),
+                        },
+                    ),
+                ));
+            };
+            let mut namespace = record.namespace.clone();
+
+            // A workgroup holds the compute attached to this namespace, so the namespace
+            // cannot go while one still references it. The message is the remediation AWS
+            // builds from the blocking resource: delete THAT workgroup first. It names one
+            // workgroup — the first in list order, so the text is deterministic — because the
+            // caller's next call is a single DeleteWorkgroup either way.
+            let blocking = state
+                .workgroups_in_namespace(&input.namespace_name)
+                .first()
+                .map(|name| name.to_string());
+            if let Some(workgroup_name) = blocking {
+                return Err(DeleteNamespaceErrorModeled::ConflictException(ConflictException {
+                    message: format!(
+                        "Delete the associated workgroup {workgroup_name} before you delete \
+                         the namespace."
+                    ),
+                })
+                .into());
+            }
+
+            state.namespaces.remove(&input.namespace_name);
+            namespace.status = Some(crate::state::NAMESPACE_DELETING.to_string());
+            namespace
         };
-        let mut namespace = record.namespace.clone();
 
-        // A workgroup holds the compute attached to this namespace, so the namespace
-        // cannot go while one still references it. The message is the remediation AWS
-        // builds from the blocking resource: delete THAT workgroup first. It names one
-        // workgroup — the first in list order, so the text is deterministic — because the
-        // caller's next call is a single DeleteWorkgroup either way.
-        let blocking = state
-            .workgroups_in_namespace(&input.namespace_name)
-            .first()
-            .map(|name| name.to_string());
-        if let Some(workgroup_name) = blocking {
-            return Err(DeleteNamespaceErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "Delete the associated workgroup {workgroup_name} before you delete \
-                     the namespace."
-                ),
-            })
-            .into());
+        // The delete is accepted, so the secret this service manages for the namespace's
+        // admin credentials goes with it: that secret exists for this namespace alone, and
+        // one left behind would hold the credentials of a database nothing can reach. The
+        // namespace is already gone, so a secret that cannot be deleted is recorded rather
+        // than answered: the delete stands
+        // ([`crate::state::managed_admin_secret::release_orphaned_namespace_admin_secret`]).
+        if let Some(secret_arn) = namespace.admin_password_secret_arn.clone() {
+            crate::state::managed_admin_secret::release_orphaned_namespace_admin_secret(
+                &*self.engine,
+                ctx,
+                &crate::state::request_region(ctx),
+                namespace.namespace_arn.as_deref().unwrap_or_default(),
+                &secret_arn,
+            )
+            .await;
         }
 
-        state.namespaces.remove(&input.namespace_name);
-        namespace.status = Some(crate::state::NAMESPACE_DELETING.to_string());
         Ok(DeleteNamespaceOutput { namespace })
     }
 }
