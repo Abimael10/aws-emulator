@@ -2093,7 +2093,10 @@ pub(crate) fn elapse(
 
 /// An epoch-seconds timestamp member of a response body (`StartTime`, `ExpiryTime`), which
 /// is how restJson1 puts a `timestamp` on the wire, or `None` when the body carries none.
-fn timestamp_member(reply: &Reply, name: &str) -> Option<f64> {
+///
+/// `pub(crate)` so a sibling suite asserting on a reported instant reads it the same way
+/// rather than growing a second copy of the wire form.
+pub(crate) fn timestamp_member(reply: &Reply, name: &str) -> Option<f64> {
     reply.json().get(name).and_then(serde_json::Value::as_f64)
 }
 

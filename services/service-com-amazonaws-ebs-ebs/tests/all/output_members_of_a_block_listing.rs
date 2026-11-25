@@ -22,6 +22,12 @@
 //!   about the geometry of either, so `VolumeSize`, `BlockSize` and `ExpiryTime` are all
 //!   omitted.
 //!
+//! The VALUE a snapshot listing reports for `ExpiryTime` is asserted too, not only its
+//! presence: it is the one deadline the snapshot carries, so the same instant is reported on
+//! a page that reports blocks and on a page of that same snapshot that reports none, and it
+//! lies a `Timeout` window past the snapshot's own clock whatever window the request asked
+//! for.
+//!
 //! Each listing is asserted over a TABLE, whose rows differ along WHY the page reports
 //! nothing (a snapshot that holds no block, a start past every index it holds, a comparison
 //! that finds no difference), along the declared volume size, along how the block indexes
@@ -30,7 +36,10 @@
 //! shape of answer.
 
 use crate::changed_blocks_between_snapshots::{compared, sealed_snapshot};
-use crate::snapshot_block_loop::{list_blocks, router, write_snapshot, Reply, BLOCK_SIZE};
+use crate::snapshot_block_loop::{
+    block_bytes, checksum, complete_snapshot, list_blocks, member, put_block, router,
+    start_snapshot, timestamp_member, write_snapshot, Reply, BLOCK_SIZE,
+};
 
 /// RULE, asserted on one answer of a SNAPSHOT listing: `array` reports exactly `expected`,
 /// and the snapshot geometry and the token expiry are reported whatever the page reported.
@@ -298,5 +307,144 @@ async fn a_comparison_reports_the_geometry_whatever_the_page_reported() {
     for (case, first, second, query, volume_size, expected) in rows {
         let reply = compared(&router, case, first, second, query).await;
         assert_comparison_page_members(case, &reply, "ChangedBlocks", &expected, volume_size);
+    }
+}
+
+/// One row of the expiry table: the case, the `Timeout` the `StartSnapshot` request carries
+/// (`None` for a request that names none), and the window in minutes that request gives the
+/// snapshot's block tokens.
+type ExpiryRow<'a> = (&'a str, Option<i32>, u32);
+
+/// Rows differ along where the window comes from: the modelled minimum, a value inside the
+/// range, the default a request naming no `Timeout` takes, and the modelled maximum.
+///
+/// The bounds are `StartSnapshotRequest$Timeout`'s `range` 10..4320 minutes
+/// (`smithy_query(query="shape",shape="com.amazonaws.ebs#StartSnapshotRequest")`) and the
+/// default is the one its documentation states: "If no value is specified, the timeout
+/// defaults to `60` minutes."
+const EXPIRY_ROWS: &[ExpiryRow<'static>] = &[
+    ("the modelled minimum Timeout", Some(10), 10),
+    ("a Timeout inside the modelled range", Some(90), 90),
+    (
+        "the documented default Timeout, which no request names",
+        None,
+        60,
+    ),
+    ("the modelled maximum Timeout", Some(4320), 4320),
+];
+
+/// Start a snapshot of one GiB carrying `timeout` (a request that names none when it is
+/// `None`), write one block at index 0 into it and seal it, so it is readable; answer
+/// `(its id, the StartTime it reported)`.
+async fn sealed_one_block_snapshot(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    case: &str,
+    timeout: Option<i32>,
+) -> (String, f64) {
+    let request = match timeout {
+        Some(minutes) => serde_json::json!({ "VolumeSize": 1, "Timeout": minutes }),
+        None => serde_json::json!({ "VolumeSize": 1 }),
+    };
+    let started = start_snapshot(router, &request).await;
+    assert_eq!(
+        started.status,
+        201,
+        "case {case:?}: StartSnapshot of {request} must answer 201, got {} with body {}",
+        started.status,
+        String::from_utf8_lossy(&started.body)
+    );
+    let snapshot_id = member(&started, "SnapshotId");
+    let start_time = timestamp_member(&started, "StartTime").unwrap_or_else(|| {
+        panic!(
+            "case {case:?}: StartSnapshot must report a StartTime, got {}",
+            started.json()
+        )
+    });
+
+    let data = block_bytes(17);
+    let expected = checksum(&data);
+    let written = put_block(router, &snapshot_id, 0, data, BLOCK_SIZE, &expected).await;
+    assert_eq!(
+        written.status,
+        201,
+        "case {case:?}: PutSnapshotBlock must answer 201, got {} with body {}",
+        written.status,
+        String::from_utf8_lossy(&written.body)
+    );
+    let sealed = complete_snapshot(router, &snapshot_id, 1).await;
+    assert_eq!(
+        sealed.status,
+        202,
+        "case {case:?}: CompleteSnapshot must answer 202, got {} with body {}",
+        sealed.status,
+        String::from_utf8_lossy(&sealed.body)
+    );
+
+    (snapshot_id, start_time)
+}
+
+/// The `ExpiryTime` a snapshot listing reported, as epoch seconds.
+fn reported_expiry(case: &str, reply: &Reply) -> f64 {
+    timestamp_member(reply, "ExpiryTime").unwrap_or_else(|| {
+        panic!(
+            "case {case:?}: ListSnapshotBlocks must report an ExpiryTime, got {}",
+            reply.json()
+        )
+    })
+}
+
+/// RULE, on the VALUE rather than the presence: `ExpiryTime` is the one instant at which the
+/// snapshot's block tokens stop resolving, so every answer that resolved the snapshot reports
+/// THAT instant — the same on a page that reports a block and on a page of the same snapshot
+/// that reports none — and it lies the `Timeout` window the snapshot was started with past
+/// its own clock, whichever window inside the modelled range the request asked for.
+#[tokio::test]
+async fn a_snapshot_listing_reports_the_same_token_expiry_on_every_page() {
+    let router = router();
+
+    for (case, timeout, minutes) in EXPIRY_ROWS {
+        let (snapshot_id, start_time) = sealed_one_block_snapshot(&router, case, *timeout).await;
+
+        // A page that reports the one block the snapshot holds, and a page of the same
+        // snapshot started past that index, which reports none.
+        let filled = list_blocks(&router, &snapshot_id, "startingBlockIndex=0").await;
+        let empty = list_blocks(&router, &snapshot_id, "startingBlockIndex=1").await;
+        for (page, reply) in [("the filled page", &filled), ("the empty page", &empty)] {
+            assert_eq!(
+                reply.status,
+                200,
+                "case {case:?} ({page}): ListSnapshotBlocks must answer 200, got {} with body {}",
+                reply.status,
+                String::from_utf8_lossy(&reply.body)
+            );
+        }
+        assert_snapshot_page_members(case, &filled, "Blocks", &[0], 1);
+        assert_snapshot_page_members(case, &empty, "Blocks", &[], 1);
+
+        let on_the_filled_page = reported_expiry(case, &filled);
+        let on_the_empty_page = reported_expiry(case, &empty);
+        assert_eq!(
+            on_the_filled_page, on_the_empty_page,
+            "case {case:?}: both pages of one snapshot must report the one instant its block \
+             tokens expire at, got {on_the_filled_page} on the filled page and \
+             {on_the_empty_page} on the empty one"
+        );
+
+        // The window is measured from the snapshot's own clock, which the write moved
+        // forward, so the deadline is at least a window past the start it reported. The
+        // upper bound is the window plus room for the calls above to have been made, which
+        // is deliberately loose: the rule under test is WHICH window, not how fast the
+        // host runs.
+        let window = f64::from(*minutes) * 60.0;
+        let room_for_the_calls_above = 300.0;
+        assert!(
+            on_the_empty_page >= start_time + window
+                && on_the_empty_page <= start_time + window + room_for_the_calls_above,
+            "case {case:?}: expected the reported ExpiryTime to be the {minutes}-minute \
+             window past the snapshot's clock (from {} to {} in epoch seconds), got \
+             {on_the_empty_page}",
+            start_time + window,
+            start_time + window + room_for_the_calls_above
+        );
     }
 }
