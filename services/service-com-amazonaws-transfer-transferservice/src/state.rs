@@ -101,7 +101,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    AccessDeniedException, As2ConnectorConfig, ConflictException, ConnectorEgressConfig,
+    AccessDeniedException, As2AsyncMdnConnectorConfig, As2ConnectorConfig, ConflictException,
+    ConnectorEgressConfig,
     ConnectorFileTransferResult, ConnectorVpcLatticeEgressConfig, CustomDirectoriesType,
     DescribedWebAppEndpointDetails,
     DescribedWebAppIdentityProviderDetails, EndpointDetails, HomeDirectoryMapEntry,
@@ -1539,6 +1540,124 @@ pub fn merge_sftp_connector_config(
             stored.max_concurrent_connections
         },
     })
+}
+
+/// Resolve the `As2ConnectorConfig` a connector is stored with.
+///
+/// `BasicAuthSecretId` is the one member of the structure that is either SET or NOT SET:
+/// it "provides Basic authentication support to the AS2 Connectors API", its "default
+/// value ... is `null`, which indicates that Basic authentication is not enabled for the
+/// connector", and it is CLEARED by an empty value ("If you have previously enabled
+/// Basic authentication for a connector, you can disable it by using the
+/// `UpdateConnector` API call ... `--as2-config 'BasicAuthSecretId=\"\"'`"). Its target
+/// `As2ConnectorSecretId` is modelled `len 0..2048`, so the empty string reaches a
+/// handler, and it is stored as not configured — which a reader reports by omitting the
+/// member — on the same rule [`configured_logging_role`] follows for the server member
+/// that is cleared the same way.
+pub fn resolve_as2_connector_config(requested: As2ConnectorConfig) -> As2ConnectorConfig {
+    // Destructured rather than updated through `..requested`, so every member of the
+    // shape is accounted for here: a member the model gains is a compile error until it
+    // is resolved too.
+    let As2ConnectorConfig {
+        local_profile_id,
+        partner_profile_id,
+        message_subject,
+        compression,
+        encryption_algorithm,
+        signing_algorithm,
+        mdn_signing_algorithm,
+        mdn_response,
+        basic_auth_secret_id,
+        preserve_content_type,
+        async_mdn_config,
+    } = requested;
+    As2ConnectorConfig {
+        local_profile_id,
+        partner_profile_id,
+        message_subject,
+        compression,
+        encryption_algorithm,
+        signing_algorithm,
+        mdn_signing_algorithm,
+        mdn_response,
+        basic_auth_secret_id: basic_auth_secret_id.filter(|secret_id| !secret_id.is_empty()),
+        preserve_content_type,
+        async_mdn_config,
+    }
+}
+
+/// Apply the `As2Config` an update NAMES onto the AS2 settings the connector already
+/// has.
+///
+/// The same rule [`merge_sftp_connector_config`], [`merge_connector_egress_config`] and
+/// [`merge_protocol_details`] follow for the other nested configuration this service
+/// holds: the members the request names are the members the update changes, and the rest
+/// of the structure stays as it stands. The model states that rule for this structure on
+/// `BasicAuthSecretId`, whose documented way to turn Basic authentication off is an
+/// UPDATE CARRYING AN EMPTY VALUE for that one member — a member that a request omitting
+/// it already cleared would need no such call — so an omitted member keeps its stored
+/// value and only a named empty one clears it ([`resolve_as2_connector_config`]).
+///
+/// `AsyncMdnConfig` is a nested structure of its own, so the same rule applies inside
+/// it: an update that names it changes the members it names there and leaves the rest.
+pub fn merge_as2_connector_config(
+    stored: Option<&As2ConnectorConfig>,
+    requested: As2ConnectorConfig,
+) -> As2ConnectorConfig {
+    let Some(stored) = stored else {
+        return resolve_as2_connector_config(requested);
+    };
+    let As2ConnectorConfig {
+        local_profile_id,
+        partner_profile_id,
+        message_subject,
+        compression,
+        encryption_algorithm,
+        signing_algorithm,
+        mdn_signing_algorithm,
+        mdn_response,
+        basic_auth_secret_id,
+        preserve_content_type,
+        async_mdn_config,
+    } = requested;
+    resolve_as2_connector_config(As2ConnectorConfig {
+        local_profile_id: local_profile_id.or_else(|| stored.local_profile_id.clone()),
+        partner_profile_id: partner_profile_id.or_else(|| stored.partner_profile_id.clone()),
+        message_subject: message_subject.or_else(|| stored.message_subject.clone()),
+        compression: compression.or_else(|| stored.compression.clone()),
+        encryption_algorithm: encryption_algorithm.or_else(|| stored.encryption_algorithm.clone()),
+        signing_algorithm: signing_algorithm.or_else(|| stored.signing_algorithm.clone()),
+        mdn_signing_algorithm: mdn_signing_algorithm
+            .or_else(|| stored.mdn_signing_algorithm.clone()),
+        mdn_response: mdn_response.or_else(|| stored.mdn_response.clone()),
+        basic_auth_secret_id: basic_auth_secret_id
+            .or_else(|| stored.basic_auth_secret_id.clone()),
+        preserve_content_type: preserve_content_type
+            .or_else(|| stored.preserve_content_type.clone()),
+        async_mdn_config: match async_mdn_config {
+            Some(requested) => Some(merge_as2_async_mdn_config(
+                stored.async_mdn_config.as_ref(),
+                requested,
+            )),
+            None => stored.async_mdn_config.clone(),
+        },
+    })
+}
+
+/// Apply the `AsyncMdnConfig` an update names onto the asynchronous-MDN settings the
+/// connector already has, on the same rule as [`merge_as2_connector_config`].
+fn merge_as2_async_mdn_config(
+    stored: Option<&As2AsyncMdnConnectorConfig>,
+    requested: As2AsyncMdnConnectorConfig,
+) -> As2AsyncMdnConnectorConfig {
+    let Some(stored) = stored else {
+        return requested;
+    };
+    let As2AsyncMdnConnectorConfig { url, server_ids } = requested;
+    As2AsyncMdnConnectorConfig {
+        url: url.or_else(|| stored.url.clone()),
+        server_ids: server_ids.or_else(|| stored.server_ids.clone()),
+    }
 }
 
 // -----------------------------------------------------------------------------

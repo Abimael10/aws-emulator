@@ -7,7 +7,14 @@
 //! 1. an update is a PARTIAL write: every member the request names replaces the stored
 //!    one, every member it does not name keeps the value the connector already had, and
 //!    a later `DescribeConnector` reports exactly that
-//!    ([`an_update_replaces_the_members_it_names_and_leaves_the_rest`]);
+//!    ([`an_update_replaces_the_members_it_names_and_leaves_the_rest`]) — and the rule
+//!    reaches INSIDE a nested configuration member, so an `SftpConfig` or an `As2Config`
+//!    the request names modifies that structure member by member
+//!    ([`an_as2_connectors_members_update_the_same_way`]), which is what the documented
+//!    provisioning sequences need: pinning the host key `TestConnection` reported leaves
+//!    the connector's `UserSecretId`, and turning AS2 Basic authentication off takes an
+//!    update carrying an EMPTY `BasicAuthSecretId`
+//!    ([`an_empty_basic_auth_secret_configures_no_basic_authentication`]);
 //! 2. an `EgressConfig` update MODIFIES the VPC Lattice settings the connector already
 //!    has, member by member, and is refused for a connector that has none — `EgressType`
 //!    is not an updatable member
@@ -44,6 +51,19 @@ const LOCAL_PROFILE: &str = "p-0123456789abcdef0";
 
 /// A second `ProfileId`, for the partner side of the same AS2 connector.
 const PARTNER_PROFILE: &str = "p-00000000000000001";
+
+/// An `As2ConnectorSecretId` (`len 0..2048`) for the secret AS2 Basic authentication
+/// reads its credentials from.
+const AS2_BASIC_AUTH_SECRET: &str =
+    "arn:aws:secretsmanager:us-east-1:000000000000:secret:as2-basic";
+
+/// A `ServerId` (`len 19..19`, pattern `^s-([0-9a-f]{17})$`) for a server that can handle
+/// asynchronous MDN responses.
+const MDN_SERVER: &str = "s-0123456789abcdef0";
+
+/// A second such server, so `AsyncMdnConfig.ServerIds` (`len 1..10`) carries more than
+/// one.
+const OTHER_MDN_SERVER: &str = "s-00000000000000001";
 
 /// Create a connector over the wire and return its `ConnectorId`.
 async fn create_connector(emulator: &Emulator, case: &str, request: Value) -> String {
@@ -285,7 +305,16 @@ async fn an_update_replaces_the_members_it_names_and_leaves_the_rest() {
 }
 
 /// RULE (rule 1, varied along the protocol configuration): an AS2 connector's own
-/// members update the same way, and `As2Config` is replaced as a whole.
+/// members update the same way — an `As2Config` the request names MODIFIES the AS2
+/// settings the connector already has, member by member, so a member the request leaves
+/// out keeps its stored value, and only `BasicAuthSecretId`, the one member the model
+/// documents as turned off by an UPDATE CARRYING AN EMPTY VALUE, is cleared by naming it
+/// empty.
+///
+/// The rows differ along which AS2 members the request carries and how many (one,
+/// several, all of the nested `AsyncMdnConfig`, none), which value each enum member
+/// carries, the nested list length, and whether the secret member is named, named empty
+/// or not named at all.
 #[tokio::test]
 async fn an_as2_connectors_members_update_the_same_way() {
     let emulator = Emulator::new();
@@ -307,14 +336,35 @@ async fn an_as2_connectors_members_update_the_same_way() {
 
     let cases: Vec<(&str, Value, Value)> = vec![
         (
-            "the AS2 configuration is replaced as a whole, so a member it drops is gone",
+            "one AS2 member: the subject is set, and the members the create configured \
+             stay as they are",
+            json!({"As2Config": {"MessageSubject": "invoices for the next period"}}),
             json!({
+                // A nested object is compared EXACTLY, so this expectation is also what
+                // proves `Compression` and both profile ids — which the create set and
+                // this update does not name — are still on the connector.
                 "As2Config": {
                     "LocalProfileId": LOCAL_PROFILE,
                     "PartnerProfileId": PARTNER_PROFILE,
+                    "Compression": "ZLIB",
                     "MessageSubject": "invoices for the next period",
+                },
+                "Url": "https://partner.example.com/as2",
+                "EgressType": "SERVICE_MANAGED",
+                "SftpConfig": null,
+            }),
+        ),
+        (
+            "several AS2 members at once, each at one of its enum's values, leaving the \
+             subject the previous row set",
+            json!({
+                "As2Config": {
+                    "Compression": "DISABLED",
                     "EncryptionAlgorithm": "AES256_CBC",
-                    "MdnResponse": "NONE",
+                    "SigningAlgorithm": "SHA384",
+                    "MdnSigningAlgorithm": "DEFAULT",
+                    "MdnResponse": "SYNC",
+                    "PreserveContentType": "ENABLED",
                 },
             }),
             json!({
@@ -322,15 +372,127 @@ async fn an_as2_connectors_members_update_the_same_way() {
                     "LocalProfileId": LOCAL_PROFILE,
                     "PartnerProfileId": PARTNER_PROFILE,
                     "MessageSubject": "invoices for the next period",
+                    "Compression": "DISABLED",
                     "EncryptionAlgorithm": "AES256_CBC",
-                    "MdnResponse": "NONE",
-                    // A nested object is compared EXACTLY, so this expectation is also
-                    // what proves `Compression` — which the create set and this update
-                    // does not name — is gone with the configuration it belonged to.
+                    "SigningAlgorithm": "SHA384",
+                    "MdnSigningAlgorithm": "DEFAULT",
+                    "MdnResponse": "SYNC",
+                    "PreserveContentType": "ENABLED",
                 },
-                "Url": "https://partner.example.com/as2",
-                "EgressType": "SERVICE_MANAGED",
-                "SftpConfig": null,
+            }),
+        ),
+        (
+            "Basic authentication is enabled by naming its secret, and nothing else moves",
+            json!({"As2Config": {"BasicAuthSecretId": AS2_BASIC_AUTH_SECRET}}),
+            json!({
+                "As2Config": {
+                    "LocalProfileId": LOCAL_PROFILE,
+                    "PartnerProfileId": PARTNER_PROFILE,
+                    "MessageSubject": "invoices for the next period",
+                    "Compression": "DISABLED",
+                    "EncryptionAlgorithm": "AES256_CBC",
+                    "SigningAlgorithm": "SHA384",
+                    "MdnSigningAlgorithm": "DEFAULT",
+                    "MdnResponse": "SYNC",
+                    "PreserveContentType": "ENABLED",
+                    "BasicAuthSecretId": AS2_BASIC_AUTH_SECRET,
+                },
+            }),
+        ),
+        (
+            "the nested asynchronous-MDN configuration, named for the first time: the \
+             connector had none, so it is what the request names",
+            json!({
+                "As2Config": {
+                    "MdnResponse": "ASYNC",
+                    "AsyncMdnConfig": {"Url": "https://mdn.example.com/async"},
+                },
+            }),
+            json!({
+                "As2Config": {
+                    "LocalProfileId": LOCAL_PROFILE,
+                    "PartnerProfileId": PARTNER_PROFILE,
+                    "MessageSubject": "invoices for the next period",
+                    "Compression": "DISABLED",
+                    "EncryptionAlgorithm": "AES256_CBC",
+                    "SigningAlgorithm": "SHA384",
+                    "MdnSigningAlgorithm": "DEFAULT",
+                    "MdnResponse": "ASYNC",
+                    "PreserveContentType": "ENABLED",
+                    "BasicAuthSecretId": AS2_BASIC_AUTH_SECRET,
+                    "AsyncMdnConfig": {"Url": "https://mdn.example.com/async"},
+                },
+            }),
+        ),
+        (
+            "the same rule INSIDE that nested structure: naming the servers that handle \
+             the responses leaves the URL they are sent to",
+            json!({
+                "As2Config": {
+                    "AsyncMdnConfig": {"ServerIds": [MDN_SERVER, OTHER_MDN_SERVER]},
+                },
+            }),
+            json!({
+                "As2Config": {
+                    "LocalProfileId": LOCAL_PROFILE,
+                    "PartnerProfileId": PARTNER_PROFILE,
+                    "MessageSubject": "invoices for the next period",
+                    "Compression": "DISABLED",
+                    "EncryptionAlgorithm": "AES256_CBC",
+                    "SigningAlgorithm": "SHA384",
+                    "MdnSigningAlgorithm": "DEFAULT",
+                    "MdnResponse": "ASYNC",
+                    "PreserveContentType": "ENABLED",
+                    "BasicAuthSecretId": AS2_BASIC_AUTH_SECRET,
+                    "AsyncMdnConfig": {
+                        "Url": "https://mdn.example.com/async",
+                        "ServerIds": [MDN_SERVER, OTHER_MDN_SERVER],
+                    },
+                },
+            }),
+        ),
+        (
+            "an As2Config that names NO member leaves every AS2 setting as it stands",
+            json!({"As2Config": {}}),
+            json!({
+                "As2Config": {
+                    "LocalProfileId": LOCAL_PROFILE,
+                    "PartnerProfileId": PARTNER_PROFILE,
+                    "MessageSubject": "invoices for the next period",
+                    "Compression": "DISABLED",
+                    "EncryptionAlgorithm": "AES256_CBC",
+                    "SigningAlgorithm": "SHA384",
+                    "MdnSigningAlgorithm": "DEFAULT",
+                    "MdnResponse": "ASYNC",
+                    "PreserveContentType": "ENABLED",
+                    "BasicAuthSecretId": AS2_BASIC_AUTH_SECRET,
+                    "AsyncMdnConfig": {
+                        "Url": "https://mdn.example.com/async",
+                        "ServerIds": [MDN_SERVER, OTHER_MDN_SERVER],
+                    },
+                },
+            }),
+        ),
+        (
+            "Basic authentication is DISABLED by an empty secret id — the one member an \
+             update clears by naming it empty — and the rest of the configuration stays",
+            json!({"As2Config": {"BasicAuthSecretId": ""}}),
+            json!({
+                "As2Config": {
+                    "LocalProfileId": LOCAL_PROFILE,
+                    "PartnerProfileId": PARTNER_PROFILE,
+                    "MessageSubject": "invoices for the next period",
+                    "Compression": "DISABLED",
+                    "EncryptionAlgorithm": "AES256_CBC",
+                    "SigningAlgorithm": "SHA384",
+                    "MdnSigningAlgorithm": "DEFAULT",
+                    "MdnResponse": "ASYNC",
+                    "PreserveContentType": "ENABLED",
+                    "AsyncMdnConfig": {
+                        "Url": "https://mdn.example.com/async",
+                        "ServerIds": [MDN_SERVER, OTHER_MDN_SERVER],
+                    },
+                },
             }),
         ),
         (
@@ -342,8 +504,16 @@ async fn an_as2_connectors_members_update_the_same_way() {
                     "LocalProfileId": LOCAL_PROFILE,
                     "PartnerProfileId": PARTNER_PROFILE,
                     "MessageSubject": "invoices for the next period",
+                    "Compression": "DISABLED",
                     "EncryptionAlgorithm": "AES256_CBC",
-                    "MdnResponse": "NONE",
+                    "SigningAlgorithm": "SHA384",
+                    "MdnSigningAlgorithm": "DEFAULT",
+                    "MdnResponse": "ASYNC",
+                    "PreserveContentType": "ENABLED",
+                    "AsyncMdnConfig": {
+                        "Url": "https://mdn.example.com/async",
+                        "ServerIds": [MDN_SERVER, OTHER_MDN_SERVER],
+                    },
                 },
             }),
         ),
@@ -352,6 +522,55 @@ async fn an_as2_connectors_members_update_the_same_way() {
     for (case, request, expected) in cases {
         let described = update_connector(&emulator, case, &connector_id, request).await;
         assert_members(case, &described, &expected);
+    }
+}
+
+/// RULE (the same rule at CREATE time): `BasicAuthSecretId` is either SET or NOT SET —
+/// "the default value for this parameter is null, which indicates that Basic
+/// authentication is not enabled for the connector" — so a connector created with an
+/// empty one is created with Basic authentication off, and a reader omits the member
+/// rather than reporting the empty string back.
+#[tokio::test]
+async fn an_empty_basic_auth_secret_configures_no_basic_authentication() {
+    let emulator = Emulator::new();
+
+    // The rows differ along the form the member arrives in: not named at all, named
+    // empty (its target `As2ConnectorSecretId` is modelled `len 0..2048`, so the empty
+    // string reaches the handler), and named with a secret.
+    let cases: Vec<(&str, Value, Value)> = vec![
+        ("the member is not named", json!({}), Value::Null),
+        ("the member is named empty", json!({"BasicAuthSecretId": ""}), Value::Null),
+        (
+            "the member names a secret",
+            json!({"BasicAuthSecretId": AS2_BASIC_AUTH_SECRET}),
+            json!(AS2_BASIC_AUTH_SECRET),
+        ),
+    ];
+
+    for (case, mut as2_config, expected) in cases {
+        as2_config["LocalProfileId"] = json!(LOCAL_PROFILE);
+        as2_config["PartnerProfileId"] = json!(PARTNER_PROFILE);
+        let connector_id = create_connector(
+            &emulator,
+            case,
+            json!({
+                "AccessRole": ROLE,
+                "Url": "https://partner.example.com/as2",
+                "As2Config": as2_config,
+            }),
+        )
+        .await;
+
+        let described = describe_connector(&emulator, case, &connector_id).await;
+        let reported = member_of(&described, "As2Config")
+            .get("BasicAuthSecretId")
+            .cloned()
+            .unwrap_or(Value::Null);
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected DescribeConnector to report \
+             As2Config.BasicAuthSecretId as {expected:?}, got {reported:?} in {described:?}"
+        );
     }
 }
 

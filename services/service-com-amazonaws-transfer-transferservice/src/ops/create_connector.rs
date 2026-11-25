@@ -243,7 +243,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let connector = st::Connector {
             arn: st::connector_arn(&region, &connector_id),
             url: st::connector_url(input.url.as_deref()),
-            as2_config: input.as2_config,
+            // Resolved ONCE, here, so a member the model documents as "set or not set"
+            // is stored in that form: an empty `BasicAuthSecretId` names no secret, so
+            // the connector is stored with Basic authentication not enabled.
+            as2_config: input.as2_config.map(st::resolve_as2_connector_config),
             // Defaulted ONCE, here: every nested member the model documents a default
             // for is materialised at create time, so no reader has to re-apply one and
             // a configuration read-back reports the connector as configured.

@@ -205,18 +205,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The configuration the connector would HAVE after this update, built from "what
         // the request names, else what the connector has", and refused BEFORE anything is
-        // written. `EgressType` is create-and-read — no update member names it — and
-        // `EgressConfig` here MODIFIES the settings a VPC Lattice connector already has.
+        // written. `EgressType` is create-and-read — no update member names it — and each
+        // nested configuration member the request names MODIFIES the structure the
+        // connector already holds, member by member, rather than replacing it.
         let next_url = match input.url.as_deref() {
             // A blank `Url` names no endpoint, the reading `connector_url` gives the
             // member everywhere else, so it leaves the connector with none.
             Some(url) => st::connector_url(Some(url)),
             None => stored.url.clone(),
         };
-        let next_as2_config = input
-            .as2_config
-            .clone()
-            .or_else(|| stored.as2_config.clone());
+        // An `As2Config` the request names changes the AS2 members it names and leaves
+        // the rest of the connector's AS2 settings where they stand
+        // (`state::merge_as2_connector_config`), which is the rule the model states for
+        // the structure on `BasicAuthSecretId`: the documented way to turn Basic
+        // authentication off is an update carrying an EMPTY value for that one member.
+        let next_as2_config = match input.as2_config.clone() {
+            Some(requested) => Some(st::merge_as2_connector_config(
+                stored.as2_config.as_ref(),
+                requested,
+            )),
+            None => stored.as2_config.clone(),
+        };
         // Resolved HERE, as at create time, so the stored settings stay fully
         // materialised and the requirements below are judged against what a reader
         // reports. An `SftpConfig` the request names MODIFIES the settings the connector
