@@ -34,30 +34,31 @@
 //! reported over HTTP by `PutComplianceInquiryFeedback`, and its end-to-end row lives in
 //! `implemented_inquiry_operations.rs`, beside that operation's other rows.
 //!
-//! The date-time is rendered with a MILLISECOND fraction, three digits wide whatever the
-//! value of the milliseconds — the resolution AWS Artifact reports these members at, as a
-//! recorded catalog entry shows (`2024-11-01T00:00:00.000Z`). That is a property of the
-//! service's rendering, not of any one member, so every row below asserts it.
+//! The date-time is rendered in the CANONICAL form of the instant it names: RFC 3339 with
+//! a fractional-seconds component only where the instant has one, so an instant on the
+//! second closes straight at `Z` (`2024-11-01T00:00:00Z`, as a recorded catalog entry
+//! shows) while an instant off it reports the fraction it holds. That is a property of the
+//! service's rendering, not of any one member, so every row below asserts it, and
+//! [`a_date_time_carries_a_fraction_only_where_the_instant_has_one`] asserts it over a
+//! table of instants spanning both.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use aws_smithy_schema::traits::TimestampFormat;
 use aws_smithy_schema::Schema;
+use aws_smithy_types::date_time::Format;
+use aws_smithy_types::DateTime;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_artifact_artifact::ops::types::{
-    CustomerAgreementSummary, InquiryDetail, InquirySummary, PutComplianceInquiryFeedbackOutput,
-    QuerySummary, ReportDetail, ReportSummary, ResponseVersion,
+    artifact_date_time_text, CustomerAgreementSummary, InquiryDetail, InquirySummary,
+    PutComplianceInquiryFeedbackOutput, QuerySummary, ReportDetail, ReportSummary,
+    ResponseVersion,
 };
 use service_com_amazonaws_artifact_artifact::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::assert_rendered_date_time;
-
-/// Nanoseconds in one millisecond, for checking the reported instant carries no finer
-/// digits than the rendering shows.
-const NANOS_PER_MILLI: u32 = 1_000_000;
+use crate::harness::{assert_rendered_date_time, settled_inquiry_status};
 
 /// A SigV4 credential scope naming this service: it is what routes a request here.
 const SIGNED: &str = "AWS4-HMAC-SHA256 \
@@ -66,13 +67,6 @@ const SIGNED: &str = "AWS4-HMAC-SHA256 \
 
 /// Base64 of an uploaded document's bytes, as restJson1 carries a blob.
 const FILE_CONTENT: &str = "cXVlc3Rpb25uYWlyZQ==";
-
-/// The span after which an inquiry's processing is due to be over, plus slack. The
-/// handlers store the due instant rather than sleeping, so only the test waits.
-///
-/// `std::thread::sleep` rather than `tokio::time::sleep`: the workspace pins tokio without
-/// its `time` feature.
-const PAST_THE_PROCESSING_SPAN: Duration = Duration::from_millis(900);
 
 /// `InquiryStatusMessage`'s value for an inquiry that completed with nothing failing.
 const INQUIRY_COMPLETE: &str = "Compliance inquiry processing is complete.";
@@ -157,19 +151,14 @@ fn at(body: &Value, pointer: &str) -> Value {
 }
 
 /// Assert one `TimestampAttribute` member's wire form — the harness's one rule, an RFC
-/// 3339 UTC string carrying the three-digit millisecond fraction this service renders with
-/// — and, beyond it, that the member names a real instant at that resolution.
+/// 3339 UTC string in the canonical rendering of the instant it names — and, beyond it,
+/// that the member names a real instant.
 ///
 /// Parsed rather than matched against a literal: the instant itself is
 /// environment-specific (a created inquiry's `createdAt` is the clock's), so what is under
-/// test is the JSON type, the lexical form and the resolution, not the value.
+/// test is the JSON type, the lexical form and the precision, not the value.
 fn assert_date_time(case: &str, member: &str, value: &Value) {
     let parsed = assert_rendered_date_time(case, member, value);
-    assert_eq!(
-        parsed.subsec_nanos() % NANOS_PER_MILLI,
-        0,
-        "case {case:?}: {member} is reported at millisecond resolution, got {value:?}"
-    );
     assert!(
         parsed.secs() > 0,
         "case {case:?}: {member} must name a real instant, got {value:?}"
@@ -206,7 +195,10 @@ async fn every_reported_date_time_member_is_an_rfc3339_string() {
     )
     .await;
 
-    std::thread::sleep(PAST_THE_PROCESSING_SPAN);
+    // Waited out by POLLING for the condition — the handlers store the due instant rather
+    // than sleeping, so the test looks again until the inquiry has left its non-terminal
+    // status instead of resting for a fixed span.
+    settled_inquiry_status(&router, "every reported date-time member", &inquiry_id).await;
 
     let settled = get(
         &router,
@@ -480,7 +472,9 @@ async fn an_inquiry_completes_cleanly_when_no_query_of_it_failed() {
             .expect("the create reports the minted inquiry id")
             .to_string();
 
-        std::thread::sleep(PAST_THE_PROCESSING_SPAN);
+        // The same poll as above: wait for the inquiry to have left its non-terminal
+        // status, not for a fixed span.
+        settled_inquiry_status(&router, case, &id).await;
 
         let detail = get(
             &router,
@@ -533,4 +527,202 @@ async fn an_inquiry_completes_cleanly_when_no_query_of_it_failed() {
             );
         }
     }
+}
+
+/// One instant that falls ON the second, as text, and the `date-time` this service renders
+/// it as.
+///
+/// Source for the form: every timestamp member of this service targets
+/// `com.amazonaws.artifact#TimestampAttribute`, which the model marks
+/// `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape",shape="TimestampAttribute")`). A `date-time` is RFC 3339,
+/// whose fractional-seconds component is OPTIONAL and reports the precision the instant
+/// has — so an instant on the second is rendered without one, which is the form the
+/// recorded catalog entries of this service carry (`2024-11-01T00:00:00Z`).
+///
+/// Each row names its instant as text, which is parsed to the instant under test, so no row
+/// carries an epoch arithmetic of its own. The rows differ along what the rule generalises
+/// over: how wide a fraction the instant was WRITTEN with (a zero fraction is a whole second
+/// written long, and renders short), the second within the minute, the date, and how far
+/// from the epoch the instant lies.
+const WHOLE_SECONDS: &[(&str, &str, &str)] = &[
+    (
+        "the Unix epoch",
+        "1970-01-01T00:00:00Z",
+        "1970-01-01T00:00:00Z",
+    ),
+    (
+        "a recorded catalog period start",
+        "2024-11-01T00:00:00Z",
+        "2024-11-01T00:00:00Z",
+    ),
+    (
+        "the same instant written with a zero millisecond fraction",
+        "2024-11-01T00:00:00.000Z",
+        "2024-11-01T00:00:00Z",
+    ),
+    (
+        "a recorded catalog period end",
+        "2025-10-31T00:00:00Z",
+        "2025-10-31T00:00:00Z",
+    ),
+    (
+        "a second inside the minute",
+        "2026-03-04T05:06:07Z",
+        "2026-03-04T05:06:07Z",
+    ),
+    (
+        "the same instant written with a nine-digit zero fraction",
+        "2026-03-04T05:06:07.000000000Z",
+        "2026-03-04T05:06:07Z",
+    ),
+    (
+        "the last second of a leap day",
+        "2024-02-29T23:59:59Z",
+        "2024-02-29T23:59:59Z",
+    ),
+];
+
+/// Instants that fall OFF the second, as text: the rendering reports the precision they
+/// hold, so each is asserted by round trip rather than against a fraction width this
+/// service would be free to choose.
+const SUB_SECOND_INSTANTS: &[(&str, &str)] = &[
+    ("a millisecond part", "2026-03-04T05:06:07.120Z"),
+    ("a single millisecond", "2026-03-04T05:06:07.001Z"),
+    ("a microsecond part", "2026-03-04T05:06:07.123456Z"),
+];
+
+/// The instant `text` names.
+fn instant(case: &str, text: &str) -> DateTime {
+    DateTime::from_str(text, Format::DateTime).unwrap_or_else(|error| {
+        panic!("case {case:?}: the row's instant {text:?} must parse as a date-time ({error})")
+    })
+}
+
+/// The one date-time renderer of this service, over a table of instants: a fraction is
+/// reported exactly where the instant has one.
+#[test]
+fn a_date_time_carries_a_fraction_only_where_the_instant_has_one() {
+    for (case, written, expected) in WHOLE_SECONDS {
+        let rendered = artifact_date_time_text(&instant(case, written))
+            .unwrap_or_else(|| panic!("case {case:?}: {written:?} must render as a date-time"));
+        assert_eq!(
+            &rendered, expected,
+            "case {case:?}: an instant on the second is rendered without a fractional-seconds \
+             component, expected {expected:?}, got {rendered:?}"
+        );
+    }
+
+    for (case, written) in SUB_SECOND_INSTANTS {
+        let named = instant(case, written);
+        let rendered = artifact_date_time_text(&named)
+            .unwrap_or_else(|| panic!("case {case:?}: {written:?} must render as a date-time"));
+        assert!(
+            rendered.contains('.'),
+            "case {case:?}: this instant has a sub-second part, so the rendering reports one, \
+             got {rendered:?}"
+        );
+        assert_eq!(
+            instant(case, &rendered),
+            named,
+            "case {case:?}: the rendering must name the same instant, got {rendered:?}"
+        );
+    }
+}
+
+/// The same rule end to end, over every operation of this service that reports an instant
+/// the stored record holds ON the second: the published catalog's reporting periods and
+/// publication instants, and the account's customer-agreement effective dates. Each of
+/// those is a calendar instant (see this service's period constants in `src/state.rs`), so
+/// none of them is reported with a fractional-seconds component.
+#[tokio::test]
+async fn a_catalog_instant_is_reported_without_a_fractional_component() {
+    let router = emulator();
+
+    let reports = get(&router, "/v1/report/list").await;
+    let report_id = at(&reports, "/reports/0/id")
+        .as_str()
+        .expect("the catalog publishes at least one report")
+        .to_string();
+    let versions = get(
+        &router,
+        &format!("/v1/report/listVersions?reportId={report_id}"),
+    )
+    .await;
+    let metadata = get(
+        &router,
+        &format!("/v1/report/getMetadata?reportId={report_id}"),
+    )
+    .await;
+    let agreements = get(&router, "/v1/customer-agreement/list").await;
+
+    // (case, the list of records, the members of a record that name a stored instant).
+    let listed: Vec<(&str, &Value, &str, &[&str])> = vec![
+        (
+            "ListReports/ReportSummary",
+            &reports,
+            "reports",
+            &["periodStart", "periodEnd"],
+        ),
+        (
+            "ListReportVersions/ReportSummary",
+            &versions,
+            "reports",
+            &["periodStart", "periodEnd"],
+        ),
+        (
+            "ListCustomerAgreements/CustomerAgreementSummary",
+            &agreements,
+            "customerAgreements",
+            &["effectiveStart", "effectiveEnd"],
+        ),
+    ];
+
+    let mut asserted = 0usize;
+    for (case, body, list, members) in listed {
+        let records = body[list].as_array().cloned().unwrap_or_default();
+        assert!(
+            !records.is_empty(),
+            "case {case:?}: the answer must report records for this rule to say anything, got \
+             {body:?}"
+        );
+        for (position, record) in records.iter().enumerate() {
+            for member in members {
+                let value = &record[*member];
+                if value.is_null() {
+                    continue;
+                }
+                let row = format!("{case} record {position}");
+                assert_rendered_date_time(&row, member, value);
+                let text = value.as_str().unwrap_or_default();
+                assert!(
+                    !text.contains('.'),
+                    "case {row:?}: {member} names a stored calendar instant, so it is reported \
+                     without a fractional-seconds component, got {text:?}"
+                );
+                asserted += 1;
+            }
+        }
+    }
+
+    for member in ["periodStart", "periodEnd", "createdAt", "lastModifiedAt"] {
+        let value = at(&metadata, &format!("/reportDetails/{member}"));
+        if value.is_null() {
+            continue;
+        }
+        let row = format!("GetReportMetadata/ReportDetail {report_id}");
+        assert_rendered_date_time(&row, member, &value);
+        let text = value.as_str().unwrap_or_default().to_string();
+        assert!(
+            !text.contains('.'),
+            "case {row:?}: {member} names a stored calendar instant, so it is reported without \
+             a fractional-seconds component, got {text:?}"
+        );
+        asserted += 1;
+    }
+
+    assert!(
+        asserted > 0,
+        "the rule must be asserted over at least one reported instant, asserted {asserted}"
+    );
 }

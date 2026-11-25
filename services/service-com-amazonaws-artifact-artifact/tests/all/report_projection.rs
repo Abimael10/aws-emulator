@@ -8,9 +8,10 @@
 //!
 //! * RULE T — every projected member whose Smithy target carries
 //!   `@timestampFormat("date-time")` serializes as an ISO-8601 date-time STRING, on every
-//!   operation that projects it, carrying the MILLISECOND fraction this service renders a
-//!   date-time with — three digits wide whatever the value of the milliseconds, as the
-//!   recorded catalog entries show (`2024-11-01T00:00:00.000Z`).
+//!   operation that projects it, in the canonical date-time rendering of the instant it
+//!   names — a fractional-seconds component only where the instant has one, so the
+//!   catalog's whole-second periods close straight at `Z`, as the recorded catalog entries
+//!   show (`2024-11-01T00:00:00Z`).
 //!   (`smithy_query(query="shape",shape="ReportSummary")` and
 //!   `…shape="ReportDetail"` report `"timestampFormat": "date-time"` on `periodStart`,
 //!   `periodEnd`, `createdAt`, `lastModifiedAt` and `deletedAt`, all of which target
@@ -181,7 +182,7 @@ fn instant(case: &str, member: &str, value: &Value) -> i64 {
 }
 
 /// Assert `value` is the date-time form this service renders: the harness's one wire-form
-/// rule (an ISO-8601 UTC string carrying a three-digit millisecond fraction).
+/// rule (an ISO-8601 UTC string in the canonical rendering of the instant it names).
 fn assert_date_time(case: &str, member: &str, value: &Value) {
     assert_rendered_date_time(case, member, value);
 }

@@ -100,14 +100,22 @@ impl Observed {
 
     /// Call one CloudWatch Logs operation, requiring a 200.
     pub(crate) async fn logs(&self, operation: &str, body: &Value) -> Value {
-        let (status, parsed) = self
-            .dispatch("logs", "Logs_20140328", "1.1", operation, body)
-            .await;
+        let (status, parsed) = self.logs_call(operation, body).await;
         assert_eq!(
             status, 200,
             "case {operation}: expected 200 from CloudWatch Logs, got {status} with {parsed:?}"
         );
         parsed
+    }
+
+    /// Call one CloudWatch Logs operation and return `(status, body)`.
+    ///
+    /// What a POLL for a delivery reads the group through: a group CloudWatch Logs does
+    /// not hold yet is a refusal, and a caller waiting for the delivery that creates it has
+    /// to tell that from a failure rather than end the wait on it.
+    pub(crate) async fn logs_call(&self, operation: &str, body: &Value) -> (u16, Value) {
+        self.dispatch("logs", "Logs_20140328", "1.1", operation, body)
+            .await
     }
 
     async fn dispatch(

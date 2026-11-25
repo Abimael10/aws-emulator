@@ -27,17 +27,17 @@ use serde_json::Value;
 use service_com_amazonaws_artifact_artifact::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// How many digits wide the fraction of a rendered date-time is: the millisecond
-/// resolution this service reports an instant at, whatever the value of the milliseconds
-/// (a recorded catalog entry carries `2024-11-01T00:00:00.000Z`).
-pub const MILLISECOND_DIGITS: usize = 3;
-
 /// Assert one `TimestampAttribute` member's wire form and answer the instant it names.
 ///
 /// The ONE date-time form assertion of this crate's suites — the form is one service-wide
 /// rule, so a suite checking a member's wire form builds on this rather than on a copy of
-/// it: a JSON STRING (never restJson1's default epoch-seconds number) that the `date-time`
-/// format parses, closed by `Z`, carrying a fraction exactly [`MILLISECOND_DIGITS`] wide.
+/// it: a JSON STRING (never restJson1's default epoch-seconds number) closed by `Z` that
+/// the `date-time` format parses, and in the CANONICAL rendering of the instant it names —
+/// the text the protocol's own `date-time` writer produces for that instant, which carries
+/// a fractional-seconds component only when the instant has one. So a whole second is
+/// reported as `2024-11-01T00:00:00Z`, the form the recorded catalog entries of this
+/// service carry, and no fraction is padded onto it.
+///
 /// A suite's own extra expectations about the instant are asserted by the suite, over the
 /// value this hands back.
 pub fn assert_rendered_date_time(case: &str, member: &str, value: &Value) -> DateTime {
@@ -56,20 +56,17 @@ pub fn assert_rendered_date_time(case: &str, member: &str, value: &Value) -> Dat
         text.contains('T'),
         "case {case:?}: {member} must be an ISO-8601 date-time, got {text:?}"
     );
-    let fraction = text
-        .strip_suffix('Z')
-        .and_then(|civil| civil.split_once('.').map(|(_, fraction)| fraction))
-        .unwrap_or_else(|| {
-            panic!(
-                "case {case:?}: {member} must be a UTC date-time carrying a fraction of a \
-                 second, got {text:?}"
-            )
-        });
     assert!(
-        fraction.len() == MILLISECOND_DIGITS
-            && fraction.chars().all(|digit| digit.is_ascii_digit()),
-        "case {case:?}: {member} must carry a {MILLISECOND_DIGITS}-digit millisecond fraction, \
-         got {text:?}"
+        text.ends_with('Z'),
+        "case {case:?}: {member} must be a UTC date-time closed by Z, got {text:?}"
+    );
+    let canonical = parsed.fmt(Format::DateTime).unwrap_or_else(|error| {
+        panic!("case {case:?}: {member} must name a renderable instant ({error}), got {text:?}")
+    });
+    assert_eq!(
+        text, canonical,
+        "case {case:?}: {member} must be the canonical date-time rendering of the instant it \
+         names (a fraction only where the instant has one), expected {canonical:?}, got {text:?}"
     );
     parsed
 }

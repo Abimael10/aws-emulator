@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_sfn_awsstepfunctions::state::observability;
 
 use crate::execution_observability::{create, logging, Observed};
-use crate::state_machine_lifecycle::{string, PAST_THE_EXECUTION_DELAY};
+use crate::state_machine_lifecycle::{error_code, string, PAST_THE_EXECUTION_DELAY};
 
 /// A definition whose run produces one state's entry and exit and then fails, so one
 /// execution covers an execution-level event, a state-level pair and a failure.
@@ -111,15 +111,30 @@ fn without_payload(details: &Value) -> Value {
 }
 
 /// Every event the group `name` holds, as the parsed JSON message of each, in the order
-/// CloudWatch Logs reports them.
+/// CloudWatch Logs reports them — and NO event while CloudWatch Logs does not hold the
+/// group at all.
+///
+/// A group this state machine's delivery has not created yet holds nothing, so reading it
+/// answers the group-absent refusal rather than an empty page. That is what a caller
+/// polling for a delivery is waiting out, so it is reported here as "no events yet" and
+/// the poll looks again; any other refusal is a failure of the read.
 ///
 /// `pub(crate)`, not private: `tests/all.rs` is this binary's crate root, so a sibling
 /// suite that waits for a delivery to land reads the group through this one reader
 /// rather than carrying a second copy of it.
 pub(crate) async fn delivered(observed: &Observed, case: &str, name: &str) -> Vec<Value> {
-    let found = observed
-        .logs("FilterLogEvents", &json!({ "logGroupName": name }))
+    let (status, found) = observed
+        .logs_call("FilterLogEvents", &json!({ "logGroupName": name }))
         .await;
+    if status != 200 {
+        assert_eq!(
+            error_code(&found),
+            "ResourceNotFoundException",
+            "case {case:?}: reading the group {name} must either be served or report the group \
+             absent, got {status} with {found:?}"
+        );
+        return Vec::new();
+    }
     found
         .get("events")
         .and_then(Value::as_array)

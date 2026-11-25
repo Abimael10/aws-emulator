@@ -200,8 +200,8 @@ fn assert_refused(case: &str, answer: &Answer) {
 }
 
 /// Assert a `TimestampAttribute` member's wire form — the harness's one rule, an RFC 3339
-/// UTC string carrying the three-digit millisecond fraction this service renders with —
-/// and that it names a real instant.
+/// UTC string in the canonical date-time rendering of the instant it names — and that it
+/// names a real instant.
 ///
 /// Parsed rather than compared against a literal: the instant is the environment's clock,
 /// so what is under test is the JSON type and the lexical form.

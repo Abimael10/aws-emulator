@@ -1465,8 +1465,8 @@ impl ComplianceInquiry {
 }
 
 /// One timestamp as the service renders every `TimestampAttribute` on the wire — RFC 3339
-/// date-time, which is the `@timestampFormat` the model declares for them, at the
-/// millisecond resolution this service reports an instant at.
+/// date-time, which is the `@timestampFormat` the model declares for them, carrying a
+/// fractional-seconds component only when the instant itself has one.
 ///
 /// The ONE renderer, shared with the output serializers
 /// ([`crate::ops::types::artifact_date_time_text`]), so a document this service renders an
