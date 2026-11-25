@@ -15,6 +15,11 @@
 //! empty success, and discarding a record a second time changes nothing — so the plan, execute
 //! and discard cycle runs again over the same stack under the very same name.
 //!
+//! Both forms reach the record of the execution: a bare name addresses the record it was created
+//! under for as long as that record is there, so the record a delete discarded reads back as the
+//! modelled `ChangeSetNotFound` whichever form the delete addressed it by
+//! (`executed_change_set_delete_refusal.rs` holds that same rule over each change-set type).
+//!
 //! The table spans the ROUND of the cycle — a deployment tool diverged on the second round, which
 //! is one row here — the kind of change each round plans (a stack brought into existence, a
 //! resource of another type added, a property changed in place), and both forms `ChangeSetName`

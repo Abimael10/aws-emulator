@@ -66,13 +66,13 @@
 //! named exists.
 //!
 //! `PutResourcePolicy` attaches a resource-based policy to a knowledge base
-//! ([`crate::ops::put_resource_policy`]); `DeleteResourcePolicy`, which removes one, is
-//! still scaffolded (501). Such a document is what "allows other AWS accounts to access the
-//! knowledge base" (the model's own sentence for it), and every credential this emulator
-//! issues speaks for a principal of the one account that owns what it names, so for the
-//! callers this gate judges the identity-based decision is still the whole decision; a
-//! cross-account caller, which this emulator has none of, is what would make the stored
-//! document part of it, as every gate in this tree that reads one does.
+//! ([`crate::ops::put_resource_policy`]) and `DeleteResourcePolicy` removes one
+//! ([`crate::ops::delete_resource_policy`]). Such a document is what "allows other AWS
+//! accounts to access the knowledge base" (the model's own sentence for it), and every
+//! credential this emulator issues speaks for a principal of the one account that owns what
+//! it names, so for the callers this gate judges the identity-based decision is still the
+//! whole decision; a cross-account caller, which this emulator has none of, is what would
+//! make the stored document part of it, as every gate in this tree that reads one does.
 //!
 //! ## The callers this gate does not bound
 //!

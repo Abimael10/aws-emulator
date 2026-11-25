@@ -20,8 +20,7 @@
 //! into ONE resolution, [`ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::policy_bearing_knowledge_base`],
 //! which answers either the knowledge base whose policy the call is about or the
 //! reason there is none to be about — so `GetResourcePolicy`, the write beside it
-//! and the delete (still a scaffold stub with an issue of its own) cannot disagree
-//! on which ARN names what.
+//! and the delete that removes a policy cannot disagree on which ARN names what.
 //!
 //! What a write may ATTACH is here too ([`resource_policy_document_problem`]): the
 //! document's own two clauses, read before the store is touched, so a read never
@@ -29,7 +28,8 @@
 //!
 //! The policy itself is held on the knowledge base's own record
 //! ([`KnowledgeBaseRecord::resource_policy`]), as one [`ResourcePolicyRecord`]: the
-//! document a write stored, and the revision that write left it at.
+//! document a write stored — `None` once a removal took it off again — and the
+//! revision that write left the policy at.
 
 use super::*;
 
@@ -56,15 +56,18 @@ pub fn carries_resource_policy(knowledge_base_type: &str) -> bool {
     knowledge_base_type == MANAGED_KNOWLEDGE_BASE_TYPE
 }
 
-/// One knowledge base's resource-based policy: the document a write stored, and the
-/// revision that write left it at.
+/// One knowledge base's resource-based policy: the document the last write left
+/// attached, and the revision that write left the policy at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourcePolicyRecord {
     /// The policy document, held exactly as the write supplied it — the modelled
-    /// `ResourcePolicy` is a string, so a read reports the same bytes back.
-    pub policy: String,
-    /// How many writes this knowledge base's policy has taken, which is the
-    /// revision it is now at ([`Self::revision_id`] is how the wire carries it).
+    /// `ResourcePolicy` is a string, so a read reports the same bytes back — or
+    /// `None` when the last write was the REMOVAL that took the document off, which
+    /// leaves the knowledge base carrying no policy at a revision of its own.
+    pub document: Option<String>,
+    /// How many writes this knowledge base's policy has taken — every attach and
+    /// every removal — which is the revision it is now at ([`Self::revision_id`] is
+    /// how the wire carries it).
     pub revision: u64,
 }
 
@@ -93,15 +96,58 @@ impl KnowledgeBaseRecord {
     /// revision the same way: a first policy is revision 1 and each write past it
     /// counts one more.
     pub fn attach_resource_policy(&mut self, policy: String) -> String {
-        let revision = self
-            .resource_policy
-            .as_ref()
-            .map_or(0, |stored| stored.revision)
-            .saturating_add(1);
-        let record = ResourcePolicyRecord { policy, revision };
+        let revision = self.next_resource_policy_revision();
+        let record = ResourcePolicyRecord {
+            document: Some(policy),
+            revision,
+        };
         let revision_id = record.revision_id();
         self.resource_policy = Some(record);
         revision_id
+    }
+
+    /// Remove the policy document this knowledge base carries, answering the
+    /// `revisionId` the removal left the policy at — or `None` when it carries no
+    /// document, so there is nothing to remove.
+    ///
+    /// A removal is a WRITE of [`Self::resource_policy`], so it advances the revision
+    /// exactly as an attach does: `DeleteResourcePolicy$revisionId` is "the revision
+    /// identifier after the resource policy was deleted", and keeping the count across
+    /// the removal is what stops a later attach from re-issuing a revision an earlier
+    /// write already answered — the value is compared by equality to guard concurrent
+    /// updates, so no two writes of one knowledge base's policy may share one.
+    pub fn remove_resource_policy(&mut self) -> Option<String> {
+        self.attached_resource_policy()?;
+        let revision = self.next_resource_policy_revision();
+        let record = ResourcePolicyRecord {
+            document: None,
+            revision,
+        };
+        let revision_id = record.revision_id();
+        self.resource_policy = Some(record);
+        Some(revision_id)
+    }
+
+    /// The revision the NEXT write of this knowledge base's policy leaves it at: one
+    /// past the revision the last write left, and 1 when none has written yet.
+    fn next_resource_policy_revision(&self) -> u64 {
+        self.resource_policy
+            .as_ref()
+            .map_or(0, |stored| stored.revision)
+            .saturating_add(1)
+    }
+
+    /// The resource policy this knowledge base carries NOW — the document attached and
+    /// the revision the write that attached it left the policy at — or `None` when it
+    /// carries none, whether because nothing ever wrote one or because a removal took
+    /// the document off.
+    ///
+    /// The one reading of "does this knowledge base have a policy", so the read, the
+    /// write and the delete cannot come to answer it differently.
+    pub fn attached_resource_policy(&self) -> Option<(&str, String)> {
+        let stored = self.resource_policy.as_ref()?;
+        let document = stored.document.as_deref()?;
+        Some((document, stored.revision_id()))
     }
 
     /// Whether `expected` names the revision this knowledge base's policy is at NOW.
@@ -114,9 +160,8 @@ impl KnowledgeBaseRecord {
     /// A knowledge base carrying NO policy is at no revision, so no value names its
     /// revision: a precondition on a policy that is not there cannot hold.
     pub fn resource_policy_revision_matches(&self, expected: &str) -> bool {
-        self.resource_policy
-            .as_ref()
-            .is_some_and(|stored| stored.revision_id() == expected)
+        self.attached_resource_policy()
+            .is_some_and(|(_, revision_id)| revision_id == expected)
     }
 }
 

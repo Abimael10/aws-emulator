@@ -26,8 +26,8 @@
 //! (`KnowledgeBaseRecord::attach_resource_policy`) — which keeps a row free to store a
 //! document no accepted `PutResourcePolicy` would (one shorter than a policy, say) and
 //! still assert what the read reports. `PutResourcePolicy` itself, which attaches a
-//! policy over the wire, is `knowledge_base_resource_policy_write`'s subject;
-//! `DeleteResourcePolicy` is still a scaffold stub with an issue of its own. Everything
+//! policy over the wire, is `knowledge_base_resource_policy_write`'s subject, and
+//! `DeleteResourcePolicy` is `knowledge_base_resource_policy_delete`'s. Everything
 //! the read answers is asserted over the router, on the real wire path.
 
 use std::sync::Arc;

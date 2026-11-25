@@ -221,7 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Both `policy` and `revisionId` are @required, so a knowledge base that
         // carries no policy has no successful answer: the policy is the resource that
         // could not be retrieved, and the knowledge base it would belong to is there.
-        let Some(policy) = record.resource_policy.as_ref() else {
+        let Some((policy, policy_revision_id)) = record.attached_resource_policy() else {
             return Err(GetResourcePolicyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::resource_policy_not_found_message(Self::NAME)),
@@ -235,8 +235,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // rather than the value the request spelled: it is "the ARN of the
             // knowledge base that the resource policy is associated with".
             resource_arn: record.knowledge_base_arn.clone(),
-            policy: policy.policy.clone(),
-            revision_id: policy.revision_id(),
+            policy: policy.to_string(),
+            revision_id: policy_revision_id,
         })
     }
 }
