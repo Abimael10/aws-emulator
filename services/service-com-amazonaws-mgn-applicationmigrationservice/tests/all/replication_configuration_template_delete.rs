@@ -62,7 +62,7 @@ fn not_found_message(template_id: &str) -> String {
 /// (`smithy_query(query="operation",operation="CreateReplicationConfigurationTemplate")`),
 /// with `subnet` as the staging-area subnet so one account can hold several distinct
 /// templates.
-fn minimal_request(subnet: &str) -> Value {
+pub(crate) fn minimal_request(subnet: &str) -> Value {
     json!({
         "stagingAreaSubnetId": subnet,
         "associateDefaultSecurityGroup": true,
