@@ -70,6 +70,11 @@ const NOT_THE_APPLICATIONS: &[u16] = &[502, 504];
 /// The program the bundle's `Procfile` starts: a server that mints a boot identity
 /// ONCE, counts its requests in memory, flips its own health, echoes its process
 /// environment and reads a path of the instance it runs on.
+///
+/// Deployed and dialled through [`published`], [`launched`] and [`answered`], which
+/// are `pub(crate)` so a suite beside this one that is about what a deployment
+/// leaves ON that instance reads it back through this same probe instead of
+/// carrying a second copy of it.
 const PROBE_SERVER: &[u8] = br#"
 import json
 import os
@@ -325,7 +330,12 @@ async fn published_bundle(
 
 /// [`published_bundle`] for the Python probe, which every suite but the engine
 /// table deploys.
-async fn published(emulator: &Emulator, case: &str, version: &str, files: &[(&str, &[u8])]) {
+pub(crate) async fn published(
+    emulator: &Emulator,
+    case: &str,
+    version: &str,
+    files: &[(&str, &[u8])],
+) {
     published_bundle(
         emulator,
         case,
@@ -370,7 +380,7 @@ async fn launched_on(
 
 /// [`launched_on`] on the Python platform, which every suite but the engine table
 /// launches on.
-async fn launched(
+pub(crate) async fn launched(
     emulator: &Emulator,
     case: &str,
     prefix: &str,
@@ -392,7 +402,7 @@ async fn launched(
 /// `prefix`, looking again until the deployed application has ANSWERED — a request
 /// this emulator had no run slot for is answered as an address with nothing behind
 /// it, which is not an answer of the application's.
-async fn answered(emulator: &Emulator, case: &str, prefix: &str, path: &str) -> Answer {
+pub(crate) async fn answered(emulator: &Emulator, case: &str, prefix: &str, path: &str) -> Answer {
     let url = format!(
         "http://{}{path}",
         emulator.published_cname(TEST_REGION, prefix)
