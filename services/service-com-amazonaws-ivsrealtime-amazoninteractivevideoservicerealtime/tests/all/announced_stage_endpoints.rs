@@ -18,10 +18,11 @@
 //! 3. The addresses are the DEPLOYMENT's, not a stage's: every stage reports the same four,
 //!    carrying no part of a stage's own identity — which stage a connection joins is
 //!    carried by the participant token the client presents on them.
-//! 4. Every reported `ParticipantToken` states the EFFECTIVE lifetime it was issued for —
+//! 4. A minted `ParticipantToken` expires the EFFECTIVE lifetime it was issued for out —
 //!    the `duration` the request sized it with, or the default the model documents on the
-//!    reported member itself — on both operations that issue a token, and that lifetime is
-//!    what its `expirationTime` is computed from.
+//!    reported member itself — on both operations that issue a token;
+//!    `CreateParticipantToken` reports `duration` only where the request sized it, while
+//!    `CreateStage` restates the effective lifetime of every token it attached.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -433,14 +434,15 @@ async fn the_announced_endpoints_are_the_deployments_and_not_a_stages() {
     );
 }
 
-/// Rule 4: `duration` is reported on every minted token, as the effective lifetime, and
-/// `expirationTime` lands that many minutes out — on both operations that issue a token.
+/// Rule 4: a minted token expires its effective lifetime out on both operations that issue
+/// one, `CreateParticipantToken` reports `duration` only where the request sized it, and
+/// `CreateStage` restates the effective lifetime.
 ///
 /// The rows differ along what the rule generalises over: a request that sizes nothing
 /// (where the documented default is the answer), both published bounds of the member, the
 /// default stated explicitly, and a middling value.
 #[tokio::test]
-async fn every_minted_token_states_its_effective_duration() {
+async fn every_minted_token_expires_its_effective_lifetime_out() {
     let realtime = RealTime::new();
     let stage_arn = realtime.ok("the token's stage", "CreateStage", &json!({})).await
         ["stage"]["arn"]
@@ -482,6 +484,8 @@ async fn every_minted_token_states_its_effective_duration() {
             case,
             "CreateParticipantToken",
             &response["participantToken"],
+            // Echoed as asked: absent for a token the request did not size.
+            *requested,
             *expected,
             issued_at,
         );
@@ -517,24 +521,32 @@ async fn every_minted_token_states_its_effective_duration() {
         "expected one token per configuration, got {created}"
     );
     for (index, (case, _, expected)) in rows.iter().enumerate() {
-        assert_effective_duration(case, "CreateStage", &tokens[index], *expected, issued_at);
+        assert_effective_duration(
+            case,
+            "CreateStage",
+            &tokens[index],
+            Some(*expected),
+            *expected,
+            issued_at,
+        );
     }
 }
 
-/// Rule 4 on one reported token: `duration` is the effective lifetime, it is inside the
-/// published range, and `expirationTime` is that many minutes past the issue instant.
+/// Rule 4 on one reported token: `duration` is reported as this operation reports it, the
+/// effective lifetime is inside the published range, and `expirationTime` is that many
+/// minutes past the issue instant.
 fn assert_effective_duration(
     case: &str,
     operation: &str,
     token: &Value,
+    reported_duration: Option<i64>,
     expected: i64,
     issued_at: i64,
 ) {
     let reported = token.get("duration").and_then(Value::as_i64);
     assert_eq!(
-        reported,
-        Some(expected),
-        "case {case:?} ({operation}): expected duration {expected}, got {token}"
+        reported, reported_duration,
+        "case {case:?} ({operation}): expected duration {reported_duration:?}, got {token}"
     );
     assert!(
         (MIN_DURATION_MINUTES..=MAX_DURATION_MINUTES).contains(&expected),

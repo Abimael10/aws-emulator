@@ -16,13 +16,12 @@
 //!    resource came to be missing. Every resource-specific read of the very same ARN keeps
 //!    the modelled `ResourceNotFoundException` and names the ARN, so a client can tell a
 //!    tagging target from a resource.
-//! 2. A TOKEN STATES THE LIFETIME IT WAS ISSUED FOR, AND ECHOES NO OTHER DEFAULT.
-//!    `ParticipantToken$duration` documents the default on the REPORTED member ("Default:
-//!    720 (12 hours)"), so every reported token carries the effective duration — the one
-//!    the request sized, or the documented default — which is the lifetime its
-//!    `expirationTime` is computed from. `capabilities` documents no default on the
-//!    reported member, so it is reported exactly when the request carried it and what the
-//!    default DID is visible in the capabilities the participant really holds.
+//! 2. A MINTED TOKEN ECHOES WHAT THE CALLER ASKED FOR. `CreateParticipantToken` reports
+//!    the optional members the request carried — `duration` and `capabilities` included —
+//!    beside the identity, secret and expiry it minted, and restates none of the defaults
+//!    it resolved internally, so a token the caller did not size carries no `duration`
+//!    and its lifetime is observable through `expirationTime`. `CreateStage` instead
+//!    restates the effective lifetime of every token it attached to the stage it created.
 //! 3. A DOCUMENTED-BUT-UNMODELLED RULE ABOUT ONE MEMBER IS REFUSED IN THE MEMBER
 //!    -CONSTRAINT ENVELOPE: `Request member: <member> failed to satisfy the constraints:
 //!    <requirement>`, naming the member whose own documentation carries the rule. The
@@ -494,16 +493,16 @@ async fn a_resultant_tag_set_past_the_modelled_maximum_is_a_bad_request() {
     }
 }
 
-/// RULE 2: the reported token carries the EFFECTIVE `duration` always and `capabilities`
-/// exactly when the request carried it, on BOTH operations that issue a token — and the
-/// documented default is what an omitted member is applied as, which `expirationTime`
-/// shows.
+/// RULE 2: `CreateParticipantToken` reports `duration` and `capabilities` exactly when the
+/// request carried them, while `CreateStage` restates each token's effective `duration` —
+/// and the documented default is what an omitted member is applied as, which
+/// `expirationTime` shows on both.
 ///
 /// The rows differ along what the rule generalises over: each member present or absent
 /// independently, both published bounds of `duration`, an explicitly empty capability list
 /// and each non-empty subset.
 #[tokio::test]
-async fn a_token_states_its_effective_duration_and_reports_no_other_default() {
+async fn a_minted_token_echoes_what_the_request_asked_for() {
     let realtime = RealTime::new();
     let stage_arn = realtime.stage("the token's stage", &json!({})).await;
 
@@ -551,6 +550,8 @@ async fn a_token_states_its_effective_duration_and_reports_no_other_default() {
             "CreateParticipantToken",
             &reply.body["participantToken"],
             duration,
+            // Echoed as asked: no `duration` at all for a token the caller did not size.
+            duration,
             capabilities.as_ref(),
         );
 
@@ -578,26 +579,29 @@ async fn a_token_states_its_effective_duration_and_reports_no_other_default() {
             "CreateStage",
             &reply.body["participantTokens"][0],
             duration,
+            // The stage-creation response restates the lifetime each token really has.
+            Some(duration.unwrap_or(DEFAULT_DURATION_MINUTES)),
             capabilities.as_ref(),
         );
     }
 }
 
-/// One reported token against rule 2: `duration` is the EFFECTIVE lifetime — the
-/// documented default where the request named none — the token expires that far out, and
-/// `capabilities` is there exactly when the request carried it.
+/// One reported token against rule 2: `duration` is reported as `reported_duration` says
+/// this operation reports it, the token expires its EFFECTIVE lifetime out whatever the
+/// response restates, and `capabilities` is there exactly when the request carried it.
 fn assert_reported_presence(
     case: &str,
     operation: &str,
     token: &Value,
     duration: Option<i64>,
+    reported_duration: Option<i64>,
     capabilities: Option<&Vec<&str>>,
 ) {
     let effective = duration.unwrap_or(DEFAULT_DURATION_MINUTES);
     assert_eq!(
         token.get("duration").and_then(Value::as_i64),
-        Some(effective),
-        "case {case:?} ({operation}): expected duration {effective:?}, got {token}"
+        reported_duration,
+        "case {case:?} ({operation}): expected duration {reported_duration:?}, got {token}"
     );
     // A capability list the caller asked for is reported as asked; an empty one holds no
     // entry, so the member is omitted the way an empty `attributes` map is.

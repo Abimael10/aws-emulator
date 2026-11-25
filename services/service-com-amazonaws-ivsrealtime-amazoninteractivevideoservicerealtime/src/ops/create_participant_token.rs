@@ -236,7 +236,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        let participant_token = record.to_participant_token();
+        // The minted token is reported as the request stated it: this operation echoes the
+        // members the caller supplied beside the identity, secret and expiry this service
+        // minted, and restates none of the defaults it resolved internally — a token the
+        // caller did not size carries no `duration`, and its lifetime is observable
+        // through `expirationTime`.
+        let participant_token =
+            record.to_participant_token(crate::state::ReportedTokenDuration::AsRequested);
         store
             .participant_tokens
             .entry(input.stage_arn)

@@ -1267,8 +1267,12 @@ pub struct ParticipantTokenRecord {
     pub attributes: HashMap<String, String>,
     /// The lifetime the token was issued for: what the request asked for, or
     /// [`DEFAULT_TOKEN_DURATION_MINUTES`] when it asked for none. What
-    /// [`expiration_time`] was computed from, and what the token REPORTS.
+    /// [`expiration_time`] was computed from.
     pub duration_minutes: i32,
+    /// The `duration` the REQUEST carried, `None` when it carried none — the presence a
+    /// reported token can keep (see [`Self::to_participant_token`] and
+    /// [`ReportedTokenDuration`]).
+    pub requested_duration: Option<i32>,
     /// The capabilities the token really grants: what the request asked for, or
     /// [`default_token_capabilities`] when it asked for none. What every reader of this
     /// participant decides from, and not what the token REPORTS.
@@ -1279,26 +1283,46 @@ pub struct ParticipantTokenRecord {
     pub expiration_time: SystemTime,
 }
 
+/// Which lifetime a reported `ParticipantToken` states, chosen by the operation doing the
+/// reporting.
+///
+/// `ParticipantToken$duration` is optional and carries no `@default`, so the model leaves
+/// each response free to restate the lifetime the service resolved or to echo only the one
+/// the caller asked for; the two operations that mint tokens answer differently, so the
+/// choice belongs to the caller of [`ParticipantTokenRecord::to_participant_token`] rather
+/// than to the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportedTokenDuration {
+    /// The lifetime the token really has, defaults included: what the token's own
+    /// `expirationTime` was computed from.
+    Effective,
+    /// Only a lifetime the REQUEST stated: a token the service sized from
+    /// [`DEFAULT_TOKEN_DURATION_MINUTES`] reports no `duration` at all, and its lifetime
+    /// is observable through `expirationTime`.
+    AsRequested,
+}
+
 impl ParticipantTokenRecord {
-    /// The modelled `ParticipantToken` this record reports.
+    /// The modelled `ParticipantToken` this record reports, with `duration` stated as
+    /// `reported` asks for.
     ///
-    /// `duration` reports the EFFECTIVE lifetime, always: the model documents the default
-    /// on the reported member itself — `ParticipantToken$duration` "Duration (in minutes),
-    /// after which the participant token expires. Default: 720 (12 hours)." — so the
-    /// member states how long the token this service just issued is valid for, which is
-    /// the value its `expirationTime` was computed from, whether the caller sized it or
-    /// the service defaulted it. `capabilities` keeps the REQUEST's presence instead,
-    /// because the reported member ("Set of capabilities that the user is allowed to
-    /// perform in the stage.") documents no default and is `@length 0..2`, so a caller may
-    /// legally ask for an empty set and a token that grants no capability carries no
-    /// `capabilities` member rather than an empty list.
-    pub fn to_participant_token(&self) -> ParticipantToken {
+    /// Every other optional member echoes what the REQUEST carried: `userId` and
+    /// `attributes` as supplied, and `capabilities` because the reported member ("Set of
+    /// capabilities that the user is allowed to perform in the stage.") documents no
+    /// default and is `@length 0..2`, so a caller may legally ask for an empty set and a
+    /// token that grants no capability carries no `capabilities` member rather than an
+    /// empty list. The server-minted members — `participantId`, `token` and
+    /// `expirationTime` — are always reported.
+    pub fn to_participant_token(&self, reported: ReportedTokenDuration) -> ParticipantToken {
         ParticipantToken {
             participant_id: Some(self.participant_id.clone()),
             token: Some(self.token.clone()),
             user_id: self.user_id.clone(),
             attributes: (!self.attributes.is_empty()).then(|| self.attributes.clone()),
-            duration: Some(self.duration_minutes),
+            duration: match reported {
+                ReportedTokenDuration::Effective => Some(self.duration_minutes),
+                ReportedTokenDuration::AsRequested => self.requested_duration,
+            },
             // Reported only when the request named something, the same way `attributes`
             // is (see the rule above).
             capabilities: self
@@ -4021,10 +4045,10 @@ pub fn issue_token_record(
     });
 
     // The documented defaults are applied to what the token IS — the lifetime its
-    // expiry is computed from and which it reports, and the capability set every reader of
-    // this participant decides from (see
-    // `ParticipantTokenRecord::to_participant_token` for which of the two the reported
-    // token restates).
+    // expiry is computed from, and the capability set every reader of this participant
+    // decides from. What the request itself stated is kept beside each of them, because
+    // that is what a reported token echoes (see
+    // `ParticipantTokenRecord::to_participant_token` and `ReportedTokenDuration`).
     let duration_minutes = requested
         .duration
         .unwrap_or(DEFAULT_TOKEN_DURATION_MINUTES);
@@ -4039,6 +4063,7 @@ pub fn issue_token_record(
         user_id: requested.user_id,
         attributes: requested.attributes.unwrap_or_default(),
         duration_minutes,
+        requested_duration: requested.duration,
         capabilities: requested
             .capabilities
             .clone()

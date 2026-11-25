@@ -293,7 +293,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let participant_tokens: Option<Vec<ParticipantToken>> = (!records.is_empty()).then(|| {
             records
                 .iter()
-                .map(crate::state::ParticipantTokenRecord::to_participant_token)
+                // Each token this response reports restates the lifetime it was issued
+                // for, the documented default included: the stage-creation response is
+                // where a caller that sized no token learns how long the tokens attached
+                // to the stage it just created are valid for.
+                .map(|record| {
+                    record.to_participant_token(crate::state::ReportedTokenDuration::Effective)
+                })
                 .collect()
         });
         store.stages.insert(arn.clone(), record);
