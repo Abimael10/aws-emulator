@@ -29,7 +29,8 @@
 //! * a STOP is decided the same way, the other way round: a job that still has work to end
 //!   is accepted with 202, reported `STOPPING` and carried to `STOPPED` one span later by
 //!   the clock alone, while a job whose run is already over or already ending is refused
-//!   409 `ConflictException` naming that status;
+//!   409 `ConflictException` with ONE fixed sentence about the concurrent modification
+//!   that beat the request — carrying neither the job nor the status that blocked it;
 //! * `ListBatchEvaluations` reports exactly the jobs this emulator holds, cut from ONE
 //!   total order (newest first), one `maxResults`-sized page at a time with an opaque
 //!   `nextToken` resuming after it: whatever page size a caller asks for, following the
@@ -1551,12 +1552,40 @@ async fn stopping_a_batch_evaluation_with_no_run_left_is_refused() {
     );
 }
 
+/// How a row of the case below gets its job to the status it then refuses a stop in.
+#[derive(Debug, Clone, Copy)]
+enum ReachTheStatus {
+    /// Move the stored instants, so the row costs no wall clock — the suite's usual way.
+    MoveTheStoredInstants {
+        aged_by: Duration,
+        deferred_by: Duration,
+    },
+    /// Leave the plane's own clock to carry the job there and poll `GetBatchEvaluation`
+    /// until it reports a status the job has finished in — the sequence a CALLER drives,
+    /// with no reach into the store at all.
+    PollThePlanesOwnClock,
+}
+
 /// The stop refusal's WORDING does not vary: a stop this plane has no run left to end is
 /// refused with ONE sentence, whatever the job was named, whatever id was minted for it
-/// and whichever status with no run left it holds. The rows differ along every part a
-/// message templated from the request or from the store would have carried — the name, the
-/// id that follows from it and the status that blocked the call — and each row asserts the
-/// refusal carries none of them.
+/// and whichever status with no run left it holds.
+///
+/// THE RULE: this plane refuses a change it cannot apply to a batch evaluation with
+/// `ConflictException` (`@httpError 409` — source: smithy_query query="operation"
+/// operation="StopBatchEvaluation") worded as ONE sentence that is fixed text end to end,
+/// so the refusal carries no part of the request and no part of the store: not the id, not
+/// the name, not the status that blocked the call and not the statuses a stop is still
+/// possible in. (The delete's own 409 is worded differently and on purpose — it names the
+/// status the job is in and the statuses a delete is possible in, which the delete cases
+/// above assert — so these rows also pin that the stop does NOT borrow that wording.)
+///
+/// The rows differ along every part a message templated from the request or from the store
+/// would have carried — the name, the id that follows from it and the status that blocked
+/// the call — and along HOW the job came to have no run left: one row waits the plane's own
+/// clock out through a poll, which is the sequence a caller drives, while the others move
+/// the stored instants so they cost no wall clock. Each row sends the refused stop twice,
+/// because a refusal is not a step of the lifecycle, and the sentences are collected so the
+/// case can state that there is exactly ONE of them over every row and attempt.
 #[tokio::test]
 async fn a_refused_stop_is_worded_the_same_whatever_job_and_status_it_refuses() {
     let span = agentcore::state::BATCH_EVALUATION_TRANSITION_SPAN;
@@ -1565,44 +1594,63 @@ async fn a_refused_stop_is_worded_the_same_whatever_job_and_status_it_refuses() 
     // ^[a-zA-Z][a-zA-Z0-9_]{0,47}$).
     let longest_name = format!("Z{}y9", "y9_".repeat(15));
     // The name the row starts its job under, whether it stops the job before the refused
-    // stop, where it then puts the job's lifecycle clock, and the status that leaves the
-    // job in.
-    let cases: [(&str, &str, bool, Duration, Duration, &str); 4] = [
+    // stop, how it then gets the job to the status it refuses the stop in, and the status
+    // that is.
+    let cases: [(&str, &str, bool, ReachTheStatus, &str); 5] = [
         (
             "the shortest name the model admits, run already finished",
             "Qx",
             false,
-            span * 2 + GENEROUS_MARGIN,
-            Duration::ZERO,
+            ReachTheStatus::MoveTheStoredInstants {
+                aged_by: span * 2 + GENEROUS_MARGIN,
+                deferred_by: Duration::ZERO,
+            },
             "COMPLETED",
         ),
         (
             "the longest name the model admits, a stop still taking effect",
             &longest_name,
             true,
-            Duration::ZERO,
-            GENEROUS_MARGIN,
+            ReachTheStatus::MoveTheStoredInstants {
+                aged_by: Duration::ZERO,
+                deferred_by: GENEROUS_MARGIN,
+            },
             "STOPPING",
         ),
         (
             "mixed case and digits, already stopped",
             "Nightly_Regression_42",
             true,
-            span + GENEROUS_MARGIN,
-            Duration::ZERO,
+            ReachTheStatus::MoveTheStoredInstants {
+                aged_by: span + GENEROUS_MARGIN,
+                deferred_by: Duration::ZERO,
+            },
             "STOPPED",
         ),
         (
             "an underscored name, run already finished",
             "weekly_quality_sweep",
             false,
-            span * 2 + GENEROUS_MARGIN,
-            Duration::ZERO,
+            ReachTheStatus::MoveTheStoredInstants {
+                aged_by: span * 2 + GENEROUS_MARGIN,
+                deferred_by: Duration::ZERO,
+            },
             "COMPLETED",
+        ),
+        (
+            "stopped, polled to its terminal status, then stopped again",
+            "stop_poll_stop",
+            true,
+            ReachTheStatus::PollThePlanesOwnClock,
+            "STOPPED",
         ),
     ];
 
-    for (case, name, stop_first, aged_by, deferred_by, expected_status) in cases {
+    // Every sentence the rows were refused with, so the case can state that there is only
+    // ONE of them however the job got to where it was.
+    let mut sentences: BTreeSet<String> = BTreeSet::new();
+
+    for (case, name, stop_first, reach, expected_status) in cases {
         let (router, engine) = emulator();
         let (status, started) = start_batch_evaluation(&router, minimal_request(name)).await;
         assert_eq!(
@@ -1616,46 +1664,72 @@ async fn a_refused_stop_is_worded_the_same_whatever_job_and_status_it_refuses() 
                 status, 202,
                 "case {case:?}: expected the first stop to be accepted, got {status} with {stopped:?}"
             );
-        }
-        age_batch_evaluation(&engine, &id, aged_by);
-        defer_batch_evaluation(&engine, &id, deferred_by);
-
-        let (_, read) = get_batch_evaluation(&router, &id).await;
-        assert_eq!(
-            text(&read, "status"),
-            expected_status,
-            "case {case:?}: expected the job to be {expected_status} before the refused stop, got {read:?}"
-        );
-
-        let (status, body) = stop_batch_evaluation(&router, &id).await;
-        assert_eq!(
-            status, 409,
-            "case {case:?}: expected HTTP 409, got {status} with {body:?}"
-        );
-        assert_eq!(
-            error_code(&body),
-            "ConflictException",
-            "case {case:?}: expected ConflictException, got {body:?}"
-        );
-        let message = text(&body, "message").to_string();
-        assert_eq!(
-            message, BATCH_EVALUATION_STOP_CONFLICT_SENTENCE,
-            "case {case:?}: expected the plane's fixed stop-conflict sentence, got {message:?}"
-        );
-        for (part, value) in [
-            ("the status that blocked the stop", expected_status),
-            ("the job's id", id.as_str()),
-            ("the job's name", name),
-        ] {
-            assert!(
-                !message.contains(value),
-                "case {case:?}: expected the refusal to interpolate nothing, \
-                 but it carries {part} ({value:?}): {message:?}"
+            assert_eq!(
+                text(&stopped, "status"),
+                "STOPPING",
+                "case {case:?}: expected the accepted stop to report STOPPING, got {stopped:?}"
             );
         }
 
-        // The refused stop changed nothing a later caller sees.
-        let (_, after) = get_batch_evaluation(&router, &id).await;
+        let reported = match reach {
+            ReachTheStatus::MoveTheStoredInstants {
+                aged_by,
+                deferred_by,
+            } => {
+                age_batch_evaluation(&engine, &id, aged_by);
+                defer_batch_evaluation(&engine, &id, deferred_by);
+                let (_, read) = get_batch_evaluation(&router, &id).await;
+                text(&read, "status").to_string()
+            }
+            ReachTheStatus::PollThePlanesOwnClock => {
+                poll_batch_evaluation_until_terminal(&router, &id, case).await
+            }
+        };
+        assert_eq!(
+            reported, expected_status,
+            "case {case:?}: expected the job to be {expected_status} before the refused stop, \
+             got {reported:?}"
+        );
+
+        for attempt in 1..=2 {
+            let (status, body) = stop_batch_evaluation(&router, &id).await;
+            assert_eq!(
+                status, 409,
+                "case {case:?}: expected HTTP 409 on attempt {attempt}, got {status} with {body:?}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "ConflictException",
+                "case {case:?}: expected ConflictException on attempt {attempt}, got {body:?}"
+            );
+            let message = text(&body, "message").to_string();
+            assert_eq!(
+                message, BATCH_EVALUATION_STOP_CONFLICT_SENTENCE,
+                "case {case:?}: expected the plane's fixed stop-conflict sentence on attempt \
+                 {attempt}, got {message:?}"
+            );
+            for (part, value) in [
+                ("the status that blocked the stop", expected_status),
+                ("the job's id", id.as_str()),
+                ("the job's name", name),
+                ("the delete refusal's wording", "Cannot"),
+                ("the resource type", "batch evaluation"),
+            ] {
+                assert!(
+                    !message.contains(value),
+                    "case {case:?}: expected the refusal to interpolate nothing, \
+                     but it carries {part} ({value:?}) on attempt {attempt}: {message:?}"
+                );
+            }
+            sentences.insert(message);
+        }
+
+        // The refused stops changed nothing a later caller sees.
+        let (status, after) = get_batch_evaluation(&router, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the refused job to still read back, got {status} with {after:?}"
+        );
         assert_eq!(
             text(&after, "status"),
             expected_status,
@@ -1666,7 +1740,18 @@ async fn a_refused_stop_is_worded_the_same_whatever_job_and_status_it_refuses() 
             name,
             "case {case:?}: expected the refused stop to leave the job as it was, got {after:?}"
         );
+        assert_eq!(
+            batch_evaluation_count(&engine),
+            1,
+            "case {case:?}: expected the refused stop to add or remove nothing"
+        );
     }
+
+    assert_eq!(
+        sentences.len(),
+        1,
+        "expected ONE stop-conflict sentence over every row, got {sentences:?}"
+    );
 }
 
 /// The documented lifecycle end to end: start, a delete refused while the job runs, a
@@ -1761,6 +1846,43 @@ async fn a_batch_evaluation_is_started_stopped_and_then_deleted() {
         0,
         "expected the deleted job to be gone from the store"
     );
+}
+
+/// A deadline far longer than the lifecycle a poll below waits out, so the wait is bounded
+/// by a condition and never by how fast the host happens to be.
+const GENEROUS_POLL_DEADLINE: Duration = Duration::from_secs(300);
+
+/// How often a poll looks again. Short enough that the case is over as soon as the
+/// transition it waits for falls due, and nothing is asserted about how long it took.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Read the job until it reports a status it has FINISHED in
+/// ([`agentcore::state::batch_evaluation_status_is_terminal`]) and answer that status,
+/// letting the plane's own clock carry it there — the way a caller reaches a terminal job,
+/// with no reach into the store at all. Looks again until the condition holds or
+/// [`GENEROUS_POLL_DEADLINE`] passes.
+async fn poll_batch_evaluation_until_terminal(
+    router: &MultiServiceRouter,
+    id: &str,
+    case: &str,
+) -> String {
+    let started_polling = std::time::Instant::now();
+    loop {
+        let (status, body) = get_batch_evaluation(router, id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the job to stay readable while polling, got {status} with {body:?}"
+        );
+        let reported = text(&body, "status").to_string();
+        if agentcore::state::batch_evaluation_status_is_terminal(&reported) {
+            return reported;
+        }
+        assert!(
+            started_polling.elapsed() < GENEROUS_POLL_DEADLINE,
+            "case {case:?}: the job never reached a terminal status, last seen {reported:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// Which operation addressed by a `batchEvaluationId` a row sends (source: smithy_query
