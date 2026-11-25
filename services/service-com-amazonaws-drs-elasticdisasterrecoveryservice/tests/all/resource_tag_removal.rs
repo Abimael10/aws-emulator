@@ -37,7 +37,7 @@ use service_com_amazonaws_drs_elasticdisasterrecoveryservice::state::{self, Sour
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::replication_configuration_template_lifecycle::{call_in, drs_with_engine, Answer};
-use crate::resource_tags::{call_path, encoded_label};
+use crate::resource_tags::{call_path, encoded_label, TAG_MUTATION_SUCCESS_STATUS};
 
 /// The Region every request in this suite signs for; every ARN this service mints carries
 /// it.
@@ -205,7 +205,7 @@ async fn a_removal_takes_off_the_decoded_key_whatever_characters_it_carries() {
 
         let answer = untag(&router, &arn, &[key]).await;
         assert_eq!(
-            answer.status, 200,
+            answer.status, TAG_MUTATION_SUCCESS_STATUS,
             "case {case:?}: expected the removal to be served, got {answer:?}"
         );
 
@@ -257,7 +257,7 @@ async fn a_removal_leaves_every_other_resource_carrying_the_same_key() {
 
     let answer = untag(&router, &addressed, &["env"]).await;
     assert_eq!(
-        answer.status, 200,
+        answer.status, TAG_MUTATION_SUCCESS_STATUS,
         "expected the removal to be served, got {answer:?}"
     );
     let after = reported_tags(&router, &addressed).await;

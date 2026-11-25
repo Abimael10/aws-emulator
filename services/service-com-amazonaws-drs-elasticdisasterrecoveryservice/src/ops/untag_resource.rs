@@ -86,10 +86,25 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-drs-elasticdisasterreco
 pub struct UntagResourceOutput;
 
 impl UntagResourceOutput {
-    // `with_http` carries this operation's modelled response status. Remove it and
-    // the status falls back to the protocol default, so a modelled 204 answers 200.
+    // The response structure this operation answers with. The MODEL declares its output as
+    // `smithy.api#Unit`, which the renderers treat as the one shape that carries no body at
+    // all; this service answers a success that carries no member the way its deletes do —
+    // the no-content status, carrying the empty JSON object a response structure with no
+    // member renders as (`crate::service::no_content`) — so the shape named here is such a
+    // structure rather than `Unit`, and the serializer renders the object for it.
+    //
+    // The shape id is this service's SYNTHETIC stand-in for that `Unit` output: the model
+    // declares no `UntagResourceResponse`, so do not look for one there. It names what this
+    // operation's answer carries, which is what the serializer reads it for.
+    //
+    // `with_http` carries the method and the path this response belongs to; the status is
+    // the operation's own (`SUCCESS_STATUS` below), which is why no code is stated here.
     pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
-        ::aws_smithy_schema::ShapeId::from_static("smithy.api#Unit", "smithy.api", "Unit"),
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.drs#UntagResourceResponse",
+            "com.amazonaws.drs",
+            "UntagResourceResponse",
+        ),
         ::aws_smithy_schema::ShapeType::Structure,
         &[],
     )
@@ -165,7 +180,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "UntagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = UNTAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // A served tag removal carries nothing for a caller to read, and this service answers
+    // such a success the way it answers its deletes: the no-content status, with the empty
+    // JSON object its response structure above renders as — the same answer
+    // `TagResource`, the route's other mutation, gives, taken from the same place
+    // (`crate::service::no_content`) because the model leaves this operation's `@http`
+    // code defaulted too.
+    const SUCCESS_STATUS: u16 = crate::service::no_content::NO_CONTENT_STATUS;
 
     async fn handle(
         &self,

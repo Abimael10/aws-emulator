@@ -67,6 +67,14 @@ const VALIDATION_CODE: &str = "ValidationException";
 /// `smithy_query(query="doc",shape="TagResource")`).
 pub(crate) const TAGS_PER_RESOURCE_LIMIT: usize = 50;
 
+/// The status a SERVED tag mutation answers with: `TagResource` and `UntagResource`
+/// carry no member for a caller to read, and this service answers such a success the way
+/// it answers its deletes — the no-content status, carrying the empty JSON object a
+/// response structure with no member renders as (`tag_mutation_no_content` pins the whole
+/// answer). It is not the status of the route's read (`ListTagsForResource`, whose output
+/// DOES carry a member).
+pub(crate) const TAG_MUTATION_SUCCESS_STATUS: u16 = 204;
+
 /// An ARN as a client percent-encodes a non-greedy `@httpLabel`: `resourceArn` is bound
 /// to one path segment, so the colons and slashes inside it are escaped.
 pub(crate) fn encoded_label(arn: &str) -> String {
@@ -591,7 +599,7 @@ async fn a_write_overlays_the_keys_it_names_on_the_set_the_resource_carries() {
 
         let answer = tag_resource(&router, REGION, &arn, written).await;
         assert_eq!(
-            answer.status, 200,
+            answer.status, TAG_MUTATION_SUCCESS_STATUS,
             "case {case:?}: expected the write to be served, got {answer:?}"
         );
 
@@ -621,7 +629,7 @@ async fn a_write_overlays_the_keys_it_names_on_the_set_the_resource_carries() {
         // resource carrying the same tags.
         let again = tag_resource(&router, REGION, &arn, written).await;
         assert_eq!(
-            again.status, 200,
+            again.status, TAG_MUTATION_SUCCESS_STATUS,
             "case {case:?}: expected the repeated write to be served, got {again:?}"
         );
         let read = list_tags(&router, REGION, &arn).await;
@@ -670,8 +678,8 @@ fn overlaid(stored: &Value, written: &Value) -> Value {
 /// stored set with the written keys overlaid, so every overlap pattern the rule generalises
 /// over — disjoint, partly overlapping, identical, and either side empty — is covered, with
 /// the expected set computed from the rule instead of written out. Each write answering the
-/// operation's own 200 off the stored set is also what says the write came from a handler
-/// reading and writing state rather than from a scaffold.
+/// operation's own served status off the stored set is also what says the write came from a
+/// handler reading and writing state rather than from a scaffold.
 #[tokio::test]
 async fn a_write_overlays_its_keys_for_every_overlap_of_stored_and_written_sets() {
     let (router, _engine) = drs_with_engine();
@@ -688,7 +696,7 @@ async fn a_write_overlays_its_keys_for_every_overlap_of_stored_and_written_sets(
             let arn = plan_with_tags(&router, REGION, Some(&stored)).await;
             let answer = tag_resource(&router, REGION, &arn, &written).await;
             assert_eq!(
-                answer.status, 200,
+                answer.status, TAG_MUTATION_SUCCESS_STATUS,
                 "case {case:?}: expected the write to be served, got {answer:?}"
             );
             assert!(
@@ -745,7 +753,7 @@ async fn writes_naming_disjoint_keys_merge() {
         for write in &writes {
             let answer = tag_resource(&router, REGION, &arn, write).await;
             assert_eq!(
-                answer.status, 200,
+                answer.status, TAG_MUTATION_SUCCESS_STATUS,
                 "case {case:?}: expected the write {write} to be served, got {answer:?}"
             );
             for (key, value) in write.as_object().expect("a JSON object of tags") {
@@ -795,7 +803,7 @@ async fn a_removal_takes_out_only_the_keys_it_names() {
         for attempt in ["the removal", "the repeated removal"] {
             let answer = untag_resource(&router, REGION, &arn, keys).await;
             assert_eq!(
-                answer.status, 200,
+                answer.status, TAG_MUTATION_SUCCESS_STATUS,
                 "case {case:?}: expected {attempt} to be served, got {answer:?}"
             );
             let read = list_tags(&router, REGION, &arn).await;
@@ -845,7 +853,7 @@ async fn a_write_reaches_every_kind_of_resource_through_the_one_route() {
     ] {
         let answer = tag_resource(&router, REGION, arn, &json!({"added": "yes"})).await;
         assert_eq!(
-            answer.status, 200,
+            answer.status, TAG_MUTATION_SUCCESS_STATUS,
             "case {case:?}: expected the write to be served, got {answer:?}"
         );
         let read = list_tags(&router, REGION, arn).await;
@@ -857,7 +865,7 @@ async fn a_write_reaches_every_kind_of_resource_through_the_one_route() {
 
         let answer = untag_resource(&router, REGION, arn, &["kind"]).await;
         assert_eq!(
-            answer.status, 200,
+            answer.status, TAG_MUTATION_SUCCESS_STATUS,
             "case {case:?}: expected the removal to be served, got {answer:?}"
         );
         let read = list_tags(&router, REGION, arn).await;
@@ -886,7 +894,7 @@ async fn a_write_past_the_documented_tag_maximum_is_refused() {
     let at_limit = Value::Object(at_limit);
     let answer = tag_resource(&router, REGION, &arn, &at_limit).await;
     assert_eq!(
-        answer.status, 200,
+        answer.status, TAG_MUTATION_SUCCESS_STATUS,
         "filling the set to the limit: expected the write to be served, got {answer:?}"
     );
 
@@ -907,7 +915,7 @@ async fn a_write_past_the_documented_tag_maximum_is_refused() {
         let read = list_tags(&router, REGION, &arn).await;
         if expect_served {
             assert_eq!(
-                answer.status, 200,
+                answer.status, TAG_MUTATION_SUCCESS_STATUS,
                 "case {case:?}: expected the write to be served, got {answer:?}"
             );
             assert_eq!(

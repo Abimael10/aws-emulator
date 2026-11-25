@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateLaunchConfigurationTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateLaunchConfigurationTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateLaunchConfigurationTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes the account's Launch Configuration Template the request's
+//! `launchConfigurationTemplateID` names: every setting the request supplies replaces the
+//! stored one, a setting it leaves out keeps the value it has, and the answer is the
+//! record as it now stands in the store — so the read that reports templates
+//! (`DescribeLaunchConfigurationTemplates`) reports exactly what this call left behind.
+//! An id the store does not hold is the modelled `ResourceNotFoundException`, built where
+//! every id-keyed operation of this resource builds it
+//! (`crate::state::launch_configuration_templates::not_found`), and nothing is written
+//! for it.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +164,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateLaunchConfigurationTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateLaunchConfigurationTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateLaunchConfigurationTemplate"))
+        // `ctx` carries request metadata only: this template is addressed by the id in
+        // the request, and the ARN it is reported under was derived from that id when the
+        // create minted it, so nothing here is read off the request's credential scope.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateLaunchConfigurationTemplateErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the service store is unavailable".to_string(),
+                        retry_after_seconds: 0,
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        let id = input.launch_configuration_template_id;
+        let Some(record) = store.launch_configuration_templates.get_mut(&id) else {
+            return Err(
+                UpdateLaunchConfigurationTemplateErrorModeled::ResourceNotFoundException(
+                    crate::state::launch_configuration_templates::not_found(&id),
+                )
+                .into(),
+            );
+        };
+
+        // A supplied setting replaces the stored one; a setting the request left out is
+        // left exactly as it was. The id and the ARN are the service's own and are not
+        // input members at all, so an update cannot move a template to another id.
+        if let Some(value) = input.launch_disposition {
+            record.launch_disposition = Some(value);
+        }
+        if let Some(value) = input.target_instance_type_right_sizing_method {
+            record.target_instance_type_right_sizing_method = Some(value);
+        }
+        if let Some(value) = input.copy_private_ip {
+            record.copy_private_ip = Some(value);
+        }
+        if let Some(value) = input.copy_tags {
+            record.copy_tags = Some(value);
+        }
+        if let Some(value) = input.licensing {
+            record.licensing = Some(value);
+        }
+        if let Some(value) = input.export_bucket_arn {
+            record.export_bucket_arn = Some(value);
+        }
+        if let Some(value) = input.post_launch_enabled {
+            record.post_launch_enabled = Some(value);
+        }
+        if let Some(value) = input.launch_into_source_instance {
+            record.launch_into_source_instance = Some(value);
+        }
+        if let Some(value) = input.recovery_mode {
+            record.recovery_mode = Some(value);
+        }
+
+        // The answer is the record as it now stands IN the store — the same rendering the
+        // create and the read use — so a 200 can only report what was persisted.
+        Ok(UpdateLaunchConfigurationTemplateOutput {
+            launch_configuration_template: Some(record.to_wire()),
+        })
     }
 }

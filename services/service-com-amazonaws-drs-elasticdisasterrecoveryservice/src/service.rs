@@ -48,6 +48,10 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// What this service answers a success that carries no member with — the status, and the
+/// document such an answer carries — stated once for the operations that answer one.
+pub mod no_content;
+
 /// The error code this service answers a request body that does not satisfy the
 /// model's own rules with.
 ///
