@@ -454,9 +454,9 @@ async fn a_grid_whose_cells_are_empty_is_content_but_no_text() {
             .unwrap_or_else(|| panic!("case {case:?}: a PAGE must carry a BoundingBox"));
         let number = |name: &str| bbox.get(name).and_then(Value::as_f64).unwrap_or(-1.0);
         // The grid is drawn below the heading and inside the page's margins. A `PAGE`
-        // block's box is the bounding box around the DETECTED PAGE, so it is the page
-        // itself — which reaches past the heading's own rows and over the grid, whether or
-        // not the ruling lines were read as text.
+        // block's box is the bounding box around the DETECTED PAGE, so it spans the content
+        // found on the page — which reaches past the heading's own rows and over the grid,
+        // whether or not the ruling lines were read as text.
         let heading_rows = f64::from((3 * CELL * grid.scale) as u32) / f64::from(page.height());
         assert!(
             number("Height") > heading_rows,
@@ -464,11 +464,11 @@ async fn a_grid_whose_cells_are_empty_is_content_but_no_text() {
              it, got {bbox:?}"
         );
         assert!(
-            number("Left").abs() < 1e-6
-                && number("Top").abs() < 1e-6
-                && (number("Width") - 1.0).abs() < 1e-6
-                && (number("Height") - 1.0).abs() < 1e-6,
-            "case {case:?}: the PAGE box must be the page itself, got {bbox:?}"
+            number("Left") >= -1e-6
+                && number("Top") >= -1e-6
+                && number("Left") + number("Width") <= 1.0 + 1e-6
+                && number("Top") + number("Height") <= 1.0 + 1e-6,
+            "case {case:?}: the PAGE box must lie inside the submitted page, got {bbox:?}"
         );
     }
 }

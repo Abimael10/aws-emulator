@@ -162,21 +162,6 @@ fn rotation_of(block: &Value) -> Option<f64> {
         .and_then(Value::as_f64)
 }
 
-/// The four corners of the PAGE, clockwise from its top-left one, as the page-relative
-/// points `Polygon` is expressed in: the page is the whole of what was submitted, so its
-/// corners are the corners of the submitted raster whatever was drawn on it.
-const PAGE_CORNERS: [Point; 4] = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
-
-/// `outline` started at the corner a page whose characters are turned by `rotation` was
-/// read from: an upright page is read from its top-left corner, and each quarter turn
-/// moves the corner the reading started at one step clockwise.
-fn read_from(outline: &[Point], rotation: f64) -> Vec<Point> {
-    let first = (rotation / 90.0).round() as usize % outline.len();
-    (0..outline.len())
-        .map(|step| outline[(step + first) % outline.len()])
-        .collect()
-}
-
 fn submitted(page: &GrayImage, turns: u8) -> GrayImage {
     match turns % 4 {
         1 => image::imageops::rotate90(page),
@@ -280,23 +265,34 @@ async fn a_blocks_polygon_outlines_the_marks_its_bounding_box_bounds() {
             assert_inscribed(case.name, block);
         }
 
-        // The PAGE block outlines the PAGE: its item is the document page, so its polygon
-        // is the page's own four corners — read from the corner the characters were read
-        // from, which is what the WORD blocks report as their RotationAngle — rather than
-        // the outline of the marks that happen to be drawn on it. Those marks are outlined
-        // by the blocks they were read into, which the inscription rule above covers.
+        // The PAGE block outlines the content DETECTED on the page: its polygon is the
+        // outline of the page's own ink, so it lies inside the box around that ink and
+        // reaches each of its edges (the inscription rule above), it runs from the corner
+        // the characters were read from — which is what the WORD blocks report as their
+        // RotationAngle — and the box it bounds encloses every block read off the page.
+        // What that box must measure is asserted against the drawn ink in
+        // `crate::page_block_extent`.
         let rotation = of_type(&blocks, "WORD")
             .first()
             .and_then(|word| rotation_of(word))
             .unwrap_or_else(|| panic!("case {:?}: a WORD must report its rotation", case.name));
-        let expected = read_from(&PAGE_CORNERS, rotation);
         let reported = polygon_of(case.name, of_type(&blocks, "PAGE")[0]);
-        for (index, (point, want)) in reported.iter().zip(expected.iter()).enumerate() {
+        let page_box = bbox_of(case.name, of_type(&blocks, "PAGE")[0]);
+        for block in &blocks {
+            if block_type(block) == "PAGE" {
+                continue;
+            }
+            let block_box = bbox_of(case.name, block);
             assert!(
-                (point.0 - want.0).abs() < 1e-5 && (point.1 - want.1).abs() < 1e-5,
-                "case {:?}: the PAGE Polygon must outline the page itself ({expected:?}), \
-                 got {reported:?} differing at point {index}",
-                case.name
+                block_box.left >= page_box.left - 1e-6
+                    && block_box.top >= page_box.top - 1e-6
+                    && block_box.right() <= page_box.right() + 1e-6
+                    && block_box.bottom() <= page_box.bottom() + 1e-6,
+                "case {:?}: {} block {} at {block_box:?} must sit inside the content \
+                 detected on its page {page_box:?}",
+                case.name,
+                block_type(block),
+                block_id(block)
             );
         }
 
@@ -328,12 +324,11 @@ async fn a_blocks_polygon_outlines_the_marks_its_bounding_box_bounds() {
 
         // The outline of a block read off INK is FINER than the box around it: a page of
         // printed characters has marks that do not reach the corners of the rectangle
-        // around them, so at least one such block reports a polygon the box does not
-        // already state.
+        // around them, so at least one block reports a polygon the box does not already
+        // state.
         assert!(
             blocks
                 .iter()
-                .filter(|block| block_type(block) != "PAGE")
                 .any(|block| !is_box_corners(&polygon_of(case.name, block))),
             "case {:?}: a polygon must be the fine-grained outline of its block's marks, \
              but every block restated the corners of its own box: {:?}",

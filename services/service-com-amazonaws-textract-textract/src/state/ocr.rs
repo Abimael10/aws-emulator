@@ -62,9 +62,11 @@
 //!    the blocks carry is the position and the size the recogniser measured rather than a
 //!    typographic grid. Each measurement is both the box around the ink and its
 //!    [`Outline`] — the four extreme marks themselves — so a block can report the
-//!    fine-grained polygon around its item as well as the coarse box. The PAGE itself is
-//!    not measured off ink: a `PAGE` block locates the page, which is the whole of what
-//!    was submitted.
+//!    fine-grained polygon around its item as well as the coarse box. The page's own
+//!    CONTENT is measured the same way ([`Ink::content`]): the extent and the outline of
+//!    every mark of ink found on it, which is what a `PAGE` block reports, so a page whose
+//!    content sits in one band of the submitted canvas reports that band rather than the
+//!    canvas.
 //!
 //! No maintained Rust crate performs offline OCR: the ones that exist either bind to a
 //! C library or load neural-network weights from a file this emulator may not fetch, so
@@ -423,6 +425,16 @@ pub struct Recognised {
     /// it was submitted, and the quarter turn its characters are turned by when the page
     /// had to be turned to read them.
     pub rotation: f32,
+    /// WHERE the content detected on the page sits: the box enclosing every mark of ink
+    /// found on it and the outline of its extreme marks, both as fractions of the
+    /// submitted page's own width and height.
+    ///
+    /// Measured over ALL of the page's ink, the marks no glyph was matched to included —
+    /// a rule, a border, a logo is content of the page as much as a character is — so it
+    /// is the extent of what was detected rather than the extent of what was recognised.
+    /// `None` for a page no ink was found on at all, where nothing was detected to
+    /// measure.
+    pub content: Option<Marks>,
 }
 
 /// Where something sits on a page, in the page-relative fractions `BoundingBox` and
@@ -568,6 +580,10 @@ pub fn read_raster(bytes: &[u8], format: ImageFormat) -> Result<Recognised, Unre
         )));
     }
     let ink = Ink::of(&gray);
+    // WHERE the page's content was detected, measured once off the page as it was
+    // submitted: the ink of a page is the same ink whichever turn its characters are read
+    // at, so the content's extent does not depend on the reading below.
+    let content = ink.content(Orientation::upright(&ink));
     // What this request may spend on NAMING marks, over every reading of the page below:
     // one budget for the whole of it, so the readings cannot multiply the work (see
     // [`MAX_NAMINGS_PER_PAGE`]).
@@ -615,6 +631,7 @@ pub fn read_raster(bytes: &[u8], format: ImageFormat) -> Result<Recognised, Unre
         text: best.text,
         lines: best.lines,
         rotation: best.rotation,
+        content,
     })
 }
 
@@ -1128,6 +1145,32 @@ impl Ink {
             rect: orientation.rect(x0, right, y0, bottom),
             outline: self.outline_of(&extremes, (x0, right, y0, bottom), orientation),
         }
+    }
+
+    /// Where the ink of the WHOLE page sits on it: the box enclosing every mark found on
+    /// the page, and the outline of its extreme marks.
+    ///
+    /// What the page's own content was detected at, measured exactly as every other
+    /// block's region is ([`Self::marks`]) and over every mark of the page's ink — the ink
+    /// no glyph was matched to included, since a rule, a border or a logo is content of
+    /// the page as much as a character is.
+    ///
+    /// `None` for a page that carries no ink at all: nothing was detected on it, so there
+    /// is nothing to have measured.
+    fn content(&self, orientation: Orientation) -> Option<Marks> {
+        let mut extremes = Extremes::default();
+        for y in 0..self.height {
+            for x in 0..self.width {
+                if self.at(x, y) {
+                    extremes.mark(x, y);
+                }
+            }
+        }
+        let bounds @ (x0, x1, y0, y1) = extremes.bounds()?;
+        Some(Marks {
+            rect: orientation.rect(x0, x1, y0, y1),
+            outline: self.outline_of(&extremes, bounds, orientation),
+        })
     }
 
     /// The extreme marks of `extremes` as points on the submitted page, falling back to

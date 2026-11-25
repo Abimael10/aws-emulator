@@ -729,23 +729,19 @@ async fn a_pages_blocks_describe_the_words_that_were_drawn_on_it() {
             }
         }
 
-        // The PAGE is the page: a `PAGE` block's box is the bounding box around the
-        // DETECTED PAGE, which for a submitted raster is the whole raster, whatever was
-        // drawn on it and whichever turn it was submitted at. Every mark drawn on it — the
-        // letters, and the rules and panels around them — therefore sits inside it, as
-        // does every word read off it.
+        // The PAGE is the content DETECTED on the page: a `PAGE` block's box is the bounding
+        // box around the DETECTED PAGE, which is where the page was found on what was
+        // submitted — so it lies inside the submitted raster, and every mark drawn on the
+        // page — the letters, and the rules and panels around them — sits inside it, as does
+        // every word read off it. What that box measures is asserted against the drawn ink
+        // in `crate::page_block_extent`.
         let page_box = bbox_of(case.name, of_type(&blocks, "PAGE")[0]);
         assert!(
-            page_box.matches(
-                &Rect {
-                    left: 0.0,
-                    top: 0.0,
-                    width: 1.0,
-                    height: 1.0,
-                },
-                1e-6
-            ),
-            "case {:?}: the PAGE box must be the page itself, got {page_box:?}",
+            page_box.left >= -1e-6
+                && page_box.top >= -1e-6
+                && page_box.right() <= 1.0 + 1e-6
+                && page_box.bottom() <= 1.0 + 1e-6,
+            "case {:?}: the PAGE box must lie inside the submitted page, got {page_box:?}",
             case.name
         );
         let content = turned(drawn.content, case.turns, drawn_width, drawn_height);

@@ -9,9 +9,10 @@
 //! * a `LINE`/`WORD` block's `BoundingBox` is where that text sits in the document and as
 //!   big as it is there (for a raster: the extent of the ink it was recognised from, which
 //!   this suite knows because it DREW the page), its `Polygon` is inscribed in that box and
-//!   touches each of its edges, and a `PAGE` block's box is the PAGE — the whole document
-//!   page, which encloses every block read off it (the rule a `PAGE` locates the page
-//!   rather than its ink has its own suite, `crate::page_block_extent`);
+//!   touches each of its edges, and a `PAGE` block's box is the content detected on the
+//!   page, which encloses every block read off it (the rule a `PAGE` reports the content
+//!   measured on the page rather than the submitted canvas has its own suite,
+//!   `crate::page_block_extent`);
 //! * so the geometry varies with the document: between the lines of one page, between the
 //!   words of one line, and not at all between two renderings of the same page at two
 //!   sizes (the boxes are page-relative fractions);
@@ -68,6 +69,15 @@ impl Rect {
             && self.bottom() <= outer.bottom() + tol
     }
 }
+
+/// The whole of what was submitted: every block of an answer, the `PAGE` included, lies
+/// inside the page the request carried.
+const WHOLE_SUBMITTED_PAGE: Rect = Rect {
+    left: 0.0,
+    top: 0.0,
+    width: 1.0,
+    height: 1.0,
+};
 
 fn number(value: &Value, member: &str) -> f64 {
     value.get(member).and_then(Value::as_f64).unwrap_or(f64::NAN)
@@ -512,17 +522,15 @@ async fn a_recognised_pages_geometry_is_measured_where_the_ink_was_drawn() {
             );
         }
 
-        // The PAGE is the PAGE: `BoundingBox` is "the bounding box around the detected
-        // page, text, …", so the item a PAGE block locates is the document page, which is
-        // the whole of what was submitted — not the band of it the ink happens to sit in,
-        // which is what the page's own children locate. The blocks read off the page
-        // therefore all sit inside it.
+        // The PAGE is the content DETECTED on the page: `BoundingBox` is "the bounding box
+        // around the detected page, text, …", so the PAGE block reports where the page was
+        // found on what was submitted — the extent of its own ink, which the rule's own suite
+        // `crate::page_block_extent` asserts against the ink this test drew. Here it is held
+        // to what every page of ink implies: it lies inside the submitted page, and every
+        // block read off the page sits inside it.
         assert!(
-            page_box.left.abs() < 1e-6
-                && page_box.top.abs() < 1e-6
-                && (page_box.width - 1.0).abs() < 1e-6
-                && (page_box.height - 1.0).abs() < 1e-6,
-            "case {:?}: the PAGE box must be the page itself, got {page_box:?}",
+            page_box.within(&WHOLE_SUBMITTED_PAGE, 1e-6),
+            "case {:?}: the PAGE box must lie inside the submitted page, got {page_box:?}",
             case.name
         );
         let enclosing = union(&line_boxes);
@@ -549,10 +557,8 @@ async fn a_recognised_pages_geometry_is_measured_where_the_ink_was_drawn() {
 
         // Every Polygon is the fine-grained outline of the marks its own box coarsely
         // bounds: four points inside that box, together touching each of its edges — so no
-        // block READ OFF INK reports the page's corners for a region inside the page. That
-        // assertion, and the exact outline a drawn page must report, live in
-        // `crate::block_outlines`. The PAGE is the one block whose item is the page
-        // itself, so the page's corners are exactly what it must report.
+        // block reports the page's corners for a region inside the page. That assertion, and
+        // the exact outline a drawn page must report, live in `crate::block_outlines`.
         for block in &blocks {
             crate::block_outlines::assert_inscribed(case.name, block);
             if block_type(block) == "PAGE" {
@@ -825,16 +831,14 @@ async fn a_documents_blocks_are_laid_out_from_the_text_it_holds() {
             }
         }
 
-        // The PAGE is the page, whichever way the document's text was laid out, and the
-        // blocks read off it sit inside it.
+        // The PAGE is the content detected on the page, whichever way the document's text
+        // was laid out: it lies inside the submitted page, and the blocks read off it sit
+        // inside it.
         let page_box = bbox_of(case, of_type(&blocks, "PAGE")[0]);
         let enclosing = union(&line_boxes);
         assert!(
-            page_box.left.abs() < 1e-6
-                && page_box.top.abs() < 1e-6
-                && (page_box.width - 1.0).abs() < 1e-6
-                && (page_box.height - 1.0).abs() < 1e-6,
-            "case {case:?}: the PAGE box must be the page itself, got {page_box:?}"
+            page_box.within(&WHOLE_SUBMITTED_PAGE, 1e-6),
+            "case {case:?}: the PAGE box must lie inside the submitted page, got {page_box:?}"
         );
         assert!(
             enclosing.within(&page_box, 1e-6),
