@@ -150,14 +150,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // registry answers with the record it took, or with nothing when it held none — so
         // two deletes of the same id racing each other cannot both take it.
         if store.named_queries.remove(&input.named_query_id).is_none() {
-            // Athena models no not-found error for this operation; naming a saved query this
-            // account holds none of is "something wrong with the input to the request",
-            // which is what `InvalidRequestException` (HTTP 400) reports, under the code for
-            // a refusal the request itself caused. Worded as the read of such an id is: an id
-            // with no saved query behind it is one fact, however it is asked about.
-            return Err(DeleteNamedQueryError::invalid_request(
-                crate::state::ERROR_CODE_INVALID_INPUT,
-                crate::state::named_query_not_found(&input.named_query_id),
+            // Athena models no not-found error for this operation either, so the miss travels
+            // as `InvalidRequestException` (HTTP 400) under the class of the miss itself.
+            // Worded and classified exactly as the read of such an id is: an id with no saved
+            // query behind it is one fact, however it is asked about.
+            return Err(crate::state::named_query_not_found_refusal(
+                &input.named_query_id,
             ));
         }
 

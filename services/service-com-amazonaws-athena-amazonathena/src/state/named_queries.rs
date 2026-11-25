@@ -264,6 +264,24 @@ pub fn named_query_not_found(id: &str) -> String {
 /// by id.
 pub const ERROR_CODE_NAMED_QUERY_NOT_FOUND: &str = "NAMED_QUERY_NOT_FOUND";
 
+/// The refusal every operation addressing ONE saved query this account holds none of answers
+/// with: HTTP 400 `InvalidRequestException`, the class
+/// [`ERROR_CODE_NAMED_QUERY_NOT_FOUND`] and the sentence [`named_query_not_found`].
+///
+/// The class and the sentence are paired HERE, in the one place both are named, so the read
+/// of a single query, the write of one and the delete of one cannot classify the same miss
+/// differently: one `NamedQueryId` resolving to nothing is ONE fact about this account's
+/// state, however the request asked about it, and it is the fact the per-id entry a batch
+/// read carries states as well ([`unprocessed_named_query`]). Generic over the operation's
+/// modeled error, so each handler returns it through its own error channel, beside
+/// [`super::session_not_authorized`].
+pub fn named_query_not_found_refusal<E>(id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::invalid_request(
+        ERROR_CODE_NAMED_QUERY_NOT_FOUND,
+        named_query_not_found(id),
+    )
+}
+
 /// How a batch read of named queries reports ONE requested id it could not resolve.
 ///
 /// A batch read answers in two parts rather than refusing the whole request, and the entry

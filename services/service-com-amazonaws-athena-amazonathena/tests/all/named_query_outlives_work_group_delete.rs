@@ -22,7 +22,9 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_athena_amazonathena::state::{self, ERROR_CODE_INVALID_INPUT};
+use service_com_amazonaws_athena_amazonathena::state::{
+    self, ERROR_CODE_INVALID_INPUT, ERROR_CODE_NAMED_QUERY_NOT_FOUND,
+};
 
 use crate::harness::{assert_refusal, call, create_work_group, router};
 
@@ -349,7 +351,7 @@ async fn a_surviving_query_is_still_written_and_deleted_by_its_id() {
         "the query its own delete removed",
         status,
         &gone,
-        ERROR_CODE_INVALID_INPUT,
+        ERROR_CODE_NAMED_QUERY_NOT_FOUND,
         &state::named_query_not_found(&id),
     );
 }

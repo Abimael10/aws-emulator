@@ -147,13 +147,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         let Some(record) = store.named_queries.query(&input.named_query_id) else {
-            // Athena models no not-found error for this operation; naming a query this
-            // account holds none of is "something wrong with the input to the request",
-            // which is what `InvalidRequestException` (HTTP 400) reports, under the code
-            // for a refusal the request itself caused.
-            return Err(GetNamedQueryError::invalid_request(
-                crate::state::ERROR_CODE_INVALID_INPUT,
-                crate::state::named_query_not_found(&input.named_query_id),
+            // Athena models no not-found error for this operation, so the miss travels as
+            // `InvalidRequestException` (HTTP 400) — under the class of the MISS itself
+            // rather than the class of a malformed request: the id is well formed and this
+            // account simply holds no saved query behind it, which is the one refusal every
+            // operation addressing one saved query states for that fact.
+            return Err(crate::state::named_query_not_found_refusal(
+                &input.named_query_id,
             ));
         };
 

@@ -154,12 +154,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .query(&input.named_query_id)
             .map(|record| record.database.clone())
         else {
-            // Athena models no not-found error for this operation, so an id this account
-            // minted no query under is "something wrong with the input to the request",
+            // Athena models no not-found error for this operation, so the miss travels as
+            // `InvalidRequestException` (HTTP 400) under the class of the miss itself,
             // reported exactly as the read of such an id reports it.
-            return Err(invalid_request(crate::state::named_query_not_found(
+            return Err(crate::state::named_query_not_found_refusal(
                 &input.named_query_id,
-            )));
+            ));
         };
 
         // What the query will DESCRIBE once this update is applied: the description this
@@ -191,9 +191,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let Some(record) = store.named_queries.query_mut(&input.named_query_id) else {
-            return Err(invalid_request(crate::state::named_query_not_found(
+            return Err(crate::state::named_query_not_found_refusal(
                 &input.named_query_id,
-            )));
+            ));
         };
 
         // "Updates a NamedQuery object. The database or workgroup cannot be updated": the
@@ -212,10 +212,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The operation's own client error (HTTP 400), carrying `message`.
 ///
-/// Both refusals above are caused by the request itself — an id this account holds no query
-/// under, and a revision past what this account can hold — which is the class
-/// `InvalidRequestException` reports ("Indicates that something is wrong with the input to
-/// the request"), under the code [`crate::state::ERROR_CODE_INVALID_INPUT`].
+/// The refusal of a revision past what this account can hold is caused by the request itself
+/// — which is the class `InvalidRequestException` reports ("Indicates that something is wrong
+/// with the input to the request"), under the code
+/// [`crate::state::ERROR_CODE_INVALID_INPUT`]. An id this account holds no query under is a
+/// different fact, carried by the class every operation states that miss under
+/// ([`crate::state::named_query_not_found_refusal`]).
 fn invalid_request(message: impl Into<String>) -> UpdateNamedQueryError {
     UpdateNamedQueryError::invalid_request(crate::state::ERROR_CODE_INVALID_INPUT, message)
 }

@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::state::{
-    DEFAULT_WORK_GROUP, ERROR_CODE_INVALID_INPUT,
+    DEFAULT_WORK_GROUP, ERROR_CODE_NAMED_QUERY_NOT_FOUND,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -168,8 +168,8 @@ fn assert_served(case: &str, status: u16, body: &Value) {
     );
 }
 
-/// Assert that one delete of an id the registry holds no saved query under is refused as a
-/// bad request, in Athena's words for that miss.
+/// Assert that one delete of an id the registry holds no saved query under is refused with
+/// Athena's class and words for that miss.
 fn assert_refused(case: &str, status: u16, body: &Value, id: &str) {
     assert_eq!(
         status, 400,
@@ -182,8 +182,8 @@ fn assert_refused(case: &str, status: u16, body: &Value, id: &str) {
     );
     assert_eq!(
         body["ErrorCode"].as_str(),
-        Some(ERROR_CODE_INVALID_INPUT),
-        "case {case:?}: expected the class of a refusal the request caused, got {body:?}"
+        Some(ERROR_CODE_NAMED_QUERY_NOT_FOUND),
+        "case {case:?}: expected the class of a miss of a saved query, got {body:?}"
     );
     // The sentence itself, spelled out here rather than taken from the service's own helper:
     // the resource type, a colon, the id the request carried and "does not exist".

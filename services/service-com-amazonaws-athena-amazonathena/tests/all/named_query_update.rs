@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_athena_amazonathena::state::{
-    self, DEFAULT_WORK_GROUP, ERROR_CODE_INVALID_INPUT,
+    self, DEFAULT_WORK_GROUP, ERROR_CODE_NAMED_QUERY_NOT_FOUND,
 };
 
 use crate::harness::{assert_refusal, call, create_work_group, router};
@@ -333,7 +333,7 @@ async fn an_unknown_id_is_refused_and_writes_nothing() {
             case,
             status,
             &body,
-            ERROR_CODE_INVALID_INPUT,
+            ERROR_CODE_NAMED_QUERY_NOT_FOUND,
             &format!("NamedQuery: {id} does not exist"),
         );
         assert_eq!(
