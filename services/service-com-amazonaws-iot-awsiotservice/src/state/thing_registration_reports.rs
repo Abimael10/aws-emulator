@@ -16,7 +16,10 @@
 //! and nothing else:
 //!
 //! * the `RESULTS` report holds the lines of the input file that provisioned a thing, and the
-//!   thing each one provisioned;
+//!   thing each one provisioned — the row's own `response`, which names the ARN of every
+//!   resource that row generated under that resource's key ([`THING_RESOURCE_KEY`]), so a
+//!   reader of the report maps each line of the input file to the ARN of the thing it
+//!   registered;
 //! * the `ERRORS` report holds the lines that provisioned none, with the reason that line was
 //!   not provisioned, and — for a run that could not be performed at all — the reason no line
 //!   of the file was read.
@@ -62,6 +65,14 @@ pub const REPORT_URL_EXPIRY: Duration = Duration::from_secs(15 * 60);
 /// The media type a report object is stored under: newline delimited JSON, which is what one
 /// holds.
 const REPORT_MEDIA_TYPE: &str = "application/x-ndjson";
+
+/// The key a provisioned row's `ResourceArns` names the THING it provisioned under.
+///
+/// A row's provisioning answers the ARN of each resource it generated keyed by that resource
+/// — the same map `RegisterThing$resourceArns` answers for one device — and the resource a
+/// bulk row generates is the template's `AWS::IoT::Thing`
+/// ([`super::thing_registration`]), so this is the key the thing's ARN is reported under.
+const THING_RESOURCE_KEY: &str = "thing";
 
 /// The bucket of the emulator's own Amazon S3 that this service keeps its report objects in,
 /// for `region`.
@@ -142,8 +153,24 @@ fn report_rows(outcome: &RegistrationOutcome, report_type: &str) -> Vec<String> 
             .lines
             .iter()
             .filter_map(|line| {
-                let thing_name = line.provisioned.as_ref().ok()?;
-                Some(json!({ "lineNumber": line.line_number, "thingName": thing_name }).to_string())
+                let registered = line.provisioned.as_ref().ok()?;
+                Some(
+                    json!({
+                        "lineNumber": line.line_number,
+                        "thingName": registered.thing_name,
+                        // What the row's provisioning ANSWERED, in the form the registration
+                        // of one device answers it (`RegisterThing$resourceArns`, "ARNs for
+                        // the generated resources"): the ARN of each resource the row
+                        // provisioned, under that resource's own key. A row of a bulk task
+                        // provisions the template's `AWS::IoT::Thing` resource and nothing
+                        // else ([`super::thing_registration`]), so the one ARN here is the
+                        // thing's, and it is the ARN the registry itself recorded for it.
+                        "response": {
+                            "ResourceArns": { THING_RESOURCE_KEY: registered.thing_arn },
+                        },
+                    })
+                    .to_string(),
+                )
             })
             .collect(),
         REPORT_TYPE_ERRORS => {

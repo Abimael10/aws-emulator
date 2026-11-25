@@ -457,8 +457,23 @@ pub struct LineReport {
     /// Which line of the input file this is about, counted from 1 as a reader of the file
     /// counts its lines — blank ones included, so the number addresses the line itself.
     pub line_number: usize,
-    /// The name of the thing the line provisioned, or the reason it provisioned none.
-    pub provisioned: Result<String, String>,
+    /// The thing the line provisioned ([`RegisteredLine`]), or the reason it provisioned none.
+    pub provisioned: Result<RegisteredLine, String>,
+}
+
+/// The thing ONE line of the input file provisioned, as the registry's own write left it: the
+/// name it is registered under and the ARN that write minted for it.
+///
+/// The ARN is the registry record's, not one computed again for the report, so the ARN a
+/// task's `RESULTS` report names a row's thing by and the `thingArn` `DescribeThing` reports
+/// for the same thing are one value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredLine {
+    /// The name the thing is registered under — the registry's key.
+    pub thing_name: String,
+    /// `arn:aws:iot:<region>:<account>:thing/<thingName>`, as the registry recorded it
+    /// ([`crate::state::thing_arn`]).
+    pub thing_arn: String,
 }
 
 /// What a task's run amounted to: the counts a reader reports, what the run made of each
@@ -579,7 +594,10 @@ pub fn register_planned(
             None => Err(UNPROVISIONABLE_LINE_MESSAGE.to_string()),
             Some(thing) => store
                 .register_thing(region, thing.thing_name, thing.configuration)
-                .map(|registered| registered.thing_name)
+                .map(|registered| RegisteredLine {
+                    thing_name: registered.thing_name,
+                    thing_arn: registered.thing_arn,
+                })
                 .map_err(|refusal| refusal.message()),
         };
         if provisioned.is_ok() {

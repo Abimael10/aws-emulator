@@ -442,10 +442,22 @@ fn line(serial: &str) -> String {
     json!({ "SerialNumber": serial }).to_string()
 }
 
-/// A `RESULTS` row: the line of the file, and the thing it provisioned.
+/// A `RESULTS` row: the line of the file, the thing it provisioned, and what provisioning it
+/// answered — the ARN of every resource the row generated, under that resource's key.
 fn result_row(line_number: usize, thing_name: &str) -> Value {
-    json!({ "lineNumber": line_number, "thingName": thing_name })
+    json!({
+        "lineNumber": line_number,
+        "thingName": thing_name,
+        "response": {
+            "ResourceArns": {
+                "thing": format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:thing/{thing_name}"),
+            },
+        },
+    })
 }
+
+/// The account every ARN of this emulator is scoped to.
+const ACCOUNT_ID: &str = "000000000000";
 
 /// An `ERRORS` row: the line of the file, and why it provisioned nothing.
 fn error_row(line_number: usize, message: &str) -> Value {
