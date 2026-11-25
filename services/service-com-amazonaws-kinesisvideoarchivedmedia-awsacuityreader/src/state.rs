@@ -365,6 +365,55 @@ pub fn fragments_in_range(
         .collect()
 }
 
+/// `fragments` with the fragments that share one START timestamp collapsed to
+/// the one carrying the LARGEST fragment number, in the order they were given.
+///
+/// The rule both streaming-session operations document for the manifest or
+/// playlist they mint a session over: when the fragment selector reads producer
+/// timestamps and several fragments carry the same start timestamp, only the
+/// newest of them — the one with the largest fragment number — belongs in the
+/// snapshot, and "the other fragments are not included". Fragments with
+/// DIFFERENT start timestamps are all kept, even where their durations overlap.
+///
+/// A selector reading SERVER timestamps collapses nothing: the rule is stated
+/// for `PRODUCER_TIMESTAMP` alone, and a server timestamp is the instant the
+/// service received the fragment, which identifies it.
+///
+/// Applied BEFORE any ordering or cap, so the fragment that is kept takes its
+/// place in the snapshot by its OWN timestamps, and a maximum-results ceiling
+/// is spent on the fragments the snapshot carries rather than on the superseded
+/// ones.
+#[must_use]
+pub fn collapse_shared_start_timestamps<'a>(
+    fragments: Vec<&'a StoredFragment>,
+    origin: TimestampOrigin,
+) -> Vec<&'a StoredFragment> {
+    if origin != TimestampOrigin::Producer {
+        return fragments;
+    }
+    let mut kept: Vec<&'a StoredFragment> = Vec::with_capacity(fragments.len());
+    // Where in `kept` the fragment held for one start timestamp sits, so a
+    // group is found by its timestamp rather than by re-scanning what is kept.
+    let mut held_at: HashMap<i64, usize> = HashMap::with_capacity(fragments.len());
+    for fragment in fragments {
+        let at = epoch_millis(origin.of(fragment));
+        match held_at.get(&at).copied() {
+            Some(index) => {
+                if numeric_order(&fragment.fragment_number, &kept[index].fragment_number)
+                    == std::cmp::Ordering::Greater
+                {
+                    kept[index] = fragment;
+                }
+            }
+            None => {
+                held_at.insert(at, kept.len());
+                kept.push(fragment);
+            }
+        }
+    }
+    kept
+}
+
 /// Whether the media `fragment` archives was being recorded AT `at_millis`, read
 /// on the `origin` timestamp field: its own selected timestamp starts at or
 /// before that instant and its playback duration still covers it.
@@ -496,6 +545,10 @@ impl ResolvedStream<'_> {
     /// [`NO_FRAGMENTS_MESSAGE`]. The one selection rule both of them use, so an
     /// HLS and an MPEG-DASH session over the same archive and the same
     /// parameters carry the same fragments.
+    ///
+    /// In EVERY playback mode the fragments that share one start timestamp are
+    /// collapsed to the newest of them before the cap is applied
+    /// ([`collapse_shared_start_timestamps`]).
     #[must_use]
     pub fn session_fragment_numbers(
         &self,
@@ -514,15 +567,20 @@ impl ResolvedStream<'_> {
                 // server timestamps are included" — "this means that even if
                 // fragments ingested in the past have producer timestamps with
                 // values now, they are not included".
+                // Collapsed FIRST, so the existence check and the snapshot are
+                // decided on the same set of fragments, and the fragment that
+                // is kept is placed by its OWN server timestamp — it is the one
+                // the snapshot carries, and LIVE serves the most recently
+                // ingested of what it carries.
+                let mut newest =
+                    collapse_shared_start_timestamps(self.fragments.iter().collect(), origin);
                 let window_start = epoch_millis(now - LIVE_FRAGMENT_WINDOW);
-                let fresh = self
-                    .fragments
+                let fresh = newest
                     .iter()
                     .any(|fragment| epoch_millis(fragment.server_timestamp) >= window_start);
                 if !fresh {
                     return Vec::new();
                 }
-                let mut newest: Vec<&StoredFragment> = self.fragments.iter().collect();
                 newest.sort_by_key(|fragment| epoch_millis(fragment.server_timestamp));
                 let skip = newest.len().saturating_sub(max_fragments);
                 newest
@@ -536,12 +594,14 @@ impl ResolvedStream<'_> {
             SessionWindow::Range {
                 start_millis,
                 end_millis,
-            } => self
-                .fragments_in_range(origin, start_millis, end_millis)
-                .into_iter()
-                .take(max_fragments)
-                .map(|fragment| fragment.fragment_number.clone())
-                .collect(),
+            } => collapse_shared_start_timestamps(
+                self.fragments_in_range(origin, start_millis, end_millis),
+                origin,
+            )
+            .into_iter()
+            .take(max_fragments)
+            .map(|fragment| fragment.fragment_number.clone())
+            .collect(),
         }
     }
 }

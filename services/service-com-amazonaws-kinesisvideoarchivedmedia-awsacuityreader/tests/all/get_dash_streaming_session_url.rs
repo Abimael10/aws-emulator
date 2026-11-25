@@ -7,15 +7,18 @@
 //! assertion below is about what the handler computes FROM that archive and
 //! records in the service's own state.
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_kinesisvideoarchivedmedia_awsacuityreader as archived_media;
 
-use archived_media::state::{service_state, SessionProtocol, StreamingSession};
+use archived_media::state::{
+    from_epoch_millis, service_state, ArchivedStream, SessionProtocol, StoredFragment,
+    StreamingSession,
+};
 
 use crate::archived_media_read_path::{
-    body_json, fragment_number, seeded, Harness, EMULATOR_ENDPOINT, LIVE_FRAGMENTS, LIVE_STREAM,
-    NO_RETENTION_STREAM, STREAM, T0_SECS,
+    body_json, fragment_number, media, register_stream, seeded, Harness, EMULATOR_ENDPOINT,
+    LIVE_FRAGMENTS, LIVE_STREAM, NO_RETENTION_STREAM, STREAM, T0_SECS,
 };
 
 /// The route this suite drives.
@@ -794,4 +797,435 @@ async fn the_stream_is_resolved_by_the_same_rule_in_every_mode() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fragments that share one producer start timestamp.
+// ---------------------------------------------------------------------------
+//
+// The selection rule below is stated for the manifest this operation mints a
+// session over AND, in the same words, for the HLS media playlist of
+// `GetHLSStreamingSessionURL`, which reaches the same selection. The rows
+// therefore drive BOTH operations, so neither can drift from the other.
+
+/// The region the streams this suite seeds itself are created in: the one the
+/// harness signs its requests for.
+const REGION: &str = "us-east-1";
+
+/// The stream the archived collapse rows select from.
+const SHARED_TIMESTAMP_STREAM: &str = "shared-timestamp-stream";
+
+/// The stream the LIVE collapse rows select from: fragments ingested just now,
+/// so a LIVE session over it exists.
+const LIVE_SHARED_TIMESTAMP_STREAM: &str = "live-shared-timestamp-stream";
+
+/// The two streaming-session operations that share this selection rule: the
+/// path, the input's fragment-selector member, its maximum-fragment member, the
+/// output member carrying the session URL, and the protocol the recorded
+/// session names.
+const SESSION_OPERATIONS: &[(&str, &str, &str, &str, SessionProtocol)] = &[
+    (
+        "/getDASHStreamingSessionURL",
+        "DASHFragmentSelector",
+        "MaxManifestFragmentResults",
+        "DASHStreamingSessionURL",
+        SessionProtocol::Dash,
+    ),
+    (
+        "/getHLSStreamingSessionURL",
+        "HLSFragmentSelector",
+        "MaxMediaPlaylistFragmentResults",
+        "HLSStreamingSessionURL",
+        SessionProtocol::Hls,
+    ),
+];
+
+/// The archive the collapse rows select from: the fragment's index (its number
+/// is `fragment_number(index)`, which rises with it), its producer start
+/// timestamp and its server timestamp as offsets in SECONDS from [`T0_SECS`],
+/// and its duration in milliseconds.
+///
+/// Two groups share a producer start timestamp (a pair and a trio), one
+/// fragment stands alone, one pair shares a SERVER timestamp while carrying
+/// distinct producer ones, and one pair carries producer timestamps a second
+/// apart with five-second durations — fragments "that have different timestamps
+/// but have overlapping durations".
+const SHARED_TIMESTAMP_ARCHIVE: &[(u64, i64, i64, u64)] = &[
+    (10, 500, 900, 2000),
+    (11, 500, 901, 2000),
+    (20, 510, 910, 2000),
+    (21, 510, 911, 2000),
+    (22, 510, 912, 2000),
+    (30, 520, 920, 2000),
+    (40, 530, 930, 2000),
+    (41, 540, 930, 2000),
+    (50, 550, 950, 5000),
+    (51, 551, 951, 5000),
+];
+
+/// One row of the collapse table.
+struct CollapseRow {
+    /// What this row is about, named in every assertion.
+    case: &'static str,
+    /// The `PlaybackMode` the session is asked for.
+    mode: &'static str,
+    /// The `FragmentSelectorType` the selector reads.
+    selector_type: &'static str,
+    /// The range the selector asks for, as offsets in seconds from [`T0_SECS`],
+    /// with the end left open when the row gives none.
+    range: (i64, Option<i64>),
+    /// The maximum-fragment member's value, when the row names one.
+    max: Option<i64>,
+    /// The indices of the fragments the session must serve, in order.
+    expected: &'static [u64],
+}
+
+/// Register `stream` in both planes and append one fragment per row of
+/// `fragments`: (the index its fragment number comes from, its producer start
+/// timestamp, its server timestamp, its duration in milliseconds).
+fn seed_fragments(
+    harness: &Harness,
+    stream: &str,
+    fragments: &[(u64, SystemTime, SystemTime, u64)],
+) {
+    let state = service_state(&*harness.engine).expect("the service store");
+    let mut state = state.lock();
+    let archived = ArchivedStream::new(stream, REGION, from_epoch_millis(T0_SECS * 1000), 24);
+    register_stream(&harness.engine, &archived);
+    state.put_stream(archived);
+    for (index, producer, server, duration_millis) in fragments.iter().copied() {
+        assert!(
+            state.append_fragment(
+                stream,
+                StoredFragment::new(
+                    fragment_number(index),
+                    producer,
+                    server,
+                    duration_millis,
+                    media(index),
+                ),
+            ),
+            "case seed {stream} fragment {index}: the seeded stream must exist"
+        );
+    }
+}
+
+/// [`SHARED_TIMESTAMP_ARCHIVE`] seeded into [`SHARED_TIMESTAMP_STREAM`].
+fn seed_shared_timestamp_archive(harness: &Harness) {
+    let fragments: Vec<(u64, SystemTime, SystemTime, u64)> = SHARED_TIMESTAMP_ARCHIVE
+        .iter()
+        .copied()
+        .map(|(index, producer_secs, server_secs, duration_millis)| {
+            (
+                index,
+                from_epoch_millis((T0_SECS + producer_secs) * 1000),
+                from_epoch_millis((T0_SECS + server_secs) * 1000),
+                duration_millis,
+            )
+        })
+        .collect();
+    seed_fragments(harness, SHARED_TIMESTAMP_STREAM, &fragments);
+}
+
+/// One streaming-session request over `stream`, as this row asks for it.
+fn collapse_request(
+    stream: &str,
+    row: &CollapseRow,
+    selector_member: &str,
+    max_member: &str,
+) -> serde_json::Value {
+    let (start, end) = row.range;
+    let mut range = serde_json::json!({ "StartTimestamp": T0_SECS + start });
+    if let Some(end) = end {
+        range["EndTimestamp"] = serde_json::json!(T0_SECS + end);
+    }
+    let mut body = serde_json::json!({
+        "StreamName": stream,
+        "PlaybackMode": row.mode,
+    });
+    body[selector_member] = serde_json::json!({
+        "FragmentSelectorType": row.selector_type,
+        "TimestampRange": range,
+    });
+    if let Some(max) = row.max {
+        body[max_member] = serde_json::json!(max);
+    }
+    body
+}
+
+/// The session URL `member` of a successful response, failing `case` when the
+/// call did not succeed.
+fn minted_url(case: &str, response: &http::Response<bytes::Bytes>, member: &str) -> String {
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "case {case}: expected HTTP 200, got {} with body {:?}",
+        response.status(),
+        String::from_utf8_lossy(response.body())
+    );
+    body_json(response)[member]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case}: the response carries no {member}"))
+        .to_string()
+}
+
+/// RULE: when a streaming session's fragment selector reads PRODUCER
+/// timestamps, fragments of the stream that carry the SAME start timestamp are
+/// collapsed to the one with the largest fragment number before the snapshot is
+/// capped — "the other fragments are not included" — while fragments with
+/// different start timestamps are all kept, overlapping durations and all, and
+/// a selector reading server timestamps collapses nothing.
+///
+/// The rows differ along what the rule generalises over: how many fragments
+/// share a timestamp (two, three, none), which timestamp the selector reads,
+/// the playback mode, whether the range is closed or open-ended, and whether
+/// the snapshot is capped below the size of the group.
+#[tokio::test]
+async fn fragments_sharing_one_producer_start_timestamp_collapse_to_the_newest() {
+    let rows: &[CollapseRow] = &[
+        CollapseRow {
+            case: "a pair sharing one producer start timestamp, uncapped",
+            mode: "ON_DEMAND",
+            selector_type: "PRODUCER_TIMESTAMP",
+            range: (499, Some(501)),
+            max: None,
+            expected: &[11],
+        },
+        CollapseRow {
+            case: "that pair with the snapshot capped at one fragment",
+            mode: "ON_DEMAND",
+            selector_type: "PRODUCER_TIMESTAMP",
+            range: (499, Some(501)),
+            max: Some(1),
+            expected: &[11],
+        },
+        CollapseRow {
+            case: "a trio sharing one producer start timestamp",
+            mode: "ON_DEMAND",
+            selector_type: "PRODUCER_TIMESTAMP",
+            range: (509, Some(511)),
+            max: None,
+            expected: &[22],
+        },
+        CollapseRow {
+            case: "every group of the archive by producer timestamp",
+            mode: "ON_DEMAND",
+            selector_type: "PRODUCER_TIMESTAMP",
+            range: (499, Some(560)),
+            max: None,
+            expected: &[11, 22, 30, 40, 41, 50, 51],
+        },
+        CollapseRow {
+            case: "fragments whose durations overlap but whose timestamps differ",
+            mode: "ON_DEMAND",
+            selector_type: "PRODUCER_TIMESTAMP",
+            range: (549, Some(553)),
+            max: None,
+            expected: &[50, 51],
+        },
+        CollapseRow {
+            case: "a pair sharing one server timestamp, selected by server timestamp",
+            mode: "ON_DEMAND",
+            selector_type: "SERVER_TIMESTAMP",
+            range: (929, Some(931)),
+            max: None,
+            expected: &[40, 41],
+        },
+        CollapseRow {
+            case: "the whole archive by server timestamp",
+            mode: "ON_DEMAND",
+            selector_type: "SERVER_TIMESTAMP",
+            range: (899, Some(960)),
+            max: None,
+            expected: &[10, 11, 20, 21, 22, 30, 40, 41, 50, 51],
+        },
+        CollapseRow {
+            case: "LIVE_REPLAY from an open-ended start, at the default of five",
+            mode: "LIVE_REPLAY",
+            selector_type: "PRODUCER_TIMESTAMP",
+            range: (499, None),
+            max: None,
+            expected: &[11, 22, 30, 40, 41],
+        },
+        CollapseRow {
+            case: "LIVE_REPLAY capped at two fragments",
+            mode: "LIVE_REPLAY",
+            selector_type: "PRODUCER_TIMESTAMP",
+            range: (499, Some(560)),
+            max: Some(2),
+            expected: &[11, 22],
+        },
+    ];
+
+    for (path, selector_member, max_member, url_member, protocol) in SESSION_OPERATIONS {
+        for row in rows {
+            let case = format!("{} over {path}", row.case);
+            let harness = seeded();
+            seed_shared_timestamp_archive(&harness);
+            let body = collapse_request(
+                SHARED_TIMESTAMP_STREAM,
+                row,
+                selector_member,
+                max_member,
+            );
+            let response = harness.post(path, &body).await;
+            let url = minted_url(&case, &response, url_member);
+            let session = recorded_session(&harness, &url);
+            assert_eq!(
+                session.protocol, *protocol,
+                "case {case}: wrong session protocol, got {session:?}"
+            );
+            let expected: Vec<String> = row
+                .expected
+                .iter()
+                .copied()
+                .map(fragment_number)
+                .collect();
+            assert_eq!(
+                session.fragment_numbers, expected,
+                "case {case}: expected the snapshot {expected:?}, got {:?}",
+                session.fragment_numbers
+            );
+        }
+    }
+}
+
+/// RULE (the same one, in the mode that selects by ingestion): a LIVE session
+/// whose selector reads producer timestamps also collapses the fragments that
+/// share one start timestamp to the largest fragment number, and it does so
+/// before the snapshot is capped; a LIVE session selecting by server timestamp
+/// collapses nothing.
+///
+/// The two rows differ along which timestamp the selector reads, over one
+/// freshly ingested archive in which one PAIR shares a producer start timestamp
+/// while every server timestamp is distinct, and a third row puts the newer of
+/// a sharing pair at the HEAD of the stream and its superseded twin at the
+/// oldest ingestion, where the fragment that is kept must still be ordered and
+/// capped by its own ingestion.
+#[tokio::test]
+async fn a_live_session_collapses_a_shared_producer_start_timestamp_too() {
+    // The archive one row ingests: (the index its fragment number comes from,
+    // how long before the row's one instant its producer start timestamp is, in
+    // milliseconds, and how long before it was ingested).
+    type LiveArchive = &'static [(u64, u64, u64)];
+    // A pair sharing one producer start timestamp, ingested next to each other.
+    let adjacent: LiveArchive = &[
+        (60, 5_000, 5_000),
+        (61, 3_000, 3_000),
+        (62, 3_000, 2_000),
+    ];
+    // A pair sharing one producer start timestamp at the two ENDS of the
+    // ingestion order: the superseded fragment is the oldest ingested and the
+    // one that is kept is the stream head.
+    let far_apart: LiveArchive = &[
+        (70, 4_000, 9_000),
+        (71, 7_000, 7_000),
+        (72, 6_000, 5_000),
+        (73, 4_000, 1_000),
+    ];
+    // (case, FragmentSelectorType, the archive, the fragment indices a playlist
+    // of two fragments must carry)
+    let rows: &[(&str, &str, LiveArchive, &[u64])] = &[
+        (
+            "a producer-timestamp selector collapses the pair",
+            "PRODUCER_TIMESTAMP",
+            adjacent,
+            &[60, 62],
+        ),
+        (
+            "a server-timestamp selector collapses nothing",
+            "SERVER_TIMESTAMP",
+            adjacent,
+            &[61, 62],
+        ),
+        (
+            "the fragment that is kept is the stream head",
+            "PRODUCER_TIMESTAMP",
+            far_apart,
+            &[72, 73],
+        ),
+    ];
+
+    for (path, selector_member, max_member, url_member, _protocol) in SESSION_OPERATIONS {
+        for (case, selector_type, archive, expected) in rows {
+            let case = format!("{case} over {path}");
+            let harness = seeded();
+            // Ingested just now, so the stream head is inside the LIVE window,
+            // and spaced from ONE instant rather than from the wall clock
+            // between statements.
+            let now = SystemTime::now();
+            let at = |millis_ago: u64| now - Duration::from_millis(millis_ago);
+            let fragments: Vec<(u64, SystemTime, SystemTime, u64)> = archive
+                .iter()
+                .copied()
+                .map(|(index, producer_ago, server_ago)| {
+                    (index, at(producer_ago), at(server_ago), 1000)
+                })
+                .collect();
+            seed_fragments(&harness, LIVE_SHARED_TIMESTAMP_STREAM, &fragments);
+
+            let mut body = serde_json::json!({
+                "StreamName": LIVE_SHARED_TIMESTAMP_STREAM,
+                "PlaybackMode": "LIVE",
+            });
+            body[*selector_member] =
+                serde_json::json!({ "FragmentSelectorType": selector_type });
+            body[*max_member] = serde_json::json!(2);
+
+            let response = harness.post(path, &body).await;
+            let url = minted_url(&case, &response, url_member);
+            let session = recorded_session(&harness, &url);
+            let expected: Vec<String> = expected.iter().copied().map(fragment_number).collect();
+            assert_eq!(
+                session.fragment_numbers, expected,
+                "case {case}: expected the snapshot {expected:?}, got {:?}",
+                session.fragment_numbers
+            );
+        }
+    }
+}
+
+/// RULE (the same one, as a PLAYER sees it): the manifest the session serves
+/// names the fragment with the larger fragment number and does not name the
+/// superseded one, since "the other fragments are not included".
+#[tokio::test]
+async fn the_served_manifest_names_only_the_newer_of_two_shared_timestamp_fragments() {
+    let harness = seeded();
+    seed_shared_timestamp_archive(&harness);
+    let case = "a pair sharing one producer start timestamp";
+    let body = serde_json::json!({
+        "StreamName": SHARED_TIMESTAMP_STREAM,
+        "PlaybackMode": "ON_DEMAND",
+        "DisplayFragmentNumber": "ALWAYS",
+        "DASHFragmentSelector": {
+            "FragmentSelectorType": "PRODUCER_TIMESTAMP",
+            "TimestampRange": {
+                "StartTimestamp": T0_SECS + 499,
+                "EndTimestamp": T0_SECS + 501,
+            },
+        },
+    });
+    let response = harness.post(PATH, &body).await;
+    let url = minted_url(case, &response, "DASHStreamingSessionURL");
+
+    let manifest = harness.fetch(&url).await;
+    assert_eq!(
+        manifest.status().as_u16(),
+        200,
+        "case {case}: the manifest must be served, got {} with body {:?}",
+        manifest.status(),
+        String::from_utf8_lossy(manifest.body())
+    );
+    let manifest = String::from_utf8_lossy(manifest.body()).to_string();
+    let newer = fragment_number(11);
+    let superseded = fragment_number(10);
+    assert!(
+        manifest.contains(&newer),
+        "case {case}: the manifest must name the newer fragment {newer}, got {manifest:?}"
+    );
+    assert!(
+        !manifest.contains(&superseded),
+        "case {case}: the manifest must not name the superseded fragment {superseded}, \
+         got {manifest:?}"
+    );
 }
