@@ -462,6 +462,13 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 {
                     environment.insert(HOSTNAME_VARIABLE.to_string(), hostname);
                 }
+                // And the address of the TASK METADATA ENDPOINT this container reads what it
+                // is at, which Amazon ECS injects into every container it launches
+                // ([`super::task_metadata_endpoint`]).
+                environment.insert(
+                    TASK_METADATA_URI_VARIABLE.to_string(),
+                    container_metadata_uri(container),
+                );
                 environment.extend(environment_of(stored.environment.as_deref()));
                 // `ContainerOverride$environment`: "The environment variables to send to
                 // the container ... This parameter maps to Env in the docker container
@@ -816,16 +823,23 @@ pub fn settle_container_runtime<Eng: Send + Sync + 'static>(
         // And the client its program reaches those same servers THROUGH, for a task reached at
         // an address of its own: a container's program routinely asks its own server for a
         // document ([`super::container_http_client`]) — and another workload's, which the
-        // account's network decides the arrival of ([`super::task_reachability`]).
-        let http = launch
-            .address
-            .clone()
-            .zip(addresses.clone())
-            .map(|(address, addresses)| {
-                ContainerHttpClient::new(address, addresses)
-                    .on_network(network.clone())
-                    .accounting_into(Arc::clone(&launch.consumption))
-            });
+        // account's network decides the arrival of ([`super::task_reachability`]). A task this
+        // emulator holds no address for still has the one endpoint inside its own namespace:
+        // the task metadata endpoint its containers read what they are at
+        // ([`super::task_metadata_endpoint`]).
+        let http = addresses.clone().map(|addresses| {
+            let client = match launch.address.clone() {
+                Some(address) => ContainerHttpClient::new(address, addresses),
+                None => ContainerHttpClient::unaddressed(addresses),
+            };
+            client
+                .on_network(network.clone())
+                .accounting_into(Arc::clone(&launch.consumption))
+                .with_task_metadata(TaskMetadataEndpoint::new(
+                    ::engine::ServiceState::clone(&state),
+                    launch.container_arn.clone(),
+                ))
+        });
         // The volumes the container's `mountPoints` mount, resolved with NO guard of this
         // store held: the files of an `efsVolumeConfiguration` volume are the Amazon EFS
         // service's own, so resolving one reads that service's store

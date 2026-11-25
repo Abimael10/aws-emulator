@@ -689,9 +689,22 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                         candidate.name.is_some() && candidate.name == container.name
                     })
                 });
-                let environment = stored
-                    .map(|stored| health_probe_environment(stored.environment.as_deref()))
-                    .unwrap_or_default();
+                // The probe runs inside the container, so it reads what that container is at
+                // the same TASK METADATA ENDPOINT the container's own program reads it at
+                // ([`super::task_metadata_endpoint`]) — put in place BEFORE the definition's
+                // own `environment`, exactly as the container's own run and an exec session put
+                // it there, so a revision that sets that name itself is what every session
+                // inside the container sees.
+                let mut environment: BTreeMap<String, String> = BTreeMap::new();
+                environment.insert(
+                    TASK_METADATA_URI_VARIABLE.to_string(),
+                    container_metadata_uri(container),
+                );
+                environment.extend(
+                    stored
+                        .map(|stored| health_probe_environment(stored.environment.as_deref()))
+                        .unwrap_or_default(),
+                );
                 let mounts = match (definition, stored) {
                     (Some(definition), Some(stored)) => mount_requests(definition, stored, task),
                     _ => Vec::new(),
@@ -1060,12 +1073,21 @@ pub fn settle_container_health<Eng: Send + Sync + 'static>(
             mounted_volumes(&**engine, &state, &probe.mounts),
         );
         // The client the probe asks the server of its own task for a document with, for a task
-        // reached at an address of its own ([`super::container_http_client`]).
-        let http = probe.address.clone().zip(addresses.clone()).map(
-            |(address, addresses)| {
-                ContainerHttpClient::new(address, addresses).on_network(network.clone())
-            },
-        );
+        // reached at an address of its own ([`super::container_http_client`]) — and the task
+        // metadata endpoint inside the container's own namespace, which a task this emulator
+        // holds no address for has all the same ([`super::task_metadata_endpoint`]).
+        let http = addresses.clone().map(|addresses| {
+            let client = match probe.address.clone() {
+                Some(address) => ContainerHttpClient::new(address, addresses),
+                None => ContainerHttpClient::unaddressed(addresses),
+            };
+            client
+                .on_network(network.clone())
+                .with_task_metadata(TaskMetadataEndpoint::new(
+                    ::engine::ServiceState::clone(&state),
+                    probe.container_arn.clone(),
+                ))
+        });
         let handle = runtime
             .spawn(async move { run_health_probe(probe_state, callback, probe, filesystem, http).await });
         // The handle is kept with the container's health record, so a probe whose container

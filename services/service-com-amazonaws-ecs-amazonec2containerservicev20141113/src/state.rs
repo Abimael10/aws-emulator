@@ -445,6 +445,11 @@ pub use container_aws_cli::*;
 mod container_http_client;
 pub use container_http_client::*;
 
+/// The TASK METADATA ENDPOINT a container reads its own and its task's metadata at: the address
+/// Amazon ECS puts in every container's environment, and the documents the agent answers there.
+mod task_metadata_endpoint;
+pub use task_metadata_endpoint::*;
+
 /// WHO reaches a task at the address of its own elastic network interface: the security groups
 /// on that interface.
 mod task_reachability;

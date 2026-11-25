@@ -20,6 +20,14 @@
 //! task's own interface therefore reach the same servers — the ones the containers of that task
 //! started ([`super::container_servers`]).
 //!
+//! # The task's own metadata endpoint
+//!
+//! One address inside a task is not a workload's at all: the link-local address Amazon ECS
+//! serves the TASK METADATA ENDPOINT at, which every container's environment carries
+//! ([`super::task_metadata_endpoint`]). It is in the task's own network namespace, so a request
+//! to it is answered by that endpoint rather than by anything the account's network holds, and
+//! no security group stands between a container and it.
+//!
 //! # Another workload's address
 //!
 //! A program of a container is not confined to its own task: an interface of the account is
@@ -80,8 +88,9 @@
 use ::service_common::instance_metadata_service::{
     written_out, Invocation, TransferOutcome, COULD_NOT_CONNECT, HTTP_RETURNED_ERROR,
 };
-use ::service_common::served_http_addresses::ServedAddresses;
+use ::service_common::served_http_addresses::{ServedAddresses, ServesHttp};
 
+use super::task_metadata_endpoint::{is_task_metadata_host, TaskMetadataEndpoint};
 use super::task_reachability::{Reach, TaskNetwork};
 
 /// The HTTP client a container's session provides under its own name, the one every documented
@@ -435,8 +444,15 @@ fn read_downloader_request(arguments: &[String]) -> Option<Request> {
 pub struct ContainerHttpClient {
     /// The private address of the interface the task was allocated, which is both the host a
     /// request of this container reaches its own task's servers by and the SOURCE address a
-    /// request to another workload comes from.
-    address: String,
+    /// request to another workload comes from — `None` for a task this emulator holds no
+    /// address for, whose containers reach no workload at all.
+    address: Option<String>,
+    /// The TASK METADATA ENDPOINT of the container this client belongs to, which answers the
+    /// requests it makes to the address that endpoint answers at
+    /// ([`super::task_metadata_endpoint`]) —
+    /// `None` for a client given none, which then reaches that address no more than any other
+    /// client reaches an address nothing serves.
+    metadata: Option<TaskMetadataEndpoint>,
     /// The records the servers of this task's containers are published in.
     addresses: ServedAddresses,
     /// The account's own network, which decides whether a request to ANOTHER workload's
@@ -458,13 +474,39 @@ impl ContainerHttpClient {
     #[must_use]
     pub fn new(address: String, addresses: ServedAddresses) -> Self {
         Self {
-            address,
+            address: Some(address),
+            metadata: None,
             addresses,
             network: None,
             accounting: ::std::sync::Arc::new(
                 super::container_consumption::ContainerConsumption::new(),
             ),
         }
+    }
+
+    /// The client of a container whose task this emulator holds NO address for: a task that was
+    /// allocated no interface of its own. Its requests reach no workload — neither the servers
+    /// of its own task nor another's — and its container's own task metadata endpoint, which is
+    /// in the task's network namespace rather than on the account's network.
+    #[must_use]
+    pub fn unaddressed(addresses: ServedAddresses) -> Self {
+        Self {
+            address: None,
+            metadata: None,
+            addresses,
+            network: None,
+            accounting: ::std::sync::Arc::new(
+                super::container_consumption::ContainerConsumption::new(),
+            ),
+        }
+    }
+
+    /// This client with the TASK METADATA ENDPOINT of its own container on it, which is what
+    /// answers its requests to the address it is served at ([`super::task_metadata_endpoint`]).
+    #[must_use]
+    pub fn with_task_metadata(mut self, metadata: TaskMetadataEndpoint) -> Self {
+        self.metadata = Some(metadata);
+        self
     }
 
     /// This client on `network` — the account's own, which decides whether a request it makes
@@ -504,17 +546,33 @@ impl ContainerHttpClient {
         let downloader = program == HTTP_DOWNLOADER;
         let request = read_request(program, arguments)?;
         let (destination, port, path) = self.addressed(&request.url)?;
-        // WHERE the request is answered from: this task's own servers for its own address and
-        // the loopback inside it, and the server published at another workload's address for a
-        // packet the account's network delivers there.
+        // WHERE the request is answered from: the container's own task metadata endpoint for
+        // the address that endpoint is served at inside the task, this task's own servers for
+        // its own address and the loopback inside it, and the server published at another
+        // workload's address for a packet the account's network delivers there.
         let served_at = match &destination {
-            Destination::OwnTask => self.address.clone(),
+            // The endpoint is in the task's own network namespace, so it answers the request
+            // itself rather than through the records the account's workloads publish servers in
+            // ([`super::task_metadata_endpoint`]).
+            Destination::TaskMetadata => {
+                let metadata = self.metadata.as_ref()?;
+                // The request line this client puts on the connection, which is what it sends.
+                self.accounting
+                    .record_network_sent(request.method.len().saturating_add(path.len()));
+                let answered = metadata.serve(&request.method, &path);
+                return Some(self.answered(&request, &path, answered, downloader));
+            }
+            // A task this emulator holds no address for is on no network of this emulator, so
+            // its containers reach no workload at all: the request is one this session could
+            // not make, exactly as a host that is no address at all is.
+            Destination::OwnTask => self.address.clone()?,
             Destination::Peer(address) => {
                 match self
                     .network
                     .as_ref()
-                    .map_or(Reach::OffNetwork, |network| {
-                        network.reach(&self.address, address, port)
+                    .zip(self.address.as_deref())
+                    .map_or(Reach::OffNetwork, |(network, own)| {
+                        network.reach(own, address, port)
                     })
                 {
                     Reach::Admitted => address.clone(),
@@ -544,13 +602,29 @@ impl ContainerHttpClient {
         // The request line this client puts on the connection, which is what it sends.
         self.accounting
             .record_network_sent(request.method.len().saturating_add(path.len()));
-        let Some(answered) = self
+        let answered = self
             .addresses
-            .serve(&served_at, port, &request.method, &path)
-        else {
+            .serve(&served_at, port, &request.method, &path);
+        Some(self.answered(&request, &path, answered, downloader))
+    }
+
+    /// What one invocation ANSWERS, given what the server it addressed answered: the status the
+    /// client exits with, the document it writes and where that document goes.
+    ///
+    /// Read the same way whatever answered the request — a server of the container's own task,
+    /// one of another workload, or the task's own metadata endpoint — so one answer comes to one
+    /// thing on each client's own terms.
+    fn answered(
+        &self,
+        request: &Request,
+        path: &str,
+        answered: Option<::service_common::served_http_addresses::AddressAnswer>,
+        downloader: bool,
+    ) -> FetchedDocument {
+        let Some(answered) = answered else {
             // Nothing is listening there, so the request was never answered: the connection
             // could not be made.
-            return Some(FetchedDocument {
+            return FetchedDocument {
                 status: if downloader {
                     WGET_NETWORK_FAILURE
                 } else {
@@ -559,7 +633,7 @@ impl ContainerHttpClient {
                 document: None,
                 save_to: None,
                 written_out: request.written_out(&TransferOutcome::default()),
-            });
+            };
         };
         // The bytes the server really answered with, whatever the client then does with them.
         self.accounting.record_network_received(answered.body.len());
@@ -570,7 +644,7 @@ impl ContainerHttpClient {
             content_type: answered.content_type.clone(),
         };
         if answered.body.len() > MAX_FETCHED_BYTES {
-            return Some(FetchedDocument {
+            return FetchedDocument {
                 status: if downloader {
                     WGET_GENERIC_ERROR
                 } else {
@@ -579,13 +653,13 @@ impl ContainerHttpClient {
                 document: None,
                 save_to: None,
                 written_out: request.written_out(&outcome),
-            });
+            };
         }
         // An error response is a failure of the client's own only where that client reports one
         // as such: the downloader always does, and `curl` only when it was asked to
         // (`-f`/`--fail`). Such a request writes no document.
         if answered.status >= 400 && request.report_error {
-            return Some(FetchedDocument {
+            return FetchedDocument {
                 status: if downloader {
                     WGET_SERVER_ERROR
                 } else {
@@ -594,7 +668,7 @@ impl ContainerHttpClient {
                 document: None,
                 save_to: None,
                 written_out: request.written_out(&outcome),
-            });
+            };
         }
         // The bytes a server answered with, as the text a session carries. A document that is
         // not text is one this session holds nothing of, so nothing of it is written — and nor
@@ -603,7 +677,7 @@ impl ContainerHttpClient {
             .wants_document
             .then(|| String::from_utf8(answered.body).ok())
             .flatten();
-        Some(FetchedDocument {
+        FetchedDocument {
             status: 0,
             document,
             // The downloader SAVES what it fetched, so an invocation of it that named no path
@@ -613,12 +687,12 @@ impl ContainerHttpClient {
             save_to: match (&request.save_to, request.wants_document) {
                 (Some(named), _) => Some(named.clone()),
                 (None, true) if downloader && !request.to_standard_output => {
-                    Some(saved_at(&path))
+                    Some(saved_at(path))
                 }
                 (None, _) => None,
             },
             written_out: request.written_out(&outcome),
-        })
+        }
     }
 
     /// WHAT one request addresses: the destination, the port and the path it asks for — `None`
@@ -648,18 +722,28 @@ impl ContainerHttpClient {
             _ => return None,
         };
         let host = parsed.host()?.trim_matches(|bracket| bracket == '[' || bracket == ']');
+        let port = parsed.port_u16().map_or(default_port, i32::from);
         let own = LOOPBACK_HOSTS
             .iter()
             .any(|loopback| host.eq_ignore_ascii_case(loopback))
-            || host.eq_ignore_ascii_case(&self.address);
-        let destination = if own {
+            || self
+                .address
+                .as_deref()
+                .is_some_and(|address| host.eq_ignore_ascii_case(address));
+        let destination = if is_task_metadata_host(host) && port == HTTP_PORT {
+            // The one address inside a task that is no workload's: the endpoint Amazon ECS
+            // serves the task's own metadata at ([`super::task_metadata_endpoint`]). It answers
+            // on the port the address a container's environment carries names and on no other,
+            // so that address on another port is read below like any other address no workload
+            // of this emulator holds.
+            Destination::TaskMetadata
+        } else if own {
             Destination::OwnTask
         } else if host.parse::<::std::net::IpAddr>().is_ok() {
             Destination::Peer(host.to_string())
         } else {
             return None;
         };
-        let port = parsed.port_u16().map_or(default_port, i32::from);
         let path = parsed.path();
         Some((
             destination,
@@ -680,6 +764,9 @@ enum Destination {
     /// task was allocated. Both reach the servers the task's containers started, and no
     /// security group stands between a container and its own task's namespace.
     OwnTask,
+    /// The TASK METADATA ENDPOINT Amazon ECS serves inside the task, which is in that same
+    /// namespace and is no workload's address at all ([`super::task_metadata_endpoint`]).
+    TaskMetadata,
     /// Another workload, at the address written here — reached across the account's network,
     /// which decides whether the packet arrives ([`super::task_reachability`]).
     Peer(String),
@@ -1275,6 +1362,74 @@ mod tests {
                 carried.as_deref(),
                 *document,
                 "case {case:?}: expected document {document:?}, got {carried:?}"
+            );
+        }
+    }
+
+    /// RULE: WHICH destination a URL addresses — the task's own metadata endpoint at the address
+    /// it is served at on the port that address names, the task's own servers for the loopback
+    /// inside it and its own address, and another workload for every other address.
+    ///
+    /// The rows span what the reading generalises over: the endpoint's address with and without
+    /// its port written out, that same address on ANOTHER port (which the endpoint does not
+    /// answer on, so it is read as an address no workload of this emulator holds), each form of
+    /// the loopback, the task's own address, a peer's, and a host that is a name rather than an
+    /// address.
+    #[test]
+    fn a_url_addresses_the_destination_its_host_and_port_name() {
+        let (client, _listening) = client();
+        let metadata_host = super::super::task_metadata_endpoint::task_metadata_host();
+        let peer = "10.9.9.9".to_string();
+        // (case, the URL a program named, the destination it addresses)
+        let rows: &[(&str, String, Option<Destination>)] = &[
+            (
+                "the metadata endpoint's own address",
+                format!("http://{metadata_host}/v4/t-1"),
+                Some(Destination::TaskMetadata),
+            ),
+            (
+                "the same address with its port written out",
+                format!("http://{metadata_host}:80/v4/t-1/task"),
+                Some(Destination::TaskMetadata),
+            ),
+            (
+                "that address on a port the endpoint does not answer on",
+                format!("http://{metadata_host}:8080/v4/t-1"),
+                Some(Destination::Peer(metadata_host.clone())),
+            ),
+            (
+                "the loopback inside the task",
+                "http://localhost/ping".to_string(),
+                Some(Destination::OwnTask),
+            ),
+            (
+                "the loopback written as an address",
+                "http://127.0.0.1:8080/ping".to_string(),
+                Some(Destination::OwnTask),
+            ),
+            (
+                "the task's own address",
+                format!("http://{TASK_ADDRESS}/ping"),
+                Some(Destination::OwnTask),
+            ),
+            (
+                "another workload's address",
+                format!("http://{peer}/ping"),
+                Some(Destination::Peer(peer.clone())),
+            ),
+            (
+                "a host that is a name rather than an address",
+                "http://service.internal/ping".to_string(),
+                None,
+            ),
+        ];
+        for (case, url, expected) in rows {
+            let addressed = client
+                .addressed(url)
+                .map(|(destination, _, _)| destination);
+            assert_eq!(
+                addressed, *expected,
+                "case {case:?}: expected {expected:?}, got {addressed:?}"
             );
         }
     }

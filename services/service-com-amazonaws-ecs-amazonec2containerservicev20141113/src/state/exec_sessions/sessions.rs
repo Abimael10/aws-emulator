@@ -360,6 +360,13 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             .map(|arn| arn.region.to_string())
             .unwrap_or_default();
         let mut environment: BTreeMap<String, String> = BTreeMap::new();
+        // The session runs INSIDE the container, so it reads what that container is at the
+        // TASK METADATA ENDPOINT the container's own program reads it at
+        // ([`super::super::task_metadata_endpoint`]).
+        environment.insert(
+            super::super::task_metadata_endpoint::TASK_METADATA_URI_VARIABLE.to_string(),
+            super::super::task_metadata_endpoint::container_metadata_uri(container),
+        );
         for pair in stored.environment.iter().flatten() {
             if let Some(key) = pair.name.clone() {
                 environment.insert(key, pair.value.clone().unwrap_or_default());
@@ -384,6 +391,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         }
         Some(ExecSessionParts {
             command: session.command.clone(),
+            container_arn: session.container_arn.clone(),
             environment,
             mounts: super::super::container_volumes::mount_requests(definition, stored, task),
             working_directory: stored.working_directory.clone(),
@@ -410,6 +418,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
 pub(in crate::state) struct ExecSessionParts {
     /// The program the session runs.
     command: String,
+    /// The container the session runs inside, which is the container its own task metadata
+    /// endpoint belongs to ([`super::super::task_metadata_endpoint`]).
+    container_arn: String,
     /// The environment that container's definition and the launch's override give it.
     environment: BTreeMap<String, String>,
     /// The volumes mounted into it, resolved where the session is started.
@@ -499,13 +510,23 @@ pub fn exec_session_shell<Eng: Send + Sync + 'static>(
         parts.credential.clone(),
     ));
     // And the client it asks the servers of its own task for a document with, for a task
-    // reached at an address of its own.
-    if let Some(http) = parts
-        .address
-        .clone()
-        .zip(::service_common::served_http_addresses::ServedAddresses::of(engine))
-        .map(|(address, addresses)| ContainerHttpClient::new(address, addresses))
-    {
+    // reached at an address of its own — and the task metadata endpoint inside the container's
+    // own namespace, which a task this emulator holds no address for has all the same
+    // ([`super::super::task_metadata_endpoint`]).
+    if let Some(http) = ::service_common::served_http_addresses::ServedAddresses::of(engine).map(
+        |addresses| {
+            let client = match parts.address.clone() {
+                Some(address) => ContainerHttpClient::new(address, addresses),
+                None => ContainerHttpClient::unaddressed(addresses),
+            };
+            client.with_task_metadata(
+                super::super::task_metadata_endpoint::TaskMetadataEndpoint::new(
+                    ::engine::ServiceState::clone(&state),
+                    parts.container_arn.clone(),
+                ),
+            )
+        },
+    ) {
         shell = shell.with_http_client(http);
     }
     Some(ExecSessionShell {
