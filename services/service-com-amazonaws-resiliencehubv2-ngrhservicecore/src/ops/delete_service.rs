@@ -170,6 +170,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .idempotency
             .retain(|_, arn| arn != &record.service_arn);
         store.orphan_input_sources(&record.service_arn);
+        // Its EVENT LOG went with the record too, for the same reason: the log is the log
+        // of that service, so there is no log left for this delete to be recorded in and no
+        // reader that could reach one.
 
         Ok(DeleteServiceOutput {
             service_arn: record.service_arn,

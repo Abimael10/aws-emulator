@@ -234,6 +234,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // changes are applied on top of the record's current state.
         record.materialise(now);
 
+        // What the service referenced BEFORE this call, so the references this merge
+        // establishes and drops can be recorded in its event log once the merge is done.
+        let policy_before = record.policy_arn.clone();
+        let systems_before: Vec<String> = record
+            .associated_systems
+            .iter()
+            .map(|system| system.system_arn.clone())
+            .collect();
+
         // Every member of this request except `serviceArn` is optional, and an absent one
         // means "leave it alone" — only the members the caller sent are applied.
         if let Some(description) = input.description {
@@ -261,6 +270,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             record.link_dev_ops_agent(requested, now);
         }
         record.updated_at = now;
+
+        // What this merge CHANGED, as the service's event log records it: a reference the
+        // service did not hold before is an association, one it no longer holds is a
+        // disassociation, and a reference the request restated unchanged is neither.
+        let policy_after = record.policy_arn.clone();
+        let systems_after: Vec<String> = record
+            .associated_systems
+            .iter()
+            .map(|system| system.system_arn.clone())
+            .collect();
+        if policy_after != policy_before {
+            if let Some(policy_arn) = policy_before {
+                store.record_service_event(
+                    &input.service_arn,
+                    &crate::state::ServiceChange::PolicyDisassociated { policy_arn },
+                    now,
+                );
+            }
+            if let Some(policy_arn) = policy_after {
+                store.record_service_event(
+                    &input.service_arn,
+                    &crate::state::ServiceChange::PolicyAssociated { policy_arn },
+                    now,
+                );
+            }
+        }
+        for system_arn in systems_before
+            .iter()
+            .filter(|before| !systems_after.contains(before))
+        {
+            store.record_service_event(
+                &input.service_arn,
+                &crate::state::ServiceChange::SystemDisassociated {
+                    system_arn: system_arn.clone(),
+                },
+                now,
+            );
+        }
+        for system_arn in systems_after
+            .iter()
+            .filter(|after| !systems_before.contains(after))
+        {
+            store.record_service_event(
+                &input.service_arn,
+                &crate::state::ServiceChange::SystemAssociated {
+                    system_arn: system_arn.clone(),
+                },
+                now,
+            );
+        }
 
         // The body is projected through the store's one `Service` view rather than from
         // the record alone: `effectivePolicyValues` is derived from the policy the

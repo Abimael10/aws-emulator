@@ -243,6 +243,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         service.assertions.insert(assertion_id, record);
 
+        // The create is committed, so the service's event log records it.
+        store.record_service_event(
+            &service_arn,
+            &crate::state::ServiceChange::AssertionCreated {
+                assertion_id: assertion.assertion_id.clone(),
+            },
+            now,
+        );
+
         Ok(CreateAssertionOutput { assertion })
     }
 }

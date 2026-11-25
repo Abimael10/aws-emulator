@@ -42,6 +42,9 @@
 //! `CreateServiceFunctionResources` may associate with one of its functions — asking the
 //! component that owns each one rather than taking a caller's word for it.
 //!
+//! [`service_events`] holds the EVENT LOG of a service: the record every mutation of a
+//! service, or of a resource inside it, appends to and `ListServiceEvents` reports.
+//!
 //! [`not_found`] holds the refusal every operation that resolves an ARN answers with when
 //! the ARN names nothing stored, so the whole crate words it once, [`conflicts`] holds the
 //! `ConflictException` wordings a create answers with, [`availability_slo`] holds the
@@ -58,6 +61,7 @@ mod input_sources;
 mod invoker_role;
 mod not_found;
 mod policies;
+mod service_events;
 mod systems;
 mod tagging;
 mod user_journeys;
@@ -86,6 +90,16 @@ pub use not_found::{
     resource_not_found, service_function_not_found, INPUT_SOURCE_RESOURCE_TYPE,
     POLICY_RESOURCE_TYPE, SERVICE_FUNCTION_RESOURCE_TYPE, SERVICE_RESOURCE_TYPE,
     SYSTEM_RESOURCE_TYPE,
+};
+pub use service_events::{
+    caller_actor, ServiceChange, ServiceEventRecord, ACTOR_TYPE_USER, MAX_EVENTS_PER_SERVICE,
+    SERVICE_EVENT_ASSERTION_CREATED, SERVICE_EVENT_ASSERTION_DELETED,
+    SERVICE_EVENT_ASSERTION_UPDATED, SERVICE_EVENT_CREATED,
+    SERVICE_EVENT_FUNCTION_CREATED, SERVICE_EVENT_FUNCTION_DELETED,
+    SERVICE_EVENT_FUNCTION_RESOURCES_ADDED, SERVICE_EVENT_FUNCTION_UPDATED,
+    SERVICE_EVENT_INPUT_SOURCES_UPDATED, SERVICE_EVENT_POLICY_ASSOCIATED,
+    SERVICE_EVENT_POLICY_DISASSOCIATED, SERVICE_EVENT_SYSTEM_ASSOCIATED,
+    SERVICE_EVENT_SYSTEM_DISASSOCIATED,
 };
 pub use systems::{
     mint_system_arn, system_in_use_message, SystemCreateRequest, SystemIdempotencyRecord,
@@ -313,6 +327,11 @@ pub struct ServiceRecord {
     /// a second one, and the same token offered for different text is refused. Scoped to
     /// the parent service for the same reason as above.
     pub assertion_idempotency: BTreeMap<String, AssertionIdempotencyRecord>,
+    /// This service's event log: one entry per change made to the service or to a resource
+    /// inside it, in the order they were recorded. See [`service_events`] — held inside the
+    /// parent record for the same reason [`Self::assertions`] is, so deleting the service
+    /// takes its log with it.
+    pub events: Vec<ServiceEventRecord>,
 }
 
 impl ServiceRecord {

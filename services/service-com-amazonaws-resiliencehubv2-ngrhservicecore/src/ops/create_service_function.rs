@@ -262,6 +262,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         service.service_functions.insert(service_function_id, record);
 
+        // The create is committed, so the service's event log records it.
+        store.record_service_event(
+            &service_arn,
+            &crate::state::ServiceChange::FunctionCreated {
+                service_function_id: service_function.service_function_id.clone(),
+                name: service_function.name.clone(),
+            },
+            now,
+        );
+
         Ok(CreateServiceFunctionOutput { service_function })
     }
 }

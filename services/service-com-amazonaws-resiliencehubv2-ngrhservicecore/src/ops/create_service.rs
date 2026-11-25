@@ -308,6 +308,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nor any assertion, nor a `CreateAssertion` token to replay.
             assertions: Default::default(),
             assertion_idempotency: Default::default(),
+            // The log of what has been done to this service starts empty; the create's own
+            // entry goes in through `record_service_event` below, the one path every event
+            // this crate records is appended through.
+            events: Vec::new(),
         };
         if let Some(requested) = input.dependency_discovery.as_deref() {
             record.set_dependency_discovery(requested, now);
@@ -328,7 +332,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let effective =
             store.effective_policy_values(record.policy_arn.as_deref(), &record.account_id);
         let service = record.to_service(effective);
-        store.services.insert(service_arn, record);
+        // What this create did, as the service's event log records it: the create itself,
+        // and the references it established. Read off the record before it is stored.
+        let name = record.name.clone();
+        let policy_arn = record.policy_arn.clone();
+        let associated: Vec<String> = record
+            .associated_systems
+            .iter()
+            .map(|system| system.system_arn.clone())
+            .collect();
+        store.services.insert(service_arn.clone(), record);
+        // Appended AFTER the record is stored, so the log holds an entry only for a change
+        // the store really took.
+        store.record_service_event(
+            &service_arn,
+            &crate::state::ServiceChange::Created { name },
+            now,
+        );
+        if let Some(policy_arn) = policy_arn {
+            store.record_service_event(
+                &service_arn,
+                &crate::state::ServiceChange::PolicyAssociated { policy_arn },
+                now,
+            );
+        }
+        for system_arn in associated {
+            store.record_service_event(
+                &service_arn,
+                &crate::state::ServiceChange::SystemAssociated { system_arn },
+                now,
+            );
+        }
         Ok(CreateServiceOutput { service })
     }
 }

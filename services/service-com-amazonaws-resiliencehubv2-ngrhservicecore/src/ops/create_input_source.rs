@@ -236,6 +236,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         sources.sources.insert(input_source_id.clone(), record);
 
+        // The create is committed, so the service's event log records that its input
+        // sources changed.
+        store.record_service_event(
+            &service_arn,
+            &crate::state::ServiceChange::InputSourcesUpdated,
+            now,
+        );
+
         Ok(CreateInputSourceOutput {
             service_arn,
             input_source_id,

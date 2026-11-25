@@ -221,9 +221,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // left where it was: the function was not created again.
         record.updated_at = now;
 
-        Ok(UpdateServiceFunctionOutput {
-            service_function: record.to_service_function(&input.service_arn),
-        })
+        let service_function = record.to_service_function(&input.service_arn);
+        // The update is committed, so the service's event log records it.
+        store.record_service_event(
+            &input.service_arn,
+            &crate::state::ServiceChange::FunctionUpdated {
+                service_function_id: service_function.service_function_id.clone(),
+                name: service_function.name.clone(),
+            },
+            now,
+        );
+
+        Ok(UpdateServiceFunctionOutput { service_function })
     }
 }
 

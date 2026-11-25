@@ -238,6 +238,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         function.resources = held;
         function.updated_at = now;
+        let service_function_name = function.name.clone();
+
+        // The association is committed, so the service's event log records it.
+        store.record_service_event(
+            &input.service_arn,
+            &crate::state::ServiceChange::FunctionResourcesAdded {
+                service_function_id: input.service_function_id.clone(),
+                name: service_function_name,
+                resources: associated.clone(),
+            },
+            now,
+        );
 
         Ok(CreateServiceFunctionResourcesOutput {
             service_arn: Some(input.service_arn),

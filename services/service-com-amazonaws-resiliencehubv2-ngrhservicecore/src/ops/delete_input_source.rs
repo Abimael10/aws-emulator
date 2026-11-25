@@ -152,6 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
         // An input source OUTLIVES the service it was created for, so the delete resolves
@@ -191,6 +192,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The delete is committed, so the event log of the service these sources belong to
+        // records that its input sources changed. An input source OUTLIVES its service, so
+        // a delete addressed to the ARN of a service that is gone has no log to append to
+        // and records nothing.
+        store.record_service_event(
+            &input.service_arn,
+            &crate::state::ServiceChange::InputSourcesUpdated,
+            now,
+        );
 
         Ok(DeleteInputSourceOutput {
             service_arn: input.service_arn,

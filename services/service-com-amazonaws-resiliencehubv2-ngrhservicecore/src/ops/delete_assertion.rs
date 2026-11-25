@@ -150,6 +150,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
         // An assertion lives inside its service's record, so the parent is resolved first:
@@ -179,6 +180,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         service
             .assertion_idempotency
             .retain(|_, consumed| consumed.assertion_id != input.assertion_id);
+
+        // The delete is committed, so the service's event log records it.
+        store.record_service_event(
+            &input.service_arn,
+            &crate::state::ServiceChange::AssertionDeleted {
+                assertion_id: input.assertion_id.clone(),
+            },
+            now,
+        );
 
         Ok(DeleteAssertionOutput {
             assertion_id: Some(input.assertion_id),

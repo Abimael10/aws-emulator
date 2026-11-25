@@ -188,10 +188,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `source`, which say which assertion this is and which side produced it.
         record.updated_at = now;
 
+        let assertion = record.to_assertion(&input.service_arn);
+        // The update is committed, so the service's event log records it.
+        store.record_service_event(
+            &input.service_arn,
+            &crate::state::ServiceChange::AssertionUpdated {
+                assertion_id: assertion.assertion_id.clone(),
+            },
+            now,
+        );
+
         // The response is projected through the same path every later read answers from, so
         // what this call reports and what `ListAssertions` reports cannot drift.
-        Ok(UpdateAssertionOutput {
-            assertion: record.to_assertion(&input.service_arn),
-        })
+        Ok(UpdateAssertionOutput { assertion })
     }
 }

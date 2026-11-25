@@ -150,6 +150,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
         // A function lives inside its service's record, so the parent is resolved first: a
@@ -181,6 +182,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         service
             .service_function_idempotency
             .retain(|_, id| id != &removed.service_function_id);
+
+        // The delete is committed, so the service's event log records it.
+        store.record_service_event(
+            &input.service_arn,
+            &crate::state::ServiceChange::FunctionDeleted {
+                service_function_id: removed.service_function_id.clone(),
+                name: removed.name.clone(),
+            },
+            now,
+        );
 
         Ok(DeleteServiceFunctionOutput {
             service_function_id: Some(removed.service_function_id),

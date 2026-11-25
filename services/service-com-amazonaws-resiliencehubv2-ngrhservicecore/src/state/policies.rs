@@ -331,7 +331,11 @@ impl ComAmazonawsResiliencehubv2NgrhservicecoreState {
 
 /// The account segment of an ARN (`arn:<partition>:<service>:<region>:<account>:…`), or
 /// `None` when the value has too few segments to carry one.
-fn arn_account(arn: &str) -> Option<&str> {
+///
+/// Reached by the event log beside this module as well ([`super::service_events`]), which
+/// reports the account that owns the policy an event names, so the two read a policy's
+/// owning account the same way.
+pub(super) fn arn_account(arn: &str) -> Option<&str> {
     arn.split(':').nth(4)
 }
 
