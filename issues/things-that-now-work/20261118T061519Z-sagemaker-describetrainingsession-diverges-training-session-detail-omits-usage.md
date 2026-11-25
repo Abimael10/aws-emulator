@@ -56,3 +56,24 @@ Expected: status settles in the terminal Stopped (TrainingSessionStatus enum inc
 2. Replay fixture sagemakertrainingsessionruntime-execute-sampling-operation-generates-text.
 3. Cause 1 — at step task#6 the fixture calls sagemaker DescribeTrainingSession for the session it created. Inspect the 200 response body: TrainingSessionDetail has no BillableTokenUsage and no LastReceivedSequenceNumber member (AWS reports both, zero-valued for a session with no accounted traffic), and CreationTime/LastModifiedTime are serialized as fractional epoch seconds.
 4. Cause 2 — let the fixture run to teardown#11: it calls StopTrainingSession and then polls DescribeTrainingSession for TrainingSessionStatus == 'Stopped'. Every poll (15 attempts) returns 'Running', so the step never satisfies and teardown times out.
+
+## Fix status
+
+Cause 1: FIXED. `LastReceivedSequenceNumber` and `BillableTokenUsage` are now accounted
+values every existing session reports: the data plane that serves a session's operations
+publishes what its own records add up to into one shared account
+(`services/common/src/training_session_usage.rs`), the control plane's create opens that
+account zeroed and `DescribeTrainingSession` reports it, so a session with no accounted
+traffic reports the counted zero rather than no member. The timestamp sub-point is fixed at
+the one conversion every instant of the record goes through
+(`crate::state::training_session_instant`): a stored instant is reported at the whole
+second it falls in, so the host clock's sub-second remainder never reaches the wire.
+Replay: step task#6 no longer diverges at all (`bound_step_state: not_among_divergences`).
+
+Cause 2: FIXED. `StopTrainingSession` is implemented: the session moves to the modelled
+transient `Stopping` and the clock settles it in the terminal `Stopped`, stamping
+`EndTime`, with the describe reporting both. A repeated stop is the same stop. The fixture
+cannot evidence this one: it now stops at task#7 on another issue's cause
+(`sagemakertrainingsessionruntime|ExecuteSamplingOperation|2xx->2xx|$.operationId`), so
+teardown#11 is never graded; `tests/all/training_session_stop.rs` pins the lifecycle end to
+end instead.

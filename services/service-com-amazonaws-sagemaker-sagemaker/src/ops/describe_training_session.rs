@@ -2,9 +2,11 @@
 
 //! @op DescribeTrainingSession
 //! IMPLEMENTED: reports the training session `crate::state` holds under the requested
-//! `TrainingSessionName`, materialising the `Created` -> `Running` transition the clock
-//! already owed, and refuses a name this account holds no session under. This is the ONLY
-//! file to touch for this operation.
+//! `TrainingSessionName` together with what that session has ACCOUNTED (the sequence
+//! number it last received and the tokens billed for its traffic, from the account the
+//! data plane publishes into), materialising the transitions the clock already owed
+//! (`Created` -> `Running`, `Stopping` -> `Stopped`), and refuses a name this account
+//! holds no session under. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,26 +158,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let session = session.clone();
+        drop(store);
+
+        // What the session has ACCOUNTED for the traffic submitted against it, from the
+        // one account the data plane that serves that traffic publishes into. A session
+        // nothing has been submitted against has accounted zero, which is a counted value
+        // and is reported as one.
+        let usage = crate::state::training_session_usage(&*self.engine)
+            .map(|account| account.lock().usage(&session.name))
+            .unwrap_or_default();
+
         let output = DescribeTrainingSessionOutput {
             training_session_detail: TrainingSessionDetail {
                 training_session_arn: session.arn.clone(),
                 training_session_name: session.name.clone(),
                 training_session_status: session.status.clone(),
                 model_package_group_arn: session.model_package_group_arn.clone(),
-                creation_time: crate::state::timestamp(session.creation_time),
-                last_modified_time: Some(crate::state::timestamp(session.last_modified_time)),
-                // A session that is still being provisioned or running has not ended, and
-                // nothing has failed or blocked it, so neither member reports a value: the
-                // stop and the expiry that end a session are their own operations.
-                end_time: None,
+                creation_time: crate::state::training_session_instant(session.creation_time),
+                last_modified_time: Some(crate::state::training_session_instant(
+                    session.last_modified_time,
+                )),
+                // The instant the session ENDED, which only a session that has reached a
+                // terminal status has: one still provisioning, running or stopping has not
+                // ended, so it reports no value. Nothing has failed or blocked a session
+                // this service's operations can reach, so `ErrorDetails` reports none.
+                end_time: session
+                    .end_time
+                    .map(crate::state::training_session_instant),
                 error_details: None,
-                // The sequence numbers and the token counts are accrued by the training
-                // and sampling operations a caller submits through the SageMaker Training
-                // Session Runtime data plane, which keeps those records in its own store;
-                // this control plane observes none of them, so it reports no count rather
-                // than one it did not measure.
-                last_received_sequence_number: None,
-                billable_token_usage: None,
+                // Two ACCOUNTED quantities, always reported for a session that exists: the
+                // sequence number of the last training operation the session received, and
+                // the tokens billed for its traffic. Both are counters the service keeps,
+                // so a session with no accounted traffic reports the zero it has accounted
+                // rather than no member at all.
+                last_received_sequence_number: Some(usage.last_received_sequence_number),
+                billable_token_usage: Some(BillableTokenUsage {
+                    prefill_token_count: Some(usage.prefill_tokens),
+                    sample_token_count: Some(usage.sample_tokens),
+                    training_token_count: Some(usage.training_tokens),
+                }),
                 vpc_config: session.vpc_config.clone(),
                 role_arn: Some(session.role_arn.clone()),
                 lora_config: Some(session.lora_config.clone()),
@@ -187,13 +209,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 tags: Some(session.tags.clone()),
             },
         };
-        let arn = session.arn.clone();
-        drop(store);
 
         if settled {
             // The transition is a state change, so it leaves the same record a create does
             // rather than happening unobservably on a read path.
-            crate::state::record_state_change(Self::NAME, &arn, ctx);
+            crate::state::record_state_change(Self::NAME, &session.arn, ctx);
         }
         Ok(output)
     }

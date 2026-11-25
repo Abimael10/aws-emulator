@@ -230,6 +230,15 @@ pub struct Session {
     pub loaded_checkpoint_arn: Option<String>,
     /// The checkpoint `loadWeightsForSampling` last loaded for inference.
     pub sampling_checkpoint_arn: Option<String>,
+    /// The sequence number of the last training operation this session RECEIVED, and `0`
+    /// for a session that has received none: sequence numbers start at 1, so zero is the
+    /// cursor of a session no training operation has reached.
+    ///
+    /// Distinct from [`Self::next_sequence_number`], which is the slot the queue will
+    /// EXECUTE next: this one records receipt, so it moves on every accepted submit
+    /// whether or not that operation has executed. It is what the control plane reports as
+    /// `TrainingSessionDetail$LastReceivedSequenceNumber` ([`Session::accounted_usage`]).
+    pub last_received_sequence_number: i32,
 }
 
 impl Session {
@@ -249,7 +258,69 @@ impl Session {
             queue_free_at: None,
             loaded_checkpoint_arn: None,
             sampling_checkpoint_arn: None,
+            last_received_sequence_number: 0,
         }
+    }
+
+    /// Record that this session RECEIVED a training operation carrying `sequence_number`,
+    /// which is what the control plane reports as the last sequence number the session
+    /// received. Called where a submit is ACCEPTED, so a refused one is not accounted.
+    pub fn receive_training_operation(&mut self, sequence_number: i32) {
+        self.last_received_sequence_number = sequence_number;
+    }
+
+    /// What this session has ACCOUNTED so far: the sequence number it last received, and
+    /// the tokens its operations have consumed.
+    ///
+    /// COUNTED from this session's own records rather than estimated: the token totals are
+    /// the sums of the usage the operations themselves report, so an operation that
+    /// consumed no token adds none. No model, tokenizer or training engine runs in this
+    /// emulator, so the operations that would put data through one report no usage and the
+    /// totals stay at the zero the session has really consumed; the sums follow whatever
+    /// the operations do report.
+    ///
+    /// This is the value the data plane publishes into the account the SageMaker control
+    /// plane reads ([`publish_session_usage`]), which reports both as members of its own
+    /// `TrainingSessionDetail`.
+    #[must_use]
+    pub fn accounted_usage(&self) -> ::service_common::training_session_usage::SessionUsage {
+        let mut usage = ::service_common::training_session_usage::SessionUsage {
+            last_received_sequence_number: self.last_received_sequence_number,
+            ..::service_common::training_session_usage::SessionUsage::default()
+        };
+        for op in self.training_ops.values() {
+            // "The token usage statistics for metering purposes": the training operations
+            // that put data through the model are the ones that report it.
+            let reported = match op.result.as_ref() {
+                Some(OperationResult::Forward(result)) => result.token_usage.as_ref(),
+                Some(OperationResult::forwardBackward(result)) => result.token_usage.as_ref(),
+                _ => None,
+            };
+            if let Some(training_tokens) = reported.and_then(|reported| reported.training_tokens) {
+                usage.training_tokens = usage
+                    .training_tokens
+                    .saturating_add(i64::from(training_tokens));
+            }
+        }
+        for op in self.sampling_ops.values() {
+            // A sampling operation reports its usage per SAMPLED SEQUENCE, split into the
+            // tokens the prompt was prefilled with and the tokens decoded for it.
+            let Some(SampleOperationResult::Sample(response)) = op.result.as_ref() else {
+                continue;
+            };
+            for sequence in &response.sequences {
+                let Some(reported) = sequence.token_usage.as_ref() else {
+                    continue;
+                };
+                usage.prefill_tokens = usage
+                    .prefill_tokens
+                    .saturating_add(i64::from(reported.prefill));
+                usage.sample_tokens = usage
+                    .sample_tokens
+                    .saturating_add(i64::from(reported.decode));
+            }
+        }
+        usage
     }
 
     /// Mint an operation id in `namespace`, within `OperationId`'s 1..64 length and
@@ -633,6 +704,51 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsSagemakertrainingsessionruntimeLegorouterserviceState>)
+}
+
+/// The SHARED training-session account in the shared engine: call it with a handler's
+/// `&*self.engine`.
+///
+/// The SageMaker control plane creates and REPORTS a training session, and two members of
+/// the detail it reports — the sequence number the session last received and the tokens
+/// billed for its traffic — are accounted quantities of the traffic THIS service serves
+/// and nothing else observes. So this service publishes what its own records add up to
+/// into one account under one shared type
+/// ([`::service_common::training_session_usage::TrainingSessionUsageDirectory`]); the
+/// engine keys state by TYPE, so a copy of its own inside this service's state would be
+/// invisible to that reader.
+///
+/// LOCK ORDER: a writer takes [`service_state`] first and this account second, and no
+/// reader holds this one while taking another store, so the order cannot invert.
+pub fn training_session_usage<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<
+    ::engine::ServiceState<::service_common::training_session_usage::TrainingSessionUsageDirectory>,
+> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::training_session_usage::TrainingSessionUsageDirectory,
+            >,
+        )
+}
+
+/// Publish what the session `name` has accounted ([`Session::accounted_usage`]) into the
+/// shared account the SageMaker control plane reads.
+///
+/// Called where this service ACCEPTS or PERFORMS work for a session, which is where those
+/// totals change. Publishing is an aid to another service and never part of this
+/// operation's own answer, so an engine holding no account leaves it unwritten rather than
+/// failing the call.
+pub fn publish_session_usage<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    name: &str,
+    usage: ::service_common::training_session_usage::SessionUsage,
+) {
+    if let Some(account) = training_session_usage(engine) {
+        account.lock().publish(name, usage);
+    }
 }
 
 /// The region a request is addressed to: the third field of its SigV4 credential scope,
@@ -1058,4 +1174,220 @@ fn write_document_canonical(out: &mut String, document: &Document) {
         }
     }
     walk(out, document, 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::ops::types::{
+        ComputeLogprobsConfig, ForwardBackwardResult, ForwardResult, LoadStateConfig,
+        SampleResponse, SampleTokenUsage, SampledSequence, TrainingTokenUsage,
+    };
+
+    /// One settled training operation whose result reports `training_tokens`, at
+    /// `sequence`. `kind` picks which result member carries the usage, because the two
+    /// training results that report it are the ones that put data through the model.
+    fn training_op(sequence: i32, kind: &str, training_tokens: Option<i32>) -> TrainingOp {
+        let usage = Some(TrainingTokenUsage {
+            training_tokens,
+        });
+        let result = match kind {
+            "forward" => Some(OperationResult::Forward(ForwardResult {
+                loss_fn_output_type: None,
+                loss_fn_outputs: None,
+                metrics: None,
+                token_usage: usage,
+            })),
+            "forwardBackward" => Some(OperationResult::forwardBackward(ForwardBackwardResult {
+                loss_fn_output_type: None,
+                loss_fn_outputs: None,
+                metrics: None,
+                token_usage: usage,
+            })),
+            // A result member that carries no token usage at all, so nothing is accounted
+            // for it.
+            _ => Some(OperationResult::loadState(LoadStateResult {})),
+        };
+        TrainingOp {
+            operation_id: format!("training-{sequence}-{kind}"),
+            sequence_number: sequence,
+            client_token: None,
+            request_fingerprint: String::new(),
+            config: OperationConfig::loadState(LoadStateConfig::default()),
+            status: STATUS_COMPLETED,
+            result,
+            error_details: None,
+            submitted_at: UNIX_EPOCH,
+            due_at: None,
+            reserved: None,
+        }
+    }
+
+    /// One settled sampling operation whose sampled sequences report `(prefill, decode)`
+    /// each, and `None` for an operation whose result carries no usage.
+    fn sampling_op(id: &str, usage: &[(i32, i32)]) -> SamplingOp {
+        let sequences = usage
+            .iter()
+            .map(|(prefill, decode)| SampledSequence {
+                stop_reason: "stop".to_string(),
+                tokens: vec![1, 2],
+                logprobs: None,
+                token_usage: Some(SampleTokenUsage {
+                    prefill: *prefill,
+                    decode: *decode,
+                }),
+            })
+            .collect();
+        SamplingOp {
+            operation_id: id.to_string(),
+            config: SampleOperationConfig::computeLogprobs(ComputeLogprobsConfig::default()),
+            status: STATUS_COMPLETED,
+            result: Some(SampleOperationResult::Sample(SampleResponse {
+                sequences,
+                prompt_logprobs: None,
+                topk_prompt_logprobs: None,
+            })),
+            error_details: None,
+            submitted_at: UNIX_EPOCH,
+            due_at: None,
+        }
+    }
+
+    /// One row of the accounting table: the traffic a session holds and the totals it must
+    /// then have accounted.
+    struct UsageRow {
+        case: &'static str,
+        /// The sequence number the session last received.
+        received: i32,
+        training_ops: Vec<TrainingOp>,
+        sampling_ops: Vec<SamplingOp>,
+        /// The expected `(cursor, prefill, sample, training)`.
+        expected: (i32, i64, i64, i64),
+    }
+
+    /// RULE: what a session has accounted is COUNTED from its own records — the cursor it
+    /// moved on each received training operation, and the sums of the token usage its
+    /// operations' results report, each kind of usage into the counter it belongs to.
+    #[test]
+    fn accounted_usage_sums_what_the_operations_report() {
+        // The rows span what the rule generalises over: a session with no operation at
+        // all, each kind of traffic on its own, results that report no usage, several
+        // operations and several sampled sequences of one operation.
+        let rows = vec![
+            UsageRow {
+                case: "no operation at all",
+                received: 0,
+                training_ops: vec![],
+                sampling_ops: vec![],
+                expected: (0, 0, 0, 0),
+            },
+            UsageRow {
+                case: "one forward pass reporting training tokens",
+                received: 1,
+                training_ops: vec![training_op(1, "forward", Some(12))],
+                sampling_ops: vec![],
+                expected: (1, 0, 0, 12),
+            },
+            UsageRow {
+                case: "a result that reports no usage",
+                received: 4,
+                training_ops: vec![training_op(4, "loadState", None)],
+                sampling_ops: vec![],
+                expected: (4, 0, 0, 0),
+            },
+            UsageRow {
+                case: "a usage structure whose count is absent",
+                received: 2,
+                training_ops: vec![training_op(2, "forwardBackward", None)],
+                sampling_ops: vec![],
+                expected: (2, 0, 0, 0),
+            },
+            UsageRow {
+                case: "several training operations of both reporting kinds",
+                received: 3,
+                training_ops: vec![
+                    training_op(1, "forward", Some(5)),
+                    training_op(2, "forwardBackward", Some(7)),
+                    training_op(3, "loadState", None),
+                ],
+                sampling_ops: vec![],
+                expected: (3, 0, 0, 12),
+            },
+            UsageRow {
+                case: "one sampling operation of several sequences",
+                received: 0,
+                training_ops: vec![],
+                sampling_ops: vec![sampling_op("sampling-a", &[(10, 3), (20, 4)])],
+                expected: (0, 30, 7, 0),
+            },
+            UsageRow {
+                case: "both kinds of traffic",
+                received: 9,
+                training_ops: vec![training_op(9, "forward", Some(100))],
+                sampling_ops: vec![
+                    sampling_op("sampling-a", &[(1, 2)]),
+                    sampling_op("sampling-b", &[(3, 4)]),
+                ],
+                expected: (9, 4, 6, 100),
+            },
+        ];
+
+        for row in rows {
+            let UsageRow {
+                case,
+                received,
+                training_ops,
+                sampling_ops,
+                expected,
+            } = row;
+            let mut session = Session::new("accounted".to_string(), UNIX_EPOCH);
+            session.receive_training_operation(received);
+            for op in training_ops {
+                session.training_ops.insert(op.operation_id.clone(), op);
+            }
+            for op in sampling_ops {
+                session.sampling_ops.insert(op.operation_id.clone(), op);
+            }
+
+            let usage = session.accounted_usage();
+            let actual = (
+                usage.last_received_sequence_number,
+                usage.prefill_tokens,
+                usage.sample_tokens,
+                usage.training_tokens,
+            );
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected (sequence, prefill, sample, training) {expected:?}, \
+                 got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: the cursor records RECEIPT — it is the sequence number of the last operation
+    /// the session took, not the highest one and not the slot the queue executes next.
+    #[test]
+    fn the_cursor_is_the_last_sequence_number_received() {
+        // Each row is the order the submits arrived in; the cursor is the last of them.
+        let rows: Vec<(&str, Vec<i32>, i32)> = vec![
+            ("nothing received", vec![], 0),
+            ("one operation", vec![1], 1),
+            ("in order", vec![1, 2, 3], 3),
+            ("a gap left behind", vec![1, 5], 5),
+            ("the gap filled afterwards", vec![1, 5, 2], 2),
+        ];
+        for (case, received, expected) in rows {
+            let mut session = Session::new("cursor".to_string(), UNIX_EPOCH);
+            for sequence in received {
+                session.receive_training_operation(sequence);
+            }
+            let actual = session.accounted_usage().last_received_sequence_number;
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected the last received sequence number {expected}, \
+                 got {actual}"
+            );
+        }
+    }
 }

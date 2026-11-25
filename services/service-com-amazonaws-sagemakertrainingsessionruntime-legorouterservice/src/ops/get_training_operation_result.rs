@@ -202,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        Ok(GetTrainingOperationResultOutput {
+        let output = GetTrainingOperationResultOutput {
             status: op.status.to_string(),
             operation_result: op.result.clone(),
             error_details: op.error_details.clone(),
@@ -211,6 +211,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // and no model runs here, so none was consumed. A count is reported only for
             // work that actually ran.
             token_usage: None,
-        })
+        };
+        // The token usage an operation consumed is accounted when the operation itself
+        // settles, which the clock made due at the instant stored on it whether or not
+        // anybody polled: publishing the session's totals here materialises that accrual
+        // for the control plane that reports them, and nothing about the poll changes what
+        // a later caller reads.
+        let accounted = session.accounted_usage();
+        drop(store);
+        crate::state::publish_session_usage(
+            &*self.engine,
+            &input.training_session_name,
+            accounted,
+        );
+
+        Ok(output)
     }
 }

@@ -220,6 +220,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Start the operation that was just submitted, so a caller that polls straight
         // after the submit observes the transient status rather than `Pending` for ever.
         session.advance(now);
+        let accounted = session.accounted_usage();
+        drop(store);
+
+        // What the session has accounted is reported by the SageMaker control plane, which
+        // cannot see this store: it is published into the account both services read.
+        crate::state::publish_session_usage(
+            &*self.engine,
+            &input.training_session_name,
+            accounted,
+        );
 
         Ok(ExecuteSamplingOperationOutput { operation_id })
     }

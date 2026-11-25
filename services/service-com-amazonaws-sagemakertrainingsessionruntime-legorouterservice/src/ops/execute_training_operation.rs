@@ -307,10 +307,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.client_token {
             session.client_tokens.insert(token, operation_id.clone());
         }
+        // The session has RECEIVED this operation's sequence number: the submit was
+        // accepted, so the cursor the control plane reports moves whether or not the queue
+        // executes the operation yet.
+        session.receive_training_operation(input.sequence_number);
         // Let the queue start the operation that is now at its head, so a submit that
         // fills the session's next slot leaves that operation `InProgress` rather than
         // waiting for the first poll to start it.
         session.advance(now);
+        let accounted = session.accounted_usage();
+        drop(store);
+
+        // What the session has accounted is reported by the SageMaker control plane, which
+        // cannot see this store: it is published into the account both services read.
+        crate::state::publish_session_usage(
+            &*self.engine,
+            &input.training_session_name,
+            accounted,
+        );
 
         Ok(ExecuteTrainingOperationOutput { operation_id })
     }

@@ -3317,6 +3317,43 @@ pub fn job_directory<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<::service_common::agentic_rft_jobs::JobDirectory>)
 }
 
+/// The SHARED training-session account directory in the shared engine: call it with a
+/// handler's `&*self.engine`.
+///
+/// A training session is CREATED and REPORTED here (`CreateTrainingSession`,
+/// `DescribeTrainingSession`), while the training and sampling operations submitted
+/// against it are served by the SageMaker Training Session Runtime data plane. Two members
+/// of the reported detail are nevertheless ACCOUNTED quantities of that traffic —
+/// `LastReceivedSequenceNumber` and `BillableTokenUsage` — which only the data plane
+/// observes. So this service can report them only because the data plane PUBLISHED what
+/// its own records add up to, in ONE account under one shared type
+/// ([`::service_common::training_session_usage::TrainingSessionUsageDirectory`]). The
+/// engine keys state by TYPE, so a copy of its own inside
+/// [`ComAmazonawsSagemakerSagemakerState`] would be invisible to that publisher.
+///
+/// LOCK ORDER: as for [`job_directory`] — a caller takes [`service_state`] first and this
+/// account second, and no reader holds this one while taking another store, so the order
+/// cannot invert.
+///
+/// Answer `None` by reporting the ZERO account, which is what a session with no accounted
+/// traffic has accounted
+/// ([`::service_common::training_session_usage::TrainingSessionUsageDirectory::usage`]):
+/// the account is an aid shared with another service, never a reason to refuse a read of
+/// this service's own record.
+pub fn training_session_usage<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<
+    ::engine::ServiceState<::service_common::training_session_usage::TrainingSessionUsageDirectory>,
+> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::training_session_usage::TrainingSessionUsageDirectory,
+            >,
+        )
+}
+
 /// The message a handler refuses with when the service is mounted on an engine that
 /// holds no store for it. Unreachable in the assembled emulator (the router mounts
 /// every service on the one shared `InMemoryEngine`); stated once so no handler

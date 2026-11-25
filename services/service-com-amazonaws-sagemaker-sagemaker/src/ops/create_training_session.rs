@@ -4,8 +4,9 @@
 //! IMPLEMENTED: registers a training session in `crate::state` under its
 //! `TrainingSessionName`, minting the `TrainingSessionArn` from the region the request
 //! signed for, refusing a name already in use, a store at its bound and a model package
-//! group this account does not hold, and storing the instant the clock owes the session's
-//! `Created` -> `Running` transition. This is the ONLY file to touch for this operation.
+//! group this account does not hold, storing the instant the clock owes the session's
+//! `Created` -> `Running` transition, and opening the session's zeroed usage account. This
+//! is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -237,7 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.training_sessions.insert(
             input.training_session_name.clone(),
             crate::state::TrainingSession {
-                name: input.training_session_name,
+                name: input.training_session_name.clone(),
                 arn: arn.clone(),
                 // The compute the session runs on is still being provisioned: the clock
                 // owes `Running` at `running_due_at`.
@@ -252,9 +253,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 creation_time: now,
                 last_modified_time: now,
                 running_due_at: now + crate::state::TRAINING_SESSION_RUNNING_AFTER,
+                // Nobody has asked this session to stop, so the clock owes it no stop and
+                // the session has not ended.
+                stopped_due_at: None,
+                end_time: None,
             },
         );
         drop(store);
+
+        // The session starts its accounting from nothing: it has received no training
+        // operation and consumed no token yet, and a name created again does not inherit
+        // what the session that held it accounted. The account is the one the data plane
+        // that serves this session's operations publishes into, and this service's describe
+        // reports.
+        if let Some(account) = crate::state::training_session_usage(&*self.engine) {
+            account.lock().open(&input.training_session_name);
+        }
 
         crate::state::record_state_change(Self::NAME, &arn, ctx);
         Ok(CreateTrainingSessionOutput {

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopTrainingSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopTrainingSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopTrainingSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: asks the training session `crate::state` holds under the requested
+//! `TrainingSessionName` to stop — the session reports `Stopping` and the clock owes it
+//! the terminal `Stopped` — and refuses a name this account holds no session under. This
+//! is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +130,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopTrainingSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopTrainingSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopTrainingSession"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some((arn, started)) = store.stop_training_session(&input.training_session_name, now)
+        else {
+            return Err(StopTrainingSessionErrorModeled::ResourceNotFound(
+                ResourceNotFound {
+                    message: Some(crate::state::training_session_not_found(
+                        &input.training_session_name,
+                    )),
+                },
+            )
+            .into());
+        };
+        drop(store);
+
+        // A session this call moved into `Stopping` is a state change and leaves the same
+        // record a create does. A session that was already stopping or stopped is left as
+        // it is — the stop it is serving is the one the first call asked for — so this call
+        // changed nothing and records nothing.
+        if started {
+            crate::state::record_state_change(Self::NAME, &arn, ctx);
+        }
+        // "Stops a running training session and sets the session status to Stopping": the
+        // operation's modelled output carries no member, so the terminal `Stopped` the
+        // clock then settles the session in is observed through `DescribeTrainingSession`.
+        Ok(StopTrainingSessionOutput {})
     }
 }

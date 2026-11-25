@@ -26,17 +26,17 @@ use super::inference_deployment_lifecycle::{error_code, message, Emulator, ACCOU
 
 /// The two `TrainingSessionStatus` members a created session passes through, from
 /// `smithy_query(query="shape",shape="TrainingSessionStatus")`.
-const STATUS_CREATED: &str = "Created";
+pub(crate) const STATUS_CREATED: &str = "Created";
 /// See [`STATUS_CREATED`].
-const STATUS_RUNNING: &str = "Running";
+pub(crate) const STATUS_RUNNING: &str = "Running";
 
 /// How long a poll for the clock-owed `Created` -> `Running` transition keeps looking
 /// before it fails. Far above the span itself (3 s), so a loaded or slow host still
 /// passes: the test waits for the CONDITION, not for a fixed time.
-const SETTLE_DEADLINE: Duration = Duration::from_secs(60);
+pub(crate) const SETTLE_DEADLINE: Duration = Duration::from_secs(60);
 
 /// How long the poll loop waits before looking again.
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// A role ARN inside `RoleArn`'s modelled pattern
 /// (`^arn:aws[a-z\-]*:iam::\d{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+$`).
@@ -59,7 +59,7 @@ fn kms_key_arn() -> String {
 const OUTPUT_PATH: &str = "s3://session-outputs/run";
 
 /// A create request for `name` with the required members, plus whatever `extra` names.
-fn create_request(name: &str, extra: Value) -> Value {
+pub(crate) fn create_request(name: &str, extra: Value) -> Value {
     let mut body = json!({
         "TrainingSessionName": name,
         "LoraConfig": { "Rank": 8, "Alpha": 16 },
@@ -86,7 +86,7 @@ fn group_arn(region: &str, name: &str) -> String {
 }
 
 /// A member of a response body, with JSON `null` read as the absence it stands for.
-fn field(body: &Value, member: &str) -> Value {
+pub(crate) fn field(body: &Value, member: &str) -> Value {
     match body.get(member) {
         None | Some(Value::Null) => Value::Null,
         Some(value) => value.clone(),
@@ -94,12 +94,12 @@ fn field(body: &Value, member: &str) -> Value {
 }
 
 /// The `TrainingSessionDetail` a `DescribeTrainingSession` answer carries.
-fn detail(body: &Value) -> Value {
+pub(crate) fn detail(body: &Value) -> Value {
     field(body, "TrainingSessionDetail")
 }
 
 /// Describe `name` in `region`, requiring a 200, and answer the detail it reports.
-async fn describe(emulator: &Emulator, region: &str, name: &str) -> Value {
+pub(crate) async fn describe(emulator: &Emulator, region: &str, name: &str) -> Value {
     let (status, parsed) = emulator
         .call_in(
             region,
@@ -114,18 +114,34 @@ async fn describe(emulator: &Emulator, region: &str, name: &str) -> Value {
     detail(&parsed)
 }
 
-/// The detail members this emulator never fills, each for a reason the handler states: a
-/// session that is provisioning or running has not ended and nothing failed it, and the
-/// sequence numbers and token counts are the runtime data plane's own records.
-const ALWAYS_ABSENT: [&str; 4] = [
-    "EndTime",
-    "ErrorDetails",
-    "LastReceivedSequenceNumber",
-    "BillableTokenUsage",
-];
+/// The detail members this emulator never fills for a session no stop has ended, each for
+/// a reason the handler states: a session that is provisioning or running has not ended,
+/// and nothing has failed or blocked it.
+const ALWAYS_ABSENT: [&str; 2] = ["EndTime", "ErrorDetails"];
+
+/// The ACCOUNTED members every existing session reports, and the value each carries for a
+/// session no traffic has been submitted against: the counters are totals the service
+/// keeps, so a session with nothing accounted reports zero rather than no member.
+///
+/// Member source: `smithy_query(query="shape",shape="TrainingSessionDetail")` —
+/// `LastReceivedSequenceNumber` (JavaInteger) and `BillableTokenUsage`
+/// (`PrefillTokenCount` / `SampleTokenCount` / `TrainingTokenCount`, all long).
+pub(crate) fn zero_accounting() -> Vec<(&'static str, Value)> {
+    vec![
+        ("LastReceivedSequenceNumber", json!(0)),
+        (
+            "BillableTokenUsage",
+            json!({
+                "PrefillTokenCount": 0,
+                "SampleTokenCount": 0,
+                "TrainingTokenCount": 0,
+            }),
+        ),
+    ]
+}
 
 /// Describe `name` until its status is `want`, or fail once [`SETTLE_DEADLINE`] passes.
-async fn poll_until_status(emulator: &Emulator, name: &str, want: &str) -> Value {
+pub(crate) async fn poll_until_status(emulator: &Emulator, name: &str, want: &str) -> Value {
     let started = std::time::Instant::now();
     loop {
         let reported = describe(emulator, "us-east-1", name).await;
@@ -261,8 +277,19 @@ async fn describe_replays_what_create_stored() {
                 "case {case}: {member} must be absent, got {reported}"
             );
         }
+        // The accounted members are reported for every session that exists, zeroed for one
+        // nothing has been submitted against.
+        for (member, want) in zero_accounting() {
+            assert_eq!(
+                field(&reported, member),
+                want,
+                "case {case}: {member} must be reported as {want}, got {reported}"
+            );
+        }
         // Both timestamps are reported, and a session nothing has modified yet reports
-        // the instant it was created as both.
+        // the instant it was created as both. Each is an epoch-seconds number carrying
+        // the WHOLE SECOND the instant fell in: the host clock's sub-second remainder is
+        // not part of what this service reports.
         let created_at = field(&reported, "CreationTime")
             .as_f64()
             .unwrap_or_else(|| panic!("case {case}: CreationTime is a timestamp"));
@@ -274,6 +301,14 @@ async fn describe_replays_what_create_stored() {
             "case {case}: expected LastModifiedTime at or after CreationTime, \
              got {modified_at} and {created_at}"
         );
+        for (member, at) in [("CreationTime", created_at), ("LastModifiedTime", modified_at)] {
+            assert_eq!(
+                at.fract(),
+                0.0,
+                "case {case}: {member} carries the whole second the instant fell in, \
+                 got {at}"
+            );
+        }
     }
 
     // Every session is its own record: each row still reads back its own configuration

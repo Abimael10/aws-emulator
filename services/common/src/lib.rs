@@ -100,6 +100,12 @@
 //!   own API carries no feature-group definition, so a record's identifier feature and
 //!   its event-time feature, and whether the named group exists at all, are knowable
 //!   there only because the control plane recorded them;
+//! * [`training_session_usage`], the account one SageMaker training session's accounted
+//!   traffic is kept in — the sequence number of the last training operation it received
+//!   and the tokens billed for it — written by the SageMaker Training Session Runtime data
+//!   plane, which is the only service that serves those operations, and read by the
+//!   SageMaker control plane, which REPORTS both on its own describe of the session and
+//!   cannot see the data plane's store;
 //! * [`management_events`], the account's management-event (audit) log — written by the
 //!   service that SERVED an API call, which is the only one that knows the call
 //!   happened, and read by CloudTrail, which is the service that reports it
@@ -322,6 +328,11 @@ pub mod ad_directories;
 /// of a reinforcement-fine-tuning category, and the AgenticRFT job runtime data plane
 /// reads to resolve the job ARN its callers carry.
 pub mod agentic_rft_jobs;
+/// The account one SageMaker training session's accounted traffic is kept in — what it has
+/// received and what it has consumed — written by the SageMaker Training Session Runtime
+/// data plane that serves its operations and read by the SageMaker control plane that
+/// reports the session.
+pub mod training_session_usage;
 /// The inventory of which AgentCore Memory containers and code interpreters the account
 /// holds, written by the Bedrock AgentCore CONTROL plane — which creates and deletes them —
 /// and read by the AgentCore DATA plane, which creates neither and so cannot tell a
