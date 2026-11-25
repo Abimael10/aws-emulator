@@ -11,34 +11,44 @@ use super::*;
 /// the "AWS WAF quotas" page of the AWS WAF Developer Guide), and the `QuotaCode`s that
 /// catalog is keyed on.
 ///
-/// Two rows are published as quotas OF A RESOURCE rather than of the account: the AWS
-/// AppSync GraphQL API associations and the API Gateway REST API associations of one
-/// regional web ACL may be raised for an individual resource as well as account-wide, so
-/// each names the level AWS publishes it as adjustable at and the resource type that plane
-/// applies to ([`QuotaRow::adjustable_at`]), and reports the RESOURCE scope on every record
-/// of it, because the plane it is counted on is the resource whichever record is read
-/// ([`QuotaRow::counted_per_resource`]).
+/// Three rows are published as quotas OF A RESOURCE rather than of the account: the AWS
+/// AppSync GraphQL API associations, the API Gateway REST API associations and the custom
+/// response bodies of one regional web ACL may be raised for an individual resource as
+/// well as account-wide, so each names the level AWS publishes it as adjustable at and the
+/// resource type that plane applies to ([`QuotaRow::adjustable_at`]), and reports the
+/// RESOURCE scope on every record of it, because the plane it is counted on is the
+/// resource whichever record is read ([`QuotaRow::counted_per_resource`]).
 ///
 /// The recorded listing states the quota published under `L-B32E8672` (the API Gateway
 /// REST API associations of one regional web ACL, 100, scoped to the web ACL), under
 /// `L-D6DA96AE` (the account's regional IP sets, 100, metered by the `AWS/Usage`
 /// `ResourceCount` of that plane over the window those counts are published over), under
 /// `L-5B2F9B11` (the AWS AppSync GraphQL API associations of one regional web ACL, 100,
-/// scoped to the web ACL the same way) and under `L-D95DED7E` (the inspectable request-body
-/// size, in kilobytes, of the protections it names, 64, NOT adjustable). The rule-group
-/// capacity, the `GetSampledRequests` rate, the web ACL's capacity units and the retained
-/// managed-rule-group versions this catalog used to key on those codes are NOT published
-/// here, and neither is the code it used to key the account's IP sets on (`L-08788A4E`): no
-/// source available here states AWS's code for the first group or AWS's quota for the last
-/// one, so they are left to the default-quota-set gap rather than served under another
-/// quota's code. A row whose published `Description` no source available here states
-/// carries none, rather than a sentence this emulator words itself.
+/// scoped to the web ACL the same way), under `L-71C2E81B` (the custom response bodies of
+/// one regional web ACL or rule group, published as ADJUSTABLE and as a quota of the web
+/// ACL, adjustable at the `ALL` level) and under `L-D95DED7E` (the inspectable
+/// request-body size, in kilobytes, of the protections it names, 64, NOT adjustable). The
+/// rule-group capacity, the `GetSampledRequests` rate, the web ACL's capacity units and
+/// the retained managed-rule-group versions this catalog used to key on those codes are
+/// NOT published here, and neither is the code it used to key the account's IP sets on
+/// (`L-08788A4E`): no source available here states AWS's code for the first group or AWS's
+/// quota for the last one, so they are left to the default-quota-set gap rather than
+/// served under another quota's code. A row whose published `Description` no source
+/// available here states carries none, rather than a sentence this emulator words itself.
+///
+/// The statement nesting depth of one rule, which this catalog used to key on
+/// `L-71C2E81B`, is the plane that binding displaced: it is carried by `L-0224FEE0`, whose
+/// own published quota no source available here states. That is not a claim that AWS
+/// publishes the nesting depth under `L-0224FEE0`, and it is replaced the moment the quota
+/// that code publishes can be sourced.
 pub(in crate::state) fn wafv2_quotas() -> Vec<QuotaRow> {
     vec![
-        quota("Custom response bodies per web ACL", 50.0)
+        // A code whose own published quota no source available here states, carrying the
+        // plane the `L-71C2E81B` binding displaced (see the header).
+        quota("Statement nesting depth per rule", 10.0)
             .code("L-0224FEE0")
             .fixed()
-            .describe("The maximum number of custom response bodies in one web ACL."),
+            .describe("The maximum nesting depth of the statements of one rule."),
         quota("Custom headers per rule", 5.0)
             .code("L-030B54CC")
             .fixed()
@@ -99,10 +109,23 @@ pub(in crate::state) fn wafv2_quotas() -> Vec<QuotaRow> {
             .code("L-6F32B880")
             .fixed()
             .describe("The maximum number of labels added by one rule."),
-        quota("Statement nesting depth per rule", 10.0)
-            .code("L-71C2E81B")
-            .fixed()
-            .describe("The maximum nesting depth of the statements of one rule."),
+        // The custom response bodies of one regional web ACL or rule group, which the
+        // recorded listing publishes under this code as ADJUSTABLE and as a quota OF the
+        // web ACL — so the row carries that level and that resource type. Those are the
+        // members a source states for this code. Its limit is the plane's published
+        // default, the exact wording of its published NAME is reconstructed from the way
+        // the recorded listing words the two sibling rows of this class (`L-5B2F9B11` and
+        // `L-B32E8672`) rather than quoted, and the sentence AWS publishes for it no
+        // source available here states, so the row carries none: name and value are
+        // replaced the moment the recorded row can be read.
+        quota(
+            "Maximum number of custom response bodies per web ACL or rule group in WAF for \
+             regional",
+            50.0,
+        )
+        .code("L-71C2E81B")
+        .adjustable_at(LEVEL_ALL, "AWS::WAFv2::WebACL")
+        .counted_per_resource(),
         quota("Token domains per web ACL", 10.0)
             .code("L-74EBD1DD")
             .fixed()

@@ -182,6 +182,7 @@ const DESCRIPTION_WITHHELD: &[(&str, &str)] = &[
     ("vpc-lattice", "L-6095700C"),
     ("vpc-lattice", "L-CA6A1CC5"),
     ("wafv2", "L-5B2F9B11"),
+    ("wafv2", "L-71C2E81B"),
     ("wafv2", "L-B32E8672"),
     ("wafv2", "L-D6DA96AE"),
     ("wafv2", "L-D95DED7E"),

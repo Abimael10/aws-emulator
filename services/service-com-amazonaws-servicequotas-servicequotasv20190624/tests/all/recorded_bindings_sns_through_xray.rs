@@ -669,7 +669,10 @@ fn period_json(period: Option<(i32, &str)>) -> Value {
 /// The `QuotaContext` a row publishes, as the wire reports it: a row managed for the
 /// account describes no plane at all, and one published as a quota of a resource names
 /// the resource type and the level an increase is askable at.
-fn context_json(resource_plane: Option<(&str, &str)>) -> Value {
+///
+/// `pub(crate)` so the other suites in this target describe the context shape through ONE
+/// construction instead of each growing a copy of it.
+pub(crate) fn context_json(resource_plane: Option<(&str, &str)>) -> Value {
     match resource_plane {
         Some((scope_type, level)) => json!({
             "ContextScope": "RESOURCE",

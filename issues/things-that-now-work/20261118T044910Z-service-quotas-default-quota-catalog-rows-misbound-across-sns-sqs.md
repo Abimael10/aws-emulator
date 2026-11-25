@@ -998,7 +998,7 @@ Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCod
 Issue-Related: 20261114T054246Z-service-quotas-timestream-listawsdefaultservicequotas-rows-are-bound-to-the-wrong.md
 Issue-Commit: 2b493b29800d7a854b42f905b4db8bab42375d7a
 
-# Default quota catalog rows misbound across sns sqs sso storagegateway timestream vpc vpc-lattice wafv2 workspaces xray
+# Default quota catalog rows misbound across sns sqs sso storagegateway timestream vpc vpc-lattice wafv2 workspaces xray (PARTIAL CLOSE: every per-code binding, value, unit, adjustability, period, usage metric, quota context and Description THIS REPORT QUOTES is now published under the code the recording binds it to — the last one outstanding, wafv2 `L-71C2E81B`, by this fix; the codes whose recorded quota the report does not state carry no row of another quota's, as the report's own rule requires, and closing them needs the recorded rows themselves, which nothing in this checkout states)
 
 > _Note: this issue was identified against the code base at commit `2b493b29800d7a854b42f905b4db8bab42375d7a`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
