@@ -572,8 +572,23 @@ async fn an_athena_rate_row_meters_its_own_api() {
         }
     }
 
+    // A throttled API publishes a rate and the multiplier on it — except where the code
+    // one of the two rows had been served under publishes another quota entirely, as the
+    // recorded listing states for the `StopQueryExecution` multiplier, whose own code that
+    // listing does not state: that row is published under none at all, so its API appears
+    // among the rates with no multiplier beside it.
+    const MULTIPLIER_UNDER_NO_CODE: &[&str] = &["StopQueryExecution"];
+    let multiplied: BTreeSet<String> = burst
+        .union(
+            &MULTIPLIER_UNDER_NO_CODE
+                .iter()
+                .map(|api| (*api).to_string())
+                .collect(),
+        )
+        .cloned()
+        .collect();
     assert_eq!(
-        replenished, burst,
+        replenished, multiplied,
         "case athena: a throttled API publishes a rate and the multiplier on it, got \
          {replenished:?} replenished and {burst:?} multiplied"
     );

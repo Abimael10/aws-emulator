@@ -291,6 +291,69 @@ pub(crate) async fn whole_default_catalog(
     catalog
 }
 
+/// The `AWS/Usage` series a published default-quota row is metered by, as the catalog
+/// suites pin it.
+///
+/// `pub(crate)` with the two constructors below so the suites that pin a metered row share
+/// ONE construction of the `MetricInfo` JSON rather than each keeping a copy of it.
+pub(crate) struct Metric {
+    pub(crate) metric_name: &'static str,
+    pub(crate) statistic: &'static str,
+    /// The service's DISPLAY name, as `AWS/Usage` publishes it.
+    pub(crate) usage_service: &'static str,
+    /// The usage `Class` the series is published under — `None` where the service
+    /// publishes no class, and the class's own name where it does.
+    pub(crate) class: &'static str,
+    pub(crate) resource: &'static str,
+    pub(crate) usage_type: &'static str,
+}
+
+impl Metric {
+    /// The `MetricInfo` JSON this series is published as.
+    pub(crate) fn published(&self) -> Value {
+        json!({
+            "MetricNamespace": "AWS/Usage",
+            "MetricName": self.metric_name,
+            "MetricStatisticRecommendation": self.statistic,
+            "MetricDimensions": {
+                "Service": self.usage_service,
+                "Class": self.class,
+                "Resource": self.resource,
+                "Type": self.usage_type,
+            },
+        })
+    }
+}
+
+/// The count of a RESOURCE in use: the largest count over the window is the one that
+/// matters, so `Maximum` is the statistic recommended for it.
+pub(crate) const fn resource_count(
+    usage_service: &'static str,
+    resource: &'static str,
+) -> Metric {
+    Metric {
+        metric_name: "ResourceCount",
+        statistic: "Maximum",
+        usage_service,
+        class: "None",
+        resource,
+        usage_type: "Resource",
+    }
+}
+
+/// The call count of ONE API: a rate is the calls added up over the window, so `Sum` is
+/// the statistic recommended for it.
+pub(crate) const fn call_count(usage_service: &'static str, api: &'static str) -> Metric {
+    Metric {
+        metric_name: "CallCount",
+        statistic: "Sum",
+        usage_service,
+        class: "None",
+        resource: api,
+        usage_type: "API",
+    }
+}
+
 /// Every listing yields ONE ordered set of items, whatever page size it is walked
 /// with, and a page size is honoured.
 #[tokio::test]

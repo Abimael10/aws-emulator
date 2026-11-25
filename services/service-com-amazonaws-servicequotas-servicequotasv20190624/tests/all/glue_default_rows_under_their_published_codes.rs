@@ -27,6 +27,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 
 use crate::quota_workflow::{client, default_quotas, emulator, walk_pages, Client};
+use crate::recorded_rows_events_through_imagebuilder::sentence_is_unsourced;
 
 /// One row of the `glue` catalog, as the service publishes it under its own code.
 struct Row {
@@ -198,7 +199,7 @@ const ROWS: &[Row] = &[
         value: 40.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum number of integrations in your account.",
+        description: "The maximum number of integrations per AWS Region for this account.",
         period: None,
         call_count: None,
     },
@@ -210,7 +211,7 @@ const ROWS: &[Row] = &[
         value: 1_000_000.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum number of data quality rulesets in your account.",
+        description: "The maximum number of data quality rulesets per account.",
         period: None,
         call_count: None,
     },
@@ -235,17 +236,18 @@ const DISPLACED_QUOTA_NAMES: &[&str] = &[
     "Rate of GetPartitions requests",
     "Rate of StartJobRun requests",
     "Rate of BatchDeletePartition requests",
+    "Rate of CreateTable requests",
+    "Rate of StartWorkflowRun requests",
 ];
 
-/// The `QuotaCode`s this catalog used to serve a quota that belongs under another code: no
-/// source available here binds any `glue` quota to either, so each carries no row at all
-/// rather than a second copy of the quota now published under `L-04CEE988` and under
-/// `L-87F5991C`.
+/// The `QuotaCode` this catalog used to serve a quota that belongs under another code: no
+/// source available here binds any `glue` quota to it, so it carries no row at all rather
+/// than a second copy of the quota now published under `L-04CEE988`.
 ///
 /// The rest of the default-quota-set gap (the recorded codes whose quota no source states)
 /// is reported by the count equation and the `GAP_CODE_COUNT` tripwire of
 /// `aws_minted_catalog_coverage.rs`, so that shortfall is not asserted here as a contract.
-const GAP_CODES: &[&str] = &["L-5E4153CA", "L-83192DBF"];
+const GAP_CODES: &[&str] = &["L-5E4153CA"];
 
 /// The `glue` catalog, keyed by `QuotaCode`, asserting each code is published once.
 async fn catalog_by_code(caller: &Client) -> BTreeMap<String, Value> {
@@ -388,12 +390,23 @@ async fn a_displaced_glue_quota_is_published_under_no_code() {
     }
 
     // A sentence belongs to one quota of the service, so no two rows share one: a row that
-    // borrowed a neighbour's text would show up here.
+    // borrowed a neighbour's text would show up here. A row whose own sentence no source
+    // states carries none at all, which is what `sentence_is_unsourced` answers for.
     let mut by_description: BTreeMap<&str, &String> = BTreeMap::new();
     for (code, quota) in &catalog {
         let Some(description) = quota["Description"].as_str() else {
-            panic!("case glue/{code}: every published row carries its sentence, got {quota}")
+            assert!(
+                sentence_is_unsourced("glue", code),
+                "case glue/{code}: every published row whose sentence a source states \
+                 carries it, got {quota}"
+            );
+            continue;
         };
+        assert!(
+            !sentence_is_unsourced("glue", code),
+            "case glue/{code}: a row whose sentence no source states publishes none, got \
+             {description:?}"
+        );
         if let Some(first) = by_description.insert(description, code) {
             panic!(
                 "case glue/{code}: a published sentence belongs to one quota, got \

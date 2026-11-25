@@ -100,7 +100,7 @@ const SERVICES: &[ServiceRow] = &[
             Published {
                 quota_code: "L-782A3EE2",
                 quota_name: "Scalable targets for ECS",
-                value: 500.0,
+                value: 3000.0,
                 unit: "None",
                 adjustable: true,
             },

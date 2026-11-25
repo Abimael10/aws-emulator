@@ -27,6 +27,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 
 use crate::quota_workflow::{client, default_quotas, emulator, Client};
+use crate::recorded_rows_events_through_imagebuilder::sentence_is_unsourced;
 
 /// One row of the `glue` catalog, as the service publishes it under its own code.
 struct Row {
@@ -292,11 +293,17 @@ async fn a_glue_quota_displaced_from_an_account_plane_code_is_published_under_no
     }
 
     // A sentence belongs to one quota of the service, so no two rows share one: a row that
-    // borrowed a neighbour's text would show up here.
+    // borrowed a neighbour's text would show up here. A row whose own sentence no source
+    // states carries none at all, which is what `sentence_is_unsourced` answers for.
     let mut by_description: BTreeMap<&str, &String> = BTreeMap::new();
     for (code, quota) in &catalog {
         let Some(description) = quota["Description"].as_str() else {
-            panic!("case glue/{code}: every published row carries its sentence, got {quota}")
+            assert!(
+                sentence_is_unsourced("glue", code),
+                "case glue/{code}: every published row whose sentence a source states \
+                 carries it, got {quota}"
+            );
+            continue;
         };
         if let Some(first) = by_description.insert(description, code) {
             panic!(

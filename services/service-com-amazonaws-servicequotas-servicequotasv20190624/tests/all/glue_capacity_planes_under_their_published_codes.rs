@@ -151,15 +151,15 @@ async fn an_increase_requested_by_a_glue_code_with_no_stated_quota_is_refused() 
     let engine = emulator();
     let caller = client(&engine, "eu-west-3");
 
-    // `L-83192DBF` is the code the data-quality-ruleset plane had been served under; that
-    // plane is published under `L-87F5991C` above, and no source available here states
-    // which quota `glue` publishes under this code.
+    // `L-5E4153CA` is the code the account's machine-learning transforms had been served
+    // under; that plane is published under `L-04CEE988`, and no source available here
+    // states which quota `glue` publishes under this code.
     let (status, error) = caller
         .refused(
             "RequestServiceQuotaIncrease",
             json!({
                 "ServiceCode": "glue",
-                "QuotaCode": "L-83192DBF",
+                "QuotaCode": "L-5E4153CA",
                 "DesiredValue": 2_000.0,
             }),
         )
@@ -167,7 +167,7 @@ async fn an_increase_requested_by_a_glue_code_with_no_stated_quota_is_refused() 
     assert_eq!(
         (status, error.as_str()),
         (400, "NoSuchResourceException"),
-        "case glue/L-83192DBF: an increase on a code this service publishes nothing under \
+        "case glue/L-5E4153CA: an increase on a code this service publishes nothing under \
          must be refused"
     );
 
@@ -175,13 +175,13 @@ async fn an_increase_requested_by_a_glue_code_with_no_stated_quota_is_refused() 
     let (status, error) = caller
         .refused(
             "ListRequestedServiceQuotaChangeHistoryByQuota",
-            json!({"ServiceCode": "glue", "QuotaCode": "L-83192DBF"}),
+            json!({"ServiceCode": "glue", "QuotaCode": "L-5E4153CA"}),
         )
         .await;
     assert_eq!(
         (status, error.as_str()),
         (400, "NoSuchResourceException"),
-        "case glue/L-83192DBF: the history of a code this service publishes nothing under \
+        "case glue/L-5E4153CA: the history of a code this service publishes nothing under \
          must be refused"
     );
 }

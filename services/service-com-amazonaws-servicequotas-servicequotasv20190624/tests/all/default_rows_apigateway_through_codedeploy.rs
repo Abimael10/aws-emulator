@@ -35,38 +35,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 
-use crate::quota_workflow::{client, default_quotas as defaults, emulator};
-
-/// The `AWS/Usage` metric a published row is metered by.
-///
-/// The sibling suites' helper fixes the usage `Class` at `None`; a row of these catalogs
-/// can publish a class of its own (Athena publishes its active-query count per query
-/// class), so the class is a field here.
-struct Metric {
-    metric_name: &'static str,
-    statistic: &'static str,
-    usage_service: &'static str,
-    class: &'static str,
-    resource: &'static str,
-    usage_type: &'static str,
-}
-
-impl Metric {
-    /// The `MetricInfo` JSON this metric is published as.
-    fn published(&self) -> Value {
-        json!({
-            "MetricNamespace": "AWS/Usage",
-            "MetricName": self.metric_name,
-            "MetricStatisticRecommendation": self.statistic,
-            "MetricDimensions": {
-                "Service": self.usage_service,
-                "Class": self.class,
-                "Resource": self.resource,
-                "Type": self.usage_type,
-            },
-        })
-    }
-}
+// The `AWS/Usage` metric a published row is metered by is the `Metric` the catalog suites
+// share: a row of these catalogs can publish a usage `Class` of its own (Athena publishes
+// its active-query count per query class), which is why that dimension is a field of it.
+use crate::quota_workflow::{
+    call_count, client, default_quotas as defaults, emulator, resource_count, Metric,
+};
 
 /// One published default-quota row.
 struct Published {
@@ -83,30 +57,6 @@ struct Published {
     period: Option<(i32, &'static str)>,
     /// The usage metric, for a quota usage is published for.
     metric: Option<Metric>,
-}
-
-/// A `ResourceCount` metric: the largest count over the window is the one that matters.
-const fn resource_count(usage_service: &'static str, resource: &'static str) -> Metric {
-    Metric {
-        metric_name: "ResourceCount",
-        statistic: "Maximum",
-        usage_service,
-        class: "None",
-        resource,
-        usage_type: "Resource",
-    }
-}
-
-/// A `CallCount` metric of one API: a rate is the calls added up over the window.
-const fn call_count(usage_service: &'static str, api: &'static str) -> Metric {
-    Metric {
-        metric_name: "CallCount",
-        statistic: "Sum",
-        usage_service,
-        class: "None",
-        resource: api,
-        usage_type: "API",
-    }
 }
 
 /// The `ServiceCode`s whose whole catalogs the second test walks.

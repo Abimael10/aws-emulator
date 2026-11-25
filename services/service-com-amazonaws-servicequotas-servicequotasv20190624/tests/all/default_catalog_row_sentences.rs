@@ -129,7 +129,7 @@ const ROWS: &[Row] = &[
         service_code: "appconfig",
         quota_code: "L-A5FC0339",
         quota_name: "Deployment size limit",
-        value: 1024.0,
+        value: 2048.0,
         unit: "Kilobytes",
         adjustable: true,
         description: None,

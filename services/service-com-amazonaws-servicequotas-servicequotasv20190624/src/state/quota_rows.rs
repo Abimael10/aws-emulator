@@ -211,7 +211,13 @@ fn maximum_number_phrase(counted: &str) -> String {
 /// adjustable), the account's client certificates (`L-824C9E42`), the integration timeout
 /// in milliseconds (`L-E5AE38E3`), the Regional APIs of a Region (`L-AA0FF27B`, published
 /// as NOT adjustable) and the length of a method ARN (`L-5244589D`, published in bytes and
-/// as not adjustable). API Gateway publishes a row's sentence as the quota's OWN published
+/// as not adjustable). That listing also states the quota published under four codes this
+/// catalog had bound to other planes: the size a resource policy may reach (`L-8B81B02C`,
+/// with the sentence it states for the plane), the developer portals of an account
+/// (`L-F8BD84D3`), the subnets of a VERSION 2 VPC link (`L-668C9B28`) and the payload size
+/// of ONE WebSocket message (`L-FD0EB744`, published in kilobytes).
+///
+/// API Gateway publishes a row's sentence as the quota's OWN published
 /// phrase rather than in a counted-plane voice, except on the planes it minted later (the
 /// portal and domain-name-access planes) and the account's API keys and client
 /// certificates, which carry the `The maximum number of …` form; a row whose own published
@@ -220,10 +226,12 @@ fn maximum_number_phrase(counted: &str) -> String {
 ///
 /// The codes this listing states no quota for keep the row they have carried, as the module
 /// header states: `L-01C8A9E0`, the code the Regional-API plane below vacated, carries the
-/// HTTP-API authorizer count, and the two planes left with no code of their own — the size
-/// of a resource policy, and the per-Region API-key count the recorded listing shows is the
-/// same plane as `L-1D180A63`'s — are published under no row, since minting a code for them
-/// would assert an identity AWS never assigned.
+/// HTTP-API authorizer count, and `L-A966AB5C`, the code the WebSocket-payload binding
+/// vacated, carries the per-API TAG plane that binding displaced. The planes left with no
+/// code of their own — the account's request rate, its per-API integration count, its
+/// per-Region custom-domain-name count, and the per-Region API-key count the recorded
+/// listing shows is the same plane as `L-1D180A63`'s — are published under no row, since
+/// minting a code for them would assert an identity AWS never assigned.
 pub(super) fn apigateway_quotas() -> Vec<QuotaRow> {
     vec![
         // The quota this code publishes is one nothing available here names, so the row
@@ -273,7 +281,11 @@ pub(super) fn apigateway_quotas() -> Vec<QuotaRow> {
         quota("Client certificates per account per Region", 60.0).code("L-608BDCD4"),
         quota("Usage plans per account per Region", 300.0).code("L-60AC41CD"),
         quota("Usage plans per API key", 10.0).code("L-65B5C802"),
-        quota("Custom domain names per account per Region", 120.0).code("L-668C9B28"),
+        // The subnets a VERSION 2 VPC link may reach, which the recorded listing publishes
+        // under THIS code at its published default. The per-Region custom-domain-name count
+        // this code had carried names no code that listing states, so this catalog
+        // publishes no row for it (see the module header).
+        quota("Subnets per VPC link(V2)", 10.0).code("L-668C9B28"),
         quota("Base path mappings per domain name", 200.0).code("L-68B79FF0"),
         // The developer-portal planes, published as NOT adjustable: the products of an
         // account's portals, and the custom domain names ONE portal may carry.
@@ -291,11 +303,16 @@ pub(super) fn apigateway_quotas() -> Vec<QuotaRow> {
             )),
         quota("Models per API", 300.0).code("L-85120D8E"),
         quota("Request validators per API", 20.0).code("L-8A5B8E43"),
-        // The account-level request rate and its burst allowance: a rate quota, so it
-        // carries the one-second window AWS publishes it over.
-        quota("Throttle rate", 10_000.0)
+        // The size a RESOURCE POLICY may reach, which the recorded listing publishes under
+        // THIS code, at the bytes its name states and with the sentence it states for the
+        // plane. The account-level request rate this code had carried names no code that
+        // listing states, so this catalog publishes no row for it (see the module header).
+        quota("Maximum resource policy size in bytes", 8192.0)
             .code("L-8B81B02C")
-            .period(1, "SECOND"),
+            .describe(
+                "The maximum resource policy size in bytes you can have in this account in \
+                 the current region.",
+            ),
         quota("Throttle burst rate", 5000.0).code("L-8C2F9A1D").fixed(),
         quota("Integration timeout", 29_000.0)
             .code("L-8E6A5A87")
@@ -341,10 +358,12 @@ pub(super) fn apigateway_quotas() -> Vec<QuotaRow> {
             .code("L-A93447B8")
             .unit("Kilobytes")
             .fixed(),
-        quota("WebSocket message payload size", 128.0)
-            .code("L-A966AB5C")
-            .unit("Kilobytes")
-            .fixed(),
+        // The quota THIS code publishes is one nothing available here names — the recorded
+        // listing publishes the WebSocket message payload size under the code the per-API
+        // tag plane had carried — so the row carries that displaced plane, marked as the
+        // module header says such a row is: not a claim about AWS, and replaced the moment
+        // the quota this code publishes can be sourced.
+        quota("Tags per API", 50.0).code("L-A966AB5C").fixed(),
         quota("Routes per WebSocket API", 300.0).code("L-A9DBC573"),
         // The Regional APIs of a Region, which the recorded listing publishes under THIS
         // code, at its published default and as NOT adjustable.
@@ -395,9 +414,18 @@ pub(super) fn apigateway_quotas() -> Vec<QuotaRow> {
             .unit("Kilobytes")
             .fixed()
             .describe("The maximum size of a logo"),
-        quota("Integrations per API", 300.0).code("L-F8BD84D3"),
+        // The developer PORTALS of an account, which the recorded listing publishes under
+        // THIS code at its published default. The per-API integration count this code had
+        // carried names no code that listing states, so this catalog publishes no row for
+        // it.
+        quota("Portals per account", 15.0).code("L-F8BD84D3"),
         quota("Authorizers per WebSocket API", 10.0).code("L-FB4F0270"),
-        quota("Tags per API", 50.0).code("L-FD0EB744").fixed(),
+        // The payload size of ONE WebSocket message, which the recorded listing publishes
+        // under THIS code, in kilobytes and as not adjustable.
+        quota("WebSocket message payload size", 128.0)
+            .code("L-FD0EB744")
+            .unit("Kilobytes")
+            .fixed(),
     ]
 }
 
@@ -449,7 +477,8 @@ fn appconfig_resource_plane(code: &str, name: &str, limit: f64, resource: &str) 
 /// `L-FA210A1F`, with that plane's own `ResourceCount` series and the sentence AppConfig
 /// publishes for the plane, the applications of the account under `L-EEB0151E`, the
 /// environments of an application under `L-A52E46BE`, at the limit that listing states for
-/// it, and the size limit of ONE deployment under `L-A5FC0339`.
+/// it, and the size limit of ONE deployment under `L-A5FC0339`, at the limit it states for
+/// that plane.
 pub(super) fn appconfig_quotas() -> Vec<QuotaRow> {
     vec![
         quota("Maximum number of treatments per experiment", 5.0).code("L-08D2C632"),
@@ -468,13 +497,11 @@ pub(super) fn appconfig_quotas() -> Vec<QuotaRow> {
             "EnvironmentsPerApplication",
         ),
         // The size limit on ONE deployment, which the recorded listing publishes under
-        // THIS code, in the kilobytes the size planes of this service are published in.
-        // The limit that listing states for it is not available here, so the row keeps the
-        // limit it has carried, as the module header says a member nothing states is
-        // treated; the size limit of a configuration store this service does not host,
-        // which this code had carried, is left with no code of its own and so is published
-        // under no row.
-        quota("Deployment size limit", 1024.0)
+        // THIS code, at the limit it states for the plane and in the kilobytes the size
+        // planes of this service are published in. The size limit of a configuration
+        // store this service does not host, which this code had carried, is left with no
+        // code of its own and so is published under no row.
+        quota("Deployment size limit", 2048.0)
             .code("L-A5FC0339")
             .unit("Kilobytes"),
         quota("Maximum number of experiment definitions per application", 50.0)
@@ -550,11 +577,14 @@ fn per_target_phrase(counted: &str) -> String {
 ///
 /// The recorded default-quota listing of that code states which service's targets the codes
 /// it names publish: `L-A2AD6458` Lambda, `L-1AAF0700` SageMaker, `L-4A11ECEB` the custom
-/// resources of the custom resource namespace, `L-60E4E5E2` the targets of the ElastiCache
-/// namespace, `L-799ACCDF` Amazon Keyspaces (whose namespace AWS publishes as Cassandra and
-/// which carries the class's higher limit), `L-8998F403` AppStream and `L-D75CA9D2` EMR
-/// (whose namespace AWS publishes as Elastic MapReduce (EMR) and which it publishes as
-/// adjustable); that the per-target scheduled-action plane is the NOT-adjustable row
+/// resources of the custom resource namespace, `L-60E4E5E2` Amazon ElastiCache (whose
+/// targets are registered under the ElastiCache namespace), `L-799ACCDF` Amazon Keyspaces
+/// (whose namespace AWS publishes as Cassandra and which carries the class's higher limit),
+/// `L-800F6F7B` RDS, `L-1A11EB4B` Amazon MSK (whose targets are registered under the Kafka
+/// namespace), `L-8998F403` AppStream and `L-D75CA9D2` EMR (whose namespace AWS publishes
+/// as Elastic MapReduce (EMR) and which it publishes as adjustable); the limits it states
+/// for the ECS plane (`L-782A3EE2`) and the DynamoDB plane (`L-A1D42901`), each above the
+/// class's own; that the per-target scheduled-action plane is the NOT-adjustable row
 /// published under `L-95848B5F`; and that the step adjustments of a step scaling policy are
 /// published under `L-9C25247C`. The scalable service the remaining codes of the class
 /// publish is not stated there, so those rows carry a service the listing binds to no other
@@ -562,24 +592,28 @@ fn per_target_phrase(counted: &str) -> String {
 pub(super) fn application_autoscaling_quotas() -> Vec<QuotaRow> {
     vec![
         scalable_targets("L-17D5F681", "Comprehend", "Comprehend", 500.0),
-        scalable_targets("L-1A11EB4B", "Aurora", "Aurora", 500.0),
+        // The Amazon MSK plane, named for that service as AWS names it and described for
+        // the Kafka namespace its targets are registered under.
+        scalable_targets("L-1A11EB4B", "Amazon MSK", "Kafka", 500.0),
         scalable_targets("L-1AAF0700", "SageMaker", "SageMaker", 500.0),
         scalable_targets("L-297D9EC9", "EC2", "EC2", 500.0),
         // The custom resources an account may register, which AWS publishes in the plural
         // and whose namespace it names in the singular.
         scalable_targets("L-4A11ECEB", "custom resources", "custom resource", 500.0),
-        // The ElastiCache plane, which the recorded listing describes for that namespace;
-        // the name AWS publishes the row under is not stated there, so it names the
-        // namespace it is described for, as the rest of the class does.
-        scalable_targets("L-60E4E5E2", "ElastiCache", "ElastiCache", 500.0),
-        scalable_targets("L-782A3EE2", "ECS", "ECS", 500.0),
+        // The ElastiCache plane, named for that service as AWS names it — with the Amazon
+        // prefix — and described for the namespace its targets are registered under, which
+        // AWS publishes without it.
+        scalable_targets("L-60E4E5E2", "Amazon ElastiCache", "ElastiCache", 500.0),
+        // The two planes AWS publishes above the class's limit, each at the limit the
+        // recorded listing states for its own code.
+        scalable_targets("L-782A3EE2", "ECS", "ECS", 3000.0),
         // The Amazon Keyspaces plane, the one row of the class AWS publishes a higher
         // limit for, named for that service as AWS names it and described for the
         // Cassandra namespace its targets are registered under.
         scalable_targets("L-799ACCDF", "Amazon Keyspaces", "Cassandra", 1500.0),
-        scalable_targets("L-800F6F7B", "Neptune", "Neptune", 500.0),
+        scalable_targets("L-800F6F7B", "RDS", "RDS", 500.0),
         scalable_targets("L-8998F403", "AppStream", "AppStream", 500.0),
-        scalable_targets("L-A1D42901", "DynamoDB", "DynamoDB", 500.0),
+        scalable_targets("L-A1D42901", "DynamoDB", "DynamoDB", 5000.0),
         scalable_targets("L-A2AD6458", "Lambda", "Lambda", 500.0),
         scalable_targets("L-D75CA9D2", "EMR", "Elastic MapReduce (EMR)", 500.0),
         // The step adjustments of ONE step scaling policy, which the recorded listing
@@ -782,20 +816,51 @@ pub(super) fn apprunner_quotas() -> Vec<QuotaRow> {
 /// `Service` dimension of every metered Athena quota.
 const ATHENA_USAGE_SERVICE: &str = "Athena";
 
-/// The pair of quotas Athena publishes for the calls of ONE of its APIs: the
-/// REPLENISHMENT RATE of the token bucket those calls are served from (a per-second
-/// rate, metered by the API's `AWS/Usage` `CallCount` metric) and the BURST
-/// MULTIPLIER on it, which AWS publishes as not adjustable.
+/// The REPLENISHMENT RATE of the token bucket ONE of Athena's APIs is served from: a
+/// per-second rate, metered by that API's `AWS/Usage` `CallCount` metric.
 ///
-/// The burst row's `Description` is the sentence Athena publishes for that class, which
-/// states the multiplier's arithmetic against the rate quota and then what the burst is,
-/// with the row's OWN API named in each of its three places — so one constructor fills it
-/// and no row of the class carries another API's sentence. The replenishment row's
-/// published sentence is one nothing available here states, so it carries none rather than
-/// one worded here.
+/// The published sentence of this class is one nothing available here states, so a row of
+/// it carries none rather than one worded here.
+///
+/// SOURCE: the recorded default-quota listing of `athena`, which publishes every row of
+/// this class over a one-second window and metered by the call count of the API the row
+/// names.
+fn athena_replenishment_rate(code: &str, rate: f64, api_name: &str) -> QuotaRow {
+    quota(format!("Replenishment rate of {api_name} API calls"), rate)
+        .code(code)
+        .period(1, "SECOND")
+        .metric(call_count_metric(ATHENA_USAGE_SERVICE, api_name))
+}
+
+/// The BURST MULTIPLIER on the replenishment rate of ONE of Athena's APIs, which AWS
+/// publishes as not adjustable.
+///
+/// The row's `Description` is the sentence Athena publishes for that class, which states
+/// the multiplier's arithmetic against the rate quota and then what the burst is, with the
+/// row's OWN API named in each of its three places — so one constructor fills it and no row
+/// of the class carries another API's sentence.
 ///
 /// SOURCE: the recorded default-quota listing of `athena`, which publishes the burst
 /// multiplier of its `ListQueryExecutions` calls with exactly that sentence.
+fn athena_burst_multiplier(code: &str, burst: f64, api_name: &str) -> QuotaRow {
+    quota(format!("Burst multiplier quota for {api_name} API"), burst)
+        .code(code)
+        .fixed()
+        .describe(&format!(
+            "Multiplier factor to scale burst capacity for {api_name} API based on the \
+             rate quota (Burst = Rate * BurstMultiplierQuota). {api_name} Burst is the \
+             maximum number of {api_name} API tokens you can accumulate in the account \
+             in the region"
+        ))
+}
+
+/// The pair of quotas Athena publishes for the calls of ONE of its APIs: the
+/// [`athena_replenishment_rate`] of the token bucket those calls are served from and the
+/// [`athena_burst_multiplier`] on it.
+///
+/// The two rows of an API are published under codes of their own, so an API whose pair the
+/// recorded listing splits across the catalog — one of its two codes publishing another
+/// quota entirely — is built from the two row constructors rather than from this one.
 fn athena_api_call_rate(
     replenishment_code: &str,
     rate: f64,
@@ -804,19 +869,8 @@ fn athena_api_call_rate(
     api_name: &str,
 ) -> [QuotaRow; 2] {
     [
-        quota(format!("Replenishment rate of {api_name} API calls"), rate)
-            .code(replenishment_code)
-            .period(1, "SECOND")
-            .metric(call_count_metric(ATHENA_USAGE_SERVICE, api_name)),
-        quota(format!("Burst multiplier quota for {api_name} API"), burst)
-            .code(burst_code)
-            .fixed()
-            .describe(&format!(
-                "Multiplier factor to scale burst capacity for {api_name} API based on \
-                 the rate quota (Burst = Rate * BurstMultiplierQuota). {api_name} Burst \
-                 is the maximum number of {api_name} API tokens you can accumulate in \
-                 the account in the region"
-            )),
+        athena_replenishment_rate(replenishment_code, rate, api_name),
+        athena_burst_multiplier(burst_code, burst, api_name),
     ]
 }
 
@@ -838,12 +892,20 @@ fn athena_api_call_rate(
 /// API pairs are published the other way round from the class default — the replenishment
 /// rate NOT adjustable, or the burst multiplier beside it adjustable.
 ///
+/// That listing also states the quota published under three codes this catalog had bound to
+/// a row of the per-API class: the WORKGROUP plane of an account is the row published under
+/// `L-FD9D80C2`, at the limit it states for it and metered by the `AWS/Usage`
+/// `ResourceCount` of the service's `WorkGroup` resource over no window of its own, and the
+/// replenishment rate of `ListNamedQueries` calls is the row published under `L-82E47245`.
+///
 /// The codes this listing states no quota for keep the row they have carried, as the module
-/// header states: `L-5A8D5237` and `L-722F8D5C`, the codes the two bindings above vacated,
-/// carry the DML query timeout and the `GetWorkGroup` burst multiplier those bindings
-/// displaced. The WORKGROUP plane is left with no code of its own — the code it had carried
-/// is the GetQueryResults burst multiplier's, as that listing states — so it is published
-/// under no row rather than under a minted code.
+/// header states: `L-5A8D5237`, `L-722F8D5C` and `L-D0D8C912`, the codes the bindings above
+/// vacated, carry the DML query timeout, the `GetWorkGroup` burst multiplier and the
+/// `GetQueryExecution` replenishment rate those bindings displaced — each at the limit its
+/// own code has carried, since the limit a code publishes is a member of its row rather
+/// than of the API the row names. The `StopQueryExecution` burst multiplier is left with no
+/// code of its own — the code it had carried is the workgroup plane's, as that listing
+/// states — so it is published under no row rather than under a minted code.
 pub(super) fn athena_quotas() -> Vec<QuotaRow> {
     let mut quotas = vec![
         quota("Active DML queries", 20.0).code("L-56A94400").fixed(),
@@ -894,12 +956,30 @@ pub(super) fn athena_quotas() -> Vec<QuotaRow> {
         // The one API pair whose burst multiplier the recorded listing publishes above
         // the class's two, under `L-3702C1C1`.
         athena_api_call_rate("L-07F4444F", 100.0, "L-3702C1C1", 5.0, "GetQueryResults"),
-        athena_api_call_rate("L-D0D8C912", 5.0, "L-D8C0E3AF", 2.0, "ListNamedQueries"),
+        athena_api_call_rate("L-82E47245", 100.0, "L-D8C0E3AF", 2.0, "ListNamedQueries"),
         athena_api_call_rate("L-E20AD6B8", 20.0, "L-FE3693EE", 2.0, "ListQueryExecutions"),
-        athena_api_call_rate("L-FC5F6546", 20.0, "L-FD9D80C2", 2.0, "StopQueryExecution"),
     ] {
         quotas.extend(pair);
     }
+    // The WORKGROUP plane of an account, under the code the recorded listing binds it to,
+    // with the limit and the `ResourceCount` series it states for it, over no window of its
+    // own. The `StopQueryExecution` burst multiplier this code had carried names no code
+    // that listing states, so that API's replenishment rate is published on its own and the
+    // multiplier under no row at all (see the module header).
+    quotas.push(athena_replenishment_rate("L-FC5F6546", 20.0, "StopQueryExecution"));
+    quotas.push(
+        quota("Maximum number of workgroups per account", 1000.0)
+            .code("L-FD9D80C2")
+            .fixed()
+            .metric_without_period(usage_metric(
+                ATHENA_USAGE_SERVICE,
+                &[
+                    ("Class", "None"),
+                    ("Resource", "WorkGroup"),
+                    ("Type", "Resource"),
+                ],
+            )),
+    );
     // The APIs whose REPLENISHMENT rate the service publishes as not adjustable. The
     // `GetWorkGroup` burst multiplier is published under the code that API's own multiplier
     // vacated when the recorded listing bound `L-CC64F7CE` to GetNamedQuery's: the quota
@@ -914,7 +994,7 @@ pub(super) fn athena_quotas() -> Vec<QuotaRow> {
     }
     // And the APIs whose BURST multiplier it publishes as adjustable.
     for [replenishment, burst] in [
-        athena_api_call_rate("L-82E47245", 100.0, "L-9D86AA19", 2.0, "GetQueryExecution"),
+        athena_api_call_rate("L-D0D8C912", 5.0, "L-9D86AA19", 2.0, "GetQueryExecution"),
         athena_api_call_rate("L-E80DC288", 20.0, "L-EFB619E3", 2.0, "StartQueryExecution"),
     ] {
         quotas.push(replenishment);
@@ -2111,16 +2191,19 @@ pub(super) fn glacier_quotas() -> Vec<QuotaRow> {
 /// task runs the ACCOUNT may run at once (`L-83A59AA6`), the Data Catalog's global path
 /// plane (`L-FB210BD9`), the Data Catalog's global TAG plane (`L-785C1F39`), the
 /// development-endpoint plane of an account (`L-DBA56E2F`), its INTEGRATION plane
-/// (`L-F1AAB534`) and its data-quality-ruleset plane (`L-87F5991C`).
+/// (`L-F1AAB534`, counted per AWS Region for the account), its data-quality-ruleset plane
+/// (`L-87F5991C`), the queued job runs of its orchestration plane (`L-A457CBAB`), the
+/// connection TYPES of the Data Catalog (`L-F545C262`) and the security configurations of
+/// an account (`L-83192DBF`, which that listing publishes as adjustable).
 ///
 /// The quotas this catalog had served under those codes — the database, workflow and
 /// account-wide machine-learning-transform planes, the job-concurrency planes, the
 /// per-table table-version plane, the schema-version plane, and the `GetTable`,
 /// `StartCrawler`, `BatchCreatePartition`, `UpdatePartition`, `UpdateJob`, `GetPartitions`,
-/// `StartJobRun` and `BatchDeletePartition` call rates — name no code that listing states,
-/// so they are published under no code at all rather than served under another quota's; so
-/// are the codes this catalog had served the account-wide crawler plane, the account's
-/// machine-learning transforms and its data-quality rulesets under.
+/// `StartJobRun`, `CreateTable`, `StartWorkflowRun` and `BatchDeletePartition` call rates —
+/// name no code that listing states, so they are published under no code at all rather than
+/// served under another quota's; so are the codes this catalog had served the account-wide
+/// crawler plane and the account's machine-learning transforms under.
 pub(super) fn glue_quotas() -> Vec<QuotaRow> {
     let rate = |code: &str, api: &str, per_second: f64| request_rate(code, "Glue", api, per_second);
     vec![
@@ -2232,11 +2315,11 @@ pub(super) fn glue_quotas() -> Vec<QuotaRow> {
         quota("Interactive sessions per account", 100.0)
             .code("L-7DD7C33A")
             .describe("The maximum number of interactive sessions in your account."),
-        // NOT published here: `L-83192DBF`, the code this catalog had served the
-        // data-quality-ruleset plane of an account under. That plane is published under
-        // `L-87F5991C` below, the code the recorded listing binds it to with the name and
-        // value it carries for it, and the listing states no quota this catalog can cite
-        // under `L-83192DBF`, so that code is left to the default-quota-set gap.
+        // The SECURITY-CONFIGURATION plane the recorded listing publishes under
+        // `L-83192DBF`, with the name, value and adjustability it states for it. The
+        // sentence that listing carries for the row is one nothing available here states,
+        // so the row publishes none rather than one worded here (see the module header).
+        quota("Max security configurations per account", 250.0).code("L-83192DBF"),
         // The machine-learning task runs the WHOLE ACCOUNT may run at once, beside the
         // per-transform concurrency plane published under `L-E15CE20A`: the recorded listing
         // binds this code to that account-wide plane, so the row carries its name, value and
@@ -2252,13 +2335,14 @@ pub(super) fn glue_quotas() -> Vec<QuotaRow> {
              learning transforms for this account.",
         ),
         // The DATA-QUALITY-RULESET plane of an account, under the code the recorded
-        // listing binds it to and with the name and value it carries for it, in the
-        // sentence form this catalog's recorded account planes are worded in. The
+        // listing binds it to, with the name, value and sentence it carries for it — a
+        // sentence that counts the plane for the account rather than in the possessive
+        // voice this catalog's other account planes are worded in. The
         // `BatchDeletePartition` call rate this catalog had served under the code names no
         // code the listing states, so it is left to the default-quota-set gap.
         quota("Max data quality rulesets per account", 1_000_000.0)
             .code("L-87F5991C")
-            .describe("The maximum number of data quality rulesets in your account."),
+            .describe("The maximum number of data quality rulesets per account."),
         rate("L-94D025B7", "BatchGetPartition", 50.0),
         // The in-flight completion requests of an account, whose published sentence the
         // service carries WITHOUT a closing period.
@@ -2272,7 +2356,13 @@ pub(super) fn glue_quotas() -> Vec<QuotaRow> {
         // would be exactly the carry-over the rule at the head of this module forbids
         // — so the row is left as it stands rather than published with a limit no source
         // states.
-        rate("L-A457CBAB", "CreateTable", 10.0),
+        // The queued job runs of an account's ORCHESTRATION plane, under the code the
+        // recorded listing binds it to, with the name, value and sentence it carries for
+        // it. The `CreateTable` call rate this catalog had served under the code names no
+        // code that listing states, so it is left to the default-quota-set gap.
+        quota("Maximum number of queued job runs", 1000.0)
+            .code("L-A457CBAB")
+            .describe("Orchestration: maximum number of queued job runs"),
         // The DATABASE plane of one Data Catalog, under the code the recorded listing
         // binds it to, with the sentence that listing carries for it.
         quota("Max databases per catalog", 10_000.0)
@@ -2348,13 +2438,20 @@ pub(super) fn glue_quotas() -> Vec<QuotaRow> {
             .code("L-F1653A6D")
             .describe("The maximum number of triggers in your account."),
         // The INTEGRATION plane of an account, under the code the recorded listing binds
-        // it to and with the name and value it carries for it. The `StartJobRun` call rate
-        // this catalog had served under the code names no code the listing states, so it is
-        // left to the default-quota-set gap.
+        // it to, with the name, value and sentence it carries for it — a sentence that
+        // counts the plane per AWS REGION for the account. The `StartJobRun` call rate
+        // this catalog had served under the code names no code the listing states, so it
+        // is left to the default-quota-set gap.
         quota("Number of integrations", 40.0)
             .code("L-F1AAB534")
-            .describe("The maximum number of integrations in your account."),
-        rate("L-F545C262", "StartWorkflowRun", 10.0),
+            .describe("The maximum number of integrations per AWS Region for this account."),
+        // The CONNECTION-TYPE plane of the Data Catalog, under the code the recorded
+        // listing binds it to, with the name and value it carries for it; the sentence that
+        // listing carries for the row is one nothing available here states, so the row
+        // publishes none rather than one worded here. The `StartWorkflowRun` call rate this
+        // catalog had served under the code names no code the listing states, so it is left
+        // to the default-quota-set gap.
+        quota("Number of connection types", 1000.0).code("L-F545C262"),
         rate("L-F574AED9", "UpdateDatabase", 10.0),
         rate("L-F953935E", "UpdateTable", 10.0),
         // The Data Catalog's global PATH plane, published under this code with the
