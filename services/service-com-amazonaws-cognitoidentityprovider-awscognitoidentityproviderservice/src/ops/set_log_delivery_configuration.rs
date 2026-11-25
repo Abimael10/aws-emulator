@@ -98,8 +98,13 @@ use super::types::*;
 // `#[path]` is needed because the generated `ops` module declares this file with a
 // `#[path]` of its own, which makes `src/ops/` the directory rustc looks in for a bare
 // child declaration.
+//
+// Crate-visible: the reading of WHICH Region a destination is addressed in is the same
+// whether the destination is being accepted here or written to later
+// ([`log_destinations::log_group_destination_region`]), so the export path calls this
+// module rather than restating it.
 #[path = "set_log_delivery_configuration/log_destinations.rs"]
-mod log_destinations;
+pub(crate) mod log_destinations;
 
 // What an ACCEPTED Amazon S3 destination grants the log delivery service on that bucket's
 // own policy, written where Amazon S3 holds it. Same `#[path]`, for the same reason.
@@ -458,7 +463,11 @@ const DELIVERABLE_SOURCES: [DeliverableSource; 2] = [
         required_plan: None,
     },
     DeliverableSource {
-        event_source: "userAuthEvents",
+        // The source the pool's user-activity export is configured for, named where the
+        // export itself reads it ([`crate::state::auth_events::log_export`]), so the
+        // configuration this call accepts and the records it turns on cannot name
+        // different sources.
+        event_source: crate::state::auth_events::log_export::USER_AUTH_EVENTS_SOURCE,
         destinations: &[
             "CloudWatchLogsConfiguration",
             "FirehoseConfiguration",

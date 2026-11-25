@@ -290,7 +290,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             attempt,
             ::std::time::SystemTime::now(),
         );
-        crate::state::auth_events::record(
+        crate::state::auth_events::log_export::record_and_export(
+            ctx,
             &*self.engine,
             &crate::state::auth_events::Logged {
                 user_pool_id: None,
@@ -312,7 +313,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 outstanding_session: None,
             },
             ::std::time::SystemTime::now(),
-        );
+        )
+        .await;
         answered
     }
 }

@@ -231,7 +231,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // protection records about it is the outcome this call reached
         // ([`crate::state::auth_events`]).
         let answered = self.resend_and_deliver(&input, ctx).await;
-        crate::state::auth_events::record(
+        crate::state::auth_events::log_export::record_and_export(
+            ctx,
             &*self.engine,
             &crate::state::auth_events::Logged {
                 // This operation models no `UserPoolId`: the app client names the pool.
@@ -258,7 +259,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 outstanding_session: None,
             },
             ::std::time::SystemTime::now(),
-        );
+        )
+        .await;
         answered
     }
 }

@@ -177,7 +177,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // The change is served first and LOGGED after, because what the pool's threat
         // protection records about it is the outcome this call reached
         // ([`crate::state::auth_events`]). The user it was attempted for is the one the
@@ -187,7 +186,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut attempted_for = None;
         let answered = self.change(input, &mut attempted_for);
         if let Some((user_pool_id, username)) = attempted_for {
-            crate::state::auth_events::record(
+            crate::state::auth_events::log_export::record_and_export(
+                ctx,
                 &*self.engine,
                 &crate::state::auth_events::Logged {
                     user_pool_id: Some(&user_pool_id),
@@ -215,7 +215,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     outstanding_session: None,
                 },
                 ::std::time::SystemTime::now(),
-            );
+            )
+            .await;
         }
         answered
     }

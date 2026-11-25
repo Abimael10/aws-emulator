@@ -297,6 +297,16 @@ pub(super) fn destination_region<'a>(arn: &'a str, vendor: &str, pool_region: &'
         .unwrap_or(crate::state::DEFAULT_REGION)
 }
 
+/// [`destination_region`] for a CloudWatch Logs LOG GROUP destination, which is the one
+/// destination this service also WRITES to after accepting it.
+///
+/// The accept path and the write path ask the same question about the same ARN — which
+/// Region the group is in — so they ask it here, once, rather than each reading the ARN its
+/// own way ([`crate::state::auth_events::log_export`] is the writer).
+pub(crate) fn log_group_destination_region<'a>(arn: &'a str, pool_region: &'a str) -> &'a str {
+    destination_region(arn, LOGS_ARN_NAMESPACE, pool_region)
+}
+
 /// Trace a destination this emulator could not ask the owning service about, which is a
 /// deployment with no such service mounted rather than a destination reported missing.
 ///

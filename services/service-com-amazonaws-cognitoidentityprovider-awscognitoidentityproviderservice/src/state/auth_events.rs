@@ -49,6 +49,11 @@
 //! and still no level: that decision "overrides the risk decision"
 //! (`RiskExceptionConfigurationType`) instead of resting on an assessment.
 
+/// Where the events this log holds are also DELIVERED: the destinations a pool's log
+/// delivery configuration names, which is how a client reads the same trail outside this
+/// service's own API.
+pub mod log_export;
+
 use ::std::time::SystemTime;
 
 use crate::ops::types::{
@@ -394,33 +399,64 @@ pub struct Logged<'a> {
     pub outstanding_session: Option<String>,
 }
 
+/// What one logged call left in the history: the event as the log now holds it,
+/// which is also what a pool's log delivery exports ([`log_export`]).
+///
+/// The values are the STORED ones rather than the request's — the pool and the
+/// user as this service holds them — so a reader of the exported trail and
+/// `AdminListUserAuthEvents` cannot disagree about one attempt.
+#[derive(Debug, Clone)]
+pub struct Recorded {
+    /// The pool whose log the event belongs to.
+    pub user_pool_id: String,
+    /// The app client the attempt ran against, for a call that names one.
+    pub client_id: Option<String>,
+    /// The user the event was logged for, as the pool holds its name.
+    pub username: String,
+    /// The id the logged event is addressed by.
+    pub event_id: String,
+    /// `EventType`: what the call that logged it attempted.
+    pub event_type: String,
+    /// `EventResponseType`: the outcome the attempt has reached.
+    pub event_response: String,
+    /// The challenges checked during the attempt so far, in the order they were
+    /// checked.
+    pub challenge_responses: Vec<ChallengeResponseType>,
+}
+
 /// Log what one call contributed to the event history of the user it was
-/// attempted for.
+/// attempted for, and report the event it left behind.
 ///
 /// Call it with no state guard of this service held: this takes the lock itself,
-/// once the call it reports has already been answered. Nothing is logged for a
-/// pool this service does not hold, for a pool the named app client does not
-/// belong to, for a pool whose threat protection is switched off, or for a user
-/// the pool does not hold — in each case there is no event history for the
-/// attempt to belong to.
-pub fn record<Eng: Send + Sync + 'static>(engine: &Eng, logged: &Logged<'_>, at: SystemTime) {
-    let Some(state) = super::service_state(engine) else {
-        return;
-    };
+/// once the call it reports has already been answered. Nothing is logged — and
+/// `None` is reported — for a pool this service does not hold, for a pool the
+/// named app client does not belong to, for a pool whose threat protection is
+/// switched off, or for a user the pool does not hold: in each case there is no
+/// event history for the attempt to belong to.
+pub fn record<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    logged: &Logged<'_>,
+    at: SystemTime,
+) -> Option<Recorded> {
+    let state = super::service_state(engine)?;
     let mut guard = state.lock();
-    let Some(user_pool_id) = addressed_pool(&guard, logged) else {
-        return;
-    };
-    let Some(pool) = guard.pool_mut(&user_pool_id) else {
-        return;
-    };
+    let user_pool_id = addressed_pool(&guard, logged)?;
+    let pool = guard.pool_mut(&user_pool_id)?;
     if !pool.add_ons_enabled() {
-        return;
+        return None;
     }
-    let Some(user) = pool.user_mut(logged.username) else {
-        return;
-    };
-    log(user, logged, at);
+    let user = pool.user_mut(logged.username)?;
+    let username = user.username.clone();
+    let entry = log(user, logged, at);
+    Some(Recorded {
+        user_pool_id,
+        client_id: logged.client_id.map(str::to_string),
+        username,
+        event_id: entry.event_id,
+        event_type: entry.event_type,
+        event_response: entry.event_response,
+        challenge_responses: entry.challenge_responses,
+    })
 }
 
 /// The id of the stored pool `logged` is about, or `None` when it names none
@@ -442,9 +478,32 @@ fn addressed_pool(
     pool.map(|pool| pool.id.clone())
 }
 
+/// The event one logged call left in the history, as the log now holds it: the
+/// part of [`AuthEvent`] a reader of the log is told about, carrying neither the
+/// challenge session nor the feedback token, each of which authorizes a call.
+#[derive(Debug)]
+struct Entry {
+    event_id: String,
+    event_type: String,
+    event_response: String,
+    challenge_responses: Vec<ChallengeResponseType>,
+}
+
+impl Entry {
+    /// The entry `event` now is.
+    fn of(event: &AuthEvent) -> Self {
+        Self {
+            event_id: event.event_id.clone(),
+            event_type: event.event_type.clone(),
+            event_response: event.response.clone(),
+            challenge_responses: event.challenge_responses.clone(),
+        }
+    }
+}
+
 /// Append what `logged` reports to `user`'s event history, or finish the event of
-/// the attempt it continues.
-fn log(user: &mut User, logged: &Logged<'_>, at: SystemTime) {
+/// the attempt it continues, and report the event it left behind.
+fn log(user: &mut User, logged: &Logged<'_>, at: SystemTime) -> Entry {
     let event_type = logged.event_type.as_str();
     if let Some(answered) = logged.answered_session.as_deref() {
         // The attempt this call continues is the one WAITING ON the session the
@@ -465,7 +524,7 @@ fn log(user: &mut User, logged: &Logged<'_>, at: SystemTime) {
                     .challenge_responses
                     .push(challenge_result(challenge, logged.attempt));
             }
-            return;
+            return Entry::of(event);
         }
     }
     let event = AuthEvent {
@@ -483,6 +542,7 @@ fn log(user: &mut User, logged: &Logged<'_>, at: SystemTime) {
         outstanding_session: logged.outstanding_session.clone(),
         feedback_token: new_feedback_token(),
     };
+    let entry = Entry::of(&event);
     user.auth_events.push(event);
     // The log is bounded, and it is the OLDEST history that is dropped: the
     // reader serves the most recent events first.
@@ -490,6 +550,7 @@ fn log(user: &mut User, logged: &Logged<'_>, at: SystemTime) {
     if held > MAX_AUTH_EVENTS_PER_USER {
         user.auth_events.drain(..held - MAX_AUTH_EVENTS_PER_USER);
     }
+    entry
 }
 
 /// One entry of an event's `ChallengeResponses`: the challenge the call checked

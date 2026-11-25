@@ -91,7 +91,10 @@ pub(crate) fn router() -> MultiServiceRouter {
 
 /// Call one awsJson operation of `service`, whose `X-Amz-Target` prefix is `target_prefix`,
 /// and return its status and response body.
-async fn json_rpc(
+///
+/// Crate-visible: it is the ONE description of another service's awsJson wire this crate's
+/// suites drive, so two suites cannot address CloudWatch Logs differently.
+pub(crate) async fn json_rpc(
     router: &MultiServiceRouter,
     service: &str,
     target_prefix: &str,

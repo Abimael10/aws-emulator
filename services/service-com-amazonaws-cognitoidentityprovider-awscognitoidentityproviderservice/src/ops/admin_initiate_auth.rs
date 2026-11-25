@@ -375,7 +375,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let signs_in = counter == crate::state::auth_metrics::Counter::SignIn
             && !matches!(answered, Err(crate::scaffolded::Scaffolded::NotImplemented(_)));
         if let Some(username) = attempted_for.as_deref().filter(|_| signs_in) {
-            crate::state::auth_events::record(
+            crate::state::auth_events::log_export::record_and_export(
+                ctx,
                 &*self.engine,
                 &crate::state::auth_events::Logged {
                     user_pool_id: Some(&user_pool_id),
@@ -395,7 +396,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .and_then(|output| output.session.clone()),
                 },
                 ::std::time::SystemTime::now(),
-            );
+            )
+            .await;
         }
         answered
     }

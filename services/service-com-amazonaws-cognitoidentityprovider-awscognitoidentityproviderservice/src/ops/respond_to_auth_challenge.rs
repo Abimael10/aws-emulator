@@ -378,7 +378,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rather than evaluated by the pool, so the pool logged nothing about it.
         let served = !matches!(answered, Err(crate::scaffolded::Scaffolded::NotImplemented(_)));
         if let Some(username) = attempted_for.as_deref().filter(|_| served) {
-            crate::state::auth_events::record(
+            crate::state::auth_events::log_export::record_and_export(
+                ctx,
                 &*self.engine,
                 &crate::state::auth_events::Logged {
                     user_pool_id: None,
@@ -400,7 +401,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .and_then(|output| output.session.clone()),
                 },
                 ::std::time::SystemTime::now(),
-            );
+            )
+            .await;
         }
         answered
     }
