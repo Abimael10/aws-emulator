@@ -26,3 +26,31 @@ Actual: AssertionError: the app task never started: stopCode=EssentialContainerE
 
 ## Steps to Reproduce
 Create a VPC with two public subnets, an ALB security group and a task security group, a log group and an execution role; CreateCluster; RegisterTaskDefinition (FARGATE/awsvpc) with an essential HTTP-server container and awslogs; RunTask; poll DescribeTasks for RUNNING. Observe STOPPED with stopCode EssentialContainerExited instead.
+
+## How it was answered
+`Task$stopCode` `EssentialContainerExited` states that an essential container EXITED, and
+`Container$exitCode` — "the exit code returned from the container" — is the record of one, so a task
+is stopped with that code only where an essential container of it really produced an exit status. A
+standalone task's work span now decides only WHEN such a stop may be reported, never THAT one is
+(`state/store.rs`'s clock pass clears the instant unless an essential container has exited and no
+essential program is still being performed, `state.rs` `TaskRecord::essential_container_exited` /
+`finish_work`, `state/container_runtime.rs` `record_container_outcome` /
+`performing_containers`), and a command that runs a server in the FOREGROUND does not return: it
+holds its container's run open and publishes the server at the task's own address
+(`state/container_shell.rs` `run_server` over `state/container_servers.rs`). So a `RunTask` task
+whose essential container serves HTTP reports `RUNNING` with no `stopCode` and no `stoppedReason`
+for as long as that program holds, and the address it holds is a target an Application Load Balancer
+checks and forwards to.
+
+That is pinned end to end, for the standalone path this report takes, in
+`core/router/tests/all/ecs_run_task_serves_as_its_own_alb_target.rs`: a table of foreground-server
+programs (the image's own server invoked by the revision, the other image's documented foreground
+wrapper, no command at all — which runs the command the image declares — the interpreter's own HTTP
+server module, and the multi-call binary's server applet), each with `awslogs` under an execution
+role, every task having to stay `RUNNING` with no stop on every look across a window longer than the
+span after which a standalone task whose essential container exited is stopped; the contrast row is
+a program that really ends, which takes exactly this report's stop code and sentence; and the whole
+load-balancing chain the report says cannot be exercised is driven over the fronted task's own
+address — `unhealthy` with `Target.ResponseCodeMismatch`, the fail-open `200` carrying the
+container's own document, the repair back to `healthy`, and the load balancer's own `503` once its
+only registration is deregistered.
