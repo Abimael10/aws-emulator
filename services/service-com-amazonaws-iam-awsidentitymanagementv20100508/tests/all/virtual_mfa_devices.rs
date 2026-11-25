@@ -520,7 +520,7 @@ const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// How IAM words a serial number the account holds no MFA device under — the sentence
 /// every operation addressing a device by serial refuses with.
-fn not_found_message(serial_number: &str) -> String {
+pub(crate) fn not_found_message(serial_number: &str) -> String {
     format!("MFA Device with serial number {serial_number} does not exist.")
 }
 
@@ -536,7 +536,7 @@ fn tag_members(tags: &[(&str, &str)]) -> Vec<(String, String)> {
 }
 
 /// One `TagMFADevice` call for the device `serial_number`.
-async fn tag(
+pub(crate) async fn tag(
     router: &MultiServiceRouter,
     serial_number: &str,
     tags: &[(&str, &str)],
@@ -556,7 +556,7 @@ async fn untag(router: &MultiServiceRouter, serial_number: &str, keys: &[&str]) 
 }
 
 /// One `ListMFADeviceTags` call, with an optional page size and marker.
-async fn list_tags(
+pub(crate) async fn list_tags(
     router: &MultiServiceRouter,
     serial_number: &str,
     max_items: Option<i32>,
