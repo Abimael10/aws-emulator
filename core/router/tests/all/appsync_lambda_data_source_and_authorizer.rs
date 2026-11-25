@@ -492,7 +492,14 @@ pub(crate) async fn create_function(
 /// The documents are written compactly and free of the characters an
 /// `application/x-www-form-urlencoded` body treats specially (`&`, `=`, `+`, `%`, space), so
 /// they need no encoding.
-async fn create_role(router: &MultiServiceRouter, name: &str, document: &str) -> String {
+///
+/// Shared with the sibling suites that put a data source of their own under a service role, so
+/// there is one reading of how such a role comes to exist.
+pub(crate) async fn create_role(
+    router: &MultiServiceRouter,
+    name: &str,
+    document: &str,
+) -> String {
     let trust = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\
                  \"Principal\":{\"Service\":\"appsync.amazonaws.com\"},\
                  \"Action\":\"sts:AssumeRole\"}]}";
@@ -517,8 +524,9 @@ async fn create_role(router: &MultiServiceRouter, name: &str, document: &str) ->
     role_arn
 }
 
-/// A policy allowing `action` on every resource.
-fn allowing(action: &str) -> String {
+/// A policy allowing `action` on every resource. Shared with the sibling suites for the reason
+/// [`create_role`] is.
+pub(crate) fn allowing(action: &str) -> String {
     format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":\
          [{{\"Effect\":\"Allow\",\"Action\":\"{action}\",\"Resource\":\"*\"}}]}}"
