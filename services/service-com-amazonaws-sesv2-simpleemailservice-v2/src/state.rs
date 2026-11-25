@@ -2051,13 +2051,18 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
 
     /// Mint the id of a new multi-region endpoint.
     ///
-    /// `EndpointId` carries no modelled pattern beyond being "the ID of the
-    /// multi-region endpoint", and SES hands it back as a UUID, so it is minted as one
-    /// ([`minted_uuid`]) while the only guarantees this makes are the ones a client
-    /// depends on: the id is unique across endpoints and stable for as long as the
-    /// endpoint holds it (it is minted once, at create, and read back from the record
-    /// afterwards). The monotonic sequence number is part of what the bytes are derived
-    /// from, so two endpoints created in the same instant still differ.
+    /// `EndpointId` is documented only as "the ID of the multi-region endpoint" and
+    /// carries no modelled pattern and no modelled length, so the surface promises an
+    /// IDENTITY rather than a format, and that identity is what this mint owes a client:
+    /// the id is minted ONCE, here, for the endpoint being created, it is unique across
+    /// endpoints, and it is stable for as long as the endpoint holds it (every read
+    /// reports it off the record). The monotonic sequence number is part of what the
+    /// bytes are derived from, so two endpoints created in the same instant still differ,
+    /// and a name whose endpoint was deleted is minted a NEW id when it is created again
+    /// rather than the id the deleted endpoint held. With no modelled form to take, the
+    /// text form is the one this store writes its other opaque identifiers in — a UUID
+    /// ([`minted_uuid`]), so a client that round-trips the id through a UUID type is
+    /// served — and no caller may depend on anything narrower than the identity above.
     pub fn next_endpoint_id(&mut self, name: &str, region: &str, now: SystemTime) -> String {
         self.endpoint_sequence += 1;
         minted_uuid(b"Endpoint", self.endpoint_sequence, now, &[name, region])
