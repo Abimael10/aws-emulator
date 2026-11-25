@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCapacityProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCapacityProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCapacityProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes a stored capacity provider's DESCRIPTION — the only member an update may change —
+//! and leaves every other member as [`crate::ops::create_capacity_provider`] persisted it, so
+//! `GetCapacityProvider` and `ListCapacityProviders` answer from the one record this write
+//! touched.
+//!
+//! The description is the request's `UpdatedDescription` wrapper, applied with the PATCH
+//! semantics the model states for it: absent leaves the stored description alone, present
+//! replaces it with `optionalValue`, and present without `optionalValue` clears it
+//! ([`crate::state::CapacityProviderRecord::accept_update`]).
+//!
+//! The change is ACCEPTED rather than complete (HTTP 202): the provider reports `UPDATING`
+//! until the clock owes it `READY` one settle span later
+//! ([`crate::state::CAPACITY_PROVIDER_SETTLE_DELAY`]) — nothing here sleeps for it. A second
+//! update arriving while that transition is still owed is accepted too and the LAST write is
+//! the description the provider carries; a provider whose own provisioning or removal is
+//! still what it is doing takes no change at all and is the modelled `ConflictException`
+//! (409) with nothing written ([`crate::state::capacity_provider_accepts_update`]).
+//!
+//! A repeated `clientToken` answers with the provider that token first updated and applies
+//! no second change; it is idempotent for the request it replays, so the same token aimed at
+//! another provider is served as the fresh request it is.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +190,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCapacityProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCapacityProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateCapacityProviderErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the capacity provider store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A replayed request carrying the same `clientToken` answers with the provider that
+        // token first updated, rather than applying a second change: "If this token matches a
+        // previous request, the service ignores the request, but doesn't return an error."
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCapacityProvider"))
+        // A token is idempotent for the REQUEST it replays, so the record answers only while
+        // it names the provider this request addresses: the same token aimed at another
+        // provider is a different request and takes the ordinary path below, where that
+        // provider's own existence and status decide the answer.
+        if store
+            .replayed_capacity_provider_result(Self::NAME, input.client_token.as_deref())
+            .is_some_and(|replayed| replayed == input.capacity_provider_id)
+        {
+            // The id came from the store, which holds the provider it names, so this lookup
+            // cannot miss.
+            if let Some(record) = store.capacity_providers.get(&input.capacity_provider_id) {
+                return Ok(record.update_output(now));
+            }
+        }
+
+        // The store is keyed by the `capacityProviderId` the create minted; an id naming no
+        // stored provider is the modelled 404 and nothing is written for it.
+        let record = store
+            .capacity_providers
+            .get_mut(&input.capacity_provider_id)
+            .ok_or_else(|| {
+                UpdateCapacityProviderErrorModeled::ResourceNotFoundException(
+                    crate::state::capacity_provider_not_found(&input.capacity_provider_id),
+                )
+            })?;
+
+        // A provider that is not available for use, and is not already taking a change, is
+        // busy with its own asynchronous work: this request collides with that rather than
+        // overwriting what it is doing, so the stored provider is left exactly as it was.
+        let status = record.status_at(now).to_string();
+        if !crate::state::capacity_provider_accepts_update(&status) {
+            return Err(UpdateCapacityProviderErrorModeled::ConflictException(
+                crate::state::capacity_provider_status_conflict(
+                    &input.capacity_provider_id,
+                    &status,
+                ),
+            )
+            .into());
+        }
+
+        // Accepted: the description takes the PATCH rule the model states for it, the
+        // provider enters `UPDATING` until the clock owes it `READY`, and nothing else about
+        // it changes — "Only the description can be changed."
+        record.accept_update(input.description.as_ref(), now);
+        let output = record.update_output(now);
+        store.remember_capacity_provider_client_token(
+            Self::NAME,
+            input.client_token,
+            &input.capacity_provider_id,
+        );
+
+        Ok(output)
     }
 }

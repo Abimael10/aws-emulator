@@ -12,7 +12,8 @@ use super::*;
 
 use crate::ops::types::{
     CapacityProviderSummary, ComputeConfiguration, CreateCapacityProviderOutput,
-    GetCapacityProviderOutput, PermissionsConfiguration,
+    GetCapacityProviderOutput, PermissionsConfiguration, UpdateCapacityProviderOutput,
+    UpdatedDescription,
 };
 
 /// The modelled not-found error for a capacity provider this account does not hold.
@@ -139,7 +140,42 @@ pub fn capacity_provider_arn(region: &str, capacity_provider_id: &str) -> String
 /// provisioning that failed, which nothing here makes happen, and the documented
 /// `statusCode`/`statusReason` that explain one are reported only for such a provider.
 pub const CAPACITY_PROVIDER_STATUS_CREATING: &str = "CREATING";
+pub const CAPACITY_PROVIDER_STATUS_UPDATING: &str = "UPDATING";
 pub const CAPACITY_PROVIDER_STATUS_READY: &str = "READY";
+
+/// Whether a provider reporting `status` can take an accepted change right now.
+///
+/// A provider is modifiable once it is "available for use" — `READY` — and while it is
+/// already `UPDATING`, where a further change is the one that wins; a provider whose own
+/// asynchronous provisioning or removal is what it is doing (`CREATING`, `DELETING`) or has
+/// failed at (`*_FAILED`) is not (`smithy_query shape=CapacityProviderStatus`).
+pub fn capacity_provider_accepts_update(status: &str) -> bool {
+    matches!(
+        status,
+        CAPACITY_PROVIDER_STATUS_READY | CAPACITY_PROVIDER_STATUS_UPDATING
+    )
+}
+
+/// The modelled conflict for a change asked of a capacity provider that is not in a status
+/// which admits one ([`capacity_provider_accepts_update`]): the request collides with what the
+/// provider is already doing, so nothing is written.
+///
+/// The sentence is fixed and tells the caller what to wait for; its variable parts are the id
+/// the request carried and the status the provider is in right now, spelled as the
+/// `CapacityProviderStatus` token every response reports it in — worded as the sibling
+/// resources of this control plane word the same refusal
+/// ([`consent_portal_status_conflict`]).
+pub fn capacity_provider_status_conflict(
+    capacity_provider_id: &str,
+    status: &str,
+) -> ConflictException {
+    ConflictException {
+        message: Some(format!(
+            "Capacity provider {capacity_provider_id} is in {status} status and cannot be \
+             modified. Retry the request once its status is {CAPACITY_PROVIDER_STATUS_READY}."
+        )),
+    }
+}
 
 /// How long a freshly created capacity provider stays `CREATING` before the clock owes it
 /// `READY`.
@@ -208,6 +244,47 @@ impl CapacityProviderRecord {
             capacity_provider_id: self.capacity_provider_id.clone(),
             name: self.name.clone(),
             status: self.status_at(now).to_string(),
+        }
+    }
+
+    /// Apply an accepted modification at `now`: the provider reports `UPDATING` until the
+    /// clock owes it `READY` one settle span later, exactly as the create's own transition is
+    /// owed, and `lastUpdatedAt` becomes the instant of this call.
+    ///
+    /// `description` is the request's `UpdatedDescription` wrapper, applied with the PATCH
+    /// semantics the model states for it: "When present in an update request, the description
+    /// is replaced with optionalValue. When absent, the description is left unchanged. To
+    /// unset the description, include the wrapper with optionalValue not specified"
+    /// (`smithy_query doc shape=UpdatedDescription`). Every other member of the provider —
+    /// its name, its id, its ARN, its compute and permissions configuration — is NOT
+    /// modifiable by an update ("Only the description can be changed. To change other
+    /// configuration, such as instance types, networking, or storage, create a new capacity
+    /// provider") and is left as the create stored it.
+    ///
+    /// A second change arriving while the first is still owed its transition is applied the
+    /// same way, so the LAST write is the one the provider carries and the span it settles in
+    /// runs from that write.
+    pub fn accept_update(&mut self, description: Option<&UpdatedDescription>, now: SystemTime) {
+        if let Some(wrapper) = description {
+            self.description = wrapper.optional_value.clone();
+        }
+        self.transient_status = CAPACITY_PROVIDER_STATUS_UPDATING.to_string();
+        self.settled_status = CAPACITY_PROVIDER_STATUS_READY.to_string();
+        self.settles_at = now + CAPACITY_PROVIDER_SETTLE_DELAY;
+        self.updated_at = now;
+    }
+
+    /// This provider as `UpdateCapacityProvider`'s response envelope: every member
+    /// `UpdateCapacityProviderResponse` declares, read off the record the update just wrote,
+    /// so the response and a later read cannot disagree about the status or the instants.
+    pub fn update_output(&self, now: SystemTime) -> UpdateCapacityProviderOutput {
+        UpdateCapacityProviderOutput {
+            capacity_provider_arn: self.capacity_provider_arn.clone(),
+            capacity_provider_id: self.capacity_provider_id.clone(),
+            name: self.name.clone(),
+            status: self.status_at(now).to_string(),
+            created_at: timestamp(self.created_at),
+            last_updated_at: timestamp(self.updated_at),
         }
     }
 
