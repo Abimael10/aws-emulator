@@ -791,20 +791,29 @@ impl TargetGroupRecord {
     /// ([`TargetGroupRecord::health_of`]). It carries the workload it stands for, which is
     /// what lets the scheduler that added it take it out again.
     ///
-    /// Nothing is replaced: a key this group already holds — whether a caller registered it
-    /// or the same workload did — is left exactly as it is, so a reconcile does not restart
-    /// a drain or a health check. A group already holding its quota of targets
+    /// A registration IN SERVICE is not replaced: a key this group already holds — whether a
+    /// caller registered it or the same workload did — is left exactly as it is, so a
+    /// reconcile does not restart a health check. One that is DRAINING is returned to
+    /// service, exactly as `RegisterTargets` returns one (`crate::ops::register_targets`):
+    /// `draining` is the state of a target "in the process of being deregistered and the
+    /// deregistration delay period has not expired" (`TargetHealth$Reason`
+    /// `Target.DeregistrationInProgress`), which a target registered again is not — so the
+    /// deregistration is cancelled and the registration is checked from now, rather than
+    /// waiting out a drain it is no longer in and leaving the workload reachable through
+    /// nothing in the meantime. A group already holding its quota of targets
     /// ([`targets_per_target_group`]) takes no further registration, the same bound
-    /// `RegisterTargets` refuses past.
+    /// `RegisterTargets` refuses past; a key already held takes up no further room, so
+    /// returning one to service is not held to that bound.
     ///
-    /// Answers whether this call added a registration.
+    /// Answers whether this call put a registration in service.
     pub fn register_for(&mut self, declared: &SchedulerRegistration, now: SystemTime) -> bool {
         let key: TargetKey = (declared.id.clone(), declared.port.or(self.port));
-        if self.targets.contains_key(&key) {
-            return false;
-        }
-        if self.targets.len() >= targets_per_target_group(self) {
-            return false;
+        match self.targets.get(&key) {
+            // Being deregistered: this call cancels that, and the record below replaces it.
+            Some(held) if held.draining_until.is_some() => {}
+            Some(_) => return false,
+            None if self.targets.len() >= targets_per_target_group(self) => return false,
+            None => {}
         }
         // The zone this registration is stored under, read off the group before it is
         // written to: a target type whose targets are in no one zone of the group's network
@@ -823,6 +832,9 @@ impl TargetGroupRecord {
                 availability_zone,
                 registered_at: now,
                 healthy_at: due_at(now, SETTLE_AFTER),
+                // This record REPLACES whatever the key held, so a target that was being
+                // deregistered is no longer in a drain and no longer leaves the group when
+                // that drain runs out.
                 draining_until: None,
                 // The first check of it is owed at once — a load balancer begins sending a
                 // registration checks as soon as it is registered — and every later one comes
@@ -1337,6 +1349,189 @@ mod tests {
                 "case {case:?}: expected {expected:?}, got {:?}",
                 reported_pair(&health)
             );
+        }
+    }
+
+    /// A scheduler's declaration of one registration: `id` reached on `port`, standing for
+    /// `workload`.
+    fn declared_by_a_scheduler(
+        id: &str,
+        port: Option<i32>,
+        workload: &str,
+    ) -> SchedulerRegistration {
+        SchedulerRegistration {
+            id: id.to_string(),
+            port,
+            availability_zone: None,
+            workload: workload.to_string(),
+            serves_ports: Vec::new().into(),
+            guarded_by: Vec::new().into(),
+        }
+    }
+
+    /// What one key of a group holds before the scheduler registers it again.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Held {
+        /// Nothing: the key is free.
+        Nothing,
+        /// A registration IN SERVICE, made by the same scheduler.
+        InServiceForAScheduler,
+        /// A registration IN SERVICE that a `RegisterTargets` caller made.
+        InServiceForACaller,
+        /// A registration being DEREGISTERED, made by the same scheduler.
+        DrainingForAScheduler,
+        /// A registration being DEREGISTERED that a `RegisterTargets` caller made.
+        DrainingForACaller,
+    }
+
+    /// RULE: a scheduler registering a target puts it IN SERVICE — the registration is
+    /// reported `initial` while its first checks are sent and carries the workload it stands
+    /// for — whether that key was free or held a registration being DEREGISTERED, because
+    /// `draining` is the state of a target "in the process of being deregistered and the
+    /// deregistration delay period has not expired" (`TargetHealth$Reason`
+    /// `Target.DeregistrationInProgress`), which a target registered again is not; a key
+    /// holding a registration that is in service is left exactly as it is, so a reconcile
+    /// that moved nothing restarts no check.
+    ///
+    /// The rows span what the rule generalises over: what the key held (nothing, a
+    /// registration in service, one being deregistered) and WHOSE it was (the same
+    /// scheduler's, and a `RegisterTargets` caller's), each at the group's own port and at a
+    /// port the registration overrides.
+    #[test]
+    fn a_scheduler_registering_a_draining_target_returns_it_to_service() {
+        let rows: [(&str, Held, bool); 5] = [
+            ("a key the group holds nothing at", Held::Nothing, true),
+            (
+                "a registration of the same workload that is in service",
+                Held::InServiceForAScheduler,
+                false,
+            ),
+            (
+                "a registration a RegisterTargets caller made and is in service",
+                Held::InServiceForACaller,
+                false,
+            ),
+            (
+                "a registration of an earlier workload that is being deregistered",
+                Held::DrainingForAScheduler,
+                true,
+            ),
+            (
+                "a registration a RegisterTargets caller made and is deregistering",
+                Held::DrainingForACaller,
+                true,
+            ),
+        ];
+        // The ports the registration may receive traffic on: the group's own, and one the
+        // registration overrides ("you can override the port for a target when you register
+        // it", `RegisterTargets`).
+        let ports: [(&str, Option<i32>); 2] = [
+            ("the group's own port", None),
+            ("an overridden port", Some(8080)),
+        ];
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let address = "10.0.0.9";
+        let earlier = "arn:aws:ecs:us-east-1:000000000000:task/served/earlier";
+        let placed = "arn:aws:ecs:us-east-1:000000000000:task/served/placed";
+        for (port_case, port) in ports {
+            for (case, held, expected_in_service) in rows {
+                let case = format!("{case} at {port_case}");
+                let mut group = group_with(None);
+                group.port = Some(80);
+                group.health_check.enabled = true;
+                let key: TargetKey = (address.to_string(), port.or(group.port));
+                let draining_before =
+                    matches!(held, Held::DrainingForAScheduler | Held::DrainingForACaller);
+                let scheduler_owned_before = matches!(
+                    held,
+                    Held::InServiceForAScheduler | Held::DrainingForAScheduler
+                );
+                if held != Held::Nothing {
+                    let drain = due_at(now, deregistration_delay(&group));
+                    group.targets.insert(
+                        key.clone(),
+                        RegisteredTarget {
+                            id: key.0.clone(),
+                            port: key.1,
+                            availability_zone: None,
+                            registered_at: now,
+                            healthy_at: now,
+                            draining_until: draining_before.then_some(drain),
+                            checks_due_at: now,
+                            probe: TargetProbe::default(),
+                            registered_for: scheduler_owned_before
+                                .then(|| earlier.to_string()),
+                            serves_ports: Vec::new().into(),
+                            guarded_by: Vec::new().into(),
+                        },
+                    );
+                }
+
+                let answered = group.register_for(
+                    &declared_by_a_scheduler(address, port, placed),
+                    now + Duration::from_secs(1),
+                );
+                assert_eq!(
+                    answered, expected_in_service,
+                    "case {case:?}: expected register_for to answer {expected_in_service}, got \
+                     {answered}"
+                );
+
+                let target = group
+                    .targets
+                    .get(&key)
+                    .unwrap_or_else(|| panic!("case {case:?}: the group holds the registration"));
+                let state = group
+                    .health_of(target, now + Duration::from_secs(1))
+                    .state
+                    .unwrap_or_default();
+                if expected_in_service {
+                    assert_eq!(
+                        state, INITIAL_STATE,
+                        "case {case:?}: a registration put in service is checked from now, so it \
+                         is reported {INITIAL_STATE}, got {state:?}"
+                    );
+                    assert_eq!(
+                        target.registered_for.as_deref(),
+                        Some(placed),
+                        "case {case:?}: the registration stands for the workload this call \
+                         declared, got {:?}",
+                        target.registered_for
+                    );
+                    assert_eq!(
+                        target.draining_until, None,
+                        "case {case:?}: a registration in service is in no drain, got {:?}",
+                        target.draining_until
+                    );
+                } else {
+                    assert_eq!(
+                        target.registered_at, now,
+                        "case {case:?}: a registration already in service keeps the instant it \
+                         was made at, got {:?}",
+                        target.registered_at
+                    );
+                    // Left exactly as it is: whose it is, and the checking it is already
+                    // under, are untouched by a registration this call did not make.
+                    assert_eq!(
+                        target.registered_for.as_deref(),
+                        scheduler_owned_before.then_some(earlier),
+                        "case {case:?}: a registration already in service keeps the workload it \
+                         stood for, got {:?}",
+                        target.registered_for
+                    );
+                    assert_eq!(
+                        target.checks_due_at, now,
+                        "case {case:?}: a registration already in service keeps the instant its \
+                         next check is due at, got {:?}",
+                        target.checks_due_at
+                    );
+                    assert_ne!(
+                        state, DRAINING.0,
+                        "case {case:?}: a registration already in service is in no drain, got \
+                         {state:?}"
+                    );
+                }
+            }
         }
     }
 }
