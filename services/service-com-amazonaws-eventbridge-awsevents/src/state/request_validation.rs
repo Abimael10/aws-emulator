@@ -50,6 +50,51 @@ pub fn reserved_bus_name_violation(name: &str) -> Option<String> {
         .then(|| format!("EventBus name starting with '{RESERVED_BUS_NAMESPACE}' is not valid."))
 }
 
+/// Whether `name` has the form of a PARTNER event bus name.
+///
+/// The one name in the reserved namespace an account's own bus can carry: a
+/// partner event bus "name must exactly match the name of the partner event
+/// source that this event bus is matched to" (`CreateEventBus$Name`), and a
+/// source name is `EventSourceName`'s modelled pattern
+/// `^aws\.partner(/[\.\-_A-Za-z0-9]+){2,}$` — [`super::PARTNER_EVENT_SOURCE_PREFIX`]
+/// followed by at least two `/`-separated segments of that character set. Read as
+/// the FORM alone: whether such a bus exists is the store's answer, not this
+/// check's.
+fn has_partner_event_bus_form(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(super::PARTNER_EVENT_SOURCE_PREFIX) else {
+        return false;
+    };
+    let segments: Vec<&str> = rest.split('/').collect();
+    segments.len() >= 2
+        && segments.iter().all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+        })
+}
+
+/// Why `name` names no event bus that can be ADDRESSED, or `None` when it may.
+///
+/// The read half of [`reserved_bus_name_violation`]: the reserved namespace is
+/// not an account's to name a bus in, so a name in it is a name no bus of this
+/// account can carry — not a bus that merely has not been created yet. Every
+/// operation that resolves a bus by the name a request submitted asks this
+/// BEFORE the store lookup, so one name is refused the same way whichever
+/// operation carried it, and a client reading `ValidationException` to repair its
+/// input is never told instead that a resource is missing.
+///
+/// The partner event bus is the exception, exactly as it is for the create
+/// ([`has_partner_event_bus_form`]): such a bus is the account's, so a name of
+/// that form is resolved against the store like any other and answered as present
+/// or missing.
+pub fn addressed_bus_name_violation(name: &str) -> Option<String> {
+    if has_partner_event_bus_form(name) {
+        return None;
+    }
+    reserved_bus_name_violation(name)
+}
+
 /// The ARN namespace of Amazon SQS, named once: it is the one service a
 /// dead-letter queue is a queue of, and the service whose FIFO queues a target
 /// may only be delivered to with a message group ([`target_parameters_violation`]).

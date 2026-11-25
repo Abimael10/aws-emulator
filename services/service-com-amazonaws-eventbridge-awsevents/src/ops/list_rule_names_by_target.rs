@@ -156,6 +156,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let bus_name = crate::state::effective_bus_name(input.event_bus_name.as_deref());
+        // A name in the namespace EventBridge reserves for the buses it names
+        // itself is a name no bus of this account carries, so it is refused as
+        // the bad request it is before any lookup — the same check
+        // `CreateEventBus` makes of the name it is given
+        // (`crate::state::request_validation::addressed_bus_name_violation`).
+        if let Some(reason) =
+            crate::state::request_validation::addressed_bus_name_violation(&bus_name)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(reason));
+        }
         let store = state.lock();
         let Some(bus) = store.bus(&region, &bus_name) else {
             return Err(ListRuleNamesByTargetErrorModeled::ResourceNotFoundException(

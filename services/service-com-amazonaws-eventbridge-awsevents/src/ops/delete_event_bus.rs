@@ -146,6 +146,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this handler and the member is the bus name itself.
         let name = input.name;
 
+        // A name in the namespace EventBridge reserves for the buses it names
+        // itself is a name no bus of this account carries, so it is refused as
+        // the bad request it is rather than taken as a delete that found nothing
+        // — the same check `CreateEventBus` makes of the name it is given
+        // (`crate::state::request_validation::addressed_bus_name_violation`), on
+        // the same 400 `ValidationException` channel this operation's other
+        // refusals travel.
+        if let Some(reason) = crate::state::request_validation::addressed_bus_name_violation(&name)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(reason));
+        }
+
         // "You can't delete your account's default event bus" (this operation's
         // own documentation). The model declares no client-input error for this
         // operation, so the refusal travels on the 400 `ValidationException`

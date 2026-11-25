@@ -152,6 +152,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the default event bus is displayed" — both resolved by the one helper
         // every operation of this service addresses a bus through.
         let bus_name = crate::state::effective_bus_name(input.name.as_deref());
+        // The namespace EventBridge names its own buses in is not this account's,
+        // so a name in it is a name no bus of this account carries — judged
+        // BEFORE the lookup, because such a name is a bad request rather than a
+        // resource that has merely not been created yet
+        // (`crate::state::request_validation::addressed_bus_name_violation`). The
+        // model declares no input error for this operation, so the refusal
+        // travels on the 400 `ValidationException` channel, the same channel
+        // `CreateEventBus` refuses the same name on.
+        if let Some(reason) =
+            crate::state::request_validation::addressed_bus_name_violation(&bus_name)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(reason));
+        }
         // A pure read: the Region's `default` bus is resolved without writing
         // anything, so the store is left exactly as it was found.
         let store = state.lock();
