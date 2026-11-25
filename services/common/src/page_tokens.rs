@@ -123,6 +123,32 @@ pub fn page_cursor(key: &PageTokenKey, token: &str) -> Option<String> {
     key.cursor_of(&bytes)
 }
 
+/// A fixed-width stand-in for the SEQUENCE a cursor belongs to: the SHA-256 digest of
+/// `scope`, lowercase hexadecimal — the same 64 characters whatever the scope holds.
+///
+/// A cursor names a position in ONE sequence, so it carries the identity of that
+/// sequence — the collection walked, the parent it was taken under, the filters in
+/// force — and a reader refuses a token whose scope is not its own rather than seeking
+/// into a sequence the position means nothing in. That identity is built from REQUEST
+/// text, and a model leaves some of it unbounded, so a scope travelling VERBATIM inside
+/// the token makes the token a service hands out grow with the request that asked for
+/// it, past the length the model declares for the member it travels on — and a page named
+/// by a token the service's own request walk refuses cannot be fetched at all.
+///
+/// Digesting the scope is what keeps the SIZE of an issued token a property of the
+/// service rather than of the request. It identifies the sequence just as exactly (two
+/// different scopes digest alike only on a SHA-256 collision), and nothing reads a scope
+/// back OUT of a cursor: a reader only compares the digest a token carries with the digest
+/// of the scope of the read replaying it.
+///
+/// The digest and its hexadecimal rendering come from the maintained crates this workspace
+/// already computes both with, so a service that scopes its cursors names this one
+/// function rather than spelling a digest of its own.
+pub fn scope_digest(scope: &str) -> String {
+    use ::sha2::Digest as _;
+    ::hex::encode(::sha2::Sha256::digest(scope.as_bytes()))
+}
+
 /// Redacted: the key authenticates a store's page tokens, so it belongs in no log line
 /// and in no debug dump of the state that holds it.
 impl std::fmt::Debug for PageTokenKey {
@@ -210,6 +236,57 @@ mod tests {
                 None,
                 "case {case:?}: expected no cursor"
             );
+        }
+    }
+
+    /// The stand-in a cursor carries for its sequence is one fixed width whatever the
+    /// scope holds, and two different sequences never share one.
+    #[test]
+    fn a_scope_digest_is_fixed_width_and_identifies_its_scope() {
+        // How many characters a hex SHA-256 digest is written in.
+        const DIGEST_CHARS: usize = 64;
+
+        // Scopes spanning the forms a read builds one in — empty, a collection name, a
+        // name and a filter, one carrying a separator byte — and then sizes far past any
+        // of them, because what a model leaves unbounded is the request text inside a
+        // scope: a few characters, a few thousand, and a multi-byte value.
+        let long = "a".repeat(10_000);
+        let longer = "b".repeat(100_000);
+        let multibyte = "é".repeat(5_000);
+        let scopes = [
+            "",
+            "lexicons",
+            "[\"resources/one\",[[\"regionCode\",\"us-east-1\"]]]",
+            "scope\u{1f}key",
+            long.as_str(),
+            longer.as_str(),
+            multibyte.as_str(),
+        ];
+        let mut seen: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+        for scope in scopes {
+            let digest = scope_digest(scope);
+            assert_eq!(
+                digest.chars().count(),
+                DIGEST_CHARS,
+                "case a scope of {} characters: expected {DIGEST_CHARS} characters, got {}",
+                scope.chars().count(),
+                digest.chars().count()
+            );
+            assert_eq!(
+                digest,
+                scope_digest(scope),
+                "case a scope of {} characters: expected the same digest twice",
+                scope.chars().count()
+            );
+            if let Some(other) = seen.insert(digest.clone(), scope) {
+                panic!(
+                    "case a scope of {} characters: expected a digest no other scope \
+                     produces, got {digest:?}, which is also the digest of a scope of {} \
+                     characters",
+                    scope.chars().count(),
+                    other.chars().count()
+                );
+            }
         }
     }
 

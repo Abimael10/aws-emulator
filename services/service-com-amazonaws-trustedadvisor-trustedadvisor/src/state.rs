@@ -71,7 +71,10 @@
 //! name some position in the sequence and a caller could resume from a position
 //! the service never offered; with it, [`decode_token`] answers a key only for a
 //! token THIS store minted for THAT read's scope, and every other value is a
-//! [`MalformedToken`] the handler refuses.
+//! [`MalformedToken`] the handler refuses. The read a cursor belongs to travels
+//! in it as the fixed-width [`scope_digest`] rather than as the scope text, so
+//! the size of an issued token is a property of this service and not of the
+//! request's own filter values, which the model leaves unbounded.
 //!
 //! The one rule a lifecycle update applies to a stored recommendation lives
 //! here as well — [`apply_lifecycle_update`], with the guard
@@ -130,7 +133,12 @@ use crate::ops::types::{
 /// so a value a caller assembled is told from one this store issued. The
 /// workspace's one reading of a page token, re-exported so this crate's
 /// pagination helpers and the tests that drive them name one type.
-pub use ::service_common::page_tokens::PageTokenKey;
+///
+/// [`scope_digest`] comes from that same module: it is the fixed-width stand-in
+/// a cursor of this service carries for the read it belongs to ([`encode_token`])
+/// rather than the scope text itself, which is what bounds the length of every
+/// token this service hands out.
+pub use ::service_common::page_tokens::{scope_digest, PageTokenKey};
 
 /// What this service answers a caller whose account's support plan does not
 /// include the Trusted Advisor API: the support-level gate's refusal, carried by
@@ -1740,10 +1748,10 @@ impl MalformedToken {
     }
 }
 
-/// The separator between a cursor's scope and its key. ASCII unit separator: a
-/// key this service pages on is a stored id or ARN, which cannot contain it, and
-/// a scope is JSON ([`list_scope`]), whose serializer escapes every control
-/// character — so the split is unambiguous.
+/// The separator between the digest of a cursor's scope and its key. ASCII unit
+/// separator: a key this service pages on is a stored id or ARN, which cannot
+/// contain it, and the digest ahead of it is hexadecimal ([`scope_digest`]) — so
+/// the split is unambiguous.
 const TOKEN_SEPARATOR: char = '\u{1f}';
 
 /// The cursor scope for one read of a filtered list: the list's name (and, for a
@@ -1788,9 +1796,22 @@ pub fn list_scope(list: &str, filters: &[(&str, Option<&str>)]) -> String {
 }
 
 /// The cursor for a page of `scope` that ended on `last_key`: base64 of the
-/// scope and that key behind an AUTHENTICATOR this store computes under
+/// scope's DIGEST and that key behind an AUTHENTICATOR this store computes under
 /// `token_key`, so the token is opaque to a caller and carries no state of its
 /// own.
+///
+/// The scope travels as the fixed-width [`scope_digest`] rather than verbatim,
+/// which is what bounds the length of every token this service hands out: a
+/// cursor is the authenticator, that digest, the separator and a stored key, so
+/// an issued `nextToken` stays well inside the `@length(4, 10000)` the model
+/// declares for the member it travels on, however long the filter values of the
+/// request were. The model bounds only part of a scope's text — the Region code
+/// both resource lists filter on carries no `@length` at all, and the AWS
+/// resource ARN `ListRecommendationsForResource` is taken under ends in a
+/// free-form tail — so a scope carried verbatim would make a page of this
+/// service's own sequence be named by a cursor the centralized request walk
+/// refuses before any handler runs, and a caller following the tokens of that
+/// sequence could not reach its end.
 ///
 /// The position a continuation token names travels INSIDE the token — there is
 /// no page kept on the side to look it up in — so the scope and the key alone
@@ -1804,9 +1825,10 @@ pub fn list_scope(list: &str, filters: &[(&str, Option<&str>)]) -> String {
 /// authenticated together with the key, so a token cannot be replayed on a
 /// different list or filter set, where the same key would mean something else.
 pub fn encode_token(token_key: &PageTokenKey, scope: &str, last_key: &str) -> String {
-    ::aws_smithy_types::base64::encode(
-        token_key.mint(&format!("{scope}{TOKEN_SEPARATOR}{last_key}")),
-    )
+    ::aws_smithy_types::base64::encode(token_key.mint(&format!(
+        "{}{TOKEN_SEPARATOR}{last_key}",
+        scope_digest(scope)
+    )))
 }
 
 /// The key a cursor points at, or [`MalformedToken`] when the token is not one
@@ -1828,7 +1850,7 @@ pub fn decode_token(
     let (token_scope, key) = minted
         .split_once(TOKEN_SEPARATOR)
         .ok_or_else(|| MalformedToken::new(token))?;
-    if token_scope != scope {
+    if token_scope != scope_digest(scope) {
         return Err(MalformedToken::new(token));
     }
     Ok(key.to_string())

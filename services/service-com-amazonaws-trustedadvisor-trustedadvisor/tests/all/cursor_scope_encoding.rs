@@ -32,7 +32,11 @@
 //!   list whose free-form filter precedes a constrained one
 //!   (`ListOrganizationRecommendationResources`) and on the list whose scope
 //!   embeds a free-form parent ARN (`ListRecommendationsForResource`); and the
-//!   issuing read still resumes with it.
+//!   issuing read still resumes with it;
+//! * a cursor a read MINTS stays inside the `@length(4, 10000)` the model puts on
+//!   `nextToken`, and the sequence stays walkable to its end, however long the
+//!   free-form filter value the read was taken under is — the scope identifies
+//!   the read, but its SIZE is no part of the token the service hands out.
 //!
 //! Every call is made as an account whose support plan includes the Trusted
 //! Advisor API; the gate ahead of every handler is pinned in
@@ -46,7 +50,9 @@ use service_com_amazonaws_trustedadvisor_trustedadvisor::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::organization_recommendation_lifecycle::organization_recommendation_arn;
-use crate::recommendation_loop::{call, emulator_on_plan, error_code, label, resource_arn};
+use crate::recommendation_loop::{
+    call, emulator_on_plan, error_code, field_of_each, label, recommendation_arn, resource_arn,
+};
 
 /// The ASCII separator characters a delimited encoding of a cursor scope uses —
 /// the record separator between the parts of a scope and the unit separator
@@ -466,5 +472,265 @@ async fn a_parent_arn_that_spells_out_another_reads_scope_cannot_replay_its_toke
             resumed, 1,
             "case {case}: expected the second page to carry the remaining row, got {body}"
         );
+    }
+}
+
+/// What the model admits as a `nextToken`, on the INPUT member and on the OUTPUT
+/// member alike: `smithy_query(query="operation",
+/// operation="ListRecommendationResources",
+/// model_path="services/service-com-amazonaws-trustedadvisor-trustedadvisor/smithy-model/com-amazonaws-trustedadvisor-trustedadvisor.json")`
+/// shows `"nextToken": {"target": "String", "length": {"min": 4, "max": 10000}}`
+/// on both, and so does every other paginated read of this service.
+const TOKEN_LENGTH: std::ops::RangeInclusive<usize> = 4..=10_000;
+
+/// A Region code no SEEDED resource sits in — the `SEED` table in `src/state.rs`
+/// places its resources in `us-east-1`, `us-west-2`, `eu-west-1` and
+/// `ap-southeast-1` — so a read filtered on it reports exactly the resources a
+/// test wrote and nothing else.
+const UNSEEDED_REGION: &str = "me-central-1";
+
+/// One arbitrary filter value as it goes into a request's query string: every
+/// byte outside the RFC 3986 unreserved set percent-encoded.
+///
+/// `regionCode` is request text under no modelled constraint, so a value below
+/// carries whatever a caller may send — a control character, a multi-byte
+/// character — and a URI carries none of those raw.
+fn query_value(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                char::from(byte).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
+}
+
+/// A mounted emulator whose store holds TWO resources of [`CHECK`]'s
+/// recommendation in the Region `region`, together with their ARNs in the order
+/// both resource lists page them (ARN order) — so a read filtered on that Region
+/// matches two entries and a page of one is truncated.
+///
+/// Written straight into the store, as the sibling suites do: Trusted Advisor
+/// models no operation that creates a check result, so a finding can only arrive
+/// from outside the API.
+fn emulator_with_two_resources_in(region: &str) -> (MultiServiceRouter, Vec<String>) {
+    let (router, engine) = emulator_on_plan(SupportPlan::Business);
+    let state = service_state(&*engine).expect("the engine carries this service's state");
+    let mut state = state.lock();
+    let seeded = state
+        .recommendation_resources
+        .get(&resource_arn(CHECK, SEEDED_RESOURCE_ID))
+        .cloned()
+        .expect("the seeded store holds this check's first resource");
+    let mut written = Vec::new();
+    for id in ["res-ec2-8001", "res-ec2-8002"] {
+        let mut resource = seeded.clone();
+        resource.id = id.to_string();
+        resource.arn = resource_arn(CHECK, id);
+        resource.aws_resource_id = format!("i-0abc{id}");
+        resource.region_code = region.to_string();
+        written.push(resource.arn.clone());
+        state
+            .recommendation_resources
+            .insert(resource.arn.clone(), resource);
+    }
+    drop(state);
+    (router, written)
+}
+
+/// Follow one read's OWN tokens from its first page until none comes back,
+/// reporting the `arn` of every entry seen in order and every token the read
+/// handed out.
+///
+/// `query` holds the read's filters; each page is asked for one entry at a time,
+/// so a sequence of `n` entries is `n` pages and `n - 1` tokens.
+async fn walked(
+    router: &MultiServiceRouter,
+    case: &str,
+    path: &str,
+    query: &str,
+    list: &str,
+    pages_at_most: usize,
+) -> (Vec<String>, Vec<String>) {
+    let mut seen = Vec::new();
+    let mut tokens: Vec<String> = Vec::new();
+    let mut resume: Option<String> = None;
+    for _ in 0..pages_at_most {
+        let uri = match &resume {
+            Some(token) => format!("{path}?{query}&maxResults=1&nextToken={}", label(token)),
+            None => format!("{path}?{query}&maxResults=1"),
+        };
+        let (status, body) = call(router, "GET", &uri, None).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: expected 200 from the read resuming at {resume:?}, got {status} with \
+             {body}"
+        );
+        seen.extend(field_of_each(&body, list, "arn"));
+        match body["nextToken"].as_str() {
+            Some(token) => {
+                tokens.push(token.to_string());
+                resume = Some(token.to_string());
+            }
+            None => return (seen, tokens),
+        }
+    }
+    panic!("case {case}: expected the read to run out of pages within {pages_at_most}")
+}
+
+#[tokio::test]
+async fn a_cursor_a_read_mints_stays_inside_the_modelled_token_length() {
+    // Rows differ along the SIZE of the free-form filter value the read is taken
+    // under (a Region code, then values far past what a Region code is, up to
+    // three times the token member's own modelled maximum), along its ENCODING
+    // (ASCII and multi-byte), and along whether it carries the characters a
+    // delimited cursor encoding delimits on. Every row is a well-formed request:
+    // `regionCode` is a plain `String` with no `length` and no `pattern`
+    // (`smithy_query(query="operation",operation="ListRecommendationResources")`).
+    let split_on_scope = format!(
+        "{}{SCOPE_SEPARATOR}{}",
+        "a".repeat(4_000),
+        "b".repeat(4_000)
+    );
+    let split_on_cursor = format!(
+        "{}{TOKEN_SEPARATOR}{}",
+        "a".repeat(4_000),
+        "b".repeat(4_000)
+    );
+    let cases: Vec<(&str, String)> = vec![
+        ("a Region code", UNSEEDED_REGION.to_string()),
+        ("a thousand characters", "a".repeat(1_000)),
+        ("seven and a half thousand characters", "a".repeat(7_500)),
+        (
+            "as many characters as the token member's own maximum",
+            "a".repeat(10_000),
+        ),
+        ("three times that maximum", "a".repeat(30_000)),
+        (
+            "ten thousand bytes of a multi-byte character",
+            "é".repeat(5_000),
+        ),
+        (
+            "the scope separator between two long halves",
+            split_on_scope,
+        ),
+        (
+            "the cursor separator between two long halves",
+            split_on_cursor,
+        ),
+    ];
+
+    // Both reads whose cursor scope embeds this free-form filter: the
+    // account-level resource list and the organization-level one.
+    let own = engine::EMULATOR_ACCOUNT_ID;
+    let reads: Vec<(&str, String, &str, String)> = vec![
+        (
+            "ListRecommendationResources",
+            format!(
+                "/v1/recommendations/{}/resources",
+                label(&recommendation_arn(CHECK))
+            ),
+            "recommendationResourceSummaries",
+            String::new(),
+        ),
+        (
+            "ListOrganizationRecommendationResources",
+            resources_path(),
+            "organizationRecommendationResourceSummaries",
+            format!("affectedAccountId={own}&"),
+        ),
+    ];
+
+    for (read, path, list, extra) in &reads {
+        let mut minted_lengths: Vec<(&str, usize)> = Vec::new();
+        for (row, region) in &cases {
+            let case = format!("{read} under {row}");
+            let (router, expected) = emulator_with_two_resources_in(region);
+            let query = format!("{extra}regionCode={}", query_value(region));
+            // One page per entry written, plus the page that reports the
+            // sequence is exhausted — so a read handing back a cursor that
+            // resumed nowhere would fail here rather than loop.
+            let (seen, tokens) = walked(
+                &router,
+                &case,
+                path,
+                &query,
+                list,
+                expected.len() + 2,
+            )
+            .await;
+
+            for token in &tokens {
+                let length = token.chars().count();
+                assert!(
+                    TOKEN_LENGTH.contains(&length),
+                    "case {case}: expected a minted token the model admits \
+                     ({TOKEN_LENGTH:?} characters), got one of {length}"
+                );
+            }
+            assert_eq!(
+                seen, expected,
+                "case {case}: expected the token-following walk to report every resource of that \
+                 Region exactly once, got {seen:?}"
+            );
+            assert_eq!(
+                tokens.len(),
+                expected.len() - 1,
+                "case {case}: expected one token per page but the last, got {}",
+                tokens.len()
+            );
+            minted_lengths.push((row, tokens[0].chars().count()));
+
+            // The cursor it minted is also a value this service's OWN refusal
+            // answers: replayed on a differently filtered sequence it is refused
+            // as a token not issued for that read, and not by the framework's
+            // modelled-length clause — which is the answer a caller got while
+            // the token the service handed out could be longer than the member
+            // the model declares.
+            let other = format!("{extra}regionCode={}", query_value(&format!("{region}x")));
+            let (status, body) = call(
+                &router,
+                "GET",
+                &format!(
+                    "{path}?{other}&maxResults=1&nextToken={}",
+                    label(&tokens[0])
+                ),
+                None,
+            )
+            .await;
+            assert_eq!(
+                status, 400,
+                "case {case}: expected the token to be refused on a differently filtered \
+                 sequence, got {status} with {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "ValidationException",
+                "case {case}: expected ValidationException, got {body}"
+            );
+            let message = body["message"].as_str().unwrap_or_else(|| {
+                panic!("case {case}: expected a refusal carrying a message, got {body}")
+            });
+            assert!(
+                !message.contains("length"),
+                "case {case}: expected this service's page-token refusal rather than a clause \
+                 about the member's modelled length, got {message:?}"
+            );
+        }
+
+        // And the size of a cursor is a property of the read, not of the request
+        // it was taken under: every row above pages the same sequence from the
+        // same cut point, so the tokens differ in their bytes and not in their
+        // length.
+        let (first_row, first_length) = minted_lengths[0];
+        for (row, length) in &minted_lengths {
+            assert_eq!(
+                *length, first_length,
+                "case {read} under {row}: expected a cursor the same length as the one minted \
+                 under {first_row} ({first_length} characters), got {length}"
+            );
+        }
     }
 }
