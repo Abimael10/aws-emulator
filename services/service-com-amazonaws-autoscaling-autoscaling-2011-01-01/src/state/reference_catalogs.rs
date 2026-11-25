@@ -149,32 +149,38 @@ pub const AUTO_SCALING_NOTIFICATION_TYPES: &[&str] = &[
 /// `EnableMetricsCollection` and published by this catalog without appearing in
 /// it.
 ///
-/// Grouped the way that documentation groups what it does enumerate — sizes,
-/// then instance counts, then capacities, then the warm pool — with each metric
-/// the prose omits beside the one it refines.
+/// ORDERED as the service publishes it, which is what a refusal naming the valid
+/// metric-collection types enumerates
+/// ([`metrics_collection::valid_metric_collection_types_message`]): the group's
+/// three sizes first, then each group series as an instance/capacity PAIR — the
+/// count of instances in a state immediately followed by the capacity those
+/// instances carry — then the warm pool's own series in the same pairing, and the
+/// two combined `GroupAndWarmPool*` series last. The model member's prose lists
+/// every instance count before every capacity, which is a grouping of the names it
+/// enumerates and not the order the service publishes them in.
 pub const METRIC_COLLECTION_TYPES: &[&str] = &[
     "GroupMinSize",
     "GroupMaxSize",
     "GroupDesiredCapacity",
     "GroupInServiceInstances",
-    "GroupPendingInstances",
-    "GroupStandbyInstances",
-    "GroupTerminatingInstances",
-    "GroupTerminatingRetainedInstances",
-    "GroupTotalInstances",
     "GroupInServiceCapacity",
+    "GroupPendingInstances",
     "GroupPendingCapacity",
-    "GroupStandbyCapacity",
+    "GroupTerminatingInstances",
     "GroupTerminatingCapacity",
+    "GroupTerminatingRetainedInstances",
     "GroupTerminatingRetainedCapacity",
+    "GroupStandbyInstances",
+    "GroupStandbyCapacity",
+    "GroupTotalInstances",
     "GroupTotalCapacity",
     "WarmPoolMinSize",
     "WarmPoolDesiredCapacity",
-    "WarmPoolWarmedCapacity",
     "WarmPoolPendingCapacity",
     "WarmPoolPendingRetainedCapacity",
     "WarmPoolTerminatingCapacity",
     "WarmPoolTerminatingRetainedCapacity",
+    "WarmPoolWarmedCapacity",
     "WarmPoolTotalCapacity",
     "GroupAndWarmPoolDesiredCapacity",
     "GroupAndWarmPoolTotalCapacity",

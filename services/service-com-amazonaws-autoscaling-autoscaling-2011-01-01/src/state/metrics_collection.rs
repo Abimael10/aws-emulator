@@ -53,8 +53,8 @@ pub type EnabledMetrics = BTreeMap<String, String>;
 ///
 /// Neither variant carries anything from the request: this service answers a request that
 /// names a value outside an enumerated member's own set by reporting that set
-/// ([`valid_metrics_message`], [`valid_metric_granularities_message`]), the same form it
-/// refuses an unserved policy type with.
+/// ([`valid_metric_collection_types_message`], [`valid_metrics_granularity_message`]), the
+/// same form it refuses an unserved policy type with.
 #[derive(Debug, PartialEq, Eq)]
 pub enum MetricsRefusal {
     /// The request names at least one metric outside this service's own catalog.
@@ -69,8 +69,8 @@ impl MetricsRefusal {
     #[must_use]
     pub fn message(&self) -> String {
         match self {
-            Self::UnknownMetrics => valid_metrics_message(),
-            Self::UnknownGranularity => valid_metric_granularities_message(),
+            Self::UnknownMetrics => valid_metric_collection_types_message(),
+            Self::UnknownGranularity => valid_metrics_granularity_message(),
         }
     }
 }
@@ -158,12 +158,17 @@ pub fn named_metrics(requested: &[String]) -> Result<Vec<String>, MetricsRefusal
 }
 
 /// The sentence a request naming a metric outside this service's own catalog is refused
-/// with: the metrics the caller has to choose from, read from the catalog the service
-/// publishes, and nothing from the request.
+/// with: the metric-collection types the caller has to choose from, read in order from the
+/// catalog the service publishes ([`super::METRIC_COLLECTION_TYPES`]), and nothing from the
+/// request.
+///
+/// The sentence around the bracketed set is this service's own fixed text for the refusal
+/// class — the member's valid values named by the kind of value they are — so only the set
+/// and its order vary, with the catalog.
 #[must_use]
-pub fn valid_metrics_message() -> String {
+pub fn valid_metric_collection_types_message() -> String {
     format!(
-        "Valid metrics are: [{}].",
+        "Valid metrics collection types are: [{}].",
         super::METRIC_COLLECTION_TYPES.join(", ")
     )
 }
@@ -171,15 +176,15 @@ pub fn valid_metrics_message() -> String {
 /// The sentence a request asking for a granularity this service does not aggregate at is
 /// refused with.
 ///
-/// The counterpart of [`valid_metrics_message`] for the granularity member, in the wording
-/// this refusal class carries: the subject stays plural (`metrics`) while the thing named
-/// is singular (`granularity type is`). Every word of it is fixed text; its ONE variable
-/// part is the bracketed enumeration of the granularities the service accepts, read from
-/// the catalog it publishes ([`super::METRIC_GRANULARITIES`], what
+/// The counterpart of [`valid_metric_collection_types_message`] for the granularity member,
+/// in the wording this refusal class carries: the subject stays plural (`metrics`) while the
+/// thing named is singular (`granularity type is`). Every word of it is fixed text; its ONE
+/// variable part is the bracketed enumeration of the granularities the service accepts, read
+/// from the catalog it publishes ([`super::METRIC_GRANULARITIES`], what
 /// `DescribeMetricCollectionTypes` reports as `Granularities`) rather than written out
 /// here, so the sentence states the very set the request was checked against.
 #[must_use]
-pub fn valid_metric_granularities_message() -> String {
+pub fn valid_metrics_granularity_message() -> String {
     format!(
         "Valid metrics granularity type is: [{}].",
         super::METRIC_GRANULARITIES.join(", ")

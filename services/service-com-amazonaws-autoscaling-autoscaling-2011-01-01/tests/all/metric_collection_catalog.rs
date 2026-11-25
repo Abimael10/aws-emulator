@@ -699,7 +699,10 @@ async fn a_metrics_request_outside_the_published_catalog_is_refused_and_writes_n
     );
 
     // The metrics the caller may choose from, as the service publishes them.
-    let valid_metrics = format!("Valid metrics are: [{}].", catalog.join(", "));
+    let valid_metrics = format!(
+        "Valid metrics collection types are: [{}].",
+        catalog.join(", ")
+    );
     let valid_granularities = format!(
         "Valid metrics granularity type is: [{}].",
         granularities.join(", ")
