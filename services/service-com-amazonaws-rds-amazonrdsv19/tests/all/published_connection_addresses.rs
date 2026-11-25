@@ -350,12 +350,13 @@ async fn every_published_connection_address_is_one_this_emulator_answers_on() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_clusters_reader_endpoint_names_the_read_path_in_the_zone_its_listener_is_reached_in() {
+async fn a_clusters_reader_endpoint_names_the_interface_its_read_only_listener_is_reached_on() {
     let (router, _engine) = emulator_with_engine();
     // The reader member is the one connection endpoint of a cluster the model gives no port
-    // of its own, so no client composes an address from it: it stays the name the CLUSTER
-    // mints under the published `cluster-ro-` label, which is what tells a read path from a
-    // write path, in the zone RFC 6761 reserves for the interface the core bound.
+    // of its own, so no client composes an address from it on its own: it is the OTHER own
+    // spelling of the interface the cluster's read-only listener is bound on — the name
+    // RFC 6761 reserves for the loopback interface — which is what tells a read path from a
+    // write path while staying an address a client of this emulator resolves.
     let row = &RESOURCES[0];
     let identifier = "emu-pca-reader";
     create_cluster(&router, row, identifier).await;
@@ -368,20 +369,9 @@ async fn a_clusters_reader_endpoint_names_the_read_path_in_the_zone_its_listener
          both",
         row.case
     );
-    assert!(
-        reader.starts_with(&format!("{identifier}.cluster-ro-"))
-            && reader.ends_with(&format!(".{REGION}.rds.localhost")),
-        "case {:?}: expected the minted reader name \
-         {identifier}.cluster-ro-<label>.{REGION}.rds.localhost, got {reader:?}",
-        row.case
-    );
-    assert!(
-        !reader.contains(':'),
-        "case {:?}: an endpoint member carries no port of its own, got {reader:?}",
-        row.case
-    );
-    // A name in the loopback zone and nothing of AWS's own: a name in a zone AWS serves would
-    // send the client out of the emulated environment.
+    crate::db_clusters::assert_own_endpoint_host(row.case, "reader", identifier, REGION, &reader);
+    // A spelling of the loopback interface and nothing of AWS's own: a name in a zone AWS
+    // serves would send the client out of the emulated environment.
     assert!(
         service_common::data_plane_addressing::names_the_loopback_interface(&reader),
         "case {:?}: expected a name of the loopback interface, got {reader:?}",

@@ -6,7 +6,7 @@
 //! the core opened for that cluster is answered at, beside that listener's port in the one
 //! `DBCluster$Port` ("the port that the database engine is listening on") — so the pair the
 //! client composes reaches the plane that serves it, which a name this emulator resolves for
-//! nobody would not. The `cluster-ro-` name the cluster mints beside it is the read path, which
+//! nobody would not. The own host the cluster publishes beside it is the read path, which
 //! is what a client that splits its traffic reads.
 //!
 //! A cluster this emulator serves NO data plane for keeps the minted form under the published
@@ -190,8 +190,8 @@ async fn a_served_clusters_published_endpoint_is_the_address_its_engine_listener
 
         // And that address IS the listener's own: the host the core bound the cluster's
         // listener on, with that listener's port beside it — so what the client dials is the
-        // interface the plane answers on. The reader member beside it is the `cluster-ro-`
-        // name the cluster mints in the zone that interface is reached in.
+        // interface the plane answers on. The reader member beside it is the other own
+        // spelling of that interface.
         let reader = text(&settled, "ReaderEndpoint");
         assert_served_endpoint_pair(row.case, row.identifier, REGION, &endpoint, &reader);
         let listener = listener_address(&engine, row.case, row.identifier);

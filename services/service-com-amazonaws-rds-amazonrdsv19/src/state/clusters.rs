@@ -658,8 +658,11 @@ impl DbClusterRecord {
     }
 
     /// The reader endpoint, which "load-balances connections across the Aurora Replicas
-    /// that are available in a DB cluster": the name the cluster mints under the published
-    /// `cluster-ro-` label, over the suffix [`Self::endpoint_dns_suffix`] answers.
+    /// that are available in a DB cluster": for a cluster whose data plane this emulator
+    /// SERVES, an own host of this emulator naming the interface that cluster's read-only
+    /// listener is answered on ([`served_reader_host`]), and for a cluster it serves no plane
+    /// for the name the cluster mints under the published `cluster-ro-` label, over the suffix
+    /// [`Self::endpoint_dns_suffix`] answers.
     ///
     /// A HOST, exactly as [`Self::endpoint`] is: the model gives a DB cluster ONE port
     /// member for both of its endpoints (`DBCluster$Port`, "the port that the database
@@ -667,26 +670,19 @@ impl DbClusterRecord {
     /// neither is ever written as a `host:port` authority — a client composes the address it
     /// dials from the endpoint and that one `Port`.
     ///
-    /// The CLUSTER mints the name, not any reader instance: it is therefore non-empty,
-    /// distinct from the writer endpoint and of this form whatever the cluster's membership
-    /// is — a cluster with no Aurora Replica at all is still reached at it. The
-    /// `cluster-ro-` label is what tells a read path from a write path, which is the whole of
-    /// what this member carries that the writer endpoint does not: the read-only plane is a
-    /// listener of its own ([`data_plane::DbEngineEndpoint::reader`]) with a port of its own,
-    /// and the one `Port` the model gives the pair is the WRITER listener's, so the address a
-    /// client composes from this name and that port reaches the writer's plane. Publishing
-    /// the read-only listener's own address needs a resource to be dialable at a port of its
-    /// own, which the core does not offer (`vendor/server/src/listeners.rs` binds every
-    /// listener on the one operator-chosen interface at an OS-assigned port).
-    ///
-    /// It is the minted NAME and not an address of this emulator's, where the writer endpoint
-    /// is the address the write path is answered at ([`Self::endpoint`]): the read-only plane
-    /// is a listener of its own ([`data_plane::DbEngineEndpoint::reader`]) with a port of its
-    /// own, and the one `Port` the model gives the pair is the WRITER listener's, so an
-    /// address published here would be composed with the wrong port. The `cluster-ro-` label
-    /// is what tells the two paths apart, and a client that reaches the read-only plane does
-    /// it on a custom endpoint, whose own shape carries the port the core assigned it
-    /// ([`DbClusterEndpointRecord::to_wire`]).
+    /// It is non-empty and DISTINCT from the writer endpoint whatever the cluster's membership
+    /// is — a cluster with no Aurora Replica at all is still reached at it — and that
+    /// distinction is what tells a read path from a write path. For a SERVED cluster the two
+    /// members are the two own spellings of the ONE interface the core bound
+    /// ([`served_reader_host`]), because this emulator resolves no name of its own invention
+    /// for its clients: the read-only plane is a listener of its own
+    /// ([`data_plane::DbEngineEndpoint::reader`]) with a port of its own, and the one `Port`
+    /// the model gives the pair is the WRITER listener's, so a client that reaches the
+    /// read-only plane does it on a custom endpoint, whose own shape carries the port the core
+    /// assigned it ([`DbClusterEndpointRecord::to_wire`]). Publishing the read-only listener's
+    /// own address needs a resource to be dialable at a port of its own, which the core does
+    /// not offer (`vendor/server/src/listeners.rs` binds every listener on the one
+    /// operator-chosen interface at an OS-assigned port).
     ///
     /// A cluster whose data plane is an AWS API this emulator serves at its OWN endpoint
     /// publishes the host that endpoint is reached at instead
@@ -699,6 +695,7 @@ impl DbClusterRecord {
             if engine_data_plane_is_an_api(&self.engine) {
                 return served.host.clone();
             }
+            return served_reader_host(&served.host);
         }
         self.minted_endpoint_name(CLUSTER_READER_LABEL)
     }

@@ -19,8 +19,9 @@
 //!    own address for each `CUSTOM` entry — so no two of a cluster's endpoints collapse onto
 //!    one value. For a cluster whose wire this emulator serves, the kinds a client DIALS
 //!    publish the address of the listener that answers them (the cluster's own for `WRITER`,
-//!    the endpoint's own for `CUSTOM`) and the `READER` entry the `cluster-ro-` name the
-//!    cluster mints. The one cluster class whose endpoints share an address is the one whose
+//!    the endpoint's own for `CUSTOM`) and the `READER` entry the other own spelling of the
+//!    interface the cluster's read-only listener is bound on. The one cluster class whose
+//!    endpoints share an address is the one whose
 //!    whole data plane is served at this emulator's own endpoint, where that address is where
 //!    every one of its endpoints is reached.
 //! 3. `DBClusterEndpointResourceIdentifier` is a server-minted id of the form
@@ -267,8 +268,8 @@ async fn the_report_lists_the_custom_endpoints_of_a_cluster_before_its_own_two()
 #[derive(Debug, PartialEq, Eq)]
 enum Published {
     /// A cluster whose own engine LISTENER serves its data plane: the writer entry publishes
-    /// the address that listener answers on, the reader entry the `cluster-ro-` name the
-    /// cluster mints in the zone the interface it is bound on names, and the custom endpoint
+    /// the address that listener answers on, the reader entry the other own spelling of the
+    /// interface it is bound on, and the custom endpoint
     /// the address of the listener OPENED FOR IT — a client dials the members that endpoint
     /// selects there.
     NamesWithCustomListener,
@@ -445,12 +446,23 @@ async fn every_endpoint_of_a_cluster_publishes_the_address_of_its_own_kind() {
                         row.case
                     ),
                 }
-                assert!(
-                    reader.starts_with(&format!("{}.cluster-ro-", row.cluster)),
-                    "case {:?}: expected a reader endpoint of the form \
-                     <cluster>.cluster-ro-<label>…, got {reader:?}",
-                    row.case
-                );
+                // The READER entry is the cluster's read path: for a cluster whose engine wire
+                // this emulator serves it is the other own spelling of the interface that
+                // cluster's read-only listener is bound on, and a cluster with no plane of
+                // this emulator's keeps the name it mints under the `cluster-ro-` label.
+                match row.expected {
+                    Published::NamesWithCustomListener => {
+                        crate::db_clusters::assert_own_endpoint_host(
+                            row.case, READER, row.cluster, REGION, &reader,
+                        );
+                    }
+                    _ => assert!(
+                        reader.starts_with(&format!("{}.cluster-ro-", row.cluster)),
+                        "case {:?}: expected a reader endpoint of the form \
+                         <cluster>.cluster-ro-<label>…, got {reader:?}",
+                        row.case
+                    ),
+                }
                 // The WRITER entry is the member a client composes its connection from with
                 // the cluster's one `Port`, so for a cluster whose engine wire this emulator
                 // serves it publishes the ADDRESS that plane is answered at rather than a

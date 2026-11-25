@@ -5,19 +5,21 @@
 //! The rule under test: `DBCluster$Endpoint` and `DBCluster$ReaderEndpoint` are hosts, with
 //! the port reported only in `DBCluster$Port` and the zone in `DBCluster$HostedZoneId`, and
 //! the two are non-empty and DISTINCT whatever the cluster's membership is. For a cluster
-//! whose engine wire this emulator SERVES, `Endpoint` is the address that wire is answered at
-//! — the host of the cluster's own listener — because that host with the published `Port` is
-//! the whole address a session is opened on; `ReaderEndpoint` is the name the CLUSTER mints
-//! from its own identifier, `<identifier>.cluster-ro-<label>`, which is what lets a
+//! whose engine wire this emulator SERVES, both are hosts this emulator ANSWERS on, because an
+//! address a service hands a client is one the client resolves and dials and a name minted
+//! under this emulator's own zone resolves for nobody: `Endpoint` is the address that wire is
+//! answered at — the host of the cluster's own listener — because that host with the published
+//! `Port` is the whole address a session is opened on, and `ReaderEndpoint` is the other own
+//! spelling of that interface, the name RFC 6761 reserves for it, which is what lets a
 //! read/write-splitting client, a DSN builder or a production-readiness audit tell a read path
 //! from a write path. Neither member is read off a member instance: a cluster with no DB
 //! instance in it at all publishes both.
 //!
-//! An address a service hands a client is one the client DIALS, so both published members lead
-//! to the interface the cluster's own listeners are bound on, and the pair `<endpoint>` +
-//! `<Port>` is an address a session really opens on — asserted here by resolving each
-//! published member and completing a PostgreSQL login on it, and by looking the published pair
-//! up in the register an in-process client of this emulator dials through.
+//! Both published members therefore lead to the interface the cluster's own listeners are bound
+//! on, and the pair `<endpoint>` + `<Port>` is an address a session really opens on — asserted
+//! here by resolving each published member and completing a PostgreSQL login on it, and by
+//! looking the published pair up in the register an in-process client of this emulator dials
+//! through.
 //!
 //! The rows span what the rule generalises over: the MEMBERSHIP a cluster has (none at all —
 //! the Aurora Serverless v2 cluster nobody created an instance in — one member, and a writer

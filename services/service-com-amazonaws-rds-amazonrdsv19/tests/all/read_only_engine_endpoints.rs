@@ -263,8 +263,8 @@ async fn available_cluster(
     });
     // Both endpoint members are HOSTS: the model gives a DB cluster ONE `Port` for the pair,
     // so neither carries a port of its own. The writer member is the address this emulator
-    // answers the cluster's engine wire at, and the reader member the `cluster-ro-` name the
-    // cluster mints, which is what tells the read path from the write path.
+    // answers the cluster's engine wire at, and the reader member the other own spelling of
+    // that interface, which is what tells the read path from the write path.
     let reader_host = text(&settled, "ReaderEndpoint");
     crate::db_clusters::assert_served_endpoint_pair(
         row.case,

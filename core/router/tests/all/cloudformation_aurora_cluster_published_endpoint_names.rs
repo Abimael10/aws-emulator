@@ -3,20 +3,22 @@
 //! The two endpoint members an Aurora DB CLUSTER publishes when a CloudFormation stack is what
 //! deployed it, read back through Amazon RDS's own `DescribeDBClusters`.
 //!
-//! The rule under test: a DB cluster's endpoint members are DNS HOSTS and nothing else — the
+//! The rule under test: a DB cluster's endpoint members are HOSTS and nothing else — the
 //! port is reported only in the Integer member `Port` and the zone only in `HostedZoneId`
-//! (`smithy_query(query="shape", shape="DBCluster")`) — and the CLUSTER mints its reader name
-//! from its own identifier under the discriminating `cluster-ro-` label,
-//! `<DBClusterIdentifier>.cluster-ro-<label>.<region>.<suffix>`, whatever the cluster's
-//! membership is and whoever created it. That label is the only thing that tells a read path
-//! from a write path, so a consumer that derives read/write splitting from the pair — a DSN or
-//! JDBC URL builder, a driver, a production-readiness audit — needs it there and needs the port
-//! NOT glued onto the host, or it composes a target carrying the port twice.
+//! (`smithy_query(query="shape", shape="DBCluster")`) — and for a cluster whose engine wire
+//! this emulator SERVES each member is a host this emulator ANSWERS on, because an address a
+//! service hands a client is one the client resolves and then dials: the writer member is the
+//! address that wire is answered at and the reader member the other own spelling of that
+//! interface (the name RFC 6761 reserves for it), the two staying DISTINCT. That distinction is
+//! the only thing that tells a read path from a write path, so a consumer that derives
+//! read/write splitting from the pair — a DSN or JDBC URL builder, a driver, a
+//! production-readiness audit — needs both members there and needs the port NOT glued onto the
+//! host, or it composes a target carrying the port twice. A cluster this emulator serves no
+//! plane for mints the published AWS names instead, `<DBClusterIdentifier>.cluster-<label>` and
+//! `<DBClusterIdentifier>.cluster-ro-<label>`: there is no local plane for such a cluster to
+//! lead a client to.
 //!
-//! The writer member is the one a client COMPOSES ITS CONNECTION FROM, so for a cluster whose
-//! engine wire this emulator serves it is the address that wire is answered at, and for one it
-//! serves no plane for it is the minted `<identifier>.cluster-` name; either way it is a bare
-//! host, carries no port and is distinct from the reader name.
+//! Both hold whatever the cluster's membership is and whoever created it.
 //!
 //! Beside the representation, the same deployment pins the rule that makes it reach a client:
 //! every endpoint value a stack publishes for the cluster is the value Amazon RDS published for
@@ -49,6 +51,11 @@ use crate::query_wire::{
 /// The Region every request here is signed for, and so the Region the estate lives in — and
 /// the Region label a cluster's minted endpoint names carry.
 const REGION: &str = "us-west-2";
+
+/// The DNS zone RFC 6761 reserves for the loopback interface, which is the host a cluster whose
+/// data plane this emulator serves publishes for its read path: the other own spelling of the
+/// interface the core bound its listeners on.
+const LOOPBACK_ZONE: &str = "localhost";
 
 /// The master user the declared clusters are created with: the username the stack's secret
 /// holds, and the JSON key its generated password is put under.
@@ -372,26 +379,33 @@ async fn cluster_identifier(router: &MultiServiceRouter, case: &str, stack: &str
         .unwrap_or_else(|| panic!("case {case:?}: expected the cluster's physical id in {body}"))
 }
 
-/// RULE: the name the CLUSTER mints for its READER endpoint is its own identifier, the
-/// `cluster-ro-` label and one server-assigned label, over the region and the DNS suffix its
-/// endpoints share — a bare host, never an address with a port glued on.
-fn assert_reader_name(case: &str, identifier: &str, port: u16, reader: &str) {
-    let prefix = format!("{identifier}.cluster-ro-");
+/// RULE: the READER member of a cluster whose engine wire this emulator SERVES is a host this
+/// emulator answers on — the address its listeners are bound to, or the name RFC 6761 reserves
+/// for that interface — and a cluster it serves no plane for publishes the name the CLUSTER
+/// mints from its own identifier, the `cluster-ro-` label and one server-assigned label over
+/// the region and the DNS suffix its endpoints share. A bare host either way, never an address
+/// with a port glued on.
+fn assert_reader_host(case: &str, identifier: &str, port: u16, reader: &str) {
+    // A HOST and nothing else: no port and no authority — the port is the cluster's one `Port`
+    // member, so a client composes the target itself. An IPv6 literal is the one host form that
+    // carries colons of its own.
     assert!(
-        reader.starts_with(&prefix),
-        "case {case:?}: expected a reader endpoint of the form {prefix}<label>.{REGION}.<suffix>, \
-         got {reader:?}"
+        !reader.ends_with(&format!(":{port}")),
+        "case {case:?}: an endpoint member carries no port of its own, got {reader:?}"
     );
-    // A HOST and nothing else: no port, no authority, and not an address literal — the port is
-    // the cluster's one `Port` member, so a client composes the target itself.
+    let served = reader.parse::<IpAddr>().is_ok() || reader.eq_ignore_ascii_case(LOOPBACK_ZONE);
+    if served {
+        return;
+    }
     assert!(
         !reader.contains(':'),
         "case {case:?}: an endpoint member carries no port of its own, got {reader:?}"
     );
+    let prefix = format!("{identifier}.cluster-ro-");
     assert!(
-        reader.parse::<IpAddr>().is_err() && !reader.ends_with(&format!(":{port}")),
-        "case {case:?}: expected the reader endpoint to be the name the cluster mints rather \
-         than an address, got {reader:?}"
+        reader.starts_with(&prefix),
+        "case {case:?}: expected the reader endpoint to be a host this emulator answers on or a \
+         name of the form {prefix}<label>.{REGION}.<suffix>, got {reader:?}"
     );
     let rest = &reader[prefix.len()..];
     let (label, zone) = rest.split_once('.').unwrap_or_else(|| {
@@ -414,7 +428,7 @@ fn assert_reader_name(case: &str, identifier: &str, port: u16, reader: &str) {
 /// RULE: the WRITER member is the one a client composes its connection from, so it is either
 /// the address this emulator answers the cluster's engine wire at or the `<identifier>.cluster-`
 /// name a cluster it serves no plane for mints — a bare host either way, carrying no port and
-/// distinct from the reader name.
+/// distinct from the reader member.
 fn assert_writer_host(case: &str, identifier: &str, port: u16, writer: &str, reader: &str) {
     let served = writer.parse::<IpAddr>().is_ok();
     assert!(
@@ -491,9 +505,9 @@ async fn a_stack_deployed_aurora_cluster_publishes_the_reader_name_it_mints() {
 
         let writer = element(&body, "Endpoint");
         let reader = element(&body, "ReaderEndpoint");
-        assert_reader_name(case, &identifier, port, &reader);
+        assert_reader_host(case, &identifier, port, &reader);
         assert_writer_host(case, &identifier, port, &writer, &reader);
-        // The membership the row declared, which the rule holds ACROSS: the reader name is the
+        // The membership the row declared, which the rule holds ACROSS: the reader member is the
         // cluster's own whether or not there is an instance in it.
         let members = blocks_of(&body, "DBClusterMember").len();
         assert_eq!(

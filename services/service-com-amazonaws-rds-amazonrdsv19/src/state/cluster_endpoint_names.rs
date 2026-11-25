@@ -25,13 +25,12 @@
 //! an address that client can dial and this emulator resolves no name for its clients:
 //!
 //! * a cluster whose engine wire this emulator serves is reached on listeners of its own
-//!   ([`super::data_plane::cluster_endpoint`]), so its WRITER member publishes the host that
-//!   listener is answered at ([`super::DbClusterRecord::endpoint`]) beside the one published
-//!   `Port`, and only its reader member — which the model gives no port of its own, so no
-//!   client composes an address from it — carries a minted name, under the engine's own
-//!   service label in the zone a resolver answers with the interface those listeners are
-//!   bound on ([`served_endpoint_suffix`]), `localhost` and every name under it being
-//!   reserved for the loopback interface the core binds on (RFC 6761);
+//!   ([`super::data_plane::cluster_endpoint`]), so BOTH of its members publish a host this
+//!   emulator answers on: the WRITER member the address its own listener is answered at
+//!   ([`super::DbClusterRecord::endpoint`]) beside the one published `Port`, and the READER
+//!   member the other own spelling of that same interface ([`served_reader_host`]) — a name
+//!   MINTED under that interface's zone resolves for no client of this emulator, however
+//!   RFC 6761 reads the zone, so neither member carries one;
 //! * a cluster this emulator serves no data plane for publishes the AWS form for BOTH, under
 //!   the DNS domain of the control plane that owns its engine ([`super::endpoint_domain`]):
 //!   there is no local plane for such a cluster to lead a client to.
@@ -101,6 +100,42 @@ pub fn served_endpoint_suffix(endpoint_domain: &str, served_host: &str) -> Strin
         .unwrap_or(endpoint_domain);
     let zone = ::service_common::data_plane_addressing::announced_zone_of_authority(served_host);
     format!("{service}.{zone}")
+}
+
+/// The host a cluster whose data plane this emulator SERVES publishes for its READ path,
+/// given `served_host`, the interface its listeners are bound on.
+///
+/// An endpoint member is an address a client RESOLVES and then dials, and the only addresses
+/// a client of this emulator can resolve are this process's own: the interface the core bound
+/// and the name reserved for it. A name this service MINTS under that interface's zone is not
+/// one of them — nothing answers for a sub-name of the host this process is reached at — so a
+/// served cluster publishes no minted name for either member, and the cluster's own identifier
+/// and server-assigned label are reported in the members that carry an identity
+/// (`DBClusterIdentifier`, `DbClusterResourceId`) rather than in an address.
+///
+/// The two members stay DISTINCT, which is what tells a read path from a write path: the
+/// writer publishes the address its listener is bound to ([`super::DbClusterRecord::endpoint`])
+/// — it is the member a client composes with the one published `Port`, so it is the literal
+/// the listener landed on — and the reader the OTHER own spelling of that same interface, the
+/// zone name RFC 6761 reserves for the loopback interface
+/// ([`::service_common::data_plane_addressing::LOOPBACK_ZONE`]), which resolves to exactly the
+/// interface the cluster's read-only listener is answered on. An interface an OPERATOR bound
+/// instead of loopback has no second name this emulator may announce, so both members name it
+/// as the core reports it.
+#[must_use]
+pub fn served_reader_host(served_host: &str) -> String {
+    let loopback_zone = ::service_common::data_plane_addressing::LOOPBACK_ZONE;
+    let unspecified = served_host
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_unspecified());
+    match ::service_common::data_plane_addressing::names_the_loopback_interface(served_host)
+        || unspecified
+    {
+        // A listener on the loopback interface — and one on the wildcard address, which
+        // accepts on loopback too — is reached at the loopback zone's own name.
+        true => loopback_zone.to_string(),
+        false => served_host.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -180,6 +215,36 @@ mod tests {
                      ({aws_zone}), got {suffix:?}"
                 );
             }
+        }
+    }
+
+    /// RULE: the host a SERVED cluster publishes for its read path is an own host of this
+    /// emulator naming the interface its listeners are bound on — the loopback zone's own
+    /// name for a loopback or wildcard bind, the bound address itself otherwise — and never a
+    /// name minted under that interface's zone.
+    #[test]
+    fn a_served_clusters_reader_host_is_an_own_host_of_this_emulator() {
+        // The rows span the addresses the core can report a listener on: both loopback
+        // literals, the wildcard addresses of both families (which accept on loopback too),
+        // and a routable address an operator bound.
+        let rows: &[(&str, &str, &str)] = &[
+            ("the default loopback bind", "127.0.0.1", "localhost"),
+            ("another address of the loopback block", "127.0.0.42", "localhost"),
+            ("an IPv6 loopback bind", "::1", "localhost"),
+            ("a wildcard bind", "0.0.0.0", "localhost"),
+            ("an IPv6 wildcard bind", "::", "localhost"),
+            ("a routable bind", "192.168.1.10", "192.168.1.10"),
+        ];
+        for (case, served_host, expected) in rows {
+            let reader = served_reader_host(served_host);
+            assert_eq!(
+                reader, *expected,
+                "case {case:?}: expected the reader host {expected:?}, got {reader:?}"
+            );
+            assert!(
+                !reader.contains(':') || reader.contains("::"),
+                "case {case:?}: an endpoint member carries no port, got {reader:?}"
+            );
         }
     }
 }

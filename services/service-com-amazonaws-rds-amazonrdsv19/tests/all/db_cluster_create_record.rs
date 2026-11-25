@@ -17,8 +17,9 @@
 //!   endpoints, the resolved engine version, the defaults, the timestamps, the tags and the
 //!   zones) in one assertion, so a member computed at response time instead of being stored
 //!   fails here whether or not any suite names it.
-//! * An identity RDS mints is the resource's own: the `DbClusterResourceId` and the
-//!   server-assigned endpoint label are of their published forms, no two clusters share
+//! * An identity RDS mints is the resource's own: the `DbClusterResourceId` and — for a
+//!   cluster that publishes minted endpoint NAMES at all — the server-assigned endpoint label
+//!   are of their published forms, no two clusters share
 //!   them, and no later read changes them.
 //!
 //! The table spans what those rules generalise over: both cluster TYPES `CreateDBCluster`
@@ -350,9 +351,11 @@ const IDENTITY_CASES: &[IdentityCase] = &[
 #[derive(Debug, PartialEq, Eq)]
 struct Identity {
     resource_id: String,
-    /// The DNS name the cluster's reader endpoint carries the server-assigned label in,
-    /// which is minted per cluster.
-    reader_endpoint: String,
+    /// The DNS name the cluster MINTS for its reader endpoint, which carries the
+    /// server-assigned label minted per cluster — `None` for a cluster whose data plane this
+    /// emulator SERVES, which publishes a host of this emulator's own for both of its endpoint
+    /// members and so mints no name a client could be handed.
+    reader_endpoint: Option<String>,
     arn: String,
 }
 
@@ -407,26 +410,30 @@ fn identity_of(case: &str, identifier: &str, suffix: &str, cluster: &str) -> Ide
         "case {case:?}: expected 26 server-minted characters, got {resource_id:?}"
     );
 
-    // The reader endpoint is the name the CLUSTER mints from its own identifier, where the
-    // server-assigned label this test reads is visible. The writer endpoint is the member a
-    // client composes its connection from, so a cluster whose engine wire this emulator serves
-    // publishes the address that plane is answered at there, and every other cluster the name
-    // minted under the `cluster-` label.
+    // A cluster whose engine wire this emulator SERVES publishes a host this emulator answers
+    // on for both of its endpoint members — the address its own listener is answered at as the
+    // writer, which is the member a client composes its connection from, and the other own
+    // spelling of that interface as the reader — and every other cluster the names the CLUSTER
+    // mints from its own identifier, where the server-assigned label this test reads is
+    // visible.
     let endpoint = text(cluster, "Endpoint");
-    if suffix == SERVED_SUFFIX {
-        assert!(
-            endpoint.parse::<std::net::IpAddr>().is_ok(),
-            "case {case:?}: expected the address this emulator answers the cluster's engine \
-             wire at as its writer endpoint, got {endpoint:?}"
-        );
-    } else {
-        endpoint_name(case, identifier, "cluster-", suffix, &endpoint);
-    }
     let reader = text(cluster, "ReaderEndpoint");
+    let minted = match suffix == SERVED_SUFFIX {
+        true => {
+            crate::db_clusters::assert_served_endpoint_pair(
+                case, identifier, REGION, &endpoint, &reader,
+            );
+            None
+        }
+        false => {
+            endpoint_name(case, identifier, "cluster-", suffix, &endpoint);
+            Some(endpoint_name(case, identifier, "cluster-ro-", suffix, &reader))
+        }
+    };
 
     Identity {
         resource_id,
-        reader_endpoint: endpoint_name(case, identifier, "cluster-ro-", suffix, &reader),
+        reader_endpoint: minted,
         arn: text(cluster, "DBClusterArn"),
     }
 }
@@ -467,13 +474,17 @@ async fn every_cluster_is_minted_an_identity_of_its_own() {
                 "clusters {left} and {right} were minted the same DbClusterResourceId {:?}",
                 left_identity.resource_id
             );
-            // The DNS name a cluster publishes carries a label minted for that cluster, so
-            // no two of them are the same.
-            assert_ne!(
-                left_identity.reader_endpoint, right_identity.reader_endpoint,
-                "clusters {left} and {right} publish the same reader endpoint {:?}",
-                left_identity.reader_endpoint
-            );
+            // A DNS name a cluster MINTS carries a label minted for that cluster, so no two of
+            // them are the same — for the clusters that publish one at all.
+            if let (Some(left_name), Some(right_name)) = (
+                left_identity.reader_endpoint.as_ref(),
+                right_identity.reader_endpoint.as_ref(),
+            ) {
+                assert_ne!(
+                    left_name, right_name,
+                    "clusters {left} and {right} publish the same reader endpoint {left_name:?}"
+                );
+            }
             assert_ne!(
                 left_identity.arn, right_identity.arn,
                 "clusters {left} and {right} report the same ARN {:?}",
