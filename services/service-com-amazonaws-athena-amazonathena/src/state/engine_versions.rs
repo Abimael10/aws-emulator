@@ -10,10 +10,11 @@
 //! service's own rather than anything a request wrote: no operation adds to it or takes
 //! from it, which is why two listings of it report the same entries.
 //!
-//! Each entry pairs a selectable version with the version a query then runs on, through
-//! the SAME resolution the create and update paths apply to a workgroup's selection
-//! ([`resolved_engine_version`]) — so the effective version this catalog publishes for a
-//! selection is the one a workgroup that made that selection reports.
+//! Each entry of the catalog names ONE offer: the value a request may select and the
+//! engine family that value belongs to ([`engine_version_category`], the one place this
+//! service decides a family). What a selection then RESOLVES to is a different question,
+//! answered where a selection is actually made ([`resolved_engine_version`]) — a catalog
+//! row stands for no selection, so it carries no resolved version.
 
 use super::*;
 
@@ -24,19 +25,31 @@ use crate::ops::types::EngineVersion;
 /// Athena's Spark family is named by the same scheme as its SQL one (see
 /// [`PYSPARK_ENGINE_VERSION_PREFIX`], which is what identifies the family), and Athena's
 /// documentation names PySpark engine version 3 as the version a Spark enabled workgroup
-/// runs its sessions and notebooks on — so that is the member of the family this emulator
-/// offers, beside [`DEFAULT_EFFECTIVE_ENGINE_VERSION`] for SQL.
+/// runs its sessions and notebooks on.
 pub const PYSPARK_ENGINE_VERSION: &str = "PySpark engine version 3";
+
+/// The Apache Spark version a Spark enabled workgroup selects, the other offer of Athena's
+/// Spark family beside [`PYSPARK_ENGINE_VERSION`].
+///
+/// Athena's documentation names Apache Spark version 3.5 among the engine versions a Spark
+/// enabled workgroup or a session may run on, so it is one of the values this catalog
+/// publishes as selectable.
+pub const APACHE_SPARK_ENGINE_VERSION: &str = "Apache Spark version 3.5";
 
 /// Every engine version a request may select, in the order a listing reports them.
 ///
-/// The Auto option first — `ListEngineVersions` documents its answer as "a list of engine
-/// versions that are available to choose from, including the Auto option" — then the
-/// Athena SQL version ([`DEFAULT_EFFECTIVE_ENGINE_VERSION`]) and the PySpark one
-/// ([`PYSPARK_ENGINE_VERSION`]), one per engine family Athena runs. `EngineVersionsList`
-/// holds 0 to 10 entries, which this catalog is within, so a listing of it is one page
-/// wide at the modelled maximum page size.
+/// One entry per offer Athena publishes: the Spark family's Apache Spark
+/// ([`APACHE_SPARK_ENGINE_VERSION`]) and PySpark ([`PYSPARK_ENGINE_VERSION`]) versions, the
+/// Athena SQL version ([`DEFAULT_EFFECTIVE_ENGINE_VERSION`]), and the Auto option
+/// ([`ENGINE_VERSION_AUTO`]) — `ListEngineVersions` documents its answer as "a list of
+/// engine versions that are available to choose from, including the Auto option", and
+/// `EngineVersion$SelectedEngineVersion` names the same set from the other side. The
+/// version names are the ones Athena's own documentation gives each family; the order is
+/// the one the catalog is published in. `EngineVersionsList` holds 0 to 10 entries, which
+/// this catalog is within, so a listing of it is one page wide at the modelled maximum page
+/// size.
 pub const SELECTABLE_ENGINE_VERSIONS: &[&str] = &[
+    APACHE_SPARK_ENGINE_VERSION,
     ENGINE_VERSION_AUTO,
     DEFAULT_EFFECTIVE_ENGINE_VERSION,
     PYSPARK_ENGINE_VERSION,
@@ -75,23 +88,21 @@ pub fn engine_version_category(version: &str) -> &'static str {
     }
 }
 
-/// The catalog as the modelled `EngineVersion` entries a listing reports: each selectable
-/// version beside the version it resolves to.
+/// The catalog as the modelled `EngineVersion` entries a listing reports: one entry per
+/// offer, naming the value a request may select and the engine family it belongs to.
 ///
-/// Built through [`resolved_engine_version`], the one place this service decides what a
-/// selection means, so the `EffectiveEngineVersion` published here cannot drift from the
-/// one a workgroup selecting that version is created with.
+/// No entry carries `EffectiveEngineVersion`: that member is "the engine version on which
+/// the query runs" for a version somebody SELECTED, and a catalog row is an offer nobody
+/// has selected yet, so there is no query and no resolved version to report. What a
+/// selection resolves to is decided where one is made ([`resolved_engine_version`]).
 pub fn selectable_engine_versions() -> Vec<EngineVersion> {
     SELECTABLE_ENGINE_VERSIONS
         .iter()
-        .map(|selected| {
-            resolved_engine_version(Some(&EngineVersion {
-                selected_engine_version: Some((*selected).to_string()),
-                // Read only, and ignored on the way in: the resolution decides it.
-                effective_engine_version: None,
-                // Decided by the resolution too, from the version it resolves to.
-                category: None,
-            }))
+        .map(|selected| EngineVersion {
+            category: Some(engine_version_category(selected).to_string()),
+            selected_engine_version: Some((*selected).to_string()),
+            // Nothing is selected on an offer, so nothing has resolved.
+            effective_engine_version: None,
         })
         .collect()
 }

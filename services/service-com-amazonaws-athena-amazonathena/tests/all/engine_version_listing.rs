@@ -6,23 +6,26 @@
 //! assertion is about what an SDK client observes.
 //!
 //! The rule under test: the listing reports the service's catalog of selectable engine
-//! versions — one entry per version a request may select, including the Auto option — each
-//! pairing that selection with the version a query selecting it then runs on, in pages of
+//! versions — one entry per OFFER, naming the value a request may select (including the
+//! Auto option) and the engine family that value belongs to, and nothing a selection would
+//! have resolved to, because a catalog row is an offer nobody has selected. The pages are
 //! at most `MaxResults` entries, each page but the last followed by a `NextToken` this
 //! service minted and no other value. The catalog belongs to the service, not to the
 //! account: no request adds to it or takes from it, so two listings report the same
 //! entries, and every version it publishes is one a workgroup may be created with and
-//! then reports as its own.
+//! then reports — resolved — as its own.
 //!
 //! Each rule is asserted over a TABLE rather than one request: the rows differ along what
 //! the rule generalises over — which published version is selected, the page size asked
 //! for (every size the model allows, none, and one past the catalog), and the form of a
 //! continuation token a caller sends back.
 
+use std::collections::BTreeSet;
+
 use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::state::{
     page_token_malformed, DEFAULT_EFFECTIVE_ENGINE_VERSION, ENGINE_VERSION_AUTO,
-    ERROR_CODE_INVALID_INPUT, PYSPARK_ENGINE_VERSION_PREFIX, SELECTABLE_ENGINE_VERSIONS,
+    ERROR_CODE_INVALID_INPUT, SELECTABLE_ENGINE_VERSIONS,
 };
 use service_common::page_tokens::AUTHENTICATOR_BYTES;
 use smithy_server_runtime::MultiServiceRouter;
@@ -49,13 +52,40 @@ fn selected(entry: &Value) -> String {
         .to_string()
 }
 
-/// The `EffectiveEngineVersion` of one entry.
-fn effective(entry: &Value) -> String {
-    entry["EffectiveEngineVersion"]
+/// The `Category` of one entry.
+fn category(entry: &Value) -> String {
+    entry["Category"]
         .as_str()
-        .unwrap_or_else(|| panic!("every entry names the version it runs on, got {entry:?}"))
+        .unwrap_or_else(|| panic!("every entry names the engine family, got {entry:?}"))
         .to_string()
 }
+
+/// The engine version a request selecting `selected` then runs on: the Auto option is the
+/// one Athena resolves itself, and any other selection runs on the very version it names.
+fn resolves_to(selected: &str) -> String {
+    if selected == ENGINE_VERSION_AUTO {
+        DEFAULT_EFFECTIVE_ENGINE_VERSION.to_string()
+    } else {
+        selected.to_string()
+    }
+}
+
+/// The catalog Athena publishes, as `(engine family, selectable version)` rows: every
+/// offer, and the family each one belongs to.
+///
+/// Written out here rather than derived from the service's own catalog, so a change to
+/// either its contents or its families is a failure here instead of agreeing with itself.
+/// Sources: the members an entry carries are `EngineVersion$Category` and
+/// `EngineVersion$SelectedEngineVersion`
+/// (`smithy_query(query="shape",shape="com.amazonaws.athena#EngineVersion")`); the version
+/// names and the two families are the ones Athena's own documentation gives its Spark and
+/// Athena SQL engines, beside the Auto option `ListEngineVersions` documents it includes.
+const PUBLISHED_CATALOG: &[(&str, &str)] = &[
+    ("Spark", "Apache Spark version 3.5"),
+    ("Presto", ENGINE_VERSION_AUTO),
+    ("Presto", DEFAULT_EFFECTIVE_ENGINE_VERSION),
+    ("Spark", "PySpark engine version 3"),
+];
 
 /// The versions a listing reported selecting, in the order it reported them.
 fn selections(listed: &Value) -> Vec<String> {
@@ -77,10 +107,10 @@ async fn list(router: &MultiServiceRouter, request: &Value) -> Value {
     listed
 }
 
-/// The whole catalog in one call: every selectable version, each with the version it
-/// resolves to, and nothing a caller has to page for.
+/// The whole catalog in one call: every offer, each naming its engine family and the value
+/// a request may select, and nothing a caller has to page for.
 #[tokio::test]
-async fn the_listing_publishes_every_selectable_engine_version_with_its_effective_one() {
+async fn the_listing_publishes_every_selectable_engine_version_with_its_family() {
     let router = router();
     let listed = list(&router, &json!({})).await;
 
@@ -103,43 +133,41 @@ async fn the_listing_publishes_every_selectable_engine_version_with_its_effectiv
         "a listing that reported everything hands back no token, got {listed:?}"
     );
 
-    // The rule for each entry: the Auto option is the one Athena resolves itself, and any
-    // other selection runs on the very version it names.
+    // Every offer Athena publishes, in the order it publishes them, each naming its family
+    // and the value a request may select — and NOTHING else: a row is an offer nobody has
+    // selected, so it carries no resolved version.
+    let reported: Vec<(String, String)> = entries(&listed)
+        .iter()
+        .map(|entry| (category(entry), selected(entry)))
+        .collect();
+    let expected_rows: Vec<(String, String)> = PUBLISHED_CATALOG
+        .iter()
+        .map(|(family, version)| ((*family).to_string(), (*version).to_string()))
+        .collect();
+    assert_eq!(
+        reported, expected_rows,
+        "expected the published catalog {expected_rows:?}, got {reported:?}"
+    );
     for entry in entries(&listed) {
         let case = selected(&entry);
-        let expected_effective = if case == ENGINE_VERSION_AUTO {
-            DEFAULT_EFFECTIVE_ENGINE_VERSION.to_string()
-        } else {
-            case.clone()
-        };
+        // The member SET, so the claim is about which members an entry carries and not
+        // about the order they are serialized in.
+        let members: BTreeSet<String> = entry
+            .as_object()
+            .unwrap_or_else(|| panic!("case {case:?}: an entry is a structure, got {entry:?}"))
+            .keys()
+            .cloned()
+            .collect();
         assert_eq!(
-            effective(&entry),
-            expected_effective,
-            "case {case:?}: expected the effective version {expected_effective:?}, got \
-             {entry:?}"
+            members,
+            BTreeSet::from([
+                "Category".to_string(),
+                "SelectedEngineVersion".to_string()
+            ]),
+            "case {case:?}: expected a catalog row to carry the family and the selectable \
+             version and no resolved one, got {members:?}"
         );
     }
-
-    // The two choices the catalog has to offer whatever else is in it: the Auto option
-    // `ListEngineVersions` documents it includes, and one version of each engine family —
-    // Athena SQL and PySpark, the families a workgroup's selection picks between.
-    assert!(
-        published.iter().any(|version| version == ENGINE_VERSION_AUTO),
-        "the catalog includes the Auto option, got {published:?}"
-    );
-    assert!(
-        published
-            .iter()
-            .any(|version| version == DEFAULT_EFFECTIVE_ENGINE_VERSION),
-        "the catalog includes the Athena SQL engine version {DEFAULT_EFFECTIVE_ENGINE_VERSION:?}, \
-         got {published:?}"
-    );
-    assert!(
-        published
-            .iter()
-            .any(|version| version.starts_with(PYSPARK_ENGINE_VERSION_PREFIX)),
-        "the catalog includes a {PYSPARK_ENGINE_VERSION_PREFIX:?}, got {published:?}"
-    );
 
     // A READ, of a catalog no request owns: a second listing sees exactly what the first
     // one did, and so does one made after the account has been written to.
@@ -304,10 +332,12 @@ async fn a_next_token_this_service_did_not_mint_names_no_page() {
     );
 }
 
-/// Every version the listing publishes is one a workgroup may select, and a workgroup
-/// that selects it reports the effective version the listing published for it — read back
-/// through `GetWorkGroup`, so the claim is about persisted state and not about the create
-/// call's own answer.
+/// Every version the listing publishes is one a workgroup may select; a workgroup that
+/// selects it reports that selection RESOLVED — the version its queries run on, under the
+/// family the catalog published the offer with — read back through `GetWorkGroup`, so the
+/// claim is about persisted state and not about the create call's own answer. This is the
+/// other side of the offer: the resolved version lives on the selection, never on the
+/// catalog row.
 #[tokio::test]
 async fn every_published_version_is_one_a_work_group_can_select() {
     let router = router();
@@ -339,12 +369,19 @@ async fn every_published_version_is_one_a_work_group_can_select() {
             "case {case:?}: expected the workgroup to report the version it selected, got \
              {read:?}"
         );
+        let expected_effective = resolves_to(&case);
         assert_eq!(
             version["EffectiveEngineVersion"].as_str(),
-            Some(effective(&entry).as_str()),
-            "case {case:?}: expected the effective version the listing published, {:?}, got \
-             {read:?}",
-            effective(&entry)
+            Some(expected_effective.as_str()),
+            "case {case:?}: expected the selection to resolve to {expected_effective:?}, got \
+             {read:?}"
+        );
+        let expected_family = category(&entry);
+        assert_eq!(
+            version["Category"].as_str(),
+            Some(expected_family.as_str()),
+            "case {case:?}: expected the family the catalog published, {expected_family:?}, \
+             got {read:?}"
         );
     }
 }

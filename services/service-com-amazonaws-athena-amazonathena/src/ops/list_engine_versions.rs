@@ -3,9 +3,10 @@
 //! @op ListEngineVersions
 //!
 //! Reports the engine versions a request may select, out of the catalog this service
-//! holds ([`crate::state::SELECTABLE_ENGINE_VERSIONS`]), each paired with the version it
-//! resolves to by the same rule the workgroup create and update paths apply
-//! ([`crate::state::resolved_engine_version`]). A pure read: nothing here writes the
+//! holds ([`crate::state::SELECTABLE_ENGINE_VERSIONS`]), one entry per offer: the value a
+//! request may select and the engine family it belongs to, and no resolved version,
+//! because a catalog row is an offer nobody has selected
+//! ([`crate::state::selectable_engine_versions`]). A pure read: nothing here writes the
 //! store, so what the next caller sees is what it saw before this call — including the
 //! catalog itself, which no request adds to or takes from.
 //!
@@ -180,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // Every version a request may select, each with the version it resolves to.
+        // Every version a request may select, each with the engine family it belongs to.
         let versions = crate::state::selectable_engine_versions();
         let end = position.saturating_add(page_size).min(versions.len());
         let page = versions.get(position..end).unwrap_or_default().to_vec();

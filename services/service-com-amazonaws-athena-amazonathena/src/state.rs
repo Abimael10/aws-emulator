@@ -111,9 +111,10 @@
 //!
 //! The ENGINE VERSIONS a request may select are the service's own catalog rather than
 //! anything a request wrote ([`SELECTABLE_ENGINE_VERSIONS`]): `ListEngineVersions`
-//! reports them and [`resolved_engine_version`] decides what each one means, so the
-//! effective version the listing publishes for a selection is the one a workgroup making
-//! that selection is created with.
+//! reports them as the offers they are — a selectable value and the engine family it
+//! belongs to — while [`resolved_engine_version`] decides what a selection MADE by a
+//! workgroup or a session means, so the family the listing publishes for a version is the
+//! family reported for a workgroup running it.
 
 /// The SQL engine a query execution runs on, and the result set it produces.
 pub mod query_engine;
