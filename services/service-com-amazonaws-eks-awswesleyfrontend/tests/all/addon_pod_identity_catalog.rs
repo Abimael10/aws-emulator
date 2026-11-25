@@ -19,8 +19,8 @@
 //! * a TABLE of the recommendations the catalog publishes at each add-on's newest
 //!   build, whose rows differ along what the rule generalises over — how many
 //!   service accounts an add-on runs as (none, one, two), how many policies are
-//!   recommended for one of them (one, two), and the path depth of the policy ARNs
-//!   (the account root and `/service-role/`);
+//!   recommended for one of them (one per service account), and the path depth of the
+//!   policy ARNs (the account root and `/service-role/`);
 //! * the version-keyed half of the rule, over the whole published build line of the
 //!   one add-on whose published history reaches back before the releases its
 //!   components gained pod identity support in;
@@ -64,15 +64,12 @@ struct Expected {
 /// are the tail of the table.
 const EXPECTED: &[Expected] = &[
     Expected {
-        // One service account, TWO recommended policies: the agent publishes both
-        // metrics and traces.
+        // One service account, ONE recommended policy: the agent's metrics, logs and
+        // traces are all carried by the policy published for a CloudWatch agent.
         addon: "amazon-cloudwatch-observability",
         pod_identity: &[(
             "cloudwatch-agent",
-            &[
-                "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy",
-                "arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess",
-            ],
+            &["arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"],
         )],
     },
     Expected {
@@ -85,11 +82,13 @@ const EXPECTED: &[Expected] = &[
         )],
     },
     Expected {
-        // The EBS driver calls AWS from its controller only, so one entry.
+        // The EBS driver calls AWS from its controller only, so one entry, and the
+        // policy published for the driver now sits at the account root rather than
+        // under the `/service-role/` path its superseded one was filed at.
         addon: "aws-ebs-csi-driver",
         pod_identity: &[(
             "ebs-csi-controller-sa",
-            &["arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"],
+            &["arn:aws:iam::aws:policy/AmazonEBSCSIDriverPolicyV2"],
         )],
     },
     Expected {

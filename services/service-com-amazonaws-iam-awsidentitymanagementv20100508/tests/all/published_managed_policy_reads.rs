@@ -48,20 +48,15 @@ struct PublishedPolicy {
     arn: &'static str,
 }
 
-/// Every ARN the add-on catalog recommends: two at the account root for one add-on,
-/// one at the root for another, and two under `/service-role/`, so the table spans
-/// both path depths an attachable AWS-managed policy is published under and both
-/// single- and multi-policy recommendations.
+/// Every ARN the add-on catalog recommends that this emulator's published catalog
+/// carries: three at the account root and one under `/service-role/`, so the table
+/// spans both path depths an attachable AWS-managed policy is published under, and
+/// both the controller-only and the controller-and-node recommendations.
 const PUBLISHED: &[PublishedPolicy] = &[
     PublishedPolicy {
         addon: "amazon-cloudwatch-observability",
         service_account: "cloudwatch-agent",
         arn: "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy",
-    },
-    PublishedPolicy {
-        addon: "amazon-cloudwatch-observability",
-        service_account: "cloudwatch-agent",
-        arn: "arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess",
     },
     PublishedPolicy {
         addon: "vpc-cni",
@@ -71,7 +66,7 @@ const PUBLISHED: &[PublishedPolicy] = &[
     PublishedPolicy {
         addon: "aws-ebs-csi-driver",
         service_account: "ebs-csi-controller-sa",
-        arn: "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy",
+        arn: "arn:aws:iam::aws:policy/AmazonEBSCSIDriverPolicyV2",
     },
     PublishedPolicy {
         addon: "aws-efs-csi-driver",

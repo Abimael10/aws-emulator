@@ -292,12 +292,14 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         default_namespace: "amazon-cloudwatch",
         requires_iam_permissions: true,
         required_configuration: &[],
+        // The agent runs as ONE service account, with the ONE managed policy Amazon
+        // Web Services publishes for a CloudWatch agent — the grant that carries its
+        // metrics, its logs and its traces alike. Nothing else is recommended for it:
+        // a second policy here is a grant Amazon EKS does not ask an installer to
+        // attach.
         pod_identity: &[(
             "cloudwatch-agent",
-            &[
-                "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy",
-                "arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess",
-            ],
+            &["arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"],
         )],
         configuration_properties: &[
             ("admissionWebhooks", "object"),
@@ -409,9 +411,14 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         default_namespace: ADDON_DEFAULT_NAMESPACE,
         requires_iam_permissions: true,
         required_configuration: &[],
+        // The driver calls Amazon EC2 from its controller only, which runs as this one
+        // service account. The policy recommended for it is the one Amazon Web
+        // Services publishes for the driver NOW — the V2 policy, at the account root
+        // — not the superseded one filed under `/service-role/`, the path AWS reserved
+        // for the service roles of the IRSA era.
         pod_identity: &[(
             "ebs-csi-controller-sa",
-            &["arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"],
+            &["arn:aws:iam::aws:policy/AmazonEBSCSIDriverPolicyV2"],
         )],
         configuration_properties: &[
             ("additionalDaemonSets", "object"),

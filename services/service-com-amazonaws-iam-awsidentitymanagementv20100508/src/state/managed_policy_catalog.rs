@@ -266,9 +266,9 @@ pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
         is_attachable: true,
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["logs:*"],"Resource":"arn:aws:logs:*:*:*"},{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject"],"Resource":"arn:aws:s3:::*"}]}"#,
     },
-    // Recommended by the EKS add-on catalog for the `amazon-cloudwatch-observability`
-    // add-on's `cloudwatch-agent` service account, beside
-    // `CloudWatchAgentServerPolicy`.
+    // The write half of the AWS X-Ray grants, which an application that only emits
+    // trace segments is given: named by a CloudFormation `AWS::Serverless::Function`
+    // policy template by its bare friendly name, which resolves at the account root.
     AwsManagedPolicy {
         path: "/",
         policy_name: "AWSXrayWriteOnlyAccess",
@@ -288,6 +288,22 @@ pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
         revised: "2015-02-06T18:39:46Z",
         is_attachable: true,
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#,
+    },
+    // Recommended by the EKS add-on catalog for the `aws-ebs-csi-driver` add-on's
+    // `ebs-csi-controller-sa` service account: the policy Amazon Web Services
+    // publishes for the driver NOW, at the account root, which supersedes the
+    // `/service-role/` entry of the same family below. The conditions are the
+    // published policy's: the driver may create and delete only the volumes and
+    // snapshots tagged for it, and it may restore a snapshot's fast-restore state.
+    AwsManagedPolicy {
+        path: "/",
+        policy_name: "AmazonEBSCSIDriverPolicyV2",
+        policy_id: "ANPAZQT2WKMJ6PVNHLR4B",
+        default_version_id: "v2",
+        published: "2024-11-14T18:12:04Z",
+        revised: "2025-02-20T16:41:09Z",
+        is_attachable: true,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ec2:CreateSnapshot","ec2:AttachVolume","ec2:DetachVolume","ec2:ModifyVolume","ec2:DescribeAvailabilityZones","ec2:DescribeInstances","ec2:DescribeSnapshots","ec2:DescribeTags","ec2:DescribeVolumes","ec2:DescribeVolumesModifications","ec2:EnableFastSnapshotRestores"],"Resource":"*"},{"Effect":"Allow","Action":["ec2:CreateTags"],"Resource":["arn:aws:ec2:*:*:volume/*","arn:aws:ec2:*:*:snapshot/*"],"Condition":{"StringEquals":{"ec2:CreateAction":["CreateVolume","CreateSnapshot"]}}},{"Effect":"Allow","Action":["ec2:DeleteTags"],"Resource":["arn:aws:ec2:*:*:volume/*","arn:aws:ec2:*:*:snapshot/*"]},{"Effect":"Allow","Action":["ec2:CreateVolume"],"Resource":"*","Condition":{"StringLike":{"aws:RequestTag/ebs.csi.aws.com/cluster":"true"}}},{"Effect":"Allow","Action":["ec2:CreateVolume"],"Resource":"*","Condition":{"StringLike":{"aws:RequestTag/CSIVolumeName":"*"}}},{"Effect":"Allow","Action":["ec2:DeleteVolume"],"Resource":"*","Condition":{"StringLike":{"ec2:ResourceTag/ebs.csi.aws.com/cluster":"true"}}},{"Effect":"Allow","Action":["ec2:DeleteVolume"],"Resource":"*","Condition":{"StringLike":{"ec2:ResourceTag/CSIVolumeName":"*"}}},{"Effect":"Allow","Action":["ec2:DeleteSnapshot"],"Resource":"*","Condition":{"StringLike":{"ec2:ResourceTag/CSIVolumeSnapshotName":"*"}}},{"Effect":"Allow","Action":["ec2:DeleteSnapshot"],"Resource":"*","Condition":{"StringLike":{"ec2:ResourceTag/ebs.csi.aws.com/cluster":"true"}}}]}"#,
     },
     // The policy AWS documents for the pull half of an Amazon ECR registry ("Amazon
     // ECR managed policies", Amazon ECR User Guide): the grants a container runtime
@@ -2433,10 +2449,11 @@ pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
         is_attachable: true,
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ec2:CreateNetworkInterface","ec2:DescribeAvailabilityZones","ec2:DescribeInternetGateways","ec2:DescribeSecurityGroups","ec2:DescribeSubnets","ec2:DescribeVpcs","ec2:DeleteNetworkInterface","ec2:ModifyNetworkInterfaceAttribute"],"Resource":"*"}]}"#,
     },
-    // Recommended by the EKS add-on catalog for the `aws-ebs-csi-driver` add-on's
-    // `ebs-csi-controller-sa` service account. The conditions are the published
-    // policy's: the driver may create and delete only the volumes and snapshots it
-    // tagged for itself.
+    // The driver's policy of the IRSA era, which AWS still publishes under the path it
+    // filed service-role policies at — superseded for the add-on catalog's
+    // recommendation by the root-path `AmazonEBSCSIDriverPolicyV2` entry above. The
+    // conditions are the published policy's: the driver may create and delete only the
+    // volumes and snapshots it tagged for itself.
     AwsManagedPolicy {
         path: "/service-role/",
         policy_name: "AmazonEBSCSIDriverPolicy",
