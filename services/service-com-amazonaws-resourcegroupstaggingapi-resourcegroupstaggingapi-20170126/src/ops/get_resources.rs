@@ -250,19 +250,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "You can't specify both this parameter and the ResourceTypeFilters /
         // TagFilters parameter … and any of the pagination parameters
         // (ResourcesPerPage, TagsPerPage, PaginationToken) in the same request.
-        // If you do, you get an Invalid Parameter exception." ONE refusal
-        // answers every one of those combinations, and its text names none of
-        // the members involved.
-        if !arn_list.is_empty()
-            && (!tag_filters.is_empty()
-                || !type_filters.is_empty()
-                || input.resources_per_page.is_some()
-                || input.tags_per_page.is_some()
-                || !token.is_empty())
-        {
-            return Err(invalid(
-                crate::state::FILTERS_WITH_RESOURCE_LIST_MESSAGE.to_string(),
-            ));
+        // If you do, you get an Invalid Parameter exception." Each prohibited
+        // member has its OWN sentence, because the message is the only part of
+        // the refusal that says which combination the request sent — and a
+        // request carrying several of them earns one answer, naming the first
+        // member the documented prohibition lists.
+        if !arn_list.is_empty() {
+            let refused = if !type_filters.is_empty() {
+                Some(crate::state::member_with_resource_list_message(
+                    "ResourceTypeFilters",
+                ))
+            } else if !tag_filters.is_empty() {
+                Some(crate::state::FILTERS_WITH_RESOURCE_LIST_MESSAGE.to_string())
+            } else if input.resources_per_page.is_some() {
+                Some(crate::state::member_with_resource_list_message(
+                    "ResourcesPerPage",
+                ))
+            } else if input.tags_per_page.is_some() {
+                Some(crate::state::member_with_resource_list_message("TagsPerPage"))
+            } else if !token.is_empty() {
+                Some(crate::state::member_with_resource_list_message(
+                    "PaginationToken",
+                ))
+            } else {
+                None
+            };
+            if let Some(message) = refused {
+                return Err(invalid(message));
+            }
         }
 
         // A list member of this request selects a SET: naming one value twice

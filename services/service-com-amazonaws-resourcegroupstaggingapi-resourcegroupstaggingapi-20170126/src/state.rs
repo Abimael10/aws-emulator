@@ -517,16 +517,29 @@ pub fn out_of_range_message(member: &str, min: i32, max: i32) -> String {
     format!("{member} is not in the valid range of {min} and {max}")
 }
 
-/// What `GetResources` answers when `ResourceARNList` is combined with any of
-/// the filtering or pagination members it is mutually exclusive with.
+/// What `GetResources` answers when `ResourceARNList` is combined with
+/// `TagFilters`.
 ///
-/// ONE sentence covers every one of those combinations — the documented
-/// prohibition is the same for `TagFilters`, `ResourceTypeFilters`,
-/// `ResourcesPerPage`, `TagsPerPage` and `PaginationToken` — and it is entirely
-/// fixed text: it names no member, value or limit, so there is nothing in it to
-/// substitute from the request.
+/// The one combination whose sentence speaks GENERICALLY of "Filters" and of "a
+/// resource list" rather than naming the two members; it is entirely fixed text,
+/// so there is nothing in it to substitute from the request.
 pub const FILTERS_WITH_RESOURCE_LIST_MESSAGE: &str =
     "Filters is not allowed when providing a resource list.";
+
+/// What `GetResources` answers when `ResourceARNList` is combined with one of the
+/// OTHER members it is mutually exclusive with — `ResourceTypeFilters` and each
+/// of the pagination members (`ResourcesPerPage`, `TagsPerPage`,
+/// `PaginationToken`).
+///
+/// The refusal's one variable part is the member that is not allowed beside a
+/// resource list, spelled as the API spells it: the message is the only part of
+/// the refusal that tells a caller WHICH prohibited combination it sent, so each
+/// member has its own sentence rather than one sentence for every combination.
+/// `TagFilters` keeps [`FILTERS_WITH_RESOURCE_LIST_MESSAGE`], the sentence the
+/// service serves for that one.
+pub fn member_with_resource_list_message(member: &str) -> String {
+    format!("{member} is not allowed when providing a ResourceARNList.")
+}
 
 /// The `InvalidParameterException` message for a list member whose element is
 /// missing a field the element's own shape requires (`TagFilters`' `Key`).

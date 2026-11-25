@@ -344,17 +344,37 @@ async fn a_list_member_naming_one_value_twice_is_refused() {
 }
 
 #[tokio::test]
-async fn resource_arn_list_with_a_filter_or_a_pagination_member_is_refused_by_one_sentence() {
+async fn resource_arn_list_with_a_filter_or_a_pagination_member_names_that_member() {
     let router = emulator();
     let arn = format!("arn:aws:rds:{REGION}:{ACCOUNT_ID}:db:exclusive-db");
-    let rows: &[(&str, Value)] = &[
-        ("TagFilters", json!({ "Key": "Env", "Values": ["prod"] })),
-        ("ResourceTypeFilters", json!("lambda:function")),
-        ("ResourcesPerPage", json!(1)),
-        ("TagsPerPage", json!(100)),
-        ("PaginationToken", json!("ZGVhZGJlZWY=")),
+    let rows: &[(&str, Value, &str)] = &[
+        (
+            "TagFilters",
+            json!({ "Key": "Env", "Values": ["prod"] }),
+            FILTERS_SENTENCE,
+        ),
+        (
+            "ResourceTypeFilters",
+            json!("lambda:function"),
+            "ResourceTypeFilters is not allowed when providing a ResourceARNList.",
+        ),
+        (
+            "ResourcesPerPage",
+            json!(1),
+            "ResourcesPerPage is not allowed when providing a ResourceARNList.",
+        ),
+        (
+            "TagsPerPage",
+            json!(100),
+            "TagsPerPage is not allowed when providing a ResourceARNList.",
+        ),
+        (
+            "PaginationToken",
+            json!("ZGVhZGJlZWY="),
+            "PaginationToken is not allowed when providing a ResourceARNList.",
+        ),
     ];
-    for (member, value) in rows {
+    for (member, value, sentence) in rows {
         let mut request = json!({ "ResourceARNList": [arn] });
         // `TagFilters` and `ResourceTypeFilters` are lists; the two page sizes
         // and the token are scalars.
@@ -374,8 +394,8 @@ async fn resource_arn_list_with_a_filter_or_a_pagination_member_is_refused_by_on
         );
         assert_eq!(
             error_message(&body),
-            "Filters is not allowed when providing a resource list.",
-            "case ResourceARNList+{member}: expected the one fixed sentence, got {body}"
+            *sentence,
+            "case ResourceARNList+{member}: expected the sentence naming that member, got {body}"
         );
     }
 }
@@ -410,19 +430,30 @@ async fn a_tag_filter_element_without_a_key_is_refused_by_the_field_it_left_out(
     }
 }
 
-/// The ONE sentence that answers every prohibited combination of an explicit
-/// resource list with a filtering or pagination member.
+/// The sentence that answers a resource list combined with `TagFilters`.
 ///
 /// Source: the request-level refusal the API serves for the prohibition
-/// `GetResourcesInput.ResourceARNList` documents against `ResourceTypeFilters`,
-/// `TagFilters` and the pagination members. It is entirely fixed text — it names
-/// no member, value, ARN or limit — so the same bytes, trailing period included,
-/// answer every one of those combinations.
-const ONE_SENTENCE: &str = "Filters is not allowed when providing a resource list.";
+/// `GetResourcesInput.ResourceARNList` documents against `TagFilters`. It is the
+/// ONE combination whose sentence speaks generically of "Filters" and of "a
+/// resource list" instead of naming the member, and it is entirely fixed text —
+/// trailing period included.
+const FILTERS_SENTENCE: &str = "Filters is not allowed when providing a resource list.";
 
-/// Every prohibited combination is refused by that one sentence, whatever the
-/// resource list holds and however many of the excluded members the request
-/// carries.
+/// `<Member> is not allowed when providing a ResourceARNList.`, the sentence that
+/// answers a resource list combined with any OTHER excluded member.
+///
+/// Source: the request-level refusal the API serves for the prohibitions
+/// `GetResourcesInput.ResourceARNList` documents against `ResourceTypeFilters`
+/// and against the pagination members (`ResourcesPerPage`, `TagsPerPage`,
+/// `PaginationToken`): the member is the sentence's only variable part, spelled
+/// as the API spells it.
+fn member_sentence(member: &str) -> String {
+    format!("{member} is not allowed when providing a ResourceARNList.")
+}
+
+/// Every prohibited combination is refused by the sentence naming the member it
+/// carries, whatever the resource list holds and however many of the excluded
+/// members the request carries.
 ///
 /// The table spans both axes the rule generalises over:
 ///
@@ -434,10 +465,11 @@ const ONE_SENTENCE: &str = "Filters is not allowed when providing a resource lis
 ///   services (one of them an ARN with no Region or account), and a list filled
 ///   to `ResourceARNListForGet`'s modelled maximum of 100 entries.
 ///
-/// Every case must answer the SAME bytes: the refusal is not templated, so no
-/// member name, ARN or filter value may appear in it.
+/// A request carrying several excluded members earns ONE answer, naming the first
+/// member the documented prohibition lists; and no case's sentence carries an
+/// ARN, a filter value or a page size, because only the member name is variable.
 #[tokio::test]
-async fn a_resource_list_with_any_excluded_member_is_refused_by_the_same_sentence() {
+async fn a_resource_list_with_any_excluded_member_names_the_member_it_refuses() {
     let router = emulator();
 
     let single = vec![format!(
@@ -459,38 +491,46 @@ async fn a_resource_list_with_any_excluded_member_is_refused_by_the_same_sentenc
         ("the modelled maximum of 100 ARNs", &full),
     ];
 
-    let combinations: &[(&str, Value)] = &[
+    let combinations: &[(&str, Value, String)] = &[
         (
             "TagFilters",
             json!({ "TagFilters": [{ "Key": "Env", "Values": ["prod"] }] }),
+            FILTERS_SENTENCE.to_string(),
         ),
         (
             "TagFilters carrying a key alone",
             json!({ "TagFilters": [{ "Key": "Env" }] }),
+            FILTERS_SENTENCE.to_string(),
         ),
         (
             "ResourceTypeFilters",
             json!({ "ResourceTypeFilters": ["lambda:function"] }),
+            member_sentence("ResourceTypeFilters"),
         ),
         (
             "ResourcesPerPage at its documented maximum",
             json!({ "ResourcesPerPage": 100 }),
+            member_sentence("ResourcesPerPage"),
         ),
         (
             "TagsPerPage at its documented minimum",
             json!({ "TagsPerPage": 100 }),
+            member_sentence("TagsPerPage"),
         ),
         (
             "a PaginationToken this service never minted",
             json!({ "PaginationToken": "ZGVhZGJlZWY=" }),
+            member_sentence("PaginationToken"),
         ),
         (
             "both filter members",
             json!({ "TagFilters": [{ "Key": "Env" }], "ResourceTypeFilters": ["s3"] }),
+            member_sentence("ResourceTypeFilters"),
         ),
         (
             "both page sizes",
             json!({ "ResourcesPerPage": 1, "TagsPerPage": 500 }),
+            member_sentence("ResourcesPerPage"),
         ),
         (
             "all five excluded members at once",
@@ -501,11 +541,12 @@ async fn a_resource_list_with_any_excluded_member_is_refused_by_the_same_sentenc
                 "TagsPerPage": 200,
                 "PaginationToken": "ZGVhZGJlZWY=",
             }),
+            member_sentence("ResourceTypeFilters"),
         ),
     ];
 
     for (list_case, arns) in lists {
-        for (combination_case, members) in combinations {
+        for (combination_case, members, sentence) in combinations {
             let case = format!("{list_case} + {combination_case}");
             let mut request = json!({ "ResourceARNList": arns });
             for (member, value) in members
@@ -526,16 +567,16 @@ async fn a_resource_list_with_any_excluded_member_is_refused_by_the_same_sentenc
             );
             let message = error_message(&body);
             assert_eq!(
-                message, ONE_SENTENCE,
-                "case {case}: expected the one fixed sentence, got {message:?} in {body}"
+                &message, sentence,
+                "case {case}: expected the sentence naming the member, got {message:?} in \
+                 {body}"
             );
             assert!(
-                !message.contains("ResourceARNList")
-                    && !message.contains("arn:aws:")
-                    && !message.contains("Env")
-                    && !message.contains("Page"),
-                "case {case}: the sentence is fixed text, so it names no member or value, \
-                 got {message:?}"
+                !message.contains("arn:aws:")
+                    && !message.contains("prod")
+                    && !message.chars().any(char::is_numeric),
+                "case {case}: only the member name is variable, so the sentence carries no \
+                 ARN, filter value or page size, got {message:?}"
             );
         }
     }
