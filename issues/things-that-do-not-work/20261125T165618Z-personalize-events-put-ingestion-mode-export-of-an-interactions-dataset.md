@@ -1,0 +1,50 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: personalize-events.put-events-minimal-fields-success
+Issue-Shape-Id: com.amazonaws.personalizeevents#AmazonPersonalizeEvents
+Issue-Key: personalize-events.put-events-minimal-fields-success|_poll_until#12|Timeout|time.sleep(interval_s)
+Issue-Commit: ff726bd67edf765e79ac63fc928612486072107b
+
+# PUT-ingestion-mode export of an Interactions dataset renames the real-time event record's columns to the schema's declared field names, so the event cannot be read back
+
+> _Note: this issue was identified against the code base at commit `ff726bd67edf765e79ac63fc928612486072107b`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+PutEvents
+
+## Description
+Cause 1 of 1: a dataset export job run with ingestionMode=PUT over an Interactions dataset renames every column of the real-time event records (the rows PutEvents ingested) to the uppercase field names the Interactions schema declares, so a client reading the export back by the column names AWS writes for PUT-ingested interaction data finds no rows at all and PutEvents' 200 becomes unverifiable. Failing check: personalize-events.put-events-minimal-fields-success.
+
+NOTE — this cause was previously filed and closed as Cause 1 of fixed issue 20261115T185027Z-personalize-events-2-net-new-causes-put-ingestion.md, and the current code has the pre-fix behavior again: services/service-com-amazonaws-personalize-amazonpersonalize/src/state/export.rs::export_rows now states that "BOTH halves are exported under the column names the DATASET's schema declares" and maps the PUT rows through schema_named_row. The call is NOT refused (every operation answers 200), so this is filed as a fresh defect rather than a reopened refusal. It must not be fixed by simply reverting: open issue 20261124T193003Z-personalize-events-dataset-export-of-put-ingested-records-names-its.md records the opposite requirement for the ENTITY datasets (a PutItems/PutUsers PUT export is keyed by the schema's declared ITEM_ID/PRICE, USER_ID/AGE), and the five checks it names pass today. The renaming rule therefore has to be dataset-type-aware: schema spelling for BULK rows and for entity (Items/Users/Actions) PUT rows, the record's own column names for the PUT half of an Interactions / Action_Interactions dataset.
+
+AWS: recorded behavior only for the column spelling — neither the personalize nor the personalize-events model states the on-disk layout of an export object. Smithy (com.amazonaws.personalize) CreateDatasetExportJob$ingestionMode documents "only PUT data that you imported incrementally (using the console, PutEvents, PutUsers and PutItems operations)", and DatasetExportJob$status the progression "CREATE PENDING > CREATE IN_PROGRESS > ACTIVE -or- CREATE FAILED"; PutEvents (com.amazonaws.personalizeevents#PutEvents) answers 200 with an empty body (output Unit), with userId optional and only eventType/sentAt required per event. The recording ingests one event carrying eventType, sentAt and itemId and NO userId into a tracker of a dataset group whose Interactions schema declares USER_ID, ITEM_ID, TIMESTAMP, EVENT_TYPE, then exports with ingestionMode=PUT and reads the written CSV: AWS's header row names the raw real-time record's own lowercase snake_case columns (event_type, item_id, user_id, timestamp, session_id), not the schema's uppercase declarations, and exactly ONE row is present with event_type equal to the eventType just sent and an empty user_id cell. The fixed part of the requirement is "the PUT half of an interaction stream is exported under the column names the record itself carries"; the particular field names and values come from the schema and the request in each run.
+
+Emulator: PutEvents stores the event correctly and the export job reaches ACTIVE with an object written, but every exported column is renamed to the schema's spelling for every ingestion mode, so the header row of a PUT-mode Interactions export reads USER_ID,ITEM_ID,TIMESTAMP,EVENT_TYPE (plus session_id, which the schema declares no field for). A client selecting rows by "event_type" sees zero matching rows, re-runs the export on its retry cadence and never converges; the check is killed by its budget with "Check timed out after 60.0s" instead of asserting on the single expected row. No status or error code diverges — PutEvents, CreateDatasetExportJob, DescribeDatasetExportJob and the S3 reads all succeed; the divergence is the exported object's column naming.
+
+Why: a client that makes a real-time event durable and then reads it back at the only terminal reader AWS offers for PUT data parses the export by AWS's PUT column names and gets an empty result set, so it concludes the events were lost even though the emulator holds them. Any downstream consumer keyed on event_type / item_id / user_id silently drops every interaction row, and the divergence is silent: the job reports ACTIVE and the object exists.
+
+Fix: the column-naming step of the dataset-export path in the personalize control plane (the per-row column rename applied before rendering, and the header-row construction that follows it) must select its naming by where the row came from and what type the dataset is, instead of applying the schema spelling to every row of every mode; the rows the ingestion store hands it for an interaction stream already carry the right names. The PutEvents handler and its state need no change.
+
+Traces: personalize-events.put-events-minimal-fields-success. Code: services/service-com-amazonaws-personalize-amazonpersonalize/src/state/export.rs lines 218-277 (exported_column / schema_named_row and export_rows mapping BOTH halves through it) and lines 286-320 (export_columns / render_csv emitting that renamed header); services/service-com-amazonaws-personalize-amazonpersonalize/src/state/ingested.rs lines 31-50 and 197-236 (event_row building the row with timestamp / event_type / session_id plus user_id and item_id, inserting an EMPTY cell for an omitted userId).
+
+## Evidence
+Failing check personalize-events.put-events-minimal-fields-success reports, with no botocore error at all:
+  Check timed out after 60.0s
+
+Expected (AWS recording): PutEvents(trackingId=<tracker's trackingId>, sessionId=<session>, eventList=[{eventType=<type>, sentAt=<now>, itemId=<item>}]) -> HTTP 200 whose body is empty (response carries only ResponseMetadata). Then personalize.CreateDatasetExportJob(datasetArn=<the group's Interactions dataset>, ingestionMode="PUT", jobOutput={"s3DataDestination":{"path":"s3://<bucket>/<prefix>/"}}, roleArn=<role>) reaches ACTIVE and the CSV objects under that prefix have a header row naming the real-time record's own columns — including "event_type" and "item_id" — with exactly one row whose event_type equals the eventType just sent and whose user_id cell is empty.
+
+Actual (emulator): PutEvents answers 200 and the export job reaches ACTIVE with an object written, but its header row carries the Interactions schema's declared spellings for the PUT-sourced rows (USER_ID,ITEM_ID,TIMESTAMP,EVENT_TYPE), so csv.DictReader rows have r.get("event_type") == None and the row selection yields 0 matches. The check's export-and-retry loop (45s cadence, 1200s own budget) therefore never satisfies len(matching) >= 1 and the harness kills the check at 60s.
+
+The emulator's own source states the rule it applies: export.rs::export_rows — "BOTH halves are exported under the column names the DATASET's schema declares ... a client reading an export back addresses every row by the field names it wrote in the schema" — and exported_column matches a column against the schema's declared fields case-insensitively (so "event_type" becomes "EVENT_TYPE"). The create-status clock is NOT a contributor here: state.rs CREATE_SPAN is Duration::ZERO, so every Describe* after a create already reports ACTIVE and the whole 60s is spent in the export retry loop.
+
+## Steps to Reproduce
+1. Boot the emulator.
+2. personalize.CreateSchema(name=<name>, schema=<Interactions record declaring USER_ID string, ITEM_ID string, TIMESTAMP long, EVENT_TYPE string>) -> 200.
+3. personalize.CreateDatasetGroup(name=<name>) -> 200; DescribeDatasetGroup until ACTIVE.
+4. personalize.CreateDataset(name=<name>, datasetGroupArn=<arn>, datasetType="Interactions", schemaArn=<arn>) -> 200; DescribeDataset until ACTIVE. personalize.CreateEventTracker(name=<name>, datasetGroupArn=<arn>) -> 200; DescribeEventTracker until ACTIVE and take its trackingId.
+5. personalize-events.PutEvents(trackingId=<trackingId>, sessionId=<session>, eventList=[{eventType="<type>", sentAt=<now>, itemId="<item>"}]) -> HTTP 200, empty body (no userId is sent).
+6. s3.CreateBucket(<bucket>); iam.CreateRole + PutRolePolicy granting s3:PutObject/s3:ListBucket on that bucket; s3.PutBucketPolicy allowing personalize.amazonaws.com.
+7. personalize.CreateDatasetExportJob(jobName=<name>, datasetArn=<the Interactions dataset>, ingestionMode="PUT", jobOutput={"s3DataDestination":{"path":"s3://<bucket>/<prefix>/"}}, roleArn=<role arn>) -> 200; DescribeDatasetExportJob until ACTIVE.
+8. s3.ListObjectsV2(Bucket=<bucket>, Prefix="<prefix>/"), GetObject each key, parse with csv.DictReader. Expected: header contains "event_type" and "item_id" and exactly one row with event_type == the eventType of step 5 and an empty user_id. Actual: header reads USER_ID,ITEM_ID,TIMESTAMP,EVENT_TYPE (plus session_id), so a reader keyed on "event_type" finds zero rows and a poll-until-present loop never terminates.
+9. Regression guard for the companion requirement: repeat with an Items dataset (schema ITEM_ID, PRICE) and PutItems, and with a Users dataset (USER_ID, AGE) and PutUsers — those PUT exports must KEEP the schema's declared spellings (checks personalize-events.put-items-success, put-users-success), so the naming must be chosen per dataset type, not globally.
