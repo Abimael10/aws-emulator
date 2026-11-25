@@ -309,9 +309,25 @@ impl WorkflowRunStatus {
     /// This is where a run differs from an act: an act's status may be re-sent as often as
     /// a caller likes ([`Act::move_to`]), while a run's completion is claimed ONCE — of
     /// several callers finishing one run, the first commits its status and every later one,
-    /// the one naming the same status included, is refused the state conflict.
+    /// the one naming the same status included, is refused.
     pub fn is_running(self) -> bool {
         matches!(self, Self::Running)
+    }
+
+    /// Whether a run whose current status is this one admits a move to `requested`.
+    ///
+    /// A run still under way takes the status it already holds — which moves nothing, as the
+    /// retry of an `@idempotent` update must observe — or any one of the statuses that
+    /// FINISH it. `DELETING` is the status the delete of a run reports while the removal it
+    /// started is outstanding, so it describes work a status write starts nothing of and no
+    /// run admits it. A run that has SETTLED (it finished, or it is on its way out) has no
+    /// execution left for any further status to describe, the one it already holds included,
+    /// so it admits none: a run's completion is claimed once.
+    ///
+    /// Stated over the statuses that ARE admitted rather than over the one that is not, so a
+    /// value the model grows later is refused until this rule says what a run does with it.
+    pub fn admits(self, requested: Self) -> bool {
+        self.is_running() && (requested.is_running() || requested.is_terminal())
     }
 }
 

@@ -7,12 +7,12 @@
 //! status is writable only while the run is still under way, so a `RUNNING` run takes the
 //! status it already holds (changing nothing) or any one of the statuses that FINISH it,
 //! the transition is decided and committed under one hold of the store — which is what
-//! makes exactly ONE of several callers racing to finish the same run the winner — and a
-//! run that has left `RUNNING` admits no further status at all: that request conflicts
-//! with the state the run is now in and is refused 409 `ConflictException` naming the run
-//! and its kind, the same terminal status included. `DELETING` describes a removal this
-//! update starts nothing of, so naming it for a run still under way is refused 400
-//! `ValidationException` with reason `InvalidStatus`.
+//! makes exactly ONE of several callers racing to finish the same run the winner — and
+//! every other status write is refused 400 `ValidationException` with reason
+//! `InvalidStatus`, because the status it names is not one the run's current status
+//! admits: a run that has left `RUNNING` admits none at all, the terminal status it
+//! already holds included, and `DELETING` describes a removal this update starts nothing
+//! of.
 //!
 //! So the tables below vary what that rule generalises over: which of the statuses
 //! `WorkflowRunStatus` declares is asked for, whether it finishes the run, the status the
@@ -31,7 +31,7 @@ use crate::workflow_lifecycle::{text, Emulator};
 /// The sentence this service states for a run whose current status does not admit the one a
 /// request named, spelled out here rather than taken from the crate so a rewording of the
 /// handler's constant cannot change both sides of the comparison at once.
-const RUN_IN_UNEXPECTED_STATE: &str = "Workflow run in unexpected state";
+pub(crate) const RUN_IN_UNEXPECTED_STATE: &str = "WorkflowRun in unexpected state";
 
 /// The kind name a refusal reports for a workflow run.
 const RUN_RESOURCE_TYPE: &str = "workflow-run";
@@ -48,7 +48,10 @@ const ABSENT_UUID: &str = "00000000-0000-4000-8000-000000000000";
 /// ran out of time. Only a run in one of them reports an `endedAt`; `RUNNING` describes a
 /// run still under way and `DELETING` one on its way out
 /// (`smithy_query(query="shape",shape="WorkflowRunStatus")`).
-const FINISHING_STATUSES: [&str; 3] = ["SUCCEEDED", "FAILED", "TIMED_OUT"];
+///
+/// `pub(crate)` so the sibling suite that tables the refusal reads the finishing set from
+/// this one spelling of it.
+pub(crate) const FINISHING_STATUSES: [&str; 3] = ["SUCCEEDED", "FAILED", "TIMED_OUT"];
 
 /// One definition to hang every run of a case off.
 async fn definition(emulator: &Emulator) {
@@ -111,41 +114,62 @@ pub(crate) async fn read_run(emulator: &Emulator, definition_name: &str, run_id:
     body
 }
 
-/// Assert one refusal is the modelled conflict for a run already in `current` that a
-/// caller asked to move to `requested`.
-fn assert_conflict(
+/// Put the stored run on its way out, in the store.
+///
+/// `DeleteWorkflowRun` is not implemented yet, and the delete of the run's definition — which
+/// does move the runs under it — makes the whole definition stop resolving after the span the
+/// clock owes, which is not what a case about a status write is for. `pub(crate)` so both
+/// suites that need a run in `DELETING` reach it the same way.
+pub(crate) fn put_on_its_way_out(
+    emulator: &Emulator,
     case: &str,
-    status: u16,
-    body: &Value,
+    definition_name: &str,
     run_id: &str,
-    current: &str,
-    requested: &str,
 ) {
+    let store = emulator.store();
+    let mut store = store.lock();
+    let run = store
+        .workflow_definitions
+        .get_mut(definition_name)
+        .and_then(|definition| definition.runs.get_mut(run_id))
+        .unwrap_or_else(|| panic!("case {case}: the run must be stored"));
+    run.move_to(WorkflowRunStatus::Deleting, std::time::SystemTime::now());
+}
+
+/// Assert one refusal is the modelled refusal of a status the run's current status does not
+/// admit: HTTP 400 `ValidationException` with reason `InvalidStatus`
+/// (`smithy_query(query="shape",shape="ValidationException,ValidationExceptionReason")`) and
+/// the fixed sentence, echoing nothing of the run or of the request.
+///
+/// `pub(crate)` so the sibling suite that tables this refusal over every pair of statuses
+/// asserts it through this one reading of the rule.
+pub(crate) fn assert_unexpected_state(case: &str, status: u16, body: &Value) {
     assert_eq!(
-        status, 409,
-        "case {case}: expected HTTP 409, got {status} {body}"
+        status, 400,
+        "case {case}: expected HTTP 400, got {status} {body}"
     );
     assert_eq!(
-        body["__type"], "ConflictException",
-        "case {case}: expected ConflictException, got {body}"
-    );
-    // `ConflictException` requires `message`, `resourceId` and `resourceType`
-    // (`smithy_query(query="shape",shape="ConflictException")`).
-    assert_eq!(
-        body["resourceId"], run_id,
-        "case {case}: expected resourceId {run_id:?}, got {body}"
+        body["__type"], "ValidationException",
+        "case {case}: expected ValidationException, got {body}"
     );
     assert_eq!(
-        body["resourceType"], RUN_RESOURCE_TYPE,
-        "case {case}: expected resourceType {RUN_RESOURCE_TYPE:?}, got {body}"
+        body["reason"], "InvalidStatus",
+        "case {case}: expected reason \"InvalidStatus\", got {body}"
     );
-    let expected =
-        format!("workflow run {run_id} is {current} and cannot be moved to {requested}");
     let message = text(body, "message");
     assert_eq!(
-        message, expected,
-        "case {case}: expected message {expected:?}, got {message:?}"
+        message, RUN_IN_UNEXPECTED_STATE,
+        "case {case}: expected message {RUN_IN_UNEXPECTED_STATE:?}, got {message:?}"
     );
+    // `ValidationException` carries `message`, `reason` and at most a `fieldList`: the
+    // members a `ConflictException` body would carry are not part of this refusal, and the
+    // value the request named is admissible in itself, so there is no field to point at.
+    for absent in ["resourceId", "resourceType", "fieldList"] {
+        assert!(
+            body[absent].is_null(),
+            "case {case}: expected no {absent} member, got {body}"
+        );
+    }
 }
 
 /// Every status that finishes a run is stored, and `endedAt` is reported exactly once the
@@ -218,23 +242,7 @@ async fn deleting_is_not_a_status_this_update_can_set() {
     let before = read_run(&emulator, DEFINITION, &run_id).await;
 
     let (status, answer) = move_to(&emulator, DEFINITION, &run_id, "DELETING").await;
-    assert_eq!(status, 400, "expected HTTP 400, got {status} {answer}");
-    assert_eq!(
-        answer["__type"], "ValidationException",
-        "expected ValidationException, got {answer}"
-    );
-    // `ValidationExceptionReason` declares `InvalidStatus`
-    // (`smithy_query(query="shape",shape="ValidationExceptionReason")`), which is what a
-    // status the run's current one does not admit is.
-    assert_eq!(
-        answer["reason"], "InvalidStatus",
-        "expected reason \"InvalidStatus\", got {answer}"
-    );
-    let message = text(&answer, "message");
-    assert_eq!(
-        message, RUN_IN_UNEXPECTED_STATE,
-        "expected message {RUN_IN_UNEXPECTED_STATE:?}, got {message:?}"
-    );
+    assert_unexpected_state("a running run asked for DELETING", status, &answer);
 
     let after = read_run(&emulator, DEFINITION, &run_id).await;
     assert_eq!(
@@ -244,8 +252,8 @@ async fn deleting_is_not_a_status_this_update_can_set() {
 }
 
 /// A run that has finished keeps the status and the instant it finished with: a request
-/// naming ANY status — the one the run holds included — conflicts with the state the run is
-/// in.
+/// naming ANY status — the one the run holds included — names a status the state the run is
+/// in does not admit.
 #[tokio::test]
 async fn a_finished_run_refuses_every_further_status() {
     let emulator = Emulator::new("us-east-1");
@@ -265,7 +273,7 @@ async fn a_finished_run_refuses_every_further_status() {
             let finished_read = read_run(&emulator, DEFINITION, &run_id).await;
 
             let (status, answer) = move_to(&emulator, DEFINITION, &run_id, requested).await;
-            assert_conflict(&case, status, &answer, &run_id, finished, requested);
+            assert_unexpected_state(&case, status, &answer);
 
             // The refusal left the run exactly as it was, instants included.
             let after = read_run(&emulator, DEFINITION, &run_id).await;
@@ -278,7 +286,7 @@ async fn a_finished_run_refuses_every_further_status() {
 }
 
 /// A run on its way out is settled too: the status its deletion put it in is the last one it
-/// takes, so an update naming any other conflicts as well.
+/// takes, so an update naming any other is refused as well.
 #[tokio::test]
 async fn a_run_on_its_way_out_refuses_a_further_status() {
     let emulator = Emulator::new("ap-southeast-1");
@@ -286,30 +294,11 @@ async fn a_run_on_its_way_out_refuses_a_further_status() {
 
     for requested in FINISHING_STATUSES {
         let run_id = new_run(&emulator).await;
-        // The run is put on its way out directly: `DeleteWorkflowRun` is not implemented
-        // yet, and the delete of its definition — which does move the runs under it — makes
-        // the whole definition stop resolving after the span the clock owes, which is not
-        // what this row is about.
-        {
-            let store = emulator.store();
-            let mut store = store.lock();
-            let run = store
-                .workflow_definitions
-                .get_mut(DEFINITION)
-                .and_then(|definition| definition.runs.get_mut(&run_id))
-                .unwrap_or_else(|| panic!("case {requested:?}: the run must be stored"));
-            run.move_to(WorkflowRunStatus::Deleting, std::time::SystemTime::now());
-        }
+        // The run is put on its way out directly, through the shared helper.
+        put_on_its_way_out(&emulator, requested, DEFINITION, &run_id);
 
         let (status, answer) = move_to(&emulator, DEFINITION, &run_id, requested).await;
-        assert_conflict(
-            &format!("DELETING then {requested}"),
-            status,
-            &answer,
-            &run_id,
-            "DELETING",
-            requested,
-        );
+        assert_unexpected_state(&format!("DELETING then {requested}"), status, &answer);
         let after = read_run(&emulator, DEFINITION, &run_id).await;
         assert_eq!(
             after["status"], "DELETING",
@@ -349,7 +338,7 @@ async fn race(emulator: &Arc<Emulator>, run_id: &str, wanted: &[&'static str]) -
 }
 
 /// Of several callers racing to finish one run, exactly one commits its status and the rest
-/// are refused the modelled conflict — and the run reports the WINNER's status afterwards.
+/// are refused the modelled refusal — and the run reports the WINNER's status afterwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exactly_one_racer_wins_the_terminal_transition() {
     let emulator = Arc::new(Emulator::new("us-west-2"));
@@ -398,19 +387,16 @@ async fn exactly_one_racer_wins_the_terminal_transition() {
         );
         let (_, won_with, _, _) = winners[0];
 
-        // Every loser is refused the modelled conflict, reporting the status the winner
-        // committed as the state its own request conflicts with.
+        // Every loser is refused the one modelled refusal: once the winner has committed,
+        // the run admits no further status.
         for (index, requested, status, body) in answers
             .iter()
             .filter(|(_, _, status, _)| *status != 200)
         {
-            assert_conflict(
+            assert_unexpected_state(
                 &format!("{case:?} racer {index} asking for {requested}"),
                 *status,
                 body,
-                &run_id,
-                won_with,
-                requested,
             );
         }
 

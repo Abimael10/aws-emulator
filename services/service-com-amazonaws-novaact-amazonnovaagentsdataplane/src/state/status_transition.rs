@@ -5,12 +5,17 @@
 //! The classification is modelled — `ValidationException` (HTTP 400) with `reason`
 //! `InvalidStatus`, the value `ValidationExceptionReason` declares for a well-formed
 //! request naming a status the resource's state does not allow — but the WORDS are not, so
-//! they live here once rather than as a sentence per operation: a refusal states the SET of
-//! statuses the update would have taken, so a caller can read the admissible values out of
-//! the message and pick a legal one.
+//! they live here once rather than as a sentence per operation. There are two, one per KIND
+//! of resource a status write addresses, each as this service's recorded refusal for that
+//! kind words it: for an act the refusal states the SET of statuses the act's current status
+//! admits, so a caller can read the admissible values out of the message and pick a legal
+//! one; for a workflow run it names the kind of resource that is in a state the write did
+//! not expect, with no set in it at all.
 //!
-//! The set itself is not decided here. It is the transition rule of the resource being
-//! written (for an act, `crate::state::ActStatus::admitted`), so the sentence always names
+//! WHICH statuses are admitted is not decided here. That is the transition rule of the
+//! resource being written (`crate::state::ActStatus::admits` and `admitted` for an act,
+//! `crate::state::WorkflowRunStatus::admits` for a run); this module only states the
+//! refusal once a handler has read that rule, and the set-stating sentence always carries
 //! what the operation actually admits for the state the resource is in.
 
 use crate::ops::types::ValidationException;
@@ -39,6 +44,32 @@ pub fn status_must_be_one_of(admitted: &[&str]) -> String {
 pub fn invalid_status(admitted: &[&str]) -> ValidationException {
     ValidationException {
         message: status_must_be_one_of(admitted),
+        reason: INVALID_STATUS.to_string(),
+        field_list: None,
+    }
+}
+
+/// How this service states that the resource a status write names is in a state that write
+/// did not expect: the KIND of resource — named as the operations that work on it name it,
+/// so a run is a `WorkflowRun` — then fixed text.
+///
+/// This is the wording for a kind of resource whose refusal states no admissible set —
+/// whatever its current status does admit, the sentence is the same; where the refusal
+/// states the set instead, [`status_must_be_one_of`] words it. Nothing of the request is
+/// echoed — not the rejected status, not the resource's identifiers, not the status it holds
+/// — so the sentence reads the same for every caller a resource of that kind refuses.
+pub fn resource_in_unexpected_state(resource_kind: &str) -> String {
+    format!("{resource_kind} in unexpected state")
+}
+
+/// The modelled refusal for a status write on a resource of `resource_kind` whose current
+/// status does not admit the status named: `ValidationException` with reason `InvalidStatus`
+/// over [`resource_in_unexpected_state`]. A status the resource's state does not admit is a
+/// bad value for the member the request carries, not a conflict with the resource, so this
+/// is the same classification [`invalid_status`] carries.
+pub fn in_unexpected_state(resource_kind: &str) -> ValidationException {
+    ValidationException {
+        message: resource_in_unexpected_state(resource_kind),
         reason: INVALID_STATUS.to_string(),
         field_list: None,
     }

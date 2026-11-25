@@ -10,11 +10,11 @@
 //! `RUNNING` (no change) or one of the statuses that FINISH it (`SUCCEEDED`, `FAILED`,
 //! `TIMED_OUT`), and the transition is decided and committed under one hold of the store,
 //! so of several callers racing to finish one run exactly ONE commits its status. Every
-//! later status write on that run — the same terminal status included — conflicts with the
-//! state the run is now in and is refused `ConflictException` (409) carrying the run as
-//! `resourceId` and its kind as `resourceType`. `DELETING` is the status the delete of a
-//! run produces rather than one this update can set, so naming it for a run still under
-//! way is a `ValidationException` (400) with reason `InvalidStatus`.
+//! other status write is refused as a bad value for the `status` member —
+//! `ValidationException` (400) with reason `InvalidStatus` — because the status it names is
+//! not one the run's current status admits: `DELETING` is the status the delete of a run
+//! produces rather than one this update can set, and a run that has LEFT `RUNNING` has
+//! settled, so no later write on it is taken, the status it already holds included.
 //!
 //! ## Shape of an operation
 //!
@@ -83,17 +83,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// How this service states a status the workflow run's current status does not admit: the
-/// run is in a state this update did not expect. Fixed text with nothing interpolated, so
-/// the refusal reads the same whichever run and whichever status a caller named — the same
-/// shape `UpdateAct` states for an act. Private: the sentence belongs to this operation,
-/// and the wire cases spell it out themselves.
-const RUN_IN_UNEXPECTED_STATE: &str = "Workflow run in unexpected state";
-
-/// What a `ConflictException` from this operation reports as the type of the resource whose
-/// current state the request conflicts with — the kind name every refusal of this service
-/// uses for a workflow run.
-const RUN_RESOURCE_TYPE: &str = "workflow-run";
+/// How a refusal of this operation names the kind of resource it found in a state the write
+/// did not expect: a workflow run, spelled as the operations that work on one spell it
+/// (`UpdateWorkflowRun`, `GetWorkflowRun`, `ListWorkflowRuns`), not as the hyphenated kind
+/// name a `resourceType` member carries. The sentence itself lives with this service's other
+/// state-transition refusals, in `crate::state::status_transition`.
+const RUN_RESOURCE_KIND: &str = "WorkflowRun";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -223,36 +218,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(not_found)?;
         let current = run.status;
 
-        // `DELETING` is what the delete of a run reports while the removal it started is
-        // outstanding, so it describes work a status write starts nothing of: a request
-        // naming it for a run still under way names a status that run's current status does
-        // not admit, which is what `ValidationExceptionReason`'s `InvalidStatus` is for.
-        if requested == crate::state::WorkflowRunStatus::Deleting && current.is_running() {
-            return Err(UpdateWorkflowRunErrorModeled::ValidationException(ValidationException {
-                message: RUN_IN_UNEXPECTED_STATE.to_string(),
-                reason: "InvalidStatus".to_string(),
-                field_list: None,
-            })
-            .into());
-        }
-
-        // A run that has left `RUNNING` has settled: its execution is over (it finished) or
-        // it is on its way out (it is being deleted), so there is no transition left for
-        // this update to make and the request conflicts with the state the run is in.
+        // Which statuses a run can still take is a property of the status it holds
+        // (`crate::state::WorkflowRunStatus::admits`): a run still under way takes the
+        // status it already holds or one of the statuses that FINISH it, while `DELETING`
+        // describes a removal this update starts nothing of, and a run that has settled —
+        // its execution over, or on its way out — has no transition left for this update to
+        // make at all. A status the run's current status does not admit is a bad value for
+        // the `status` member the request carries rather than a conflict with the run, so it
+        // is refused through the same `InvalidStatus` channel every state-transition refusal
+        // of this service states, naming the kind of resource that is in a state the write
+        // did not expect — nothing of the request or of the run is echoed into it.
+        //
         // Deciding this under the one hold of the store the write happens under is what
         // makes a single caller the winner when several race to finish the same run: the
         // first to take the store moves the run, and every later one reads a settled run.
-        if !current.is_running() {
-            return Err(UpdateWorkflowRunErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "workflow run {} is {} and cannot be moved to {}",
-                    input.workflow_run_id,
-                    current.as_wire(),
-                    requested.as_wire()
-                ),
-                resource_id: input.workflow_run_id.clone(),
-                resource_type: RUN_RESOURCE_TYPE.to_string(),
-            })
+        if !current.admits(requested) {
+            return Err(UpdateWorkflowRunErrorModeled::ValidationException(
+                crate::state::status_transition::in_unexpected_state(RUN_RESOURCE_KIND),
+            )
             .into());
         }
 
