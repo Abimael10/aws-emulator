@@ -247,6 +247,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into());
                 }
+                // A `*Filters` field states per field whether its `ValueList` is
+                // a list of unique values, exactly as `Filter$ValueList` does
+                // for the generic surface — so a value repeated in a list the
+                // documentation states unique is refused here too, by the one
+                // rule both surfaces go through
+                // (`crate::state::repeated_filter_value`), and a field the
+                // documentation states nothing about takes the repetition.
+                for criterion in &criteria {
+                    if !crate::state::type_filter_values_unique(filtered, &criterion.member) {
+                        continue;
+                    }
+                    if let Some(fault) = crate::state::repeated_filter_value(
+                        "EntityTypeFilters",
+                        &format!("{filtered}Filters.{}", criterion.member),
+                        &criterion.value_list,
+                    ) {
+                        return Err(ListEntitiesErrorModeled::ValidationException(fault).into());
+                    }
+                }
                 criteria
             }
         };

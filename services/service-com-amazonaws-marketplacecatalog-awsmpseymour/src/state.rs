@@ -249,6 +249,61 @@ fn first_repeated(values: &[String]) -> Option<&String> {
         .map(|(_, value)| value)
 }
 
+/// Whether the `ValueList` of the field `member` of the `EntityTypeFilters`
+/// shape belonging to `entity_type` is a list of UNIQUE values.
+///
+/// The per-type filter shapes state it per field, exactly as `Filter$ValueList`
+/// does for the generic filter surface ([`filter_values_unique`]): the four
+/// product types whose filter fields are documented "A string array of unique
+/// entity id / product title / visibility values to be filtered on"
+/// (`AmiProductEntityIdFilter$ValueList`, `AmiProductTitleFilter$ValueList`,
+/// `AmiProductVisibilityFilter$ValueList` and the same three shapes of
+/// `ContainerProduct`, `DataProduct` and `SaaSProduct` —
+/// `smithy_query(query="shape", shape="AmiProductEntityIdFilter")`) state those
+/// three lists unique, so a value repeated in one of them is a request the
+/// documentation forbids.
+///
+/// Every other `*Filters` field's `ValueList` states no uniqueness — the
+/// `MachineLearningProduct` fields are documented "A list of entity IDs to
+/// filter by", and the `Offer`, `OfferSet`, `ResaleAuthorization` and
+/// `ExpressPrivateOfferConfiguration` fields "with list input" / "A list of
+/// `ProductId` values to filter on" — so, as on the generic surface, a field the
+/// documentation says nothing about is left unconstrained. No `ValueList` shape
+/// in the model carries `@uniqueItems`, so this prose is the whole of the rule.
+pub fn type_filter_values_unique(entity_type: &str, member: &str) -> bool {
+    match entity_type {
+        "AmiProduct" | "ContainerProduct" | "DataProduct" | "SaaSProduct" => matches!(
+            member,
+            ENTITY_ID_FILTER_NAME | "ProductTitle" | ENTITY_VISIBILITY_DETAIL_MEMBER
+        ),
+        _ => false,
+    }
+}
+
+/// The modelled `ValidationException` for a value `values` names twice, and
+/// `None` when every value in it is distinct.
+///
+/// This is the one place a repeated filter value is refused, so both filter
+/// surfaces of a list operation — the generic `FilterList` and a type's own
+/// `*Filters` — refuse the same repetition the same way: `field` is the request
+/// member the list arrived in and `filter` the filter it belongs to.
+pub fn repeated_filter_value(
+    field: &str,
+    filter: &str,
+    values: &[String],
+) -> Option<ValidationException> {
+    first_repeated(values).map(|repeated| {
+        validation(
+            field,
+            quoting(
+                &format!("filter {filter} matches a list of unique values, and '"),
+                repeated,
+                "' is named twice",
+            ),
+        )
+    })
+}
+
 /// The `Sort$SortBy` values `ListChangeSets` accepts, from `Sort$SortBy`'s doc
 /// ("For `ListChangeSets`, supported attributes include `StartTime` and
 /// `EndTime`"). The first entry is the default.
@@ -336,15 +391,8 @@ pub fn filter_predicate(
         }
     }
     if filter_values_unique(&name) {
-        if let Some(repeated) = first_repeated(&values) {
-            return Err(validation(
-                "FilterList.ValueList",
-                quoting(
-                    &format!("filter {name} matches a list of unique values, and '"),
-                    repeated,
-                    "' is named twice",
-                ),
-            ));
+        if let Some(fault) = repeated_filter_value("FilterList.ValueList", &name, &values) {
+            return Err(fault);
         }
     }
     Ok((name, values))
