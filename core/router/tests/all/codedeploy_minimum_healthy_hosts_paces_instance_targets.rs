@@ -46,6 +46,13 @@
 //! Every wait here polls for the CONDITION it is waiting on and nothing asserts how long
 //! anything took on this host: the two windows compared at the end are the `createTime` and
 //! `completeTime` the service itself reports.
+//!
+//! The harness that stands that emulator up — [`emulator`], the fleet launches
+//! ([`given_running_fleet`]) and the CodeDeploy calls ([`codedeploy`], [`given_group`],
+//! [`deploy`], [`deployment_info`]) — is `pub(crate)` so the sibling suite that reads the same
+//! fleet through `ListDeploymentTargets`
+//! (`codedeploy_list_deployment_targets_reports_the_resolved_fleet.rs`) drives it through these
+//! very calls instead of writing a second harness that drifts from this one.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -94,17 +101,17 @@ const ROLE_VALUE: &str = "web";
 /// ships: `minimumHealthyHosts` HOST_COUNT 0 for the first (every host at once) and
 /// FLEET_PERCENT 99 for the second (one host at a time), which is also the configuration a
 /// deployment group that names none runs under.
-const ALL_AT_ONCE: &str = "CodeDeployDefault.AllAtOnce";
+pub(crate) const ALL_AT_ONCE: &str = "CodeDeployDefault.AllAtOnce";
 /// See [`ALL_AT_ONCE`].
-const ONE_AT_A_TIME: &str = "CodeDeployDefault.OneAtATime";
+pub(crate) const ONE_AT_A_TIME: &str = "CodeDeployDefault.OneAtATime";
 
 /// How long a poll waits for a condition the clock owes — an instance reaching a state, a
 /// deployment reaching an outcome. Generous by design: it is a deadline, not a measurement.
-const CONVERGENCE_BUDGET: Duration = Duration::from_secs(120);
+pub(crate) const CONVERGENCE_BUDGET: Duration = Duration::from_secs(120);
 
 /// How long a poll waits between two reads. Fine enough that the window each wave of targets
 /// is out of service for is sampled many times over.
-const POLL_INTERVAL: Duration = Duration::from_millis(25);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// The six counts `deploymentOverview` partitions a deployment's targets into
 /// (`smithy_query(query="shape",shape="DeploymentOverview")`).
@@ -119,7 +126,7 @@ const OVERVIEW_COUNTS: &[&str] = &[
 
 /// One emulator carrying Amazon EC2 and CodeDeploy over ONE shared engine, as the assembled
 /// router mounts them.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -174,7 +181,11 @@ async fn ec2(router: &MultiServiceRouter, action: &str, params: &[(String, Strin
 }
 
 /// Call one CodeDeploy operation over the awsJson1_1 wire its model declares.
-async fn codedeploy(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn codedeploy(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -193,7 +204,11 @@ async fn codedeploy(router: &MultiServiceRouter, operation: &str, body: &Value) 
 }
 
 /// Call one CodeDeploy operation, requiring HTTP 200.
-async fn codedeploy_ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+pub(crate) async fn codedeploy_ok(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> Value {
     let (status, answered) = codedeploy(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -249,7 +264,7 @@ async fn poll_until_state(router: &MultiServiceRouter, instance_id: &str, state:
 
 /// Launch `hosts` instances tagged with the fleet tag and wait until EC2 reports each running,
 /// answering their ids in launch order.
-async fn given_running_fleet(router: &MultiServiceRouter, hosts: usize) -> Vec<String> {
+pub(crate) async fn given_running_fleet(router: &MultiServiceRouter, hosts: usize) -> Vec<String> {
     let mut ids = Vec::with_capacity(hosts);
     for _ in 0..hosts {
         ids.push(launch(router, &[(FLEET_KEY, FLEET_VALUE), (ROLE_KEY, ROLE_VALUE)]).await);
@@ -262,7 +277,7 @@ async fn given_running_fleet(router: &MultiServiceRouter, hosts: usize) -> Vec<S
 
 /// Create a `Server` application and one deployment group of it selecting the fleet with
 /// `selector`, under `deployment_config` when it names one.
-async fn given_group(
+pub(crate) async fn given_group(
     router: &MultiServiceRouter,
     application: &str,
     group: &str,
@@ -290,7 +305,7 @@ async fn given_group(
 }
 
 /// The `ec2TagFilters` selector that takes in the launched fleet.
-fn by_tag_filter() -> Value {
+pub(crate) fn by_tag_filter() -> Value {
     json!({
         "ec2TagFilters": [
             {"Key": FLEET_KEY, "Value": FLEET_VALUE, "Type": "KEY_AND_VALUE"},
@@ -309,7 +324,11 @@ fn s3_revision(key: &str) -> Value {
 }
 
 /// Deploy a revision to `application`/`group`, answering the deployment id CodeDeploy minted.
-async fn deploy(router: &MultiServiceRouter, application: &str, group: &str) -> String {
+pub(crate) async fn deploy(
+    router: &MultiServiceRouter,
+    application: &str,
+    group: &str,
+) -> String {
     codedeploy_ok(
         router,
         "CreateDeployment",
@@ -327,7 +346,7 @@ async fn deploy(router: &MultiServiceRouter, application: &str, group: &str) -> 
 }
 
 /// The stored `deploymentInfo` of `deployment_id`.
-async fn deployment_info(router: &MultiServiceRouter, deployment_id: &str) -> Value {
+pub(crate) async fn deployment_info(router: &MultiServiceRouter, deployment_id: &str) -> Value {
     codedeploy_ok(
         router,
         "GetDeployment",
