@@ -60,9 +60,17 @@ impl RequestAttributes {
         } else {
             format!("in the namespace \"{}\"", self.namespace)
         };
+        // The addressed object's name is part of the sentence exactly when the
+        // request names one: a request addressing a collection has no name to
+        // attribute the denial to, and gets the shorter form.
+        let addressed = if self.name.is_empty() {
+            qualified
+        } else {
+            format!("{qualified} \"{}\"", self.name)
+        };
         ApiRefusal::forbidden(
             format!(
-                "{qualified} is forbidden: User \"{username}\" cannot {} resource \
+                "{addressed} is forbidden: User \"{username}\" cannot {} resource \
                  \"{resource}\" in API group \"{}\" {scope}",
                 self.verb, self.api_group
             ),
