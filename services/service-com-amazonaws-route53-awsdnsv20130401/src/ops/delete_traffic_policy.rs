@@ -71,7 +71,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::no_such_traffic_policy_without_message;
+use crate::state::no_such_traffic_policy;
 
 /// The refusal text a delete of a traffic policy version that traffic policy
 /// instances were created from answers with (`TrafficPolicyInUse`, HTTP 400).
@@ -201,9 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|policy| policy.versions.get_mut(&input.version))
             .filter(|version| !version.deleted)
             .ok_or_else(|| {
-                DeleteTrafficPolicyErrorModeled::NoSuchTrafficPolicy(
-                    no_such_traffic_policy_without_message(),
-                )
+                DeleteTrafficPolicyErrorModeled::NoSuchTrafficPolicy(no_such_traffic_policy())
             })?;
 
         if in_use {

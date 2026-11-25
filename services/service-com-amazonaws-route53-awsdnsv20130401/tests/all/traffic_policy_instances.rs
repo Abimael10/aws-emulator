@@ -695,8 +695,8 @@ async fn a_create_naming_something_the_account_does_not_hold_is_refused() {
             row.code,
             reply.body
         );
-        // A traffic policy the account does not hold is reported with the one sentence
-        // that refusal states, and every other refusal here says why in its own.
+        // A traffic policy the account does not hold is reported by its code alone, and
+        // every other refusal here says why in its own message.
         if row.code == "NoSuchTrafficPolicy" {
             assert_no_such_traffic_policy(&reply, row.case);
         } else {

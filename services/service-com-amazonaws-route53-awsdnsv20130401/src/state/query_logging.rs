@@ -83,8 +83,9 @@ pub fn query_logging_config_already_exists() -> QueryLoggingConfigAlreadyExists 
 ///
 /// The ONE place this service words that refusal, so every configuration-addressed
 /// operation — the read and the delete — answers a missing configuration identically.
-/// Entirely FIXED text, like the traffic-policy refusal beside it
-/// ([`super::NO_SUCH_TRAFFIC_POLICY_MESSAGE`]): it states the fact about the
+/// Entirely FIXED text, unlike the traffic-policy refusal beside it
+/// ([`super::no_such_traffic_policy`], which this service reports by its code alone): it
+/// states the fact about the
 /// configuration and carries nothing the request named, so a caller learns WHICH id it
 /// asked about from its own request.
 pub fn no_such_query_logging_config() -> NoSuchQueryLoggingConfig {

@@ -18,8 +18,8 @@
 //!    policy is not a new policy — the account's traffic policy count does not
 //!    move for one.
 //! 3. An `Id` the account holds no policy under names nothing to add a version
-//!    to: the modelled `NoSuchTrafficPolicy` (HTTP 404), reported on this path by
-//!    its IDENTITY ALONE — `Type` and `Code` and no `Message` element — and
+//!    to: the modelled `NoSuchTrafficPolicy` (HTTP 404), reported by its
+//!    IDENTITY ALONE — `Type` and `Code` and no `Message` element — and
 //!    nothing is persisted.
 //! 4. The document is the version's definition, so a document the published
 //!    traffic policy document format does not define is refused with the

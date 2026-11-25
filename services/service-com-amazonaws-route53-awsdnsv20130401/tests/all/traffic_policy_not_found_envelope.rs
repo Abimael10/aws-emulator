@@ -3,21 +3,17 @@
 //! The error BODY of the two Route 53 traffic-policy not-found refusals, end to
 //! end over the router.
 //!
-//! The rules under test: a traffic policy the account does not hold is reported HTTP 404
-//! with `<ErrorResponse><Error><Type>Sender</Type><Code>NoSuchTrafficPolicy</Code>` and the
-//! sentence `<Message>The policy does not exist.</Message>` — fixed text stating the rule
-//! and carrying nothing the request named — on every operation that READS or amends a
-//! traffic policy VERSION, while the DELETE and the version CREATE report the same code by
-//! their IDENTITY ALONE, as a traffic policy INSTANCE the account does not hold is reported
-//! on every operation that
-//! binds that error: with NO `Message` child. Each holds whichever half of `(Id, Version)`
+//! The rule under test: a traffic policy — or a traffic policy INSTANCE — the account
+//! does not hold is reported by that error's IDENTITY ALONE, HTTP 404 with
+//! `<ErrorResponse><Error><Type>Sender</Type><Code>NoSuchTrafficPolicy</Code>` (or
+//! `NoSuchTrafficPolicyInstance`) and NO `Message` child at all, on every operation that
+//! binds the error. Each holds whichever half of `(Id, Version)`
 //! the store does not hold and whatever form the requested id takes. The error shapes'
 //! documentation states the RULE each refusal reports ("No traffic policy exists with the
 //! specified ID", "No traffic policy instance exists with the specified ID",
 //! smithy_query(query="shape",shape="NoSuchTrafficPolicy,NoSuchTrafficPolicyInstance"))
 //! rather than a sentence the service sends, and the `message` member both shapes carry is
-//! optional — so which of them puts an element on the wire is the service's own
-//! behaviour, not the model's.
+//! optional — so neither of them puts an element on the wire.
 //!
 //! The rules are about the SHAPE of the body, so each is asserted over a table of
 //! requests rather than over the one that exposed it: every implemented operation
@@ -32,16 +28,14 @@
 //! belongs to these two refusals rather than to the operations or to the
 //! service's error envelope.
 //!
-//! That the sentence has no variable part at all is an INVARIANT over the pair a
+//! That the body carries no message at all is an INVARIANT over the pair a
 //! request names rather than a property of any one pair, so it is also asserted
 //! over drawn `(Id, Version)` pairs: whatever a request asked about, the refusal
-//! states the one sentence and none of what it asked about.
+//! reports its code and nothing else.
 //!
 //! The harness (`router`, `call`, `Reply`) and the request builders come from the
 //! suites that own these operations, so these tests drive the service through the
 //! same router a socket-served request goes through.
-
-use std::collections::BTreeSet;
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -70,10 +64,6 @@ const VERSION_MAX: &str = "1000";
 /// The DNS name every traffic policy instance in this suite is applied to.
 const INSTANCE_NAME: &str = "www.example.com";
 
-/// The one sentence a traffic policy the account does not hold is refused with: fixed text
-/// stating the rule, carrying nothing the request named.
-pub(crate) const NO_SUCH_POLICY_MESSAGE: &str = "The policy does not exist.";
-
 /// Assert that `reply` reports a refusal by its identity alone: HTTP 404, the
 /// `Error` element carrying `Type` `Sender` and the expected `Code`, and no
 /// `Message` element anywhere in the body.
@@ -87,38 +77,13 @@ pub(crate) fn assert_identity_only(reply: &Reply, case: &str, code: &str) {
 }
 
 /// Assert that `reply` is the traffic-policy not-found refusal: HTTP 404, the `Error`
-/// element carrying `Type` `Sender`, the code `NoSuchTrafficPolicy`, and the one sentence
-/// that refusal states.
+/// element carrying `Type` `Sender`, the code `NoSuchTrafficPolicy`, and no `Message`
+/// element at all.
 ///
 /// `pub(crate)` for the same reason [`assert_identity_only`] is: every suite that drives
 /// this refusal asserts its body through this one check.
 pub(crate) fn assert_no_such_traffic_policy(reply: &Reply, case: &str) {
-    assert_eq!(
-        reply.status, 404,
-        "case {case:?}: expected HTTP 404, got {} with body {}",
-        reply.status, reply.body
-    );
-    assert_eq!(
-        reply.error_code(),
-        NO_SUCH_POLICY,
-        "case {case:?}: expected the code {NO_SUCH_POLICY:?}, got {:?}; body {}",
-        reply.error_code(),
-        reply.body
-    );
-    assert_eq!(
-        reply.first("Error/Type"),
-        Some("Sender"),
-        "case {case:?}: expected the fault Type \"Sender\", got {:?}; body {}",
-        reply.first("Error/Type"),
-        reply.body
-    );
-    assert_eq!(
-        reply.first("Error/Message"),
-        Some(NO_SUCH_POLICY_MESSAGE),
-        "case {case:?}: expected the refusal's own sentence, got {:?}; body {}",
-        reply.first("Error/Message"),
-        reply.body
-    );
+    assert_identity_only(reply, case, NO_SUCH_POLICY);
 }
 
 /// Every implemented operation that binds `NoSuchTrafficPolicy`.
@@ -137,36 +102,12 @@ enum PolicyOperation {
 }
 
 impl PolicyOperation {
-    /// Whether this operation words the refusal's sentence, as against reporting
-    /// the refusal's identity alone.
-    ///
-    /// Which of the two a path answers with is that path's own recorded behaviour:
-    /// the DELETE and the version CREATE report the class alone, and the operations
-    /// that read or amend a version state the sentence.
-    fn states_the_sentence(self) -> bool {
-        !matches!(
-            self,
-            Self::DeleteTrafficPolicy | Self::CreateTrafficPolicyVersion
-        )
-    }
-
     /// Whether the request names a `TrafficPolicyVersion` at all.
     fn addresses_version(self) -> bool {
         !matches!(
             self,
             Self::CreateTrafficPolicyVersion | Self::ListTrafficPolicyVersions
         )
-    }
-
-    /// Assert the refusal this operation words for a traffic policy the account does not
-    /// hold: the DELETE and the version CREATE report the refusal's identity alone, every
-    /// other operation states the one sentence.
-    fn assert_refused(self, reply: &Reply, case: &str) {
-        if self.states_the_sentence() {
-            assert_no_such_traffic_policy(reply, case);
-        } else {
-            assert_identity_only(reply, case, NO_SUCH_POLICY);
-        }
     }
 
     /// Send this operation's request for `(id, version)`, with everything else
@@ -237,7 +178,7 @@ async fn policy_id(router: &MultiServiceRouter, name: &str) -> String {
 }
 
 #[tokio::test]
-async fn a_traffic_policy_the_account_does_not_hold_is_refused_with_one_sentence() {
+async fn a_traffic_policy_the_account_does_not_hold_is_refused_by_its_code_alone() {
     let router = router();
     let zone = create_zone_ok(&router, "example.com", "ref-policy-identity-only").await;
     // A policy the account DOES hold, so the rows below ask about versions of a
@@ -262,9 +203,9 @@ async fn a_traffic_policy_the_account_does_not_hold_is_refused_with_one_sentence
         for operation in POLICY_OPERATIONS {
             let case = format!("{operation:?} on {case}");
             let reply = operation.send(&router, &zone, id, "1").await;
-            // The sentence is fixed text: asserting it EQUALS the one sentence is what
-            // proves no part of the request reached it.
-            operation.assert_refused(&reply, &case);
+            // No `Message` element at all: the refusal is its code, so there is no
+            // text for any part of the request to reach.
+            assert_no_such_traffic_policy(&reply, &case);
         }
     }
 
@@ -283,7 +224,7 @@ async fn a_traffic_policy_the_account_does_not_hold_is_refused_with_one_sentence
         {
             let case = format!("{operation:?} on {case}");
             let reply = operation.send(&router, &zone, &held, version).await;
-            operation.assert_refused(&reply, &case);
+            assert_no_such_traffic_policy(&reply, &case);
         }
     }
 
@@ -309,7 +250,7 @@ async fn a_traffic_policy_the_account_does_not_hold_is_refused_with_one_sentence
     {
         let case = format!("{operation:?} on a version a delete flagged");
         let reply = operation.send(&router, &zone, &deleted, "1").await;
-        operation.assert_refused(&reply, &case);
+        assert_no_such_traffic_policy(&reply, &case);
     }
 }
 
@@ -478,10 +419,7 @@ const PAIRS_DRAWN: usize = 12;
 /// Draw an id of the form `TrafficPolicyId` admits — `len 1..36`
 /// (smithy_query(query="shape",shape="TrafficPolicyId")) — from 8 characters up.
 ///
-/// The length floor is what makes the "carries nothing the request named" check
-/// below meaningful: the sentence's longest run without a space is six
-/// characters, so a drawn id can only turn up inside the message if the service
-/// put it there. The one-character end of the range is a row of the table above.
+/// The one-character end of the range is a row of the table above.
 fn drawn_policy_id(rng: &mut StdRng) -> String {
     const CHARACTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789-";
     let length = rng.random_range(8..=36usize);
@@ -491,7 +429,7 @@ fn drawn_policy_id(rng: &mut StdRng) -> String {
 }
 
 #[tokio::test]
-async fn the_refusal_states_one_sentence_whatever_pair_the_request_named() {
+async fn the_refusal_carries_no_message_whatever_pair_the_request_named() {
     let router = router();
     let zone = create_zone_ok(&router, "example.com", "ref-policy-drawn-pairs").await;
     // A policy the account DOES hold, so each draw asks about a version of a real
@@ -504,10 +442,6 @@ async fn the_refusal_states_one_sentence_whatever_pair_the_request_named() {
         .expect("the published version bound is a number");
 
     let mut rng = StdRng::seed_from_u64(PAIR_SEED);
-    // Every sentence these refusals stated. The rule is that the text has no
-    // variable part at all, so however many pairs were asked about, there must be
-    // exactly ONE sentence among them.
-    let mut sentences: BTreeSet<String> = BTreeSet::new();
 
     for draw in 0..PAIRS_DRAWN {
         let unknown_id = drawn_policy_id(&mut rng);
@@ -519,24 +453,16 @@ async fn the_refusal_states_one_sentence_whatever_pair_the_request_named() {
         // A version the held policy does not hold: it holds its first one only.
         let unheld_version = rng.random_range(2..=version_max).to_string();
 
-        for operation in POLICY_OPERATIONS
-            .iter()
-            .filter(|operation| operation.states_the_sentence())
-        {
+        for operation in POLICY_OPERATIONS {
             // One half of the pair: an id nothing minted, at a drawn version.
             let case = format!(
                 "{operation:?} on the drawn id {unknown_id:?} at version {version:?} \
                  (seed {PAIR_SEED:#x}, draw {draw})"
             );
             let reply = operation.send(&router, &zone, &unknown_id, &version).await;
+            // The refusal is its code: a body with no `Message` element carries
+            // nothing the request named, whatever the request named.
             assert_no_such_traffic_policy(&reply, &case);
-            let message = message_of(&reply, &case);
-            assert!(
-                !message.contains(&unknown_id) && !message.contains(version.as_str()),
-                "case {case:?}: the sentence must carry nothing the request named, \
-                 got {message:?}"
-            );
-            sentences.insert(message);
 
             // The other half: the policy the account holds, at a version it does
             // not. Only the operations that name a version can ask this.
@@ -549,25 +475,6 @@ async fn the_refusal_states_one_sentence_whatever_pair_the_request_named() {
             );
             let reply = operation.send(&router, &zone, &held, &unheld_version).await;
             assert_no_such_traffic_policy(&reply, &case);
-            let message = message_of(&reply, &case);
-            assert!(
-                !message.contains(&held) && !message.contains(unheld_version.as_str()),
-                "case {case:?}: the sentence must carry nothing the request named, \
-                 got {message:?}"
-            );
-            sentences.insert(message);
         }
     }
-
-    assert_eq!(
-        sentences.len(),
-        1,
-        "the refusal has no variable part, so every drawn pair must be refused with \
-         the same sentence (seed {PAIR_SEED:#x}), got {sentences:?}"
-    );
-    assert!(
-        sentences.contains(NO_SUCH_POLICY_MESSAGE),
-        "the one sentence must be {NO_SUCH_POLICY_MESSAGE:?} (seed {PAIR_SEED:#x}), \
-         got {sentences:?}"
-    );
 }

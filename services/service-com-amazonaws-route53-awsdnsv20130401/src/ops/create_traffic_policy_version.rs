@@ -85,7 +85,7 @@
 use super::types::*;
 
 use crate::state::{
-    invalid_traffic_policy_document, no_such_traffic_policy_without_message, resource_location,
+    invalid_traffic_policy_document, no_such_traffic_policy, resource_location,
     traffic_policy_record_type, StoredTrafficPolicyVersion, MAX_TRAFFIC_POLICY_VERSION,
 };
 
@@ -202,12 +202,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The request addresses ONE existing policy — the new version is a
         // version OF it — so the only `Id` with nothing to add a version to is
-        // one the store holds no policy record under. This path reports that by
-        // the refusal's IDENTITY ALONE — the `Error` element carries `Type` and
-        // `Code` and no `Message` child — which
-        // `no_such_traffic_policy_without_message` is the one place to word; the
-        // operations that READ or amend a version state the sentence instead
-        // (`no_such_traffic_policy`). A policy
+        // one the store holds no policy record under. That is reported by the
+        // refusal's IDENTITY ALONE — the `Error` element carries `Type` and
+        // `Code` and no `Message` child — which `no_such_traffic_policy` is the
+        // one place to word, for this path as for every other operation
+        // addressed at a traffic policy. A policy
         // whose versions have all been flagged by a delete is still a policy
         // record: "Route 53 never fully deletes the traffic policy … if you
         // retain the ID of the policy", so its id keeps resolving and the
@@ -217,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&input.id)
             .ok_or_else(|| {
                 CreateTrafficPolicyVersionErrorModeled::NoSuchTrafficPolicy(
-                    no_such_traffic_policy_without_message(),
+                    no_such_traffic_policy(),
                 )
             })?;
 
