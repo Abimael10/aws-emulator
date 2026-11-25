@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePricingRule
-//! Removes a stored pricing rule, so a later read no longer reports it and its name
-//! is free again. A rule a pricing plan still names is refused with the modelled
-//! `ConflictException` instead, because deleting it would leave that plan pointing
-//! at a rule that does not exist.
+//! Removes a stored pricing rule, so a read of the billing period the call is made in,
+//! or of any later one, no longer reports it and its name is free again. Every read of a
+//! pricing rule is scoped to a billing period, so the delete ends the rule FROM the
+//! period it is made in and never earlier: a read of an earlier period still reports the
+//! rule as it stood then ([`crate::state::DeletedPricingRuleRecord`]). A rule a pricing
+//! plan still names is refused with the modelled `ConflictException` instead, because
+//! deleting it would leave that plan pointing at a rule that does not exist.
 //!
 //! ## Shape of an operation
 //!
@@ -206,7 +209,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // One state method removes the rule and the index entries that only existed
         // because of it: its name-index entry (so the name can be reused) and the
-        // idempotency entries that named it.
+        // idempotency entries that named it. The rule's own record of the billing periods
+        // it existed in is kept, because a delete that names no range ends a
+        // billing-period-scoped record from the period the call is made in and never
+        // earlier.
         state.remove_pricing_rule(&rule_arn);
 
         // The audit record for a state-changing call, as `DeletePricingPlan` writes it

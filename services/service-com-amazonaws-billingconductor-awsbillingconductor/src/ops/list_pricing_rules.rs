@@ -78,11 +78,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The billing-period versioning rule a read of a pricing rule is answered from
-/// (`exists_in` / `effective_in`), implemented once for every versioned resource of this
-/// store.
-use crate::state::VersionedResource;
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -217,8 +212,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `BillingPeriod` selects the month the listing is READ FOR — "the billing
         // period for which the described pricing rules are applicable" — and a request
         // that names no period asks about the current one. So a rule is reported only
-        // for the periods it existed in, with the values that held in the period asked
-        // about: the generation in force then
+        // for the periods it existed in — which, for a rule a delete has since removed,
+        // are the periods before that delete was made in — with the values that held in
+        // the period asked about: the generation in force then
         // ([`crate::state::PricingRuleRecord::effective_in`]) and the plan associations
         // in force then.
         let billing_period = input
@@ -226,19 +222,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone()
             .unwrap_or_else(crate::state::current_billing_period);
 
-        // `pricing_rules` is ordered by ARN, and an ARN carries the monotonic id this
-        // service mints, so the sequence is creation order and a `NextToken` names the
-        // same cut point on the next call. The page is cut FIRST, so the generation each
-        // reported rule stood at is projected for at most one page of rules — bounded by
-        // the request's `MaxResults`, or by `DEFAULT_PAGE_SIZE` when it names none.
-        let selected: Vec<(String, &crate::state::PricingRuleRecord)> = state
-            .pricing_rules
-            .iter()
-            .filter(|(arn, rule)| {
-                wanted.as_ref().is_none_or(|wanted| wanted.contains(*arn))
-                    && rule.exists_in(&billing_period)
-            })
-            .map(|(arn, rule)| (arn.clone(), rule))
+        // `pricing_rules_in` is the crate's ONE answer to "which rules does this billing
+        // period hold, and as which generation of themselves": the stored rules that
+        // existed by then and the rules a delete has since removed, for the periods
+        // before that delete took effect. It is keyed by ARN, and an ARN carries the
+        // monotonic id this service mints, so the sequence is creation order and a
+        // `NextToken` names the same cut point on the next call. The page is cut FIRST, so
+        // the plan count each reported rule carries is derived for at most one page of
+        // rules — bounded by the request's `MaxResults`, or by `DEFAULT_PAGE_SIZE` when it
+        // names none.
+        let selected: Vec<(
+            String,
+            (
+                &crate::state::PricingRuleRecord,
+                crate::state::PricingRuleVersion,
+            ),
+        )> = state
+            .pricing_rules_in(&billing_period)
+            .into_iter()
+            .filter(|(arn, _)| wanted.as_ref().is_none_or(|wanted| wanted.contains(arn)))
             .collect();
 
         // The token is minted for this listing AND the month it is answered for
@@ -255,13 +257,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(ListPricingRulesErrorModeled::ValidationException)?;
         let pricing_rules: Vec<PricingRuleListElement> = page
             .iter()
-            .filter_map(|rule| {
-                let version = rule.effective_in(&billing_period)?;
-                Some(element(
+            .map(|(rule, version)| {
+                element(
                     rule,
-                    &version,
+                    version,
                     state.associated_pricing_plan_count(&rule.arn, &billing_period),
-                ))
+                )
             })
             .collect();
 

@@ -17,11 +17,13 @@ mod item_associations;
 mod refusals;
 mod billing_period_checks;
 mod pagination;
+mod deleted_records;
 mod period_history;
 mod tagging;
 mod charges;
 pub use association_periods::*;
 pub use auto_association::*;
+pub use deleted_records::*;
 pub use period_history::*;
 pub use tagging::*;
 pub use pagination::*;
@@ -1822,125 +1824,9 @@ impl ResourceGeneration for BillingGroupVersion {
     }
 }
 
-/// A billing group that was DELETED, with the instant the delete was made at: the
-/// record of the billing periods that group billed in, which the delete does not
-/// erase.
-///
-/// A billing group bills a consolidated family FOR A BILLING PERIOD, so a period it
-/// billed in keeps a record of it after it is gone — which is what the model's
-/// `BILLING_GROUP_ALREADY_EXIST_IN_CURRENT_BILLING_PERIOD` refusal is decided from
-/// (`smithy_query(query="shape",shape="ValidationExceptionReason")`): a name a group
-/// occupied in a billing period stays occupied for that period. The whole record is
-/// kept rather than just its name, because the name a period reports is the one the
-/// generation in force THEN carried ([`Self::name_in`]).
-#[derive(Debug, Clone)]
-pub struct DeletedBillingGroupRecord {
-    /// The group as it stood when the delete took it, with every generation of it the
-    /// store still held.
-    pub record: BillingGroupRecord,
-    /// The instant the delete was made at; the billing period it falls in is the LAST
-    /// one this group existed in ([`Self::deletion_billing_period`]).
-    pub deletion_time_millis: i64,
-}
-
-impl DeletedBillingGroupRecord {
-    /// The billing period the delete was made in — the last period this group billed
-    /// in, since a group deleted part-way through a month billed its family for that
-    /// month.
-    pub fn deletion_billing_period(&self) -> String {
-        billing_period_at(self.deletion_time_millis)
-    }
-
-    /// Did this group exist in `billing_period`? From the period it was created in
-    /// through the one it was deleted in, both inclusive; a value that is not a billing
-    /// period at all names no period at all.
-    pub fn existed_in(&self, billing_period: &str) -> bool {
-        match (
-            billing_period_key(billing_period),
-            billing_period_key(&self.record.creation_billing_period()),
-            billing_period_key(&self.deletion_billing_period()),
-        ) {
-            (Some(wanted), Some(created), Some(deleted)) => {
-                (created..=deleted).contains(&wanted)
-            }
-            _ => false,
-        }
-    }
-
-    /// Does a read of the billing groups scoped to `billing_period` still REPORT this
-    /// deleted group? From the period it was created in up to, but NOT including, the
-    /// period the delete was made in.
-    ///
-    /// A delete takes effect in the billing period it is made in: that is the period the
-    /// memberships the group held end at
-    /// ([`release_account`](ComAmazonawsBillingconductorAwsbillingconductorState::release_account)),
-    /// so from that period on the group holds no accounts and no read reports it, while
-    /// every earlier period it billed in still reports it as it stood then. That is
-    /// narrower than [`Self::existed_in`], which spans the periods the group's NAME stays
-    /// occupied for — the period of the delete keeps the name the group carried there even
-    /// though no read of the groups reports the group itself for it.
-    pub fn reported_in(&self, billing_period: &str) -> bool {
-        match (
-            billing_period_key(billing_period),
-            billing_period_key(&self.record.creation_billing_period()),
-            billing_period_key(&self.deletion_billing_period()),
-        ) {
-            (Some(wanted), Some(created), Some(deleted)) => (created..deleted).contains(&wanted),
-            _ => false,
-        }
-    }
-
-    /// The generations of this deleted group a period-scoped read of the billing groups
-    /// can still REPORT, oldest first: the generation in force in each of the periods
-    /// [`Self::reported_in`] answers for, which is exactly what
-    /// [`billing_groups_in`](ComAmazonawsBillingconductorAwsbillingconductorState::billing_groups_in)
-    /// projects for this record.
-    ///
-    /// A generation is in force from its own start period up to the next generation's
-    /// ([`VersionedResource::effective_in`]), so a generation that took effect in the
-    /// period of the delete or later is reported by no period at all, and a group
-    /// created and deleted within ONE period is reported by none of its generations.
-    /// The OLDEST generation still kept answers for the periods before it, so it is
-    /// reported whenever any period reports the group at all.
-    pub fn reported_versions(&self) -> Vec<BillingGroupVersion> {
-        let (Some(created), Some(deleted)) = (
-            billing_period_key(&self.record.creation_billing_period()),
-            billing_period_key(&self.deletion_billing_period()),
-        ) else {
-            return Vec::new();
-        };
-        if created >= deleted {
-            return Vec::new();
-        }
-        self.record
-            .versions()
-            .into_iter()
-            .enumerate()
-            .filter(|(index, version)| {
-                *index == 0
-                    || billing_period_key(&version.start_billing_period())
-                        .is_some_and(|start| start < deleted)
-            })
-            .map(|(_, version)| version)
-            .collect()
-    }
-
-    /// The name this group carried in `billing_period` — the name it OCCUPIED there —
-    /// or `None` when it did not exist in that period.
-    ///
-    /// A rename takes effect in the period it is made in, so the name a period holds is
-    /// the one the generation in force then carried
-    /// ([`BillingGroupRecord::effective_in`]), not whichever name the group happened to
-    /// end with.
-    pub fn name_in(&self, billing_period: &str) -> Option<String> {
-        if !self.existed_in(billing_period) {
-            return None;
-        }
-        self.record
-            .effective_in(billing_period)
-            .map(|version| version.name)
-    }
-}
+// What a delete leaves behind of a billing group, and of a pricing rule, is one rule for
+// every billing-period-scoped record a delete removes whole, so it lives in
+// `deleted_records` (`DeletedBillingGroupRecord`, `DeletedPricingRuleRecord`).
 
 /// One resource associated to a percentage custom line item, as
 /// `BatchAssociateResourcesToCustomLineItem` (or the `AssociatedValues` of the
@@ -2895,7 +2781,9 @@ const TRANSFER_DIRECTIONS: &[&str] = &["inbound", "outbound"];
 /// * `deleted_billing_groups` keeps the record of the groups a delete removed, so the
 ///   billing periods they billed in still hold them; at most
 ///   [`MAX_DELETED_BILLING_GROUPS`], oldest deletion forgotten first, which reads back
-///   as a period that never held that group.
+///   as a period that never held that group. `deleted_pricing_rules` keeps the same
+///   record of the rules a delete removed, at most [`MAX_DELETED_PRICING_RULES`], bounded
+///   and forgotten the same way.
 /// * `custom_line_items` holds one entry per custom line item, at most
 ///   [`MAX_CUSTOM_LINE_ITEMS`], and each item at most
 ///   [`MAX_RESOURCES_PER_CUSTOM_LINE_ITEM`] associated resources — as many as there
@@ -2948,6 +2836,19 @@ const TRANSFER_DIRECTIONS: &[&str] = &["inbound", "outbound"];
 pub struct ComAmazonawsBillingconductorAwsbillingconductorState {
     /// Pricing rules by full ARN.
     pub pricing_rules: BTreeMap<String, PricingRuleRecord>,
+    /// The pricing rules a delete removed, oldest deletion first, at most
+    /// [`MAX_DELETED_PRICING_RULES`] of them.
+    ///
+    /// Every read of a pricing rule is scoped to a BILLING PERIOD, so deleting it does
+    /// not erase the periods it existed in: the record of each deleted rule is kept here,
+    /// which is what lets a read scoped to one of the periods before the delete still
+    /// report the rule as it stood then (see
+    /// [`pricing_rules_in`](ComAmazonawsBillingconductorAwsbillingconductorState::pricing_rules_in)),
+    /// the way `deleted_billing_groups` does for the sibling resource. Written only by
+    /// [`remove_pricing_rule`](ComAmazonawsBillingconductorAwsbillingconductorState::remove_pricing_rule),
+    /// which is where the cap is enforced; the oldest deletion is forgotten first, which
+    /// reads back as a period that never held that rule.
+    pub deleted_pricing_rules: VecDeque<DeletedPricingRuleRecord>,
     /// Pricing rule name -> ARN; the uniqueness index behind the name conflict
     /// ("The names must be unique to each pricing rule").
     pub pricing_rule_names: BTreeMap<String, String>,
@@ -3520,26 +3421,19 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
     /// Keyed by ARN, and an ARN carries the monotonic id this service mints, so the
     /// sequence is creation order whether or not a group is still stored, and a `NextToken`
     /// names the same cut point on the next call.
+    ///
+    /// The projection itself — stored records and still-reported deletions as one period's
+    /// view — is [`resources_in`]'s, so the group side and the rule side
+    /// ([`Self::pricing_rules_in`]) cannot answer it differently.
     pub fn billing_groups_in(
         &self,
         billing_period: &str,
     ) -> BTreeMap<String, (&BillingGroupRecord, BillingGroupVersion)> {
-        let mut groups: BTreeMap<String, (&BillingGroupRecord, BillingGroupVersion)> =
-            BTreeMap::new();
-        for deleted in &self.deleted_billing_groups {
-            if !deleted.reported_in(billing_period) {
-                continue;
-            }
-            if let Some(version) = deleted.record.effective_in(billing_period) {
-                groups.insert(deleted.record.arn.clone(), (&deleted.record, version));
-            }
-        }
-        for (arn, group) in &self.billing_groups {
-            if let Some(version) = group.effective_in(billing_period) {
-                groups.insert(arn.clone(), (group, version));
-            }
-        }
-        groups
+        resources_in(
+            &self.billing_groups,
+            &self.deleted_billing_groups,
+            billing_period,
+        )
     }
 
     /// Was the billing group `group_arn` BILLING in `billing_period` — is it one of the
@@ -3657,33 +3551,40 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
     }
 
     /// Keep the record of a deleted billing group, so the billing periods it billed in
-    /// still hold it. The only writer of `deleted_billing_groups`, so the cap below
-    /// holds wherever a group is deleted.
-    ///
-    /// Past [`MAX_DELETED_BILLING_GROUPS`] the OLDEST deletion is forgotten, which
-    /// reads back the way that period read before the group ever existed; a forgotten
-    /// record frees the name it occupied, which is the one thing about this store a
-    /// caller cannot see in a response, so it is logged — only the group's ARN, never a
-    /// `@sensitive` member such as its name.
+    /// still hold it. The only writer of `deleted_billing_groups`, so the cap
+    /// [`MAX_DELETED_BILLING_GROUPS`] holds wherever a group is deleted; what keeping it
+    /// and evicting the oldest deletion mean is [`record_deletion`]'s, written once for
+    /// every billing-period-scoped record a delete removes whole.
     fn record_deleted_billing_group(
         &mut self,
         record: BillingGroupRecord,
         deletion_time_millis: i64,
     ) {
-        self.deleted_billing_groups.push_back(DeletedBillingGroupRecord {
+        record_deletion(
+            &mut self.deleted_billing_groups,
             record,
             deletion_time_millis,
-        });
-        while self.deleted_billing_groups.len() > MAX_DELETED_BILLING_GROUPS {
-            let Some(forgotten) = self.deleted_billing_groups.pop_front() else {
-                break;
-            };
-            ::tracing::warn!(
-                billing_group_arn = %forgotten.record.arn,
-                cap = MAX_DELETED_BILLING_GROUPS,
-                "the oldest deleted billing group was forgotten at the store's cap"
-            );
-        }
+            MAX_DELETED_BILLING_GROUPS,
+            "billinggroup",
+        );
+    }
+
+    /// Keep the record of a deleted pricing rule, so the billing periods it existed in
+    /// still hold it. The only writer of `deleted_pricing_rules`, so the cap
+    /// [`MAX_DELETED_PRICING_RULES`] holds wherever a rule is deleted; the rule is
+    /// [`record_deletion`]'s, as it is for a deleted billing group.
+    fn record_deleted_pricing_rule(
+        &mut self,
+        record: PricingRuleRecord,
+        deletion_time_millis: i64,
+    ) {
+        record_deletion(
+            &mut self.deleted_pricing_rules,
+            record,
+            deletion_time_millis,
+            MAX_DELETED_PRICING_RULES,
+            "pricingrule",
+        );
     }
 
     /// The billing group that was DELETED but still occupied `name` in
@@ -3933,13 +3834,45 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
     /// were in force in. A plan's own associations go with the plan
     /// ([`Self::remove_pricing_plan`]), which is what makes the rule deletable again.
     /// `tests/all/pricing_rule_delete_reader_agreement.rs` holds the readers to it.
+    ///
+    /// What the delete does NOT erase is the rule's own record of the billing periods it
+    /// existed in: like every other billing-period-scoped record a delete that names no
+    /// range of its own ends, the rule stops being reported FROM the billing period the
+    /// delete is made in and never earlier ([`BillingPeriodSpan::ending_now`]), so the
+    /// removed record is kept as a [`DeletedPricingRuleRecord`] and a read scoped to one of
+    /// the periods before the delete still reports the rule as it stood then
+    /// ([`Self::pricing_rules_in`]) — the same thing
+    /// [`Self::remove_billing_group`] keeps for the sibling resource.
     pub fn remove_pricing_rule(&mut self, rule_arn: &str) -> Option<PricingRuleRecord> {
         let removed = self.pricing_rules.remove(rule_arn)?;
         self.pricing_rule_names.remove(&removed.name);
+        self.record_deleted_pricing_rule(removed.clone(), now_millis());
 
         self.release_idempotent_arns(rule_arn);
 
         Some(removed)
+    }
+
+    /// The pricing rules `billing_period` holds, each with the generation of itself that
+    /// was in force then — the rules a read scoped to that period reports
+    /// (`ListPricingRules`).
+    ///
+    /// The crate's ONE answer to "which rules does this billing period hold": the stored
+    /// rules that existed by then ([`PricingRuleRecord::effective_in`]) together with the
+    /// rules a delete has since removed, for the periods BEFORE that delete took effect
+    /// ([`DeletedRecord::reported_in`]). A stored rule wins over a deleted record of the
+    /// same ARN, which no live store can hold at once — an id is minted once
+    /// ([`Self::mint_resource_id`]) — so one rule is reported once.
+    ///
+    /// Keyed by ARN, and an ARN carries the monotonic id this service mints, so the
+    /// sequence is creation order whether or not a rule is still stored, and a `NextToken`
+    /// names the same cut point on the next call. The projection is [`resources_in`]'s,
+    /// the one the billing-group twin [`Self::billing_groups_in`] answers from.
+    pub fn pricing_rules_in(
+        &self,
+        billing_period: &str,
+    ) -> BTreeMap<String, (&PricingRuleRecord, PricingRuleVersion)> {
+        resources_in(&self.pricing_rules, &self.deleted_pricing_rules, billing_period)
     }
 
     /// Delete a pricing plan and the index entries that only existed because of it:
@@ -4057,17 +3990,34 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
     /// a read scoped to that period reports?
     ///
     /// The same question the period-scoped LISTING of the rules answers for a whole
-    /// period ([`VersionedResource::exists_in`], which `ListPricingRules` filters on),
-    /// asked about the ONE rule a read addresses by ARN, so a read of one rule cannot
-    /// disagree with the listing of the period it asks about: a rule exists from the
-    /// period it was created in on. There are no AWS-managed pricing rules — the
+    /// period ([`Self::pricing_rules_in`], which `ListPricingRules` reports from), asked
+    /// about the ONE rule a read addresses by ARN, so a read of one rule cannot
+    /// disagree with the listing of the period it asks about: a stored rule exists from the
+    /// period it was created in on ([`VersionedResource::exists_in`]), and a rule a delete
+    /// has since removed existed up to, but not including, the period that delete was made
+    /// in ([`DeletedRecord::reported_in`]). There are no AWS-managed pricing rules — the
     /// `PricingRuleArn` pattern allows only a 12-digit account segment — so what is
-    /// stored is the whole universe of rules, and an ARN this account holds no rule for
-    /// names no rule in any period at all.
+    /// stored is the whole universe of rules, and an ARN neither a stored nor a deleted
+    /// rule carries names no rule in any period at all.
     pub fn pricing_rule_exists_in(&self, rule_arn: &str, billing_period: &str) -> bool {
-        self.pricing_rules
-            .get(rule_arn)
-            .is_some_and(|rule| rule.exists_in(billing_period))
+        if let Some(rule) = self.pricing_rules.get(rule_arn) {
+            return rule.exists_in(billing_period);
+        }
+        self.deleted_pricing_rule(rule_arn)
+            .is_some_and(|deleted| deleted.reported_in(billing_period))
+    }
+
+    /// The record a delete kept of the pricing rule `rule_arn`, if any: the NEWEST
+    /// deletion of it, the way [`Self::deleted_billing_group`] takes the newest deletion
+    /// of a group.
+    ///
+    /// How a read that addresses ONE rule by ARN reaches a rule the store no longer
+    /// holds; which periods that record still answers for is [`DeletedRecord::reported_in`].
+    pub fn deleted_pricing_rule(&self, rule_arn: &str) -> Option<&DeletedPricingRuleRecord> {
+        self.deleted_pricing_rules
+            .iter()
+            .rev()
+            .find(|deleted| deleted.record.arn == rule_arn)
     }
 
     /// Did the pricing plan `plan_arn` exist in `billing_period` — is it one of the plans
@@ -4528,6 +4478,16 @@ pub const MAX_BILLING_GROUPS: usize = 1000;
 /// before the group existed, and of the same order as [`MAX_BILLING_GROUPS`], since
 /// that is how many groups can be deleted at once.
 pub const MAX_DELETED_BILLING_GROUPS: usize = 1000;
+
+/// How many DELETED pricing rules this emulator keeps the record of, so a billing period
+/// a deleted rule existed in still reports it.
+///
+/// A CHOSEN bound, not an AWS limit, decided the way [`MAX_DELETED_BILLING_GROUPS`] is
+/// and of the same order as [`MAX_PRICING_RULES`], since that is how many rules can be
+/// deleted at once: each delete is one more record to answer a past period from, and the
+/// OLDEST deletion is forgotten first, which reads back the way that period read before
+/// the rule existed.
+pub const MAX_DELETED_PRICING_RULES: usize = 1000;
 
 /// How many of a consolidated billing family's billing groups may have automatic
 /// account association enabled at once.

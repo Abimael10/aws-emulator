@@ -44,7 +44,8 @@ use serde_json::json;
 
 use crate::association_delete_gate_spans_billing_periods::error_code;
 use crate::pricing_rule_association_periods::{
-    probe_periods, shift_period, Emulator, DELETE_PLAN_PATH, DELETE_RULE_PATH, DISASSOCIATE_PATH,
+    period_months, probe_periods, shift_period, Emulator, DELETE_PLAN_PATH, DELETE_RULE_PATH,
+    DISASSOCIATE_PATH,
 };
 
 /// How a row spells the rule its delete addresses: both spellings the modelled
@@ -371,17 +372,30 @@ async fn a_rule_is_deletable_once_the_plan_holding_its_association_is_gone() {
             "case {case:?}: expected the rule's delete to be served once no plan reports the \
              association, got {status} with {body:?}"
         );
+        // The delete ends the rule FROM the billing period it was made in, so the periods
+        // before it — the ones this row backdated the rule's creation into — still report
+        // it, and every one of them reports no association, because the plan that held
+        // the association is gone.
         for period in probe_periods(&start, &now) {
-            assert!(
-                !rule_is_reported(&em, &case, &rule, &period).await,
-                "case {case:?}: ListPricingRules still reports the deleted rule {rule} for \
-                 {period}"
+            let before_the_delete = period_months(&period) >= period_months(&start)
+                && period_months(&period) < period_months(&now);
+            assert_eq!(
+                rule_is_reported(&em, &case, &rule, &period).await,
+                before_the_delete,
+                "case {case:?}: expected ListPricingRules to report the deleted rule {rule} for \
+                 {period}: {before_the_delete}"
             );
             let (status, plans) = em.plans_for_rule_answer(&rule, Some(&period)).await;
+            let expected_status = if before_the_delete { 200 } else { 404 };
             assert_eq!(
-                status, 404,
-                "case {case:?}: expected the deleted rule to resolve nowhere in {period}, got \
-                 {status} with {plans:?}"
+                status, expected_status,
+                "case {case:?}: expected HTTP {expected_status} reading the plans of the deleted \
+                 rule in {period}, got {status} with {plans:?}"
+            );
+            assert!(
+                plans.is_empty(),
+                "case {case:?}: the deleted plan held the only association, so {period} must \
+                 report no plan for {rule}, got {plans:?}"
             );
         }
     }

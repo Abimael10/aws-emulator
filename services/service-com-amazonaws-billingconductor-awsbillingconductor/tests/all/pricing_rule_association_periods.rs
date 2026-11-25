@@ -335,6 +335,22 @@ impl Emulator {
         record.last_modified_time_millis = at;
     }
 
+    /// Backdate the DELETE of `rule_arn` to `period`, as if the deleting call had been
+    /// made in that billing period: the wire can only delete now, and the billing periods
+    /// a deleted rule is still reported for are the ones before the delete was made in
+    /// (`tests/all/deleted_pricing_rule_period_reads.rs`).
+    pub(crate) fn delete_rule_in(&self, rule_arn: &str, period: &str) {
+        let at = period_start_millis(period);
+        let state = self.engine.state::<BillingConductorState>();
+        let mut state = state.lock();
+        let deleted = state
+            .deleted_pricing_rules
+            .iter_mut()
+            .find(|deleted| deleted.record.arn == rule_arn)
+            .expect("setup delete_rule_in: the rule was deleted above");
+        deleted.deletion_time_millis = at;
+    }
+
     /// Backdate the rule's CURRENT generation to `period`, as if the write that left the
     /// rule as it stands had been made in that billing period: how a world whose
     /// generations started in DIFFERENT periods is set up, which no request can ask for
