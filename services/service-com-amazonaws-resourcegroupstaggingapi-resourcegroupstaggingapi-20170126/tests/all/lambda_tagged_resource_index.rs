@@ -211,7 +211,11 @@ fn function_arn(region: &str, name: &str) -> String {
 }
 
 /// `CreateFunction` in `region`, with the tags of `tags`, and the ARN it answers.
-async fn create_function(
+///
+/// `pub(crate)` so a sibling suite needing a function AWS Lambda really holds stands one
+/// up through that service's own create rather than carrying a second copy of it
+/// ([`crate::tag_batch_partial_failure`]).
+pub(crate) async fn create_function(
     router: &MultiServiceRouter,
     region: &str,
     name: &str,
@@ -249,7 +253,10 @@ async fn create_function(
 }
 
 /// The tag map Lambda's OWN `ListTags` reports for one ARN.
-async fn lambda_tags(router: &MultiServiceRouter, arn: &str) -> BTreeMap<String, String> {
+///
+/// `pub(crate)` for the same reason [`create_function`] is: a sibling suite reads the tag
+/// set the owning service holds through ITS reader, the same way this one does.
+pub(crate) async fn lambda_tags(router: &MultiServiceRouter, arn: &str) -> BTreeMap<String, String> {
     let body = lambda_ok(
         router,
         REGION,
