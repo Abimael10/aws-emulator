@@ -60,7 +60,7 @@ const SIGNED: &str = "AWS4-HMAC-SHA256 \
 /// SOURCE: `smithy_query(query="operation", operation="CreateAssertion")` reports
 /// `text` targeting `AssertionText` with `length {min: 1, max: 1000}`.
 const ASSERTION_TEXT_MIN_LENGTH: usize = 1;
-const ASSERTION_TEXT_MAX_LENGTH: usize = 1000;
+pub(crate) const ASSERTION_TEXT_MAX_LENGTH: usize = 1000;
 
 /// The values `AssertionSource` accepts on the wire.
 ///
@@ -69,7 +69,7 @@ const ASSERTION_TEXT_MAX_LENGTH: usize = 1000;
 const ASSERTION_SOURCE_VALUES: [&str; 2] = ["AI_GENERATED", "USER"];
 
 /// An emulator holding only this service, over one shared engine.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -105,7 +105,7 @@ async fn call(
 }
 
 /// Create a service named `name` and answer its ARN.
-async fn create_service(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn create_service(router: &MultiServiceRouter, name: &str) -> String {
     let (status, body) = call(
         router,
         "POST",
@@ -128,7 +128,7 @@ async fn create_assertion(router: &MultiServiceRouter, body: Value) -> (u16, Val
     call(router, "POST", CREATE_ASSERTION, Some(body)).await
 }
 
-async fn update_assertion(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
+pub(crate) async fn update_assertion(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
     call(router, "POST", UPDATE_ASSERTION, Some(body)).await
 }
 
@@ -161,7 +161,7 @@ async fn delete_service(router: &MultiServiceRouter, service_arn: &str) -> (u16,
 }
 
 /// The modelled error code of a refusal, from the restJson1 `__type` discriminator.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body["__type"]
         .as_str()
         .unwrap_or("<no __type>")
@@ -739,7 +739,7 @@ async fn deleting_a_service_cascades_to_the_assertions_it_holds() {
 
 /// The text an assertion under edit carries before the edit: one row of the create class,
 /// so the replacement is what every edit suite varies.
-const TEXT_BEFORE_THE_EDIT: &str = "Survives the loss of one Availability Zone.";
+pub(crate) const TEXT_BEFORE_THE_EDIT: &str = "Survives the loss of one Availability Zone.";
 
 /// A well-formed `Uuid` that identifies no assertion of any service in a fresh emulator.
 ///
@@ -754,7 +754,13 @@ const UNUSED_ASSERTION_ID: &str = "0ac1f2e3-4b5d-4c6e-8f90-1a2b3c4d5e6f";
 /// An edit replaces the stored text and stamps the instant of the edit; everything that
 /// says WHICH assertion this is and where it came from — its id, its parent service, its
 /// `source` and its `createdAt` — is left exactly where the create put it.
-fn assert_edited(case: &str, text: &str, service_arn: &str, at_create: &Value, edited: &Value) {
+pub(crate) fn assert_edited(
+    case: &str,
+    text: &str,
+    service_arn: &str,
+    at_create: &Value,
+    edited: &Value,
+) {
     assert_eq!(
         edited["text"].as_str(),
         Some(text),
@@ -784,7 +790,7 @@ fn assert_edited(case: &str, text: &str, service_arn: &str, at_create: &Value, e
 }
 
 /// The assertion carrying `assertion_id` in `service_arn`'s listing.
-async fn listed_assertion(
+pub(crate) async fn listed_assertion(
     router: &MultiServiceRouter,
     case: &str,
     service_arn: &str,
@@ -803,7 +809,11 @@ async fn listed_assertion(
 
 /// Create one assertion carrying [`TEXT_BEFORE_THE_EDIT`] under `service_arn` and answer
 /// the `Assertion` the create projected.
-async fn create_one(router: &MultiServiceRouter, case: &str, service_arn: &str) -> Value {
+pub(crate) async fn create_one(
+    router: &MultiServiceRouter,
+    case: &str,
+    service_arn: &str,
+) -> Value {
     let (status, body) = create_assertion(
         router,
         json!({"serviceArn": service_arn, "text": TEXT_BEFORE_THE_EDIT}),
