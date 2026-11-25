@@ -7,8 +7,8 @@
 //! pagination rule, the documented `notifyOnCaseSeverity` consistency rule, the account
 //! a caller-supplied `channelRoleArn` must name together with which refusal that member
 //! draws and in which order its rules are judged, the parts of a modelled `@pattern` the
-//! request boundary's walk cannot apply (`channelName`'s `.` and `accountAlias`'s `\w`
-//! among them),
+//! request boundary's walk cannot apply (`channelName`'s `.`, `accountAlias`'s `\w` and the
+//! `\S` the Slack ids and the pagination token share among them),
 //! which stored Slack channel configuration a `(teamId, channelId)` pair names and how a
 //! pair the account holds none for is refused,
 //! whether a Slack workspace is registered
@@ -500,8 +500,17 @@ pub fn workspace_not_registered_message(team_id: &str) -> String {
 /// SERVICE models — widened onto each listing's own error enum, since neither
 /// operation's `errors` list names it — worded by
 /// [`invalid_pagination_token_message`]; `operation` is the caller's `Operation::NAME`.
+///
+/// The member's own declared `@pattern` is judged FIRST, because a value outside it is not a
+/// token this service could have minted in any state: the member is `paginationToken`, which
+/// declares the same `^\S+$` the Slack ids do, and the part of that expression the request
+/// boundary's walk cannot apply is applied through [`slack_id_refusal`] — so a malformed
+/// member is refused as the declared constraint it breaks, before this service's own rule
+/// about a token no listing returned is stated.
 pub fn pagination_token_refusal(operation: &str, next_token: Option<&str>) -> Option<String> {
-    next_token.map(|_| invalid_pagination_token_message(operation))
+    let next_token = next_token?;
+    slack_id_refusal(&[(NEXT_TOKEN_PATH, next_token)])
+        .or_else(|| Some(invalid_pagination_token_message(operation)))
 }
 
 /// The three notification flags as this service's PROSE names them.
@@ -702,15 +711,116 @@ pub fn channel_name_refusal(channel_name: &str) -> Option<String> {
 /// `declared` is the expression as the MODEL spells it, anchors and all, and `path` is the
 /// member the clause names, in the lowerCamel spelling the envelope states a member with.
 fn declared_pattern_refusal(path: &str, declared: &str, value: &str) -> Option<String> {
-    let violation = ::aws_smithy_schema_server::constraints::Violation {
+    let violation = declared_pattern_violation(path, declared, value);
+    ::aws_smithy_schema_server::constraints::envelope(::std::slice::from_ref(&violation))
+}
+
+/// The single clause a value outside its member's own declared `@pattern` is refused with,
+/// as the framework's own violation — the one [`declared_pattern_refusal`] renders, kept
+/// apart from the rendering so a request whose SEVERAL members are each outside their own
+/// declared expression is refused in ONE counted envelope naming every clause, exactly as
+/// the walk refuses several violations it caught itself.
+fn declared_pattern_violation(
+    path: &str,
+    declared: &str,
+    value: &str,
+) -> ::aws_smithy_schema_server::constraints::Violation {
+    ::aws_smithy_schema_server::constraints::Violation {
         path: path.to_string(),
         kind: ::aws_smithy_schema_server::constraints::ViolationKind::Pattern(
             ::service_common::validation::unanchored(declared),
         ),
         value: Some(::service_common::validation::quoted_echo(value).into_owned()),
         sensitive: false,
-    };
-    ::aws_smithy_schema_server::constraints::envelope(::std::slice::from_ref(&violation))
+    }
+}
+
+/// The declared `@pattern` `teamId`, `channelId` and `paginationToken` share, as the model
+/// spells it — ANCHORED, which is the text a clause reporting it is rendered from
+/// (`smithy_query(query="shape",shape="teamId,channelId,paginationToken")`).
+pub const SLACK_ID_PATTERN: &str = r"^\S+$";
+
+/// The member path a clause about `teamId` names, in the lowerCamel spelling the validation
+/// envelope states a member with.
+const TEAM_ID_PATH: &str = "teamId";
+
+/// The same, for `channelId`.
+const CHANNEL_ID_PATH: &str = "channelId";
+
+/// The same, for the member every listing of this service carries `paginationToken` as.
+const NEXT_TOKEN_PATH: &str = "nextToken";
+
+/// The characters a modelled `@pattern`'s `\S` does NOT match that the engine the
+/// framework's centralized constraint walk compiles a `@pattern` with lets through.
+///
+/// A Smithy `@pattern` is an ECMA-262 regular expression, and there `\s` matches every
+/// WhiteSpace and every LineTerminator: the tab, the vertical tab, the form feed, the space,
+/// the no-break space, every character of the Unicode `Space_Separator` category, the ZERO
+/// WIDTH NO-BREAK SPACE U+FEFF, and the four [`PATTERN_DOT_EXCLUDED_CHARS`]. `\S` is that
+/// class complemented, so it matches none of them.
+///
+/// Stated here because such a class has to be applied by hand (see [`slack_id_refusal`]),
+/// and because the engine that walk compiles with reads `\s` as the Unicode `White_Space`
+/// property, which holds every one of those characters EXCEPT U+FEFF — so U+FEFF is the
+/// whole of what its `\S` admits and the modelled expression's `\S` does not.
+const PATTERN_SPACE_CHARS_BEYOND_WHITE_SPACE: [char; 1] = ['\u{FEFF}'];
+
+/// Whether `value` carries a character a modelled `@pattern`'s `\S` does not match (one of
+/// the [`PATTERN_SPACE_CHARS_BEYOND_WHITE_SPACE`]) — the one test every `\S`-based
+/// expression this module applies by hand shares, so no member's rule spells it out again.
+fn carries_pattern_space_char(value: &str) -> bool {
+    value
+        .chars()
+        .any(|character| PATTERN_SPACE_CHARS_BEYOND_WHITE_SPACE.contains(&character))
+}
+
+/// Why the `\S`-patterned members a request carried are outside their declared `@pattern`
+/// ([`SLACK_ID_PATTERN`]), as the message the refusal carries, or `None` when every value is
+/// one the expression admits.
+///
+/// The expression is `\S`-based, and the framework's centralized constraint walk cannot apply
+/// such an expression in full: it compiles a `@pattern` with an engine whose `\s` is the
+/// Unicode `White_Space` property, where the modelled ECMA-262 expression's `\s` also matches
+/// the [`PATTERN_SPACE_CHARS_BEYOND_WHITE_SPACE`]. So the part of the expression that walk
+/// admits but the model does not is applied HERE, by every operation that CARRIES one of
+/// these members, before the store is reached: the same shapes with the same `@pattern` are
+/// OUTPUT members — `SlackChannelConfiguration$teamId` and `$channelId` are `@required`
+/// members of what `ListSlackChannelConfigurations` reports,
+/// `SlackWorkspaceConfiguration$teamId` of what `ListSlackWorkspaceConfigurations` reports,
+/// and `UpdateSlackChannelConfiguration` answers with both — so a value the expression does
+/// not admit could not be reported back through the shape it was stored under. The rest of
+/// the expression (its `+`, and each member's declared `@length` 1..256) is the walk's, which
+/// applies it to every request that carries the member.
+///
+/// `members` are the members the request carries, each as its path and its value, in the
+/// order the model declares them: a request whose members are each outside the expression is
+/// refused in ONE counted envelope naming every clause, as the walk refuses a request whose
+/// members it caught itself.
+fn slack_id_refusal(members: &[(&str, &str)]) -> Option<String> {
+    let violations: Vec<::aws_smithy_schema_server::constraints::Violation> = members
+        .iter()
+        .filter(|(_, value)| carries_pattern_space_char(value))
+        .map(|(path, value)| declared_pattern_violation(path, SLACK_ID_PATTERN, value))
+        .collect();
+    ::aws_smithy_schema_server::constraints::envelope(&violations)
+}
+
+/// Why the `teamId` a request carried is outside that member's declared `@pattern`, or
+/// `None` when the value is one the expression admits — the entry point the operations that
+/// carry the member ALONE (`RegisterSlackWorkspaceForOrganization` and
+/// `DeleteSlackWorkspaceConfiguration`) go through. See [`slack_id_refusal`] for the rule.
+pub fn team_id_refusal(team_id: &str) -> Option<String> {
+    slack_id_refusal(&[(TEAM_ID_PATH, team_id)])
+}
+
+/// Why the `(teamId, channelId)` pair a request carried is outside those members' declared
+/// `@pattern`, or `None` when both values are ones the expression admits — the entry point
+/// the operations that name a channel configuration by its pair
+/// (`CreateSlackChannelConfiguration`, `UpdateSlackChannelConfiguration` and
+/// `DeleteSlackChannelConfiguration`) go through. Both clauses travel in one envelope, in
+/// the order the model declares the members. See [`slack_id_refusal`] for the rule.
+pub fn channel_pair_refusal(team_id: &str, channel_id: &str) -> Option<String> {
+    slack_id_refusal(&[(TEAM_ID_PATH, team_id), (CHANNEL_ID_PATH, channel_id)])
 }
 
 /// `accountAlias`'s declared `@pattern`, as the model spells it — ANCHORED, which is the

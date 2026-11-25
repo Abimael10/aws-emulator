@@ -14,6 +14,11 @@
 //! form it has — see [`crate::state::channel_role_arn_refusal`], which owns both of the
 //! member's rules and the order between them.
 //!
+//! The `teamId` and `channelId` this request carries declare a `\S`-based `@pattern`, which
+//! the request boundary's constraint walk cannot apply in full either — see
+//! [`crate::state::channel_pair_refusal`], which owns that part of both members' rule for
+//! every operation that names a channel configuration by its pair.
+//!
 //! The `channelName` this request carries declares a `.`-based `@pattern`, which the
 //! request boundary's constraint walk cannot apply in full — see
 //! [`crate::state::channel_name_refusal`], which owns that part of the member's rule for
@@ -207,6 +212,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateSlackChannelConfigurationErrorModeled::AccessDeniedException(denied).into(),
             );
+        }
+
+        // `teamId` and `channelId` declare a `\S`-based `@pattern`, and the request
+        // boundary's walk reads a `\S` more widely than the modelled expression does, so the
+        // part of that expression the walk admits is applied here — first, because these are
+        // the members the model declares first, and before the store is reached, because a
+        // pair the expression does not admit could not be reported back through the shape it
+        // would be stored under. See [`crate::state::channel_pair_refusal`].
+        if let Some(message) =
+            crate::state::channel_pair_refusal(&input.team_id, &input.channel_id)
+        {
+            return Err(CreateSlackChannelConfigurationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
         }
 
         // `channelName`'s declared `@pattern` is `.`-based, and the request boundary's walk

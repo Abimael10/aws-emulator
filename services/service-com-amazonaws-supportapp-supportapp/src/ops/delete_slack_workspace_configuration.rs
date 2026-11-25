@@ -163,6 +163,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // `teamId` declares a `\S`-based `@pattern`, and the request boundary's walk reads a
+        // `\S` more widely than the modelled expression does, so the part of that expression
+        // the walk admits is applied here, before the store is reached: a `teamId` outside
+        // the member's own expression names no workspace this account could hold, so it is
+        // refused as the declared constraint it breaks rather than looked up. See
+        // [`crate::state::team_id_refusal`].
+        if let Some(message) = crate::state::team_id_refusal(&input.team_id) {
+            return Err(
+                DeleteSlackWorkspaceConfigurationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteSlackWorkspaceConfigurationErrorModeled::InternalServerException(
                 InternalServerException {

@@ -229,6 +229,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // `teamId` and `channelId` declare a `\S`-based `@pattern`, and the request
+        // boundary's walk reads a `\S` more widely than the modelled expression does, so the
+        // part of that expression the walk admits is applied here — first, because these are
+        // the members the model declares first, and before the store is reached, so a pair
+        // the expression does not admit names no configuration to rewrite and nothing is
+        // reported back through the shape it would be stored under. See
+        // [`crate::state::channel_pair_refusal`].
+        if let Some(message) =
+            crate::state::channel_pair_refusal(&input.team_id, &input.channel_id)
+        {
+            return Err(UpdateSlackChannelConfigurationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         // `channelName`'s declared `@pattern` is `.`-based, and the request boundary's walk
         // reads a `.` more widely than the modelled expression does, so the part of that
         // expression the walk admits is applied here, to the value this request CARRIES: an

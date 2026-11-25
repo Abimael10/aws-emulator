@@ -231,6 +231,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // `teamId` declares a `\S`-based `@pattern`, and the request boundary's walk reads a
+        // `\S` more widely than the modelled expression does, so the part of that expression
+        // the walk admits is applied here, before any store is reached: the same shape with
+        // the same `@pattern` is an OUTPUT member of this very operation and of
+        // `ListSlackWorkspaceConfigurations`, so a value the expression does not admit could
+        // not be reported back through the shape it would be registered under. See
+        // [`crate::state::team_id_refusal`].
+        if let Some(message) = crate::state::team_id_refusal(&input.team_id) {
+            return Err(
+                RegisterSlackWorkspaceForOrganizationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             RegisterSlackWorkspaceForOrganizationErrorModeled::InternalServerException(
                 InternalServerException {
