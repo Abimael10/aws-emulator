@@ -21,6 +21,15 @@ Issue-Commit: 91eb64ca5a78a7d78f4748085e65681abc417e15
 
 > _Note: this issue was identified against the code base at commit `91eb64ca5a78a7d78f4748085e65681abc417e15`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+## Resolution and remaining residue (read this first)
+
+The catalog now holds this data as per-row DATA instead of deriving it:
+
+* Cause 1 / Cause 3 (choice prose): the framework lens's `cloud-financial-management` choice rows carry the lens's published prose. Replay confirms `$.Answer.Choices[0]`, `[1]`, `[2]`, `[3]` and `[5]` now match the recording exactly. RESIDUE: `Choices[4]`, `[6]`, `[7]`, `[8]` and the terminal `[9]` still differ in wording — the recording's exact published strings for those five rows are quoted neither in this report nor by the replay (which withholds recorded values), so they carry the published prose only as closely as this catalog knows it. They were deliberately not reverse-engineered one string at a time.
+* Cause 2 (question documents): `Answer$HelpfulResourceUrl` / `$ImprovementPlanUrl` are no longer assembled from `LensVersion` + `LensAlias` + `QuestionId`; they address the document the lens publishes for the question, named by that question's published label (`OPS_1` … `SUS_6`), so the pair no longer moves when the version string moves. RESIDUE: the exact published URL string the recording carries is quoted nowhere available, so these two members still diverge on `task#5`/`task#6`/`task#7`.
+* Cause 4 (`ListLenses` instants): each row states its own published creation and last-revision instants. Replay confirms `$.LensSummaries[0]` (the framework lens) and `$.LensSummaries[1]` (`connectedmobility`) now match the recorded elements whole-element, which also disproves this report's `LensAlias` hypothesis — the member is present in the recording. RESIDUE: `$.LensSummaries[2]`..`[15]` still differ: the recorded catalog holds 16 published lenses (it includes `containerbuild` and `mergersandacquisitions`, which this catalog carries no content for) and the published instants of those rows are not disclosed.
+* `Issue-Key wellarchitected|ListAnswers|2xx->2xx|$.NextToken` is DECLINED: an opaque server-generated continuation token, satisfying the modelled `NextToken` pattern and round-tripping, is not a value another implementation can reproduce byte for byte.
+
 ## Operation
 GetAnswer
 

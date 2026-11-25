@@ -188,10 +188,11 @@ pub use trusted_advisor_checks::{
 };
 
 pub use official_lenses::{
-    framework_lens_published_at, lens_metadata, lens_pillars, lens_question, lens_question_count,
-    lens_questions, official_lens, LensMetadata, OfficialLens, AUTHORED_CONTENT_REVISION,
-    CATALOG_DESCRIPTION_PREFIX, CATALOG_DESCRIPTION_SUFFIX, LENS_NAME_SUFFIX,
-    OFFICIAL_LENS_CATALOG, WELL_ARCHITECTED_PILLARS,
+    framework_lens, framework_lens_published_at, improvement_plan_url_of, lens_metadata,
+    lens_pillars, lens_question, lens_question_count, lens_question_document_url, lens_questions,
+    official_lens, published_question_label, LensMetadata, OfficialLens,
+    AUTHORED_CONTENT_REVISION, CATALOG_DESCRIPTION_PREFIX, CATALOG_DESCRIPTION_SUFFIX,
+    IMPROVEMENT_PLAN_FRAGMENT, LENS_NAME_SUFFIX, OFFICIAL_LENS_CATALOG, WELL_ARCHITECTED_PILLARS,
 };
 
 use crate::ops::types::{
@@ -553,14 +554,15 @@ impl FrameworkQuestion {
     /// so a question that did not offer it could not be answered that way at all.
     ///
     /// `lens` is the catalog row this question belongs to: a lens serves the document for
-    /// one of its questions under the version its content is published at
+    /// one of its questions under the label it publishes that question with
     /// ([`official_lenses::lens_question_document_url`]), so the question-level
-    /// helpful-resource and improvement-plan URLs are derived from that lens and this
-    /// question's own id.
+    /// helpful-resource and improvement-plan URLs are that lens's published documents and
+    /// are absent for a question whose content this emulator authored, which publishes none.
     pub fn to_review_question(&self, lens: &official_lenses::OfficialLens) -> ReviewQuestion {
-        let document = self
-            .publishes_content()
-            .then(|| official_lenses::lens_question_document_url(lens, self.question_id));
+        // ONE resolution of the question's published document: the improvement plan is a
+        // section of that same document, so it is appended to what was resolved rather than
+        // resolved again.
+        let document = official_lenses::lens_question_document_url(lens, self.question_id);
         ReviewQuestion {
             pillar_id: self.pillar_id.to_string(),
             question_id: self.question_id.to_string(),

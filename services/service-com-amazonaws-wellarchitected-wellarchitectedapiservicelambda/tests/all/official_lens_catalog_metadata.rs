@@ -140,11 +140,16 @@ fn text(value: &Value, name: &str) -> String {
 
 /// Midnight UTC of the day `day` names, rendered the way a restJson1 `Timestamp` travels.
 fn midnight_epoch_seconds(day: &str) -> f64 {
+    instant_epoch_seconds(&format!("{day}T00:00:00Z"))
+}
+
+/// The instant `stamp` names, rendered the way a restJson1 `Timestamp` travels.
+fn instant_epoch_seconds(stamp: &str) -> f64 {
     let parsed = ::aws_smithy_types::DateTime::from_str(
-        &format!("{day}T00:00:00Z"),
+        stamp,
         ::aws_smithy_types::date_time::Format::DateTime,
     )
-    .unwrap_or_else(|error| panic!("a catalog day must be a calendar day: {day:?} ({error})"));
+    .unwrap_or_else(|error| panic!("a catalog instant must be a date and time: {stamp:?} ({error})"));
     parsed.as_secs_f64()
 }
 
@@ -196,18 +201,24 @@ async fn every_official_lens_is_listed_with_its_own_version_instants_and_descrip
 
         let created = summary.get("CreatedAt").and_then(Value::as_f64);
         let updated = summary.get("UpdatedAt").and_then(Value::as_f64);
+        // The instants AWS's lens catalog publishes for the lens, where this catalog
+        // carries them — they are the lens's own data, not a reading of its version string
+        // — and the start of the day the version names where it carries only the day.
         assert_eq!(
             updated,
-            Some(midnight_epoch_seconds(official.version)),
-            "case {case:?}: UpdatedAt is midnight of the day the version names, got {summary:?}"
+            Some(match official.revised_at {
+                Some(revised) => instant_epoch_seconds(revised),
+                None => midnight_epoch_seconds(official.version),
+            }),
+            "case {case:?}: UpdatedAt is the instant the lens was last revised, got {summary:?}"
         );
         assert_eq!(
             created,
-            Some(midnight_epoch_seconds(
-                official.first_published.unwrap_or(official.version)
-            )),
-            "case {case:?}: CreatedAt is midnight of the day the lens was first published, \
-             got {summary:?}"
+            Some(match official.published_at {
+                Some(published) => instant_epoch_seconds(published),
+                None => midnight_epoch_seconds(official.first_published.unwrap_or(official.version)),
+            }),
+            "case {case:?}: CreatedAt is the instant the lens was created, got {summary:?}"
         );
         assert!(
             created.zip(updated).is_some_and(|(at, then)| at <= then),

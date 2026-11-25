@@ -20,6 +20,13 @@
 //!    published choice set, the terminal choice included, in the lens's own order.
 //! 5. A CUSTOM lens's question-level content is the one ITS document declares, and its
 //!    questions offer exactly the choices the document declares.
+//! 6. A choice's `Description` is the lens's PUBLISHED prose for that best practice, carried
+//!    verbatim as fixed text: the same words on every path that projects the choice
+//!    (`GetAnswer`, `UpdateAnswer`, `ListAnswers`), for every workload, with no part of it
+//!    taken from the request or from the answer recorded against the question.
+//! 7. The documents an answer points at are addressed by the question's own PUBLISHED LABEL
+//!    rather than assembled from the lens's `LensVersion`, so a revision of the lens does
+//!    not move a document the lens publishes.
 //!
 //! Requests go through the real `MultiServiceRouter`, so routing, restJson1
 //! (de)serialization, boundary constraint validation and the handler all run as they do in
@@ -43,9 +50,10 @@ use super::workload_harness::{
 const URL_LENGTH: (usize, usize) = (1, 2048);
 const DESCRIPTION_LENGTH: (usize, usize) = (1, 1024);
 
-/// `Choice$ChoiceId` is `@length(min: 1, max: 64)`
-/// (`smithy_query(query="shape", shape="Choice")`).
+/// `Choice$ChoiceId` is `@length(min: 1, max: 64)` and `Choice$Description`
+/// `@length(min: 1, max: 1024)` (`smithy_query(query="shape", shape="Choice")`).
 const CHOICE_ID_LENGTH: (usize, usize) = (1, 64);
+const CHOICE_DESCRIPTION_LENGTH: (usize, usize) = (1, 1024);
 
 /// The page size `ListAnswers` is asked for while sweeping a lens's whole question set: the
 /// ceiling its `MaxResults` member allows (`@range(min: 1, max: 50)`).
@@ -378,9 +386,12 @@ async fn a_questions_published_description_and_documents_are_reported_by_every_p
                     let improvement = improvement.unwrap_or_else(|| {
                         panic!("case {case:?}: a published question carries an improvement plan, got {answer:?}")
                     });
-                    // The document is the LENS's, addressed under its published content
-                    // root by the version its content is published at and the question's
-                    // own id; the improvement plan is a section of that same document.
+                    // The document is the LENS's own, addressed by the label the lens
+                    // publishes the question under rather than by the version its content
+                    // is published at, so the document does not move when `LensVersion`
+                    // does; the improvement plan is a section of that same document.
+                    let label = state::published_question_label(lens, question_id)
+                        .unwrap_or_else(|| panic!("case {case:?}: a published question carries a label"));
                     for (member, url) in [("HelpfulResourceUrl", &helpful), ("ImprovementPlanUrl", &improvement)] {
                         assert!(
                             url.starts_with("https://"),
@@ -392,13 +403,17 @@ async fn a_questions_published_description_and_documents_are_reported_by_every_p
                              character(s)",
                             url.len()
                         );
-                        for segment in [lens.version, lens.alias, question_id] {
-                            assert!(
-                                url.contains(segment),
-                                "case {case:?}: {member} must address the lens's own content \
-                                 by {segment:?}, got {url:?}"
-                            );
-                        }
+                        assert!(
+                            url.contains(&label),
+                            "case {case:?}: {member} must address the lens's own content by \
+                             the question's published label {label:?}, got {url:?}"
+                        );
+                        assert!(
+                            !url.contains(lens.version),
+                            "case {case:?}: {member} must not be assembled from the lens \
+                             version {:?}, got {url:?}",
+                            lens.version
+                        );
                     }
                     assert!(
                         improvement.starts_with(&helpful) && improvement.len() > helpful.len(),
@@ -702,6 +717,342 @@ async fn a_custom_lenss_question_content_is_the_one_its_document_declares() {
                 .map(|choice| Some(format!("{question_id}_c{choice}")))
                 .collect::<Vec<Option<String>>>(),
             "case {case:?}: the question offers the document's own choices, got {answer:?}"
+        );
+    }
+}
+
+/// One row of the published-prose table: a question of a lens, and the prose the lens
+/// publishes for each of the choices under test — `None` where the lens publishes none.
+type ProseRow = (
+    &'static str,
+    &'static str,
+    &'static [(&'static str, Option<&'static str>)],
+);
+
+/// The `Description` each entry of a projected `Choices` catalog carries, paired with its
+/// `ChoiceId` — the mapping every path that projects a question's choices must agree on.
+fn descriptions_by_choice(value: &Value) -> Vec<(String, Option<String>)> {
+    choice_members(value, "ChoiceId")
+        .into_iter()
+        .zip(choice_members(value, "Description"))
+        .filter_map(|(id, description)| id.map(|id| (id, description)))
+        .collect()
+}
+
+/// Rule 6: a `Choice$Description` of a lens AWS publishes is that lens's published prose for
+/// the best practice, carried verbatim as fixed text — the same words on every path that
+/// projects the choice, for every workload, with no part of it taken from the request or
+/// from the answer recorded against the question.
+///
+/// The rows are the prose the Well-Architected Framework lens publishes for the best
+/// practices of two of its questions, in two different pillars, beside a question of a lens
+/// whose question set this emulator authored and which therefore publishes no prose at all.
+/// Each quoted sentence is the WHOLE published description of that best practice, so the
+/// assertion is an equality against the words rather than against a shape.
+///
+/// SOURCE of the quoted prose: the framework lens's own published content, as
+/// `state::FRAMEWORK_LENS_QUESTIONS` carries it.
+#[tokio::test]
+async fn a_choice_description_is_the_lenss_published_prose_on_every_path() {
+    let rows: [ProseRow; 3] = [
+        (
+            "wellarchitected",
+            "cloud-financial-management",
+            &[
+                (
+                    "cost_cloud_financial_management_function",
+                    Some(
+                        "Create a team (Cloud Business Office, Cloud Center of Excellence, \
+                         or FinOps team) that is responsible for establishing and \
+                         maintaining cost awareness across your organization. The owner of \
+                         cost optimization can be individual or a team (requires people \
+                         from finance, technology, and business teams) that understands the \
+                         entire organization and cloud finance.",
+                    ),
+                ),
+                (
+                    "cost_cloud_financial_management_partnership",
+                    Some(
+                        "Involve finance and technology teams in cost and usage discussions \
+                         at all stages of your cloud journey. Teams regularly meet and \
+                         discuss topics such as organizational goals and targets, current \
+                         state of cost and usage, and financial and accounting practices.",
+                    ),
+                ),
+                (
+                    "cost_cloud_financial_management_budget_forecast",
+                    Some(
+                        "Adjust existing organizational budgeting and forecasting processes \
+                         to be compatible with the highly variable nature of cloud costs \
+                         and usage. Processes must be dynamic, using trend-based or business \
+                         driver-based algorithms or a combination of both.",
+                    ),
+                ),
+                (
+                    "cost_cloud_financial_management_cost_awareness",
+                    Some(
+                        "Implement cost awareness, create transparency, and accountability \
+                         of costs into new or existing processes that impact usage, and \
+                         leverage existing processes for cost awareness. Implement cost \
+                         awareness into employee training.",
+                    ),
+                ),
+                (
+                    "cost_cloud_financial_management_scheduled",
+                    Some(
+                        "Consult regularly with experts or AWS Partners to consider which \
+                         services and features provide lower cost. Review AWS blogs and \
+                         other information sources.",
+                    ),
+                ),
+                // The terminal choice is not a best practice, so what it carries is what
+                // selecting it says about the workload.
+                (
+                    "cost_cloud_financial_management_no",
+                    Some(state::NONE_OF_THESE_DESCRIPTION),
+                ),
+            ],
+        ),
+        (
+            "wellarchitected",
+            "organization-priorities",
+            &[
+                (
+                    "ops_priorities_ext_cust_needs",
+                    Some(
+                        "Involve key stakeholders, including business, development and \
+                         operations teams, when determining where to focus efforts on \
+                         external customer needs.",
+                    ),
+                ),
+                ("ops_priorities_no", Some(state::NONE_OF_THESE_DESCRIPTION)),
+            ],
+        ),
+        // A lens whose question set this emulator authored publishes no prose for a best
+        // practice, and the member is optional, so it is left off rather than filled in.
+        (
+            "serverless",
+            "serverless-ops-01",
+            &[("serverless-ops-01-bp-01", None)],
+        ),
+    ];
+
+    let client = Client::new();
+    for (alias, question_id, choices) in rows {
+        let group = format!("{alias}/{question_id}");
+        let slug = group.replace('/', "-");
+        let question = state::lens_question(alias, question_id)
+            .unwrap_or_else(|| panic!("case {group:?}: the lens must ask the question"));
+
+        // Two workloads, with different names, one of them carrying an ANSWER to the
+        // question: a choice's prose describes the LENS, so neither the request nor what is
+        // recorded against the question can change a word of it.
+        let answered = workload_reviewing(&client, alias, &slug).await;
+        let untouched = workload_reviewing(&client, alias, &format!("{slug}-again")).await;
+
+        let read = get_answer(&client, &answered, alias, question_id).await;
+        assert_eq!(
+            read.status, 200,
+            "case {group:?}: expected GetAnswer 200, got {read:?}"
+        );
+        let written = update_answer(
+            &client,
+            &answered,
+            alias,
+            question_id,
+            json!({ "SelectedChoices": [question.choice_id(0)] }),
+        )
+        .await;
+        assert_eq!(
+            written.status, 200,
+            "case {group:?}: expected UpdateAnswer 200, got {written:?}"
+        );
+        let unanswered = get_answer(&client, &untouched, alias, question_id).await;
+        assert_eq!(
+            unanswered.status, 200,
+            "case {group:?}: expected GetAnswer 200, got {unanswered:?}"
+        );
+        let summary = all_answers(&client, &answered, alias, &group)
+            .await
+            .into_iter()
+            .find(|summary| text(summary, "QuestionId").as_deref() == Some(question_id))
+            .unwrap_or_else(|| panic!("case {group:?}: ListAnswers must report the question"));
+
+        let projections = [
+            ("GetAnswer", descriptions_by_choice(&answer_of(&read))),
+            ("UpdateAnswer", descriptions_by_choice(&answer_of(&written))),
+            ("ListAnswers", descriptions_by_choice(&summary)),
+            (
+                "GetAnswer/unanswered",
+                descriptions_by_choice(&answer_of(&unanswered)),
+            ),
+        ];
+
+        for (choice_id, published) in choices {
+            for (path, projected) in &projections {
+                let case = format!("{group}/{choice_id}/{path}");
+                let reported = projected
+                    .iter()
+                    .find(|(id, _)| id == choice_id)
+                    .map(|(_, description)| description.clone())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "case {case:?}: the question must offer this choice, got \
+                             {projected:?}"
+                        )
+                    });
+                assert_eq!(
+                    reported.as_deref(),
+                    *published,
+                    "case {case:?}: expected the lens's published prose {published:?}, got \
+                     {reported:?}"
+                );
+                if let Some(prose) = reported {
+                    assert!(
+                        (CHOICE_DESCRIPTION_LENGTH.0..=CHOICE_DESCRIPTION_LENGTH.1)
+                            .contains(&prose.len()),
+                        "case {case:?}: Description is @length{CHOICE_DESCRIPTION_LENGTH:?}, \
+                         got {} character(s)",
+                        prose.len()
+                    );
+                    for borrowed in [answered.as_str(), untouched.as_str(), alias, question_id] {
+                        assert!(
+                            !prose.contains(borrowed),
+                            "case {case:?}: published prose is fixed text, so it cannot \
+                             carry {borrowed:?}, got {prose:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Rule 7: the documents an answer points at are the LENS's own, addressed by the label the
+/// lens publishes the question under, and therefore unchanged when the lens's `LensVersion`
+/// moves.
+///
+/// The rows are one question from each pillar of the framework lens, including the first and
+/// last published number of three of them (`SEC 1`, `REL 13`, `PERF 5`), beside a question
+/// of a lens whose content this emulator authored, which publishes no document.
+///
+/// SOURCE of the labels: the framework's own published question numbering (OPS 1-11,
+/// SEC 1-11, REL 1-13, PERF 1-5, COST 1-11, SUS 1-6), which is what
+/// `state::published_question_label` reads off the lens's question table.
+#[tokio::test]
+async fn a_questions_documents_are_addressed_by_its_published_label_not_the_lens_version() {
+    let rows: [(&str, &str, Option<&str>); 7] = [
+        ("wellarchitected", "organization-priorities", Some("OPS_1")),
+        ("wellarchitected", "securely-operate", Some("SEC_1")),
+        ("wellarchitected", "plan-for-dr", Some("REL_13")),
+        ("wellarchitected", "performance-monitoring", Some("PERF_5")),
+        (
+            "wellarchitected",
+            "cloud-financial-management",
+            Some("COST_1"),
+        ),
+        ("wellarchitected", "region-selection", Some("SUS_1")),
+        ("serverless", "serverless-ops-01", None),
+    ];
+
+    let client = Client::new();
+    let mut documents: BTreeSet<String> = BTreeSet::new();
+    for (alias, question_id, label) in rows {
+        let case = format!("{alias}/{question_id}");
+        let lens = state::official_lens(alias)
+            .unwrap_or_else(|| panic!("case {case:?}: the catalog must carry the lens"));
+        let question = state::lens_question(alias, question_id)
+            .unwrap_or_else(|| panic!("case {case:?}: the lens must ask the question"));
+        assert_eq!(
+            state::published_question_label(lens, question_id).as_deref(),
+            label,
+            "case {case:?}: the question's published label must be the framework's own \
+             numbering"
+        );
+
+        let workload_id = workload_reviewing(&client, alias, &case.replace('/', "-")).await;
+        let read = get_answer(&client, &workload_id, alias, question_id).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: expected GetAnswer 200, got {read:?}"
+        );
+        let written = update_answer(
+            &client,
+            &workload_id,
+            alias,
+            question_id,
+            json!({ "SelectedChoices": [question.choice_id(0)] }),
+        )
+        .await;
+        assert_eq!(
+            written.status, 200,
+            "case {case:?}: expected UpdateAnswer 200, got {written:?}"
+        );
+
+        // A question whose content this emulator authored publishes no document to point at,
+        // so both members are left off rather than pointed at a page the lens does not serve.
+        let expected =
+            label.map(|label| format!("https://wa.aws.amazon.com/wat.question.{label}.en.html"));
+        for (path, answer) in [
+            ("GetAnswer", answer_of(&read)),
+            ("UpdateAnswer", answer_of(&written)),
+        ] {
+            let case = format!("{case}/{path}");
+            let helpful = text(&answer, "HelpfulResourceUrl");
+            let improvement = text(&answer, "ImprovementPlanUrl");
+            assert_eq!(
+                helpful, expected,
+                "case {case:?}: HelpfulResourceUrl must be the document the lens publishes \
+                 for the question, got {answer:?}"
+            );
+            assert_eq!(
+                improvement,
+                expected
+                    .as_ref()
+                    .map(|url| format!("{url}{}", state::IMPROVEMENT_PLAN_FRAGMENT)),
+                "case {case:?}: ImprovementPlanUrl must be the improvement plan of that same \
+                 document, got {answer:?}"
+            );
+            if let Some(url) = &helpful {
+                assert!(
+                    (URL_LENGTH.0..=URL_LENGTH.1).contains(&url.len()),
+                    "case {case:?}: HelpfulResourceUrl is @length{URL_LENGTH:?}, got {} \
+                     character(s)",
+                    url.len()
+                );
+                // The document is the lens's published one, so no part of the pair is
+                // assembled from the version string the lens happens to carry now.
+                assert!(
+                    !url.contains(lens.version),
+                    "case {case:?}: the document must not be assembled from the lens version \
+                     {:?}, got {url:?}",
+                    lens.version
+                );
+            }
+        }
+
+        // One document per question: two questions of a lens cannot share one.
+        if let Some(url) = expected {
+            assert!(
+                documents.insert(url.clone()),
+                "case {case:?}: each question must address its own document, got {url:?} twice"
+            );
+        }
+    }
+
+    // And EVERY pillar the framework lens is organized into has published documents: a
+    // pillar whose questions carried no label would silently report no document at all.
+    for (pillar_id, pillar_name, _) in state::framework_lens().pillars() {
+        let first = state::FRAMEWORK_LENS_QUESTIONS
+            .iter()
+            .find(|question| question.pillar_id == pillar_id)
+            .unwrap_or_else(|| panic!("case {pillar_name:?}: the pillar must ask a question"));
+        assert!(
+            state::published_question_label(state::framework_lens(), first.question_id)
+                .is_some_and(|label| label.ends_with("_1")),
+            "case {pillar_name:?}: the pillar's first question must carry its published \
+             number, got {:?}",
+            state::published_question_label(state::framework_lens(), first.question_id)
         );
     }
 }

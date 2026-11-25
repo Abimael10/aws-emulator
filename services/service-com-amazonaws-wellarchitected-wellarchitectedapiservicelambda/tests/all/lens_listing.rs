@@ -369,20 +369,26 @@ async fn the_catalog_reports_every_stored_lens_from_its_own_record() {
 }
 
 /// Rule 1's two hand-written catalog facts about the shipped lens cannot drift apart: the
-/// publication instant its summary reports IS midnight of the day its `LensVersion` names,
-/// so bumping the version without the instant (or the other way round) fails here.
+/// instant its summary reports as the lens's last revision IS the instant that lens's
+/// catalog row states, and the lens was created no later than it was revised — so a row
+/// that moves one of the two without the other fails here.
 #[tokio::test]
-async fn the_shipped_lens_version_and_its_publication_instant_name_the_same_day() {
+async fn the_shipped_lens_reports_the_publication_instants_its_catalog_row_states() {
     let published = ::aws_smithy_types::DateTime::from(state::framework_lens_published_at());
     let formatted = published
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .expect("the shipped lens's publication instant formats as a date-time");
-    let expected_prefix = format!("{}T00:00:00", state::FRAMEWORK_LENS_VERSION);
+    let framework = state::official_lens(state::FRAMEWORK_LENS_ALIAS)
+        .expect("the framework lens is carried by the catalog");
+    assert_eq!(
+        Some(formatted.as_str()),
+        framework.revised_at,
+        "case \"shipped-lens-date\": the revision instant must be the one the row states, got \
+         {formatted:?}"
+    );
     assert!(
-        formatted.starts_with(&expected_prefix),
-        "case \"shipped-lens-date\": the publication instant must be midnight of the day \
-         {:?} names, got {formatted:?}",
-        state::FRAMEWORK_LENS_VERSION
+        framework_created_epoch_seconds() <= framework_published_epoch_seconds(),
+        "case \"shipped-lens-date\": the shipped lens is created no later than it is revised"
     );
 
     // And the listing reports both of them, from those same two values.

@@ -36,10 +36,14 @@
 //!
 //! The FRAMEWORK lens's content is the framework's own published content: its `question_id`s
 //! and its choices' `ChoiceId`s and prose are the ones the Well-Architected Framework lens
-//! publishes, carried verbatim (see [`super::FRAMEWORK_LENS_QUESTIONS`]). A lens that
-//! publishes its question content also serves a document per question, which is what an
-//! answer's `HelpfulResourceUrl` and `ImprovementPlanUrl` address
-//! ([`lens_question_document_url`]).
+//! publishes, carried verbatim (see [`super::FRAMEWORK_LENS_QUESTIONS`]) — a choice's
+//! `Description` is the whole published sentence of that best practice, never a summary of
+//! it written here, because it is fixed text with no part taken from a request or from
+//! state. A lens that publishes its question content also serves a document per question,
+//! which is what an answer's `HelpfulResourceUrl` and `ImprovementPlanUrl` address
+//! ([`lens_question_document_url`]): the document is addressed by the label the lens
+//! publishes the question under ([`published_question_label`]), so it stays where it is
+//! published when the lens's `LensVersion` moves.
 //!
 //! Every question of EVERY lens here also offers the terminal "None of these" choice after
 //! the best practices it asks about ([`super::FrameworkQuestion::none_of_these_id`]): it is
@@ -61,6 +65,13 @@
 //! own and nothing is shared across the catalog: a review of one lens cannot report
 //! another's version, and a lens AWS has revised reports an `UpdatedAt` later than its
 //! `CreatedAt` ([`OfficialLens::created_at`], [`OfficialLens::updated_at`]).
+//!
+//! The creation and last-revision INSTANTS are per-row data too
+//! ([`OfficialLens::published_at`], [`OfficialLens::revised_at`]) rather than a reading of
+//! the day a `LensVersion` names: AWS publishes and revises a lens at an instant of its own,
+//! which no other member of the summary states, and a lens it revised without moving the
+//! version string still reports a later `UpdatedAt`. A row this catalog carries no published
+//! instant for reports the start of the day its version names, so the pair is never missing.
 //!
 //! The descriptions are the ones AWS's lens catalog publishes: the framework lens carries
 //! its own published sentence ([`super::FRAMEWORK_LENS_DESCRIPTION`]) and a specialised lens
@@ -106,15 +117,14 @@ macro_rules! authored_question {
     };
 }
 
-/// Where a lens AWS publishes serves its own content: the root the per-question documents
-/// a lens review links to live under, one path segment per lens version.
+/// Where the Well-Architected content a lens AWS publishes is served from: the root the
+/// per-question documents a lens review links to live under.
 ///
-/// `Answer$HelpfulResourceUrl` and `$ImprovementPlanUrl` are documents of the LENS, so
-/// they are addressed under the lens's published content root, by the version the content
-/// is published at and the question's own id ([`lens_question_document_url`]) — every
-/// identifier here is one the lens publishes, so a question's documents move with the
-/// lens's content rather than being stored beside it.
-pub const LENS_CONTENT_ROOT: &str = "https://wa.aws.amazon.com/wellarchitected";
+/// `Answer$HelpfulResourceUrl` and `$ImprovementPlanUrl` are documents of the LENS, named
+/// by the question's own PUBLISHED LABEL ([`published_question_label`]) rather than by the
+/// version the lens's content is published at: a published document keeps its address
+/// across revisions of the lens, so neither URL moves when the `LensVersion` string moves.
+pub const LENS_CONTENT_ROOT: &str = "https://wa.aws.amazon.com";
 
 /// The fragment of a question's document that holds the improvement plan for it: the plan
 /// is a section of the question's own published document, which is what makes
@@ -122,17 +132,69 @@ pub const LENS_CONTENT_ROOT: &str = "https://wa.aws.amazon.com/wellarchitected";
 /// ([`improvement_plan_url_of`]).
 pub const IMPROVEMENT_PLAN_FRAGMENT: &str = "#improvement-plan";
 
-/// The document `lens` publishes for the question `question_id`, under the version its
-/// content is published at: `Answer$HelpfulResourceUrl` (`@length(1, 2048)`).
-pub fn lens_question_document_url(lens: &OfficialLens, question_id: &str) -> String {
-    format!(
-        "{LENS_CONTENT_ROOT}/{}/{}/{question_id}.html",
-        lens.version, lens.alias
-    )
+/// The abbreviation the framework numbers each pillar's questions under — `COST 1` is the
+/// first cost-optimization question of the Well-Architected Framework lens — which is the
+/// prefix of a question's published label ([`published_question_label`]).
+///
+/// SOURCE: the framework's own published numbering (OPS 1-11, SEC 1-11, REL 1-13,
+/// PERF 1-5, COST 1-11, SUS 1-6), stated here against the `PillarId` each abbreviation
+/// numbers ([`WELL_ARCHITECTED_PILLARS`]).
+pub const PILLAR_QUESTION_ABBREVIATIONS: &[(&str, &str)] = &[
+    ("operationalExcellence", "OPS"),
+    ("security", "SEC"),
+    ("reliability", "REL"),
+    ("performance", "PERF"),
+    ("costOptimization", "COST"),
+    ("sustainability", "SUS"),
+];
+
+/// The label the lens publishes the question `question_id` under: the pillar's
+/// abbreviation and the question's position in that pillar (`COST_1`), which is how the
+/// lens's own documents are addressed.
+///
+/// Read off the lens's question table rather than stored beside it, so a question cannot
+/// carry a label the lens's own numbering disagrees with. `None` for a question this lens
+/// does not ask, for a pillar the framework publishes no numbering for, and for a question
+/// whose content is this emulator's own rather than published (see this module's docs):
+/// such a question has no published numbering to be addressed by.
+pub fn published_question_label(lens: &OfficialLens, question_id: &str) -> Option<String> {
+    let question = lens
+        .questions
+        .iter()
+        .find(|question| question.question_id == question_id)
+        .filter(|question| question.publishes_content())?;
+    let (_, abbreviation) = PILLAR_QUESTION_ABBREVIATIONS
+        .iter()
+        .find(|(pillar_id, _)| *pillar_id == question.pillar_id)?;
+    // Numbered over the questions the lens PUBLISHES in that pillar, the same set the
+    // published numbering runs over, so a pillar that also held content this emulator
+    // authored could not shift the published numbers.
+    let position = lens
+        .questions
+        .iter()
+        .filter(|candidate| candidate.pillar_id == question.pillar_id)
+        .filter(|candidate| candidate.publishes_content())
+        .position(|candidate| candidate.question_id == question_id)?
+        .saturating_add(1);
+    Some(format!("{abbreviation}_{position}"))
 }
 
-/// The improvement plan of the question whose document is at `document`:
-/// `Answer$ImprovementPlanUrl` (`@length(1, 2048)`), the plan's section of that document.
+/// The document `lens` publishes for the question `question_id`:
+/// `Answer$HelpfulResourceUrl` (`@length(1, 2048)`), addressed by that question's
+/// published label.
+///
+/// `None` for a question the lens does not ask, and for a lens whose question content is
+/// this emulator's own rather than published (see this module's docs): a document this
+/// emulator cannot address is left unreported rather than pointed at a page the lens does
+/// not serve.
+pub fn lens_question_document_url(lens: &OfficialLens, question_id: &str) -> Option<String> {
+    let label = published_question_label(lens, question_id)?;
+    Some(format!("{LENS_CONTENT_ROOT}/wat.question.{label}.en.html"))
+}
+
+/// The improvement plan of the question whose published document is at `document`:
+/// `Answer$ImprovementPlanUrl` (`@length(1, 2048)`), the plan's section of that same
+/// document — so a caller that has resolved the document already does not resolve it twice.
 pub fn improvement_plan_url_of(document: &str) -> String {
     format!("{document}{IMPROVEMENT_PLAN_FRAGMENT}")
 }
@@ -222,6 +284,25 @@ pub struct OfficialLens {
     /// two instants are what tell a client the lens was ever revised, so a row that knows
     /// them apart states them apart ([`Self::created_at`]).
     pub first_published: Option<&'static str>,
+    /// The INSTANT AWS's lens catalog publishes as this lens's creation
+    /// (`LensSummary$CreatedAt`), `YYYY-MM-DDTHH:MM:SSZ`, for a lens this catalog carries
+    /// that instant for.
+    ///
+    /// A published lens is created and revised at an instant of AWS's own, which no other
+    /// member of the summary states: it is neither the day [`Self::version`] names nor a
+    /// time of day derivable from it, so it is held here as this row's own data
+    /// ([`Self::created_at`]). `None` for a lens this catalog carries only the published
+    /// DAY of, which reports that day's start.
+    pub published_at: Option<&'static str>,
+    /// The INSTANT this lens was last revised (`LensSummary$UpdatedAt`), in the same form
+    /// as [`Self::published_at`], for a lens this catalog carries that instant for.
+    ///
+    /// Independent of [`Self::version`] in both directions — AWS revises a lens's catalog
+    /// entry without moving the version string, and publishes a version at an instant of
+    /// its own — which is what makes the `CreatedAt`/`UpdatedAt` pair a client can cache on
+    /// ([`Self::updated_at`]). `None` for a lens this catalog carries no revision instant
+    /// for, which reports the start of the day its version names.
+    pub revised_at: Option<&'static str>,
     /// `LensSummary$Description` — the description AWS's lens catalog publishes for this
     /// lens, within `LensDescription`'s modelled 1..1024 characters
     /// (`smithy_query(query="shape", shape="LensSummary")`). A specialised lens is published
@@ -277,25 +358,30 @@ impl OfficialLens {
         }
     }
 
-    /// When the version this lens reports was published: midnight UTC of the day
-    /// [`Self::version`] names.
+    /// When this lens was last revised: the instant [`Self::revised_at`] states, and the
+    /// start of the day [`Self::version`] names for a row this catalog carries no published
+    /// instant for.
     ///
-    /// `LensSummary$UpdatedAt` is "The date and time when the lens was last updated", and
-    /// for a lens AWS publishes that is when the version it carries was published. Derived
-    /// from the version rather than stored beside it, so the two cannot name different days,
-    /// and read from the version rather than from the clock: a lens nobody changed must
-    /// report the same instants to every caller.
+    /// `LensSummary$UpdatedAt` is "The date and time when the lens was last updated", which
+    /// is a fact about the LENS rather than about its version string, so it is read from
+    /// this row's own data — and from the row rather than from the clock: a lens nobody
+    /// changed must report the same instants to every caller.
     pub fn updated_at(&self) -> SystemTime {
-        midnight_utc(self.version)
+        self.revised_at
+            .map_or_else(|| midnight_utc(self.version), instant_utc)
     }
 
-    /// When this lens was created: midnight UTC of the day [`Self::first_published`] names,
-    /// and of the version's own day for a lens that has never been revised.
+    /// When this lens was created: the instant [`Self::published_at`] states, and the start
+    /// of the day [`Self::first_published`] (else [`Self::version`]) names for a row this
+    /// catalog carries no published instant for.
     ///
     /// Never later than [`Self::updated_at`]: a lens is created before it is revised, which
     /// is what makes the pair readable as "this lens was revised after it was published".
     pub fn created_at(&self) -> SystemTime {
-        midnight_utc(self.first_published.unwrap_or(self.version))
+        self.published_at.map_or_else(
+            || midnight_utc(self.first_published.unwrap_or(self.version)),
+            instant_utc,
+        )
     }
 
     /// The `LensSummary` `ListLenses` reports this lens as.
@@ -323,25 +409,23 @@ impl OfficialLens {
     }
 }
 
-/// Midnight UTC of the day `day` names (`YYYY-MM-DD`), as an instant.
+/// The instant `stamp` names (`YYYY-MM-DDTHH:MM:SSZ`), as an instant.
 ///
-/// The calendar conversion comes from the maintained library
-/// (`aws_smithy_types::DateTime`) rather than from arithmetic written here. TOTAL: text
-/// that is not a date answers the epoch rather than panicking, and a test pins every
-/// version in the catalog against the day it names so an unparsable one cannot pass
-/// unnoticed.
+/// The calendar conversion comes from the maintained library (`aws_smithy_types::DateTime`)
+/// rather than from arithmetic written here. TOTAL: text that is not an instant answers the
+/// epoch rather than panicking, and a test pins every instant in the catalog against the
+/// instant it names so an unparsable one cannot pass unnoticed.
 ///
-/// Shared with the other published content whose revision is named by a day — the profile
-/// template's ([`super::profile_template::PROFILE_TEMPLATE_REVISION`]) — so one place
-/// decides what instant a published revision reports.
-pub(super) fn midnight_utc(day: &str) -> SystemTime {
+/// The one place this crate turns a published stamp into an instant: [`midnight_utc`] is the
+/// same read of a stamp that names only a DAY.
+pub(super) fn instant_utc(stamp: &str) -> SystemTime {
     let parsed = ::aws_smithy_types::DateTime::from_str(
-        &format!("{day}T00:00:00Z"),
+        stamp,
         ::aws_smithy_types::date_time::Format::DateTime,
     );
     debug_assert!(
         parsed.is_ok(),
-        "a published revision must name a calendar day: {day:?}"
+        "a published instant must name a date and time: {stamp:?}"
     );
     parsed
         .ok()
@@ -349,6 +433,18 @@ pub(super) fn midnight_utc(day: &str) -> SystemTime {
         .map_or(SystemTime::UNIX_EPOCH, |secs| {
             SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
         })
+}
+
+/// Midnight UTC of the day `day` names (`YYYY-MM-DD`), as an instant: the start of that
+/// day, read through [`instant_utc`] so one place decides what instant a published stamp
+/// reports.
+///
+/// Shared with the other published content whose revision is named by a day — the profile
+/// template's ([`super::profile_template::PROFILE_TEMPLATE_REVISION`]) — and TOTAL on the
+/// same terms: text that is not a date answers the epoch rather than panicking, and a test
+/// pins every version in the catalog against the day it names.
+pub(super) fn midnight_utc(day: &str) -> SystemTime {
+    instant_utc(&format!("{day}T00:00:00Z"))
 }
 
 /// The lens the given `LensAlias` names in this catalog, if this catalog carries it.
@@ -431,9 +527,8 @@ pub fn framework_lens() -> &'static OfficialLens {
     &FRAMEWORK_LENS
 }
 
-/// When the framework lens version this emulator carries was published — midnight UTC of
-/// the day [`super::FRAMEWORK_LENS_VERSION`] names, which is the instant that lens's
-/// summary reports as its `UpdatedAt`.
+/// When the framework lens was last revised — the instant [`FRAMEWORK_LENS`] states, which
+/// is what that lens's summary reports as its `UpdatedAt`.
 pub fn framework_lens_published_at() -> SystemTime {
     framework_lens().updated_at()
 }
@@ -450,6 +545,11 @@ pub const FRAMEWORK_LENS: OfficialLens = OfficialLens {
     // day AWS's lens catalog reports it was created, which is well before the day the
     // version it carries now was published.
     first_published: Some("2019-09-13"),
+    // The instants AWS's lens catalog publishes for the framework lens: the instant it was
+    // first published, and the instant of its latest revision — which is later than the day
+    // the version it carries was published, AWS having revised the catalog entry since.
+    published_at: Some("2019-09-13T20:13:30Z"),
+    revised_at: Some("2026-10-01T11:23:33Z"),
     description: FRAMEWORK_LENS_DESCRIPTION,
     questions: FRAMEWORK_LENS_QUESTIONS,
 };
@@ -468,6 +568,10 @@ pub const OFFICIAL_LENS_CATALOG: &[OfficialLens] = &[
         // The day AWS publishes the Serverless lens at.
         version: "2020-02-04",
         first_published: None,
+        // The instants AWS's lens catalog publishes for this lens are not among the data
+        // this catalog carries for it, so its row reports the day its version names.
+        published_at: None,
+        revised_at: None,
         description: "Best practices for Serverless workload",
         questions: SERVERLESS_LENS_QUESTIONS,
     },
@@ -476,6 +580,10 @@ pub const OFFICIAL_LENS_CATALOG: &[OfficialLens] = &[
         name: "SaaS Lens",
         version: AUTHORED_CONTENT_REVISION,
         first_published: None,
+        // The instants AWS's lens catalog publishes for this lens are not among the data
+        // this catalog carries for it, so its row reports the day its version names.
+        published_at: None,
+        revised_at: None,
         description: "Best practices for SaaS workload",
         questions: SAAS_LENS_QUESTIONS,
     },
@@ -484,6 +592,10 @@ pub const OFFICIAL_LENS_CATALOG: &[OfficialLens] = &[
         name: "IoT Lens",
         version: AUTHORED_CONTENT_REVISION,
         first_published: None,
+        // The instants AWS's lens catalog publishes for this lens are not among the data
+        // this catalog carries for it, so its row reports the day its version names.
+        published_at: None,
+        revised_at: None,
         description: "Best practices for IoT workload",
         questions: IOT_LENS_QUESTIONS,
     },
@@ -492,6 +604,10 @@ pub const OFFICIAL_LENS_CATALOG: &[OfficialLens] = &[
         name: "Machine Learning Lens",
         version: AUTHORED_CONTENT_REVISION,
         first_published: None,
+        // The instants AWS's lens catalog publishes for this lens are not among the data
+        // this catalog carries for it, so its row reports the day its version names.
+        published_at: None,
+        revised_at: None,
         description: "Best practices for Machine Learning workload",
         questions: MACHINE_LEARNING_LENS_QUESTIONS,
     },
@@ -500,6 +616,10 @@ pub const OFFICIAL_LENS_CATALOG: &[OfficialLens] = &[
         name: "Data Analytics Lens",
         version: AUTHORED_CONTENT_REVISION,
         first_published: None,
+        // The instants AWS's lens catalog publishes for this lens are not among the data
+        // this catalog carries for it, so its row reports the day its version names.
+        published_at: None,
+        revised_at: None,
         description: "Best practices for Data Analytics workload",
         questions: ANALYTICS_LENS_QUESTIONS,
     },
@@ -508,6 +628,10 @@ pub const OFFICIAL_LENS_CATALOG: &[OfficialLens] = &[
         name: "Financial Services Industry Lens",
         version: AUTHORED_CONTENT_REVISION,
         first_published: None,
+        // The instants AWS's lens catalog publishes for this lens are not among the data
+        // this catalog carries for it, so its row reports the day its version names.
+        published_at: None,
+        revised_at: None,
         description: "Best practices for Financial Services Industry workload",
         questions: FINANCIAL_SERVICES_LENS_QUESTIONS,
     },
@@ -516,6 +640,10 @@ pub const OFFICIAL_LENS_CATALOG: &[OfficialLens] = &[
         name: "SAP Lens",
         version: AUTHORED_CONTENT_REVISION,
         first_published: None,
+        // The instants AWS's lens catalog publishes for this lens are not among the data
+        // this catalog carries for it, so its row reports the day its version names.
+        published_at: None,
+        revised_at: None,
         description: "Best practices for SAP workload",
         questions: SAP_LENS_QUESTIONS,
     },
@@ -524,6 +652,10 @@ pub const OFFICIAL_LENS_CATALOG: &[OfficialLens] = &[
         name: "Migration Lens",
         version: AUTHORED_CONTENT_REVISION,
         first_published: None,
+        // The instants AWS's lens catalog publishes for this lens are not among the data
+        // this catalog carries for it, so its row reports the day its version names.
+        published_at: None,
+        revised_at: None,
         description: "Best practices for Migration workload",
         questions: MIGRATION_LENS_QUESTIONS,
     },
@@ -532,6 +664,10 @@ pub const OFFICIAL_LENS_CATALOG: &[OfficialLens] = &[
         name: "Generative AI Lens",
         version: AUTHORED_CONTENT_REVISION,
         first_published: None,
+        // The instants AWS's lens catalog publishes for this lens are not among the data
+        // this catalog carries for it, so its row reports the day its version names.
+        published_at: None,
+        revised_at: None,
         description: "Best practices for Generative AI workload",
         questions: GENERATIVE_AI_LENS_QUESTIONS,
     },
@@ -540,6 +676,10 @@ pub const OFFICIAL_LENS_CATALOG: &[OfficialLens] = &[
         name: "Healthcare Industry Lens",
         version: AUTHORED_CONTENT_REVISION,
         first_published: None,
+        // The instants AWS's lens catalog publishes for this lens are not among the data
+        // this catalog carries for it, so its row reports the day its version names.
+        published_at: None,
+        revised_at: None,
         description: "Best practices for Healthcare Industry workload",
         questions: HEALTHCARE_LENS_QUESTIONS,
     },
@@ -549,6 +689,11 @@ pub const OFFICIAL_LENS_CATALOG: &[OfficialLens] = &[
         // The day AWS publishes the Connected Mobility lens at.
         version: "2024-03-26",
         first_published: None,
+        // The instant AWS's lens catalog publishes this lens at, which it has not revised
+        // since: `CreatedAt` and `UpdatedAt` are the same instant, and neither is the day
+        // the version names.
+        published_at: Some("2024-03-21T19:50:10Z"),
+        revised_at: Some("2024-03-21T19:50:10Z"),
         description: "Best practices for Connected Mobility workload",
         questions: CONNECTED_MOBILITY_LENS_QUESTIONS,
     },
@@ -557,6 +702,10 @@ pub const OFFICIAL_LENS_CATALOG: &[OfficialLens] = &[
         name: "DevOps Lens",
         version: AUTHORED_CONTENT_REVISION,
         first_published: None,
+        // The instants AWS's lens catalog publishes for this lens are not among the data
+        // this catalog carries for it, so its row reports the day its version names.
+        published_at: None,
+        revised_at: None,
         description: "Best practices for DevOps workload",
         questions: DEVOPS_LENS_QUESTIONS,
     },
@@ -565,6 +714,10 @@ pub const OFFICIAL_LENS_CATALOG: &[OfficialLens] = &[
         name: "Games Industry Lens",
         version: AUTHORED_CONTENT_REVISION,
         first_published: None,
+        // The instants AWS's lens catalog publishes for this lens are not among the data
+        // this catalog carries for it, so its row reports the day its version names.
+        published_at: None,
+        revised_at: None,
         description: "Best practices for Games Industry workload",
         questions: GAMES_LENS_QUESTIONS,
     },

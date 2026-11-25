@@ -23,6 +23,9 @@
 //!    EVERY lens the catalog carries rather than for a chosen few: two independent
 //!    responses about one lens cannot disagree about its name, description, version, ARN or
 //!    owner.
+//! 4. `CreatedAt` and `UpdatedAt` are each lens's OWN published instants, held as that row's
+//!    data: independent of the day its `LensVersion` names in both directions, so a lens AWS
+//!    revised after publishing the version it carries reports a later `UpdatedAt`.
 //!
 //! The rows are the catalog's own lenses, which differ in name, in where the version they
 //! report comes from and in the question set behind them; rule 2's rows differ in signed
@@ -320,6 +323,109 @@ async fn get_lens_reports_the_same_published_data_as_the_listing() {
                 reported, expected,
                 "case {case:?}: GetLens and ListLenses must agree about {member}, expected \
                  {expected:?}, got {reported:?}"
+            );
+        }
+    }
+}
+
+/// The instant `stamp` names, in epoch seconds — how a restJson1 `Timestamp` travels.
+fn epoch_seconds(stamp: &str) -> f64 {
+    ::aws_smithy_types::DateTime::from_str(stamp, ::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|error| panic!("a published instant must parse: {stamp:?} ({error})"))
+        .as_secs_f64()
+}
+
+/// Rule 4: `ListLenses` reports each AWS-official lens's OWN published creation and
+/// last-revision instants, held as that row's data rather than read off the day its
+/// `LensVersion` names.
+///
+/// The rows span the three cases the catalog holds: a lens AWS has revised SINCE the version
+/// it carries was published (so `UpdatedAt` falls AFTER that day), a lens whose published
+/// instant falls BEFORE the day its version names (so neither instant is derivable from the
+/// version, in either direction), and a lens this catalog carries no published instant for,
+/// which reports the start of the day its version names.
+///
+/// SOURCE of the quoted instants: the instants AWS's lens catalog publishes for those
+/// lenses, as `state::OFFICIAL_LENS_CATALOG` carries them per row.
+#[tokio::test]
+async fn list_lenses_reports_each_lenss_own_published_instants() {
+    // (LensAlias, CreatedAt, UpdatedAt, whether UpdatedAt falls after the version's day)
+    let rows: [(&str, &str, &str, bool); 3] = [
+        (
+            "wellarchitected",
+            "2019-09-13T20:13:30Z",
+            "2026-10-01T11:23:33Z",
+            true,
+        ),
+        (
+            "connectedmobility",
+            "2024-03-21T19:50:10Z",
+            "2024-03-21T19:50:10Z",
+            false,
+        ),
+        // No published instant of its own: the start of the day its version names.
+        ("sap", "2025-01-15T00:00:00Z", "2025-01-15T00:00:00Z", false),
+    ];
+
+    let client = Client::new();
+    let catalog = official_catalog(&client, SIGNED_REGION, 50, "instants").await;
+    // A listing is a REPORT of what the catalog holds, so a second one answers the same
+    // instants: neither is minted while the request is served.
+    let again = official_catalog(&client, SIGNED_REGION, 50, "instants-again").await;
+
+    for (alias, created, updated, revised_after_version_day) in rows {
+        let case = alias;
+        let official = state::official_lens(alias)
+            .unwrap_or_else(|| panic!("case {case:?}: the catalog must carry the lens"));
+        let listed = catalog
+            .get(alias)
+            .unwrap_or_else(|| panic!("case {case:?}: the lens must be listed, got {catalog:?}"));
+
+        let reported_created = listed["CreatedAt"].clone();
+        let reported_updated = listed["UpdatedAt"].clone();
+        assert_eq!(
+            reported_created,
+            format!("{}", epoch_seconds(created)),
+            "case {case:?}: expected CreatedAt {created:?}, got {listed:?}"
+        );
+        assert_eq!(
+            reported_updated,
+            format!("{}", epoch_seconds(updated)),
+            "case {case:?}: expected UpdatedAt {updated:?}, got {listed:?}"
+        );
+        assert!(
+            epoch_seconds(created) <= epoch_seconds(updated),
+            "case {case:?}: a lens is created no later than it is revised, got {listed:?}"
+        );
+        assert_eq!(
+            again.get(alias).map(|row| row["UpdatedAt"].clone()),
+            Some(reported_updated),
+            "case {case:?}: reading the catalog must not move the lens's instants"
+        );
+
+        // The pair is a fact about the LENS: the revision instant of a lens AWS revised
+        // after publishing this version falls after that version's day, while another
+        // lens's falls before its own version day — so neither can be read off the version
+        // string, in either direction.
+        let version_day = epoch_seconds(&format!("{}T00:00:00Z", official.version));
+        assert_eq!(
+            epoch_seconds(updated) > version_day,
+            revised_after_version_day,
+            "case {case:?}: expected UpdatedAt {} the day the version names, got {updated:?} \
+             against {:?}",
+            if revised_after_version_day {
+                "after"
+            } else {
+                "not after"
+            },
+            official.version
+        );
+        if official.revised_at.is_some() {
+            assert_ne!(
+                epoch_seconds(updated),
+                version_day,
+                "case {case:?}: a published instant is not the start of the version day, got \
+                 {updated:?}"
             );
         }
     }

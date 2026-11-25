@@ -331,10 +331,10 @@ async fn list_lenses_reports_every_aws_official_lens() {
              {description:?}"
         );
 
-        // `UpdatedAt` is the instant the version this lens reports was published, so it
-        // names the same day the version does — one hand-written fact cannot drift from the
-        // other — and `CreatedAt` is no later: a lens AWS has revised was created before the
-        // version it carries now.
+        // `UpdatedAt` is the instant AWS last revised this lens and `CreatedAt` the instant
+        // it was created, each the row's own published data — so the pair is read back
+        // through the catalog rather than off the day the version names, and `CreatedAt` is
+        // no later: a lens AWS has revised was created before the revision it carries now.
         let created = summary.get("CreatedAt").and_then(Value::as_f64);
         let updated = summary.get("UpdatedAt").and_then(Value::as_f64);
         assert!(
@@ -345,10 +345,14 @@ async fn list_lenses_reports_every_aws_official_lens() {
             .map(::aws_smithy_types::DateTime::from_secs_f64)
             .and_then(|at| at.fmt(::aws_smithy_types::date_time::Format::DateTime).ok())
             .unwrap_or_default();
+        let official = state::official_lens(alias)
+            .unwrap_or_else(|| panic!("case {alias:?}: the catalog must carry the lens"));
         assert_eq!(
             rendered,
-            format!("{version}T00:00:00Z"),
-            "case {alias:?}: UpdatedAt must be midnight of the day {version:?} names, got \
+            official
+                .revised_at
+                .map_or_else(|| format!("{version}T00:00:00Z"), str::to_string),
+            "case {alias:?}: UpdatedAt must be the revision instant the catalog states, got \
              {rendered:?}"
         );
     }
@@ -949,32 +953,37 @@ async fn the_catalog_is_internally_consistent() {
             "case {case:?}: the questions must be grouped in the lens's pillar order"
         );
 
-        // The version names a day, and the instant the summary reports as the lens's last
-        // revision is that day's midnight — the two cannot drift apart.
+        // The instants the catalog publishes for the lens: its own data where this catalog
+        // carries it, and the start of the day its version names where it does not. Read
+        // through the same accessors every reader uses, so the summary and the row cannot
+        // drift apart.
         let rendered = ::aws_smithy_types::DateTime::from(official.updated_at())
             .fmt(::aws_smithy_types::date_time::Format::DateTime)
             .unwrap_or_default();
         assert_eq!(
             rendered,
-            format!("{}T00:00:00Z", official.version),
-            "case {case:?}: the revision instant must be midnight of the day the version \
-             names, got {rendered:?}"
+            official
+                .revised_at
+                .map_or_else(|| format!("{}T00:00:00Z", official.version), str::to_string),
+            "case {case:?}: the revision instant must be the one the row states, got \
+             {rendered:?}"
         );
 
         // And the lens was created no later than it was last revised: a row that names the
-        // day AWS first published the lens reports that day, and one that names none was
-        // created at the version it carries.
+        // instant AWS created the lens reports that instant, one that names only the day it
+        // was first published reports that day, and one that names neither was created at
+        // the version it carries.
         let created = ::aws_smithy_types::DateTime::from(official.created_at())
             .fmt(::aws_smithy_types::date_time::Format::DateTime)
             .unwrap_or_default();
         assert_eq!(
             created,
-            format!(
-                "{}T00:00:00Z",
-                official.first_published.unwrap_or(official.version)
+            official.published_at.map_or_else(
+                || format!("{}T00:00:00Z", official.first_published.unwrap_or(official.version)),
+                str::to_string
             ),
-            "case {case:?}: the creation instant must be midnight of the day the lens was \
-             first published, got {created:?}"
+            "case {case:?}: the creation instant must be the one the row states, got \
+             {created:?}"
         );
         assert!(
             official.created_at() <= official.updated_at(),
