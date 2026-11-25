@@ -514,10 +514,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this call nothing to migrate is answered as Amazon RDS answers it — a bucket this
         // Region's object store does not reach is the parameter value it is, and a bucket
         // that IS there holding no file under the prefix is the modelled
-        // `InvalidS3BucketFault`. An engine with no object store beside this service
-        // establishes nothing and refuses nothing. It is read AFTER every request-only
-        // refusal above, so a request whose parameters cannot hold together is answered
-        // without the bucket being touched.
+        // `InvalidS3BucketFault` reporting the missing backup files. One error class covers
+        // both of the latter's causes, so the MESSAGE is what separates them. An engine with
+        // no object store beside this service establishes nothing and refuses nothing. It is
+        // read AFTER every request-only refusal above, so a request whose parameters cannot
+        // hold together is answered without the bucket being touched.
         match crate::state::ingestion_location_defect(
             &*self.engine,
             &region,
@@ -532,7 +533,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(crate::state::IngestionLocationDefect::NoBackupUnderPrefix) => {
                 return Err(RestoreDBInstanceFromS3ErrorModeled::InvalidS3BucketFault(
                     InvalidS3BucketFault {
-                        message: Some(crate::state::invalid_ingestion_bucket_message()),
+                        message: Some(crate::state::no_backup_files_message()),
                     },
                 )
                 .into());

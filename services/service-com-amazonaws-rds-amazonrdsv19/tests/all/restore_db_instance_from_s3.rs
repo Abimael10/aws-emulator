@@ -13,7 +13,8 @@
 //! * A location holding no file this Region can migrate is refused as that location is: a
 //!   bucket this Region's object store does not reach is `InvalidParameterValue`, and a
 //!   bucket that IS there holding no backup under the prefix is the modelled
-//!   `InvalidS3BucketFault`; both carry the one sentence that error class states.
+//!   `InvalidS3BucketFault`; each carries the sentence of ITS OWN cause, since one error
+//!   class covers several and the message is what separates them.
 //! * A request whose engine pair and backup both resolve CREATES the instance, which
 //!   `DescribeDBInstances` then reports, reaching `available` on its own.
 
@@ -190,7 +191,22 @@ struct LocationRow {
     /// The Query API error code the location is refused with: which code says whether the
     /// value named a bucket this Region's object store holds at all.
     code: &'static str,
+    /// The sentence that cause is worded with: the message is what tells the causes of one
+    /// error class apart, so each row names the one it expects.
+    message: &'static str,
 }
+
+/// The sentence Amazon RDS words a source location it cannot find or read at all with, which
+/// names the two members a caller can act on.
+const BUCKET_UNREACHABLE: &str =
+    "The specified Amazon S3 bucket name can't be found or Amazon RDS isn't authorized to \
+     access the specified Amazon S3 bucket. Verify the SourceS3BucketName and \
+     S3IngestionRoleArn values and try again.";
+
+/// The sentence Amazon RDS words a bucket that IS there and readable but holds no backup
+/// files with.
+const NO_BACKUP_FILES: &str = "No backup files were found in the specified Amazon S3 bucket. \
+                               Check the bucket name or create backup files and try again.";
 
 /// Rule: a location holding no file this Region can migrate leaves the restore nothing to
 /// read, and each of the two conditions is refused the way Amazon RDS refuses it — the rule
@@ -199,6 +215,7 @@ struct LocationRow {
 async fn a_location_holding_no_backup_is_refused_as_that_location_is() {
     const ELSEWHERE: &str = "emu-s3-inst-elsewhere";
     const PREFIXED: &str = "emu-s3-inst-prefixed";
+    const EMPTY: &str = "emu-s3-inst-empty-bucket";
     const ROWS: &[LocationRow] = &[
         LocationRow {
             case: "a bucket the object store holds nothing under",
@@ -206,6 +223,7 @@ async fn a_location_holding_no_backup_is_refused_as_that_location_is() {
             bucket: "emu-s3-inst-never-created",
             prefix: None,
             code: "InvalidParameterValue",
+            message: BUCKET_UNREACHABLE,
         },
         LocationRow {
             case: "a prefix the backup is not under",
@@ -213,6 +231,15 @@ async fn a_location_holding_no_backup_is_refused_as_that_location_is() {
             bucket: PREFIXED,
             prefix: Some("ledger/"),
             code: "InvalidS3BucketFault",
+            message: NO_BACKUP_FILES,
+        },
+        LocationRow {
+            case: "an existing, readable bucket holding no file at all",
+            identifier: "emu-s3-inst-empty",
+            bucket: EMPTY,
+            prefix: None,
+            code: "InvalidS3BucketFault",
+            message: NO_BACKUP_FILES,
         },
         LocationRow {
             case: "a bucket that exists in another Region",
@@ -220,11 +247,13 @@ async fn a_location_holding_no_backup_is_refused_as_that_location_is() {
             bucket: ELSEWHERE,
             prefix: None,
             code: "InvalidParameterValue",
+            message: BUCKET_UNREACHABLE,
         },
     ];
 
     let (router, _engine) = emulator();
     create_bucket(&router, PREFIXED, REGION).await;
+    create_bucket(&router, EMPTY, REGION).await;
     create_bucket(&router, ELSEWHERE, OTHER_REGION).await;
     put_object(
         &router,
@@ -251,17 +280,22 @@ async fn a_location_holding_no_backup_is_refused_as_that_location_is() {
             400,
             row.code,
         );
-        // The sentence that error class states for this operation, which names the two
-        // members a caller can act on and carries no value of the request.
+        // The sentence of the row's OWN cause, which carries no value of the request: the
+        // code alone does not say what to fix, so the message is the diagnosis.
         let message = text(&body, "Message");
-        let expected = "The specified Amazon S3 bucket name can't be found or Amazon RDS isn't \
-                        authorized to access the specified Amazon S3 bucket. Verify the \
-                        SourceS3BucketName and S3IngestionRoleArn values and try again.";
         assert_eq!(
-            message, expected,
-            "case {:?}: expected the sentence {expected:?}, got {message:?}",
-            row.case
+            message, row.message,
+            "case {:?}: expected the sentence {:?}, got {message:?}",
+            row.case, row.message
         );
+        for value in [Some(row.bucket), row.prefix].into_iter().flatten() {
+            assert!(
+                !message.contains(value),
+                "case {:?}: expected fixed text naming no value of the request, but \
+                 {message:?} carries {value:?}",
+                row.case
+            );
+        }
         expect_error(
             row.case,
             call(

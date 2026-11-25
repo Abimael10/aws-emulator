@@ -15,8 +15,9 @@
 //!   read, and each condition is refused as Amazon RDS refuses it: a bucket this Region's
 //!   object store does not reach — one it holds nothing under, one it holds in another Region
 //!   — is the parameter value it is (`InvalidParameterValue`), while a bucket that IS there
-//!   holding no backup under the prefix is the modelled `InvalidS3BucketFault`. Both carry
-//!   the one sentence that error class states.
+//!   holding no backup under the prefix is the modelled `InvalidS3BucketFault`. Each carries
+//!   the sentence of its OWN cause, since one error class covers several and the message is
+//!   what separates them.
 //! * A request whose engine pair and backup both resolve CREATES the cluster: it is reported
 //!   by `DescribeDBClusters` from the restore onwards, reaches `available` on its own and
 //!   publishes an endpoint, whatever the files under the prefix are named.
@@ -232,14 +233,29 @@ struct LocationRow {
     /// The Query API error code the location is refused with: which code says whether the
     /// value named a bucket this Region's object store holds at all.
     code: &'static str,
+    /// The sentence that cause is worded with: the message is what tells the causes of one
+    /// error class apart, so each row names the one it expects.
+    message: &'static str,
 }
+
+/// The sentence Amazon RDS words a source location it cannot find or read at all with, which
+/// names the two members a caller can act on.
+const BUCKET_UNREACHABLE: &str =
+    "The specified Amazon S3 bucket name can't be found or Amazon RDS isn't authorized to \
+     access the specified Amazon S3 bucket. Verify the SourceS3BucketName and \
+     S3IngestionRoleArn values and try again.";
+
+/// The sentence Amazon RDS words a bucket that IS there and readable but holds no backup
+/// files with.
+const NO_BACKUP_FILES: &str = "No backup files were found in the specified Amazon S3 bucket. \
+                               Check the bucket name or create backup files and try again.";
 
 /// Rule: a location holding no file this Region can migrate leaves the restore nothing to
 /// read, and each of the two conditions is refused the way Amazon RDS refuses it — a bucket
 /// this Region's object store does not reach is the parameter value it is
-/// (`InvalidParameterValue`), while a bucket that IS there holding no backup under the prefix
-/// is the modelled `InvalidS3BucketFault`. Both carry the one sentence that error class
-/// states for this operation.
+/// (`InvalidParameterValue`), while a bucket that IS there and readable holding no backup
+/// under the prefix is the modelled `InvalidS3BucketFault`, worded with the sentence of ITS
+/// cause: one error class covers several causes, so the message is what separates them.
 ///
 /// The rows span every way a location can hold none: no such bucket, a bucket outside the
 /// Region, an empty bucket, and a prefix with nothing under it.
@@ -255,6 +271,7 @@ async fn a_location_holding_no_backup_is_refused_as_that_location_is() {
             bucket: "emu-s3-restore-never-created",
             prefix: None,
             code: "InvalidParameterValue",
+            message: BUCKET_UNREACHABLE,
         },
         LocationRow {
             case: "a bucket that holds no object at all",
@@ -262,6 +279,7 @@ async fn a_location_holding_no_backup_is_refused_as_that_location_is() {
             bucket: EMPTY,
             prefix: None,
             code: "InvalidS3BucketFault",
+            message: NO_BACKUP_FILES,
         },
         LocationRow {
             case: "a prefix the backup is not under",
@@ -269,6 +287,7 @@ async fn a_location_holding_no_backup_is_refused_as_that_location_is() {
             bucket: PREFIXED,
             prefix: Some("ledger/"),
             code: "InvalidS3BucketFault",
+            message: NO_BACKUP_FILES,
         },
         LocationRow {
             case: "a bucket that exists in another Region",
@@ -276,6 +295,7 @@ async fn a_location_holding_no_backup_is_refused_as_that_location_is() {
             bucket: ELSEWHERE,
             prefix: None,
             code: "InvalidParameterValue",
+            message: BUCKET_UNREACHABLE,
         },
     ];
 
@@ -308,17 +328,22 @@ async fn a_location_holding_no_backup_is_refused_as_that_location_is() {
             400,
             row.code,
         );
-        // The sentence that error class states for this operation, which names the two
-        // members a caller can act on and carries no value of the request.
+        // The sentence of the row's OWN cause, which carries no value of the request: the
+        // code alone does not say what to fix, so the message is the diagnosis.
         let message = text(&body, "Message");
-        let expected = "The specified Amazon S3 bucket name can't be found or Amazon RDS isn't \
-                        authorized to access the specified Amazon S3 bucket. Verify the \
-                        SourceS3BucketName and S3IngestionRoleArn values and try again.";
         assert_eq!(
-            message, expected,
-            "case {:?}: expected the sentence {expected:?}, got {message:?}",
-            row.case
+            message, row.message,
+            "case {:?}: expected the sentence {:?}, got {message:?}",
+            row.case, row.message
         );
+        for value in [Some(row.bucket), row.prefix].into_iter().flatten() {
+            assert!(
+                !message.contains(value),
+                "case {:?}: expected fixed text naming no value of the request, but \
+                 {message:?} carries {value:?}",
+                row.case
+            );
+        }
         no_such_cluster(row.case, &router, row.identifier).await;
     }
 }

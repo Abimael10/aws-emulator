@@ -95,21 +95,20 @@ impl S3RestorePair {
     }
 }
 
-/// What a refusal of the LOCATION a restore reads carries, whichever of the two conditions
-/// it was: the sentence the MODEL states for that error class on these two operations — "The
-/// specified Amazon S3 bucket name can't be found or Amazon RDS isn't authorized to access
-/// the specified Amazon S3 bucket. Verify the SourceS3BucketName and S3IngestionRoleArn
-/// values and try again." — which states the two conditions that leave a location unusable
-/// and names the two members a caller can act on.
+/// What a refusal of a source location the restore cannot FIND OR READ AT ALL carries: the
+/// sentence the MODEL states for that error class on these two operations — "The specified
+/// Amazon S3 bucket name can't be found or Amazon RDS isn't authorized to access the
+/// specified Amazon S3 bucket. Verify the SourceS3BucketName and S3IngestionRoleArn values
+/// and try again." — which states the two conditions that leave a location unreachable and
+/// names the two members a caller can act on.
 ///
-/// One sentence, two codes: WHICH code the refusal carries is what says whether the value
-/// named a bucket at all ([`IngestionLocationDefect`]), while what is wrong is the one thing
-/// this sentence reports — the location the restore cannot read a backup out of.
-///
-/// Its second clause — "Amazon RDS isn't authorized to access the specified Amazon S3
-/// bucket" — is about the location being unreachable, and is NOT how a restore whose
-/// ingestion role withholds a read of a location that IS reachable is worded: that refusal
-/// reports the files it cannot list ([`ingestion_role_cannot_list_message`]).
+/// One error class, several causes: the CODE is the same for each of them, so the MESSAGE is
+/// what tells a caller which cause it was and therefore what to fix. This sentence is the one
+/// for a location that cannot be found or read. A location that IS there and readable but
+/// holds no backup for the migration to read is a DIFFERENT cause of the same class, and
+/// carries its own sentence ([`no_backup_files_message`]); a role that withholds a read of a
+/// location that is reachable reports the files it cannot list
+/// ([`ingestion_role_cannot_list_message`]).
 ///
 /// It carries no variable part of its own: the bucket and the role are values the request
 /// already holds, and the sentence names the MEMBERS rather than their values.
@@ -118,6 +117,25 @@ pub fn invalid_ingestion_bucket_message() -> String {
     "The specified Amazon S3 bucket name can't be found or Amazon RDS isn't authorized to \
      access the specified Amazon S3 bucket. Verify the SourceS3BucketName and \
      S3IngestionRoleArn values and try again."
+        .to_string()
+}
+
+/// What a refusal of a source location that IS there and readable but holds NO BACKUP FILES
+/// carries: "No backup files were found in the specified Amazon S3 bucket. Check the bucket
+/// name or create backup files and try again."
+///
+/// The other cause of the error class [`invalid_ingestion_bucket_message`] words, and the
+/// reason the two are worded apart: a caller told to verify the bucket name and the ingestion
+/// role would be checking two values that are already right, when what the location is
+/// missing is the backup itself — the files the migration reads. This sentence states that,
+/// and the remedy for it.
+///
+/// Fixed text with no variable part: it names neither the bucket nor the prefix nor the role,
+/// so no value the request carried appears in it.
+#[must_use]
+pub fn no_backup_files_message() -> String {
+    "No backup files were found in the specified Amazon S3 bucket. Check the bucket name or \
+     create backup files and try again."
         .to_string()
 }
 
@@ -131,10 +149,11 @@ pub enum IngestionLocationDefect {
     /// API's `InvalidParameterValue`, carrying the sentence this operation words a location
     /// it cannot find in ([`invalid_ingestion_bucket_message`]).
     BucketUnreachable,
-    /// The bucket IS there and holds no file under the prefix the request named, so there is
-    /// no backup under it for the migration to read: the modelled `InvalidS3BucketFault`,
-    /// whose own sentence reports a location that "can't be found" and names the two members
-    /// a caller can act on ([`invalid_ingestion_bucket_message`]).
+    /// The bucket IS there and is readable, and holds no file under the prefix the request
+    /// named, so there is no backup under it for the migration to read: the modelled
+    /// `InvalidS3BucketFault`, carrying the sentence that reports the missing backup files
+    /// rather than the one about a bucket that cannot be found or read
+    /// ([`no_backup_files_message`]).
     NoBackupUnderPrefix,
 }
 
