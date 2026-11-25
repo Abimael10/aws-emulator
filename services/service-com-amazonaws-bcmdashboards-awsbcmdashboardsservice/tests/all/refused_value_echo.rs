@@ -3,12 +3,11 @@
 //! What the VALUE half of a boundary constraint clause states, over the whole numeric
 //! domain a member's declared `@range` refuses.
 //!
-//! The rule: a refusal of a numeric value outside its member's modelled `@range` states the
-//! value the request submitted, the member it sat at and the bound it broke — whatever the
-//! magnitude or sign of the number submitted, the clause quotes that number back as the
-//! request wrote it, so a client always learns WHICH value was refused. The rule is the
-//! constraint CLASS's: it holds for every `@range` member of this service's surface, as it
-//! does for every other class.
+//! The rule: a refusal of a numeric value outside its member's modelled `@range` names the
+//! member it sat at and the bound it broke, and quotes NO number — whatever the magnitude or
+//! sign of the number submitted, nothing of it reaches the sentence. The rule is the
+//! constraint CLASS's: it holds for every `@range` member of this service's surface, where
+//! every other class still states the value it was handed.
 //!
 //! This suite is the domain sweep behind the sibling table in
 //! `tests/all/range_refusal_wording.rs`, whose helpers it states the clause with: that table
@@ -17,9 +16,9 @@
 //! varies — exhaustively through the integers either side of each bound, then out to the
 //! extremes an `integer` member admits — at a top-level member of both listings and at a
 //! member nested under a list element. The bound check widens a value to compare it, so an
-//! extreme magnitude is where a RE-RENDERING of it could show up in the sentence (a
-//! thousands separator, an exponent, a truncated or re-rounded number) while the
-//! neighbourhood of the bound still looked right.
+//! extreme magnitude is where a RENDERING of it could leak into the sentence (a thousands
+//! separator, an exponent, a truncated or re-rounded number) while the neighbourhood of the
+//! bound still looked right; here no magnitude may leak anything at all.
 //!
 //! Sources for the bounds: `smithy_query(query="closure",
 //! operation="ListDashboards,ListScheduledReports,CreateDashboard")` — `MaxResults` range
@@ -63,10 +62,10 @@ fn outside(min: i64, max: i64) -> Vec<(i64, String)> {
 }
 
 #[tokio::test]
-async fn a_page_size_outside_its_range_is_stated_with_the_number_submitted() {
+async fn a_page_size_outside_its_range_is_stated_with_no_number_at_all() {
     let router = router();
 
-    // The same member on both listings: the value half is quoted for the class, not for
+    // The same member on both listings: the value half is dropped for the class, not for
     // one operation's reading of it.
     for operation in ["ListDashboards", "ListScheduledReports"] {
         for (submitted, requirement) in outside(1, 100) {
@@ -85,26 +84,31 @@ async fn a_page_size_outside_its_range_is_stated_with_the_number_submitted() {
             let message = error_message(&body);
             assert_eq!(
                 message,
-                one_error(&range_clause(submitted, "maxResults", &requirement)),
+                one_error(&range_clause("maxResults", &requirement)),
                 "case {operation} maxResults {submitted}: expected the clause to state the \
-                 rejected value, the member and the bound, got {message:?}"
+                 member and the bound, got {message:?}"
             );
             assert!(
-                message.contains(&format!("{VALUE_HALF_OPENING}{submitted}' at 'maxResults'")),
-                "case {operation} maxResults {submitted}: the clause must quote the number it \
-                 refused at the member it sat at, got {body}"
+                message.contains(&format!("{VALUELESS_OPENING}maxResults'")),
+                "case {operation} maxResults {submitted}: the clause must name the member it \
+                 refused with no value half, got {body}"
             );
             assert!(
-                !message.contains(VALUELESS_OPENING),
-                "case {operation} maxResults {submitted}: the refusal must read the value \
-                 back, got {body}"
+                !message.contains(VALUE_HALF_OPENING),
+                "case {operation} maxResults {submitted}: the refusal must quote no number, \
+                 got {body}"
+            );
+            assert!(
+                !message.contains(&submitted.to_string()),
+                "case {operation} maxResults {submitted}: nothing of the submitted number may \
+                 reach the sentence, got {body}"
             );
         }
     }
 }
 
 #[tokio::test]
-async fn a_nested_member_outside_its_range_quotes_its_number_too() {
+async fn a_nested_member_outside_its_range_quotes_no_number_either() {
     let router = router();
 
     // The rule holds wherever a `@range` member sits: a widget's `width` (2..6) and
@@ -140,19 +144,19 @@ async fn a_nested_member_outside_its_range_quotes_its_number_too() {
                 let path = format!("widgets.1.member.{member}");
                 assert_eq!(
                     message,
-                    one_error(&range_clause(submitted, &path, &requirement)),
+                    one_error(&range_clause(&path, &requirement)),
                     "case {operation} {member} {submitted}: expected the clause to state the \
-                     rejected value, the nested member and the bound, got {message:?}"
+                     nested member and the bound, got {message:?}"
                 );
                 assert!(
-                    message.contains(&format!("{VALUE_HALF_OPENING}{submitted}' at '{path}'")),
-                    "case {operation} {member} {submitted}: the clause must quote the number \
-                     it refused at the member it sat at, got {body}"
+                    message.contains(&format!("{VALUELESS_OPENING}{path}'")),
+                    "case {operation} {member} {submitted}: the clause must name the member it \
+                     refused with no value half, got {body}"
                 );
                 assert!(
-                    !message.contains(VALUELESS_OPENING),
-                    "case {operation} {member} {submitted}: the refusal must read the \
-                     value back, got {body}"
+                    !message.contains(VALUE_HALF_OPENING),
+                    "case {operation} {member} {submitted}: the refusal must quote no number, \
+                     got {body}"
                 );
             }
         }

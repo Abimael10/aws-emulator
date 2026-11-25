@@ -967,21 +967,27 @@ async fn an_id_no_profile_holds_is_refused_by_both_readers() {
     let stored_id = created.root().text_at("Id").unwrap_or_default().to_string();
 
     // The rows span the ways an id can name no profile: a well-shaped profile id that was
-    // never minted, an id in another namespace and of a width no identifier of this kind is
-    // issued at, and a value of no CloudFront identifier form at all. A value WRITTEN in the
-    // alphabet this service writes an identifier in is carried through to the STORE, whatever
-    // namespace letter and width it carries, so it is the profile reported absent; a value
-    // outside that alphabet is no identifier the service can READ at all.
+    // never minted, an id in another namespace at the width this service issues one at, an id
+    // of the alphabet at no issued width, and a value of no CloudFront identifier form at all.
+    // A value written the way this service ISSUES an identifier — the identifier alphabet at
+    // the issued width — is carried through to the STORE whatever namespace letter it carries,
+    // so it is the profile reported absent, and so is a value outside that alphabet, which
+    // claims to be no identifier of this mint; a value of the alphabet at no issued width is the
+    // identifier the service cannot READ.
     for (case, expected) in [
         (
             "P280MFCLSYOCVU",
             NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
         ),
         (
-            "EDFDVBD6EXAMPLE",
+            "E2QWRUHAPOMQZL",
             NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
         ),
-        ("not-a-profile-id", UNREADABLE_PROFILE_ID_MESSAGE),
+        ("EDFDVBD6EXAMPLE", UNREADABLE_PROFILE_ID_MESSAGE),
+        (
+            "not-a-profile-id",
+            NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
+        ),
     ] {
         for (reader, answer) in [
             ("GetFieldLevelEncryptionProfile", get_profile(&router, case).await),

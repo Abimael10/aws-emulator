@@ -25,11 +25,13 @@
 //! The id travels in the path on four of those operations and in a submitted DOCUMENT on the
 //! other two. An id borne by a document addresses nothing, so any id the store holds no profile
 //! for is the absent profile there; an id that ADDRESSES the operation is read for its ISSUED
-//! FORM first, and a value WRITTEN as an identifier of this service's mint that no profile id
-//! could be is the identifier reported unreadable under that same one not-found code — these
-//! operations model no argument error. The rows below span those shapes — another namespace of
-//! this service, a value of no minted id's alphabet, a caller reference — beside well-formed
-//! profile ids nothing answers to.
+//! FORM first, and a value of the identifier alphabet at a width no identifier of this mint is
+//! issued at is the identifier reported unreadable under that same one not-found code — these
+//! operations model no argument error. A value written outside that alphabet claims to be no
+//! identifier of this mint at all, so it has no form to be wrong and is the absent profile
+//! wherever it travels. The rows below span those shapes — another namespace of this service, a
+//! value of no minted id's alphabet, a caller reference — beside well-formed profile ids nothing
+//! answers to.
 //!
 //! Every message is also asserted NOT to be the documentation prose of its error shape
 //! (`smithy_query(query="doc",shape="NoSuchFieldLevelEncryptionProfile")` and
@@ -49,7 +51,6 @@ use crate::field_level_encryption_config_lifecycle::{
 };
 use crate::field_level_encryption_profile_lifecycle::{
     create_profile, get_profile, get_profile_config, is_profile_id, upload_key, Entity, Profile,
-    UNREADABLE_PROFILE_ID_MESSAGE,
 };
 
 /// The sentences CloudFront sends on the wire for these refusals, spelled out here rather than
@@ -241,17 +242,17 @@ async fn every_path_that_reports_a_missing_profile_sends_the_wire_sentence() {
         (
             "a stored id in lower case",
             known.to_lowercase(),
-            UNREADABLE_PROFILE_ID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
         (
             "a token that is no profile id",
             "not-a-profile-id".to_string(),
-            UNREADABLE_PROFILE_ID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
         (
             "the caller reference rather than the id",
             "fle-profile-message-known".to_string(),
-            UNREADABLE_PROFILE_ID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
     ];
 
@@ -387,7 +388,7 @@ async fn a_profile_read_answers_one_sentence_for_every_id_it_cannot_resolve() {
         (
             "a UUID, the namespace the policy kinds are keyed by",
             "00000000-0000-0000-0000-000000000000".to_string(),
-            UNREADABLE_PROFILE_ID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
         (
             "a profile id never minted",
@@ -397,17 +398,17 @@ async fn a_profile_read_answers_one_sentence_for_every_id_it_cannot_resolve() {
         (
             "the stored id in lower case",
             known.to_lowercase(),
-            UNREADABLE_PROFILE_ID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
         (
             "a bare word",
             "not-a-profile-id".to_string(),
-            UNREADABLE_PROFILE_ID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
         (
             "the profile's caller reference rather than its id",
             "fle-profile-kinds-known".to_string(),
-            UNREADABLE_PROFILE_ID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
     ];
 

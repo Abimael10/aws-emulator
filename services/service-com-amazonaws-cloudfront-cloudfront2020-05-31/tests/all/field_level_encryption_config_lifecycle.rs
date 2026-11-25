@@ -1473,14 +1473,15 @@ async fn an_id_no_configuration_holds_is_refused_by_the_configuration_reader() {
     let stored_id = created.root().text_at("Id").unwrap_or_default().to_string();
 
     // The rows span the ways an id can name no configuration: a well-shaped configuration id
-    // that was never minted, an id in another namespace and of a width no identifier of this
-    // kind is issued at, a minted id of another kind (the profile's, a different resource
-    // under the same surface), the configuration's own id with a character changed, a bare
-    // digit, and a value outside the identifier alphabet. A value written in the identifier
-    // alphabet claims to be an identifier of this mint, so it is carried through to the store
-    // whatever namespace letter and width it carries — WHICH identifier was ever issued is the
-    // store's to say — while a value outside that alphabet is no identifier the service can
-    // READ at all.
+    // that was never minted, an id in another namespace at the issued width, a minted id of
+    // another kind (the profile's, a different resource under the same surface), the
+    // configuration's own id with a character changed, an id of the alphabet at no issued width
+    // (a bare digit and a 15-character one), and a value outside the identifier alphabet. A
+    // value written the way this service ISSUES an identifier — the identifier alphabet at the
+    // issued width — is carried through to the store whatever namespace letter it carries, since
+    // WHICH identifier was ever issued is the store's to say; a value outside that alphabet
+    // claims to be no identifier of this mint, so it is carried through as well; and a value of
+    // the alphabet at no issued width is the identifier the service cannot READ.
     let mut mangled: Vec<char> = stored_id.chars().collect();
     if let Some(last) = mangled.last_mut() {
         *last = if *last == 'A' { 'B' } else { 'A' };
@@ -1488,11 +1489,12 @@ async fn an_id_no_configuration_holds_is_refused_by_the_configuration_reader() {
     let mangled: String = mangled.into_iter().collect();
     for (case, expected) in [
         ("C3V3PVOY5NSBVE", NO_SUCH_CONFIG_MESSAGE),
-        ("EDFDVBD6EXAMPLE", NO_SUCH_CONFIG_MESSAGE),
+        ("EDFDVBD6EXAMPLE", UNREADABLE_ID_MESSAGE),
+        ("E2QWRUHAPOMQZL", NO_SUCH_CONFIG_MESSAGE),
         (profile.as_str(), NO_SUCH_CONFIG_MESSAGE),
         (mangled.as_str(), NO_SUCH_CONFIG_MESSAGE),
-        ("not-a-configuration-id", UNREADABLE_ID_MESSAGE),
-        ("0", NO_SUCH_CONFIG_MESSAGE),
+        ("not-a-configuration-id", NO_SUCH_CONFIG_MESSAGE),
+        ("0", UNREADABLE_ID_MESSAGE),
     ] {
         let answer = get_config_document(&router, case).await;
         assert_eq!(

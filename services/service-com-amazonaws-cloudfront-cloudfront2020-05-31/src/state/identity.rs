@@ -1237,31 +1237,31 @@ pub const ISSUED_ENTITY_ID_LEN: usize = ID_BODY_LEN + 1;
 /// alone decides about such an identifier, and the whole of what separates the two sentences
 /// the one not-found code carries.
 ///
-/// A form is refused only of a value that is WRITTEN as one of this service's identifiers:
+/// A value is READ as an identifier of this mint when it is written the way one is ISSUED: in
 /// the characters CloudFront writes an identifier in ([`is_entity_id_form`] — decimal digits
-/// and uppercase ASCII letters, carrying no separator and no lower case). Such a value claims
-/// to be an identifier, so it has to be written at the WIDTH identifiers are ISSUED at
-/// ([`ISSUED_ENTITY_ID_LEN`]) to be one: a value of the alphabet at any other width is no
-/// identifier CloudFront ever issued, and is the identifier a route reports it cannot READ
+/// and uppercase ASCII letters, carrying no separator and no lower case) at the WIDTH every
+/// identifier of this mint is issued at ([`ISSUED_ENTITY_ID_LEN`]). Such a value is carried
+/// through to the STORE — WHICH identifier was ever issued is a property of the store rather
+/// than of the value — and the record the store holds none under is the resource that is ABSENT.
+///
+/// A value written in that alphabet at ANY OTHER WIDTH claims to be an identifier of this mint
+/// and is none: no identifier CloudFront ever issued is written that way, so there is nothing in
+/// it for the service to resolve and it is the identifier a route reports it cannot READ
 /// ([`invalid_id_format`]).
 ///
-/// The width is the WHOLE of the form these routes read. The namespace letter is not: WHICH
-/// kind an identifier of the issued form was issued for is a property of the STORE rather than
-/// of the value, so a value at the issued width is carried through to it and the record it
-/// holds none under is the resource that is ABSENT — whether the leading letter is the
-/// addressed kind's own, another kind's of this service, or one no kind of it mints under.
-/// The recorded answers of this surface are what say so: a read of a field-level encryption
-/// configuration, and one of a profile, each addressed by a value of the issued form under
-/// ANOTHER namespace letter, both report the record absent rather than unreadable.
+/// A value written OUTSIDE that alphabet — in lower case, around a separator, as a UUID or as a
+/// word — makes no claim to be an identifier of this mint at all, so there is no identifier in
+/// it whose form could be wrong: the recorded answers of this surface resolve it against the
+/// store and report the resource ABSENT.
 ///
-/// A value written OUTSIDE that alphabet — in lower case, around a separator, as a UUID or as
-/// a word — makes no claim to be an identifier of this mint at all, so there is no identifier
-/// in it whose form could be wrong: the recorded answers of this surface resolve it against
-/// the store and report the resource ABSENT.
+/// The WIDTH is the whole of the form these routes read. The namespace letter is not: WHICH kind
+/// an identifier of the issued width was issued for is a property of the STORE rather than of
+/// the value, so such a value is carried through to it whether the leading letter is the
+/// addressed kind's own, another kind's of this service, or one no kind of it mints under.
 ///
 /// So the two refusals keep the conditions they describe: a value this reports `true` for is
-/// the identifier a route reports it cannot READ, and every other value the store holds
-/// nothing under is the resource that is ABSENT.
+/// the identifier a route reports it cannot READ, and every other value the store holds nothing
+/// under is the resource that is ABSENT.
 ///
 /// `prefix` is the namespace letter the addressed kind mints under, kept in the signature
 /// because it NAMES the kind this question is asked for; the identifiers of the family whose
@@ -1269,7 +1269,7 @@ pub const ISSUED_ENTITY_ID_LEN: usize = ID_BODY_LEN + 1;
 /// ([`ComAmazonawsCloudfrontCloudfront20200531State::unresolved_origin_access_control`]).
 pub fn id_format_refused_for(prefix: char, value: &str) -> bool {
     let _ = prefix;
-    !is_entity_id_form(value)
+    is_entity_id_form(value) && value.len() != ISSUED_ENTITY_ID_LEN
 }
 
 /// Whether `body` is [`ID_BODY_LEN`] characters of the id alphabet — the body every

@@ -201,6 +201,11 @@ pub(super) enum OfferedReleases {
     /// From an OpenSearch release onwards, and on no Elasticsearch release: a family
     /// the service publishes for the OpenSearch engine alone.
     SinceOpenSearch((u32, u32)),
+    /// Every ELASTICSEARCH release, and no OpenSearch release: a family the service
+    /// carried on the legacy engine line and did not carry over to the OpenSearch one,
+    /// so a domain of an OpenSearch release cannot be provisioned on it and there are
+    /// no limits to publish for the pairing.
+    ElasticsearchOnly,
 }
 
 /// One family of the published instance-type catalog: the instance types the service
@@ -227,6 +232,7 @@ impl CatalogFamily {
             OfferedReleases::Every => true,
             OfferedReleases::SinceElasticsearch(release) => version.since_elasticsearch(release),
             OfferedReleases::SinceOpenSearch(release) => version.opensearch_at_least(release),
+            OfferedReleases::ElasticsearchOnly => !version.is_opensearch(),
         }
     }
 }
@@ -750,16 +756,16 @@ pub(super) const INSTANCE_TYPE_CATALOG: &[CatalogFamily] = &[
         roles: ROLES_DATA_AND_MASTER,
         releases: OfferedReleases::Every,
     },
-    // The burstable previous generation, which the T3 family above succeeded. Like every
-    // other previous generation it is still offered on BOTH engine lines
-    // ([`PREVIOUS_GENERATION_FAMILIES`]): the catalog is not filtered by instance
-    // generation, only by the engine prerequisite a family publishes, and this one
-    // publishes none.
+    // The burstable previous generation, which the T3 family above succeeded. It is the one
+    // previous generation the service did NOT carry over to the OpenSearch engine line: the
+    // T3 family replaced it there, so a domain of an OpenSearch release cannot be provisioned
+    // on a T2 instance and the pairing has no limits to publish — while every Elasticsearch
+    // release still offers it, as the recorded catalog of those releases reports.
     CatalogFamily {
         family: "t2",
         instance_types: &["t2.micro.search", "t2.small.search", "t2.medium.search"],
         roles: ROLES_DATA_AND_MASTER,
-        releases: OfferedReleases::Every,
+        releases: OfferedReleases::ElasticsearchOnly,
     },
     // The UltraWarm tier.
     CatalogFamily {

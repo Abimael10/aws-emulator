@@ -57,7 +57,7 @@ use crate::distribution_lifecycle::{
 };
 use crate::field_level_encryption_config_lifecycle::{
     create_config, get_config, get_config_document, is_config_id, simple, table, Config,
-    ContentTypeMapping, QueryArgMapping, Section, UNREADABLE_ID_MESSAGE,
+    ContentTypeMapping, QueryArgMapping, Section,
 };
 use crate::field_level_encryption_profile_lifecycle::store_profile;
 use crate::public_key_lifecycle::is_wire_timestamp;
@@ -1008,7 +1008,7 @@ async fn an_id_no_configuration_holds_is_refused() {
         (
             "the existing id in lower case",
             id.to_lowercase(),
-            UNREADABLE_ID_MESSAGE,
+            NO_SUCH_FIELD_LEVEL_ENCRYPTION_CONFIG_MESSAGE,
         ),
         (
             "a profile id where a configuration id belongs",
@@ -1018,7 +1018,7 @@ async fn an_id_no_configuration_holds_is_refused() {
         (
             "a token of no configuration id's shape",
             "not-a-configuration".to_string(),
-            UNREADABLE_ID_MESSAGE,
+            NO_SUCH_FIELD_LEVEL_ENCRYPTION_CONFIG_MESSAGE,
         ),
     ];
 

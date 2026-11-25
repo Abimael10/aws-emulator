@@ -32,14 +32,15 @@ use super::domain_lifecycle::{
 
 /// Pairings the service does not offer: an instance type together with an engine
 /// release that does not run it, one row per family the published instance-type
-/// catalog gates on a release (the UltraWarm family, the Graviton families and the
-/// OpenSearch-only family), each asked on a release that does not offer it and, where
+/// catalog gates on a release (the UltraWarm family, the Graviton families, the
+/// OpenSearch-only family and the previous-generation burstable family the OpenSearch
+/// line does not carry), each asked on a release that does not offer it and, where
 /// the family is gated across both engine lines, on each line.
 ///
 /// Source of the rows: the catalog `ListInstanceTypeDetails` publishes, which
 /// [`the_published_catalog_agrees_about_every_row`] below reads for each row rather
 /// than this suite asserting the gates against themselves.
-const UNOFFERED: [(&str, &str); 8] = [
+const UNOFFERED: [(&str, &str); 10] = [
     ("Elasticsearch_5.1", "ultrawarm1.medium.search"),
     ("Elasticsearch_6.7", "ultrawarm1.xlarge.search"),
     ("Elasticsearch_7.1", "c6g.large.search"),
@@ -48,13 +49,15 @@ const UNOFFERED: [(&str, &str); 8] = [
     ("Elasticsearch_7.10", "or1.large.search"),
     ("OpenSearch_1.3", "or1.medium.search"),
     ("OpenSearch_2.3", "or1.medium.search"),
+    ("OpenSearch_1.0", "t2.micro.search"),
+    ("OpenSearch_2.11", "t2.small.search"),
 ];
 
 /// Pairings the service DOES offer, as the counterpart of each row above: the release
 /// each gated family is offered from, a later release of the same line, an ungated
-/// family on an early release, and the previous-generation burstable family — for which
-/// the service publishes no engine prerequisite — on each engine line.
-const OFFERED: [(&str, &str); 9] = [
+/// family on an early release, and the previous-generation burstable family — which the
+/// OpenSearch line does not carry — on the Elasticsearch line it is published for.
+const OFFERED: [(&str, &str); 8] = [
     ("Elasticsearch_6.8", "ultrawarm1.medium.search"),
     ("Elasticsearch_7.9", "c6g.large.search"),
     ("Elasticsearch_7.10", "t4g.small.search"),
@@ -63,7 +66,6 @@ const OFFERED: [(&str, &str); 9] = [
     ("Elasticsearch_5.1", "m5.large.search"),
     ("Elasticsearch_7.10", "t2.medium.search"),
     ("Elasticsearch_1.5", "t2.small.search"),
-    ("OpenSearch_2.11", "t2.small.search"),
 ];
 
 /// This suite's OWN statement of the refusal text: the fixed sentence, whose single

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The ALPHABET a field-level encryption path identifier is written in is what every operation
+//! The WIDTH a field-level encryption path identifier is written at is what every operation
 //! addressed by one reads of it, of a value that is WRITTEN as an identifier of this service's
 //! mint, end to end over HTTP.
 //!
@@ -8,18 +8,20 @@
 //! the kind's ONE modelled not-found code and its 404 for every identifier it cannot resolve
 //! (`smithy_query(query="operation",operation="GetFieldLevelEncryption,GetFieldLevelEncryptionConfig,GetFieldLevelEncryptionProfile,GetFieldLevelEncryptionProfileConfig")`
 //! reports the kind's not-found error and `AccessDenied` and nothing else), so the MESSAGE is
-//! all that tells the two conditions apart, and the ALPHABET the value is written in is what
-//! decides it:
+//! all that tells the two conditions apart, and the FORM this service ISSUES an identifier in is
+//! what decides it:
 //!
 //! * the configuration's `/config` read, the profile's two reads, and the updates and deletes
-//!   of both read the alphabet a value is WRITTEN in: a value written in the identifier
-//!   alphabet (digits and uppercase letters, no separator and no lower case) claims to be an
-//!   identifier this service issued, so it is carried through to the STORE whatever body,
-//!   width or namespace letter it carries — WHICH identifier was ever issued, and for which
-//!   kind, is a property of the store rather than of the value — and the record the store
-//!   holds none under is the record reported ABSENT. A value written OUTSIDE that alphabet is
-//!   no identifier of this mint at all, so there is nothing in it for the service to resolve:
-//!   it is the identifier the service reports it cannot READ ("Id format is invalid");
+//!   of both read the WIDTH a value of the identifier alphabet (digits and uppercase letters, no
+//!   separator and no lower case) is written at. A value of that alphabet at the width an
+//!   identifier is ISSUED at is carried through to the STORE whatever body or namespace letter
+//!   it carries — WHICH identifier was ever issued, and for which kind, is a property of the
+//!   store rather than of the value — and the record the store holds none under is the record
+//!   reported ABSENT. A value of that alphabet at any OTHER width claims to be an identifier of
+//!   this mint and is none, so it is the identifier the service reports it cannot READ ("Id
+//!   format is invalid"). A value written OUTSIDE the alphabet claims to be no identifier of
+//!   this mint at all, so it has no form to be wrong: it is resolved against the store and
+//!   reported ABSENT;
 //! * `GetFieldLevelEncryption`, the configuration's resource read, reads NO form at all: `Id`
 //!   is a plain `string` `@httpLabel` with no `@pattern` and no `@length`, so every value
 //!   whatever its form is carried through to the store there, and the one the store holds no
@@ -41,9 +43,8 @@
 //!   path identifier — both readers, the update and the delete;
 //! * and the values that are outside the alphabet altogether: a minted identifier in lower
 //!   case, the kind's own letter over a lower-cased body, a UUID, a caller reference, a
-//!   hyphenated word and an identifier body carrying a separator — the identifier reported
-//!   UNREADABLE on every route that reads the alphabet, and the record reported absent on the
-//!   one that reads none.
+//!   hyphenated word and an identifier body carrying a separator — the record reported ABSENT
+//!   on every route, since a value of no identifier form claims no form to be refused.
 //!
 //! The issued width is read off an identifier this emulator really issued, so no width here is
 //! written out by hand. The harness, the document builders and the create paths are the
@@ -303,14 +304,13 @@ pub(crate) fn in_the_identifier_alphabet(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase())
 }
 
-/// Whether `id` is written in the form the kind's identifiers are ISSUED in: the identifier
-/// alphabet, whatever body, width or namespace letter it carries, since WHICH identifier was
-/// ever issued — and for which kind — is a property of the store rather than of the value.
-/// `minted` is an identifier this emulator really issued for the kind, kept in the signature
-/// because it is what the rows are derived from.
+/// Whether `id` is written the way this service ISSUES an identifier: the identifier alphabet
+/// at the WIDTH an identifier is issued at, whatever body or namespace letter it carries, since
+/// WHICH identifier was ever issued — and for which kind — is a property of the store rather
+/// than of the value. `minted` is an identifier this emulator really issued for the kind, so the
+/// width is read off a real identifier rather than written out here.
 pub(crate) fn of_the_issued_form(id: &str, minted: &str) -> bool {
-    let _ = minted;
-    in_the_identifier_alphabet(id)
+    in_the_identifier_alphabet(id) && id.len() == minted.len()
 }
 
 /// The sentence every operation addressed by an identifier of `kind` answers `id` when the
@@ -318,17 +318,22 @@ pub(crate) fn of_the_issued_form(id: &str, minted: &str) -> bool {
 /// for that kind.
 ///
 /// The two sentences of the kind's one not-found code: the unreadable identifier for a value
-/// written OUTSIDE the alphabet this service writes an identifier in, which is no identifier of
-/// this mint for the service to resolve at all, and the absent record for every value written
-/// INSIDE it — whatever body, width or namespace letter it carries — as well as for every value
-/// whatever its form on the one route that reads no form ([`reads_the_form`]).
+/// written IN the alphabet this service writes an identifier in at a width it issues no
+/// identifier at — a value claiming to be an identifier of this mint that none of them could be
+/// — and the absent record for every value of the ISSUED width, whatever body or namespace
+/// letter it carries, for every value written outside the alphabet altogether (which claims to
+/// be no identifier of this mint, so it has no form to be wrong), and for every value whatever
+/// its form on the one route that reads no form ([`reads_the_form`]).
 pub(crate) fn unresolved_answer(
     operation: &str,
     kind: Kind,
     id: &str,
     minted: &str,
 ) -> &'static str {
-    if reads_the_form(operation) && !of_the_issued_form(id, minted) {
+    if reads_the_form(operation)
+        && in_the_identifier_alphabet(id)
+        && !of_the_issued_form(id, minted)
+    {
         UNREADABLE_IDENTIFIER
     } else {
         kind.absent()

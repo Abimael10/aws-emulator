@@ -644,13 +644,13 @@ async fn a_continuation_token_no_listing_issued_is_refused_by_naming_the_paramet
     );
 }
 
-/// Whether `token` is written in base64's url-safe alphabet, unpadded (RFC 4648 §5), which is
+/// Whether `token` is written in base64's standard alphabet, padded (RFC 4648 §4), which is
 /// the alphabet an object listing's continuation token is spelled in.
 fn is_base64(token: &str) -> bool {
     !token.is_empty()
         && token
             .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '+' | '/' | '='))
 }
 
 /// Whether `token` is written in lowercase hexadecimal, which is the alphabet the account's
@@ -697,13 +697,13 @@ fn flip_last(token: &str) -> String {
     characters.into_iter().collect()
 }
 
-/// Assert that `token` is an opaque cursor over `position`: url-safe base64 text, and no
+/// Assert that `token` is an opaque cursor over `position`: standard base64 text, and no
 /// rendering of
 /// that position a caller could compute for itself.
 fn assert_opaque(case: &str, token: &str, position: &str) {
     assert!(
         is_base64(token),
-        "case {case:?}: a continuation token is url-safe base64 text, got {token:?}"
+        "case {case:?}: a continuation token is standard base64 text, got {token:?}"
     );
     assert_no_computable_spelling(case, token, position);
     // And the position's own text is nowhere in it — read only for a position wide enough

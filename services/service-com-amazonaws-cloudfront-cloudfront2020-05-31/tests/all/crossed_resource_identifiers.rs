@@ -25,11 +25,13 @@
 //!   nor the width of its body says which of them issued it: those routes read the identifier
 //!   ALPHABET (digits and uppercase letters, no separator and no lower case) and nothing more;
 //! * a field-level encryption configuration's and a profile's identifiers come from namespaces
-//!   of their OWN (`C` and `P`), so a value WRITTEN as an identifier of this service's mint — in
-//!   that same alphabet — says which namespace it came from and how wide it is: those routes
-//!   read the whole issued form, and refuse a value of another namespace, or of any namespace at
-//!   another width, as unreadable. A value outside the alphabet is no identifier of the mint at
-//!   all and claims no form for them to refuse, so they resolve it against the store.
+//!   of their OWN (`C` and `P`), so those routes read the WIDTH a value of that alphabet is
+//!   written at: one as wide as an identifier this service issues is carried through to the
+//!   store whatever namespace letter it carries — WHICH identifier was ever issued, and for
+//!   which kind, stays the store's to say — while one of the alphabet at any other width claims
+//!   to be an identifier of this mint that none of them could be, and is unreadable. A value
+//!   outside the alphabet is no identifier of the mint at all and claims no form for them to
+//!   refuse, so they resolve it against the store.
 //!
 //! The rows are the CROSSOVER: four resource kinds are created through their own APIs, and
 //! each one's really-minted identifier is then submitted to every other kind's route, beside
@@ -123,15 +125,29 @@ impl Route {
 
     /// The sentence this route owes `id` when nothing of its kind answers to it.
     ///
-    /// Every route of both families reads the ALPHABET alone: a value written in it is carried
-    /// through to the store, since WHICH identifier was issued — and for which kind — is a
-    /// property of the store, so the record it holds none under is the record reported ABSENT;
-    /// a value outside it is the identifier the route reports it cannot READ.
+    /// How much of the value a route reads is the resource kind's own recorded contract. The
+    /// origin access control's routes read the ALPHABET alone, because its identifiers come
+    /// from the namespace its kind SHARES with the distributions: a value written in it is
+    /// carried through to the store, so the record it holds none under is reported ABSENT, and
+    /// a value outside it is the identifier the route reports it cannot READ. The field-level
+    /// encryption routes read the WIDTH instead: a value of the alphabet at the width this
+    /// service issues an identifier at is carried through to the store whatever namespace letter
+    /// it carries, one of the alphabet at any other width is the identifier they cannot read,
+    /// and a value outside the alphabet claims to be no identifier of this mint at all, so it is
+    /// carried through to the store too.
     fn expected(self, id: &str) -> &'static str {
-        if in_the_identifier_alphabet(id) {
-            self.absent()
-        } else {
+        let unreadable = match self {
+            Self::OriginAccessControl | Self::OriginAccessControlConfig => {
+                !in_the_identifier_alphabet(id)
+            }
+            Self::FieldLevelEncryptionConfig | Self::FieldLevelEncryptionProfile => {
+                in_the_identifier_alphabet(id) && id.len() != MINTED_ID_WIDTH
+            }
+        };
+        if unreadable {
             UNREADABLE_IDENTIFIER
+        } else {
+            self.absent()
         }
     }
 }

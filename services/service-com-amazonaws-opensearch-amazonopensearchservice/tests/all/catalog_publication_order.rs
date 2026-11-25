@@ -31,7 +31,9 @@ use serde_json::{json, Value};
 
 use super::compatible_versions::rank;
 use super::domain_lifecycle::Emulator;
-use super::instance_type_catalog::{instance_types, list, whole_listing};
+use super::instance_type_catalog::{
+    instance_types, list, whole_listing, PREVIOUS_GENERATION_BURSTABLE,
+};
 
 /// The releases every case below spans: the oldest Elasticsearch release, the releases
 /// the catalog gates an instance family on and one either side of them, the engine-line
@@ -161,6 +163,7 @@ async fn a_later_release_publishes_the_earlier_listing_in_the_same_order() {
                 continue;
             }
             let case = format!("{earlier} -> {later}");
+            let crosses_the_fork = earlier.starts_with("Elasticsearch_") && later.starts_with("OpenSearch_");
 
             // Walk the later listing once: each type of the earlier listing appears in
             // it after the types it followed there, so the earlier listing is the later
@@ -170,7 +173,19 @@ async fn a_later_release_publishes_the_earlier_listing_in_the_same_order() {
                 // A release offers at least what an earlier release of the succession
                 // offers: every family the catalog gates is gated on a release it is
                 // offered FROM, so nothing an earlier listing published is missing from a
-                // later one.
+                // later one — except across the engine-line FORK, which the burstable
+                // previous generation did not cross
+                // (`super::instance_type_catalog::PREVIOUS_GENERATION_BURSTABLE`).
+                if crosses_the_fork
+                    && PREVIOUS_GENERATION_BURSTABLE.contains(&instance_type.as_str())
+                {
+                    assert!(
+                        !later_types.contains(instance_type),
+                        "case {case}: expected the burstable previous generation not to cross \
+                         the engine-line fork, got {instance_type} published"
+                    );
+                    continue;
+                }
                 assert!(
                     later_types.contains(instance_type),
                     "case {case}: expected the later listing to publish {instance_type}, \

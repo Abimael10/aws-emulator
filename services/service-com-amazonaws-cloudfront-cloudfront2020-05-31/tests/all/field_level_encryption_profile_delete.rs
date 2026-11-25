@@ -636,22 +636,22 @@ async fn an_id_no_profile_holds_is_refused() {
         (
             "a known id in lower case",
             known.to_lowercase(),
-            UNREADABLE_PROFILE_ID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
         (
             "a token that is no profile id",
             "not-a-profile-id".to_string(),
-            UNREADABLE_PROFILE_ID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
         (
             "the caller reference rather than the id",
             "fle-profile-the-only-one".to_string(),
-            UNREADABLE_PROFILE_ID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
         (
             "an identifier of this mint's alphabet at no issued width",
             "PBOGUSPROFILEID0000".to_string(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_PROFILE_ID_MESSAGE,
         ),
     ];
 

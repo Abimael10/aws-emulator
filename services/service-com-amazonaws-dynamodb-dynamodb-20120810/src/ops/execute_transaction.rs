@@ -726,13 +726,11 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
         // item, so it cancels the transaction. A refusal about the VALUE the request
         // carried needs no table to decide, so it stays a request-level refusal.
         let keying = |error| cancelled_by_element(at, elements, error);
-        // The documented item-size ceiling is the ITEM's and does not move with the surface
-        // an update arrives through ([`crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE`]), and
-        // crossing it refuses the CALL: a change that would leave an item past the ceiling is
-        // a change no item could be left by, so the request is refused on its own terms and
-        // none of the transaction is applied, exactly as the `Update` action of a
-        // `TransactWriteItems` is. Every other failure applying the change finds stays that
-        // statement's own ([`keying`]).
+        // Every refusal about the item a statement's change would LEAVE is that STATEMENT's
+        // failure and cancels the transaction ([`keying`]) — the documented item-size ceiling
+        // excepted ([`crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE`]), which refuses the
+        // CALL: the change the statement spells is one the update path does not admit, so the
+        // request is refused on its own terms and none of the transaction is applied.
         let update_outcome = |error: crate::state::RequestError| match error {
             crate::state::RequestError::Validation(message)
                 if message == crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE =>
@@ -902,9 +900,10 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                     {
                         let table = store.active_table(region, &name, now).map_err(lift)?;
                         // Crossing the ceiling refuses the CALL, as it does on the other
-                        // transactional surface: the change the statement spells is one no
-                        // item could be left by, so the request is refused on its own terms
-                        // and none of the transaction is applied.
+                        // transactional surface where the item still fits the quota: the change
+                        // the statement spells is one the update path does not admit, so the
+                        // request is refused on its own terms and none of the transaction is
+                        // applied.
                         if crate::state::update_size_exceeded(table, &item, 0) {
                             return Err(crate::scaffolded::Scaffolded::validation(
                                 crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,

@@ -29,15 +29,15 @@
 //! a transaction that carries more than one.
 //!
 //! The BOUNDARIES are driven beside them: a change inside the ceiling COMMITS through a
-//! transaction and reads back, an action whose own condition is not met CANCELS the transaction
-//! with its own reason — which is what a failure of one action, as against a defect of the
-//! request, is answered with — and an item a `Put` CARRIES past the ceiling earns the sentence
-//! for an item that was carried.
+//! transaction and reads back, an action whose own condition is not met cancels the transaction
+//! with its own reason code rather than the size one, and an item a `Put` CARRIES past the
+//! ceiling earns the request refusal for an item that was carried.
 //!
 //! Source of the ceiling: "Service, Account, and Table Quotas" in the Amazon DynamoDB
 //! Developer Guide ("The maximum item size in DynamoDB is 400 KB"). Source of the class the
-//! crossing takes: the recorded answers of `TransactWriteItems` to an `Update` that grows a
-//! stored item past it.
+//! crossing takes inside a transaction: `TransactWriteItems`'s own documented cancellation
+//! conditions — "an item size becomes too large (bigger than 400 KB) [...] or a similar
+//! validation error occurs because of changes made by the transaction".
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;

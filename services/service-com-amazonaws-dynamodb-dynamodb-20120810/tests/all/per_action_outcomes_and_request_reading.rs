@@ -373,12 +373,12 @@ async fn an_action_read_against_the_stored_item_reports_its_own_cancellation_rea
 /// oversized value, two clauses that only cross together, a value the update COMPUTES from
 /// what the request carried, and a small value over an item already near the ceiling), and
 /// WHERE the crossing action sits (alone, before an action that would succeed, after one,
-/// beside an action whose condition does not hold). What stands beside it makes no difference,
-/// which is what the rows carrying siblings pin.
+/// beside an action whose condition does not hold) — which is what the reason list reports at
+/// each action's own index.
 ///
 /// The other side of the rule is driven beside them: an item a `Put` CARRIES past the ceiling
-/// is too large as SUBMITTED — a fact of the REQUEST, settled before any of the transaction is
-/// applied — so it refuses the CALL with the sentence for an item that was carried.
+/// is too large as SUBMITTED — a fact of the REQUEST, settled before any stored item is read —
+/// so it refuses the CALL with the sentence for an item that was carried and grades no action.
 #[tokio::test]
 async fn an_update_the_transaction_grows_past_the_item_quota_cancels_it() {
     let router = seeded().await;

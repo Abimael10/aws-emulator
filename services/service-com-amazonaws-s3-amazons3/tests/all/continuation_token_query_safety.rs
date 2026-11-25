@@ -6,15 +6,14 @@
 //! service mints for the caller to hand back on the `continuation-token` query parameter —
 //! "you can use this ContinuationToken for the pagination of the list results"
 //! (`ListDirectoryBucketsRequest$ContinuationToken`), "an opaque value that Amazon S3
-//! understands" (`ListBucketMetricsConfigurationsOutput$NextContinuationToken`) — so every
-//! character of it is one a URI query component carries unchanged (RFC 3986's unreserved set).
-//! A character outside that set has TWO spellings on the wire, itself and its
-//! percent-encoding, of which a SigV4 canonical request covers one: a token carrying one
-//! resumes the listing for a client that encodes it and is refused for the signature for a
-//! client that hands the value back as it was given, and a value documented as round-trippable
-//! gives a caller nothing to choose between them by. Written in the unreserved set, the
-//! verbatim hand-back and the percent-encoded hand-back are the SAME bytes, so both resume the
-//! same page.
+//! understands" (`ListBucketMetricsConfigurationsOutput$NextContinuationToken`) — so a client
+//! that puts the value on that parameter the way it puts any other query value there, with the
+//! characters a query component reads otherwise percent-encoded
+//! ([`handed_back_in_query`]), resumes the listing exactly where the page stopped. The value a
+//! listing writes in LOWERCASE HEX carries only characters of RFC 3986's unreserved set, so
+//! there the encoded hand-back and the verbatim one are the SAME bytes; the value written in
+//! base64's STANDARD alphabet carries `+`, `/` and `=`, which travel percent-encoded as any
+//! other reserved character of a query value does.
 //!
 //! The rows span what the rule generalises over: WHICH paged listing minted the token, which
 //! covers both alphabets this service writes a token in (`super::continuation_token_alphabet`
@@ -70,13 +69,33 @@ fn is_unreserved(token: &str) -> bool {
         })
 }
 
-/// Assert the rule about the token ITSELF: it carries only characters a query component
-/// carries unchanged, so percent-encoding it as a client encodes a query value leaves the
-/// value it hands back identical to the one it was given.
+/// Whether every character of `token` is one of the two alphabets this service writes a token
+/// in: lowercase hex, or base64's standard alphabet over its padding.
+fn is_a_published_alphabet(token: &str) -> bool {
+    !token.is_empty()
+        && token.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '+' | '/' | '=')
+        })
+}
+
+/// Assert the rule about the token ITSELF: it is written in one of the two alphabets this
+/// service publishes, so a client puts it on the query parameter the way it puts any query
+/// value there.
+fn assert_a_published_alphabet(case: &str, token: &str) {
+    assert!(
+        is_a_published_alphabet(token),
+        "case {case:?}: a continuation token is written in one of the two published alphabets, \
+         got {token:?}"
+    );
+}
+
+/// Assert the rule for a token of the HEX alphabet: every character of it is one a query
+/// component carries unchanged, so percent-encoding it as a client encodes a query value leaves
+/// the value it hands back identical to the one it was given.
 fn assert_travels_unchanged(case: &str, token: &str) {
     assert!(
         is_unreserved(token),
-        "case {case:?}: a continuation token is written in the characters a query component \
+        "case {case:?}: a hex continuation token is written in the characters a query component \
          carries unchanged, got {token:?}"
     );
     let encoded = handed_back_in_query(token);
@@ -87,8 +106,9 @@ fn assert_travels_unchanged(case: &str, token: &str) {
     );
 }
 
-/// RULE on the DIRECTORY-bucket listing: its token travels unchanged on the query parameter
-/// and resumes the account's listing where the page stopped, handed back VERBATIM.
+/// RULE on the DIRECTORY-bucket listing: its token is written in a published alphabet and
+/// resumes the account's listing where the page stopped, handed back the way a client puts a
+/// query value on the wire.
 #[tokio::test]
 async fn the_directory_bucket_listing_token_travels_unchanged_and_resumes_the_listing() {
     let router = router();
@@ -122,10 +142,14 @@ async fn the_directory_bucket_listing_token_travels_unchanged_and_resumes_the_li
             .filter(|token| !token.is_empty());
         match token {
             Some(token) => {
-                assert_travels_unchanged(&case, &token);
-                // Handed back VERBATIM: nothing percent-encoded, exactly as a client that
-                // round-trips the value it was given sends it.
-                query = format!("?max-directory-buckets=1&continuation-token={token}");
+                assert_a_published_alphabet(&case, &token);
+                // Handed back the way a client puts a query value on the wire: the characters
+                // a query component reads otherwise percent-encoded, everything else as it was
+                // given.
+                query = format!(
+                    "?max-directory-buckets=1&continuation-token={}",
+                    handed_back_in_query(&token)
+                );
             }
             None => {
                 assert_eq!(
@@ -145,8 +169,7 @@ async fn the_directory_bucket_listing_token_travels_unchanged_and_resumes_the_li
 }
 
 /// RULE on the OBJECT listing, whose token is written in the same alphabet: the value handed
-/// back verbatim resumes the listing, and carries only characters a query component carries
-/// unchanged.
+/// back the way a client puts a query value on the wire resumes the listing.
 #[tokio::test]
 async fn the_object_listing_token_travels_unchanged_and_resumes_the_listing() {
     let router = router();
@@ -181,8 +204,11 @@ async fn the_object_listing_token_travels_unchanged_and_resumes_the_listing() {
             );
             continue;
         }
-        assert_travels_unchanged(&case, &token);
-        query = format!("&max-keys=1&continuation-token={token}");
+        assert_a_published_alphabet(&case, &token);
+        query = format!(
+            "&max-keys=1&continuation-token={}",
+            handed_back_in_query(&token)
+        );
     }
     let mut expected: Vec<String> = keys.iter().map(|key| (*key).to_string()).collect();
     expected.sort();
@@ -222,7 +248,7 @@ async fn the_bucket_listing_token_travels_unchanged_and_resumes_the_account() {
         });
     assert_travels_unchanged(case, &token);
 
-    // Handed back VERBATIM, as the directory and object listings' tokens are above.
+    // Handed back VERBATIM: a hex token needs no encoding at all.
     let resumed = list_buckets(&router, &format!("&max-buckets=1&continuation-token={token}")).await;
     assert_eq!(
         resumed.status,

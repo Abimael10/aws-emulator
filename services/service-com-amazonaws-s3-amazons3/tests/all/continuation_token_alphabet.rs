@@ -12,14 +12,13 @@
 //! round-tripped rather than parsed, so what the alphabet decides is what a client reading
 //! the value's FORM sees.
 //!
-//! What the two alphabets have in common is not free: the value travels on the
-//! `continuation-token` query parameter, so every character of it is one a URI query component
-//! carries unchanged (RFC 3986's unreserved set) — the base64 one is base64's URL-SAFE
-//! alphabet without padding (RFC 4648 §5, `A-Za-z0-9-_`), the hex one is `0-9a-f`. A client
-//! that percent-encodes the value it was given ([`handed_back_in_query`]) and a client that
-//! hands it back VERBATIM therefore send the same bytes, and both resume the same page, which
-//! is what a signed request needs: a character with two spellings on the wire has only one of
-//! them inside the signature.
+//! What the two alphabets are is not free: each is the one AWS writes that listing's own
+//! tokens in — the base64 one is base64's STANDARD alphabet over its padding (RFC 4648 §4,
+//! `A-Za-z0-9+/` and `=`), the hex one is `0-9a-f`. The value travels on the
+//! `continuation-token` query parameter, where the three characters of the base64 alphabet a
+//! query component reads otherwise travel percent-encoded ([`handed_back_in_query`]), exactly
+//! as any other query value's reserved characters do — which is what a signed request needs:
+//! a character with two spellings on the wire has only one of them inside the signature.
 //!
 //! The rows span what the rule generalises over: the LISTING that minted the token (the
 //! objects a bucket holds and the buckets an account holds), the shape of the position it
@@ -39,8 +38,8 @@ use super::object_storage::{list_objects_v2, listing_of, store_keys};
 
 /// The characters a QUERY COMPONENT reads otherwise, which a client percent-encodes: `+` is
 /// the form-encoded space, `/` is a path separator and `=` separates a parameter from its
-/// value. A continuation token of this service carries none of them (the suite's own rule), so
-/// this encoder is the identity on one — it is what makes that assertable rather than assumed.
+/// value. Base64's standard alphabet carries all three, so this encoder is what puts a token of
+/// that alphabet on the wire the way an SDK does.
 const QUERY_VALUE: &AsciiSet = &CONTROLS.add(b'+').add(b'/').add(b'=');
 
 /// `token` as a client puts it on the `continuation-token` query parameter: percent-encoded,
@@ -59,18 +58,18 @@ fn is_lowercase_hex(token: &str) -> bool {
     !token.is_empty() && token.chars().all(|character| matches!(character, '0'..='9' | 'a'..='f'))
 }
 
-/// Whether `token` is written in base64's URL-SAFE alphabet, unpadded (RFC 4648 §5).
-fn is_url_safe_base64(token: &str) -> bool {
+/// Whether `token` is written in base64's STANDARD alphabet, padded (RFC 4648 §4).
+fn is_standard_base64(token: &str) -> bool {
     !token.is_empty()
         && token
             .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '+' | '/' | '='))
 }
 
-/// Which of base64's three alignment classes `token` is of: the length modulo four, which an
-/// unpadded value carries instead of padding characters.
+/// Which of base64's three alignment classes `token` is of: the padding it carries, which a
+/// padded value writes as one `=`, two, or none at all.
 fn alignment(token: &str) -> usize {
-    token.len() % 4
+    token.chars().filter(|character| *character == '=').count()
 }
 
 /// The `NextContinuationToken` of a `ListObjectsV2` answer, which a truncated page carries.
@@ -114,21 +113,21 @@ fn assert_carries_no_position(case: &str, token: &str, position: &str) {
     }
 }
 
-/// Assert an object listing's token SPELLING: base64's url-safe alphabet, decodable as
-/// unpadded url-safe base64, and no rendering of the position it resumes at.
+/// Assert an object listing's token SPELLING: base64's standard alphabet, decodable as padded
+/// standard base64, and no rendering of the position it resumes at.
 fn assert_spelled_in_base64(case: &str, token: &str, position: &str) {
     use ::base64::Engine as _;
     assert!(
-        is_url_safe_base64(token),
-        "case {case:?}: a continuation token of an object listing is url-safe base64, got \
+        is_standard_base64(token),
+        "case {case:?}: a continuation token of an object listing is standard base64, got \
          {token:?}"
     );
     assert!(
-        ::base64::engine::general_purpose::URL_SAFE_NO_PAD
+        ::base64::engine::general_purpose::STANDARD
             .decode(token)
             .is_ok(),
-        "case {case:?}: a continuation token of an object listing decodes as unpadded \
-         url-safe base64, got {token:?}"
+        "case {case:?}: a continuation token of an object listing decodes as padded \
+         standard base64, got {token:?}"
     );
     assert_carries_no_position(case, token, position);
 }
@@ -149,11 +148,11 @@ fn object_rows() -> Vec<(&'static str, Vec<&'static str>)> {
     ]
 }
 
-/// RULE: every token the object listing mints is spelled in base64's url-safe alphabet and
+/// RULE: every token the object listing mints is spelled in base64's standard alphabet and
 /// resumes the listing exactly where the page stopped when it is handed back on the query
 /// parameter the way a client hands a query value back.
 #[tokio::test]
-async fn an_object_listing_token_is_url_safe_base64_and_resumes_the_page() {
+async fn an_object_listing_token_is_standard_base64_and_resumes_the_page() {
     let router = router();
     let mut seen_alignment: Vec<usize> = Vec::new();
 
@@ -214,9 +213,9 @@ async fn an_object_listing_token_is_url_safe_base64_and_resumes_the_page() {
         );
     }
 
-    // The rows covered every base64 alignment, so the rule was read back at each of them. An
-    // unpadded value carries its alignment in its length, so the classes are 0, 2 and 3.
-    for class in [0_usize, 2, 3] {
+    // The rows covered every base64 alignment, so the rule was read back at each of them. A
+    // padded value carries its alignment in its padding, so the classes are 0, 1 and 2 `=`.
+    for class in [0_usize, 1, 2] {
         assert!(
             seen_alignment.contains(&class),
             "the rows must cover every base64 alignment class, got {seen_alignment:?} with \
@@ -225,44 +224,50 @@ async fn an_object_listing_token_is_url_safe_base64_and_resumes_the_page() {
     }
 }
 
-/// RULE, the verbatim hand-back: a client that returns the value it was given unread, with
-/// nothing percent-encoded, resumes the same page — every character of the value is one a
-/// query component carries unchanged, so the verbatim form and the encoded form are the same
-/// bytes.
+/// RULE, the hand-back of a HEX-spelled token: the alphabet the account's own bucket listing
+/// writes its token in carries only characters a query component reads as themselves, so a
+/// client that returns that value unread, with nothing percent-encoded, resumes the same page —
+/// the verbatim form and the encoded form are the same bytes there.
 #[tokio::test]
-async fn a_token_handed_back_verbatim_resumes_the_same_page() {
+async fn a_hex_token_handed_back_verbatim_resumes_the_same_page() {
     let router = router();
-
-    for (index, (case, keys)) in object_rows().into_iter().enumerate() {
-        let bucket_name = format!("token-verbatim-objects-{index}");
-        create_bucket(&router, &bucket_name, None, None).await;
-        store_keys(&router, &bucket_name, &keys).await;
-
-        let first = list_objects_v2(&router, &bucket_name, "&max-keys=1").await;
-        let token = object_token(case, &first);
-        let resumed = list_objects_v2(
-            &router,
-            &bucket_name,
-            &format!("&continuation-token={token}"),
-        )
-        .await;
-        assert_eq!(
-            resumed.status,
-            200,
-            "case {case:?}: the value the listing handed back resumes it, got {} with body {:?}",
-            resumed.status,
-            text(&resumed)
-        );
-        assert_eq!(
-            listing_of(&resumed).keys(),
-            keys[1..]
-                .iter()
-                .map(|key| (*key).to_string())
-                .collect::<Vec<_>>(),
-            "case {case:?}: the resumed page reports the keys the first page left, got {:?}",
-            listing_of(&resumed).keys()
-        );
+    let names = [
+        "token-verbatim-hex-a",
+        "token-verbatim-hex-b",
+        "token-verbatim-hex-c",
+    ];
+    for name in names {
+        create_bucket(&router, name, None, None).await;
     }
+
+    let case = "the account's buckets, one per page";
+    let first = list_buckets(&router, "&max-buckets=1").await;
+    let token = bucket_token(case, &first);
+    assert!(
+        is_lowercase_hex(&token),
+        "case {case:?}: the bucket listing's token is lowercase hex, got {token:?}"
+    );
+    assert_eq!(
+        handed_back_in_query(&token),
+        token,
+        "case {case:?}: a hex token percent-encodes to itself, so the two hand-backs are the \
+         same bytes"
+    );
+
+    let resumed = list_buckets(&router, &format!("&max-buckets=1&continuation-token={token}")).await;
+    assert_eq!(
+        resumed.status,
+        200,
+        "case {case:?}: the value the listing handed back resumes it, got {} with body {:?}",
+        resumed.status,
+        text(&resumed)
+    );
+    assert_eq!(
+        resumed.elements("Name"),
+        vec![names[1].to_string()],
+        "case {case:?}: the resumed page reports the bucket the first page left, got {:?}",
+        resumed.elements("Name")
+    );
 }
 
 /// RULE, on the other listing: the account's own bucket listing spells its token in the

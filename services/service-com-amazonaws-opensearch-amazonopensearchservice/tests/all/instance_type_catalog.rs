@@ -99,12 +99,11 @@ const PREVIOUS_GENERATION_FAMILIES: [&str; 8] = ["c4", "d2", "i2", "m3", "m4", "
 /// hot-tier families.
 const WARM_FAMILY: &str = "ultrawarm1";
 
-/// The previous-generation BURSTABLE instance types, which the catalog offers on both
-/// engine lines like every other previous generation: the `t3` family succeeded them but
-/// the service publishes no engine prerequisite for them, so no release stops offering
-/// them. Read off the published catalog by
-/// [`the_previous_generation_burstable_family_is_offered_on_both_engine_lines`] rather
-/// than asserted against the service's own table.
+/// The previous-generation BURSTABLE instance types, which the catalog offers on the
+/// ELASTICSEARCH line alone: the `t3` family succeeded them, and the OpenSearch line carries
+/// that one instead, so no OpenSearch release offers these. Read off the published catalog by
+/// [`the_previous_generation_burstable_family_is_offered_on_the_elasticsearch_line_alone`]
+/// rather than asserted against the service's own table.
 pub(crate) const PREVIOUS_GENERATION_BURSTABLE: [&str; 3] =
     ["t2.micro.search", "t2.small.search", "t2.medium.search"];
 
@@ -391,16 +390,11 @@ async fn the_listing_is_published_in_the_catalogs_documented_order() {
     }
 
     // The catalog is not filtered by instance GENERATION: a previous-generation family
-    // is published for a current release too, after the current generations — the
-    // burstable previous generation among them
-    // ([`PREVIOUS_GENERATION_BURSTABLE`]).
+    // is published for a current release too, after the current generations — every one of
+    // them except the burstable previous generation, which the OpenSearch line does not
+    // carry at all ([`PREVIOUS_GENERATION_BURSTABLE`]).
     let current = instance_types(&whole_listing(&emulator, "OpenSearch_2.19", "").await);
-    for previous_generation in [
-        "c4.4xlarge.search",
-        "m4.large.search",
-        "r4.2xlarge.search",
-        "t2.small.search",
-    ] {
+    for previous_generation in ["c4.4xlarge.search", "m4.large.search", "r4.2xlarge.search"] {
         assert!(
             current.contains(&previous_generation.to_string()),
             "case {previous_generation} on OpenSearch_2.19: expected the catalog to carry \
@@ -408,6 +402,14 @@ async fn the_listing_is_published_in_the_catalogs_documented_order() {
             current.len()
         );
     }
+    // And the Elasticsearch line carries the burstable one, which is where it is published.
+    let legacy = instance_types(&whole_listing(&emulator, "Elasticsearch_7.10", "").await);
+    assert!(
+        legacy.contains(&"t2.small.search".to_string()),
+        "case t2.small.search on Elasticsearch_7.10: expected the legacy line to carry the \
+         burstable previous generation, got {} entries",
+        legacy.len()
+    );
 }
 
 #[tokio::test]
@@ -460,12 +462,20 @@ async fn the_listing_is_the_catalog_the_named_release_offers() {
         );
     }
 
-    // A release offers at least what an earlier release of the line offers: a family is
-    // introduced for a release and is offered from it onwards, so the catalog grows
-    // along the succession and loses nothing.
+    // A release offers at least what an earlier release of the SAME LINE offers: a family is
+    // introduced for a release and is offered from it onwards, so the catalog grows along the
+    // succession and loses nothing. Across the FORK the rule is weaker, because one family did
+    // not cross it: the burstable previous generation the OpenSearch line does not carry
+    // ([`PREVIOUS_GENERATION_BURSTABLE`]), which is the only thing an OpenSearch release may
+    // have lost from an Elasticsearch one.
+    let crosses_the_fork: BTreeSet<String> = PREVIOUS_GENERATION_BURSTABLE
+        .iter()
+        .map(|instance_type| (*instance_type).to_string())
+        .collect();
     for earlier in VERSIONS {
         for later in VERSIONS {
-            let succeeds = if parse(earlier).0 == parse(later).0 {
+            let same_line = parse(earlier).0 == parse(later).0;
+            let succeeds = if same_line {
                 (parse(later).1, parse(later).2) >= (parse(earlier).1, parse(earlier).2)
             } else {
                 is_opensearch(later)
@@ -481,7 +491,10 @@ async fn the_listing_is_the_catalog_the_named_release_offers() {
                 instance_types(&whole_listing(&emulator, later, "").await)
                     .into_iter()
                     .collect();
-            let lost: Vec<&String> = earlier_types.difference(&later_types).collect();
+            let lost: Vec<&String> = earlier_types
+                .difference(&later_types)
+                .filter(|instance_type| same_line || !crosses_the_fork.contains(*instance_type))
+                .collect();
             assert!(
                 lost.is_empty(),
                 "case {earlier} -> {later}: expected a release to offer every instance \
@@ -492,21 +505,21 @@ async fn the_listing_is_the_catalog_the_named_release_offers() {
 }
 
 #[tokio::test]
-async fn the_previous_generation_burstable_family_is_offered_on_both_engine_lines() {
+async fn the_previous_generation_burstable_family_is_offered_on_the_elasticsearch_line_alone() {
     let emulator = Emulator::new();
 
-    // Every release of the version table, so the rule is read off the published catalog
-    // on both engine lines: a previous generation the service publishes no engine
-    // prerequisite for is offered on every release, however early or late and whichever
-    // engine it runs.
+    // Every release of the version table, so the rule is read off the published catalog on
+    // both engine lines: the burstable previous generation is offered on every Elasticsearch
+    // release, however early or late, and on no OpenSearch release — the T3 family succeeded
+    // it there, so a domain of an OpenSearch release cannot be provisioned on one.
     for version in VERSIONS {
         let offered = instance_types(&whole_listing(&emulator, version, "").await);
         for instance_type in PREVIOUS_GENERATION_BURSTABLE {
-            assert!(
+            assert_eq!(
                 offered.contains(&instance_type.to_string()),
-                "case {instance_type} on {version}: expected a previous generation with no \
-                 published engine prerequisite to be offered on every release, got {} \
-                 entries",
+                !is_opensearch(version),
+                "case {instance_type} on {version}: expected the burstable previous generation \
+                 to be offered on the Elasticsearch line alone, got {} entries",
                 offered.len()
             );
         }
@@ -707,9 +720,15 @@ async fn a_feature_available_on_one_release_stays_available_on_a_later_one() {
                     .pop()
                     .expect("one entry has one InstanceType");
                 // A family the later release's engine offers no entry of carries no
-                // feature forward, and the catalog gates none: every type an earlier
-                // listing published is in the later one.
+                // feature forward: every type an earlier listing published is in the later
+                // one, EXCEPT across the fork, where the burstable previous generation did
+                // not cross ([`PREVIOUS_GENERATION_BURSTABLE`]).
                 let case = format!("{instance_type}: {earlier} -> {later}");
+                if earlier_engine != later_engine
+                    && PREVIOUS_GENERATION_BURSTABLE.contains(&instance_type.as_str())
+                {
+                    continue;
+                }
                 let successor = later_listing
                     .iter()
                     .find(|candidate| candidate["InstanceType"].as_str() == Some(&instance_type))

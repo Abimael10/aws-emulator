@@ -51,8 +51,9 @@ enum Surface {
     /// The single-item update.
     UpdateItem,
     /// The `Update` action of a transaction, held to the same ceiling as the single-item
-    /// update and cancelling the transaction with that action's reason, in that same
-    /// sentence, when a change crosses it.
+    /// update: it cancels the transaction with that action's reason, in that same sentence,
+    /// where the item the change leaves is past the quota in the bytes it stores, and refuses
+    /// the call where only what the request's own accounting charges crossed the ceiling.
     TransactWriteItems,
     /// A PartiQL `UPDATE` run on its own.
     ExecuteStatement,

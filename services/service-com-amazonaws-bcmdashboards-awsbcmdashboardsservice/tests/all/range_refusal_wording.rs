@@ -3,15 +3,14 @@
 //! How this service states a NUMERIC value outside its member's declared range, over the
 //! wire.
 //!
-//! The rule: a boundary refusal of a value outside a member's modelled `@range` states the
-//! REJECTED VALUE the request carried, the member it sat at and the bound that member's
-//! values have to respect — `Value '<the number submitted>' at '<member path>' failed to
-//! satisfy constraint: Member must have value {less,greater} than or equal to <bound>`. The
-//! value and the member path come from the request and the bound from the member's declared
-//! range, so the sentence reads the same way at whichever end of the range and on whichever
-//! member, and a client parsing it always learns WHICH value was refused. The rule holds for
-//! the CLASS, not for an operation or a member: every `@range` member of this service's
-//! surface quotes its value that way, as every other constraint class does. Everything else
+//! The rule: a boundary refusal of a value outside a member's modelled `@range` names the
+//! member it sat at and the bound that member's values have to respect, and quotes NO number —
+//! `Value at '<member path>' failed to satisfy constraint: Member must have value
+//! {less,greater} than or equal to <bound>`. The member path comes from the request and the
+//! bound from the member's declared range, so the sentence reads the same way at whichever end
+//! of the range and on whichever member. The rule holds for the CLASS, not for an operation or
+//! a member: every `@range` member of this service's surface is stated that way, where every
+//! OTHER constraint class still quotes the value it was handed. Everything else
 //! about the refusal is the framework's and unchanged: HTTP 400, `ValidationException`, the
 //! `N validation error(s) detected: ` envelope, and the member path including a list index.
 //!
@@ -25,15 +24,16 @@
 //! 1..100, `WidgetWidth` 2..6, `WidgetHeight` 4..10; they are the only `@range` members the
 //! model declares.
 //!
-//! Two neighbouring tests pin the SCOPE of the rule: another constraint class states the
-//! value it was given too, and a request that breaks a range AND a length states both
-//! clauses under one envelope, each quoting what it was handed.
+//! Two neighbouring tests pin the SCOPE of the rule: another constraint class still states the
+//! value it was given, and a request that breaks a range AND a length states both clauses
+//! under one envelope, each in its own voice.
 //!
 //! A last table varies the COUNT: the clause is built per VIOLATION, so a request that breaks
-//! several declared ranges at once is answered with one value-quoting clause per violated
+//! several declared ranges at once is answered with one valueless clause per violated
 //! member under the counted envelope — two ranges on one widget, one range on each of several
 //! widgets, both ends of both widget members on an update — and a request that breaks a range
-//! and another class quotes a value in every clause, whatever the number of clauses stated.
+//! and another class quotes a value in the OTHER class's clause alone, whatever the number of
+//! clauses stated.
 //!
 //! Every call goes through the real router, so what these tests assert is what an SDK client
 //! sees.
@@ -59,18 +59,18 @@ pub(crate) fn one_error(clause: &str) -> String {
     format!("1 validation error detected: {clause}")
 }
 
-/// The clause a `@range` violation states: the value the request submitted, the member path
-/// it sat at and the bound that member's values have to respect.
-pub(crate) fn range_clause(submitted: i64, path: &str, requirement: &str) -> String {
-    format!("Value '{submitted}' at '{path}' failed to satisfy constraint: {requirement}")
+/// The clause a `@range` violation states: the member path the value sat at and the bound that
+/// member's values have to respect, with no value quoted.
+pub(crate) fn range_clause(path: &str, requirement: &str) -> String {
+    format!("Value at '{path}' failed to satisfy constraint: {requirement}")
 }
 
-/// The opening of a clause that states NO value: `Value` runs straight into `at` — what a
-/// `@range` clause must NOT read like, since the rejected value is request-derived.
+/// The opening of a clause that states NO value: `Value` runs straight into `at` — what every
+/// `@range` clause of this service reads like.
 pub(crate) const VALUELESS_OPENING: &str = "Value at '";
 
-/// The opening of the half of a clause that QUOTES the value the request submitted — what
-/// every constraint class carries, the `@range` class among them.
+/// The opening of the half of a clause that QUOTES the value the request submitted — what the
+/// constraint classes OTHER than `@range` carry.
 pub(crate) const VALUE_HALF_OPENING: &str = "Value '";
 
 /// The requirement a value above `max` broke, as the framework words that class.
@@ -241,7 +241,7 @@ fn range_cases() -> Vec<RangeCase> {
 }
 
 #[tokio::test]
-async fn a_range_refusal_states_the_rejected_value_the_member_and_the_bound() {
+async fn a_range_refusal_states_the_member_and_the_bound_and_no_value() {
     let router = router();
 
     for case in range_cases() {
@@ -268,20 +268,20 @@ async fn a_range_refusal_states_the_rejected_value_the_member_and_the_bound() {
         let message = error_message(&body);
         assert_eq!(
             message,
-            one_error(&range_clause(submitted, path, &requirement)),
-            "case {label:?}: expected the clause to state the rejected value, the member and \
-             the bound, got {message:?}"
+            one_error(&range_clause(path, &requirement)),
+            "case {label:?}: expected the clause to state the member and the bound, got \
+             {message:?}"
         );
-        // The clause quotes the number the request carried, at the member it sat at.
+        // The clause names the member it refused and quotes nothing of the number the
+        // request carried.
         assert!(
-            message.contains(&format!("{VALUE_HALF_OPENING}{submitted}' at '{path}'")),
-            "case {label:?}: the clause must quote {submitted} at the member it refused, got \
-             {body}"
+            message.contains(&format!("{VALUELESS_OPENING}{path}'")),
+            "case {label:?}: the clause must name {path} with no value half, got {body}"
         );
         assert!(
-            !message.contains(VALUELESS_OPENING),
-            "case {label:?}: the clause must not drop the value half, and {submitted} was \
-             submitted, got {body}"
+            !message.contains(VALUE_HALF_OPENING),
+            "case {label:?}: the clause must quote no value, and {submitted} was submitted, \
+             got {body}"
         );
     }
 }
@@ -414,10 +414,10 @@ async fn every_published_bound_is_still_served() {
 async fn another_constraint_class_states_the_value_it_was_given() {
     let router = router();
 
-    // The scope of the rule: the value half is quoted for the `@range` class exactly as it
-    // is for every other class. `nextToken` targets `NextPageToken`, length 1..8192, so the
-    // empty token breaks the length minimum and is stated with the (empty) value it
-    // submitted.
+    // The scope of the rule: the value half is dropped for the `@range` class alone, and
+    // every other class still quotes what it was handed. `nextToken` targets
+    // `NextPageToken`, length 1..8192, so the empty token breaks the length minimum and is
+    // stated with the (empty) value it submitted.
     let (status, body) = call(&router, "ListDashboards", &json!({"nextToken": ""})).await;
     assert_eq!(
         status, 400,
@@ -440,8 +440,9 @@ async fn a_request_breaking_a_range_and_a_length_states_each_in_its_own_voice() 
     let router = router();
 
     // One request, two classes: the page size is past its maximum and the cursor is under
-    // its length minimum. Both clauses are stated under one envelope, each quoting the value
-    // it was given — the number for the range, the empty string for the length.
+    // its length minimum. Both clauses are stated under one envelope, each in its own voice —
+    // the range names its member and bound alone, the length quotes the empty string it was
+    // given.
     let (status, body) = call(
         &router,
         "ListScheduledReports",
@@ -459,7 +460,7 @@ async fn a_request_breaking_a_range_and_a_length_states_each_in_its_own_voice() 
          clauses, got {message:?}"
     );
     for clause in [
-        range_clause(101, "maxResults", &at_most(100)),
+        range_clause("maxResults", &at_most(100)),
         "Value '' at 'nextToken' failed to satisfy constraint: \
          Member must have length greater than or equal to 1"
             .to_string(),
@@ -491,8 +492,8 @@ struct ClauseSetCase {
     request: Value,
     /// Every clause the refusal must state, in no particular order.
     clauses: Vec<String>,
-    /// How many of those clauses quote the value the request submitted — every one of them,
-    /// whichever class each violation belongs to.
+    /// How many of those clauses quote the value the request submitted — none of the `@range`
+    /// clauses, and one per violation of any other class.
     value_halves: usize,
 }
 
@@ -509,10 +510,10 @@ fn clause_set_cases() -> Vec<ClauseSetCase> {
                 ]
             }),
             clauses: vec![
-                range_clause(7, "widgets.1.member.width", &at_most(6)),
-                range_clause(11, "widgets.2.member.height", &at_most(10)),
+                range_clause("widgets.1.member.width", &at_most(6)),
+                range_clause("widgets.2.member.height", &at_most(10)),
             ],
-            value_halves: 2,
+            value_halves: 0,
         },
         ClauseSetCase {
             label: "one widget past both of its members' ends",
@@ -522,10 +523,10 @@ fn clause_set_cases() -> Vec<ClauseSetCase> {
                 "widgets": [widget("Spend", json!({"width": 1, "height": 11}))]
             }),
             clauses: vec![
-                range_clause(1, "widgets.1.member.width", &at_least(2)),
-                range_clause(11, "widgets.1.member.height", &at_most(10)),
+                range_clause("widgets.1.member.width", &at_least(2)),
+                range_clause("widgets.1.member.height", &at_most(10)),
             ],
-            value_halves: 2,
+            value_halves: 0,
         },
         ClauseSetCase {
             label: "three widgets, three ranges across both members and both ends",
@@ -539,11 +540,11 @@ fn clause_set_cases() -> Vec<ClauseSetCase> {
                 ]
             }),
             clauses: vec![
-                range_clause(7, "widgets.1.member.width", &at_most(6)),
-                range_clause(3, "widgets.2.member.height", &at_least(4)),
-                range_clause(1, "widgets.3.member.width", &at_least(2)),
+                range_clause("widgets.1.member.width", &at_most(6)),
+                range_clause("widgets.2.member.height", &at_least(4)),
+                range_clause("widgets.3.member.width", &at_least(2)),
             ],
-            value_halves: 3,
+            value_halves: 0,
         },
         ClauseSetCase {
             label: "four ranges over two widgets, on an update",
@@ -557,17 +558,17 @@ fn clause_set_cases() -> Vec<ClauseSetCase> {
                 ]
             }),
             clauses: vec![
-                range_clause(7, "widgets.1.member.width", &at_most(6)),
-                range_clause(11, "widgets.1.member.height", &at_most(10)),
-                range_clause(1, "widgets.2.member.width", &at_least(2)),
-                range_clause(3, "widgets.2.member.height", &at_least(4)),
+                range_clause("widgets.1.member.width", &at_most(6)),
+                range_clause("widgets.1.member.height", &at_most(10)),
+                range_clause("widgets.2.member.width", &at_least(2)),
+                range_clause("widgets.2.member.height", &at_least(4)),
             ],
-            value_halves: 4,
+            value_halves: 0,
         },
         ClauseSetCase {
             // The scope of the rule under the same envelope as a range: `description`
             // targets `Description`, length 1..200, so the empty description quotes its
-            // (empty) value beside the widget's quoted number.
+            // (empty) value beside the widget's valueless range clause.
             label: "a widget range and an empty description, on a create",
             operation: "CreateDashboard",
             request: json!({
@@ -577,9 +578,9 @@ fn clause_set_cases() -> Vec<ClauseSetCase> {
             }),
             clauses: vec![
                 valued_clause("", "description", &length_at_least(1)),
-                range_clause(7, "widgets.1.member.width", &at_most(6)),
+                range_clause("widgets.1.member.width", &at_most(6)),
             ],
-            value_halves: 2,
+            value_halves: 1,
         },
     ]
 }
@@ -604,7 +605,7 @@ fn stated_clauses(label: &str, message: &str, expected: usize) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn several_ranges_in_one_request_each_quote_their_rejected_value() {
+async fn several_ranges_in_one_request_each_state_their_member_and_bound() {
     let router = router();
 
     for case in clause_set_cases() {
@@ -636,8 +637,8 @@ async fn several_ranges_in_one_request_each_quote_their_rejected_value() {
             stated, expected,
             "case {label:?}: expected one clause per violated member, got {message:?}"
         );
-        // Every clause of the `@range` class quotes its value, however many of them one
-        // envelope carries, exactly as another class's clause does.
+        // No clause of the `@range` class quotes a value, however many of them one envelope
+        // carries, and a clause of another class under the same envelope still does.
         assert_eq!(
             message.matches(VALUE_HALF_OPENING).count(),
             value_halves,

@@ -41,18 +41,13 @@
 //! base64 one. A client round-trips either unread, so WHICH of the two a listing writes is a
 //! fidelity question — which is why it is read off the recordings rather than chosen.
 //!
-//! What is NOT free in either alphabet is the CHARACTER SET. The value a caller hands back
-//! travels on the `continuation-token` query parameter of a SIGNED request, and a character a
-//! query component does not carry unchanged has two spellings on the wire — the character
-//! itself and its percent-encoding — of which a request's SigV4 canonical form covers one: a
-//! token carrying such a character resumes the listing for a client that encodes it and is
-//! refused for the signature for a client that hands the value back verbatim, which "you can
-//! use this ContinuationToken for the pagination of the list results"
-//! (`ListDirectoryBucketsRequest$ContinuationToken`) gives a caller no way to tell apart. So
-//! every token of this service is written in the characters a query component carries
-//! unchanged (RFC 3986's unreserved set): lowercase hex already is, and the base64 one is
-//! written in base64's URL-SAFE alphabet without padding (RFC 4648 §5) — the same base64
-//! width, with `-` and `_` for `+` and `/` and no `=`.
+//! What is NOT free in either alphabet is the CHARACTER SET, which is read off the recorded
+//! answers of each listing rather than chosen: lowercase hex, and base64 in the STANDARD
+//! alphabet over its padding (RFC 4648 §4), which is what the recorded tokens of the object
+//! listings and the directory-bucket listing are written in. The two characters of that
+//! alphabet a URI query component does not carry unchanged (`+` and `/`), and its padding
+//! (`=`), travel percent-encoded on the `continuation-token` parameter the caller hands the
+//! value back on, exactly as any other query value does.
 //!
 //! No page is kept on the side: the cursor is the position the next page resumes at — a
 //! configuration id, a bucket name, an object key, an annotation name — which is why every
@@ -134,10 +129,11 @@ impl PagedListing {
 enum Spelling {
     /// Lowercase hexadecimal (RFC 4648 §8's alphabet, lowercased).
     Hex,
-    /// Base64 in the URL-SAFE alphabet, unpadded (RFC 4648 §5, `A-Za-z0-9-_`): base64 of the
-    /// same width as the standard alphabet's, written in the characters a URI query component
-    /// carries unchanged, so the value a response hands out is the value a signed request can
-    /// hand back (the module docs).
+    /// Base64 in the STANDARD alphabet, padded (RFC 4648 §4, `A-Za-z0-9+/` over `=`): the
+    /// alphabet the recorded tokens of these listings are written in, which is what a client
+    /// reading the value's FORM, or a recorded-answer comparison, sees. A client hands the
+    /// value back on a query parameter, where the two characters outside the unreserved set
+    /// travel percent-encoded, as every SDK writes a query value.
     Base64,
 }
 
@@ -147,7 +143,7 @@ impl Spelling {
         use ::base64::Engine as _;
         match self {
             Self::Hex => ::hex::encode(bytes),
-            Self::Base64 => ::base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes),
+            Self::Base64 => ::base64::engine::general_purpose::STANDARD.encode(bytes),
         }
     }
 
@@ -171,7 +167,7 @@ impl Spelling {
             }
             Self::Base64 => {
                 use ::base64::Engine as _;
-                ::base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token).ok()
+                ::base64::engine::general_purpose::STANDARD.decode(token).ok()
             }
         }
     }
@@ -392,16 +388,17 @@ mod tests {
                 Some(id),
                 "case {listing:?}/{id:?}: a minted token must name its position, got {token:?}"
             );
-            // The same token handed back VERBATIM on a query parameter: every character of
-            // either alphabet is one a query component carries unchanged, so nothing has to
-            // be repaired on the way in (the module docs).
+            // The same token handed back on a query parameter: the hex alphabet is written in
+            // the characters a query component carries unchanged, and base64's standard
+            // alphabet adds `+`, `/` and the `=` padding, which travel percent-encoded as any
+            // other query value's reserved characters do (the module docs).
             assert!(
                 token
                     .chars()
                     .all(|character| character.is_ascii_alphanumeric()
-                        || matches!(character, '-' | '.' | '_' | '~')),
-                "case {listing:?}/{id:?}: a token is written in the characters a query \
-                 component carries unchanged, got {token:?}"
+                        || matches!(character, '-' | '.' | '_' | '~' | '+' | '/' | '=')),
+                "case {listing:?}/{id:?}: a token is written in one of the two published \
+                 alphabets, got {token:?}"
             );
             assert_eq!(
                 decode_continuation_token(&other_store, listing, scope, &token),
@@ -451,9 +448,9 @@ mod tests {
                 Spelling::Base64 => assert!(
                     !token.is_empty()
                         && token.chars().all(|character| character.is_ascii_alphanumeric()
-                            || matches!(character, '-' | '_')),
-                    "case {listing:?}/{id:?}: a token of this listing is unpadded url-safe \
-                     base64, got {token:?}"
+                            || matches!(character, '+' | '/' | '=')),
+                    "case {listing:?}/{id:?}: a token of this listing is standard base64, got \
+                     {token:?}"
                 ),
             }
         }
@@ -466,7 +463,7 @@ mod tests {
             ::hex::encode([0_u8; ::service_common::page_tokens::AUTHENTICATOR_BYTES + 1]);
         let shaped_base64 = {
             use ::base64::Engine as _;
-            ::base64::engine::general_purpose::URL_SAFE_NO_PAD
+            ::base64::engine::general_purpose::STANDARD
                 .encode([0_u8; ::service_common::page_tokens::AUTHENTICATOR_BYTES + 1])
         };
         for listing in [PagedListing::Metrics, PagedListing::Objects] {
