@@ -2309,7 +2309,12 @@ fn declared_update_replace_policy(
 /// condition evaluates TRUE. A condition this module cannot evaluate is not an answer of
 /// `false`: the resource is created, because dropping a resource the template declares
 /// would be a worse answer than materialising one a false condition would have excluded.
-fn is_created(
+///
+/// `pub` because the resource set a REVISION declares is the same question the change-set
+/// comparison asks of each of its two sides ([`super::change_plan::computed_changes`]): one
+/// reader of a resource's `Condition`, so what a plan previews and what a deployment
+/// materialises cannot disagree.
+pub fn is_created(
     declared: &DeclaredResource,
     scope: &Scope<'_>,
     budget: &mut Budget,

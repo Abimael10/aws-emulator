@@ -546,17 +546,46 @@ pub fn computed_changes(
         imports: current.imports,
         stack_outputs: &no_stack_outputs,
     };
-    let declared_resources: BTreeSet<&str> = submitted
+    // Which resources each revision really DECLARES: "the optional `Conditions` section …
+    // controls whether certain resources are created", so a logical id whose condition does
+    // not hold under that revision is not in that revision's resource set at all — it leaves
+    // the set exactly as a logical id the submitted template stops declaring does (a
+    // `Remove`), and enters it exactly as a newly declared one does (an `Add`). Each side is
+    // judged in its OWN scope, since the parameter values a condition reads are the ones that
+    // revision carries, and by the same reader the deployment materialises the template
+    // through ([`template::is_created`]), so a plan cannot preview a resource set the
+    // execution would not deploy. Out of the comparison's ONE budget, as a deployment
+    // evaluates a template's conditions and its properties out of one: a condition this
+    // reader cannot evaluate keeps the resource, exactly as it does for the deployment.
+    let submitted_resources: Vec<&template::DeclaredResource> = submitted
         .resources
         .iter()
+        .filter(|resource| template::is_created(resource, &after, &mut budget))
+        .collect();
+    let current_resources: Vec<&template::DeclaredResource> = current
+        .template
+        .resources
+        .iter()
+        .filter(|resource| template::is_created(resource, &before, &mut budget))
+        .collect();
+    // What a `Ref` inside either revision can be a reference to A RESOURCE of: the two
+    // resource sets above, so a logical id whose condition holds on NEITHER side is no
+    // resource of either revision and a reference reading it is attributed to no resource
+    // ([`resource_entity`]) — the same reading the deployment gives it, which materialises
+    // no such resource for the reference to resolve to.
+    let declared_resources: BTreeSet<&str> = submitted_resources
+        .iter()
+        .chain(current_resources.iter())
         .map(|resource| resource.logical_id.as_str())
-        .chain(
-            current
-                .template
-                .resources
-                .iter()
-                .map(|resource| resource.logical_id.as_str()),
-        )
+        .collect();
+    // The resources this plan CREATES: declared by the submitted revision and not held by
+    // the stack, so their physical ids are ones the execution itself mints
+    // ([`property_details`] reads this to tell a reference whose new value the plan knows
+    // from a reference whose value nothing can know).
+    let creating_resources: BTreeSet<&str> = submitted_resources
+        .iter()
+        .map(|resource| resource.logical_id.as_str())
+        .filter(|logical_id| !deployed.contains_key(*logical_id))
         .collect();
     let changed_parameters: BTreeSet<&str> = before_parameters
         .keys()
@@ -578,6 +607,7 @@ pub fn computed_changes(
         changed_parameters: &changed_parameters,
         declared_parameters: &declared_parameters,
         declared_resources: &declared_resources,
+        creating_resources: &creating_resources,
     };
 
     // What the two revisions say about each resource the submitted template declares,
@@ -585,11 +615,10 @@ pub fn computed_changes(
     // the resources referring to it report, so the direct comparison has to be complete
     // before the references are followed.
     let mut planned: Vec<Planned<'_>> = Vec::new();
-    for resource in &submitted.resources {
-        let previous = current
-            .template
-            .resources
+    for resource in submitted_resources.iter().copied() {
+        let previous = current_resources
             .iter()
+            .copied()
             .find(|candidate| candidate.logical_id == resource.logical_id);
         planned.push(match previous {
             None => Planned::Added { resource },
@@ -669,9 +698,8 @@ pub fn computed_changes(
             )),
         }
     }
-    for resource in &current.template.resources {
-        let still_declared = submitted
-            .resources
+    for resource in current_resources.iter().copied() {
+        let still_declared = submitted_resources
             .iter()
             .any(|candidate| candidate.logical_id == resource.logical_id);
         if !still_declared {
@@ -685,16 +713,13 @@ pub fn computed_changes(
     // — and a `Remove` reports only the before and an `Add` only the after, since a change
     // that takes a resource away leaves no resource to have an after context and one that
     // brings it into being had none before.
-    let declared_before: BTreeMap<&str, &template::DeclaredResource> = current
-        .template
-        .resources
+    let declared_before: BTreeMap<&str, &template::DeclaredResource> = current_resources
         .iter()
-        .map(|resource| (resource.logical_id.as_str(), resource))
+        .map(|resource| (resource.logical_id.as_str(), *resource))
         .collect();
-    let declared_after: BTreeMap<&str, &template::DeclaredResource> = submitted
-        .resources
+    let declared_after: BTreeMap<&str, &template::DeclaredResource> = submitted_resources
         .iter()
-        .map(|resource| (resource.logical_id.as_str(), resource))
+        .map(|resource| (resource.logical_id.as_str(), *resource))
         .collect();
     for change in &mut changes {
         let logical_id = change.logical_resource_id.as_str();
@@ -910,6 +935,9 @@ struct Comparison<'a> {
     /// Every parameter the submitted template declares.
     declared_parameters: &'a BTreeSet<&'a str>,
     declared_resources: &'a BTreeSet<&'a str>,
+    /// The logical ids this plan CREATES: resources the submitted revision declares that the
+    /// stack does not hold yet.
+    creating_resources: &'a BTreeSet<&'a str>,
 }
 
 /// One detail per resource attribute, and per `Properties` property, the two declarations
@@ -1037,7 +1065,20 @@ fn property_details(
         // change, and its value"; `Dynamic` is for the value it "can't determine… because
         // it depends on the result of an intrinsic function" — which here is a value this
         // template reader could not evaluate.
-        let evaluated = if declared_after.is_some() && resolved_after.is_none() {
+        //
+        // A value it could not evaluate because it reads a resource this plan CREATES is not
+        // one of those: the reference resolves to a physical id the execution itself mints,
+        // so that the property's value will change, and which resource it will come from, is
+        // known from the plan — the same reading a reference to a resource the plan RECREATES
+        // gets ([`propagate_recreations`]).
+        let reads_a_created_resource = referenced
+            .names()
+            .iter()
+            .any(|name| comparison.creating_resources.contains(name));
+        let evaluated = if declared_after.is_some()
+            && resolved_after.is_none()
+            && !reads_a_created_resource
+        {
             evaluation::DYNAMIC
         } else {
             evaluation::STATIC
