@@ -314,11 +314,18 @@ async fn a_torrent_request_whose_expected_owner_is_not_the_account_is_denied() {
         "the foreign account id must not be the account this emulator serves"
     );
 
-    // (case, the bucket the request names) — the owner mismatch is answered for a bucket
-    // this emulator holds and for one it does not, since neither is owned by that account.
-    for (case, named) in [
-        ("a bucket this emulator holds", name),
-        ("a bucket it does not hold", "object-torrent-owner-absent"),
+    // (case, the bucket the request names, the status and code it earns) — the owner mismatch
+    // is answered for a bucket this emulator HOLDS, because only a bucket that exists has an
+    // owner to compare; one it does not hold is answered about that absence instead, whatever
+    // account the header names.
+    for (case, named, status, expected_code) in [
+        ("a bucket this emulator holds", name, 403, "AccessDenied"),
+        (
+            "a bucket it does not hold",
+            "object-torrent-owner-absent",
+            404,
+            "NoSuchBucket",
+        ),
     ] {
         let answer = get_object_torrent(
             &router,
@@ -329,14 +336,14 @@ async fn a_torrent_request_whose_expected_owner_is_not_the_account_is_denied() {
         .await;
         let code = answer.error_code();
         assert_eq!(
-            answer.status, 403,
-            "case {case:?}: expected HTTP 403, got {} with body {:?}",
+            answer.status, status,
+            "case {case:?}: expected HTTP {status}, got {} with body {:?}",
             answer.status,
             String::from_utf8_lossy(&answer.body)
         );
         assert_eq!(
-            code, "AccessDenied",
-            "case {case:?}: expected the error code \"AccessDenied\", got {code:?}"
+            code, expected_code,
+            "case {case:?}: expected the error code {expected_code:?}, got {code:?}"
         );
     }
 

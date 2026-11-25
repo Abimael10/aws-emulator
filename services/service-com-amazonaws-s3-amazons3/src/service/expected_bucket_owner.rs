@@ -12,8 +12,11 @@
 //! rejected text, with no bucket read and no owner compared.
 //!
 //! The 403 `AccessDenied` is the other refusal, and it is reserved for a WELL-FORMED account
-//! id that is not the owner of the bucket addressed
-//! ([`super::authorization::expected_bucket_owner_refusal`] makes that one). Keeping the two
+//! id that is not the owner of a bucket this emulator HOLDS
+//! ([`super::authorization::expected_bucket_owner_refusal`] makes that one): ownership is
+//! something only a bucket that resolved has, so a request naming a bucket that is not there
+//! is answered about its ABSENCE by the operation it addressed, whatever account the header
+//! carries — which is why that guard takes the bucket's existence as an argument. Keeping the two
 //! apart is what a client branches on: a typo, an unexpanded template variable or an ARN
 //! pasted where an account id belongs is the caller's own request to fix, where `AccessDenied`
 //! sends an operator into a cross-account permissions investigation — and a retry layer

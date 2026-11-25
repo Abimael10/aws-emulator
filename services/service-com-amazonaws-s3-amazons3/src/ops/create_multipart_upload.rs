@@ -386,6 +386,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `CreateMultipartUploadRequest$ExpectedBucketOwner`, judged through the one rule
         // every operation of this service judges it by.
         if let Some(refusal) = crate::service::authorization::expected_bucket_owner_refusal(
+            crate::service::holds_addressed_bucket(&*self.engine, &input.bucket),
             input.expected_bucket_owner.as_deref(),
         ) {
             return Err(refusal);

@@ -381,10 +381,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
         // owes names the call it came of by them.
         let correlation = crate::state::request_ids::RequestCorrelation::mint();
 
-        // The confused-deputy guard the request itself asks for, judged before the store is
-        // reached through the one rule every operation of this service judges it by, so a
+        // The confused-deputy guard the request itself asks for, judged for a bucket that
+        // exists through the one rule every operation of this service judges it by, so a
         // mismatched guard says nothing about what the bucket holds.
         if let Some(refusal) = crate::service::authorization::expected_bucket_owner_refusal(
+            crate::service::holds_addressed_bucket(&*self.engine, &input.bucket),
             input.expected_bucket_owner.as_deref(),
         ) {
             return Err(refusal);

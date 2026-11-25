@@ -215,9 +215,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // provide does not match the actual owner of the bucket, the request fails with the
         // HTTP status code 403 Forbidden (access denied)"
         // (`DeleteBucketRequest$ExpectedBucketOwner`), judged through the one rule every
-        // operation of this service judges it by and before the store is reached, so a
+        // operation of this service judges it by for a bucket that exists, so a
         // mismatched guard says nothing about what the bucket holds.
         if let Some(refusal) = crate::service::authorization::expected_bucket_owner_refusal(
+            crate::service::holds_addressed_bucket(&*self.engine, &input.bucket),
             input.expected_bucket_owner.as_deref(),
         ) {
             return Err(refusal);

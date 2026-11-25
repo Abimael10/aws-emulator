@@ -173,11 +173,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`DeleteBucketMetadataConfigurationRequest$ExpectedBucketOwner`), judged the way
         // every other bucket-scoped operation in this crate judges it: this emulator serves
         // one account, so that account owns every bucket it holds.
-        if input
-            .expected_bucket_owner
-            .as_deref()
-            .is_some_and(|expected| expected != ::engine::emulator_account_id())
-        {
+        if crate::service::authorization::names_another_bucket_owner(
+            crate::service::holds_addressed_bucket(&*self.engine, &input.bucket),
+            input.expected_bucket_owner.as_deref(),
+        ) {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 ACCESS_DENIED_CODE,
                 ACCESS_DENIED_STATUS,

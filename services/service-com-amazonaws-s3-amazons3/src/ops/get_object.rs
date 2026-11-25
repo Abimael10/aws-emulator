@@ -439,13 +439,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the request fails with the HTTP status code 403 Forbidden (access denied)"
         // (`GetObjectRequest$ExpectedBucketOwner`), judged exactly as `HeadObject` and
         // `PutObject` judge it: this emulator serves one account, so the owner of every
-        // bucket it holds is that account. Answered ahead of the store, so a mismatched guard
-        // says nothing about what the bucket holds.
-        if input
-            .expected_bucket_owner
-            .as_deref()
-            .is_some_and(|expected| expected != ::engine::emulator_account_id())
-        {
+        // bucket it holds is that account. Compared only for a bucket this emulator holds, so
+        // a mismatched guard says nothing about what the bucket holds and a bucket that is not
+        // there is answered about its absence below.
+        if crate::service::authorization::names_another_bucket_owner(
+            crate::service::holds_addressed_bucket(&*self.engine, &input.bucket),
+            input.expected_bucket_owner.as_deref(),
+        ) {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::ACCESS_DENIED_CODE,
                 crate::state::ACCESS_DENIED_STATUS,

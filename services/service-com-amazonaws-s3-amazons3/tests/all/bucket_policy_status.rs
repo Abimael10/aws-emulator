@@ -681,11 +681,14 @@ async fn a_policy_status_read_is_refused_for_a_missing_bucket_or_another_owner()
             "AccessDenied",
         ),
         (
+            // A bucket has an owner once it EXISTS, so the guard compares none for a bucket
+            // that is not there: the read is answered about the ABSENCE, exactly as the row
+            // naming no owner at all is.
             "both: another owner named for a bucket that is not there",
             "no-such-bucket-at-all",
             Some(not_the_owner),
-            403,
-            "AccessDenied",
+            404,
+            "NoSuchBucket",
         ),
     ];
     for (label, target, expected_owner, status, code) in refused {

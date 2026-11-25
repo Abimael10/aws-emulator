@@ -185,11 +185,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // denied)" — `GetObjectTaggingRequest$ExpectedBucketOwner`, judged exactly as
         // `HeadObject` judges it: this emulator serves one account, so the owner of every
         // bucket it holds is that account.
-        if input
-            .expected_bucket_owner
-            .as_deref()
-            .is_some_and(|expected| expected != ::engine::emulator_account_id())
-        {
+        if crate::service::authorization::names_another_bucket_owner(
+            crate::service::holds_addressed_bucket(&*self.engine, &input.bucket),
+            input.expected_bucket_owner.as_deref(),
+        ) {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 "AccessDenied",
                 403,

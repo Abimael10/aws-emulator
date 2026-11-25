@@ -332,6 +332,22 @@ fn addressed_bucket_in<Eng: Send + Sync + 'static>(engine: &Eng, address: &str) 
         .map(|route| route.bucket)
 }
 
+/// Whether the address `address` reaches a bucket this emulator holds at all — the question
+/// above, asked for the ANSWER rather than for the bucket's name.
+///
+/// `pub(crate)`: this is the question the EXPECTED BUCKET OWNER guard of every operation is
+/// judged against ([`authorization::expected_bucket_owner_refusal`] and
+/// [`authorization::names_another_bucket_owner`] take the answer as their first argument,
+/// because a bucket has an owner once it exists). A handler asks it through this one reader —
+/// with no guard of the store held, and holding none when it answers — so the seams of this
+/// service and its handlers cannot disagree about which addresses reach a bucket.
+pub(crate) fn holds_addressed_bucket<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    address: &str,
+) -> bool {
+    addressed_bucket_in(engine, address).is_some()
+}
+
 /// Whether `host` carries a BUCKET as its first label, by shape alone: the label and what
 /// REMAINS of the host behind it, for a host of at least two labels whose first could be a
 /// bucket name.

@@ -438,20 +438,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         )
         .map_err(crate::scaffolded::Scaffolded::customer_key)?;
 
-        // The confused-deputy guard for either bucket, judged through the one rule every
-        // operation of this service judges it by: "if the account ID that you provide does
-        // not match the actual owner of the destination bucket, the request fails with the
-        // HTTP status code 403 Forbidden" (`CopyObjectRequest$ExpectedBucketOwner`, and the
-        // same sentence for the source bucket on `ExpectedSourceBucketOwner`).
-        for expected in [
+        // The confused-deputy guard for the DESTINATION bucket, judged through the one rule
+        // every operation of this service judges it by: "if the account ID that you provide
+        // does not match the actual owner of the destination bucket, the request fails with
+        // the HTTP status code 403 Forbidden" (`CopyObjectRequest$ExpectedBucketOwner`).
+        //
+        // It is judged against that bucket's existence, because a bucket has an owner once it
+        // exists: a destination that is not there is answered about its ABSENCE below,
+        // whatever account the request expected to own it. The SOURCE carries the same guard
+        // on `ExpectedSourceBucketOwner`, taken where that bucket is resolved below.
+        if let Some(refusal) = crate::service::authorization::expected_bucket_owner_refusal(
+            crate::service::holds_addressed_bucket(&*self.engine, &input.bucket),
             input.expected_bucket_owner.as_deref(),
-            input.expected_source_bucket_owner.as_deref(),
-        ] {
-            if let Some(refusal) =
-                crate::service::authorization::expected_bucket_owner_refusal(expected)
-            {
-                return Err(refusal);
-            }
+        ) {
+            return Err(refusal);
         }
 
         // The DESTINATION key this copy writes, judged on its bytes alone before anything
@@ -771,6 +771,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             )
             .naming_bucket(&source.bucket));
         };
+
+        // The confused-deputy guard for the SOURCE bucket — "if the account ID that you
+        // provide does not match the actual owner of the source bucket, the request fails with
+        // the HTTP status code 403 Forbidden" (`CopyObjectRequest$ExpectedSourceBucketOwner`)
+        // — taken HERE rather than beside the destination's: a bucket has an owner once it
+        // exists, so that bucket's existence is settled by the refusal just above and the
+        // account the request expected to own it is compared after it. This emulator serves
+        // one account, so that account owns every bucket it holds.
+        if crate::service::authorization::names_another_owner_of_a_resolved_bucket(
+            input.expected_source_bucket_owner.as_deref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::ACCESS_DENIED_CODE,
+                crate::state::ACCESS_DENIED_STATUS,
+                crate::state::ACCESS_DENIED_MESSAGE,
+            ));
+        }
 
         // Whether this copy has a DIRECTORY bucket on EITHER side, which is what decides
         // whether an S3 Bucket Key serves it at all — read here, while both buckets are

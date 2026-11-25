@@ -220,11 +220,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // status code 403 Forbidden (access denied)"
         // (`UpdateObjectEncryptionRequest$ExpectedBucketOwner`). This emulator serves one
         // account, so that account owns every bucket it holds.
-        if input
-            .expected_bucket_owner
-            .as_deref()
-            .is_some_and(|expected| expected != ::engine::emulator_account_id())
-        {
+        if crate::service::authorization::names_another_bucket_owner(
+            crate::service::holds_addressed_bucket(&*self.engine, &input.bucket),
+            input.expected_bucket_owner.as_deref(),
+        ) {
             return Err(access_denied(ACCESS_DENIED_MESSAGE));
         }
 

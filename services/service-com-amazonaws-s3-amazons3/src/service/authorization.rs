@@ -650,40 +650,81 @@ fn models(key: &str, published: &[&str]) -> bool {
 ///   refused [`crate::state::INVALID_BUCKET_OWNER_CODE`] at 400 naming the rejected value,
 ///   before any owner is compared: nothing can be said about ownership from a value that
 ///   names no account;
-/// * a well-formed account id that is not the owner is the confused-deputy guard the request
-///   asked for — "The account ID of the expected bucket owner. If the account ID that you
-///   provide does not match the actual owner of the bucket, the request fails with the HTTP
-///   status code 403 Forbidden (access denied)", the `ExpectedBucketOwner` member every
-///   bucket and object operation of this model binds to `x-amz-expected-bucket-owner`. This
-///   emulator serves ONE account, so that account owns every bucket it holds and any other
-///   well-formed id names an owner no bucket here has.
+/// * a well-formed account id that is not the owner of a bucket this emulator HOLDS is the
+///   confused-deputy guard the request asked for — "The account ID of the expected bucket
+///   owner. If the account ID that you provide does not match the actual owner of the bucket,
+///   the request fails with the HTTP status code 403 Forbidden (access denied)", the
+///   `ExpectedBucketOwner` member every bucket and object operation of this model binds to
+///   `x-amz-expected-bucket-owner`. This emulator serves ONE account, so that account owns
+///   every bucket it holds and any other well-formed id names an owner no bucket here has.
 ///
 /// Keeping them apart is what lets a client tell "I sent a bad value for this parameter"
 /// from "this bucket belongs to another account": the first is its own request to fix, the
 /// second a cross-account grant.
 ///
-/// One place, so the guard is the same answer on every operation that carries the header,
-/// and judged BEFORE the store is reached: neither refusal says anything about what the
-/// bucket holds. The malformed half is also what the request boundary refuses for every
-/// operation of this service ([`super::expected_bucket_owner`]), from this same reading.
+/// `bucket_resolves` is the caller's own answer to whether the bucket it addressed is one
+/// this emulator holds ([`super::holds_addressed_bucket`] is how a handler answers it), and
+/// the ownership half is taken only when it is `true`: a bucket there is none of has no owner
+/// to compare, so the operation's own bucket-absent refusal is what answers such a request,
+/// whatever account the header names. It is an ARGUMENT rather than something read here,
+/// because the handler is what knows which bucket its request addressed.
+///
+/// One place, so the guard is the same answer on every operation that carries the header. The
+/// malformed half is also what the request boundary refuses for every operation of this
+/// service ([`super::expected_bucket_owner`]), from this same reading.
 pub fn expected_bucket_owner_refusal<E>(
+    bucket_resolves: bool,
     expected: Option<&str>,
 ) -> Option<crate::scaffolded::Scaffolded<E>> {
-    let expected = expected?;
-    if !crate::state::is_account_id(expected) {
+    let supplied = expected?;
+    if !crate::state::is_account_id(supplied) {
         return Some(crate::scaffolded::Scaffolded::unmodeled(
             crate::state::INVALID_BUCKET_OWNER_CODE,
             crate::state::INVALID_BUCKET_OWNER_STATUS,
-            crate::state::invalid_bucket_owner_message(expected),
+            crate::state::invalid_bucket_owner_message(supplied),
         ));
     }
-    (expected != ::engine::emulator_account_id()).then(|| {
+    names_another_bucket_owner(bucket_resolves, expected).then(|| {
         crate::scaffolded::Scaffolded::unmodeled(
             ACCESS_DENIED_CODE,
             ACCESS_DENIED_STATUS,
             ACCESS_DENIED_MESSAGE,
         )
     })
+}
+
+/// Whether `expected` names an account OTHER than the owner of the bucket a request
+/// addresses — the comparison the confused-deputy guard of every operation carrying
+/// `x-amz-expected-bucket-owner` makes, and the one place it is made.
+///
+/// Taken only for a bucket this emulator HOLDS, which `bucket_resolves` states. A bucket has
+/// an owner once it exists, so the existence of the bucket a request addresses is settled
+/// first and the owner is compared afterwards: a request naming a bucket that is not there is
+/// answered about that absence by the operation it addressed — the bucket-absent refusal that
+/// operation words — rather than about who owns a bucket there is none of, which is what
+/// keeps the error class a statement about the bucket instead of a function of the header's
+/// value.
+///
+/// This emulator serves ONE account, so the owner of every bucket it holds is
+/// [`::engine::emulator_account_id`], and any other value the header carries names an owner
+/// no bucket here has.
+#[must_use]
+pub fn names_another_bucket_owner(bucket_resolves: bool, expected: Option<&str>) -> bool {
+    bucket_resolves && names_another_owner_of_a_resolved_bucket(expected)
+}
+
+/// The same comparison, for a bucket the caller has ALREADY resolved: the SOURCE of a copy,
+/// which `x-amz-copy-source` names and `ExpectedSourceBucketOwner` states the expected owner
+/// of.
+///
+/// Whether `expected` names an account other than that bucket's owner — the comparison
+/// [`names_another_bucket_owner`] makes for the bucket a request ADDRESSES, asked here of a
+/// bucket the handler already holds, so the existence that bucket's own refusal settles is
+/// what orders the two questions. This emulator serves ONE account, so the owner of every
+/// bucket it holds is [`::engine::emulator_account_id`].
+#[must_use]
+pub fn names_another_owner_of_a_resolved_bucket(expected: Option<&str>) -> bool {
+    expected.is_some_and(|expected| expected != ::engine::emulator_account_id())
 }
 
 #[cfg(test)]
@@ -926,7 +967,7 @@ mod tests {
             ),
         ];
         for (case, expected, refused) in rows {
-            let answered = match expected_bucket_owner_refusal::<()>(expected) {
+            let answered = match expected_bucket_owner_refusal::<()>(true, expected) {
                 None => None,
                 Some(crate::scaffolded::Scaffolded::Unmodeled(refusal)) => {
                     Some((refusal.code, refusal.status, refusal.message))
@@ -939,6 +980,25 @@ mod tests {
                     .map(|(code, status, _)| (*code, *status)),
                 refused,
                 "case {case:?}: expected {refused:?}, got {answered:?}"
+            );
+            // And the same value, for a bucket this emulator does NOT hold: the MALFORMED
+            // refusal still stands — it is a statement about the request's own value — while
+            // the ownership comparison is not made at all, so the operation's own
+            // bucket-absent refusal is what answers the request.
+            let absent = match expected_bucket_owner_refusal::<()>(false, expected) {
+                None => None,
+                Some(crate::scaffolded::Scaffolded::Unmodeled(refusal)) => {
+                    Some((refusal.code, refusal.status))
+                }
+                other => panic!("case {case:?}: expected an unmodelled refusal, got {other:?}"),
+            };
+            let malformed_only = refused.filter(|(code, _)| {
+                *code == crate::state::INVALID_BUCKET_OWNER_CODE
+            });
+            assert_eq!(
+                absent, malformed_only,
+                "case {case:?}: for a bucket that does not resolve, expected \
+                 {malformed_only:?}, got {absent:?}"
             );
             // A malformed value is quoted back, so the caller sees which text was refused.
             if let (Some(supplied), Some((code, _, message))) = (expected, answered.as_ref()) {

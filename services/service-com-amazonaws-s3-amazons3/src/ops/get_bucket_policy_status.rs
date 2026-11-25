@@ -155,9 +155,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ([`crate::service::authorization::expected_bucket_owner_refusal`]): a value that is
         // no account id at all is the malformed parameter (400), and a well-formed account id
         // that is not the owner is "the HTTP status code 403 Forbidden (access denied)"
-        // (`GetBucketPolicyStatusRequest$ExpectedBucketOwner`). Judged before the store is
-        // reached, so neither refusal says anything about what the bucket holds.
+        // (`GetBucketPolicyStatusRequest$ExpectedBucketOwner`). The owner is compared only for
+        // a bucket this emulator holds, so neither refusal says anything about what the bucket
+        // holds and a bucket that is not there is answered about its absence below.
         if let Some(refusal) = crate::service::authorization::expected_bucket_owner_refusal(
+            crate::service::holds_addressed_bucket(&*self.engine, &input.bucket),
             input.expected_bucket_owner.as_deref(),
         ) {
             return Err(refusal);
