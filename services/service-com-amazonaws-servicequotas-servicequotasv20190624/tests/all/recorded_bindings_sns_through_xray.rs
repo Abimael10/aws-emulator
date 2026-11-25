@@ -90,7 +90,7 @@ const BOUND: &[Bound] = &[
         service_code: "sns",
         quota_code: "L-876E1222",
         quota_name: "GetSubscriptionAttributes Transactions per Second",
-        value: 30.0,
+        value: 900.0,
         unit: "None",
         adjustable: true,
         description: "The maximum number of times the GetSubscriptionAttributes action can be \
@@ -103,8 +103,8 @@ const BOUND: &[Bound] = &[
         resource_plane: None,
     },
     // A COUNTED plane published under a code the catalog used to serve a rate under: a
-    // resource count over the five-minute window those counts are published on, whose
-    // series no source available here states.
+    // resource count over the five-minute window those counts are published on, under the
+    // series the recorded listing names for it.
     Bound {
         service_code: "sns",
         quota_code: "L-1A43D3DB",
@@ -115,7 +115,61 @@ const BOUND: &[Bound] = &[
         description: "The maximum number of pending subscriptions per AWS account, across all \
                       regions.",
         period: Some((5, "MINUTE")),
-        metric: Metric::ResourcesWithoutSeries {
+        metric: Metric::Resources {
+            usage_service: "SNS",
+            resource: "ApproximateNumberOfPendingSubscriptions",
+        },
+        resource_plane: None,
+    },
+    // The rate published under the code the recorded listing binds the CREATE-TOPIC rate
+    // to, beside the one SMS-attribute rate that listing publishes as ONE call per second
+    // and as NOT adjustable: the action, the limit and the adjustability are the code's.
+    Bound {
+        service_code: "sns",
+        quota_code: "L-AB928142",
+        quota_name: "CreateTopic Transactions per Second",
+        value: 900.0,
+        unit: "None",
+        adjustable: true,
+        description: "The maximum number of times the CreateTopic action can be called per \
+                      second.",
+        period: Some((1, "SECOND")),
+        metric: Metric::Calls {
+            usage_service: "SNS",
+            api: "CreateTopic",
+        },
+        resource_plane: None,
+    },
+    Bound {
+        service_code: "sns",
+        quota_code: "L-154ECCA7",
+        quota_name: "SetSMSAttributes Transactions per Second",
+        value: 1.0,
+        unit: "None",
+        adjustable: false,
+        description: "The maximum number of times the SetSMSAttributes action can be called per \
+                      second.",
+        period: Some((1, "SECOND")),
+        metric: Metric::Calls {
+            usage_service: "SNS",
+            api: "SetSMSAttributes",
+        },
+        resource_plane: None,
+    },
+    // The one rate of the notification catalog published as a count of MESSAGES over the
+    // second rather than as a count of one action's calls: the recorded listing names and
+    // describes it that way and meters it with a resource-usage series summed over the
+    // window, whose series it does not state.
+    Bound {
+        service_code: "sns",
+        quota_code: "L-F8E2BA85",
+        quota_name: "Messages Published per Second",
+        value: 30_000.0,
+        unit: "None",
+        adjustable: true,
+        description: "The maximum number of messages published per second.",
+        period: Some((1, "SECOND")),
+        metric: Metric::ResourceRateWithoutSeries {
             usage_service: "SNS",
         },
         resource_plane: None,
@@ -701,7 +755,7 @@ fn the_table_spans_the_classes_a_binding_can_get_wrong() {
             Metric::None => "none",
             Metric::Calls { .. } => "calls",
             Metric::Resources { .. } => "resources",
-            Metric::ResourcesWithoutSeries { .. } => "resources-without-series",
+            Metric::ResourceRateWithoutSeries { .. } => "resource-rate-without-series",
         })
         .collect();
     assert_eq!(

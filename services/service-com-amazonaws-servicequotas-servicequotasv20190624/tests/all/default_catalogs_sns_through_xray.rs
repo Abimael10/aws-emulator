@@ -72,25 +72,14 @@ const CATALOGS: &[Catalog] = &[
     Catalog {
         service_code: "sns",
         service_name: "Amazon Simple Notification Service (Amazon SNS)",
-        quota_count: 42,
+        quota_count: 48,
+        // Only the descriptive stand-ins: every one of this service's 48 published codes
+        // answers a row, because a code AWS publishes a quota under that resolved nowhere
+        // would make a quota that exists in AWS look nonexistent.
         withdrawn: &[
             "TopicsPerAccount",
             "SubscriptionsPerTopic",
             "PendingSubscriptionsPerAccount",
-            // The three codes this catalog used to key the CreatePlatformApplication,
-            // ConfirmSubscription and ListSubscriptionsByTopic rates on, which the
-            // recorded listing publishes those three rates under OTHER codes, so no quota
-            // of this service is attributable to them.
-            "L-154ECCA7",
-            "L-039289D5",
-            "L-93CEC191",
-            // The three codes it used to key the SetSubscriptionAttributes and
-            // GetSubscriptionAttributes rates and the account's pending-subscription
-            // plane on, which the recorded listing publishes those three quotas under
-            // OTHER codes.
-            "L-BF824DE9",
-            "L-6635B4C9",
-            "L-A4340BCD",
         ],
     },
     Catalog {
@@ -224,10 +213,12 @@ pub(crate) enum Metric {
         usage_service: &'static str,
         resource: &'static str,
     },
-    /// The `AWS/Usage` `ResourceCount` of a counted plane whose `Resource` SERIES no
-    /// source available here states: the row publishes the dimensions the class states
-    /// and names no series, rather than a series this emulator invents for it.
-    ResourcesWithoutSeries { usage_service: &'static str },
+    /// The `AWS/Usage` resource usage of a quota published as a count over a WINDOW — the
+    /// usage SUMMED over the window rather than the largest count seen in it — whose
+    /// `Resource` SERIES no source available here states: the row publishes the dimensions
+    /// the class states and names no series, rather than a series this emulator invents
+    /// for it.
+    ResourceRateWithoutSeries { usage_service: &'static str },
 }
 
 /// One published row, with every member AWS publishes for it.
@@ -264,16 +255,16 @@ const ROWS: &[Row] = &[
     Row {
         service_code: "sns",
         quota_code: "L-AB928142",
-        quota_name: "Publish Transactions per Second",
-        value: 30_000.0,
+        quota_name: "CreateTopic Transactions per Second",
+        value: 900.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum number of times the Publish action can be called per \
+        description: "The maximum number of times the CreateTopic action can be called per \
                       second.",
         period: Some((1, "SECOND")),
         metric: Metric::Calls {
             usage_service: "SNS",
-            api: "Publish",
+            api: "CreateTopic",
         },
         resource_plane: None,
     },
@@ -544,10 +535,10 @@ pub(crate) fn metric_json(metric: &Metric) -> Value {
                 "Type": "API",
             },
         }),
-        Metric::ResourcesWithoutSeries { usage_service } => json!({
+        Metric::ResourceRateWithoutSeries { usage_service } => json!({
             "MetricNamespace": "AWS/Usage",
             "MetricName": "ResourceCount",
-            "MetricStatisticRecommendation": "Maximum",
+            "MetricStatisticRecommendation": "Sum",
             "MetricDimensions": {
                 "Service": usage_service,
                 "Class": "None",
@@ -1285,19 +1276,18 @@ const BINDINGS: &[Binding] = &[
     },
 ];
 
-/// The quotas this catalog publishes under NO code: the rows the codes in [`BINDINGS`]
-/// used to carry, whose own code no source available here states.
+/// The quota NAMES no row of these catalogs carries: the rows the codes in [`BINDINGS`]
+/// used to carry, whose own code no source available here states, and a name this
+/// emulator used to word a quota with where the service words it otherwise.
 ///
-/// A quota whose code is unknown is published under none, never under the code of a
-/// neighbouring row — that substitution is the defect this suite is about, read from the
-/// quota's end rather than the code's.
+/// Read from the quota's end rather than the code's: a name the service does not publish
+/// is served by no row, and a quota whose code is unknown is never republished under a
+/// neighbouring row's code once a source binds that code to its own quota.
 const UNPUBLISHED: &[(&str, &str)] = &[
-    ("sns", "GetEndpointAttributes Transactions per Second"),
-    ("sns", "VerifySMSSandboxPhoneNumber Transactions per Second"),
-    ("sns", "DeleteSMSSandboxPhoneNumber Transactions per Second"),
-    ("sns", "PutDataProtectionPolicy Transactions per Second"),
-    ("sns", "ListSMSSandboxPhoneNumbers Transactions per Second"),
-    ("sns", "CreateSMSSandboxPhoneNumber Transactions per Second"),
+    // The notification catalog's own publish rate under the name this emulator used to
+    // word it with: the service publishes that rate as a count of MESSAGES per second, so
+    // no row carries a `Publish` call rate.
+    ("sns", "Publish Transactions per Second"),
     ("sqs", "Message Size"),
     ("sqs", "Message Retention Period"),
     ("sqs", "Transactions per Second per API Action"),
