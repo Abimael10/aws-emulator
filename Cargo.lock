@@ -12170,7 +12170,6 @@ dependencies = [
  "service-com-amazonaws-vpclattice-mercurycontrolplane",
  "service-common",
  "sha2 0.10.9",
- "shell-words",
  "tokio",
  "tracing",
  "url",

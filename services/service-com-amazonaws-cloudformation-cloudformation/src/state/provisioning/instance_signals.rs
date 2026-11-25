@@ -36,6 +36,22 @@
 //!   report the failure of their own bootstrap, is held to its `Timeout` and fails there,
 //!   exactly as before.
 //!
+//! That last question is answered by PERFORMING the configuration rather than by reading it:
+//! the configuration is a shell program, so it is performed in the one bounded, session-local
+//! POSIX/bash session this workspace performs caller-supplied shell text in
+//! ([`::service_common::posix_shell_session`]) with the two signalling commands as the only
+//! programs its environment provides ([`SignallingPrograms`]), and what the instance asks for
+//! is the invocation that program really made. A bootstrap decides the status it reports the
+//! way a program does — a conditional over the exit code its own configuration states, a
+//! variable it keeps the word in, a retry loop around the call — and all of that is the
+//! grammar's own here, so a bootstrap that reports FAILURE through a value it computed asks
+//! for that failure exactly as one that writes the word on the command line does. What the
+//! bootstrap's own WORK did is not read: a command this environment provides no program for —
+//! `cfn-init`, a package install, the fetch of the instance's own id — answers success,
+//! because the service that owns the instance reporting it SERVING is what says that work came
+//! out, so no status of such a command is read as a bootstrap that failed
+//! ([`performed_signals`]).
+//!
 //! What this records was owed at the instant the owning service reported the instance
 //! serving, whether or not anybody called: that instant is when the instance signalled. It
 //! is driven from [`super::advance_stabilisations_in`] for the reason every other call there
@@ -49,10 +65,13 @@
 //! stopping as soon as it has found the signals the gate still needs
 //! ([`InstanceGate::needed`]) — so the calls are bounded by the instances the owning service
 //! lets one group hold, and only while such a gate is open and unsatisfied, which is nothing
-//! at all for a stack that declares no `CreationPolicy`. Reading one configuration is bounded
-//! too: at most a configuration's documented size is looked at
-//! ([`MAX_BOOT_CONFIGURATION_BYTES`]) and the walk over it passes each byte once
-//! ([`signal_invocations`]). The signals themselves land in the stack's own bounded log
+//! at all for a stack that declares no `CreationPolicy`. Performing one configuration is
+//! bounded too: at most a configuration's documented size is performed
+//! ([`MAX_BOOT_CONFIGURATION_BYTES`]), everything one performance may cost is the session's
+//! own bound (how many commands it performs, how far it nests, what one word expands to —
+//! [`::service_common::posix_shell_session::Bounds`]), the invocations it records are capped
+//! ([`MAX_SIGNALLING_INVOCATIONS`]), and a `sleep` it performs states a time nothing waits
+//! for. The signals themselves land in the stack's own bounded log
 //! ([`crate::state::MAX_SIGNALS_PER_STACK`]).
 
 use super::*;
@@ -420,65 +439,240 @@ async fn serving_instances(
 /// stack that created it: "you can use the `cfn-signal` helper script … to signal".
 const SIGNAL_HELPER_SCRIPT: &str = "cfn-signal";
 
-/// The `SignalResource` API as a command line spells it (`aws cloudformation
-/// signal-resource`), which is the other way a booting instance signals its stack — the one
-/// "for … signals from anywhere other than an Amazon EC2 instance", reached from an instance
-/// that has the CLI rather than the helper scripts.
+/// The AWS CLI, which is the other way a booting instance signals its stack — the one "for …
+/// signals from anywhere other than an Amazon EC2 instance", reached from an instance that has
+/// the CLI rather than the helper scripts.
+const AWS_CLI_PROGRAM: &str = "aws";
+
+/// The CLI's command GROUP and the command of it that signals a resource, as the CLI spells
+/// them (`aws cloudformation signal-resource`).
+const CLOUDFORMATION_COMMAND_GROUP: &str = "cloudformation";
 const SIGNAL_RESOURCE_COMMAND: &str = "signal-resource";
+
+/// The options the two signalling commands name the RESOURCE they signal with: the helper
+/// script's `--resource <LogicalId>` and the API command's own
+/// `signal-resource --logical-resource-id <LogicalId>`.
+const RESOURCE_OPTIONS: &[&str] = &["--logical-resource-id", "--resource", "-r"];
+
+/// The option the API's command states the signal's STATUS with
+/// (`SignalResource$Status`: "the status of the signal, which is either success or failure").
+const STATUS_OPTION: &[&str] = &["--status"];
+
+/// The options the HELPER SCRIPT states the same thing with: the exit code the bootstrap
+/// reported (`cfn-signal -e 0` / `--exit-code 0` is a bootstrap that succeeded, a non-zero one
+/// its failure), and the success flag (`-s false`).
+const EXIT_CODE_OPTIONS: &[&str] = &["--exit-code", "-e"];
+const SUCCESS_OPTIONS: &[&str] = &["--success", "-s"];
+
+/// The value [`SUCCESS_OPTIONS`] carries for a bootstrap that did NOT succeed.
+const NOT_SUCCESSFUL: &str = "false";
+
+/// How many signalling invocations one boot program's record holds.
+///
+/// The EMULATOR's number: what decides the gate is the FIRST invocation of the program that
+/// signals the gate's resource ([`asked_signal_status`]), so nothing is read past a handful of
+/// them, and how many a program may perform at all is already bounded by the session's own
+/// command budget.
+const MAX_SIGNALLING_INVOCATIONS: usize = 16;
+
+/// What one invocation of a signalling command asked the stack for.
+#[derive(Debug, Clone)]
+struct AskedSignal {
+    /// The resource the invocation named, and `None` for one that named none this read can
+    /// resolve — an argument the bootstrap computed to nothing, or an option written with the
+    /// next option after it instead of a value.
+    resource: Option<String>,
+    /// Whether it asked for the FAILURE of the bootstrap it reports.
+    failing: bool,
+}
+
+/// The two programs an instance SIGNALS its stack with, as the environment of the session its
+/// boot program is performed in provides them.
+///
+/// Neither of them reaches this service: what the stack does with a signal follows from the
+/// instance the OWNING service reports serving ([`settle_instance_signals`] records it under
+/// that instance's own id), so what these programs do is record the invocation the boot program
+/// really made — the resource it named and whether it reported its bootstrap failed — and
+/// answer the success a CLI answers for a call it made. They are the whole of what the
+/// environment provides, so every other command the bootstrap names is one the session reports
+/// it could not run.
+#[derive(Debug, Clone, Default)]
+struct SignallingPrograms(
+    ::std::sync::Arc<::std::sync::Mutex<Vec<AskedSignal>>>,
+);
+
+impl SignallingPrograms {
+    /// The invocations the boot program performed, in the order it performed them.
+    fn performed(&self) -> Vec<AskedSignal> {
+        self.0.lock().map(|held| held.clone()).unwrap_or_default()
+    }
+
+    /// Record one invocation, up to [`MAX_SIGNALLING_INVOCATIONS`] of them.
+    fn record(&self, asked: AskedSignal) {
+        if let Ok(mut held) = self.0.lock() {
+            if held.len() < MAX_SIGNALLING_INVOCATIONS {
+                held.push(asked);
+            }
+        }
+    }
+}
+
+impl ::service_common::posix_shell_session::EnvironmentPrograms for SignallingPrograms {
+    fn run(
+        &self,
+        name: &str,
+        arguments: &[String],
+        _files: &mut dyn ::service_common::posix_shell_session::ProgramFiles,
+    ) -> Option<::service_common::posix_shell_session::ProgramOutcome> {
+        // The name a program is known by, whichever path the bootstrap invoked it through:
+        // `cfn-signal` is documented under `/opt/aws/bin`.
+        let known_as = ::service_common::posix_shell_session::command_base_name(name);
+        let asked = match known_as {
+            SIGNAL_HELPER_SCRIPT => asked_by_the_helper(arguments),
+            AWS_CLI_PROGRAM => asked_by_the_api(arguments),
+            _ => None,
+        }?;
+        self.record(asked);
+        Some(::service_common::posix_shell_session::ProgramOutcome {
+            status: ::service_common::posix_shell_session::Statuses::default().success,
+            output: Vec::new(),
+        })
+    }
+}
+
+/// What a `cfn-signal` invocation asked for, or `None` for one this program performs nothing
+/// of.
+///
+/// "The exit code … 0 means success" (`cfn-signal`), so a non-zero exit code is the bootstrap
+/// reporting that it failed, and `--success false` states the same thing the other way; an
+/// invocation stating neither reports the success of a bootstrap that ran. The exit code a
+/// bootstrap reports is the status of the work BEFORE it (`cfn-signal -e $?`), and that work is
+/// work this emulator did not run — which is why a command this environment provides no program
+/// for answers the success a serving instance says it had
+/// ([`performed_signals`]) rather than a shell's own "no such utility" status.
+fn asked_by_the_helper(arguments: &[String]) -> Option<AskedSignal> {
+    let mut words = arguments.iter();
+    let mut asked = AskedSignal {
+        resource: None,
+        failing: false,
+    };
+    while let Some(word) = words.next() {
+        if let Some(value) = option_value(word, &mut words, RESOURCE_OPTIONS) {
+            // The LAST option that names one is the resource the invocation signals; one whose
+            // value came to nothing names none, and leaves whatever was named before it.
+            asked.resource = value.or(asked.resource);
+            continue;
+        }
+        if let Some(value) = option_value(word, &mut words, EXIT_CODE_OPTIONS) {
+            asked.failing |= value
+                .is_some_and(|value| value.parse::<i64>().is_ok_and(|code| code != 0));
+            continue;
+        }
+        if let Some(value) = option_value(word, &mut words, SUCCESS_OPTIONS) {
+            asked.failing |= value.is_some_and(|value| value.eq_ignore_ascii_case(NOT_SUCCESSFUL));
+        }
+    }
+    Some(asked)
+}
+
+/// What an `aws` invocation asked for, or `None` for one that is not `aws cloudformation
+/// signal-resource` at all — every other command group and command of the CLI is an invocation
+/// this program performs nothing of.
+///
+/// The two words naming the group and the command are read among the invocation's OPERANDS,
+/// past the options and their values, because the CLI takes its own options before the group as
+/// well as after the command.
+fn asked_by_the_api(arguments: &[String]) -> Option<AskedSignal> {
+    let mut words = arguments.iter();
+    let mut asked = AskedSignal {
+        resource: None,
+        failing: false,
+    };
+    let mut operands: Vec<&str> = Vec::new();
+    while let Some(word) = words.next() {
+        if let Some(value) = option_value(word, &mut words, RESOURCE_OPTIONS) {
+            asked.resource = value.or(asked.resource);
+            continue;
+        }
+        if let Some(value) = option_value(word, &mut words, STATUS_OPTION) {
+            asked.failing |= value.is_some_and(|value| {
+                value.eq_ignore_ascii_case(crate::state::resource_signal_status::FAILURE)
+            });
+            continue;
+        }
+        if word.starts_with('-') {
+            // Every other option of the CLI: its own value, where it takes one, is the word
+            // after it, which is then not one of the operands read below.
+            if words.clone().next().is_some_and(|next| !next.starts_with('-')) {
+                words.next();
+            }
+            continue;
+        }
+        operands.push(word);
+    }
+    let signalling = operands.contains(&CLOUDFORMATION_COMMAND_GROUP)
+        && operands.contains(&SIGNAL_RESOURCE_COMMAND);
+    signalling.then_some(asked)
+}
+
+/// The value `word` carries for one of the options `names`, read the one way the programs an
+/// environment provides read an option
+/// ([`::service_common::posix_shell_session::program_option_value`]) — `None` when `word` is
+/// not one of them.
+///
+/// `Some(None)` is an option written with no value after it, and so is one written with the
+/// next OPTION after it: the invocation named nothing for it, which for the resource is "no
+/// resource this read can resolve".
+fn option_value<'words>(
+    word: &str,
+    words: &mut impl Iterator<Item = &'words String>,
+    names: &[&str],
+) -> Option<Option<String>> {
+    let value = ::service_common::posix_shell_session::program_option_value(word, words, names)?;
+    Some(
+        value.filter(|value| !value.is_empty() && !value.starts_with('-')),
+    )
+}
 
 /// WHICH status the boot configuration asks the instance to signal `logical_id` with, or
 /// `None` where it asks it for no signal on that resource at all.
 ///
-/// A bootstrap runs more than one command — `cfn-init` before `cfn-signal` is the pattern
-/// `CreationPolicy` itself documents — so what is read here is each INVOCATION of a
-/// signalling command on its own ([`signal_invocations`]), and the options of one invocation
-/// say nothing about another.
+/// The configuration is a PROGRAM, so what it asks for is what PERFORMING it asks for: it is
+/// performed in the one bounded, session-local POSIX/bash session this workspace performs
+/// caller-supplied shell text in ([`::service_common::posix_shell_session`], whose module docs
+/// state its catalog and its bounds), with the two signalling commands as the programs the
+/// environment provides ([`SignallingPrograms`]). So the conditional that picks the status a
+/// bootstrap reports, the variable it keeps it in, the loop it retries the call from and the
+/// quoting of the option's value are the GRAMMAR's rather than something scanned out of the
+/// text — a bootstrap that reports its failure through a variable it set itself asks for that
+/// failure, exactly as one that writes the word on the command line does. Nothing of it reaches
+/// a process, a host path or the network: a command outside the session's catalog and these two
+/// programs is one this environment provides no program for, and the program's own `sleep`
+/// states a time nothing waits for.
 ///
 /// Both ways of signalling name the resource they signal — the helper script as
 /// `--resource <LogicalId>`, the API's command as `--logical-resource-id <LogicalId>` — so an
-/// invocation that names ANOTHER resource outright is not this gate's signal. One whose
-/// argument is a value the instance builds at boot (`--resource ${LogicalId}`, `-r
-/// $RESOURCE`) names no resource this read can resolve, and the instances are the gate
-/// resource's own, which is what makes their signal its own.
+/// invocation that names ANOTHER resource is not this gate's signal. One whose argument came to
+/// nothing names no resource this read can resolve, and the instances are the gate resource's
+/// own, which is what makes their signal its own.
 ///
 /// "The status of the signal, which is either success or failure" (`SignalResource`), and an
-/// invocation states which it asks for: the API's own command states it as
-/// `--status <STATUS>`, and the helper script states it as the exit code it reports
-/// (`cfn-signal -e 0` / `--exit-code 0` is a bootstrap that succeeded, a non-zero one its
-/// failure) or as `--success <true|false>`. A configuration that invokes neither way of
-/// signalling asks for no signal, one whose invocation for this resource states a failure asks
-/// for that, and one that invokes it without stating a failure asks for the success of an
-/// instance that came up — which is what the owning service reporting that instance serving
-/// says happened.
-///
-/// The two ways of asking are AWS's own, and the options are read as the words those commands
-/// publish — split as a shell splits them, so a quoted value and a continued line are read as
-/// the one invocation they are — and a value a template builds at boot (`-e $?`) or the
-/// bootstrap itself computes (`--status "${STATUS}"`, set by a test the script runs) states no
-/// failure here: what such a bootstrap did is work this emulator did not run, and the instance
-/// the owning service reports serving is one that came up.
+/// invocation states which it asks for ([`asked_by_the_api`], [`asked_by_the_helper`]). A
+/// configuration that performs neither way of signalling asks for no signal, one whose
+/// invocation for this resource states a failure asks for that, and one that invokes it without
+/// stating a failure asks for the success of an instance that came up — which is what the
+/// owning service reporting that instance serving says happened.
 fn asked_signal_status(boot_configuration: &str, logical_id: &str) -> Option<&'static str> {
-    let asked = decoded(boot_configuration);
     let mut asked_failure = None;
-    for invocation in signal_invocations(&asked) {
-        // The WORDS of that invocation, split as a shell splits them: the quoting and the
-        // escaping — a line continuation's own backslash among them — are the shell's rules,
-        // so they are read by the maintained word splitter rather than by a reading of this
-        // crate's. An option joined to its value by `=` is the pair it is, which is why that
-        // separator is split on here; a command line the splitter will not read (an unclosed
-        // quote) states no option this read can rely on, so nothing is taken from it.
-        let Ok(words) = ::shell_words::split(invocation) else {
-            continue;
-        };
-        let tokens: Vec<&str> = words
-            .iter()
-            .flat_map(|word| word.split('='))
-            .filter(|token| !token.is_empty())
-            .collect();
-        if names_another_resource(&tokens, logical_id) {
+    for asked in performed_signals(&decoded(boot_configuration)) {
+        if asked
+            .resource
+            .as_deref()
+            .is_some_and(|named| named != logical_id)
+        {
             continue;
         }
-        if asks_for_failure(&tokens) {
+        if asked.failing {
             asked_failure = Some(crate::state::resource_signal_status::FAILURE);
             continue;
         }
@@ -487,87 +681,48 @@ fn asked_signal_status(boot_configuration: &str, logical_id: &str) -> Option<&'s
     asked_failure
 }
 
-/// Every INVOCATION of a signalling command the boot configuration carries: the text from the
-/// command to the end of the command line it is on, so the options read for one invocation are
-/// its own.
+/// The signalling invocations PERFORMING the boot program `asked` really made.
 ///
-/// A command line ends at a newline or at one of the separators a shell starts another command
-/// at — and a newline a BACKSLASH escapes ends nothing: that is a line continuation, so the
-/// command line goes on to the next line and the options written there are this invocation's
-/// ([`command_line_end`]). A long CLI invocation is habitually written that way, and reading it
-/// as the first line alone would read an invocation's whole option list as absent.
+/// The session is given the file utilities, because a boot program runs on a machine that has
+/// storage of its own — which is also what makes the conditionals and the loops such a program
+/// is written with forms this session performs
+/// ([`::service_common::posix_shell_session::ShellSession::with_file_utilities`]) — and no
+/// variables, because the facts of the machine are the owning service's and nothing here reads
+/// one. Everything the performance may cost is the session's own bound, and the program is at
+/// most one configuration's documented size ([`decoded`]).
 ///
-/// Bounded in both directions, the configuration being a value a caller stored: the text read
-/// is at most one configuration's documented size ([`decoded`]), each step advances past the
-/// END of the invocation it took — so no byte is scanned twice and the invocations cannot
-/// overlap — and each invocation is a SLICE of that text rather than a copy of it.
-fn signal_invocations(asked: &str) -> Vec<&str> {
-    let mut invocations = Vec::new();
-    let mut rest = asked;
-    loop {
-        let found = [SIGNAL_HELPER_SCRIPT, SIGNAL_RESOURCE_COMMAND]
-            .iter()
-            .filter_map(|command| rest.find(command))
-            .min();
-        let Some(at) = found else {
-            return invocations;
-        };
-        let invocation = &rest[at..];
-        let end = command_line_end(invocation);
-        invocations.push(&invocation[..end]);
-        rest = &invocation[end..];
-    }
-}
-
-/// Where the command line that starts at the beginning of `invocation` ENDS: the first
-/// separator a shell starts another command at that is not a line continuation.
-///
-/// A backslash immediately before a newline continues the command line, so the scan passes that
-/// newline and goes on looking. Every other separator ends the line, and a line nothing ends is
-/// the rest of the text. Each byte is looked at once, so the scan is bounded by the text it
-/// walks.
-fn command_line_end(invocation: &str) -> usize {
-    const SEPARATORS: [char; 4] = ['\n', ';', '&', '|'];
-
-    let mut from = 0;
-    while let Some(found) = invocation[from..].find(SEPARATORS) {
-        let at = from + found;
-        let continued = invocation[at..].starts_with('\n') && invocation[..at].ends_with('\\');
-        if !continued {
-            return at;
-        }
-        from = at + 1;
-    }
-    invocation.len()
-}
-
-/// Whether this invocation names a resource OTHER than `logical_id`: an argument it states
-/// outright, rather than one the instance builds at boot (which carries a substitution and so
-/// names no resource this read can resolve).
-fn names_another_resource(tokens: &[&str], logical_id: &str) -> bool {
-    tokens.windows(2).any(|pair| match pair {
-        [option, value] => {
-            matches!(*option, "-r" | "--resource" | "--logical-resource-id")
-                && !value.contains('$')
-                && *value != logical_id
-        }
-        _ => false,
-    })
-}
-
-/// Whether this invocation asks for the FAILURE of the bootstrap it reports: the status the
-/// API's command states, or the exit code — or the success flag — the helper script does.
-fn asks_for_failure(tokens: &[&str]) -> bool {
-    tokens.windows(2).any(|pair| match pair {
-        [option, value] => {
-            (option.eq_ignore_ascii_case("--status")
-                && value.eq_ignore_ascii_case(crate::state::resource_signal_status::FAILURE))
-                || (matches!(*option, "-e" | "--exit-code")
-                    && value.parse::<i64>().is_ok_and(|code| code != 0))
-                || (matches!(*option, "-s" | "--success") && value.eq_ignore_ascii_case("false"))
-        }
-        _ => false,
-    })
+/// A command this environment provides NO PROGRAM FOR answers the session's own SUCCESS rather
+/// than a shell's "the utility could not be found". What this reading is after is the signal
+/// alone: the bootstrap's own work — `cfn-init`, the packages it installs, the fetch of the
+/// instance's own id — is work this emulator did not run, and the service that owns the
+/// instance reporting it SERVING is what says that work came out. So the status of such a
+/// command is not evidence of a bootstrap that failed: taking the shell's not-found status for
+/// it would make the exit code the canonical bootstrap reports (`cfn-init …` then `cfn-signal
+/// -e $?`, the pattern `CreationPolicy` documents) the status of a command nothing performed,
+/// and would report a FAILURE no engine produced — while `cfn-init && cfn-signal -e 0` and a
+/// script run under `set -e` would never reach their signalling line at all. A line the session
+/// cannot PARSE keeps the shell's own syntax status: that is the configuration's own statement
+/// rather than this reading's.
+fn performed_signals(asked: &str) -> Vec<AskedSignal> {
+    let statuses = ::service_common::posix_shell_session::Statuses::default();
+    let programs = SignallingPrograms::default();
+    let mut session = ::service_common::posix_shell_session::ShellSession::with_programs(
+        ::std::collections::BTreeMap::new(),
+        ::service_common::posix_shell_session::SessionConfig {
+            statuses: ::service_common::posix_shell_session::Statuses {
+                could_not_run: statuses.success,
+                ..statuses
+            },
+            ..::service_common::posix_shell_session::SessionConfig::default()
+        },
+        Box::new(programs.clone()),
+    )
+    .with_file_utilities();
+    // The configuration is ONE program, read by the grammar in one piece: that is what makes a
+    // construct spanning lines the program's own and a variable one line sets there for the
+    // next.
+    session.run(asked);
+    programs.performed()
 }
 
 /// The most of a boot configuration this read looks at: "the maximum size of the user data is

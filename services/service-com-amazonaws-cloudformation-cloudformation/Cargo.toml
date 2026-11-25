@@ -107,11 +107,6 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 # resolves that role against this account's IAM before it hands it over, and the refusal is
 # worded once, by the service that owns it.
 service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
-# `shell-words`: the maintained POSIX word splitter, which is how the words of a signalling
-# command line in an instance's boot configuration are read — the quoting and the escaping
-# are the shell's rules rather than this crate's
-# (`state::provisioning::instance_signals`).
-shell-words = "1.1"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
