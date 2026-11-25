@@ -3197,17 +3197,18 @@ impl ClusterRecord {
                 // holds the cluster in this phase rather than letting it report itself ready
                 // for a script nothing performed ([`run_due_bootstrap_actions`]).
                 if now >= due && self.bootstrap_actions_have_run() {
-                    self.status.state = if self.instances.keep_job_flow_alive_when_no_steps {
-                        cluster_state::WAITING.to_string()
-                    } else {
-                        cluster_state::RUNNING.to_string()
-                    };
+                    self.status.state = self.state_while_up().to_string();
                     self.status.ready_date_time = Some(due);
                     self.status.ready_due_at = None;
                 }
             }
         }
         self.advance_steps(now);
+        // A cluster that is UP reports which of the two states being up means — running a
+        // step, or resting with none left — and the queue above is what has just moved
+        // ([`Self::state_while_up`]): the step that started takes it to `RUNNING`, and the
+        // one that ended leaves it `WAITING` when it stays up with nothing else queued.
+        self.settle_state_while_up();
         // A step whose own work FAILED applies its `ActionOnFailure`: the queue behind it was
         // stopped inside the runner above, and the shutdown the two terminating actions bring
         // is started here ([`step_failure_actions`]). It stands before the self-shutdown
@@ -3225,6 +3226,52 @@ impl ClusterRecord {
         // instances that target asks for are provisioned by the one settling of capacity
         // every target move goes through ([`settle_cluster_capacity`]).
         self.apply_due_managed_scaling(now);
+    }
+
+    /// Which of the two states being UP means this cluster reports: `RUNNING` while its queue
+    /// holds a step still to run, and `WAITING` for a cluster that stays up with none left.
+    ///
+    /// "If the `JobFlowInstancesConfig` `KeepJobFlowAliveWhenNoSteps` parameter is set to
+    /// TRUE, the cluster transitions to the `WAITING` state rather than shutting down AFTER
+    /// the steps have completed" (`RunJobFlow` doc): resting is what a cluster does once its
+    /// steps are done with, so a cluster with a step still queued or still running is running
+    /// one. The other half of that sentence is what a cluster that does NOT stay up does with
+    /// the same queue — it shuts down ([`Self::auto_terminate_due_at`]) — so such a cluster is
+    /// `RUNNING` for as long as it is up at all.
+    ///
+    /// A step still to run is any step of the queue that has not reached a terminal
+    /// `StepState` ([`Self::carries_submitted_work`]): one `PENDING` behind the slots, one
+    /// `RUNNING`, and one whose cancellation is still pending are all work the cluster has in
+    /// hand.
+    fn state_while_up(&self) -> &'static str {
+        if self.instances.keep_job_flow_alive_when_no_steps && !self.carries_submitted_work() {
+            cluster_state::WAITING
+        } else {
+            cluster_state::RUNNING
+        }
+    }
+
+    /// Move a cluster that is UP between the two states being up means, as its queue moves
+    /// ([`Self::state_while_up`]). A cluster that is coming up, shutting down or gone is left
+    /// where it is: the state it reports is that phase's, not its queue's.
+    ///
+    /// Only a queue that holds work moves a cluster INTO `RUNNING`: a cluster resting with
+    /// nothing queued whose caller has since asked it to stop staying up keeps resting until
+    /// the shutdown that call owes it ([`Self::auto_terminate_due_at`]) takes it to
+    /// `TERMINATING` — "`WAITING` for one that was staying up when the caller asked it to
+    /// stop" — rather than being reported as running a queue that holds nothing.
+    fn settle_state_while_up(&mut self) {
+        if !matches!(
+            self.status.state.as_str(),
+            cluster_state::RUNNING | cluster_state::WAITING
+        ) {
+            return;
+        }
+        if self.carries_submitted_work() {
+            self.status.state = cluster_state::RUNNING.to_string();
+        } else if self.instances.keep_job_flow_alive_when_no_steps {
+            self.status.state = cluster_state::WAITING.to_string();
+        }
     }
 
     /// The instant the shutdown a cluster that does not stay up is owed comes due, or

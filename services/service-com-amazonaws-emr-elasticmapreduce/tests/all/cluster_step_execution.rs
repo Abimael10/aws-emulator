@@ -83,7 +83,11 @@ struct Case {
     concurrency: Option<i32>,
     /// Whether the cluster stays up once it has no steps left to run.
     kept_alive: bool,
-    /// The state the cluster reports once it is ready.
+    /// The state the cluster reports once it is ready, with its queue still holding work:
+    /// `RUNNING`, whether or not the launch asked it to stay up, because resting is what a
+    /// cluster does once "the steps have completed" (`RunJobFlow` doc) and every row below
+    /// still has a step to run then. The row that rests in `WAITING` is
+    /// `tests/all/keep_job_flow_alive_when_no_steps.rs`'s, whose queue is empty.
     ready_state: &'static str,
 }
 
@@ -95,7 +99,7 @@ fn cases() -> Vec<Case> {
             steps_added: 1,
             concurrency: None,
             kept_alive: true,
-            ready_state: "WAITING",
+            ready_state: "RUNNING",
         },
         Case {
             label: "four steps one at a time, submitted with the launch",
@@ -103,7 +107,7 @@ fn cases() -> Vec<Case> {
             steps_added: 0,
             concurrency: Some(1),
             kept_alive: true,
-            ready_state: "WAITING",
+            ready_state: "RUNNING",
         },
         Case {
             label: "two steps, two slots, on a cluster that does not stay up",
@@ -119,7 +123,7 @@ fn cases() -> Vec<Case> {
             steps_added: 0,
             concurrency: Some(4),
             kept_alive: true,
-            ready_state: "WAITING",
+            ready_state: "RUNNING",
         },
     ]
 }

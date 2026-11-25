@@ -71,3 +71,36 @@ Cause 2 (cli-emr-cluster-terminate-s3-logs-persist-positive):
 5. `aws emr terminate-clusters --cluster-ids <id>` and poll to TERMINATED.
 6. `aws s3api list-objects-v2 --bucket <bucket> --prefix logs/<clusterId>/` — expect KeyCount > 0 and the same non-zero count on every re-read for 30 s after termination.
    Observe: the sequence never advances past 3/4, so the log-persistence property is never reached and the client hangs with no error to branch on.
+
+## Resolution
+
+Cause 1 is FIXED: the cluster log push is authorized as the role of the instance profile the
+launch named before each object write, so a role carrying an explicit `s3:PutObject` deny on the
+log prefix leaves that prefix empty while the unrestricted sibling's fills
+(`src/state/step_logs.rs`, `src/state/node_logs.rs`, pinned by
+`tests/all/step_log_delivery_authorization.rs`). The check
+`emr-cluster-missing-s3-logs-permission-negative` passes.
+
+Cause 2 is DECLINED: every call that check waits on is served. Measured by replaying the check
+against this emulator with one observable changed at a time:
+
+| what was changed for the measurement | where the check then stopped |
+|---|---|
+| every `command-runner.jar` step forced to the not-executed failure | `run#12`, `assert steps[0]["Status"]["State"] == "COMPLETED"` — so `ListSteps` answers and the step reaches a terminal state |
+| the resting state reported with the seconds since the launch appended | `run#14`, `assert state == "WAITING"`, with `'WAITING+20'` — so `DescribeCluster` answers, 20 s after `RunJobFlow` |
+| `TerminateJobFlows` made a no-op | `_poll_until#16` — so with the shutdown in place the poll to `TERMINATED` is answered too |
+| one extra object written under `<LogUri>/<cluster-id>/` at launch | unchanged (`run#23`) — so the `KeyCount > 0` poll is not the blocking one either |
+| every cluster phase and step span collapsed to 200 ms | unchanged (`run#23`), and the client's first observation is still 20 s after `RunJobFlow` — so the emulator's spans are not what spends the budget |
+
+So the check is killed at the harness budget inside its own fixed-duration persistence re-read
+(`run#23`, `time.sleep(2)`), past the last condition it polls an emulator response for, and no
+change to this emulator's clock shortens the ~20 s its client spends before its first poll.
+
+The one real divergence this path did carry is fixed with it: a cluster that is up now reports
+`RUNNING` while its queue still holds a step to run and `WAITING` only once it holds none —
+"the cluster transitions to the `WAITING` state rather than shutting down after the steps have
+completed" (`RunJobFlow` doc) — so this client's "a keep-alive cluster whose only step finished
+must be WAITING" is an assertion about a settled cluster rather than one a cluster still running
+its queue also satisfied. A cluster already resting whose caller takes that intent back
+(`SetKeepJobFlowAliveWhenNoSteps=false`) keeps resting until the shutdown that call owes it
+begins. Pinned by `tests/all/cluster_ready_state_tracks_its_queue.rs`.

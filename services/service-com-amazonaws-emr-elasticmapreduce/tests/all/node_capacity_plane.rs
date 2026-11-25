@@ -816,7 +816,11 @@ async fn a_raised_ceiling_is_what_lets_the_activity_grow_the_cluster() {
         }),
     )
     .await;
-    await_cluster_state(&emulator, case, &cluster_id, "WAITING").await;
+    // A cluster that is up with work still in its queue reports `RUNNING` — "the cluster
+    // transitions to the `WAITING` state … after the steps have completed" (`RunJobFlow`
+    // doc) — and that is the state its capacity is read in, while the queue still holds the
+    // demand an activity reads.
+    await_cluster_state(&emulator, case, &cluster_id, "RUNNING").await;
     let live = live_instances(&emulator, case, &cluster_id, json!({})).await;
     assert_eq!(
         live.len(),
