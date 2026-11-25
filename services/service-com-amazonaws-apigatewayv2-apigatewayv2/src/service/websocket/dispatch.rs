@@ -282,9 +282,18 @@ pub fn admission(deployed: &DeployedConfiguration) -> Admission {
 /// Whether a status a reply carries is a SUCCESS — the `2xx` class, which is what admits a
 /// connection request.
 pub fn is_success_status(status: Option<&str>) -> bool {
-    status
-        .and_then(|status| status.trim().parse::<u16>().ok())
-        .is_some_and(|status| (200..300).contains(&status))
+    reply_status(status).is_some_and(|status| (200..300).contains(&status))
+}
+
+/// The status a reply NAMES, as a number, or `None` for a reply naming no readable status at
+/// all.
+///
+/// The ONE reading of a reply's `statusCode` this plane has, so the status that decides
+/// whether a connection request is admitted, the status the gateway answers a message with
+/// and the status the stage's access-log record of that call reports are read off the same
+/// text the same way.
+pub fn reply_status(status: Option<&str>) -> Option<u16> {
+    status.and_then(|status| status.trim().parse::<u16>().ok())
 }
 
 /// The route key the api's `RouteSelectionExpression` selects for `body`, or `None` when the

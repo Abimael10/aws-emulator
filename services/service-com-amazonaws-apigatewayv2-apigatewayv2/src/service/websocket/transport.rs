@@ -256,15 +256,16 @@ async fn serve_connection(
         }
     };
     // The STAGE's record of the connection request, written once the client has been answered
-    // — the status it was answered with is part of it: the `101` only where the handshake was
-    // COMPLETED, the refusal's own status where the gateway refused it, and none at all for a
-    // client that was admitted and then did not finish the handshake, where nothing was
-    // answered to report. A handshake that resolved no stage of this api resolved no
-    // `AccessLogSettings` either, and leaves no record.
+    // — the status of the ROUTE that served the call is part of it: the status the `$connect`
+    // route's response carried where that route admitted the client, and the refusal's own
+    // status where the connection request was refused. The `101` of a completed opening
+    // handshake is the TRANSPORT's switch-protocols status and is no route's response, so it
+    // is never what this record reports. A handshake that resolved no stage of this api
+    // resolved no `AccessLogSettings` either, and leaves no record.
     if let Some(connection) = decision.connection.as_ref() {
-        let status = match (&logged_refusal, &completed) {
+        let status = match (&logged_refusal, &admitted) {
             (Some(refusal), _) => Some(refusal.status),
-            (None, Some(_)) => Some(SWITCHING_PROTOCOLS),
+            (None, Some(accepted)) => Some(accepted.connect_status),
             (None, None) => None,
         };
         access_logs::delivered(
@@ -289,10 +290,11 @@ async fn serve_connection(
     carry_frames(state, registry, callback, accepted, socket).await;
 }
 
-/// The status a COMPLETED opening handshake carries (RFC 6455 §4.1: the server's handshake
-/// is a `101 Switching Protocols`), which is what the stage's record of an admitted
-/// connection request reports as the status it was answered with.
-const SWITCHING_PROTOCOLS: u16 = 101;
+/// The status the `$connect` ROUTE's response carries when no integration named one: an api
+/// with NO `$connect` route has nothing to serve the connection request with and nothing to
+/// refuse it, so the route execution simply succeeded — `200`, "the request succeeded"
+/// (RFC 9110 §15.3.1).
+const ROUTE_SUCCEEDED_STATUS: u16 = 200;
 
 /// The bytes of one HTTP request HEAD, read up to and including the blank line that ends it,
 /// or `None` for a client that sent none within [`MAX_HEAD_BYTES`].
@@ -473,6 +475,11 @@ fn socket_limits() -> ::tokio_tungstenite::tungstenite::protocol::WebSocketConfi
 #[derive(Debug, Clone)]
 struct Admitted {
     connection: Connection,
+    /// The status the `$connect` ROUTE answered the connection request with — the status its
+    /// integration's reply named, or [`ROUTE_SUCCEEDED_STATUS`] where the api holds no such
+    /// route for an integration to serve — which is the status the stage's access-log record
+    /// of that call reports.
+    connect_status: u16,
     /// Where every later call of this connection is reported: the stage that admitted it is
     /// the stage its frames are counted under, so the publisher resolved for the handshake is
     /// carried on rather than resolved again per frame.
@@ -671,15 +678,16 @@ async fn admission(
             }
         }
     }
-    let admitted = |connection: Connection| Admitted {
+    let admitted = |connection: Connection, connect_status: u16| Admitted {
         connection,
         metrics: metrics.clone(),
+        connect_status,
     };
     let Some(connect) = offered.connect else {
         // No `$connect` route: there is nothing to refuse the connection, and no integration
         // was sent the connection request.
         metrics.served(route, CallOutcome::Served);
-        return Decided::admitted(admitted(connection));
+        return Decided::admitted(admitted(connection, ROUTE_SUCCEEDED_STATUS));
     };
     // The connection request IS sent to the `$connect` route's integration from here.
     metrics.connect_dispatched(route);
@@ -690,7 +698,13 @@ async fn admission(
         Ok(answered) if dispatch::is_success_status(answered.status_code.as_deref()) => {
             metrics.integration_latency(route, began.elapsed());
             metrics.served(route, CallOutcome::Served);
-            Decided::admitted(admitted(connection))
+            // The status that reply NAMED is the status the route answered the connection
+            // request with, and so the status the stage's record of the call reports: a
+            // `$connect` route's own answer, exactly as a message's route's answer is the
+            // status that message's record reports.
+            let status = dispatch::reply_status(answered.status_code.as_deref())
+                .unwrap_or(ROUTE_SUCCEEDED_STATUS);
+            Decided::admitted(admitted(connection, status))
         }
         Ok(answered) => {
             // The STATUS the integration answered is what the handshake is refused with, and
@@ -698,10 +712,7 @@ async fn admission(
             // backend admits or refuses a client, so its own answer is the refusal rather
             // than a status this gateway chose. A reply naming no status at all names no
             // decision, which is the gateway's own `500`.
-            let status = answered
-                .status_code
-                .as_deref()
-                .and_then(|status| status.trim().parse::<u16>().ok());
+            let status = dispatch::reply_status(answered.status_code.as_deref());
             tracing::info!(
                 %api_id,
                 stage = %stage_name,
@@ -1198,10 +1209,7 @@ async fn disconnected(
     let began = Instant::now();
     match integration::perform(callback, connection, &selected, &call, &request_id).await {
         Ok(answered) => {
-            logged.status = answered
-                .status_code
-                .as_deref()
-                .and_then(|status| status.trim().parse::<u16>().ok());
+            logged.status = dispatch::reply_status(answered.status_code.as_deref());
             metrics.integration_latency(route, began.elapsed());
             metrics.served(route, CallOutcome::Served);
         }
@@ -1493,10 +1501,7 @@ async fn served_frame(
             );
             metrics.integration_latency(route, began.elapsed());
             metrics.served(route, CallOutcome::Served);
-            let status = answered
-                .status_code
-                .as_deref()
-                .and_then(|status| status.trim().parse::<u16>().ok());
+            let status = dispatch::reply_status(answered.status_code.as_deref());
             let reply = selected.two_way.then_some(answered.payload).flatten();
             answer(reply, &selected.route_key, per_route.clone(), status, None)
         }

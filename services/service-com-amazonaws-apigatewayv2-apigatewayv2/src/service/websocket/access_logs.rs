@@ -58,9 +58,11 @@ pub struct Served {
     /// The id of the call: the one the event the integration was handed reported, so the
     /// record and that invocation name ONE call.
     pub request_id: String,
-    /// The status the GATEWAY answered the call with — the handshake's own status for a
-    /// connection request, the status a message's route produced, the status the close's
-    /// route produced — or `None` for a call nothing answered with a status at all.
+    /// The status the ROUTE that served the call answered it with — the status the
+    /// `$connect` route's response carried for a connection request, the status a message's
+    /// route produced, the status the close's route produced — or `None` for a call no route
+    /// of the api answered with a status at all. Never the `101` of the opening handshake:
+    /// that is the transport's switch-protocols status and is no route's response.
     pub status: Option<u16>,
     /// How many bytes the gateway sent back to the client for this call, where it sent any.
     pub response_length: Option<usize>,
@@ -248,7 +250,7 @@ mod tests {
                     call: Call::Connect,
                     route_key: "$connect".to_string(),
                     request_id: "req-1".to_string(),
-                    status: Some(101),
+                    status: Some(200),
                     response_length: None,
                     latency: Duration::from_millis(7),
                     error_message: None,
@@ -258,7 +260,7 @@ mod tests {
                     ("routeKey", "$connect"),
                     ("requestId", "req-1"),
                     ("extendedRequestId", "req-1"),
-                    ("status", "101"),
+                    ("status", "200"),
                     ("connectionId", "L0SM9cOFyjUCIhA="),
                     ("stage", "prod"),
                     ("apiId", "a1b2c3d4e5"),
@@ -356,7 +358,7 @@ mod tests {
             call: Call::Connect,
             route_key: "$connect".to_string(),
             request_id: "req-9".to_string(),
-            status: Some(101),
+            status: Some(200),
             response_length: None,
             latency: Duration::from_millis(4),
             error_message: None,
@@ -369,7 +371,7 @@ mod tests {
             (
                 "the published json shape",
                 r#"{"requestId":"$context.requestId","eventType":"$context.eventType","status":"$context.status"}"#,
-                r#"{"requestId":"req-9","eventType":"CONNECT","status":"101"}"#,
+                r#"{"requestId":"req-9","eventType":"CONNECT","status":"200"}"#,
             ),
             ("one reference", "$context.connectionId", "L0SM9cOFyjUCIhA="),
             ("a member no call carries", "$context.authorizer.error", "-"),

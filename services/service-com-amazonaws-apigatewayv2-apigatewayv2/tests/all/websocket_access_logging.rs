@@ -280,8 +280,8 @@ async fn every_call_of_a_session_leaves_one_record_rendered_by_the_stages_format
         .unwrap_or_else(|status| {
             panic!("case {case:?}: the handshake must be completed, got {status}")
         });
-    // The connection request is the first route execution, and its record carries the
-    // handshake's own status.
+    // The connection request is the first route execution, and its record carries the status
+    // the `$connect` ROUTE answered it with — not the `101` of the opening handshake.
     let records = records_once_at_least(&router, case, 1).await;
     let connect = parsed(case, &records[0]);
     let connection_id = connect
@@ -299,7 +299,7 @@ async fn every_call_of_a_session_leaves_one_record_rendered_by_the_stages_format
             "requestId": as_text(&connect, "requestId"),
             "eventType": "CONNECT",
             "routeKey": "$connect",
-            "status": "101",
+            "status": "200",
             "connectionId": connection_id,
             "stage": STAGE,
             "messageDirection": "IN",
@@ -461,7 +461,7 @@ async fn a_common_log_format_stage_renders_the_same_calls_in_that_format() {
     exchanged_reply(case, &mut socket, r#"{"action":"ping"}"#).await;
     let records = records_once_at_least(&router, case, 2).await;
     for (what, expected) in [
-        ("the connection request", "\"CONNECT $connect\" 101 "),
+        ("the connection request", "\"CONNECT $connect\" 200 "),
         ("the message", "\"MESSAGE ping\" 200 "),
     ] {
         assert!(

@@ -810,11 +810,7 @@ struct OfferedHandshake {
 fn refused_by_the_connection_request(
     answered: &integration::Answered,
 ) -> RtResponse {
-    let Some(status) = answered
-        .status_code
-        .as_deref()
-        .and_then(|status| status.trim().parse::<u16>().ok())
-    else {
+    let Some(status) = dispatch::reply_status(answered.status_code.as_deref()) else {
         // A reply naming no status names no decision at all.
         return json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None);
     };
