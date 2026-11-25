@@ -431,7 +431,17 @@ pub fn filter_predicates(
     Ok(predicates)
 }
 
-/// The details members an entity's `Name` is read from.
+/// The details member the five product summaries name an entity's `Name`:
+/// `AmiProductSummary$ProductTitle` and the four product titles beside it.
+pub const PRODUCT_TITLE_DETAIL_MEMBER: &str = "ProductTitle";
+
+/// The details member every other type's summary names an entity's `Name`:
+/// `OfferSummary$Name`, `OfferSetSummary$Name`,
+/// `ResaleAuthorizationSummary$Name`.
+pub const NAME_DETAIL_MEMBER: &str = "Name";
+
+/// The details members an entity's `Name` is read from, across every type this
+/// catalog has.
 ///
 /// `EntitySummary$Name` is "defined by the seller", and the per-type summaries
 /// the model carries name it two ways: the five product summaries
@@ -439,7 +449,38 @@ pub fn filter_predicates(
 /// `SaaSProductSummary`, `MachineLearningProductSummary`) call it
 /// `ProductTitle`, while `OfferSummary` / `OfferSetSummary` /
 /// `ResaleAuthorizationSummary` call it `Name`.
-pub const ENTITY_NAME_DETAIL_MEMBERS: &[&str] = &["ProductTitle", "Name"];
+///
+/// This is their UNION — the members a change's details may carry a value an
+/// entity's name is read from at, which is what the write path judges against
+/// the name contract. WHICH of them ONE entity's name comes from follows that
+/// entity's own type: [`entity_name_detail_member`].
+pub const ENTITY_NAME_DETAIL_MEMBERS: &[&str] =
+    &[PRODUCT_TITLE_DETAIL_MEMBER, NAME_DETAIL_MEMBER];
+
+/// The ONE details member an entity of `entity_type` carries its `Name` in.
+///
+/// A type whose own summary names the entity's name names it under exactly one
+/// member, and the two sets are disjoint: `ProductTitle` is no member of
+/// `OfferSummary` / `OfferSetSummary` / `ResaleAuthorizationSummary`, and `Name`
+/// is no member of any `*ProductSummary` (`smithy_query(query="shape",
+/// shape="AmiProductSummary,OfferSummary")`). So the member an entity's name is
+/// read from is the one ITS type names — `ProductTitle` for a product type
+/// ([`PRODUCT_ENTITY_TYPES`]), `Name` for every other type, which is the member
+/// a type whose summary names neither (`ExpressPrivateOfferConfiguration`, and
+/// the types the model declares no summary for) carries it in as well, since
+/// `EntitySummary$Name` is the only member reporting it there.
+///
+/// One member per type is what keeps the value the summaries REPORT and the
+/// attribute the per-type filters and sorts select and order on
+/// ([`EntityRecord::attribute_values`], which reads the details member of the
+/// name the filter and sort shapes give it) the same value.
+pub fn entity_name_detail_member(entity_type: &str) -> &'static str {
+    if PRODUCT_ENTITY_TYPES.contains(&entity_type) {
+        PRODUCT_TITLE_DETAIL_MEMBER
+    } else {
+        NAME_DETAIL_MEMBER
+    }
+}
 
 /// The details member an entity's `Visibility` is read from — the name every
 /// per-type summary and `*VisibilityFilter` in the model gives it.
@@ -1518,6 +1559,13 @@ impl EntityRecord {
     /// in their own fields, and every other member the details member of that
     /// name. A list-valued attribute (an offer's buyer accounts) answers every
     /// value it holds; an attribute the entity does not carry answers none.
+    ///
+    /// The one attribute held BOTH in a field and in the details is the entity's
+    /// name, under the member its own type names it ([`entity_name_detail_member`]):
+    /// that attribute answers the field when the details carry nothing there, so
+    /// the value a request selects and orders on is the value the summaries
+    /// report. The member ANOTHER type names a name under is no attribute of
+    /// this entity, so it answers only what the details hold at it.
     pub fn attribute_values(&self, member: &str) -> Vec<String> {
         match member {
             "EntityId" => return vec![self.id.clone()],
@@ -1533,7 +1581,7 @@ impl EntityRecord {
                 .collect(),
             _ => Vec::new(),
         };
-        if held.is_empty() && ENTITY_NAME_DETAIL_MEMBERS.contains(&member) {
+        if held.is_empty() && member == entity_name_detail_member(&self.entity_type) {
             return self.name.clone().into_iter().collect();
         }
         held
@@ -2549,7 +2597,9 @@ pub fn too_many_delivery_options(count: usize) -> ValidationException {
 }
 
 /// The `Name` the details of an applied change give an entity of
-/// `entity_type`, if any.
+/// `entity_type`, if any: the value they carry at the one member that type
+/// names an entity's name ([`entity_name_detail_member`]) — never a member
+/// another type names it, which this entity's summary reports nothing from.
 ///
 /// Only an applied change set reaches here, and a name outside
 /// [`entity_name_contract`] fails the change set before it is applied
@@ -2557,11 +2607,10 @@ pub fn too_many_delivery_options(count: usize) -> ValidationException {
 /// record — the same two-sided rule [`detail_visibility`] follows.
 fn detail_name(entity_type: &str, members: &Map<String, Value>) -> Option<String> {
     let contract = entity_name_contract(entity_type);
-    ENTITY_NAME_DETAIL_MEMBERS
-        .iter()
-        .filter_map(|member| members.get(*member))
-        .filter_map(|value| value.as_str())
-        .find(|text| contract.admits_text(text))
+    members
+        .get(entity_name_detail_member(entity_type))?
+        .as_str()
+        .filter(|text| contract.admits_text(text))
         .map(str::to_string)
 }
 
@@ -3027,12 +3076,14 @@ pub fn entity_name_contract(entity_type: &str) -> DetailContract {
 /// it reads a member to REPORT it, so the contract each one is judged against is
 /// the one the model declares for the `EntitySummary` member that reports that
 /// value: the published set of an enumerated member, and the `@length` and
-/// `@pattern` of a member targeting a string shape. The member an entity's
-/// `Name` comes from ([`ENTITY_NAME_DETAIL_MEMBERS`]) is bounded by
-/// [`entity_name_contract`], the one its `Visibility` comes from
-/// ([`ENTITY_VISIBILITY_DETAIL_MEMBER`]) by the values the `*VisibilityString`
-/// enum of the entity's own type publishes ([`entity_visibility_contract`]), and
-/// every member the listed entity's per-type summary reports by
+/// `@pattern` of a member targeting a string shape. A member an entity's `Name`
+/// is read from ([`ENTITY_NAME_DETAIL_MEMBERS`] — the one this type names it
+/// under, [`entity_name_detail_member`], and the one another type does, which a
+/// change may carry just as well) is bounded by [`entity_name_contract`], the
+/// member its `Visibility` comes from ([`ENTITY_VISIBILITY_DETAIL_MEMBER`]) by
+/// the values the `*VisibilityString` enum of the entity's own type publishes
+/// ([`entity_visibility_contract`]), and every member the listed entity's
+/// per-type summary reports by
 /// [`summary_member_contracts`]. A member NO summary reports is carried into
 /// the entity's details untouched and reported only inside the opaque `Details`
 /// document, so nothing here judges it.
@@ -3090,8 +3141,10 @@ fn invalid_detail_value(member: &str, accepts: &str, value: &Value) -> ErrorDeta
 /// so each change is applicable on its own and it is their combination the
 /// catalog cannot apply.
 ///
-/// Only the members the catalog reads into one of the entity's own FIELDS — its
-/// name and its visibility — are claims about the entity: every other member is
+/// Only the members the catalog reads into one of the entity's own FIELDS — the
+/// members an entity's name is read from ([`ENTITY_NAME_DETAIL_MEMBERS`], the
+/// union over the types, since one change set carries changes of several types)
+/// and its visibility — are claims about the entity: every other member is
 /// carried into the entity's details, where the last change to name it is the
 /// one that stands, so two changes naming it is a merge rather than a
 /// contradiction. Each change is therefore looked at through that fixed, short
