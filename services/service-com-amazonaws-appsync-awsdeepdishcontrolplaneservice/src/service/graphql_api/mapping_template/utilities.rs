@@ -295,6 +295,17 @@ pub fn call(path: &[String], args: &[Json]) -> Result<Answer, String> {
             Some(produced) => value(produced),
             None => Err(format!("{NO_SUCH_HELPER}$util.dynamodb.{helper}")),
         },
+        // The TRANSFORM helper of the same data source: a filter stated as an OBJECT — one
+        // entry per attribute, naming the operators it is compared under, with `and`, `or` and
+        // `not` grouping entries — comes to the `{expression, expressionNames,
+        // expressionValues}` the request object's own `filter` member carries, serialized, so a
+        // template inlines it where that member goes. It is the same translation an APPSYNC_JS
+        // resolver's filter travels through
+        // ([`super::super::dynamodb::helpers::filter_expression`]), so a filter stated in a
+        // template and the same filter stated in code select on the same expression.
+        ["transform", "toDynamoDBFilterExpression"] => value(Json::String(
+            super::super::dynamodb::helpers::filter_expression(&argument(0))?.to_string(),
+        )),
         // The relational-database helpers: the statement builders a request template writes
         // its statements with, and the reading of the result one produced
         // ([`super::super::relational_database::utilities`]), which is the same reading an

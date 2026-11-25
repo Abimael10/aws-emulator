@@ -147,6 +147,18 @@ fn sync(payload: &Json) -> Result<Json, String> {
     Ok(Json::Object(request))
 }
 
+/// The filter expression a filter stated as an OBJECT comes to — `{expression,
+/// expressionNames, expressionValues}`, the three members the `filter` of a selection carries.
+///
+/// The ONE translation of that filter language, which a VTL mapping template reaches through
+/// the transform helper AppSync publishes for exactly this
+/// (`crate::service::graphql_api::mapping_template::utilities`) and a resolver written for the
+/// APPSYNC_JS runtime through the module above: a filter stated in a template and the same
+/// filter stated in code therefore select on the same expression, parameterised the same way.
+pub fn filter_expression(stated: &Json) -> Result<Json, String> {
+    expressions::predicate(stated, FILTER_MEMBER)
+}
+
 /// The members every SELECTION of a page states: what it filters by, which index it reads, how
 /// many values, whether the read is consistent, what it selects, which attributes it projects
 /// and where the previous page left off.
