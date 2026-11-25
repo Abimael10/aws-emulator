@@ -113,6 +113,16 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PHASE_SPAN: Duration =
     service_com_amazonaws_sagemaker_sagemaker::state::TRAINING_JOB_PHASE_SPAN;
 
+/// A `MaxRuntimeInSeconds` that falls strictly INSIDE the span the clock lays a job's work out
+/// over: the whole second below that span, read from the state's own schedule so the row that
+/// uses it keeps its meaning whatever span the work is given rather than restating a figure one
+/// schedule happened to have. The member is whole seconds with a modelled minimum of one, which
+/// is the floor this stays at.
+fn cap_inside_the_work() -> i64 {
+    let span = service_com_amazonaws_sagemaker_sagemaker::state::TRAINING_JOB_ENDS_AFTER;
+    ((span.as_secs_f64().ceil() as i64) - 1).max(1)
+}
+
 /// The slack a comparison of two instants allows for carrying them as the epoch seconds a
 /// timestamp travels the wire as: well under a millisecond, and orders below every span
 /// compared against.
@@ -621,7 +631,7 @@ async fn a_runtime_cap_the_work_does_not_fit_inside_ends_the_job_at_the_cap() {
         (
             "a cap inside the span of the work",
             "cap-inside-the-work",
-            Some(5),
+            Some(cap_inside_the_work()),
             "Stopped",
             "MaxRuntimeExceeded",
         ),

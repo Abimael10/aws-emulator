@@ -18,15 +18,16 @@ use super::*;
 /// secondary status of a job whose work has not started, and one that keeps polling observes
 /// each stage of the work in turn before the terminal status.
 ///
-/// It is a span a POLLER can land inside: a client watches a training job by describing it
-/// every few seconds to every few tens of seconds (the lifecycle it was written against takes
-/// minutes on AWS), so a stage that is in effect for less than one such interval is a stage no
-/// client ever observes, and the whole of a job's work has to stay inside ONE such interval or
-/// a client waiting for the terminal status pays a second one. The span is therefore the whole
-/// of this crate's band for a clock-owed transition rather than its floor, and the stage that
-/// runs the CONTAINER is in effect for as long as that container's own work took besides
-/// ([`MAX_REVEALED_CONTAINER_WORK`]).
-pub const TRAINING_JOB_PHASE_SPAN: Duration = Duration::from_secs(4);
+/// It is sized so the WHOLE walk fits inside the band this crate gives one clock-owed
+/// transition ([`TRAINING_JOB_ENDS_AFTER`] is the stages' spans together, and the band's top is
+/// a few seconds), because a training job is one leg of what a client does with it: a flow that
+/// trains a model, registers it and then transforms data with it waits out one such lifecycle
+/// after another inside a single budget of its own, so a per-stage span on the scale AWS takes
+/// (minutes) leaves that flow with no terminal status to observe at all. Each stage still gets a
+/// whole span of its own, which is orders of magnitude more than the round trip a poller spends
+/// looking, and the stage that runs the CONTAINER is in effect for as long as that container's
+/// own work took besides ([`MAX_REVEALED_CONTAINER_WORK`]).
+pub const TRAINING_JOB_PHASE_SPAN: Duration = Duration::from_millis(700);
 
 /// How long after `CreateTrainingJob` the clock owes the job's move out of `InProgress`
 /// into its terminal status.
@@ -37,6 +38,10 @@ pub const TRAINING_JOB_PHASE_SPAN: Duration = Duration::from_secs(4);
 /// downloads its data, fits a model and uploads the artifact — the longest a job here takes —
 /// so a caller that waits this long (as `aws sagemaker wait training-job-completed-or-stopped`
 /// does) observes a terminal status and a waiter terminates.
+///
+/// This is THE transition the clock owes a training job, `InProgress` to its terminal status,
+/// and it is the figure held to the few-second band a clock-owed transition is given here; the
+/// stages are its subdivisions and share it out.
 pub const TRAINING_JOB_ENDS_AFTER: Duration = TRAINING_JOB_PHASE_SPAN.saturating_mul(4);
 
 /// The most of a container's own stated work the clock REVEALS a job over, on top of the span
@@ -50,11 +55,13 @@ pub const TRAINING_JOB_ENDS_AFTER: Duration = TRAINING_JOB_PHASE_SPAN.saturating
 ///
 /// THIS CEILING IS THE EMULATOR'S: the schedule is read against this host's own clock, so a
 /// program stating hours of work would leave the job non-terminal for hours and no waiter would
-/// terminate — and a client waiting for the terminal status pays a whole poll interval for every
-/// interval the work outlasts. Past it the work is still COUNTED in full — the job's own
-/// runtime, and what its `StoppingCondition` is measured against, is the whole stated time
+/// terminate — and a client that waits out this lifecycle before it can start the next one pays
+/// every second of it. It is therefore one stage's span, which keeps the whole of a job's work
+/// inside the band this crate gives a clock-owed transition however much work the container
+/// states. Past it the work is still COUNTED in full — the job's own runtime, and what its
+/// `StoppingCondition` is measured against, is the whole stated time
 /// ([`TrainingJob::reported_runtime`]) — and only how much of it the clock reveals is bounded.
-pub const MAX_REVEALED_CONTAINER_WORK: Duration = Duration::from_secs(12);
+pub const MAX_REVEALED_CONTAINER_WORK: Duration = TRAINING_JOB_PHASE_SPAN;
 
 /// When the clock owes the stage that FOLLOWS `stages_before` stages of work which the
 /// accepting call performed server-side and reported at `reported_at`.

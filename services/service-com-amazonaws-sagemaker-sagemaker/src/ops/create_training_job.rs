@@ -46,8 +46,9 @@
 //! the instants the clock owes them ([`crate::state::publish_when_due`]), so a client that
 //! polls `SecondaryStatus` to decide when the artifact exists never finds it before the job
 //! says so. The stage that runs the CONTAINER is in effect for as long as that container's own
-//! program stated its work took, so a job whose container really works for a while is
-//! observable in it for about as long; a job whose `StoppingCondition.MaxRuntimeInSeconds`
+//! program stated its work took, bounded by how much of that work the clock reveals
+//! ([`crate::state::MAX_REVEALED_CONTAINER_WORK`]) so the whole lifecycle stays inside a window
+//! a client's poll loop can traverse; a job whose `StoppingCondition.MaxRuntimeInSeconds`
 //! falls inside the runtime that work took is ended on that cap instead, with the
 //! `Stopped`/`MaxRuntimeExceeded` pair the model groups together.
 //!
