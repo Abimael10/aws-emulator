@@ -172,6 +172,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // `DisplayName` NAMES the group, and a name this API reserves cannot name one:
+        // a create carrying a reserved name is refused with the modelled
+        // `ValidationException` and stores nothing. Asked of the REQUEST alone, so it is
+        // answered before any store is resolved or locked.
+        if input
+            .display_name
+            .as_deref()
+            .is_some_and(crate::state::is_reserved_identity_name)
+        {
+            return Err(CreateGroupErrorModeled::ValidationException(
+                crate::state::validation(crate::state::reserved_identity_name_message()),
+            )
+            .into());
+        }
         // Who is creating this group: recorded on the record as its `CreatedBy`, which a
         // later `DescribeGroup` reports.
         let created_by = crate::state::caller_principal(&*self.engine, ctx);

@@ -1199,6 +1199,39 @@ pub fn validation(message: impl Into<String>) -> ValidationException {
     }
 }
 
+/// The names this API reserves: no user and no group may be named one of them.
+///
+/// Stated by the model on each of the two members that NAME an identity —
+/// `CreateUserRequest$UserName` and `CreateGroupRequest$DisplayName`
+/// (`smithy_query(query="doc",shape="CreateGroupRequest",member="DisplayName")`): both say
+/// `Administrator` and `AWSAdministrators` are reserved names and can't be used for users
+/// or groups. One catalog rather than one per handler, so a create and an update refuse
+/// the same set.
+pub const RESERVED_IDENTITY_NAMES: [&str; 2] = ["Administrator", "AWSAdministrators"];
+
+/// Whether `name` is one of the [`RESERVED_IDENTITY_NAMES`].
+///
+/// Compared without regard to letter case: what is reserved is the NAME, and these are
+/// SCIM identity names, which are not case-exact — a store that admitted another spelling
+/// of one would hold an identity named a reserved name.
+pub fn is_reserved_identity_name(name: &str) -> bool {
+    RESERVED_IDENTITY_NAMES
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(name))
+}
+
+/// The message a request naming a user or a group a reserved name is refused with.
+///
+/// The rule as the model words it, built from the catalog above so the sentence cannot
+/// name a set the service does not refuse. It states the RULE and echoes nothing a caller
+/// sent: the two members it guards are `@sensitive`.
+pub fn reserved_identity_name_message() -> String {
+    format!(
+        "{} are reserved names and can't be used for users or groups",
+        RESERVED_IDENTITY_NAMES.join(" and ")
+    )
+}
+
 /// The modelled `InternalServerException` a handler answers when it cannot reach this
 /// service's store at all.
 ///

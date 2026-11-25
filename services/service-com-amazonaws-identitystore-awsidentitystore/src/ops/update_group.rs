@@ -351,6 +351,14 @@ fn attribute_value(
     if let Some(message) = envelope(&violations) {
         return Err(invalid(message));
     }
+    // `DisplayName` NAMES the group, so an update that would give it a name this API
+    // reserves is refused exactly as a create carrying one is, and the group keeps the
+    // name it had.
+    if attribute == GroupAttribute::DisplayName
+        && crate::state::is_reserved_identity_name(text)
+    {
+        return Err(invalid(crate::state::reserved_identity_name_message()));
+    }
     Ok(Some(text.clone()))
 }
 

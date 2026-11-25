@@ -364,7 +364,19 @@ fn apply(
     // it.
     let key = path.to_ascii_lowercase();
     match key.as_str() {
-        "username" => user.user_name = optional_text(value, path, USER_NAME_MAX_LEN)?,
+        "username" => {
+            let user_name = optional_text(value, path, USER_NAME_MAX_LEN)?;
+            // `UserName` NAMES the user, so an update that would give it a name this API
+            // reserves is refused exactly as a create carrying one is, and the user keeps
+            // the name it had.
+            if user_name
+                .as_deref()
+                .is_some_and(crate::state::is_reserved_identity_name)
+            {
+                return Err(crate::state::reserved_identity_name_message());
+            }
+            user.user_name = user_name;
+        }
         "displayname" => user.display_name = optional_text(value, path, TEXT_MAX_LEN)?,
         "nickname" => user.nick_name = optional_text(value, path, TEXT_MAX_LEN)?,
         "profileurl" => user.profile_url = optional_text(value, path, TEXT_MAX_LEN)?,

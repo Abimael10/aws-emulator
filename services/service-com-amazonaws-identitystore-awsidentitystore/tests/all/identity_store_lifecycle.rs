@@ -1568,3 +1568,250 @@ async fn a_membership_the_store_does_not_hold_is_reported_as_not_found() {
          got {still_there}"
     );
 }
+
+/// The names the model reserves, so neither a user nor a group may be named one.
+///
+/// Restated here, rather than read off the crate, so this suite pins the catalog the
+/// service applies: the two members that NAME an identity —
+/// `CreateGroupRequest$DisplayName` and `CreateUserRequest$UserName`
+/// (`smithy_query(query="doc",shape="CreateGroupRequest",member="DisplayName")`) — both
+/// state that `Administrator` and `AWSAdministrators` are reserved names and can't be
+/// used for users or groups.
+const RESERVED_NAMES: [&str; 2] = ["Administrator", "AWSAdministrators"];
+
+/// The rule a refusal states, as the model words it.
+const RESERVED_NAME_MESSAGE: &str =
+    "Administrator and AWSAdministrators are reserved names and can't be used for \
+     users or groups";
+
+/// The status the modelled `ValidationException` carries
+/// (`smithy_query(query="shape",shape="ValidationException")`: `@httpError(400)`).
+const INVALID_REQUEST: u16 = 400;
+
+/// A `UniqueAttribute` alternate identifier naming `path` with `value`, the form
+/// `GetGroupId` / `GetUserId` resolve a name with.
+fn by_unique_attribute(path: &str, value: &str) -> Value {
+    json!({ "UniqueAttribute": { "AttributePath": path, "AttributeValue": value } })
+}
+
+/// Every spelling of `name` that names the same identity: an identity name is not
+/// case-exact, so a reserved name is reserved however it is cased.
+fn spellings(name: &str) -> [(&'static str, String); 3] {
+    [
+        ("as the model writes it", name.to_string()),
+        ("lower case", name.to_lowercase()),
+        ("upper case", name.to_uppercase()),
+    ]
+}
+
+/// What `DescribeGroup` reports for `group`.
+async fn describe_group(router: &MultiServiceRouter, group: &str, case: &str) -> Value {
+    ok(
+        router,
+        "DescribeGroup",
+        json!({ "IdentityStoreId": STORE, "GroupId": group }),
+        case,
+    )
+    .await
+}
+
+/// What `DescribeUser` reports for `user`.
+async fn describe_user(router: &MultiServiceRouter, user: &str, case: &str) -> Value {
+    ok(
+        router,
+        "DescribeUser",
+        json!({ "IdentityStoreId": STORE, "UserId": user }),
+        case,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_reserved_name_cannot_name_a_user_or_a_group() {
+    let router = emulator();
+    let seed = "the resources that keep their names";
+    // A group and a user that already exist, so the rows that would RENAME an identity
+    // have something to rename and every refusal can be shown to change nothing.
+    let group = create_group(&router, STORE, "the group that keeps its name", seed).await;
+    let user = create_user(&router, STORE, "the-user-that-keeps-its-name", seed).await;
+    let group_before = describe_group(&router, &group, seed).await;
+    let user_before = describe_user(&router, &user, seed).await;
+
+    for reserved in RESERVED_NAMES {
+        for (spelling, name) in spellings(reserved) {
+            let case = format!("{reserved} written in {spelling}");
+            let case = case.as_str();
+            // Every request that would give an identity this name: the two creates that
+            // mint one under it and the two updates that would rename one to it.
+            let rows = [
+                (
+                    "CreateGroup",
+                    json!({ "IdentityStoreId": STORE, "DisplayName": name }),
+                ),
+                (
+                    "CreateUser",
+                    json!({ "IdentityStoreId": STORE, "UserName": name }),
+                ),
+                (
+                    "UpdateGroup",
+                    json!({
+                        "IdentityStoreId": STORE,
+                        "GroupId": group,
+                        "Operations": [
+                            { "AttributePath": "displayName", "AttributeValue": name },
+                        ],
+                    }),
+                ),
+                (
+                    "UpdateUser",
+                    json!({
+                        "IdentityStoreId": STORE,
+                        "UserId": user,
+                        "Operations": [
+                            { "AttributePath": "userName", "AttributeValue": name },
+                        ],
+                    }),
+                ),
+            ];
+            for (operation, request) in rows {
+                let body = refused(
+                    &router,
+                    operation,
+                    request,
+                    INVALID_REQUEST,
+                    "ValidationException",
+                    case,
+                )
+                .await;
+                let message = error_message(&body);
+                assert_eq!(
+                    message, RESERVED_NAME_MESSAGE,
+                    "case {case:?}: expected {operation} to state the reserved-name rule, \
+                     got {message:?}"
+                );
+            }
+
+            // Nothing was stored under the refused name: it resolves to no group and to
+            // no user.
+            refused(
+                &router,
+                "GetGroupId",
+                json!({
+                    "IdentityStoreId": STORE,
+                    "AlternateIdentifier": by_unique_attribute("displayName", &name),
+                }),
+                NOT_FOUND,
+                "ResourceNotFoundException",
+                case,
+            )
+            .await;
+            refused(
+                &router,
+                "GetUserId",
+                json!({
+                    "IdentityStoreId": STORE,
+                    "AlternateIdentifier": by_unique_attribute("userName", &name),
+                }),
+                NOT_FOUND,
+                "ResourceNotFoundException",
+                case,
+            )
+            .await;
+        }
+    }
+
+    // The refused updates applied nothing: both resources are reported exactly as they
+    // were, revision included.
+    let group_after = describe_group(&router, &group, seed).await;
+    assert_eq!(
+        group_after, group_before,
+        "case {seed:?}: expected the refused renames to leave the group untouched, \
+         got {group_after}"
+    );
+    let user_after = describe_user(&router, &user, seed).await;
+    assert_eq!(
+        user_after, user_before,
+        "case {seed:?}: expected the refused renames to leave the user untouched, \
+         got {user_after}"
+    );
+}
+
+#[tokio::test]
+async fn a_name_the_model_does_not_reserve_names_a_user_or_a_group() {
+    let router = emulator();
+    // Rows are names a RESERVED name is a prefix, a suffix or a substring of, so the
+    // rule above cannot be read as a substring match, plus one name sharing nothing
+    // with either. None carries a space, because the modelled `UserName` pattern admits
+    // none (`smithy_query(query="shape",shape="UserName")`).
+    let rows = [
+        ("the plural of one", "Administrators"),
+        ("the singular of the other", "AWSAdministrator"),
+        ("one with a suffix", "Administrator-2"),
+        ("one with a prefix", "Deputy.Administrator"),
+        ("a prefix of one", "Admin"),
+        ("neither", "engineering"),
+    ];
+
+    for (case, name) in rows {
+        let group = create_group(&router, STORE, name, case).await;
+        let described = describe_group(&router, &group, case).await;
+        assert_eq!(
+            described["DisplayName"].as_str().unwrap_or_default(),
+            name,
+            "case {case:?}: expected the group to be stored under {name:?}, got {described}"
+        );
+
+        let user = create_user(&router, STORE, name, case).await;
+        let described = describe_user(&router, &user, case).await;
+        assert_eq!(
+            described["UserName"].as_str().unwrap_or_default(),
+            name,
+            "case {case:?}: expected the user to be stored under {name:?}, got {described}"
+        );
+    }
+
+    // And a rename to a name the model does not reserve still applies, so the rule
+    // refuses the reserved names and nothing else.
+    let case = "renamed to a name the model does not reserve";
+    let group = create_group(&router, STORE, "the group before its rename", case).await;
+    ok(
+        &router,
+        "UpdateGroup",
+        json!({
+            "IdentityStoreId": STORE,
+            "GroupId": group,
+            "Operations": [
+                { "AttributePath": "displayName", "AttributeValue": "Administrators Guild" },
+            ],
+        }),
+        case,
+    )
+    .await;
+    let described = describe_group(&router, &group, case).await;
+    assert_eq!(
+        described["DisplayName"].as_str().unwrap_or_default(),
+        "Administrators Guild",
+        "case {case:?}: expected the rename to be applied, got {described}"
+    );
+
+    let user = create_user(&router, STORE, "the-user-before-its-rename", case).await;
+    ok(
+        &router,
+        "UpdateUser",
+        json!({
+            "IdentityStoreId": STORE,
+            "UserId": user,
+            "Operations": [
+                { "AttributePath": "userName", "AttributeValue": "AWSAdministrators.deputy" },
+            ],
+        }),
+        case,
+    )
+    .await;
+    let described = describe_user(&router, &user, case).await;
+    assert_eq!(
+        described["UserName"].as_str().unwrap_or_default(),
+        "AWSAdministrators.deputy",
+        "case {case:?}: expected the rename to be applied, got {described}"
+    );
+}

@@ -216,6 +216,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // `UserName` NAMES the user, and a name this API reserves cannot name one: a
+        // create carrying a reserved name is refused with the modelled
+        // `ValidationException` and stores nothing. Asked of the REQUEST alone, so it is
+        // answered before any store is resolved or locked.
+        if input
+            .user_name
+            .as_deref()
+            .is_some_and(crate::state::is_reserved_identity_name)
+        {
+            return Err(CreateUserErrorModeled::ValidationException(
+                crate::state::validation(crate::state::reserved_identity_name_message()),
+            )
+            .into());
+        }
         // Who is creating this user: recorded on the record as its `CreatedBy`, which a
         // later `DescribeUser` reports.
         let created_by = crate::state::caller_principal(&*self.engine, ctx);
