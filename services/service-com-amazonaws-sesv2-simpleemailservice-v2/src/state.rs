@@ -1639,7 +1639,8 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
     /// SES writes each of its resources in the resource field of its ARN as the
     /// resource TYPE and then the id the resource is held under — an email identity as
     /// `identity/<identity>` (the form [`identity_arn`] mints), a contact list as
-    /// `contact-list/<name>`, a configuration set as `configuration-set/<name>` and a
+    /// `contact-list/<name>`, a configuration set as `configuration-set/<name>`, an
+    /// email template as `template/<name>` (the form [`email_template_arn`] mints) and a
     /// tenant as `tenant/<name>/<id>` (the form [`tenant_arn`] mints) — so the type
     /// picks the table and the id picks the record within it. An identity resolves
     /// through [`identity_key`], so an ARN spelling the domain part in another case
@@ -1680,6 +1681,15 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
                 .configuration_sets
                 .get(resource_id)
                 .map(ConfigurationSetRecord::tag_list),
+            // An email template belongs to the ACCOUNT, so the table this resolves
+            // against is the account's template view — the one every template operation
+            // of this surface reads, reconciled with the account's registry before a
+            // handler reaches this store, so a template created through either SES
+            // surface resolves here.
+            "template" => self
+                .email_templates
+                .get(resource_id)
+                .map(EmailTemplateRecord::tag_list),
             "tenant" => self
                 .tenants
                 .values()
@@ -1738,6 +1748,10 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
                 .configuration_sets
                 .get_mut(resource_id)
                 .map(|configuration_set| &mut configuration_set.tags),
+            "template" => self
+                .email_templates
+                .get_mut(resource_id)
+                .map(|template| &mut template.tags),
             "tenant" => self
                 .tenants
                 .values_mut()

@@ -939,7 +939,7 @@ async fn the_tagging_surface_names_the_kind_and_name_of_the_resource_it_cannot_f
             "DedicatedIpPool",
         ),
         (
-            "a resource kind nothing creates in this emulator yet",
+            "an email template the account never created",
             "template",
             "welcome",
             "Template",

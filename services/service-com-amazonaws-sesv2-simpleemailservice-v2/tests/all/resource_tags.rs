@@ -34,8 +34,8 @@
 //! (which is not their sorted order), the characters a key and a value carry, an empty
 //! tag value, and an ARN spelling a domain identity in another case. The refusal table
 //! spans the form legs (no ARN at all, another vendor, a bare resource type, an empty
-//! resource id) and the resolution legs (a name never created, a resource kind nothing
-//! creates here, another account, another Region, another resource type under a name
+//! resource id) and the resolution legs (a name never created, a template name never
+//! created, another account, another Region, another resource type under a name
 //! that exists, and a tenant id that is not the stored tenant's).
 
 use std::sync::Arc;
@@ -659,7 +659,7 @@ async fn list_tags_for_resource_refuses_an_arn_it_cannot_resolve() {
             message: not_present("ConfigurationSet", held.name),
         },
         RefusalCase {
-            case: "a resource kind nothing creates in this emulator yet",
+            case: "an email template the account never created",
             resource_arn: arn(HOME, ACCOUNT_ID, "template", "welcome"),
             status: 404,
             error_code: "NotFoundException",

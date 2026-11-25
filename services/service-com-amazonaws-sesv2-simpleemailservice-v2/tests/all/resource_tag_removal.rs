@@ -29,7 +29,7 @@
 //! documented symbol set, white space, a key outside ASCII), a tag whose value is empty,
 //! and a key differing from a stored one only in case. The refusal table spans the form
 //! legs (no ARN at all, another vendor, a bare resource type, an empty resource id) and
-//! the resolution legs (a name never created, a resource kind nothing creates here,
+//! the resolution legs (a name never created, a template name never created,
 //! another resource type under a name that exists, another account, another Region, and
 //! a tenant id that is not the stored tenant's).
 
@@ -791,7 +791,7 @@ async fn untag_resource_refuses_an_arn_it_cannot_resolve_and_writes_nothing() {
             message: not_present("ConfigurationSet", held_name),
         },
         RefusalCase {
-            case: "a resource kind nothing creates in this emulator yet",
+            case: "an email template the account never created",
             resource_arn: arn(HOME, ACCOUNT_ID, "template", "welcome"),
             status: 404,
             error_code: "NotFoundException",

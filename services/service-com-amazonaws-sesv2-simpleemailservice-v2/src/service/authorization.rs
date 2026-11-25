@@ -127,8 +127,8 @@ const MODELLED_PATH_PREFIX: [&str; 2] = ["v2", "email"];
 /// kind in the resource field of its ARN, which is stated for this service in exactly one
 /// place — the resolution of a caller-supplied `ResourceArn`
 /// (`crate::state::…::resource_tags`: `identity/<identity>`, `contact-list/<name>`,
-/// `configuration-set/<name>`, `dedicated-ip-pool/<name>`) and
-/// [`crate::state::TENANT_RESOURCE_TYPES`] (`template/<name>`). The third is the required
+/// `configuration-set/<name>`, `dedicated-ip-pool/<name>`, `template/<name>`), which
+/// [`crate::state::TENANT_RESOURCE_TYPES`] reads the same way. The third is the required
 /// member the create bound to that collection takes the new resource's name in
 /// (`smithy_query(query="operation")`: `CreateEmailIdentity$EmailIdentity`,
 /// `CreateConfigurationSet$ConfigurationSetName`, `CreateContactList$ContactListName`,
