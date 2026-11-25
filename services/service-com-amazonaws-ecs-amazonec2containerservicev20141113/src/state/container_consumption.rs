@@ -200,6 +200,10 @@ pub(super) struct ServiceConsumption {
     /// How many of those containers this emulator is performing a program for — the
     /// performers whose time the span above is a share of.
     pub(super) performers: u64,
+    /// How many RUNNING tasks this reading covers, whether or not anything is being
+    /// performed for their containers — what tells a selection there is something to measure
+    /// in from one that holds no task at all ([`super::container_usage`]).
+    pub(super) tasks: u64,
     /// How many bytes those containers are occupying at this instant: their sessions' own
     /// stores and their writable layers.
     pub(super) held_bytes: u128,
@@ -303,6 +307,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 && task.last_status == STATUS_RUNNING
                 && selected(task)
         }) {
+            reading.tasks = reading.tasks.saturating_add(1);
             reading.reserved_bytes = reading
                 .reserved_bytes
                 .saturating_add(u128::from(task_reserved_memory_bytes(task)));

@@ -468,10 +468,12 @@ pub(super) fn epoch_seconds(at: SystemTime) -> f64 {
 /// bytes those tasks moved over a network and through a filesystem, and the ephemeral storage
 /// they were given beside what their layers hold.
 ///
-/// A figure the reading has none of is not published at all — there is no quantity of CPU to
-/// report for tasks that were given none, and no usage of an ephemeral storage no placement
-/// gave them ([`super::container_usage`]). A byte COUNTER is published whatever it stands at:
-/// zero bytes moved is a measurement of the traffic those containers had.
+/// A figure the reading has none of is not published at all — there is no RESERVATION to
+/// report for tasks whose definitions state none, and no usage of an ephemeral storage no
+/// placement gave them ([`super::container_usage`]). What those tasks' containers are USING is
+/// a measurement, so it is published whatever their definitions reserve, exactly as a byte
+/// COUNTER is published whatever it stands at: zero bytes moved is a measurement of the
+/// traffic those containers had.
 fn insights_figures(
     utilization: &InsightsUtilization,
 ) -> Vec<(&'static str, f64, &'static str)> {

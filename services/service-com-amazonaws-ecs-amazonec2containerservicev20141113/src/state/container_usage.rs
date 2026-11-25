@@ -26,15 +26,19 @@
 //! ([`InsightsBaseline`]). A series' first figure closes an interval of no length and reports
 //! no CPU in use; the work its containers did is reported by the figure that does close one.
 //!
-//! # What is NOT reported
+//! # What a CPU figure is expressed against, and what is NOT reported
 //!
 //! A CPU figure needs the CPU the tasks were GIVEN to express itself against: the accounting
 //! measures the share of its performers a program held, and the quantity that share stands for
-//! is that share of what the task definitions reserve. So a cluster whose task definitions
-//! reserve no CPU at all has no CPU quantity to report, and neither `CpuUtilized` nor
-//! `CpuReserved` is published for it — as against a reservation of nothing, which would say
-//! that nothing was given AND that nothing is used. The same holds for `MemoryReserved`. The
-//! memory USED is measured directly, so it is reported whatever the definitions reserve.
+//! is that share of what those tasks were given — the CPU UNITS their task definitions
+//! reserve where they state a reservation, and otherwise the one performer per container this
+//! emulator runs their programs on, which is one vCPU of capacity ([`CPU_UNITS_PER_VCPU`],
+//! `TaskDefinition$cpu`: "1024 CPU units is the equivalent of 1 vCPU"). So the CPU USED is
+//! reported for the running tasks of a selection whatever their definitions reserve — it is a
+//! MEASUREMENT of their containers, exactly as the memory used beside it is — while
+//! `CpuReserved` is read OFF those definitions and is reported only where they state one, as
+//! `MemoryReserved` is. A selection that holds no running task at all has nothing to measure
+//! and nothing to report, so it reports neither.
 //!
 //! # The traffic and the storage of those tasks
 //!
@@ -145,10 +149,10 @@ pub enum InsightsScope {
 /// ones their task definitions reserve.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct InsightsUtilization {
-    /// The CPU units those tasks' containers used over the interval, and `None` for tasks
-    /// whose definitions reserve no CPU to express that quantity against.
+    /// The CPU units those tasks' containers used over the interval, and `None` only where
+    /// there is no running task to measure.
     pub cpu_utilized: Option<f64>,
-    /// The CPU units those definitions reserve, under the same rule.
+    /// The CPU units those definitions reserve, and `None` where they reserve none.
     pub cpu_reserved: Option<f64>,
     /// The MiB those containers are occupying — measured directly, so always reported.
     pub memory_utilized: f64,
@@ -277,6 +281,14 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         };
         let reserved_cpu =
             (reading.reserved_cpu_units > 0).then_some(reading.reserved_cpu_units as f64);
+        // The CPU those tasks were GIVEN, which is what the share of its performers a program
+        // held stands for as a quantity of CPU units: what their definitions reserve, and —
+        // for tasks whose definitions reserve none — the performer per container this
+        // emulator runs their programs on, one vCPU of capacity each. A selection holding no
+        // running task has nothing to measure at all.
+        let given_cpu = (reading.tasks > 0).then(|| {
+            reserved_cpu.unwrap_or(reading.performers as f64 * CPU_UNITS_PER_VCPU)
+        });
         // The ephemeral storage the placements of those tasks gave them, which is what their
         // layers' usage is reported beside; tasks given none have neither figure.
         let reserved_storage =
@@ -284,7 +296,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         InsightsUtilization {
             // The share of what those tasks were given, as the quantity of CPU units that
             // share stands for.
-            cpu_utilized: reserved_cpu.map(|reserved| share / 100.0 * reserved),
+            cpu_utilized: given_cpu.map(|given| share / 100.0 * given),
             cpu_reserved: reserved_cpu,
             memory_utilized: reading.held_bytes as f64 / BYTES_PER_MIB,
             memory_reserved: (reading.reserved_bytes > 0)
