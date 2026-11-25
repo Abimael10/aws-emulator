@@ -121,7 +121,11 @@ const SETTLE_DEADLINE: Duration = Duration::from_secs(120);
 ///
 /// The DNS messages are framed and read by the handler itself, so what is asserted is a real
 /// exchange on a socket inside the VPC rather than a shape this emulator agreed with itself.
-const PROBE_HANDLER: &str = r#"
+///
+/// Shared with the sibling suite that reads the same resolver from the same vantage point
+/// (`route53resolver_firewall_association_priority_in_vpc`), so one querier is maintained
+/// rather than two.
+pub(crate) const PROBE_HANDLER: &str = r#"
 import socket
 
 # How long the handler waits for one reply. Generous for a reply that is served in this same
