@@ -159,6 +159,16 @@ pub use channel_namespace_handlers::*;
 mod tagged_resource;
 pub use tagged_resource::*;
 
+/// The `additionalAuthenticationProviders` a GraphQL API is configured with: what makes two
+/// of them the same way of authenticating the API, and how many of them one API holds.
+mod authentication_providers;
+pub use authentication_providers::*;
+
+/// The CloudWatch Logs configuration an API is created or updated with: the role AppSync
+/// assumes to publish, and the refusal a value that names no role takes.
+mod log_config;
+pub use log_config::*;
+
 /// The data source introspections this service has run, and how the schema one read is
 /// reported.
 mod data_source_introspection;
@@ -752,6 +762,37 @@ pub fn unix_seconds() -> i64 {
 /// parent API does not hold ([`api_key_not_found_message`] fills the rest).
 pub const API_KEY_NOT_FOUND_PREFIX: &str = "API key not found: ";
 
+/// The longest `description` an API key accepts.
+///
+/// `CreateApiKey$description` and `UpdateApiKey$description` ("A description of the purpose
+/// of the API key") both target a plain `String` with no modelled `@length`, so the bound
+/// is the service's: a description of exactly this many characters is accepted and one
+/// character more is refused with `BadRequestException` (HTTP 400), the client error both
+/// operations model.
+pub const API_KEY_DESCRIPTION_MAX_LEN: usize = 256;
+
+/// AppSync's fixed text for a `description` past [`API_KEY_DESCRIPTION_MAX_LEN`], carried
+/// by `BadRequestException` (HTTP 400).
+///
+/// The sentence states the member and the ceiling and echoes nothing of the submitted
+/// value.
+pub fn api_key_description_too_long_message() -> String {
+    format!("Invalid description given, must be less than {API_KEY_DESCRIPTION_MAX_LEN} characters.")
+}
+
+/// Why the `description` an API-key create or update carries is not one a key can hold, as
+/// the text a `BadRequestException` (HTTP 400) states it with, or `None` when it is —
+/// including a request that carries none.
+///
+/// Shared by the create and the update, which take the same member under the same
+/// documentation, so neither can store a description the other would refuse. The length is
+/// counted in CHARACTERS, the unit a string bound is stated in.
+pub fn api_key_description_refusal(description: Option<&str>) -> Option<String> {
+    let description = description?;
+    (description.chars().count() > API_KEY_DESCRIPTION_MAX_LEN)
+        .then(api_key_description_too_long_message)
+}
+
 /// The text `NotFoundException` (HTTP 404) carries for an API key its parent API does
 /// not hold: AppSync's fixed sentence ([`API_KEY_NOT_FOUND_PREFIX`]) followed by the key
 /// id the request addressed, so a caller deleting or updating several keys can see WHICH
@@ -1100,6 +1141,14 @@ pub struct EventApiRecord {
     /// Bounded: `CreateApiKey` refuses a create once the API holds the AppSync
     /// per-API quota of keys, so this map cannot grow without limit.
     pub api_keys: BTreeMap<String, ApiKeyRecord>,
+    /// The data sources created under this API, keyed by name — the same resource a
+    /// `GraphqlApiRecord` holds, since the data-source operations address an API of
+    /// either family by the same `apiId` label (see
+    /// [`ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::data_sources_of`]).
+    /// They are what a channel namespace's `handlerConfigs` integrations name.
+    /// Bounded the same way the keys are: `CreateDataSource` refuses a create once the
+    /// API holds the per-API quota of data sources.
+    pub data_sources: BTreeMap<String, DataSourceRecord>,
 }
 
 impl EventApiRecord {
@@ -1344,7 +1393,10 @@ pub fn invalid_event_config_auth_message(call: &str) -> String {
 /// * `connectionAuthModes`, `defaultPublishAuthModes` and `defaultSubscribeAuthModes`
 ///   are each "a list of VALID authorization modes", i.e. modes the API's own
 ///   authorization providers set up — refused by the CALL the list authorizes
-///   ([`invalid_event_config_auth_message`]).
+///   ([`invalid_event_config_auth_message`]);
+/// * `logConfig.cloudWatchLogsRoleArn` is "The IAM service role that AppSync assumes to
+///   publish CloudWatch Logs in your account", so it has to name a role AppSync could
+///   assume ([`cloud_watch_logs_role_refusal`]).
 pub fn event_config_refusal(event_config: &EventConfig) -> Option<String> {
     let mut configured: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (position, provider) in event_config.auth_providers.iter().enumerate() {
@@ -1390,7 +1442,12 @@ pub fn event_config_refusal(event_config: &EventConfig) -> Option<String> {
         }
     }
 
-    None
+    cloud_watch_logs_role_refusal(
+        event_config
+            .log_config
+            .as_ref()
+            .map(|config| config.cloud_watch_logs_role_arn.as_str()),
+    )
 }
 
 /// The text a `BadRequestException` (HTTP 400) carries for a channel namespace whose
@@ -1428,6 +1485,40 @@ pub fn channel_namespace_auth_modes_refusal(
         .into_iter()
         .any(|modes| unconfigured_auth_mode(modes, configured).is_some())
         .then(|| CHANNEL_NAMESPACE_AUTH_MODE_MESSAGE.to_string())
+}
+
+/// The text a `BadRequestException` (HTTP 400) carries for a channel-namespace handler
+/// whose integration names a data source the `Api` does not hold.
+///
+/// A fixed sentence with no variable part: it states the absent dependency the way the v2
+/// surface words it, and names neither the data source the request asked for nor the API.
+pub const HANDLER_CONFIG_DATA_SOURCE_NOT_FOUND_MESSAGE: &str = "DataSource not found.";
+
+/// Why the `handlerConfigs` a channel-namespace create or update carries are not ones the
+/// `Api` could run, as the text a `BadRequestException` (HTTP 400) states it with, or
+/// `None` when they are.
+///
+/// A handler's `integration.dataSourceName` is "The unique name of the data source that
+/// has been configured ON the API" (`Integration$dataSourceName`), so it has to name a
+/// data source that API holds — the data sources `CreateDataSource` creates under it
+/// ([`ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::data_sources_of`]) — and a
+/// name it does not hold names no integration the handler could run, including one held by
+/// a DIFFERENT API. Both handlers are checked, in the order the shape declares them
+/// (`onPublish`, then `onSubscribe`), and both the create and the update carry the member,
+/// so the rule lives here once.
+pub fn handler_configs_refusal(
+    handler_configs: Option<&HandlerConfigs>,
+    data_sources: &BTreeMap<String, DataSourceRecord>,
+) -> Option<String> {
+    let handler_configs = handler_configs?;
+    [
+        handler_configs.on_publish.as_ref(),
+        handler_configs.on_subscribe.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|handler| !data_sources.contains_key(&handler.integration.data_source_name))
+    .then(|| HANDLER_CONFIG_DATA_SOURCE_NOT_FOUND_MESSAGE.to_string())
 }
 
 /// One stored custom domain name, plus the API association it carries.
@@ -2571,6 +2662,78 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
         }
     }
 
+    /// The data sources the API `api_identifier` names holds, or `None` when no stored
+    /// API has that id.
+    ///
+    /// A data source belongs to the API its `apiId` path label names, and that label is
+    /// ONE identifier space over both API resource families — a `GraphqlApi` and an `Api`
+    /// are created by operations of their own, but either is given its data sources
+    /// through the same `/v1/apis/{apiId}/datasources` path — so an `apiId` is resolved
+    /// against both stores here, the single lookup every data-source operation uses, and
+    /// only a reference that names no API at all is a not-found. The same rule
+    /// [`Self::api_keys_of`] follows for the other child resource both families share.
+    pub fn data_sources_of(
+        &self,
+        api_identifier: &str,
+    ) -> Option<&BTreeMap<String, DataSourceRecord>> {
+        self.graphql_apis
+            .get(api_identifier)
+            .map(|api| &api.data_sources)
+            .or_else(|| {
+                self.event_apis
+                    .get(api_identifier)
+                    .map(|api| &api.data_sources)
+            })
+    }
+
+    /// The data sources the API `api_identifier` names holds, for a call that writes one.
+    ///
+    /// Resolves the reference exactly as [`Self::data_sources_of`] does, so a write and a
+    /// read of one API's data sources can never disagree about which APIs exist.
+    pub fn data_sources_of_mut(
+        &mut self,
+        api_identifier: &str,
+    ) -> Option<&mut BTreeMap<String, DataSourceRecord>> {
+        match self.graphql_apis.get_mut(api_identifier) {
+            Some(api) => Some(&mut api.data_sources),
+            None => self
+                .event_apis
+                .get_mut(api_identifier)
+                .map(|api| &mut api.data_sources),
+        }
+    }
+
+    /// The `apiId` AppSync minted for the API `api_identifier` names, whichever family it
+    /// belongs to and whichever published form the reference takes, or `None` when no
+    /// stored API has that id.
+    ///
+    /// Every record kept UNDER an API — and every ARN built for one — is keyed by that
+    /// minted id ([`ApiStore::api_id_of`]), so an operation addressing a child resource
+    /// reads the parent's own id from here rather than from the reference it was handed.
+    pub fn minted_api_id(&self, api_identifier: &str) -> Option<String> {
+        self.graphql_apis
+            .api_id_of(api_identifier)
+            .or_else(|| self.event_apis.api_id_of(api_identifier))
+    }
+
+    /// Whether the API `api_identifier` names SET UP an authorization type of
+    /// `auth_type` — the question a data source that would act with the caller's own
+    /// credentials is judged against.
+    ///
+    /// Both families answer it from their own configuration: a GraphQL API's
+    /// `authenticationType` and its additional providers
+    /// ([`crate::service::graphql_api::configures`]), and an `Api`'s Event API
+    /// authorization providers ([`configured_auth_types`]). `false` for a reference no
+    /// stored API answers to, which configures nothing.
+    pub fn api_configures_auth(&self, api_identifier: &str, auth_type: &str) -> bool {
+        if let Some(api) = self.graphql_apis.get(api_identifier) {
+            return crate::service::graphql_api::configures(api, auth_type);
+        }
+        self.event_apis.get(api_identifier).is_some_and(|api| {
+            configured_auth_types(&api.event_config).contains(auth_type)
+        })
+    }
+
     /// The tags the resource `resource_arn` names holds, or `None` when this account
     /// holds no such resource.
     ///
@@ -2699,31 +2862,31 @@ pub const LAMBDA_AUTHORIZER_CONFIG: &str = "Lambda Authorizer Config";
 ///   the API's own `authenticationType` and, independently, for every
 ///   `additionalAuthenticationProviders` entry, which the refusal names by its
 ///   1-based position, the only way a caller can tell them apart;
-/// * an authentication type identifies ONE way of authenticating the API, so the API
-///   cannot name it twice;
+/// * a provider is ONE way of authenticating the API, identified by its CONFIGURATION, and
+///   an API holds at most a quota's worth of additional providers
+///   ([`additional_auth_providers_refusal`], where both rules are stated);
 /// * an OIDC provider is identified by its issuer, which "must exactly match the
 ///   value of `iss` in the ID token" — an absolute URL;
 /// * `ownerContact` "accepts any string input with a length of 0 - 256 characters"
 ///   (its own member documentation), a bound the plain `String` target leaves to the
 ///   service.
 ///
-/// The per-type presence of the API's OWN user-pool and Lambda configurations is
-/// taken as a flag rather than as the structure, because the API-level and the
-/// per-provider user-pool configurations are modelled with different shapes
-/// (`UserPoolConfig` vs `CognitoUserPoolConfig`) while the rule over them is one.
+/// The API's OWN user-pool configuration is modelled with a different shape from a
+/// provider's (`UserPoolConfig` vs `CognitoUserPoolConfig`) while the rules over the two
+/// are one, so each rule reads the member it needs out of whichever shape carries it.
 pub fn graphql_api_config_refusal(
     authentication_type: &str,
     open_id_connect_config: Option<&OpenIDConnectConfig>,
-    user_pool_config: bool,
-    lambda_authorizer_config: bool,
+    user_pool_config: Option<&UserPoolConfig>,
+    lambda_authorizer_config: Option<&LambdaAuthorizerConfig>,
     additional_authentication_providers: &[AdditionalAuthenticationProvider],
     owner_contact: Option<&str>,
 ) -> Option<String> {
     if let Some(config) = missing_auth_config(
         Some(authentication_type),
         open_id_connect_config.is_some(),
-        user_pool_config,
-        lambda_authorizer_config,
+        user_pool_config.is_some(),
+        lambda_authorizer_config.is_some(),
     ) {
         return Some(api_level_missing_config_message(config));
     }
@@ -2741,23 +2904,17 @@ pub fn graphql_api_config_refusal(
         }
     }
 
-    // The set of types already named holds at most one entry per value of the
-    // modelled `AuthenticationType` enum, because the request is refused as soon as a
-    // type repeats: its size is bounded by the model, not by the length of the list
-    // the caller sent, and membership is a set lookup rather than a scan of it.
-    let mut specified = std::collections::BTreeSet::from([authentication_type.to_string()]);
-    for (position, provider) in additional_authentication_providers.iter().enumerate() {
-        let Some(provider_type) = provider.authentication_type.clone() else {
-            continue;
-        };
-        if specified.contains(&provider_type) {
-            return Some(format!(
-                "Authentication type {provider_type} for additional authentication provider {} \
-                 already specified on the API. It can only be specified once.",
-                position + 1
-            ));
-        }
-        specified.insert(provider_type);
+    // A provider is one WAY of authenticating the API, identified by the configuration it
+    // names rather than by its type, and an API holds at most a quota's worth of them
+    // ([`additional_auth_providers_refusal`]).
+    if let Some(message) = additional_auth_providers_refusal(
+        authentication_type,
+        open_id_connect_config,
+        user_pool_config,
+        lambda_authorizer_config,
+        additional_authentication_providers,
+    ) {
+        return Some(message);
     }
 
     for config in open_id_connect_config.into_iter().chain(

@@ -540,6 +540,46 @@ fn tag_value_refusal(violations: &[Violation]) -> Option<Refused> {
         })
 }
 
+/// The member every operation that writes a resolver or a function carries its APPSYNC_JS
+/// definition in: `code`, "The `resolver` code that contains the request and response
+/// functions" (`Resolver$code`, `FunctionConfiguration$code`), whose target `Code` declares
+/// a `@length` maximum.
+const CODE_MEMBER: &str = "code";
+
+/// AppSync's own refusal for a `code` past the ceiling its target shape declares: its
+/// `BadRequestException` with the service's own sentence naming that ceiling, echoing
+/// nothing of the submitted definition.
+///
+/// A definition is refused for its SIZE by the service rather than by the framework's
+/// generic constraint report, which would quote the whole submitted module back into the
+/// message; AppSync names the member's ceiling and nothing else. The ceiling is the one the
+/// broken constraint carries, so the sentence states the model's own bound, and it is the
+/// same sentence for every operation that carries the member — one over-long definition is
+/// refused one way whichever call wrote it.
+///
+/// Only the MAXIMUM: a definition shorter than the modelled minimum keeps the framework's
+/// own report, which no recording words differently.
+fn code_length_refusal(violations: &[Violation]) -> Option<Refused> {
+    violations.iter().find_map(|violation| {
+        if violation.path != CODE_MEMBER {
+            return None;
+        }
+        let ViolationKind::MaxLength(max) = violation.kind else {
+            return None;
+        };
+        Some(Refused {
+            code: BAD_REQUEST_CODE.to_string(),
+            message: code_ceiling_message(max),
+        })
+    })
+}
+
+/// The text AppSync states a `code` past its modelled ceiling with: fixed text whose one
+/// variable part is the limit.
+fn code_ceiling_message(max: i64) -> String {
+    format!("Code must be {max} bytes or less")
+}
+
 /// AppSync's own refusal for a member whose value breaks the FORM its target shape
 /// declares — a `@length` bound or a `@pattern` — in the service's modelled
 /// `BadRequestException` (HTTP 400), carrying the framework's own constraint report as the
@@ -778,6 +818,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // * a tag whose VALUE carries a character tags may not hold is its own
         //   `BadRequestException` stating the tag grammar (`tag_value_refusal`), the way the
         //   service states the grammar of a tag key;
+        // * a `code` past the ceiling its target shape declares is its own
+        //   `BadRequestException` naming that ceiling (`code_length_refusal`), so the
+        //   submitted definition is not echoed back into the message;
         // * a value that breaks the FORM its target shape declares — a `@length` bound or
         //   a `@pattern` — is its own `BadRequestException` carrying the framework's own
         //   constraint report (`declared_form_refusal`), because the sentence is right and
@@ -791,6 +834,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                 .or_else(|| runtime_name_refusal(violations))
                 .or_else(|| without_rejected_enum_values(violations))
                 .or_else(|| tag_value_refusal(violations))
+                .or_else(|| code_length_refusal(violations))
                 .or_else(|| declared_form_refusal(violations)),
             // Authentication refusals, and any refusal kind added later, keep the
             // framework's wording.

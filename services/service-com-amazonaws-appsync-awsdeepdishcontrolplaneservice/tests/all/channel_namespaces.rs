@@ -133,6 +133,28 @@ pub(crate) async fn create_event_api(
         .to_string()
 }
 
+/// Create one data source of type `NONE` under the API `api_id`, which a channel
+/// namespace's `handlerConfigs` integration can then name: "the unique name of the data
+/// source that has been configured on the API" (`Integration$dataSourceName`), so the
+/// integration names a data source the API really holds.
+pub(crate) async fn create_handler_data_source(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    api_id: &str,
+    name: &str,
+) {
+    let answer = call(
+        router,
+        "POST",
+        &format!("/v1/apis/{api_id}/datasources"),
+        Some(json!({"name": name, "type": "NONE"})),
+    )
+    .await;
+    assert_eq!(
+        answer.status, 200,
+        "case create data source {name:?}: expected 200, got {answer:?}"
+    );
+}
+
 /// Create one channel namespace and return the answer.
 pub(crate) async fn create_namespace(
     router: &smithy_server_runtime::MultiServiceRouter,
@@ -302,6 +324,11 @@ fn create_rows() -> Vec<CreateRow> {
 async fn a_created_channel_namespace_is_answered_from_the_record_the_reader_reports() {
     let router = router();
     let api_id = create_event_api(&router, "Events_namespaces", AUTHENTICATION_TYPES).await;
+    // The data sources the rows' handler integrations name, created under the Event API
+    // that holds them: an integration names a data source the API has.
+    for data_source in ["orders_table", "audit_lambda"] {
+        create_handler_data_source(&router, &api_id, data_source).await;
+    }
 
     for row in create_rows() {
         let case = row.label;
@@ -788,6 +815,10 @@ struct UpdateRow {
 async fn an_update_replaces_the_configuration_and_keeps_the_identity() {
     let router = router();
     let api_id = create_event_api(&router, "Events_updates", AUTHENTICATION_TYPES).await;
+    // The data sources the handler integrations below name, created under the API.
+    for data_source in ["orders_table", "audit_lambda"] {
+        create_handler_data_source(&router, &api_id, data_source).await;
+    }
     let created = create_namespace(
         &router,
         &api_id,

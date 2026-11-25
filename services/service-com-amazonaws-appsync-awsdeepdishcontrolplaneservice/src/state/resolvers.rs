@@ -218,6 +218,21 @@ pub const DATA_SOURCE_NAME_MISSING_MESSAGE: &str = "Data source name not specifi
 /// cannot grow the store without limit.
 pub const RESOLVERS_PER_API: usize = 10_000;
 
+/// How many functions ONE `PIPELINE` resolver is composed of at most.
+///
+/// `PipelineConfig$functions` targets a list with no modelled bound, so the ceiling is the
+/// service's: a pipeline of exactly this many functions is stored and one function more is
+/// refused with `BadRequestException` (HTTP 400), the client error every operation that
+/// writes a resolver models.
+pub const FUNCTIONS_PER_PIPELINE_RESOLVER: usize = 10;
+
+/// The text a `BadRequestException` (HTTP 400) carries for a pipeline longer than
+/// [`FUNCTIONS_PER_PIPELINE_RESOLVER`]: the ceiling is the sentence's one variable part,
+/// and nothing of the submitted list is echoed.
+pub fn pipeline_functions_limit_message() -> String {
+    format!("A resolver can only be composed of {FUNCTIONS_PER_PIPELINE_RESOLVER} functions.")
+}
+
 /// The refusal text for a resolver definition AppSync could not run, or `None` when the
 /// request describes one it could.
 ///
@@ -226,7 +241,8 @@ pub const RESOLVERS_PER_API: usize = 10_000;
 ///
 /// * a PIPELINE resolver is defined by the functions it invokes, which `pipelineConfig`
 ///   holds ("The pipeline configuration for a resolver of kind `PIPELINE`"), so it needs
-///   one;
+///   one, holding at most [`FUNCTIONS_PER_PIPELINE_RESOLVER`] of them
+///   ([`pipeline_functions_limit_message`]);
 /// * a UNIT resolver has no pipeline, so it must carry no `pipelineConfig`, and it
 ///   "run[s] a GraphQL query against a single data source" (`Resolver$kind`), so it must
 ///   name that data source;
@@ -241,8 +257,12 @@ pub fn resolver_definition_refusal(
     runtime: Option<&AppSyncRuntime>,
 ) -> Option<String> {
     if kind == PIPELINE_KIND {
-        if pipeline_config.is_none() {
+        let Some(pipeline_config) = pipeline_config else {
             return Some(PIPELINE_CONFIG_REQUIRED_MESSAGE.to_string());
+        };
+        let functions = pipeline_config.functions.as_deref().unwrap_or_default();
+        if functions.len() > FUNCTIONS_PER_PIPELINE_RESOLVER {
+            return Some(pipeline_functions_limit_message());
         }
     } else if pipeline_config.is_some() {
         return Some(PIPELINE_CONFIG_NOT_ALLOWED_MESSAGE.to_string());

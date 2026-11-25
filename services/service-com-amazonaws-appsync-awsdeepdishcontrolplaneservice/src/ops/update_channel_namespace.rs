@@ -205,11 +205,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The API's own configured authorization types, read before the namespace is
-        // borrowed so the absence of the namespace is reported first: an update to a
-        // namespace the API does not hold is that absence, whatever else the request
-        // carries.
+        // The API's own configured authorization types and the data sources it holds,
+        // read before the namespace is borrowed so the absence of the namespace is
+        // reported first: an update to a namespace the API does not hold is that absence,
+        // whatever else the request carries.
         let configured = crate::state::configured_auth_types(&api.event_config);
+        let handler_configs_refusal = crate::state::handler_configs_refusal(
+            input.handler_configs.as_ref(),
+            &api.data_sources,
+        );
 
         let Some(record) = api.channel_namespaces.get_mut(&input.name) else {
             return Err(UpdateChannelNamespaceErrorModeled::NotFoundException(
@@ -235,6 +239,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &publish_auth_modes,
             &subscribe_auth_modes,
         ) {
+            return Err(UpdateChannelNamespaceErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(message),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        // A handler's integration names a data source the `Api` holds, exactly as the
+        // create's does ([`crate::state::handler_configs_refusal`]), and the request is
+        // refused before anything is stored.
+        if let Some(message) = handler_configs_refusal {
             return Err(UpdateChannelNamespaceErrorModeled::BadRequestException(
                 BadRequestException {
                     message: Some(message),

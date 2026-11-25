@@ -230,6 +230,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A handler's integration names "the data source that has been configured on the
+        // API", so it has to name one this `Api` holds; the rule is the same for the
+        // update, so it lives in [`crate::state::handler_configs_refusal`]. Checked
+        // before anything is written, so a refused create leaves no namespace behind.
+        if let Some(message) = crate::state::handler_configs_refusal(
+            input.handler_configs.as_ref(),
+            &api.data_sources,
+        ) {
+            return Err(CreateChannelNamespaceErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(message),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
         // A namespace's "name must be unique within the `Api`", so a create under a
         // name the API already holds conflicts with the namespace that holds it rather
         // than replacing it.

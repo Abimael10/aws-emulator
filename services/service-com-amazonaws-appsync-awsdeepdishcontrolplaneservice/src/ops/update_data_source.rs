@@ -206,13 +206,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut guard = state.lock();
-        let Some(api) = guard.graphql_apis.get_mut(&input.api_id) else {
+        // The `apiId` label names ONE identifier space over both API resource families,
+        // so it is resolved through `crate::state`'s single data-source lookup.
+        let iam_api = guard.api_configures_auth(
+            &input.api_id,
+            crate::service::graphql_api::caller::IAM_AUTH_TYPE,
+        );
+        let Some(data_sources) = guard.data_sources_of_mut(&input.api_id) else {
             return Err(UpdateDataSourceErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
             })
             .into());
         };
-        let Some(stored) = api.data_sources.get(&input.name) else {
+        let Some(stored) = data_sources.get(&input.name) else {
             return Err(UpdateDataSourceErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::data_source_not_found_message(&input.name)),
             })
@@ -286,13 +292,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // source that would act as the CALLER needs an API that authenticates callers
         // with IAM, so an update that would leave it without one is refused before the
         // stored record is replaced.
-        if let Some(message) = crate::state::caller_credentials_refusal(
-            &updated,
-            crate::service::graphql_api::configures(
-                api,
-                crate::service::graphql_api::caller::IAM_AUTH_TYPE,
-            ),
-        ) {
+        if let Some(message) = crate::state::caller_credentials_refusal(&updated, iam_api) {
             return Err(UpdateDataSourceErrorModeled::BadRequestException(BadRequestException {
                 message: Some(message.to_string()),
                 ..Default::default()
@@ -304,7 +304,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `GetDataSource` and `ListDataSources` answer with next. The projection is
         // taken from the record itself, before the map takes ownership of it.
         let data_source = updated.to_data_source();
-        api.data_sources.insert(updated.name.clone(), updated);
+        data_sources.insert(updated.name.clone(), updated);
 
         // What a source API holds is what its next merge carries into the Merged APIs it is
         // a source of, so this change PROMPTS the merge of every `AUTO_MERGE` association

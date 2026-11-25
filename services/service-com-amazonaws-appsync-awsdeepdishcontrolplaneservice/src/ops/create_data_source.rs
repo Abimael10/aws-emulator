@@ -209,14 +209,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let mut guard = state.lock();
 
-        // A data source lives under a GraphQL API, so it cannot be created under an
-        // API this account does not hold.
-        let Some(api) = guard.graphql_apis.get_mut(&input.api_id) else {
+        // A data source lives under an API, and the `apiId` label names ONE identifier
+        // space over both API resource families, so it is resolved through
+        // `crate::state`'s single data-source lookup: a reference that names no API of
+        // either family is the absent API it reports.
+        let Some(api_id) = guard.minted_api_id(&input.api_id) else {
             return Err(CreateDataSourceErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
             })
             .into());
         };
+        // Whether the API authenticates callers with IAM is read before the data-source
+        // map is borrowed for writing, and from whichever family's configuration holds
+        // the answer (`crate::state::api_configures_auth`).
+        let iam_api = guard.api_configures_auth(
+            &input.api_id,
+            crate::service::graphql_api::caller::IAM_AUTH_TYPE,
+        );
 
         // Every member the request carries is kept as it arrived, except
         // `description`: an empty description describes nothing, so the data source
@@ -231,7 +240,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         // The data source's ARN is built under the API's OWN id, whichever form the
         // request addressed the API in.
-        let api_id = api.api_id.clone();
         let record = crate::state::DataSourceRecord {
             arn: ::engine::emulator_arn(
                 crate::state::ARN_SERVICE,
@@ -293,13 +301,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // identity to act as, which only an API authenticating with `AWS_IAM` hands it
         // (see `crate::state::caller_credentials_refusal`), so a create that asks for
         // them on an API in any other mode is refused rather than stored.
-        if let Some(message) = crate::state::caller_credentials_refusal(
-            &record,
-            crate::service::graphql_api::configures(
-                api,
-                crate::service::graphql_api::caller::IAM_AUTH_TYPE,
-            ),
-        ) {
+        if let Some(message) = crate::state::caller_credentials_refusal(&record, iam_api) {
             return Err(CreateDataSourceErrorModeled::BadRequestException(BadRequestException {
                 message: Some(message.to_string()),
                 ..Default::default()
@@ -307,11 +309,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Every ground that does not depend on what the API already holds has been read,
+        // so the API's own data sources are borrowed for writing only now.
+        let Some(data_sources) = guard.data_sources_of_mut(&input.api_id) else {
+            return Err(CreateDataSourceErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into());
+        };
+
         // The name identifies the data source within its API — it is what every
         // data-source operation addresses one by — so a create cannot take a name the
         // API already holds: it would replace a resource the caller did not name for
         // replacement.
-        if api.data_sources.contains_key(&record.name) {
+        if data_sources.contains_key(&record.name) {
             return Err(CreateDataSourceErrorModeled::BadRequestException(BadRequestException {
                 message: Some(crate::state::data_source_exists_message(&record.name)),
                 ..Default::default()
@@ -323,7 +334,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // AppSync's quota is 500 data sources per API, and the per-API collection
         // this create writes to is bounded by it the way the sibling creates in this
         // crate bound theirs.
-        if api.data_sources.len() >= DATA_SOURCES_PER_API {
+        if data_sources.len() >= DATA_SOURCES_PER_API {
             return Err(CreateDataSourceErrorModeled::BadRequestException(BadRequestException {
                 message: Some(format!(
                     "an API may hold at most {DATA_SOURCES_PER_API} data sources"
@@ -334,13 +345,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let name = record.name.clone();
-        api.data_sources.insert(name.clone(), record);
+        data_sources.insert(name.clone(), record);
 
         // Answer from the STORED record, so this body is the one `GetDataSource` and
         // `ListDataSources` answer with later.
         let answered = CreateDataSourceOutput {
-            data_source: api
-                .data_sources
+            data_source: data_sources
                 .get(&name)
                 .map(crate::state::DataSourceRecord::to_data_source),
         };

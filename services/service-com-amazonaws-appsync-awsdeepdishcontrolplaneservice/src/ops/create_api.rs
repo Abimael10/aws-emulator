@@ -289,6 +289,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A fresh API holds no API keys; `CreateApiKey` mints them under this
             // API the same way it does under a GraphQL API.
             api_keys: std::collections::BTreeMap::new(),
+            // Nor any data source: `CreateDataSource` creates them under this API the
+            // same way it does under a GraphQL API, and a channel namespace's
+            // `handlerConfigs` integration names one of them.
+            data_sources: std::collections::BTreeMap::new(),
         };
 
         // Answer from the STORED record, so this body is the one `GetApi` answers

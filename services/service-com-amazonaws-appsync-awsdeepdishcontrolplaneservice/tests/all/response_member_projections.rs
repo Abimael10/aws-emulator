@@ -30,8 +30,8 @@
 use serde_json::{json, Value};
 
 use crate::channel_namespaces::{
-    create_event_api, create_namespace, get_namespace, handler_config, modes,
-    AUTHENTICATION_TYPES,
+    create_event_api, create_handler_data_source, create_namespace, get_namespace,
+    handler_config, modes, AUTHENTICATION_TYPES,
 };
 use crate::data_source_service_role::{
     get_data_source, needs_service_role, request_body, DATA_SOURCE_TYPES, ROLE_ARN,
@@ -174,6 +174,11 @@ fn assert_reports_collections(
 async fn every_channel_namespace_reply_reports_its_handler_and_auth_members() {
     let router = router();
     let api_id = create_event_api(&router, "Events_projections", AUTHENTICATION_TYPES).await;
+    // The data sources the rows' handler integrations name, created under the Event API
+    // that holds them: an integration names a data source the API has.
+    for data_source in ["orders_table", "audit_lambda"] {
+        create_handler_data_source(&router, &api_id, data_source).await;
+    }
 
     for row in namespace_rows() {
         let case = row.label;

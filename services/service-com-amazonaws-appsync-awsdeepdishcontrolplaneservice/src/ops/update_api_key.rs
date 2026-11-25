@@ -184,6 +184,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "A description of the purpose of the API key" is bounded by the service rather
+        // than by the model, so a description past that ceiling is refused and the stored
+        // key is left exactly as it was
+        // (`crate::state::api_key_description_refusal`, shared with `CreateApiKey`).
+        if let Some(message) = crate::state::api_key_description_refusal(input.description.as_deref())
+        {
+            return Err(UpdateApiKeyErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+            .into());
+        }
+
         // "From the update time, the time after which the API key expires": the window
         // the new expiration has to land in is measured from THIS call, and is judged
         // on the submitted instant, before it is floored. An `expires` the request did

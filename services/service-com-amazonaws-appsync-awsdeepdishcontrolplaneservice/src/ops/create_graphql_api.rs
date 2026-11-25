@@ -206,13 +206,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(message) = crate::state::graphql_api_config_refusal(
             &input.authentication_type,
             input.open_id_connect_config.as_ref(),
-            input.user_pool_config.is_some(),
-            input.lambda_authorizer_config.is_some(),
+            input.user_pool_config.as_ref(),
+            input.lambda_authorizer_config.as_ref(),
             input
                 .additional_authentication_providers
                 .as_deref()
                 .unwrap_or_default(),
             input.owner_contact.as_deref(),
+        ) {
+            return Err(CreateGraphqlApiErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // "The service role that AppSync assumes to publish to CloudWatch logs in your
+        // account" has to be a role AppSync could assume, so a `cloudWatchLogsRoleArn`
+        // that is not an IAM role ARN is refused before anything is created
+        // ([`crate::state::cloud_watch_logs_role_refusal`], the one reading every
+        // operation that takes a log configuration shares).
+        if let Some(message) = crate::state::cloud_watch_logs_role_refusal(
+            input
+                .log_config
+                .as_ref()
+                .map(|config| config.cloud_watch_logs_role_arn.as_str()),
         ) {
             return Err(CreateGraphqlApiErrorModeled::BadRequestException(BadRequestException {
                 message: Some(message),

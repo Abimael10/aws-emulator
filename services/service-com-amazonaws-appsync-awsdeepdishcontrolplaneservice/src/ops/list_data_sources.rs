@@ -166,7 +166,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let guard = state.lock();
-        let Some(api) = guard.graphql_apis.get(&input.api_id) else {
+        // The `apiId` label names ONE identifier space over both API resource families,
+        // so it is resolved through `crate::state`'s single data-source lookup.
+        let Some(data_sources) = guard.data_sources_of(&input.api_id) else {
             return Err(ListDataSourcesErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
             })
@@ -176,7 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The map is keyed by the name every data-source operation addresses one by,
         // so iterating it yields a total order a cursor can resume from; the page is
         // cut from that order.
-        let ordered: Vec<&crate::state::DataSourceRecord> = api.data_sources.values().collect();
+        let ordered: Vec<&crate::state::DataSourceRecord> = data_sources.values().collect();
 
         let Some(page) = crate::state::paginate(
             &ordered,

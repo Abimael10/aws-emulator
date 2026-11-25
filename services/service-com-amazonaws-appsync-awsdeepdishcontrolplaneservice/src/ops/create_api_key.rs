@@ -175,6 +175,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "A description of the purpose of the API key" is bounded by the service rather
+        // than by the model, so a description past that ceiling is refused before the key
+        // is minted and no key is created
+        // (`crate::state::api_key_description_refusal`, shared with `UpdateApiKey`).
+        if let Some(message) = crate::state::api_key_description_refusal(input.description.as_deref())
+        {
+            return Err(CreateApiKeyErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+            .into());
+        }
+
         let now = crate::state::unix_seconds();
         // "From the creation time, the time after which the API key expires. [...] The
         // default value for this parameter is 7 days from creation time." An unset

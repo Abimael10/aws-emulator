@@ -165,7 +165,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let guard = state.lock();
-        let Some(api) = guard.graphql_apis.get(&input.api_id) else {
+        // The `apiId` label names ONE identifier space over both API resource families,
+        // so it is resolved through `crate::state`'s single data-source lookup.
+        let Some(data_sources) = guard.data_sources_of(&input.api_id) else {
             return Err(GetDataSourceErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
             })
@@ -175,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A data source is addressed by name within its API, so a name the API does
         // not hold names no resource — including one held by a DIFFERENT API, and one
         // whose create was refused.
-        let Some(record) = api.data_sources.get(&input.name) else {
+        let Some(record) = data_sources.get(&input.name) else {
             return Err(GetDataSourceErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::data_source_not_found_message(&input.name)),
             })

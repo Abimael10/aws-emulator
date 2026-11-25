@@ -163,9 +163,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = state.lock();
 
-        // A data source lives under a GraphQL API, so one cannot be deleted under an
-        // API this account does not hold.
-        let Some(api) = guard.graphql_apis.get_mut(&input.api_id) else {
+        // A data source lives under an API, and the `apiId` label names ONE identifier
+        // space over both API resource families, so it is resolved through
+        // `crate::state`'s single data-source lookup.
+        let Some(data_sources) = guard.data_sources_of(&input.api_id) else {
             return Err(DeleteDataSourceErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
             })
@@ -175,43 +176,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A data source is addressed by name within its API, so a name the API does
         // not hold names no resource to delete — including one held by a DIFFERENT
         // API, and one an earlier delete already removed.
-        if !api.data_sources.contains_key(&input.name) {
+        if !data_sources.contains_key(&input.name) {
             return Err(DeleteDataSourceErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::data_source_not_found_message(&input.name)),
             })
             .into());
         }
 
-        // A function of this API resolves against the data source it names, so deleting
-        // one a function still names would leave that function resolving against
-        // nothing. The delete is refused, naming the functions that still use it, and
-        // the data source is left exactly as it was: the caller deletes those functions
-        // first.
-        if let Some(message) = api.data_source_in_use_refusal(&input.name) {
-            return Err(DeleteDataSourceErrorModeled::BadRequestException(BadRequestException {
-                message: Some(message),
-                ..Default::default()
-            })
-            .into());
-        }
+        // What can still REFER to a data source by name are the functions and the UNIT
+        // resolvers of a GraphQL API, so those references are read off that family's
+        // record; an `Api` holds neither, so nothing of it can refer to one.
+        if let Some(api) = guard.graphql_apis.get(&input.api_id) {
+            // A function of this API resolves against the data source it names, so
+            // deleting one a function still names would leave that function resolving
+            // against nothing. The delete is refused, naming the functions that still
+            // use it, and the data source is left exactly as it was: the caller deletes
+            // those functions first.
+            if let Some(message) = api.data_source_in_use_refusal(&input.name) {
+                return Err(DeleteDataSourceErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                    ..Default::default()
+                })
+                .into());
+            }
 
-        // A UNIT resolver of this API resolves against the data source its own
-        // `dataSourceName` names, which is the other live reference to a data source, so a
-        // delete that would leave a resolver resolving against nothing is refused the same
-        // way — naming the type and the field that address the resolver still using it —
-        // and the data source is left exactly as it was.
-        if let Some(message) = api.data_source_resolver_refusal(&input.name) {
-            return Err(DeleteDataSourceErrorModeled::BadRequestException(BadRequestException {
-                message: Some(message),
-                ..Default::default()
-            })
-            .into());
+            // A UNIT resolver of this API resolves against the data source its own
+            // `dataSourceName` names, which is the other live reference to a data source,
+            // so a delete that would leave a resolver resolving against nothing is refused
+            // the same way — naming the type and the field that address the resolver still
+            // using it — and the data source is left exactly as it was.
+            if let Some(message) = api.data_source_resolver_refusal(&input.name) {
+                return Err(DeleteDataSourceErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                    ..Default::default()
+                })
+                .into());
+            }
         }
 
         // Removing the record is what makes the resource gone: every reader of that API
         // (`GetDataSource`, `ListDataSources`) answers without it afterwards, and the
-        // room it took in the per-API quota is free again.
-        api.data_sources.remove(&input.name);
+        // room it took in the per-API quota is free again. The API resolved above is the
+        // one written here, so a reference that resolved for the read and not for the
+        // write would mean the store changed under one lock, which it cannot.
+        let Some(data_sources) = guard.data_sources_of_mut(&input.api_id) else {
+            return Err(DeleteDataSourceErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into());
+        };
+        data_sources.remove(&input.name);
 
         // What a source API holds is what its next merge carries into the Merged APIs it is
         // a source of, so this change PROMPTS the merge of every `AUTO_MERGE` association
