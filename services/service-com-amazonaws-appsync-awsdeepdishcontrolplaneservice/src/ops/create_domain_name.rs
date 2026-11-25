@@ -7,7 +7,7 @@
 //! rule lives in [`crate::state::certificate_region_refusal`] (the one Region a custom
 //! domain's distribution reads a certificate from) and
 //! [`crate::state::certificate_refusal`] (whether the certificate the account holds at that
-//! ARN is one Certificate Manager issued from its public authority, and whether it covers
+//! ARN is anchored in an authority a client's own trust store carries, and whether it covers
 //! the name the domain is created under).
 //!
 //! ## Shape of an operation
@@ -184,13 +184,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Nor can a certificate the account did not get from Certificate Manager's own
-        // public authority, nor one that does not COVER the requested name: the domain
-        // answers HTTPS on that name and this certificate is what would terminate the
-        // handshake, so the certificate is resolved in the services that hold one for this
-        // account ([`crate::state::certificate_refusal`]) rather than taken on the request's
-        // word. Asked with this service's own store not yet held, and judged before anything
-        // is stored — so the refused pair leaves no domain behind.
+        // Nor can a certificate no authority a client's own trust store carries anchors,
+        // nor one that does not COVER the requested name: the domain answers HTTPS on that
+        // name and this certificate is what would terminate the handshake, so the
+        // certificate is resolved in the services that hold one for this account
+        // ([`crate::state::certificate_refusal`]) rather than taken on the request's word.
+        // Asked with this service's own store not yet held, and judged before anything is
+        // stored — so the refused pair leaves no domain behind.
         if let Some(message) = crate::state::certificate_refusal(
             &*self.engine,
             &input.domain_name,

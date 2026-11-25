@@ -19,16 +19,17 @@
 //!
 //! * Certificate Manager's public issuance (`RequestCertificate`) — served;
 //! * a certificate a client brought into Certificate Manager itself (`ImportCertificate`) —
-//!   refused, whoever signed it;
+//!   refused, when nothing publicly trusted anchors what was brought in;
 //! * a certificate a PRIVATE certificate authority issued (`RequestCertificate` naming
 //!   `CertificateAuthorityArn`), which no public trust store carries — refused;
 //! * a SELF-SIGNED certificate the account uploaded to Identity and Access Management
 //!   (`UploadServerCertificate`), the other ARN form the member admits, which has no authority
 //!   above it at all — refused;
-//! * a certificate the account uploaded there that ANOTHER authority signed — served when it
-//!   covers the requested name, because the member admits a server certificate and that one
-//!   carries an issuer, and refused when it covers some OTHER name, because the handshake it
-//!   would terminate is not the domain's;
+//! * a certificate the account uploaded there that ANOTHER authority signed — refused too when
+//!   that authority is one of this suite's own making, because an authority a caller generates
+//!   locally anchors no client's trust store, whether the certificate covers the requested name
+//!   or some OTHER name; WHERE a chain has to end is `crate::domain_certificate_public_trust`'s
+//!   subject;
 //! * and, as the other half of the rule, one ARN of each form that NEITHER service resolves
 //!   anything for, which says nothing about the certificate and is refused on no ground.
 //!
@@ -146,7 +147,8 @@ async fn iam_call(
 
 /// A real certificate covering `names` that ANOTHER authority signed, as the PEM pair
 /// `UploadServerCertificate` takes: an authority of this suite's own making signs the leaf, so
-/// the uploaded certificate carries an issuer above itself rather than its own subject.
+/// the uploaded certificate carries an issuer above itself rather than its own subject — an
+/// issuer no public trust store carries.
 fn minted_by_an_authority(names: &[&str]) -> (String, String) {
     let authority_key =
         rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("a key pair");
@@ -190,17 +192,27 @@ async fn uploaded(
     name: &str,
     material: (String, String),
 ) -> String {
+    uploaded_material(router, name, material, None).await
+}
+
+/// The same upload, with `chain` as the authorities offered with the certificate — which is
+/// what a certificate an authority above it signed is presented with.
+pub async fn uploaded_material(
+    router: &MultiServiceRouter,
+    name: &str,
+    material: (String, String),
+    chain: Option<String>,
+) -> String {
     let (certificate, private_key) = material;
-    let answer = iam_call(
-        router,
-        "UploadServerCertificate",
-        &[
-            ("ServerCertificateName", name.to_string()),
-            ("CertificateBody", certificate),
-            ("PrivateKey", private_key),
-        ],
-    )
-    .await;
+    let mut params = vec![
+        ("ServerCertificateName", name.to_string()),
+        ("CertificateBody", certificate),
+        ("PrivateKey", private_key),
+    ];
+    if let Some(chain) = chain {
+        params.push(("CertificateChain", chain));
+    }
+    let answer = iam_call(router, "UploadServerCertificate", &params).await;
     assert_eq!(
         answer.status, 200,
         "case UploadServerCertificate({name}): expected 200, got {} with {}",
@@ -246,7 +258,7 @@ async fn reported_authority(router: &MultiServiceRouter, arn: &str) -> Option<St
 
 /// The ARN Identity and Access Management reports for the server certificate held under
 /// `name`, or `None` when the account holds none.
-async fn reported_server_certificate(router: &MultiServiceRouter, name: &str) -> Option<String> {
+pub async fn reported_server_certificate(router: &MultiServiceRouter, name: &str) -> Option<String> {
     let read = iam_call(
         router,
         "GetServerCertificate",
@@ -289,10 +301,10 @@ enum Issuance {
     PrivateAuthority,
     /// The account uploaded a SELF-SIGNED certificate to Identity and Access Management.
     UploadedSelfSigned,
-    /// The account uploaded a certificate ANOTHER authority signed to Identity and Access
-    /// Management.
+    /// The account uploaded a certificate an authority of this suite's own making signed to
+    /// Identity and Access Management.
     UploadedByAuthority,
-    /// The account uploaded a certificate ANOTHER authority signed that covers some OTHER
+    /// The account uploaded a certificate that authority signed that covers some OTHER
     /// name than the one the domain is created under.
     UploadedForAnotherName,
     /// A well-formed Certificate Manager ARN of this account and Region that resolves to
@@ -443,12 +455,12 @@ fn rows() -> Vec<Row> {
             accepted: false,
         },
         Row {
-            label: "a server certificate the account uploaded that another authority signed",
+            label: "a server certificate the account uploaded that a local authority signed",
             domain_name: UPLOADED_SIGNED_NAME,
             issuance: Issuance::UploadedByAuthority,
             managed_type: None,
             private_authority: false,
-            accepted: true,
+            accepted: false,
         },
         Row {
             label: "an uploaded, authority-signed server certificate for another name",
@@ -478,12 +490,12 @@ fn rows() -> Vec<Row> {
 }
 
 /// RULE: a custom domain is created only with a certificate an authority a client can verify
-/// it against issued FOR THAT NAME — one Certificate Manager issued from its own public
-/// authority, or an uploaded server certificate another authority signed, covering the name in
-/// either case. A certificate the account holds without such an issuance — imported into
-/// Certificate Manager, issued by a private certificate authority, or uploaded having signed
-/// itself — and one that serves some other host are refused with the modelled 400 and
-/// AppSync's fixed sentence, and leave no domain behind; an ARN neither service resolves
+/// it against issued FOR THAT NAME — which, of the routes a certificate reaches an account by,
+/// is Certificate Manager's own public issuance covering the name. A certificate the account
+/// holds without such an issuance — imported into Certificate Manager, issued by a private
+/// certificate authority, uploaded having signed itself, or uploaded under an authority of the
+/// caller's own making — and one that serves some other host are refused with the modelled 400
+/// and AppSync's fixed sentence, and leave no domain behind; an ARN neither service resolves
 /// anything for is refused on no ground.
 #[tokio::test]
 async fn create_domain_name_requires_a_certificate_an_authority_issued() {

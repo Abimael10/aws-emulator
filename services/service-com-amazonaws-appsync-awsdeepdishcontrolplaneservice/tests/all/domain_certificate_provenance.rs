@@ -7,8 +7,9 @@
 //! `CreateDomainName` is accepted only when the certificate the account holds at the ARN it
 //! names is one that service issued, and a certificate a client brought into the account
 //! itself is refused with 400 `BadRequestException` and AppSync's fixed sentence for a
-//! certificate it will not serve with, whatever names that certificate covers and whoever
-//! signed it. A refused pair leaves no domain behind.
+//! certificate it will not serve with, whatever names that certificate covers and whatever
+//! chain it was brought in with, while nothing publicly trusted anchors that chain. A refused
+//! pair leaves no domain behind.
 //!
 //! The rule generalises over the PROVENANCE of the certificate (requested from Certificate
 //! Manager, imported self-signed, imported with another authority's certificate as its
@@ -446,9 +447,9 @@ pub fn message(answer: &Answer) -> &str {
 }
 
 /// RULE: a custom domain is created only with a certificate Certificate Manager ISSUED. An
-/// imported certificate is refused with the modelled 400 and AppSync's own sentence however
-/// well its names cover the domain, an issued one covering the name is accepted, and an ARN
-/// the account resolves nothing for is refused on neither ground.
+/// imported certificate nothing publicly trusted anchors is refused with the modelled 400 and
+/// AppSync's own sentence however well its names cover the domain, an issued one covering the
+/// name is accepted, and an ARN the account resolves nothing for is refused on neither ground.
 #[tokio::test]
 async fn create_domain_name_requires_a_certificate_certificate_manager_issued() {
     let router = router();

@@ -10723,6 +10723,8 @@ dependencies = [
  "rcgen",
  "regex",
  "rquickjs",
+ "rustls-pki-types",
+ "rustls-webpki",
  "serde",
  "serde_json",
  "service-com-amazonaws-acm-certificatemanager",
@@ -10752,6 +10754,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "webpki-roots",
 ]
 
 [[package]]

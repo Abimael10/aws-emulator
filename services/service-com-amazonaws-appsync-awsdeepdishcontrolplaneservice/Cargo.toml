@@ -182,6 +182,18 @@ service-com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice 
 # certificate it was handed can serve the requested domain name
 # (`src/state/domain_certificate.rs`).
 service-com-amazonaws-acm-certificatemanager = { workspace = true }
+# Builds the X.509 path from a certificate the account brought in itself up to the authority
+# that anchors it, which is what decides whether a client could verify the certificate a
+# custom domain would present (`src/state/domain_certificate.rs`). The same maintained path
+# builder a TLS client uses, rather than a hand-read certificate field; `ring` names the
+# signature verifiers the path is checked with.
+rustls-webpki = { workspace = true, features = ["ring"] }
+# The public trust anchors that path has to end in: the authorities a client's own trust
+# store carries, vendored by the same maintained project.
+webpki-roots = "1"
+# The certificate, trust-anchor and instant types those two speak, and the PEM reader that
+# decodes the material a caller supplied into them.
+rustls-pki-types = { version = "1", features = ["std"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
