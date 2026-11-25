@@ -20,7 +20,8 @@
 //!   `InvalidAggregatorException` ([`crate::state::node_summary::aggregator_rejection`]) —
 //!   the request is answered against what it ASKS for before the account is looked at. A
 //!   member outside the closed enum the model declares for it is refused by the centralized
-//!   request walk before this handler runs.
+//!   request walk before this handler runs, stating the value set the live service ACCEPTS
+//!   for that member's type (`crate::service`'s own refusal wording).
 //! * A `SyncName` other than that sync's names no sync a node summary can read — "the name of
 //!   the supported resource data sync is AWS-QuickSetup-ManagedNode" — so it is
 //!   `ResourceDataSyncNotFoundException`, carrying the name and the sync type the summary

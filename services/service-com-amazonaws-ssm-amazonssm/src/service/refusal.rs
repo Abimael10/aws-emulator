@@ -30,9 +30,10 @@
 //!    rule 2 states a value set as data: the sequence is fixed text of the message, and it
 //!    belongs to the type, so one row covers every member and every operation carrying it.
 //! 2. WHICH VALUES that set holds. The set a refusal lists is the set the live service
-//!    ACCEPTS, which for three of this service's filter-key types is larger than this
-//!    checkout's model declares — the model is behind the service, and a caller reads that
-//!    list to pick a legal key. [`ACCEPTED_VALUE_SETS`] is that data, one row per type,
+//!    ACCEPTS, which for four of this service's enumerated types — three filter-key types
+//!    and the attribute a node summary groups by — is larger than this checkout's model
+//!    declares: the model is behind the service, and a caller reads that list to pick a
+//!    legal value. [`ACCEPTED_VALUE_SETS`] is that data, one row per type,
 //!    recognised by the value set the violation carries so the row is found wherever the
 //!    type appears. Which values a member ADMITS is NOT changed here, and cannot be from
 //!    here: admission is the `@enum` constraint of the generated input schema, which
@@ -239,6 +240,43 @@ const OPS_ITEM_FILTER_KEY_ACCEPTED: &[&str] = &[
     "AssigneeId",
 ];
 
+/// `com.amazonaws.ssm#NodeAttributeName` as this checkout's model declares it
+/// (`smithy_query(query="shape",shape="NodeAttributeName")`), which is the set a violation
+/// of a `NodeAggregator$AttributeName` carries — at any nesting depth, since an aggregator
+/// refines another one with an aggregator of the same shape.
+const NODE_ATTRIBUTE_NAME_DECLARED: &[&str] = &[
+    "AgentVersion",
+    "PlatformName",
+    "PlatformType",
+    "PlatformVersion",
+    "Region",
+    "ResourceType",
+    "SourceType",
+    "AvailabilityZone",
+];
+
+/// The `NodeAttributeName` values the live service accepts: the eight the model declares,
+/// then the three attributes of a node's EXTENSIONS it does not (recorded behaviour —
+/// corpus `simparity-behavioral-aws-v1`, unit
+/// `ssm.list-nodes-summary-invalid-aggregator-rejected`, where `ListNodesSummary` with an
+/// `AttributeName` outside the set is refused with an 11-value set naming
+/// `ExtensionStatus`, `ExtensionVersion` and `ExtensionId` beside the eight). Stated
+/// model-first so the listing order of two values that share a hash bucket follows the
+/// declaration they are added to.
+const NODE_ATTRIBUTE_NAME_ACCEPTED: &[&str] = &[
+    "AgentVersion",
+    "PlatformName",
+    "PlatformType",
+    "PlatformVersion",
+    "Region",
+    "ResourceType",
+    "SourceType",
+    "AvailabilityZone",
+    "ExtensionStatus",
+    "ExtensionVersion",
+    "ExtensionId",
+];
+
 /// Every enumerated type of this service whose ACCEPTED value set is larger than this
 /// checkout's model declares: the values as the model declares them, and the values the
 /// service accepts.
@@ -254,6 +292,7 @@ const ACCEPTED_VALUE_SETS: &StatedEnumValueSets<'static> = &[
     ),
     (COMMAND_FILTER_KEY_DECLARED, COMMAND_FILTER_KEY_ACCEPTED),
     (OPS_ITEM_FILTER_KEY_DECLARED, OPS_ITEM_FILTER_KEY_ACCEPTED),
+    (NODE_ATTRIBUTE_NAME_DECLARED, NODE_ATTRIBUTE_NAME_ACCEPTED),
 ];
 
 /// `com.amazonaws.ssm#OperatingSystem` as this checkout's model declares it
