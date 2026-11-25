@@ -31,7 +31,7 @@ use crate::domain_export_lifecycle::{
 };
 
 /// The XML namespace every document of this API carries.
-const SDB_NAMESPACE: &str = "http://sdb.amazonaws.com/doc/2009-04-15/";
+pub(crate) const SDB_NAMESPACE: &str = "http://sdb.amazonaws.com/doc/2009-04-15/";
 
 /// The bucket every export below writes to — a name the modelled `S3BucketName` pattern
 /// admits, so no case is refused on it.
@@ -122,12 +122,12 @@ async fn refused(
 /// parser resolves — entities and all — and never the bytes the wire carried. The match
 /// is on the element's LOCAL name, because this API's answers sit in its own namespace
 /// and its error documents sit in none.
-fn text_of(document: &str, name: &str) -> Option<String> {
+pub(crate) fn text_of(document: &str, name: &str) -> Option<String> {
     texts_of(document, name).into_iter().next()
 }
 
 /// The text of EVERY element named `name`, in document order.
-fn texts_of(document: &str, name: &str) -> Vec<String> {
+pub(crate) fn texts_of(document: &str, name: &str) -> Vec<String> {
     let parsed = ::roxmltree::Document::parse(document)
         .unwrap_or_else(|error| panic!("the answer must be XML ({error}): {document}"));
     parsed
@@ -138,7 +138,7 @@ fn texts_of(document: &str, name: &str) -> Vec<String> {
 }
 
 /// The attribute name-value pairs a `GetAttributesResult` reports, in document order.
-fn attribute_pairs(document: &str) -> Vec<(String, String)> {
+pub(crate) fn attribute_pairs(document: &str) -> Vec<(String, String)> {
     let parsed = ::roxmltree::Document::parse(document)
         .unwrap_or_else(|error| panic!("the answer must be XML ({error}): {document}"));
     let child_text = |element: ::roxmltree::Node<'_, '_>, name: &str| {
@@ -1437,7 +1437,7 @@ async fn a_request_that_names_this_endpoint_reaches_this_api() {
 
 /// An emulator that VERIFIES every request, as the served emulator does, so the cases
 /// below are judged by the same path a client reaches.
-fn authenticating_emulator() -> MultiServiceRouter {
+pub(crate) fn authenticating_emulator() -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(true);
     router.register_service(
@@ -1450,7 +1450,7 @@ fn authenticating_emulator() -> MultiServiceRouter {
 
 /// The key pair that emulator accepts: the one it publishes at start, which is what a
 /// client of it is configured with.
-fn published_credentials() -> (String, String) {
+pub(crate) fn published_credentials() -> (String, String) {
     let published =
         ::emulator_server::request_authentication::SigV4Authenticator::minted_credentials()
             .expect("an authenticating emulator publishes its key pair");
@@ -1463,21 +1463,13 @@ fn published_credentials() -> (String, String) {
 /// The host every case below addresses, and therefore signs for.
 const SIGNED_HOST: &str = "sdb.us-west-2.amazonaws.com";
 
-/// The characters Signature Version 2 leaves unescaped in the string it signs: RFC 3986's
-/// unreserved set.
-const CANONICAL_UNRESERVED: &::percent_encoding::AsciiSet = &::percent_encoding::NON_ALPHANUMERIC
-    .remove(b'-')
-    .remove(b'.')
-    .remove(b'_')
-    .remove(b'~');
-
 /// `parameters` signed the way Amazon SimpleDB 2009-04-15 publishes — Signature Version 2
-/// — and posted as the form body a client sends.
+/// — for [`SIGNED_HOST`], and posted there as the form body a client sends.
 ///
-/// The signature is computed here the way a CLIENT computes it, from the published
-/// documentation rather than from the service's own code: the HMAC of
-/// `POST\n<host>\n/\n<parameters sorted by name, percent-encoded>`, base64-encoded, under
-/// the secret of the access key the request names.
+/// The signing is the one a CLIENT does, written once in
+/// [`crate::sdb_signature_version_2_reached_endpoint::signed_fields`] — the suite that spans
+/// the authorities a client addresses, which is what that signature covers — rather than a
+/// second time here.
 async fn signed_query(
     router: &MultiServiceRouter,
     hash: &str,
@@ -1485,64 +1477,30 @@ async fn signed_query(
     secret: &str,
     parameters: &[(&str, &str)],
 ) -> (u16, String) {
-    use ::base64::Engine as _;
-    use ::hmac::Mac as _;
-
-    let mut signed: Vec<(String, String)> = parameters
-        .iter()
-        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
-        .collect();
-    signed.push(("AWSAccessKeyId".to_string(), key_id.to_string()));
-    signed.push(("SignatureVersion".to_string(), "2".to_string()));
-    signed.push(("SignatureMethod".to_string(), hash.to_string()));
-    signed.push(("Timestamp".to_string(), "2026-01-01T00:00:00Z".to_string()));
-    let mut canonical = signed.clone();
-    canonical.sort_by(|(left, _), (right, _)| left.cmp(right));
-    let encode =
-        |text: &str| ::percent_encoding::utf8_percent_encode(text, CANONICAL_UNRESERVED).to_string();
-    let query = canonical
-        .iter()
-        .map(|(name, value)| format!("{}={}", encode(name), encode(value)))
-        .collect::<Vec<String>>()
-        .join("&");
-    let string_to_sign = format!("POST\n{SIGNED_HOST}\n/\n{query}");
-    let signature = if hash == "HmacSHA1" {
-        let mut mac = <::hmac::Hmac<::sha1::Sha1> as ::hmac::Mac>::new_from_slice(secret.as_bytes())
-            .expect("HMAC takes a key of any length");
-        mac.update(string_to_sign.as_bytes());
-        ::base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
-    } else {
-        let mut mac =
-            <::hmac::Hmac<::sha2::Sha256> as ::hmac::Mac>::new_from_slice(secret.as_bytes())
-                .expect("HMAC takes a key of any length");
-        mac.update(string_to_sign.as_bytes());
-        ::base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
-    };
-    signed.push(("Signature".to_string(), signature));
+    let signed = crate::sdb_signature_version_2_reached_endpoint::signed_fields(
+        SIGNED_HOST,
+        hash,
+        key_id,
+        secret,
+        parameters,
+    );
     posted_form(router, &signed).await
 }
 
-/// One `POST "/"` carrying `fields` as its form body and NO `Authorization` header — which
-/// is what a Signature Version 2 request is: its credential travels in the body.
+/// One `POST "/"` to [`SIGNED_HOST`] carrying `fields` as its form body and NO
+/// `Authorization` header — which is what a Signature Version 2 request is: its credential
+/// travels in the body.
 async fn posted_form(
     router: &MultiServiceRouter,
     fields: &[(String, String)],
 ) -> (u16, String) {
-    let mut form = ::form_urlencoded::Serializer::new(String::new());
-    for (name, value) in fields {
-        form.append_pair(name, value);
-    }
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("host", SIGNED_HOST)
-        .header("content-type", "application/x-www-form-urlencoded; charset=utf-8")
-        .body(bytes::Bytes::from(form.finish()))
-        .expect("a well-formed test request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let body = String::from_utf8_lossy(&response.into_body()).to_string();
-    (status, body)
+    let answered = crate::sdb_signature_version_2_reached_endpoint::posted_form(
+        router,
+        SIGNED_HOST,
+        fields,
+    )
+    .await;
+    (answered.status, answered.body)
 }
 
 /// One row of the signature table: the credential and hash a request presents, and what

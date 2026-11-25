@@ -18,8 +18,9 @@
 //! * an API still signed with Signature Version 2 carries its credential in the
 //!   form-encoded body rather than in an `Authorization` header, so a conforming client
 //!   of one sends no scope either; and
-//! * a client pointed at this emulator's own address reaches it on a loopback host, which
-//!   names no service.
+//! * a client pointed at this emulator's own address reaches it on a loopback ADDRESS — in
+//!   either family, and an IPv6 one written in the brackets a URI puts its colons inside —
+//!   which names no service.
 //!
 //! [`addresses_query_request`] is the claim such a request is admitted by: the wire form,
 //! and nothing in the request naming ANOTHER service. Nothing weaker is claimed — a request
@@ -98,17 +99,65 @@ pub fn addresses_query_request(
 }
 
 /// The service the request names through a signal the QUERY protocol carries: the SigV4
-/// credential scope, in either of SigV4's two presentations, then the endpoint host and the
-/// HTTP/2 `:authority`.
+/// credential scope, in either of SigV4's two presentations, then the two endpoint tiers
+/// ([`endpoint_service`]).
 ///
-/// The framework's own `resolve_route_key` applies the same tiers with `X-Amz-Target`
-/// between them; each tier is read here through the framework's own reader for it, so the
-/// only difference is the tier a query request has no use for.
+/// The framework's own `resolve_route_key` applies the same tiers in the same order with
+/// `X-Amz-Target` between them, so the differences are the tier a query request has no use
+/// for, and the address-aware reading of a host the endpoint tiers use.
 fn route_key_without_target(parts: &http::request::Parts) -> Option<String> {
+    credential_service(parts).or_else(|| endpoint_service(parts))
+}
+
+/// The service the request's CREDENTIAL names: the SigV4 scope in the `Authorization`
+/// header, then the one a presigned URL carries in its query. The tiers both readings of
+/// the rule below begin with, so their order cannot drift between them.
+fn credential_service(parts: &http::request::Parts) -> Option<String> {
     ::emulator_server::service_from_sigv4(&parts.headers)
         .or_else(|| ::emulator_server::service_from_sigv4_query(&parts.uri))
-        .or_else(|| ::emulator_server::service_from_host(&parts.headers))
-        .or_else(|| ::emulator_server::service_from_authority(&parts.uri))
+}
+
+/// The service the request names through the signals its ENDPOINT carries: the `Host`
+/// header, then the HTTP/2 `:authority` the `http` crate parses onto the URI in its place.
+///
+/// TWO tiers, as the framework's own resolver reads them, rather than one authority chosen
+/// between the two: a request whose `Host` names no service may still name one in its
+/// authority, and a claim that stopped at the header would take such a request from the
+/// service it names. (Which authority a request was SENT TO is the other question, and
+/// [`crate::data_plane_addressing::addressed_authority`] is the reading for it — a plane
+/// resolving its own resource needs the one authority RFC 9112 points at, while routing
+/// reads whichever of the two names a service.)
+///
+/// An authority that is an ADDRESS names no service, in every form one is written in — an
+/// IPv4 literal, and an IPv6 literal, whose own colons sit inside the brackets a URI writes
+/// it in. That is the authority a client pointed at THIS emulator addresses, since the
+/// emulator answers on a loopback address rather than on any service's DNS name, and a
+/// request of this protocol has no other signal to be claimed by: reading an address as a
+/// service name would route such a request to a service no emulator registers and answer a
+/// conforming client `UnknownService`.
+///
+/// [`crate::data_plane_addressing::service_named_by_host`] is that reading — the one this
+/// crate already answers "does this host name a service" from, the framework's own host
+/// reader for a named host and `None` for an address — so the claim and every data plane
+/// read a host the same way.
+fn endpoint_service(parts: &http::request::Parts) -> Option<String> {
+    use crate::data_plane_addressing::service_named_by_host;
+
+    let host = parts
+        .headers
+        .get(http::header::HOST)
+        .and_then(|value| value.to_str().ok());
+    let authority = parts.uri.authority().map(::http::uri::Authority::as_str);
+    host.and_then(service_named_by_host)
+        .or_else(|| authority.and_then(service_named_by_host))
+}
+
+/// The service a request names through ANY signal the framework's own resolver reads: the
+/// tiers of [`route_key_without_target`] with `X-Amz-Target` in its place between them.
+fn service_named_by_any_signal(parts: &http::request::Parts) -> Option<String> {
+    credential_service(parts)
+        .or_else(|| ::emulator_server::service_from_target(&parts.headers))
+        .or_else(|| endpoint_service(parts))
 }
 
 /// Whether the request's `X-Amz-Target`, if it carries a readable one, names the service
@@ -143,7 +192,7 @@ fn addresses_query_wire_form(parts: &http::request::Parts) -> bool {
 /// `Parts`) has to know, at `Service::override_operation` (which is handed the runtime-API
 /// request), whether THIS request is one of those: a request that names this service is its
 /// own however it is written, while one that names none is claimed by the form alone and has
-/// to state which API it is for. The framework's resolver takes `Parts`, so the parts are
+/// to state which API it is for. The resolver takes `Parts`, so the parts are
 /// lifted off the request — the same lift `crate::unusable_credential::presented_access_key_id`
 /// makes for the same reason — rather than the tiered rule being written a second time.
 ///
@@ -159,7 +208,7 @@ pub fn names_no_service(req: &RtRequest) -> bool {
         return false;
     };
     let (parts, ()) = request.into_parts();
-    ::emulator_server::resolve_route_key(&parts).is_none()
+    service_named_by_any_signal(&parts).is_none()
 }
 
 /// Whether `parts` declares a form-encoded body: the media type, with whatever parameters
@@ -183,8 +232,9 @@ fn declares_form_encoded_body(parts: &http::request::Parts) -> bool {
 mod tests {
     use super::*;
 
-    /// The emulator's own address, which names no service.
+    /// The emulator's own address, which names no service, in either address family.
     const LOOPBACK: &str = "127.0.0.1:9297";
+    const IPV6_LOOPBACK: &str = "[::1]:9297";
 
     /// One query service's names, for the rows below: a signing name and the service shape
     /// its API is declared by.
@@ -228,7 +278,8 @@ mod tests {
     /// cased differently, the fully qualified Coral name whose prefix carries dots of its
     /// own, a target naming an operation no model binds), which service the target names,
     /// which other signal names a service (none, the endpoint host, the credential scope),
-    /// and the wire form itself (the method, the path, and how the media type is written).
+    /// the ADDRESS FAMILY of a loopback authority, and the wire form itself (the method, the
+    /// path, and how the media type is written).
     #[test]
     fn a_query_request_is_claimed_by_its_own_signals_whatever_target_it_carries() {
         /// One row: how the request is addressed, the target attached to it, and whether
@@ -332,6 +383,28 @@ mod tests {
                 authorization: None,
                 host: LOOPBACK,
                 target: Some("AWSCognitoIdentityService.GetId"),
+                claimed: false,
+            },
+            Row {
+                // An IPv6 loopback address: the brackets a URI writes its colons inside are
+                // part of the address, so the authority names no service here either.
+                case: "an unsigned form POST to an IPv6 loopback address",
+                method: "POST",
+                uri: "/",
+                content_type: Some(QUERY_CONTENT_TYPE),
+                authorization: None,
+                host: IPV6_LOOPBACK,
+                target: None,
+                claimed: true,
+            },
+            Row {
+                case: "an IPv6 loopback address with another service's credential scope",
+                method: "POST",
+                uri: "/",
+                content_type: Some(QUERY_CONTENT_TYPE),
+                authorization: Some(other_scope),
+                host: IPV6_LOOPBACK,
+                target: None,
                 claimed: false,
             },
             Row {
