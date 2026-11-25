@@ -62,7 +62,11 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// The report templates a report may be built from, as the model lists them
 /// (`smithy_query` shape `ReportSetting`, member `ReportTemplate`).
-const REPORT_TEMPLATES: [&str; 6] = [
+///
+/// `pub(crate)` so the sibling suite that drives the same delete over the other
+/// resource kinds this account holds walks the SAME published list rather than
+/// keeping a second copy of it.
+pub(crate) const REPORT_TEMPLATES: [&str; 6] = [
     "RESOURCE_COMPLIANCE_REPORT",
     "CONTROL_COMPLIANCE_REPORT",
     "BACKUP_JOB_REPORT",
@@ -76,18 +80,22 @@ const REPORT_TEMPLATES: [&str; 6] = [
 const MAX_NAME_LENGTH: usize = 256;
 
 /// `POST /audit/report-plans`, as the model binds the create.
-async fn create_plan(router: &MultiServiceRouter, body: &Value) -> (u16, String, Value) {
+///
+/// This helper and the three below are `pub(crate)` for the reason given on
+/// [`REPORT_TEMPLATES`]: the report-plan suites of this test binary reach the
+/// wire through ONE spelling of each binding.
+pub(crate) async fn create_plan(router: &MultiServiceRouter, body: &Value) -> (u16, String, Value) {
     call_reported(router, "POST", "/audit/report-plans", Some(&body.to_string())).await
 }
 
 /// `GET /audit/report-plans/{ReportPlanName}`, as the model binds the read.
-async fn describe_plan(router: &MultiServiceRouter, name: &str) -> (u16, String, Value) {
+pub(crate) async fn describe_plan(router: &MultiServiceRouter, name: &str) -> (u16, String, Value) {
     call_reported(router, "GET", &format!("/audit/report-plans/{name}"), None).await
 }
 
 /// `DELETE /audit/report-plans/{ReportPlanName}` — `DeleteReportPlan`'s HTTP
 /// binding.
-async fn delete_plan(router: &MultiServiceRouter, name: &str) -> (u16, String, Value) {
+pub(crate) async fn delete_plan(router: &MultiServiceRouter, name: &str) -> (u16, String, Value) {
     call_reported(
         router,
         "DELETE",
@@ -103,7 +111,7 @@ async fn list_tags(router: &MultiServiceRouter, arn: &str) -> (u16, String, Valu
 }
 
 /// The plan body a read reports (`ReportPlan`), or `Value::Null`.
-fn read_plan(body: &Value) -> Value {
+pub(crate) fn read_plan(body: &Value) -> Value {
     body.get("ReportPlan").cloned().unwrap_or(Value::Null)
 }
 
