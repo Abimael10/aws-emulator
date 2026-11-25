@@ -397,6 +397,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     management_ip: &ip_address,
                     management_subnet_id: &vlan.subnet_id,
                     service_access_subnet_id: &environment.service_access_subnet_id,
+                    // Where the request placed the host, resolved above: the instance
+                    // records it, so EC2 reports the host's placement for the same host
+                    // Amazon EVS reports it for.
+                    placement_group_id: input.host.placement_group_id.as_deref(),
+                    dedicated_host_id: input.host.dedicated_host_id.as_deref(),
                 },
             )
         });

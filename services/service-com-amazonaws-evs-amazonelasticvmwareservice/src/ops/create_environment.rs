@@ -999,6 +999,10 @@ fn add_requested_hosts<Eng: Send + Sync + 'static>(
                 management_ip: &ip_address,
                 management_subnet_id: &management_subnet_id,
                 service_access_subnet_id: &service_access_subnet_id,
+                // Where the entry placed the host, which the instance records just as the
+                // single-host path's does.
+                placement_group_id: host.placement_group_id.as_deref(),
+                dedicated_host_id: host.dedicated_host_id.as_deref(),
             },
         );
         // The host is CREATING until it has been built and joined the environment, which

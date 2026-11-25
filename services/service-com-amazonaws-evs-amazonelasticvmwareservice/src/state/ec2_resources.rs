@@ -37,7 +37,9 @@
 //!
 //! * an Amazon EVS host IS an EC2 bare metal instance (`Host` doc), so
 //!   [`launch_host_instance`] puts that instance in EC2's own store through EC2's own
-//!   state API, and the host reports the id EC2 minted for it;
+//!   state API, and the host reports the id EC2 minted for it — with the placement the
+//!   request named recorded on that instance, so the one store both services read cannot
+//!   disagree about where the host runs;
 //!   [`terminate_host_instance`] ends it again when the host is deleted from its
 //!   environment, so no instance of a host no environment holds is left running;
 //! * Amazon EVS "provisions the VLAN subnets" of an environment inside the VPC the
@@ -484,6 +486,15 @@ pub struct HostLaunch<'a> {
     /// The environment's service access subnet, read for the Availability Zone the
     /// environment is deployed in.
     pub service_access_subnet_id: &'a str,
+    /// The placement group the request placed the host IN ("the unique ID of the placement
+    /// group where the host is placed", `HostInfoForCreate$placementGroupId`), when it named
+    /// one — already resolved against the account's own placement group store by
+    /// [`host_placement_failures`].
+    pub placement_group_id: Option<&'a str>,
+    /// The Amazon EC2 Dedicated Host the request placed the host ON
+    /// (`HostInfoForCreate$dedicatedHostId`), when it named one — resolved in that same
+    /// store by that same precondition.
+    pub dedicated_host_id: Option<&'a str>,
 }
 
 /// The physical processor cores one host running on `instance_type` has — the cores a
@@ -512,7 +523,10 @@ pub fn instance_type_cores(instance_type: &str) -> Option<u64> {
 /// written through EC2's own state API ([`ec2::ComAmazonawsEc2Amazonec2State::insert_instance`]),
 /// so it is indistinguishable from one `RunInstances` launched: `pending` with the move
 /// to `running` the clock owes it, its primary private address the host's own management
-/// address, and its subnet the VLAN subnet that address came out of.
+/// address, its subnet the VLAN subnet that address came out of, and the placement the
+/// request named — a Dedicated Host, or a placement group — recorded on the instance in
+/// the members EC2 records a launch's placement in, so the Dedicated Host reports the
+/// instance running on it.
 ///
 /// `None` — no instance launched, so the host reports neither `ec2InstanceId` nor
 /// `networkInterfaces` rather than naming resources that do not exist — when the EC2
@@ -546,12 +560,39 @@ pub fn launch_host_instance<Eng: Send + Sync + 'static>(
                 .map(|zone| zone.zone_name.clone())
         })?;
 
+    // WHERE the launch put the instance, in the members EC2 records a placement on an
+    // instance with: the Dedicated Host it is on is `Placement$HostId`
+    // ([`ec2::InstanceDetail::host_id`]) and the group it is in is `Placement$GroupName`
+    // ([`ec2::InstanceDetail::placement_group_name`]), the two facts "the launch that places
+    // an instance on a host records that host on the instance" leaves behind — which is what
+    // makes the host's own `Instances`, and so the dependency its release has to honour,
+    // report this instance.
+    //
+    // An instance names its group by NAME while `HostInfoForCreate$placementGroupId` names it
+    // by ID, so the id is read to that group's own name in the same store and under this one
+    // lock. Both references were resolved there by the precondition that admitted the request
+    // ([`host_placement_failures`]), and are read against it again here, so a placement this
+    // store no longer holds leaves the instance reporting none rather than naming a resource
+    // no describe of the account can report.
+    let placement_group_name = launch
+        .placement_group_id
+        .and_then(|group_id| store.placement_groups.get(group_id))
+        .and_then(|group| group.group_name.clone());
+    let dedicated_host_id = launch
+        .dedicated_host_id
+        .filter(|host_id| store.dedicated_hosts.contains_key(*host_id))
+        .map(str::to_string);
     // The EC2 store's own ceilings, asked BEFORE anything is minted: this writer is
     // bound by them exactly as EC2's own launch paths are.
     let payload_bytes = launch.instance_type.len()
         + launch.key_name.len()
         + launch.management_subnet_id.len()
-        + availability_zone.len();
+        + availability_zone.len()
+        // The placement group's name is a string the ACCOUNT chose, so it is charged
+        // against that budget exactly as EC2's own reading of an instance's bytes charges
+        // it ([`ec2::instance_payload_bytes`]); the Dedicated Host's id is a minted id of
+        // fixed size, which that reading charges for nothing.
+        + placement_group_name.as_ref().map_or(0, String::len);
     if store.instances.len() >= ec2::MAX_STORED_INSTANCES
         || store.would_exceed_stored_bytes(payload_bytes)
     {
@@ -631,8 +672,13 @@ pub fn launch_host_instance<Eng: Send + Sync + 'static>(
         monitoring_transition: None,
         // Amazon EVS configures none of the option sets an EC2 instance reports (its
         // metadata options, enclave, tenancy and the rest), so every one of them is at its
-        // documented default.
-        detail: ec2::InstanceDetail::default(),
+        // documented default — except WHERE this launch put the instance, which the request
+        // did name and which is recorded on the instance like any other launch's placement.
+        detail: ec2::InstanceDetail {
+            placement_group_name,
+            host_id: dedicated_host_id,
+            ..ec2::InstanceDetail::default()
+        },
         architecture: ec2::architecture_for(launch.instance_type),
         // An ESX host boots the image Amazon EVS publishes, not a kernel or RAM disk
         // image a launch names, so it carries neither; source/destination checking
@@ -664,6 +710,13 @@ pub fn launch_host_instance<Eng: Send + Sync + 'static>(
         spot_instance_request_id: None,
         cpu_credits,
     });
+    // The Dedicated Host this launch put the instance on now reports it: a host's
+    // `Instances` FOLLOWS from where the account's instances were launched, so it is
+    // recomputed through EC2's own recompute of that derived member
+    // ([`ec2::ComAmazonawsEc2Amazonec2State::resync_dedicated_host_instances`]) rather than
+    // written beside the instance record — the same call EC2's own launch path makes, which
+    // is what makes a host carrying a running ESX host refuse to be released under it.
+    store.resync_dedicated_host_instances();
     // The ENIs. EC2 holds no network interface store yet (every `…NetworkInterface`
     // operation is still a scaffold stub), so the ids are minted from EC2's OWN id
     // counter — `eni-` + 17 hex digits, the form `ec2::network_interface_id_is_well_formed`
