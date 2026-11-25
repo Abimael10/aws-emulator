@@ -58,8 +58,8 @@
 //!
 //! ## Output
 //!
-//! * `Destination` (TraceSegmentDestination, one of: CloudWatchLogs | XRay) — Retrieves the
-//!   current destination.
+//! * `Destination` (TraceSegmentDestination, one of: CloudWatchLogs | Composite | XRay) —
+//!   Retrieves the current destination.
 //! * `Status` (TraceSegmentDestinationStatus, one of: ACTIVE | PENDING) — Status of the
 //!   retrieval.
 //!

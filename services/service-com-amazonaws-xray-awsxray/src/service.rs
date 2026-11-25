@@ -94,12 +94,13 @@ use std::sync::Arc;
 /// A refusal of a value outside an enumerated type names the values that type admits,
 /// and the order it names them in is the SERVICE's rather than the model's: the order a
 /// model happens to declare an enum's members in is an artefact of how the model was
-/// written, and this service's own refusals state two of its types in orders the model
+/// written, and this service's own refusals state three of its types in orders the model
 /// does not carry — the encryption type as `[KMS, NONE]` where the model declares
-/// `NONE, KMS`, and the time-range type as `[TraceId, Service, Event]` where the model
-/// declares `TraceId, Event, Service`. No one order over the declared values produces
-/// both, so the sets this service is known to state in an order the sort does not give
-/// are listed in [`STATED_VALUE_SET_ORDERS`], and every other set of this model takes
+/// `NONE, KMS`, the time-range type as `[TraceId, Service, Event]` where the model
+/// declares `TraceId, Event, Service`, and the trace segment destination with the
+/// composite destination first. No one order over the declared values produces
+/// all of those, so the sets this service is known to state in an order the sort does not
+/// give are listed in [`STATED_VALUE_SET_ORDERS`], and every other set of this model takes
 /// the sorted order — `service_common`'s one statement of that rule, applied to the
 /// violations as they arrive, so it answers for every enum and every member targeting
 /// one, in any operation.
@@ -125,6 +126,10 @@ const STATED_VALUE_SET_ORDERS: &[&[&str]] = &[
     // `com.amazonaws.xray#TimeRangeType`, which the model declares `TraceId,
     // Event, Service`.
     &["TraceId", "Service", "Event"],
+    // `com.amazonaws.xray#TraceSegmentDestination`, which this service states
+    // with the composite destination FIRST — neither the sorted order nor the
+    // order the model declares the type in.
+    &["Composite", "CloudWatchLogs", "XRay"],
 ];
 
 /// One violation with its enumerated value set in the order this service states

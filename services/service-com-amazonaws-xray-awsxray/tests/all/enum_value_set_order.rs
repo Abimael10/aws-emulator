@@ -20,14 +20,14 @@
 //! (a top-level member, a member nested inside a structure), the value refused (a
 //! name no enum carries, an admitted value in the wrong case, the empty string),
 //! and the order the model declares the type in relative to the one the refusal
-//! states — including the one type this service states in neither its declared
-//! nor its sorted order. A second test holds ONE type's set to the order the
+//! states — including the types this service states in neither their declared
+//! nor their sorted order. A second test holds ONE type's set to the order the
 //! service states it in over every spelling of a refused value a caller can
 //! send, with the set read off the service's own message rather than compared
 //! against a literal.
 //!
 //! Each value set below names where its order comes from — the `smithy_query`
-//! that gives the model's declaration order, and for the one type stated in
+//! that gives the model's declaration order, and for a type stated in
 //! neither that nor the sorted order, the order this service's own refusals
 //! state it in — so the test pins the order rather than restating whatever the
 //! service produced.
@@ -50,8 +50,11 @@ fn said(answer: &Answer) -> &str {
 /// (`smithy_query(query="shape",shape="EncryptionType")`).
 const ENCRYPTION_TYPE_SET: &str = "[KMS, NONE]";
 
-/// `com.amazonaws.xray#TraceSegmentDestination`, declared `XRay, CloudWatchLogs`.
-const TRACE_SEGMENT_DESTINATION_SET: &str = "[CloudWatchLogs, XRay]";
+/// `com.amazonaws.xray#TraceSegmentDestination`, whose admitted values are
+/// `XRay`, `CloudWatchLogs` and `Composite`, and which this service states with
+/// the composite destination first — neither the sorted order nor the order the
+/// model declares the type in.
+const TRACE_SEGMENT_DESTINATION_SET: &str = "[Composite, CloudWatchLogs, XRay]";
 
 /// `com.amazonaws.xray#TimeRangeType`, declared `TraceId, Event, Service`
 /// (`smithy_query(query="shape",shape="TimeRangeType")`) and stated by this

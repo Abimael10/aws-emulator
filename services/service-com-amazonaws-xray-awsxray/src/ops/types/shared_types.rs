@@ -269,7 +269,7 @@ pub const TRACE_FORMAT_TYPE_VALUES: &[&str] = &["OTEL", "XRAY"];
 
 
 /// The values `TraceSegmentDestination` accepts on the wire.
-pub const TRACE_SEGMENT_DESTINATION_VALUES: &[&str] = &["CloudWatchLogs", "XRay"];
+pub const TRACE_SEGMENT_DESTINATION_VALUES: &[&str] = &["CloudWatchLogs", "Composite", "XRay"];
 
 
 /// The values `TraceSegmentDestinationStatus` accepts on the wire.

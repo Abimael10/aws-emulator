@@ -65,13 +65,13 @@
 //! * `CloudWatchLogsConfiguration` (CloudWatchLogsConfiguration) — Specifies settings for the
 //!   CloudWatch Logs log groups that X-Ray creates for Transaction Search. Specify this only
 //!   when Destination is CloudWatchLogs.
-//! * `Destination` (TraceSegmentDestination, one of: CloudWatchLogs | XRay) — The configured
-//!   destination of trace segments.
+//! * `Destination` (TraceSegmentDestination, one of: CloudWatchLogs | Composite | XRay) — The
+//!   configured destination of trace segments.
 //!
 //! ## Output
 //!
-//! * `Destination` (TraceSegmentDestination, one of: CloudWatchLogs | XRay) — The destination
-//!   of the trace segments.
+//! * `Destination` (TraceSegmentDestination, one of: CloudWatchLogs | Composite | XRay) — The
+//!   destination of the trace segments.
 //! * `Status` (TraceSegmentDestinationStatus, one of: ACTIVE | PENDING) — The status of the
 //!   update.
 //!
