@@ -58,29 +58,33 @@ const ATTACHMENT_ATTACHED: &str = "attached";
 /// The `VolumeState` values this suite names (`smithy_query(query="shape",
 /// shape="VolumeState",
 /// model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")`).
-const VOLUME_AVAILABLE: &str = "available";
-const VOLUME_IN_USE: &str = "in-use";
+pub(crate) const VOLUME_AVAILABLE: &str = "available";
+pub(crate) const VOLUME_IN_USE: &str = "in-use";
 
 /// One attachment as `ec2:DescribeVolumes` reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct EbsAttachment {
-    instance_id: String,
-    device: String,
-    state: String,
+pub(crate) struct EbsAttachment {
+    pub(crate) instance_id: String,
+    pub(crate) device: String,
+    pub(crate) state: String,
 }
 
 /// What `ec2:DescribeVolumes` reports about one volume: its own `State`, and the attachments
 /// it holds.
+///
+/// `pub(crate)` with [`ebs_view`] and [`settled`] below: the sibling
+/// `disassociate_mode_propagation` suite reads the same EBS view of a volume through these
+/// helpers rather than through copies of them.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct EbsVolume {
-    state: String,
-    attachments: Vec<EbsAttachment>,
+pub(crate) struct EbsVolume {
+    pub(crate) state: String,
+    pub(crate) attachments: Vec<EbsAttachment>,
 }
 
 impl EbsVolume {
     /// The `(InstanceId, Device)` pair of every attachment reported, which is what an attach
     /// is asserted to have made and a refusal to have left alone.
-    fn attached_at(&self) -> Vec<(String, String)> {
+    pub(crate) fn attached_at(&self) -> Vec<(String, String)> {
         self.attachments
             .iter()
             .map(|attachment| (attachment.instance_id.clone(), attachment.device.clone()))
@@ -88,7 +92,7 @@ impl EbsVolume {
     }
 
     /// Whether every attachment reported has reached `attached`, and there is one.
-    fn fully_attached(&self) -> bool {
+    pub(crate) fn fully_attached(&self) -> bool {
         !self.attachments.is_empty()
             && self
                 .attachments
@@ -198,7 +202,7 @@ fn fixture_volume(zone: &str) -> Value {
 }
 
 /// What Amazon EC2 reports for `volume_id`, or `None` when it holds no such volume.
-async fn ebs_view(ec2: &::aws_sdk_ec2::Client, volume_id: &str) -> Option<EbsVolume> {
+pub(crate) async fn ebs_view(ec2: &::aws_sdk_ec2::Client, volume_id: &str) -> Option<EbsVolume> {
     let answered = ec2
         .describe_volumes()
         .volume_ids(volume_id)
@@ -232,7 +236,7 @@ async fn ebs_view(ec2: &::aws_sdk_ec2::Client, volume_id: &str) -> Option<EbsVol
 /// Look again until what Amazon EC2 reports for `volume_id` satisfies `holds`, and answer it.
 /// Waits for the CONDITION, not for a span: the deadline is only the point past which the
 /// condition is taken to be unreachable.
-async fn settled<P>(
+pub(crate) async fn settled<P>(
     ec2: &::aws_sdk_ec2::Client,
     case: &str,
     volume_id: &str,
