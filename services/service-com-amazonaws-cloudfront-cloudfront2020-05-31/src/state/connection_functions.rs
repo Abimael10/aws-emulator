@@ -456,11 +456,40 @@ pub fn connection_function_arn(id: &str) -> String {
     ::engine::emulator_arn("cloudfront", "", &format!("connection-function/{id}"))
 }
 
-/// The path of a connection function resource under this service's API version. The
-/// resource is addressed by ID, as `GetConnectionFunction`'s `{Identifier}` label and
-/// `DeleteConnectionFunction`'s `{Id}` label are.
-pub fn connection_function_path(id: &str) -> String {
-    format!("/2020-05-31/connection-function/{id}")
+/// The path of a connection function resource under this service's API version, addressed by
+/// `identifier`.
+///
+/// The segment is whichever identifier the answer being built hands the caller to address the
+/// connection function with. `GetConnectionFunction` and `DescribeConnectionFunction` name
+/// their resource by "The connection function's identifier", which a stored function answers
+/// to by id, by name or by ARN
+/// ([`ComAmazonawsCloudfrontCloudfront20200531State::connection_function`]), so a path built
+/// for a caller that already holds an id is built from that id; the URL a CREATE announces
+/// ([`connection_function_location_uri`]) carries the ARN, which is the identifier that create
+/// hands back for the function to be referenced by — `ConnectionFunctionSummary` declares "The
+/// connection function Amazon Resource Name (ARN)" required beside the id.
+pub fn connection_function_path(identifier: &str) -> String {
+    format!("/2020-05-31/connection-function/{identifier}")
+}
+
+/// The URL a create of a connection function ANNOUNCES for it — "The location of the
+/// connection function".
+///
+/// The connection function resource under the endpoint this request reached
+/// ([`super::location_uri`]), addressed by the ARN minted for it rather than by the bare id:
+/// the ARN is the identifier that names this function to every other surface (a tag, a
+/// policy, a distribution's association), so it is the identifier the announced URL carries
+/// and the one a client that parsed the URL holds afterwards — the owning account with it.
+/// The ARN carries a `/`, so the announced path is not one `{Identifier}` label: the URL is
+/// the identity AWS announces for the new function, not a route to re-request it by. A client
+/// that holds the ARN addresses the function through the identifier routes, which resolve a
+/// stored function by its ARN as well as by its id and name
+/// ([`ComAmazonawsCloudfrontCloudfront20200531State::connection_function`]).
+pub fn connection_function_location_uri(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    arn: &str,
+) -> String {
+    super::location_uri(ctx, &connection_function_path(arn))
 }
 
 /// The sentence a connection function this store does not hold is refused with, in the form

@@ -268,8 +268,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let summary = stored
             .development
             .to_summary(&stored.name, &stored.id, &stored.arn);
-        let location =
-            crate::state::location_uri(ctx, &crate::state::connection_function_path(&id));
+        let location = crate::state::connection_function_location_uri(ctx, &stored.arn);
         store.connection_functions.insert(id, stored);
 
         Ok(CreateConnectionFunctionOutput {
@@ -277,7 +276,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // that was just stored.
             connection_function_summary: Some(summary),
             // "The location of the connection function": the URI the resource is managed
-            // at under this service's one global endpoint.
+            // at, naming it by the ARN this create minted for it.
             location: Some(location),
             // "The version identifier for the current version of the connection function"
             // — the token an `If-Match` against its DEVELOPMENT stage is checked against.

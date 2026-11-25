@@ -59,3 +59,32 @@ Note the announced ports (43839, 42471, 44161) differ per fixture and none equal
 3. Fixture cloudfront-connection-function-publish-lifecycle, step task#1 — POST /2020-05-31/connection-function and read Location: the recording's path carries arn:aws:cloudfront::<account>:connection-function/<id>, the emulator's carries only <id>.
 4. Fixture cloudfront-distribution-tenant-create-and-invalidate, step task#5 — POST /2020-05-31/distribution-tenant/<id>/invalidation and read Location: same IP:port authority.
 5. Compare the FORM, not the literal strings: the hosts/ports and the generated invalidation/function ids are per-run; templating a recorded URI is not a fix.
+
+## Resolution
+
+Cause 2 FIXED; causes 1 and 3 DECLINED as per-run values, and the shared authority claim all
+three rest on is refuted by the recorded grader and by this tree's own convention.
+
+- Cause 2 FIXED: a create's `Location` path ends at the identifier its own answer publishes
+  for the new resource to be REFERENCED BY. Where the resource kind's route label is not its
+  minted id — a caller-chosen `{Name}` (`GetFunction`, `DescribeKeyValueStore`) or a general
+  `{Identifier}` (`GetConnectionFunction`) — that identifier is the ARN the create minted and
+  publishes as required output, so `CreateConnectionFunction` now announces
+  `…/2020-05-31/connection-function/arn:aws:cloudfront::<account>:connection-function/<id>`
+  (`state::connection_functions::connection_function_location_uri`, the shape
+  `state::functions::function_location_uri` already had). `CreateFunction` and
+  `CreateKeyValueStore` already announced their ARNs; every other create's route label is the
+  resource's own minted id, which is what its URI ends at, so none of them changed.
+  `tests/all/announced_location_identifier.rs` pins the rule over the identifier kinds and the
+  hosts a request may address.
+- Causes 1 and 3 DECLINED: the announced authority stays the endpoint the request reached.
+  Rooting it at AWS's published host was implemented and replayed: the three keys still
+  diverged and two passing keys regressed (`CreateDistribution` and `CreateDistributionWithTags`
+  `$headers.location`), which is what the resolved
+  `20261109T120741Z-cloudfront-create-responses-announce-a-location-uri-on.md` already records —
+  its cause 10 is a step where the recorded production-host URI was reproduced byte for byte and
+  still diverged (`host_not_own`). With the authority as it is, the only remaining difference on
+  both invalidation routes is the minted invalidation id, a per-run server-generated value that
+  already carries CloudFront's form (`I` + 25 uppercase alphanumerics, unique, stable across
+  reads, identical in the header and in `Invalidation$Id`; pinned by
+  `tests/all/minted_invalidation_identifier.rs`).

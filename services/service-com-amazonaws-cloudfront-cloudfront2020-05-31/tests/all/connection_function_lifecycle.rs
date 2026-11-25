@@ -407,9 +407,9 @@ async fn create_persists_the_connection_function_and_the_describe_reports_it() {
         let location = created.header("location").to_string();
         assert_eq!(
             location,
-            format!("https://{HOST}/{API_VERSION}/connection-function/{id}"),
-            "case {case}: expected the new connection function's URI in Location, got \
-             {location:?}"
+            format!("https://{HOST}/{API_VERSION}/connection-function/{arn}"),
+            "case {case}: expected the new connection function's URI in Location, naming it by \
+             the ARN the create minted, got {location:?}"
         );
         assert!(ids.insert(id.clone()), "case {case}: the id {id} repeated");
         assert!(arns.insert(arn.clone()), "case {case}: the ARN {arn} repeated");
