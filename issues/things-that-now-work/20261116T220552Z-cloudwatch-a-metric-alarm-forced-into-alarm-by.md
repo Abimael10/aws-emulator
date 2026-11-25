@@ -36,6 +36,44 @@ Expected: after CreateTopic + CreateQueue + SetQueueAttributes(Policy allowing s
 
 Actual: no message at all. The check cannot get past its first wait (the pre-ActionsEnabled positive control) and is killed at the 60 s cap, so SetAlarmState's action dispatch never fired and the suppression/restoration contrast produced no observation.
 
+## Resolution
+
+* Cause 1 — "`SetAlarmState` never executes the alarm's `AlarmActions`" — is DECLINED: it does
+  execute them, and this report's reading of where the check stopped is what does not hold. On the
+  emulator a client STARTS (the built binary, request authentication on, calls SigV4-signed over
+  TLS), a client's own `CreateTopic` + `CreateQueue` + `SetQueueAttributes(Policy allowing
+  sns.amazonaws.com sqs:SendMessage)` + `Subscribe(Protocol=sqs)` + `PutMetricAlarm(…,
+  AlarmActions=[topic], EvaluationPeriods=1, Period=60, TreatMissingData=missing)` +
+  `SetAlarmState(StateValue=ALARM, StateReason=<reason>)` puts exactly one message on the
+  subscribed queue within a second of the force, its `Body` the SNS envelope and
+  `json.loads(Body)["Message"]` carrying `AlarmName` = the alarm, `NewStateValue` = `ALARM` and
+  `NewStateReason` = that reason; `DisableAlarmActions` then reports `ActionsEnabled: false`,
+  the next transition into `ALARM` still happens and delivers nothing (the queue reporting
+  `ApproximateNumberOfMessages` 0), and `EnableAlarmActions` restores delivery for the next one,
+  which arrives carrying ITS own reason and nothing else. The replay key's line sits in `_receive`,
+  the helper EVERY poll of the check goes through, so it does not say which poll was cut off — and
+  this report's own account of the check gives its FIRST wait a 90 s window while the harness cap is
+  60 s, so the run is cut off on wall clock rather than on an absent delivery. The same reason is
+  already recorded for this trace id in
+  `issues/things-that-now-work/20261027T044900Z-cloudwatch-setalarmstate-never-dispatches-alarmactions-so-actionsenabled-suppression.md`
+  and, for the sibling trace, in
+  `issues/things-that-now-work/20261114T170523Z-cloudwatch-sns-a-cfn-deployed-alarm-s-sns.md`.
+* What this change adds is the one axis of that chain no test pinned: the whole estate written BY A
+  CLIENT against the emulator AS SERVED.
+  `core/router/tests/all/cloudwatch_client_forced_alarm_action_on_a_started_emulator.rs` starts the
+  built binary and drives the recorded sequence — topic, queue, queue policy, `sqs` subscription and
+  the alarm itself, all written by the client — then forces the alarm into `ALARM`, switches
+  `ActionsEnabled` off and on around two further forced transitions, and reads each leg on the
+  subscribed queue. Its rows span the wire the client drives CloudWatch over (the `awsQuery` form
+  body a query-protocol SDK sends, where the action list arrives as `AlarmActions.member.1`, and the
+  `awsJson1_0` body) and whether the queue's grant to SNS is scoped by `aws:SourceArn`.
+* No dispatch code changed, because each part of the chain already does what this report asks for:
+  `set_alarm_state.rs` enqueues the notification a state change owes and settles it,
+  `state/alarm_actions.rs` selects the action list by the state moved to, withholds it while
+  `ActionsEnabled` is false, decides the target topic's policy and publishes, and
+  `service-com-amazonaws-sns-amazonsimplenotificationservice`'s `publish/service_delivery.rs` hands
+  the notification to the subscribed queue.
+
 ## Steps to Reproduce
 1. Build and boot the emulator from this checkout.
 2. sns CreateTopic; sqs CreateQueue; sqs GetQueueAttributes(QueueArn); sqs SetQueueAttributes with a Policy allowing Principal {"Service":"sns.amazonaws.com"} to sqs:SendMessage on the queue ARN; sns Subscribe(TopicArn, Protocol=sqs, Endpoint=queueArn).
