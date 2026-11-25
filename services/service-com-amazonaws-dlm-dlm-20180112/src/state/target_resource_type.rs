@@ -18,13 +18,17 @@
 //! member the resource type it targets admits nowhere and no read reports one.
 //!
 //! The members, each with the target its own documentation admits
-//! (`smithy_query(query="shape", shape="Schedule")` and
+//! (`smithy_query(query="shape", shape="Schedule")`,
+//! `smithy_query(query="shape", shape="CreateRule")` and
 //! `smithy_query(query="shape", shape="Parameters")`):
 //!
 //! * `Schedule$VariableTags` — "[AMI policies and snapshot policies that target
 //!   instances only] ... Variable tags are only valid for EBS Snapshot
 //!   Management – Instance policies", so the policies that take it target
 //!   instances;
+//! * `CreateRule$Scripts` — "[Custom snapshot policies that target instances
+//!   only] Specifies pre and/or post scripts for a snapshot lifecycle policy
+//!   that targets instances", stated inside a schedule's `CreateRule`;
 //! * `Schedule$ArchiveRule` — "[Custom snapshot policies that target volumes
 //!   only] The snapshot archiving rule for the schedule";
 //! * `Parameters$ExcludeBootVolume` — "[Custom snapshot policies that target
@@ -33,6 +37,13 @@
 //! * `Parameters$ExcludeDataVolumeTags` — "[Custom snapshot policies that target
 //!   instances only] The tags used to identify data (non-root) volumes to
 //!   exclude from multi-volume snapshot sets".
+//!
+//! Those are every member a CUSTOM policy's configuration carries whose own
+//! documentation names one of the two targets: the shapes it is built from
+//! (`PolicyDetails`, `Schedule`, the `CreateRule` and the `Parameters` a
+//! schedule's configuration nests, and the rules each of those nests in turn)
+//! carry no other such sentence, so an entry joins the list only when the model
+//! documents another member for one target.
 //!
 //! What those sentences say about the policy TYPE that takes a member is a
 //! different member of the configuration (`PolicyDetails$PolicyType`) and is not
@@ -88,11 +99,16 @@ impl TargetRestrictedMember {
 /// the order the configuration declares them: the `Schedules` members first
 /// (`PolicyDetails` declares `Schedules` before `Parameters`), each in the order
 /// its own shape declares it — which is the order the refusal names them in.
-const TARGET_RESTRICTED_MEMBERS: [TargetRestrictedMember; 4] = [
+const TARGET_RESTRICTED_MEMBERS: [TargetRestrictedMember; 5] = [
     TargetRestrictedMember {
         name: "VariableTags",
         admitted_target: INSTANCE_TARGET,
         stated: variable_tags_stated,
+    },
+    TargetRestrictedMember {
+        name: "Scripts",
+        admitted_target: INSTANCE_TARGET,
+        stated: scripts_stated,
     },
     TargetRestrictedMember {
         name: "ArchiveRule",
@@ -118,6 +134,21 @@ const TARGET_RESTRICTED_MEMBERS: [TargetRestrictedMember; 4] = [
 /// carries the member.
 fn variable_tags_stated(details: &PolicyDetails) -> bool {
     schedules(details).any(|schedule| schedule.variable_tags.is_some())
+}
+
+/// True when any of the configuration's schedules states `Scripts` on its
+/// creation rule.
+///
+/// Judged on every element of `Schedules`, as the other schedule members are,
+/// and on the `CreateRule` each one carries, which is the structure that
+/// declares the member.
+fn scripts_stated(details: &PolicyDetails) -> bool {
+    schedules(details).any(|schedule| {
+        schedule
+            .create_rule
+            .as_ref()
+            .is_some_and(|create_rule| create_rule.scripts.is_some())
+    })
 }
 
 /// True when any of the configuration's schedules states an `ArchiveRule`.

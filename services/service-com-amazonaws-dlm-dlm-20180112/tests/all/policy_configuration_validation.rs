@@ -42,10 +42,11 @@
 //! the combination of policy type and target resource type"
 //! (`smithy_query(query="shape", shape="Parameters")`), and the members
 //! documented for policies that target one `PolicyDetails$ResourceTypes` value
-//! only — `Schedule$VariableTags` and `Parameters$ExcludeBootVolume` /
-//! `Parameters$ExcludeDataVolumeTags` for instances, `Schedule$ArchiveRule` for
-//! volumes — are refused for a policy that targets the other, naming the target
-//! stated and the members refused, before anything is stored or changed.
+//! only — `Schedule$VariableTags`, `CreateRule$Scripts` and
+//! `Parameters$ExcludeBootVolume` / `Parameters$ExcludeDataVolumeTags` for
+//! instances, `Schedule$ArchiveRule` for volumes — are refused for a policy that
+//! targets the other, naming the target stated and the members refused, before
+//! anything is stored or changed.
 //!
 //! Each table spans the class rather than the requests an issue cited: every
 //! policy kind, every member each kind is built from (one at a time and all at
@@ -1124,9 +1125,11 @@ fn stating(mut details: Value, parent: &str, member: &str, value: &Value) -> Val
 /// "[AMI policies and snapshot policies that target instances only]" and its
 /// values "must be in one of the two following formats: `$(instance-id)` or
 /// `$(timestamp)`", and `ArchiveRule` opens "[Custom snapshot policies that
-/// target volumes only]" — and `smithy_query(query="shape",
-/// shape="Parameters")`, where `ExcludeBootVolume` and `ExcludeDataVolumeTags`
-/// both open "[Custom snapshot policies that target instances only]".
+/// target volumes only]" — `smithy_query(query="shape", shape="CreateRule")`,
+/// where `Scripts` opens "[Custom snapshot policies that target instances only]"
+/// — and `smithy_query(query="shape", shape="Parameters")`, where
+/// `ExcludeBootVolume` and `ExcludeDataVolumeTags` both open "[Custom snapshot
+/// policies that target instances only]".
 fn target_restricted_members() -> Vec<TargetRestricted> {
     vec![
         TargetRestricted {
@@ -1148,6 +1151,38 @@ fn target_restricted_members() -> Vec<TargetRestricted> {
             base: two_schedule_details,
             parent: "/Schedules/1",
             value: json!([{"Key": "stamped", "Value": "$(timestamp)"}]),
+        },
+        TargetRestricted {
+            // A member of the structure NESTED in a schedule, in the form its
+            // documentation names for VSS backups: "If you are automating VSS
+            // Backups" the handler is `AWS_VSS_BACKUP` and `Stages` is omitted
+            // (`smithy_query(query="shape", shape="Script")`).
+            case: "Scripts automating VSS backups on the creation rule",
+            member: "Scripts",
+            admitted: "INSTANCE",
+            base: one_schedule_details,
+            parent: "/Schedules/0/CreateRule",
+            value: json!([{"ExecutionHandler": "AWS_VSS_BACKUP"}]),
+        },
+        TargetRestricted {
+            // The other documented form of the same member — a custom SSM
+            // document run at both `StagesList` stages, with the script's own
+            // optional members at their published bounds (`ExecutionTimeout`
+            // `@range(min: 10, max: 120)`, `MaximumRetryCount`
+            // `@range(min: 0, max: 3)`) — on a LATER element of `Schedules`.
+            case: "Scripts running a custom SSM document, on the second schedule",
+            member: "Scripts",
+            admitted: "INSTANCE",
+            base: two_schedule_details,
+            parent: "/Schedules/1/CreateRule",
+            value: json!([{
+                "Stages": ["PRE", "POST"],
+                "ExecutionHandlerService": "AWS_SYSTEMS_MANAGER",
+                "ExecutionHandler": "AWSEC2-CreateVssSnapshot",
+                "ExecuteOperationOnScriptFailure": true,
+                "ExecutionTimeout": 120,
+                "MaximumRetryCount": 3,
+            }]),
         },
         TargetRestricted {
             // The member restricted to the OTHER target, so the rule is exercised
@@ -1259,17 +1294,24 @@ async fn the_refusal_names_every_member_the_target_does_not_admit() {
     let router = emulator();
     let variable_tags = json!([{"Key": "tracker", "Value": "$(instance-id)"}]);
 
-    // Three instance-only members at once on a volume-targeting policy: the two
+    // Every instance-only member at once on a volume-targeting policy: the three
     // structures that carry one, named in the order `PolicyDetails` declares
-    // them (`Schedules` before `Parameters`) and each shape declares its own.
+    // them (`Schedules` before `Parameters`) and each shape declares its own —
+    // `Schedule$VariableTags` before the `Scripts` of the `CreateRule` nested in
+    // that same schedule, then the two `Parameters` members.
     let case = "a volume-targeting policy stating every instance-only member";
     let details = stating(
         stating(
             stating(
-                parameter_details("VOLUME"),
-                "/Schedules/0",
-                "VariableTags",
-                &variable_tags,
+                stating(
+                    parameter_details("VOLUME"),
+                    "/Schedules/0",
+                    "VariableTags",
+                    &variable_tags,
+                ),
+                "/Schedules/0/CreateRule",
+                "Scripts",
+                &json!([{"ExecutionHandler": "AWS_VSS_BACKUP"}]),
             ),
             "/Parameters",
             "ExcludeBootVolume",
@@ -1285,7 +1327,12 @@ async fn the_refusal_names_every_member_the_target_does_not_admit() {
         case,
         &answer,
         "VOLUME",
-        &["VariableTags", "ExcludeBootVolume", "ExcludeDataVolumeTags"],
+        &[
+            "VariableTags",
+            "Scripts",
+            "ExcludeBootVolume",
+            "ExcludeDataVolumeTags",
+        ],
     );
 
     // The same member on two schedules is one member to correct, so it is named
@@ -1402,5 +1449,93 @@ async fn an_update_refuses_a_member_the_target_resource_type_does_not_admit() {
                 );
             }
         }
+    }
+}
+
+/// The member a schedule carries inside its `CreateRule` is judged on EVERY
+/// schedule's creation rule, as the members a schedule carries directly are:
+/// whichever element of `Schedules` states it is what refuses a policy targeting
+/// the resource type its documentation does not admit, the member is named once
+/// however many schedules state it, and the one its target admits is stored on
+/// each schedule that states it.
+///
+/// The refused create and the refused update leave the store as it was.
+#[tokio::test]
+async fn scripts_are_judged_on_every_schedules_creation_rule() {
+    let router = emulator();
+    let scripts = json!([{"ExecutionHandler": "AWS_VSS_BACKUP"}]);
+
+    // Stated on a LATER schedule only: the walk does not stop at the first.
+    let case = "a volume-targeting policy with Scripts on the second schedule only";
+    let before = policy_count(&router).await;
+    let details = stating(
+        two_schedule_details("VOLUME"),
+        "/Schedules/1/CreateRule",
+        "Scripts",
+        &scripts,
+    );
+    let answer = create(&router, create_request(case, json!({"PolicyDetails": details}))).await;
+    assert_refused_for_target(case, &answer, "VOLUME", &["Scripts"]);
+    assert_eq!(
+        policy_count(&router).await,
+        before,
+        "case {case:?}: a refused create must leave no policy behind"
+    );
+
+    // The same member on two schedules is one member to correct, so it is named
+    // once.
+    let case = "a volume-targeting policy with Scripts on both schedules";
+    let details = stating(
+        stating(
+            two_schedule_details("VOLUME"),
+            "/Schedules/0/CreateRule",
+            "Scripts",
+            &scripts,
+        ),
+        "/Schedules/1/CreateRule",
+        "Scripts",
+        &scripts,
+    );
+    let answer = create(&router, create_request(case, json!({"PolicyDetails": details}))).await;
+    assert_refused_for_target(case, &answer, "VOLUME", &["Scripts"]);
+    assert_eq!(
+        policy_count(&router).await,
+        before,
+        "case {case:?}: a refused create must leave no policy behind"
+    );
+
+    // And the target the member's documentation admits: every schedule that
+    // states it reports it back, through a create and through an update that
+    // adds it to a policy that had none.
+    let case = "an instance-targeting policy with Scripts on both schedules";
+    let base = two_schedule_details("INSTANCE");
+    let created = create(
+        &router,
+        create_request(case, json!({"PolicyDetails": base.clone()})),
+    )
+    .await;
+    assert_owed(case, &created, &Owed::Accepted);
+    let id = created.policy_id();
+    let replacement = stating(
+        stating(base, "/Schedules/0/CreateRule", "Scripts", &scripts),
+        "/Schedules/1/CreateRule",
+        "Scripts",
+        &scripts,
+    );
+    let answer = update(&router, &id, json!({"PolicyDetails": replacement})).await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case:?}: expected HTTP 200, got {} with {:?}",
+        answer.status, answer.body
+    );
+    let read = get(&router, &id).await;
+    for schedule in ["0", "1"] {
+        let pointer = format!("/PolicyDetails/Schedules/{schedule}/CreateRule/Scripts");
+        assert_eq!(
+            at(read.policy(), &pointer),
+            scripts,
+            "case {case:?}: expected {pointer} to report {scripts:?}, got {:?}",
+            at(read.policy(), &pointer)
+        );
     }
 }
