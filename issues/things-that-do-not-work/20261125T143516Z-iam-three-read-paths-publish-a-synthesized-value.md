@@ -1,0 +1,71 @@
+Issue-Source: trace-sweep-divergence
+Issue-Trace: iam-add-client-id-to-openid-connect-provider
+Issue-Step: task#4
+Issue-Severity: HIGH
+Issue-Corpus: simparity-wire-aws-v1
+Issue-Corpus-Kind: wire
+Issue-Trace-Ids: iam-add-client-id-to-openid-connect-provider iam-policy-empty-description-regional-resource-tag-change-new-default-version-then-not-found iam-simulate-principal-policy-pagination-and-params
+Issue-Shape-Id: com.amazonaws.iam#AWSIdentityManagementV20100508
+Issue-Key: iam|GetOpenIDConnectProvider|2xx->2xx|$.GetOpenIDConnectProviderResponse.GetOpenIDConnectProviderResult.Url
+Issue-Key: iam|GetPolicy|2xx->2xx|$.GetPolicyResponse.GetPolicyResult.Policy.Description
+Issue-Key: iam|SimulatePrincipalPolicy|2xx->2xx|$.SimulatePrincipalPolicyResponse.SimulatePrincipalPolicyResult.EvaluationResults.member[*].EvalResourceName
+Issue-Commit: ff9a8ef7ac2eee2eef81f4aebd41ca244dae0c42
+
+# iam: three read paths publish a synthesized value instead of the registered or request-derived one
+
+> _Note: this issue was identified against the code base at commit `ff9a8ef7ac2eee2eef81f4aebd41ca244dae0c42`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+GetOpenIDConnectProvider
+
+## Description
+THREE net-new causes in the iam service, each its own unowned wire cluster. They share one fault: a read path answers 200 with a member the emulator synthesized locally instead of the value the request/registration supplied or the absence AWS reports. ALL THREE must be closed before this issue is submitted.
+
+=== Cause 1 of 3: GetOpenIDConnectProvider publishes the emulator's own serving authority as the provider Url ===
+AWS: Smithy iam#GetOpenIDConnectProvider -> input OpenIDConnectProviderArn (required, arnType @length 20-2048); output Url (OpenIDConnectProviderUrlType @length 1-255), ClientIDList, ThumbprintList, CreateDate, Tags; errors InvalidInput(400), NoSuchEntity(404), ServiceFailure(500). The member documentation says Url is "The URL that the IAM OIDC provider resource object is associated with" and points at CreateOpenIDConnectProvider, whose input is "The URL of the OIDC identity provider (IdP) to trust". AWS stores exactly the URL the create request carried with only the scheme removed, and that scheme-stripped URL is what this read returns and what the provider ARN encodes (arn:<partition>:iam::<account>:oidc-provider/<host>[:<port>]/<path>). The template is: the request's Url minus a leading 'https://', verbatim — host, optional port and path all from the request; nothing of the serving endpoint appears in it.
+Emulator: status 200, and the Url member is flagged with the verdict host_not_own — the authority it publishes is the emulator's own serving address rather than the registered issuer host (the two strings coincide in the replay detail because the harness canonicalizes the emulator's own authority back to the expected host before printing). The open behavioral issue 20261124T144824Z-iam-getopenidconnectprovider-reports-the-emulator-s-own-serving.md records the same defect unmasked — for an issuer registered as https://cognito-idp.<region>.amazonaws.com/<pool-id> the response carried '<emulator-host>:<emulator-port>/<pool-id>' — and cites the mechanism in services/service-com-amazonaws-iam-awsidentitymanagementv20100508/src/ops/create_open_id_connect_provider.rs (a served_endpoint field computed from published_endpoint_authority, republished on read). That issue is BEHAVIORAL: it carries no wire replay key, and this cluster is reported owned_by [], so this step is filed here to gate the same fix on the wire corpus.
+Why: the Url IS the provider's identity. A client that registers an issuer and reads it back to confirm, to compute the ARN, or to render the trust relationship sees a different issuer than it asked for, so it re-creates the provider and then collides with EntityAlreadyExists because the ARN is keyed off the real URL. Trust policies written against arn:...:oidc-provider/<issuer-host>/<path> and conditions keyed on the issuer never line up, so desired-vs-actual tooling never converges.
+Fix: the GetOpenIDConnectProvider read path and the provider record it reads, in the IAM service crate — the stored provider must report the caller-supplied Url with only the scheme stripped, and the same single value must back ListOpenIDConnectProviders and the ARN derivation. A locally reachable address, if one is needed to serve discovery, belongs outside the modeled Url member.
+Traces: iam-add-client-id-to-openid-connect-provider#task#4.
+
+=== Cause 2 of 3: GetPolicy emits an empty Description element for a policy created without one ===
+AWS: Smithy iam#GetPolicy -> input PolicyArn (required, arnType @length 20-2048); output Policy; errors InvalidInput(400), NoSuchEntity(404), ServiceFailure(500). Policy.Description targets policyDescriptionType (@length 0-1000) and is OPTIONAL; its documentation states the element is included in the response to GetPolicy. A managed policy created with no Description has none, and AWS then OMITS the member entirely from the Query/XML body — the recording for this step carries no Description element at all. Presence of the member is therefore the signal that a description was set; an empty string is not the same value as absence.
+Emulator: status 200 and every other Policy member matches, but Description is PRESENT and empty (verdict unexpected_present: expected None, got ''). The policy in this fixture was created with an empty/absent description, so the state has nothing to report and the serializer emits the element anyway.
+Why: a client relying on AWS's behavior branches on whether Description is present — to decide whether to send a description on the next CreatePolicyVersion, to diff desired-vs-actual state, or to render the policy. An always-present empty element makes every such client see a description that was never set: a strict SDK/consumer that treats presence as 'set' reports spurious drift and rewrites the policy on every reconciliation.
+Fix: the GetPolicy response projection for the managed-policy record (and the sibling projections that publish the same Policy shape — ListPolicies, CreatePolicy, GetPolicyVersion's parent read): an absent/empty stored description must serialize as NO Description member, not an empty one.
+Traces: iam-policy-empty-description-regional-resource-tag-change-new-default-version-then-not-found#task#3.
+
+=== Cause 3 of 3: SimulatePrincipalPolicy reports EvalResourceName '*' where the action has a resource ARN template ===
+AWS: Smithy iam#SimulatePrincipalPolicy -> input PolicySourceArn (required), ActionNames (required), ResourceArns, CallerArn, ContextEntries, MaxItems/Marker; output EvaluationResults, IsTruncated, Marker; errors InvalidInput(400), NoSuchEntity(404), PolicyEvaluation(500). EvaluationResult.EvalResourceName (ResourceNameType @length 1-2048) is documented as "The ARN template for the simulated resource type (for example, arn:${Partition}:s3:::${BucketName}/${KeyName}), or * if no ARN format is defined for the action" — so '*' is correct ONLY for an action with no resource ARN format, and an action that has one must report that template. For the second simulated action in this step the recording reports the IAM user resource template 'arn:aws:iam::<account>:user/'.
+Emulator: status 200 and EvaluationResults is otherwise correct (decisions, statements, ordering and the pagination legs of the same fixture pass), but member[1].EvalResourceName is served '*' where the recorded value is the action's resource ARN template — i.e. the handler falls back to the wildcard instead of resolving the action's resource type.
+Why: a client reads EvalResourceName to label which resource type each evaluation result applies to before narrowing a policy; a blanket '*' erases that distinction, so a consumer that groups results per resource type (or asserts that a result is about the user resource rather than every resource) draws the wrong conclusion from an otherwise correct decision.
+Fix: the SimulatePrincipalPolicy evaluation projection (shared with SimulateCustomPolicy) — EvalResourceName must be resolved from the simulated action's resource ARN template, with '*' reserved for actions that define no ARN format. Two open issues touch other SimulatePrincipalPolicy causes and carry neither this replay key: 20261123T114935Z-iam-2-net-new-causes-simulateprincipalpolicy-reports-a.md (negated-operator condition keys) and 20261119T062349Z-cloudformation-ecr-iam-s3-ssm-simulateprincipalpolicy-reports-implicitdeny.md (permissions-boundary decision).
+Traces: iam-simulate-principal-policy-pagination-and-params#task#2 (the same cluster also covers task#3 of that fixture).
+
+## Evidence
+Replay of simparity-wire-aws-v1 against the emulator built from this checkout: 1742/1799 steps passed (96.8%), 51 mismatched, 0 errored, bootstrap_signal false, emulator_up true. All three clusters report stub_path "" and owned_by [].
+
+Cause 1 — iam-add-client-id-to-openid-connect-provider#task#4, GetOpenIDConnectProvider, expected 200 / got 200 (verdict mismatch, affected_count 1):
+- $.GetOpenIDConnectProviderResponse.GetOpenIDConnectProviderResult.Url: host_not_own (expected 'cognito-idp.us-west-2.amazonaws.com/us-west-2_4a3875a8f', got 'cognito-idp.us-west-2.amazonaws.com/us-west-2_4a3875a8f')
+  The verdict is host_not_own on the Url member: the authority served is the emulator's own, canonicalized back to the expected host in the printed detail. The unmasked form of the same defect, from the open behavioral issue 20261124T144824Z: "expected scheme-stripped Url 'cognito-idp.us-west-2.amazonaws.com/us-west-2_37a42f8af', got '127.0.0.1:33335/us-west-2_37a42f8af'". The host:port is per-run and is not the requirement; the defect is that the issuer host from the request is replaced at all. ClientIDList, ThumbprintList and CreateDate in the same response did not diverge.
+
+Cause 2 — iam-policy-empty-description-regional-resource-tag-change-new-default-version-then-not-found#task#3, GetPolicy, expected 200 / got 200 (verdict mismatch, affected_count 1):
+- $.GetPolicyResponse.GetPolicyResult.Policy.Description: unexpected_present (expected None, got '')
+  Every other Policy member (PolicyName, PolicyId, Arn, Path, DefaultVersionId, AttachmentCount, PermissionsBoundaryUsageCount, IsAttachable, CreateDate, UpdateDate) matched, and the fixture's later tag-change/new-default-version/NoSuchEntity steps passed, so only the member's presence is wrong.
+
+Cause 3 — iam-simulate-principal-policy-pagination-and-params#task#2, SimulatePrincipalPolicy, expected 200 / got 200 (verdict mismatch, affected_count 2; other member: iam-simulate-principal-policy-pagination-and-params#task#3):
+- $.SimulatePrincipalPolicyResponse.SimulatePrincipalPolicyResult.EvaluationResults.member[1].EvalResourceName: value_mismatch (expected 'arn:aws:iam::000000000000:user/', got '*')
+  member[0] and the decisions/statements of both members matched; the account id in the expected value is the corpus account and is not the requirement — the requirement is the action's resource ARN template rather than the wildcard.
+
+Model grounding — smithy_query on services/service-com-amazonaws-iam-awsidentitymanagementv20100508/smithy-model/com-amazonaws-iam-awsidentitymanagementv20100508.json:
+- GetOpenIDConnectProvider: input OpenIDConnectProviderArn required (arnType @length 20-2048); output Url (OpenIDConnectProviderUrlType @length 1-255), ClientIDList, ThumbprintList, CreateDate, Tags; errors InvalidInput(400)/NoSuchEntity(404)/ServiceFailure(500).
+- GetPolicy: input PolicyArn required (arnType @length 20-2048); output Policy; errors InvalidInput(400)/NoSuchEntity(404)/ServiceFailure(500). Policy.Description -> policyDescriptionType @length 0-1000, optional.
+- SimulatePrincipalPolicy: input PolicySourceArn required, ActionNames required, ResourceArns, ResourcePolicy, CallerArn, ContextEntries, ResourceHandlingOption, MaxItems(1-1000), Marker; output EvaluationResults/IsTruncated/Marker; errors InvalidInput(400)/NoSuchEntity(404)/PolicyEvaluation(500); paginated by Marker. EvaluationResult.EvalResourceName -> ResourceNameType @length 1-2048, doc: "The ARN template for the simulated resource type ... or * if no ARN format is defined for the action."
+- No message text is modelled for any of these, so the quoted body values are recorded behavior.
+
+## Steps to Reproduce
+1. git_clone the repo, boot the emulator built from that checkout and replay simparity-wire-aws-v1 (replay_wire_corpus).
+2. Cause 1: fixture iam-add-client-id-to-openid-connect-provider, step task#4 — CreateOpenIDConnectProvider with Url='https://cognito-idp.<region>.amazonaws.com/<pool-id>', AddClientIDToOpenIDConnectProvider, then GetOpenIDConnectProvider on the returned ARN. Url must equal the registered URL with only 'https://' stripped; observed the emulator's own serving authority with the issuer path appended. Repeat with a second, different issuer host to confirm the host is substituted regardless of value.
+3. Cause 2: fixture iam-policy-empty-description-regional-resource-tag-change-new-default-version-then-not-found, step task#3 — CreatePolicy with no Description (or an empty one), then GetPolicy on its ARN. The response must carry NO Description member; observed an empty Description element. Check ListPolicies/CreatePolicy for the same policy to confirm the member is omitted there too.
+4. Cause 3: fixture iam-simulate-principal-policy-pagination-and-params, step task#2 — SimulatePrincipalPolicy(PolicySourceArn=<user arn>, ActionNames=[... the step's two actions ...]). EvaluationResults.member[1].EvalResourceName must be the simulated action's resource ARN template (the IAM user resource template in this recording), not '*'; '*' is correct only for an action with no ARN format. Re-check task#3 of the same fixture (the paginated leg) for the same member.
+5. Re-replay iam-add-client-id-to-openid-connect-provider#task#4, iam-policy-empty-description-regional-resource-tag-change-new-default-version-then-not-found#task#3 and iam-simulate-principal-policy-pagination-and-params#task#2 (plus that fixture's task#3) and confirm all pass before submitting.
