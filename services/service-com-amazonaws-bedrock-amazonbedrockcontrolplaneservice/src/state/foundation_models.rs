@@ -2266,26 +2266,40 @@ pub(super) const COUNT_TOKENS_MODEL_PROVIDER: &str = "Anthropic";
 /// this emulator's inference plane serves, and a member nothing publishes for a model is
 /// left absent rather than filled with a value invented for it:
 ///
+/// A member's PRESENCE follows from the KIND OF QUESTION it answers rather than from
+/// whether a table in this file happens to name the row. A member that answers a question
+/// EVERY Converse client has to settle before it sends a turn — which extra fields the
+/// request may carry, how large an answer it may ask for, what the turn may attach — is
+/// reported for every model the API reaches, with the EMPTY answer of its own type where
+/// the model's line publishes nothing (the empty object for a schema, the empty list for a
+/// format set), because "nothing" is an answer a client can act on where an absent member
+/// is not. A member that answers a question only SOME models raise — whether reasoning may
+/// be asked of the model, and where it then arrives — is reported for the models that raise
+/// it and left out for the rest.
+///
 /// * `streamingSupported` is the model's own `responseStreamingSupported`.
-/// * `maxTokensMaximum` is the ceiling the provider publishes for the model
-///   ([`CONVERSE_MAX_OUTPUT_TOKENS`]), which is the ceiling the inference plane caps a
+/// * `maxTokensMaximum` is the ceiling published for the model's line
+///   ([`model_max_output_tokens`]), which is the ceiling the inference plane caps a
 ///   generated answer at; `maxTokensDefault` is absent, because a default for it is
 ///   published nowhere.
 /// * `systemRoleSupported` holds of a model Converse reaches: a system role is part of the
 ///   conversation the API carries rather than of any one model's integration.
-/// * `reasoningSupported` is published per model ([`REASONING_MODELS`]), and names where the
-///   reasoning arrives as well as whether it is asked for
-///   ([`model_reasoning_support`]).
+/// * `reasoningSupported` is published per model ([`REASONING_MODELS`]) and names where the
+///   reasoning arrives as well as whether it is asked for ([`model_reasoning_support`]), so
+///   it is reported for a model whose provider publishes extended reasoning and for no
+///   other: a model that reasons nowhere raises no question about where its reasoning would
+///   arrive.
 /// * `stopSequencesDefault` is empty: a conversation halts at the stop sequences the
 ///   REQUEST carries, and no model publishes one of its own.
 /// * `userImageTypesSupported` and `userVideoTypesSupported` are the formats a turn may
 ///   carry TO the model in a modality the model TAKES
-///   ([`FoundationModel::input_modalities`]), and empty for a modality it does not take;
-///   `userDocumentTypesSupported` is published per model
-///   ([`model_user_document_formats`]) and absent for a model no document block reaches,
-///   because a document is a FILE a turn carries rather than a modality the model declares.
-/// * `additionalRequestFieldsSchema` is absent: the schema of a model's provider-specific
-///   request fields is published per model, and this catalog publishes one for no row.
+///   ([`FoundationModel::input_modalities`]), and `userDocumentTypesSupported` the formats
+///   its provider line parses ([`model_user_document_formats`]) — each a list that is EMPTY
+///   for a model no attachment of that kind reaches, because a document is a FILE a turn
+///   carries rather than a modality the model declares.
+/// * `additionalRequestFieldsSchema` is the schema of the provider-specific request fields
+///   the model's line accepts ([`model_additional_request_fields_schema`]), and the empty
+///   JSON object for a line that accepts none.
 #[must_use]
 pub fn model_converse_support(model: &FoundationModel) -> Option<ConverseSupport> {
     if !model_is_conversational(model) {
@@ -2302,38 +2316,91 @@ pub fn model_converse_support(model: &FoundationModel) -> Option<ConverseSupport
     Some(ConverseSupport {
         supported: Some(true),
         streaming_supported: Some(model.response_streaming_supported),
-        additional_request_fields_schema: None,
+        additional_request_fields_schema: Some(model_additional_request_fields_schema(model)),
         max_tokens_default: None,
         max_tokens_maximum: model_max_output_tokens(model),
-        reasoning_supported: Some(model_reasoning_support(model)),
+        reasoning_supported: model_reasoning_supported(model).then(|| model_reasoning_support(model)),
         stop_sequences_default: Some(Vec::new()),
         system_role_supported: Some(true),
-        user_document_types_supported: model_user_document_formats(model),
+        user_document_types_supported: Some(model_user_document_formats(model)),
         user_image_types_supported: Some(formats(takes(MODALITY_IMAGE), CONVERSE_IMAGE_FORMATS)),
         user_video_types_supported: Some(formats(takes(MODALITY_VIDEO), CONVERSE_VIDEO_FORMATS)),
     })
 }
 
-/// The document formats a turn of a conversation may carry to `model`, or `None` for a
-/// model no document block reaches at all.
+/// The document formats a turn of a conversation may carry to `model`, EMPTY for a model no
+/// document block reaches at all.
 ///
-/// PUBLISHED per model rather than implied by a modality the model takes: `ModelModality`
-/// declares no value for a document (`crate::ops::types::MODEL_MODALITY_VALUES` is
-/// EMBEDDING/IMAGE/TEXT), and a document block carries a FILE for the model's integration
-/// to parse rather than text the model is prompted with — so a model that takes text is not
-/// thereby a model a document may be sent to, and the formats it parses are published for
-/// the provider line it belongs to ([`CONVERSE_PROVIDER_DOCUMENT_FORMATS`]).
+/// PUBLISHED per provider line rather than implied by a modality the model takes:
+/// `ModelModality` declares no value for a document
+/// (`crate::ops::types::MODEL_MODALITY_VALUES` is EMBEDDING/IMAGE/TEXT), and a document
+/// block carries a FILE for the model's integration to parse rather than text the model is
+/// prompted with — so a model that takes text is not thereby a model a document may be sent
+/// to, and the formats it parses are published for the provider line it belongs to
+/// ([`CONVERSE_PROVIDER_DOCUMENT_FORMATS`]).
 ///
-/// A model whose line publishes no document input carries NO member rather than the whole
-/// `DocumentFormat` vocabulary, because reporting a format set for it would tell a client a
-/// turn may carry a document the model cannot read.
+/// A model whose line publishes no document input carries an EMPTY list rather than the
+/// whole `DocumentFormat` vocabulary — reporting a format set for it would tell a client a
+/// turn may carry a document the model cannot read — and rather than no member at all: what
+/// a turn may attach to this model is a question every Converse client settles before it
+/// sends one, and for such a model the answer is "no document".
 #[must_use]
-pub fn model_user_document_formats(model: &FoundationModel) -> Option<Vec<String>> {
+pub fn model_user_document_formats(model: &FoundationModel) -> Vec<String> {
     CONVERSE_PROVIDER_DOCUMENT_FORMATS
         .iter()
         .find(|(provider, _)| *provider == model.provider_name)
         .map(|(_, formats)| formats.iter().map(|format| (*format).to_string()).collect())
+        .unwrap_or_default()
 }
+
+/// The schema of the PROVIDER-SPECIFIC request fields a Converse request may carry to
+/// `model` — what a client builds `additionalModelRequestFields` from — as the JSON-encoded
+/// string the Converse record reports it in.
+///
+/// Published per model LINE: a provider-specific field is part of the provider's own API
+/// rather than of the Converse request, so the fields a model accepts are the ones its
+/// published line documents ([`CONVERSE_ADDITIONAL_REQUEST_FIELD_SCHEMAS`]). A line that
+/// documents none accepts none, and that is reported as the EMPTY JSON OBJECT
+/// ([`NO_ADDITIONAL_REQUEST_FIELDS_SCHEMA`]) rather than as an absent member: the member
+/// answers which extra fields a request may carry, and "none" is an answer a client can act
+/// on, where an absent schema leaves it unable to tell a model that takes no extra field
+/// from one whose fields it simply was not told about.
+#[must_use]
+pub fn model_additional_request_fields_schema(model: &FoundationModel) -> String {
+    CONVERSE_ADDITIONAL_REQUEST_FIELD_SCHEMAS
+        .iter()
+        .find(|(line, _)| model.model_id.starts_with(line))
+        .map_or(NO_ADDITIONAL_REQUEST_FIELDS_SCHEMA, |(_, schema)| *schema)
+        .to_string()
+}
+
+/// The schema reported for a model whose line accepts no provider-specific request field:
+/// the member carries a JSON SCHEMA, and the schema of "no extra fields" is a JSON object
+/// with no property in it.
+pub(super) const NO_ADDITIONAL_REQUEST_FIELDS_SCHEMA: &str = "{}";
+
+/// The provider-specific request fields each published model LINE accepts, by the prefix of
+/// the `modelId`s that line is published under, as the JSON-encoded schema the Converse
+/// record reports.
+///
+/// Keyed by line rather than by model because a provider-specific field belongs to the
+/// provider's own API for the line: two revisions of one line take the same extra fields. A
+/// line in no row accepts no extra field, which is
+/// [`NO_ADDITIONAL_REQUEST_FIELDS_SCHEMA`] — where a freshly published line starts.
+pub(super) const CONVERSE_ADDITIONAL_REQUEST_FIELD_SCHEMAS: &[(&str, &str)] =
+    &[(GPT_6_MODEL_LINE, REASONING_EFFORT_REQUEST_FIELDS_SCHEMA)];
+
+/// The `modelId` prefix of the one published line this catalog carries a provider-specific
+/// request field for.
+pub(super) const GPT_6_MODEL_LINE: &str = "openai.gpt-6";
+
+/// The schema of the reasoning-effort field a line that lets a caller CHOOSE how much the
+/// model reasons accepts: one enum-valued property, whose default is the effort the model
+/// spends when a request names none and whose values are the efforts it accepts.
+pub(super) const REASONING_EFFORT_REQUEST_FIELDS_SCHEMA: &str = concat!(
+    r#"{"reasoning_config":{"type":"enum","default":"medium","#,
+    r#""enum":["low","medium","high","xhigh","max"]}}"#
+);
 
 /// Whether EXTENDED REASONING may be asked of `model`, as the record the Converse record
 /// reports it in: whether the provider publishes reasoning for the model
@@ -2353,14 +2420,31 @@ pub fn model_reasoning_support(model: &FoundationModel) -> ReasoningSupport {
     }
 }
 
-/// The ceiling on generated tokens the provider publishes for `model` ("Inference parameters
-/// for foundation models" in the Amazon Bedrock User Guide), or `None` for a model it
-/// publishes none for.
+/// The ceiling on generated tokens published for `model` ("Inference parameters for
+/// foundation models" in the Amazon Bedrock User Guide), or `None` for a model nothing
+/// publishes one for.
+///
+/// Read per MODEL first and per PROVIDER LINE second: a provider publishes a figure for
+/// each model whose ceiling differs from its line's ([`CONVERSE_MAX_OUTPUT_TOKENS`]) and one
+/// figure for the line it serves the rest of its models under
+/// ([`CONVERSE_PROVIDER_MAX_OUTPUT_TOKENS`]) — so a model the per-model table does not name
+/// is not thereby a model without a ceiling, which is what left a newly published row
+/// reporting none.
 #[must_use]
 pub fn model_max_output_tokens(model: &FoundationModel) -> Option<i32> {
     CONVERSE_MAX_OUTPUT_TOKENS
         .iter()
         .find(|(model_id, _)| *model_id == model.model_id)
+        .map(|(_, ceiling)| *ceiling)
+        .or_else(|| provider_max_output_tokens(model.provider_name))
+}
+
+/// The ceiling `provider_name` publishes for the LINE this catalog carries its models
+/// under, or `None` for a provider that publishes a figure per model alone.
+fn provider_max_output_tokens(provider_name: &str) -> Option<i32> {
+    CONVERSE_PROVIDER_MAX_OUTPUT_TOKENS
+        .iter()
+        .find(|(provider, _)| *provider == provider_name)
         .map(|(_, ceiling)| *ceiling)
 }
 
@@ -2400,6 +2484,27 @@ pub(super) const CONVERSE_MAX_OUTPUT_TOKENS: &[(&str, i32)] = &[
     ("mistral.mistral-large-2407-v1:0", 8192),
     ("mistral.mixtral-8x7b-instruct-v0:1", 4096),
 ];
+
+/// The ceiling on generated tokens each provider publishes for the LINE this catalog
+/// carries its models under, by `providerName`: the largest `maxTokens` a Converse request
+/// may ask of a model of that line whose own figure [`CONVERSE_MAX_OUTPUT_TOKENS`] does not
+/// name.
+///
+/// A line's figure is the one its provider publishes for the whole line rather than per
+/// model ("Inference parameters for foundation models" in the Amazon Bedrock User Guide
+/// states a ceiling per provider line, and names a model of its own only where that model
+/// departs from the line) — which is why a row this table covers needs no row of its own.
+/// Both lines here are published at the 128K generation ceiling, as the recorded catalog
+/// reports for them.
+///
+/// A provider that publishes a figure per model and none for the line is in no row, and a
+/// model of its line the per-model table does not name reports no ceiling rather than one
+/// borrowed from a sibling.
+pub(super) const CONVERSE_PROVIDER_MAX_OUTPUT_TOKENS: &[(&str, i32)] =
+    &[(NEMOTRON_MODEL_PROVIDER, 131_072), (OPENAI_MODEL_PROVIDER, 131_072)];
+
+/// The `providerName` of the Nemotron lines this catalog carries.
+pub(super) const NEMOTRON_MODEL_PROVIDER: &str = "NVIDIA";
 
 /// The models whose provider publishes EXTENDED REASONING for them, by `modelId`: the
 /// reasoning lines of each provider — the Anthropic Claude lines from Claude 4 on, which

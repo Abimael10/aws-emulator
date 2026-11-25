@@ -18,11 +18,18 @@
 //!    row**: `featuresSupported.provisionedThroughput` holds of a model offered with
 //!    Provisioned Throughput — the same published fact that decides whether a purchase over
 //!    the model is accepted — so a client that reads it and then buys one is not refused.
-//! 3. **A member the catalogue publishes nothing for is OMITTED**, never defaulted to a
-//!    fixed list: the document formats a turn may carry are published per provider line
-//!    (`DocumentFormat` of the Amazon Bedrock Runtime model names the vocabulary), and a
-//!    model no document block reaches carries no `converse.userDocumentTypesSupported` at
-//!    all rather than the whole vocabulary.
+//! 3. **A member's PRESENCE follows from the question it answers.** A member that answers
+//!    what a turn may CARRY to the model, or what a request may ASK of it, is reported for
+//!    every model the Converse API reaches, with the EMPTY answer of its own type where the
+//!    model's line publishes nothing: the document formats are published per provider line
+//!    (`DocumentFormat` of the Amazon Bedrock Runtime model names the vocabulary), so a
+//!    model no document block reaches reports an empty `converse.userDocumentTypesSupported`
+//!    rather than the whole vocabulary or no member at all, and a line that accepts no
+//!    provider-specific request field reports `converse.additionalRequestFieldsSchema` as
+//!    the empty JSON object. A member that answers a question only SOME models raise is
+//!    reported for those models alone: `converse.reasoningSupported`, which names where a
+//!    model's reasoning arrives, is there for a model whose provider publishes extended
+//!    reasoning and absent for the rest.
 //! 4. **A format list keeps the order it is published in**: `converse.userImageTypesSupported`
 //!    reports the `ImageFormat` values in the published order, because a client that takes
 //!    the FIRST supported format as its default reads a different default from a different
@@ -47,7 +54,10 @@ use serde_json::Value;
 use bedrock::state::{FoundationModel, FOUNDATION_MODELS};
 use service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice as bedrock;
 
-use crate::support::{emulator, expected_user_document_formats, label, Emulator, Reply, REGION};
+use crate::support::{
+    emulator, expected_max_output_tokens, expected_reasoning_supported,
+    expected_user_document_formats, label, Emulator, Reply, REGION,
+};
 
 /// The path `ListFoundationModels` is bound to, and the prefix `GetFoundationModel` reads
 /// one model under (`smithy_query(query="operation",operation="ListFoundationModels")`).
@@ -73,8 +83,8 @@ struct Case {
     provisioned_throughput: bool,
     /// Whether extended reasoning may be asked of the model.
     reasoning: bool,
-    /// The document formats a turn may carry, or `None` for a model no document reaches.
-    documents: Option<&'static [&'static str]>,
+    /// The document formats a turn may carry; empty for a model no document reaches.
+    documents: &'static [&'static str],
     /// The image formats a turn may carry; empty for a model that takes no image.
     images: &'static [&'static str],
 }
@@ -91,7 +101,7 @@ const CASES: &[Case] = &[
         batch_inference: false,
         provisioned_throughput: false,
         reasoning: false,
-        documents: None,
+        documents: &[],
         images: PUBLISHED_IMAGE_FORMATS,
     },
     Case {
@@ -100,7 +110,7 @@ const CASES: &[Case] = &[
         batch_inference: false,
         provisioned_throughput: false,
         reasoning: true,
-        documents: Some(&["pdf"]),
+        documents: &["pdf"],
         images: PUBLISHED_IMAGE_FORMATS,
     },
     Case {
@@ -110,7 +120,7 @@ const CASES: &[Case] = &[
         batch_inference: true,
         provisioned_throughput: false,
         reasoning: true,
-        documents: Some(&["pdf"]),
+        documents: &["pdf"],
         images: PUBLISHED_IMAGE_FORMATS,
     },
     Case {
@@ -119,7 +129,7 @@ const CASES: &[Case] = &[
         batch_inference: true,
         provisioned_throughput: true,
         reasoning: false,
-        documents: None,
+        documents: &[],
         images: &[],
     },
     Case {
@@ -128,7 +138,7 @@ const CASES: &[Case] = &[
         batch_inference: true,
         provisioned_throughput: false,
         reasoning: false,
-        documents: None,
+        documents: &[],
         images: &[],
     },
     Case {
@@ -137,7 +147,7 @@ const CASES: &[Case] = &[
         batch_inference: false,
         provisioned_throughput: false,
         reasoning: true,
-        documents: None,
+        documents: &[],
         images: &[],
     },
 ];
@@ -462,34 +472,40 @@ async fn reasoning_names_whether_it_is_asked_for_and_where_it_arrives() {
         let name = case.model_id;
         let note = case.note;
         let summary = summary_of(name, &listed, name);
-        let reasoning = summary
-            .get("converse")
-            .and_then(|converse| converse.get("reasoningSupported"))
-            .unwrap_or_else(|| {
-                panic!(
-                    "case {name:?} ({note}): a conversational model carries a Converse record \
-                     with a reasoning record, got {summary:?}"
-                )
-            });
+        let converse = summary.get("converse").unwrap_or_else(|| {
+            panic!(
+                "case {name:?} ({note}): a conversational model carries a Converse record, got \
+                 {summary:?}"
+            )
+        });
+        // The record answers where a model's reasoning arrives, so it is reported for a
+        // model whose provider publishes reasoning and for no other.
+        let reasoning = converse.get("reasoningSupported");
+        assert_eq!(
+            reasoning.is_some(),
+            case.reasoning,
+            "case {name:?} ({note}): expected converse.reasoningSupported to be reported {:?}, \
+             got {converse:?}",
+            case.reasoning
+        );
+        let Some(reasoning) = reasoning else {
+            continue;
+        };
         assert!(
             reasoning.is_object(),
             "case {name:?} ({note}): expected converse.reasoningSupported to be a record, got \
              {reasoning:?}"
         );
         assert_eq!(
-            reasoning.get("isSupported").and_then(Value::as_bool),
-            Some(case.reasoning),
-            "case {name:?} ({note}): expected converse.reasoningSupported.isSupported {:?}, got \
-             {reasoning:?}",
-            case.reasoning
-        );
-        // Reasoning arrives in a block of its own for every model this catalogue publishes,
-        // so a client never has to parse it out of the answer text.
-        assert_eq!(
-            reasoning.get("embedded").and_then(Value::as_bool),
-            Some(false),
-            "case {name:?} ({note}): expected converse.reasoningSupported.embedded false, got \
-             {reasoning:?}"
+            (
+                reasoning.get("isSupported").and_then(Value::as_bool),
+                // Reasoning arrives in a block of its own for every model this catalogue
+                // publishes, so a client never has to parse it out of the answer text.
+                reasoning.get("embedded").and_then(Value::as_bool),
+            ),
+            (Some(true), Some(false)),
+            "case {name:?} ({note}): expected converse.reasoningSupported to report a \
+             supported, non-embedded reasoning, got {reasoning:?}"
         );
     }
 }
@@ -512,13 +528,17 @@ async fn a_format_list_is_published_per_model_and_keeps_its_order() {
         });
 
         // The document formats are published per provider line, so a model no document
-        // block reaches carries NO member rather than the whole vocabulary.
+        // block reaches reports an EMPTY list rather than the whole vocabulary: what a turn
+        // may attach has the empty answer for it.
         let documents = string_list(converse, "userDocumentTypesSupported");
-        let expected: Option<Vec<String>> = case
+        let expected: Vec<String> = case
             .documents
-            .map(|formats| formats.iter().map(|format| (*format).to_string()).collect());
+            .iter()
+            .map(|format| (*format).to_string())
+            .collect();
         assert_eq!(
-            documents, expected,
+            documents,
+            Some(expected.clone()),
             "case {name:?} ({note}): expected converse.userDocumentTypesSupported \
              {expected:?}, got {documents:?}"
         );
@@ -590,23 +610,36 @@ async fn every_summary_answers_every_capability_in_the_published_shape() {
             continue;
         };
         // The reasoning record names where that reasoning arrives: in a block of its own
-        // for every model this catalogue publishes.
+        // for every model this catalogue publishes it for, and it is reported for those
+        // models alone.
+        let reasoning = converse.get("reasoningSupported");
+        let publishes_reasoning = expected_reasoning_supported(model);
         assert_eq!(
-            converse
-                .get("reasoningSupported")
-                .and_then(|reasoning| reasoning.get("embedded"))
-                .and_then(Value::as_bool),
-            Some(false),
-            "case {name:?}: converse.reasoningSupported names where the reasoning arrives, and \
-             every model of this catalogue answers in a block of its own, got {converse:?}"
+            reasoning.is_some(),
+            publishes_reasoning,
+            "case {name:?}: converse.reasoningSupported is reported for a model whose provider \
+             publishes extended reasoning ({publishes_reasoning:?}) and for no other, got \
+             {converse:?}"
         );
-        // The member is there exactly while the row's provider line publishes document
-        // input, and carries the formats that line publishes.
+        if let Some(reasoning) = reasoning {
+            assert_eq!(
+                reasoning.get("embedded").and_then(Value::as_bool),
+                Some(false),
+                "case {name:?}: converse.reasoningSupported names where the reasoning arrives, \
+                 and every model of this catalogue answers in a block of its own, got \
+                 {converse:?}"
+            );
+        }
+        // The member carries the formats the row's provider line publishes, and the empty
+        // list for a line no document block reaches.
         let documents = string_list(converse, "userDocumentTypesSupported");
-        let expected: Option<Vec<String>> = expected_user_document_formats(model)
-            .map(|formats| formats.iter().map(|format| (*format).to_string()).collect());
+        let expected: Vec<String> = expected_user_document_formats(model)
+            .iter()
+            .map(|format| (*format).to_string())
+            .collect();
         assert_eq!(
-            documents, expected,
+            documents,
+            Some(expected.clone()),
             "case {name:?}: expected converse.userDocumentTypesSupported {expected:?}, got \
              {documents:?}"
         );
@@ -624,5 +657,224 @@ async fn every_summary_answers_every_capability_in_the_published_shape() {
                  {images:?}"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// 3. What a Converse request may CARRY and ASK is answered for every model the API reaches.
+// ---------------------------------------------------------------------------------------
+
+/// One row of the table below: a published model, and what the rule says the two members a
+/// request is BUILT from answer for it.
+struct RequestMetadataCase {
+    /// The `modelId` the listing carries the summary under.
+    model_id: &'static str,
+    /// What this row contributes: the combination of published facts it stands for.
+    note: &'static str,
+    /// The schema of the provider-specific fields a request may carry, as the JSON text the
+    /// member reports; `"{}"` for a line that accepts none.
+    schema: &'static str,
+    /// The ceiling a request may ask for, or `None` for a model whose line publishes none.
+    max_tokens_maximum: Option<i64>,
+    /// The document formats a turn may attach; empty for a model no document reaches.
+    documents: &'static [&'static str],
+}
+
+/// The schema the one line this catalogue publishes a provider-specific request field for
+/// accepts: a reasoning-effort choice, with the effort the model spends when a request
+/// names none as its default.
+const REASONING_EFFORT_SCHEMA: &str = concat!(
+    r#"{"reasoning_config":{"type":"enum","default":"medium","#,
+    r#""enum":["low","medium","high","xhigh","max"]}}"#
+);
+
+/// A line that accepts no provider-specific request field accepts the empty JSON object.
+const NO_REQUEST_FIELDS_SCHEMA: &str = "{}";
+
+/// The table: the rows differ along what the catalogue publishes for the model's line — a
+/// line with a provider-specific request field and one without, a model with a ceiling of
+/// its own and one that reads its line's, a provider that publishes neither, and a line
+/// published with document input.
+const REQUEST_METADATA_CASES: &[RequestMetadataCase] = &[
+    RequestMetadataCase {
+        model_id: "openai.gpt-6-astra",
+        note: "a line that publishes a provider-specific request field, and a line ceiling",
+        schema: REASONING_EFFORT_SCHEMA,
+        max_tokens_maximum: Some(131_072),
+        documents: &[],
+    },
+    RequestMetadataCase {
+        model_id: "nvidia.nemotron-nano-12b-v2",
+        note: "a line that publishes no extra request field, and a line ceiling",
+        schema: NO_REQUEST_FIELDS_SCHEMA,
+        max_tokens_maximum: Some(131_072),
+        documents: &[],
+    },
+    RequestMetadataCase {
+        model_id: "amazon.nova-pro-v1:0",
+        note: "a model with a ceiling published for it rather than for its line",
+        schema: NO_REQUEST_FIELDS_SCHEMA,
+        max_tokens_maximum: Some(5120),
+        documents: &[],
+    },
+    RequestMetadataCase {
+        model_id: "anthropic.claude-opus-4-6-v1",
+        note: "a model of the line published with document input, whose ceiling is published \
+               nowhere",
+        schema: NO_REQUEST_FIELDS_SCHEMA,
+        max_tokens_maximum: None,
+        documents: &["pdf"],
+    },
+    RequestMetadataCase {
+        model_id: "zai.glm-4.7",
+        note: "a provider that publishes no ceiling, per model or per line",
+        schema: NO_REQUEST_FIELDS_SCHEMA,
+        max_tokens_maximum: None,
+        documents: &[],
+    },
+];
+
+#[tokio::test]
+async fn what_a_request_may_carry_and_ask_is_answered_for_every_model_converse_reaches() {
+    let emu = emulator();
+    let listed = summaries(&list(&emu).await);
+
+    for case in REQUEST_METADATA_CASES {
+        let name = case.model_id;
+        let note = case.note;
+        let summary = summary_of(name, &listed, name);
+        let converse = summary.get("converse").unwrap_or_else(|| {
+            panic!(
+                "case {name:?} ({note}): a conversational model carries a Converse record, got \
+                 {summary:?}"
+            )
+        });
+
+        // Which extra fields a request may carry is answered for every model the API
+        // reaches, as a JSON OBJECT a client can read — the empty object where the line
+        // accepts none, never an absent member.
+        let schema = converse
+            .get("additionalRequestFieldsSchema")
+            .and_then(Value::as_str);
+        assert_eq!(
+            schema,
+            Some(case.schema),
+            "case {name:?} ({note}): expected converse.additionalRequestFieldsSchema {:?}, got \
+             {schema:?}",
+            case.schema
+        );
+        let parsed: Value = serde_json::from_str(schema.unwrap_or_default()).unwrap_or_else(|error| {
+            panic!(
+                "case {name:?} ({note}): converse.additionalRequestFieldsSchema carries a JSON \
+                 schema, and {schema:?} does not parse: {error}"
+            )
+        });
+        assert!(
+            parsed.is_object(),
+            "case {name:?} ({note}): expected converse.additionalRequestFieldsSchema to be a \
+             JSON object, got {parsed:?}"
+        );
+
+        // How large an answer a request may ask for is the ceiling published for the
+        // model's line, which a model's own figure overrides.
+        let ceiling = converse.get("maxTokensMaximum").and_then(Value::as_i64);
+        assert_eq!(
+            ceiling, case.max_tokens_maximum,
+            "case {name:?} ({note}): expected converse.maxTokensMaximum {:?}, got {ceiling:?}",
+            case.max_tokens_maximum
+        );
+
+        // And what a turn may attach is a list, empty where nothing of that kind reaches
+        // the model.
+        let documents = string_list(converse, "userDocumentTypesSupported");
+        let expected: Vec<String> = case
+            .documents
+            .iter()
+            .map(|format| (*format).to_string())
+            .collect();
+        assert_eq!(
+            documents,
+            Some(expected.clone()),
+            "case {name:?} ({note}): expected converse.userDocumentTypesSupported {expected:?}, \
+             got {documents:?}"
+        );
+
+        // A read of the model reports the same record, so a client that discovers a model
+        // and then reads it builds the same request either way.
+        let reply = read(&emu, name).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {name:?} ({note}): a read of a published model must answer 200, got {} {:?}",
+            reply.status, reply.body
+        );
+        let details = reply.get("modelDetails");
+        let read_converse = details.get("converse");
+        assert_eq!(
+            read_converse,
+            Some(converse),
+            "case {name:?} ({note}): expected the read to report the listed Converse record \
+             {converse:?}, got {read_converse:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_model_converse_reaches_answers_both_request_members_and_no_other_does() {
+    let emu = emulator();
+    let listed = summaries(&list(&emu).await);
+
+    for model in FOUNDATION_MODELS {
+        let name = model.model_id;
+        let summary = summary_of(name, &listed, name);
+        let converse = summary.get("converse");
+        // Converse carries a WRITTEN conversation, so the record — and with it every
+        // member a request to that API is built from — is reported for a model that answers
+        // a written turn (it produces TEXT and does not answer by speaking, since a spoken
+        // turn is carried by the stream the model is driven through) and for no other.
+        let written_turn = model.output_modalities.contains(&"TEXT")
+            && !model.output_modalities.contains(&"SPEECH");
+        assert_eq!(
+            converse.is_some(),
+            written_turn,
+            "case {name:?}: the Converse record is reported for a model that answers a written \
+             turn ({written_turn:?}) and for no other, got {summary:?}"
+        );
+        let Some(converse) = converse else {
+            continue;
+        };
+        let schema = converse
+            .get("additionalRequestFieldsSchema")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {name:?}: every model the Converse API reaches answers which extra \
+                     fields a request may carry, got {converse:?}"
+                )
+            });
+        let parsed: Value = serde_json::from_str(schema).unwrap_or_else(|error| {
+            panic!(
+                "case {name:?}: converse.additionalRequestFieldsSchema carries a JSON schema, \
+                 and {schema:?} does not parse: {error}"
+            )
+        });
+        assert!(
+            parsed.is_object(),
+            "case {name:?}: expected converse.additionalRequestFieldsSchema to be a JSON object, \
+             got {parsed:?}"
+        );
+        assert!(
+            string_list(converse, "userDocumentTypesSupported").is_some(),
+            "case {name:?}: every model the Converse API reaches answers what a turn may \
+             attach, with the empty list where no document reaches it, got {converse:?}"
+        );
+        // A ceiling is reported exactly where the catalogue publishes one for the model or
+        // for its line, and it is the figure that is published — stated by the suites' own
+        // rendering of the published figures rather than read back off the service.
+        let ceiling = converse.get("maxTokensMaximum").and_then(Value::as_i64);
+        let published = expected_max_output_tokens(model).map(i64::from);
+        assert_eq!(
+            ceiling, published,
+            "case {name:?}: expected converse.maxTokensMaximum {published:?}, got {ceiling:?}"
+        );
     }
 }

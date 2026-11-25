@@ -203,8 +203,10 @@ pub fn profile_model_id(profile_arn: &str) -> String {
 ///   region scope.
 /// * `converse` reports what a conversation may carry to the model and ask of it: a format
 ///   set per modality the model takes, the document formats its provider line publishes
-///   (absent for a line no document reaches), and whether reasoning may be asked for and
-///   where it arrives.
+///   (empty for a line no document reaches), the schema of the provider-specific fields its
+///   line accepts (the empty JSON object for a line that publishes none), and — for a model
+///   whose provider publishes extended reasoning, and for no other — whether reasoning may
+///   be asked for and where it arrives.
 ///
 /// Here rather than in one suite because the listing suite, the read suite and the
 /// capability suite all compare a response against it, and the projection they compare
@@ -321,23 +323,24 @@ pub fn expected_foundation_model_projection(
         "supported": true,
         "streamingSupported": model.response_streaming_supported,
         "systemRoleSupported": true,
-        // Reasoning names whether it may be asked for and WHERE it arrives; a reasoning
-        // block of its own is how every model of this catalogue answers, so none embeds it
-        // in the answer text.
-        "reasoningSupported": {
-            "isSupported": expected_reasoning_supported(model),
-            "embedded": false,
-        },
         "stopSequencesDefault": Vec::<&str>::new(),
         "userImageTypesSupported": formats(takes("IMAGE"), IMAGE_FORMATS),
         // No modality the model declares is video, so no row takes one.
         "userVideoTypesSupported": Vec::<&str>::new(),
+        // A document is a FILE a turn carries rather than a modality the model declares, so
+        // the formats are published per provider line — and EMPTY, not absent, for a model
+        // no document block reaches: what a turn may attach has the empty answer for it.
+        "userDocumentTypesSupported": expected_user_document_formats(model),
+        // Which provider-specific fields a request may carry is published per model line,
+        // and a line that publishes none accepts none: the empty JSON object.
+        "additionalRequestFieldsSchema": expected_additional_request_fields_schema(model),
     });
-    // A document is a FILE a turn carries rather than a modality the model declares, so the
-    // formats are published per provider line and the member is absent for a model no
-    // document block reaches.
-    if let Some(documents) = expected_user_document_formats(model) {
-        converse["userDocumentTypesSupported"] = json!(documents);
+    // Reasoning names whether it may be asked for and WHERE it arrives — a reasoning block
+    // of its own is how every model of this catalogue answers, so none embeds it in the
+    // answer text — and it is reported for a model whose provider publishes extended
+    // reasoning and for no other.
+    if expected_reasoning_supported(model) {
+        converse["reasoningSupported"] = json!({ "isSupported": true, "embedded": false });
     }
     if let Some(ceiling) = expected_max_output_tokens(model) {
         converse["maxTokensMaximum"] = json!(ceiling);
@@ -347,18 +350,45 @@ pub fn expected_foundation_model_projection(
     projection
 }
 
-/// The document formats the catalogue publishes for the row's provider line, or `None` for
-/// a line no document block reaches — stated HERE rather than read off the service, for the
+/// The document formats the catalogue publishes for the row's provider line, EMPTY for a
+/// line no document block reaches — stated HERE rather than read off the service, for the
 /// same reason as the reasoning set below.
 ///
 /// Amazon Bedrock publishes document chat per model ("Supported models and model features"
 /// in the Amazon Bedrock User Guide) rather than for every model a prompt is given to, and
 /// of the providers this catalogue carries it is the Anthropic Claude line that is
-/// published with document input, as PDF.
+/// published with document input, as PDF. What a turn may attach is a question every
+/// Converse client settles, so the member is a list that is empty for a line no document
+/// reaches rather than a member left out.
 pub fn expected_user_document_formats(
     model: &bedrock::state::FoundationModel,
-) -> Option<&'static [&'static str]> {
-    (model.provider_name == "Anthropic").then_some(&["pdf"][..])
+) -> &'static [&'static str] {
+    if model.provider_name == "Anthropic" {
+        &["pdf"]
+    } else {
+        &[]
+    }
+}
+
+/// The schema of the provider-specific request fields the row's published LINE accepts, as
+/// the JSON-encoded string the Converse record reports it in — stated HERE rather than read
+/// off the service, for the same reason as the reasoning set below.
+///
+/// A provider-specific field belongs to the provider's own API for the line, so the schema
+/// is published per line; of the lines this catalogue carries it is the OpenAI GPT-6 line
+/// that publishes one, the reasoning effort a request may choose. A line that publishes no
+/// extra field accepts none, which is the empty JSON object.
+pub fn expected_additional_request_fields_schema(
+    model: &bedrock::state::FoundationModel,
+) -> &'static str {
+    if model.model_id.starts_with("openai.gpt-6") {
+        concat!(
+            r#"{"reasoning_config":{"type":"enum","default":"medium","#,
+            r#""enum":["low","medium","high","xhigh","max"]}}"#
+        )
+    } else {
+        "{}"
+    }
 }
 
 /// The image formats a turn may carry to a model that takes IMAGE (`ImageFormat` of the
@@ -432,10 +462,20 @@ pub fn expected_max_output_tokens(model: &bedrock::state::FoundationModel) -> Op
         ("mistral.mistral-large-2407-v1:0", 8192),
         ("mistral.mixtral-8x7b-instruct-v0:1", 4096),
     ];
+    /// The ceiling each provider publishes for the LINE this catalogue carries its other
+    /// models under: a model the per-model table does not name reads its line's figure.
+    const PUBLISHED_LINE_MAX_OUTPUT_TOKENS: &[(&str, i32)] =
+        &[("NVIDIA", 131_072), ("OpenAI", 131_072)];
     PUBLISHED_MAX_OUTPUT_TOKENS
         .iter()
         .find(|(model_id, _)| *model_id == model.model_id)
         .map(|(_, ceiling)| *ceiling)
+        .or_else(|| {
+            PUBLISHED_LINE_MAX_OUTPUT_TOKENS
+                .iter()
+                .find(|(provider, _)| *provider == model.provider_name)
+                .map(|(_, ceiling)| *ceiling)
+        })
 }
 
 /// Whether a token count is served for the row: a count is the MODEL's own tokenizer's, so

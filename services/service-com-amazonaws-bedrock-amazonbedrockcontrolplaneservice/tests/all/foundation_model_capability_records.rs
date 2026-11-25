@@ -10,7 +10,8 @@
 //! 1. **A capability is reported as the RECORD naming what is supported**, never as a bare
 //!    boolean: `batchSupported` answers for the base model, for another region and for a
 //!    customization of the model; `explicitPromptCaching`, `intelligentPromptRouting` and
-//!    `converse.reasoningSupported` each name whether that capability is supported;
+//!    `converse.reasoningSupported` (reported for a model whose provider publishes
+//!    reasoning, and for no other) each name whether that capability is supported;
 //!    `featuresSupported` names each Amazon Bedrock feature; `inferenceAPIsSupported` names
 //!    each invocation API and the calling modes it offers; and `converse` carries what a
 //!    conversation may ask of the model. What one of them says about a model is more than
@@ -332,22 +333,32 @@ async fn a_capability_is_reported_as_the_record_that_names_what_is_supported() {
             Some(true),
             "case {case:?}: a conversation carries a system role, got {converse:?}"
         );
-        let reasoning = converse["reasoningSupported"]["isSupported"].as_bool();
+        // Reasoning names whether it may be asked for and WHERE it arrives, so the record
+        // is reported for a model whose provider publishes extended reasoning and for no
+        // other: a model that reasons nowhere raises no question about where its reasoning
+        // would arrive.
+        let publishes_reasoning = expected_reasoning_supported(model);
+        let reasoning = converse.get("reasoningSupported");
         assert_eq!(
-            reasoning,
-            Some(expected_reasoning_supported(model)),
-            "case {case:?}: expected converse.reasoningSupported.isSupported {:?}, got \
-             {converse:?}",
-            expected_reasoning_supported(model)
+            reasoning.is_some(),
+            publishes_reasoning,
+            "case {case:?}: expected converse.reasoningSupported to be reported \
+             {publishes_reasoning:?}, got {converse:?}"
         );
-        // Reasoning arrives in a block of its own for every model this catalogue publishes,
-        // so nothing a client reads has to be parsed out of the answer text.
-        assert_eq!(
-            converse["reasoningSupported"]["embedded"].as_bool(),
-            Some(false),
-            "case {case:?}: expected converse.reasoningSupported.embedded false, got \
-             {converse:?}"
-        );
+        if publishes_reasoning {
+            assert_eq!(
+                (
+                    converse["reasoningSupported"]["isSupported"].as_bool(),
+                    // Reasoning arrives in a block of its own for every model this
+                    // catalogue publishes, so nothing a client reads has to be parsed out
+                    // of the answer text.
+                    converse["reasoningSupported"]["embedded"].as_bool(),
+                ),
+                (Some(true), Some(false)),
+                "case {case:?}: expected converse.reasoningSupported to report a supported, \
+                 non-embedded reasoning, got {converse:?}"
+            );
+        }
         // The formats a turn may carry TO the model follow the modalities it takes.
         let images = converse["userImageTypesSupported"]
             .as_array()
