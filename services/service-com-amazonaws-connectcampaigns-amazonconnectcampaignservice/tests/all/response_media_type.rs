@@ -31,13 +31,16 @@ use super::common::{call, router, Harness};
 
 /// The region every case here signs for; the announced media type is a property of the
 /// service and not of a region, so one is enough.
-const REGION: &str = "us-east-1";
+pub const REGION: &str = "us-east-1";
 
 /// The Connect instance the rows that need a served call work against.
-const INSTANCE: &str = "media-type-instance";
+pub const INSTANCE: &str = "media-type-instance";
 
 /// The media type this service's own front door announces on what it answers.
-const FRONT_DOOR_MEDIA_TYPE: &str = "application/x-amz-json-1.1";
+///
+/// Visible to the sibling suites that assert the same rule over another part of this
+/// service's surface, so the value the recorded wire carries is written down once.
+pub const FRONT_DOOR_MEDIA_TYPE: &str = "application/x-amz-json-1.1";
 
 /// The media type the TAG tier's own refusals are announced under — the protocol's own,
 /// which is the value its producer stamped.
@@ -50,7 +53,7 @@ fn encoded(arn: &str) -> String {
 
 /// A minimal `CreateCampaign` body for `instance`: every member the model marks required
 /// (`name`, `connectInstanceId`, `dialerConfig`, `outboundCallConfig`), and nothing else.
-fn create_body(name: &str, instance: &str) -> Value {
+pub fn create_body(name: &str, instance: &str) -> Value {
     json!({
         "name": name,
         "connectInstanceId": instance,
@@ -230,7 +233,7 @@ fn rows(stored: &str, stored_arn: &str, fresh: &str) -> Vec<Row> {
 
 /// Give the account `INSTANCE` and create one campaign named `name` for it, handing back
 /// the minted id and the ARN it was minted with — the ARN the tag rows address it by.
-async fn a_stored_campaign(router: &Harness, name: &str) -> (String, String) {
+pub async fn a_stored_campaign(router: &Harness, name: &str) -> (String, String) {
     router.register_connect_instance(REGION, INSTANCE);
     let created = call(
         router,
