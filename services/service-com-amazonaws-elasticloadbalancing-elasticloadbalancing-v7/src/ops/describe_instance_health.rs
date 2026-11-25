@@ -190,6 +190,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::region_from_request(ctx.parts());
         let now = ::std::time::SystemTime::now();
+        // Whether the REQUEST named instances of its own, which decides both which
+        // instances are described and which ids are resolved against EC2 below.
+        let filtered = !requested.is_empty();
 
         // Three steps, so this service's guard is never held while EC2's store is read:
         // which instances the answer is about and what this load balancer checks them with,
@@ -225,6 +228,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::HealthCheckTarget::of(&record.health_check.target),
             )
         };
+
+        // An instance is EC2's resource, so whether the account holds one under each id the
+        // request NAMED is EC2's to say ([`crate::state::resolve_instances`]): there is no
+        // health to report for an id no instance of this account carries, so the request is
+        // refused for it. Only the ids the request itself named are resolved — a
+        // filter-less read describes the registered set, which names no id of its own — and
+        // with no EC2 to ask nothing is refused.
+        let named: Vec<String> = if filtered {
+            described.clone()
+        } else {
+            Vec::new()
+        };
+        if let crate::state::InstanceInventory::Absent { instance_id, .. } =
+            crate::state::resolve_instances(ctx, &region, &named).await
+        {
+            return Err(DescribeInstanceHealthErrorModeled::InvalidEndPointException(
+                InvalidEndPointException {
+                    message: Some(crate::state::instance_not_found_message(&instance_id)),
+                },
+            )
+            .into());
+        }
+
         // The check THIS load balancer performs, which is what its registrations are
         // observed against.
         let targets: ::std::collections::BTreeSet<crate::state::HealthCheckTarget> =

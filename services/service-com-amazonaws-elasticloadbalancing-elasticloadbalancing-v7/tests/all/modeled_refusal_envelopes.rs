@@ -14,9 +14,15 @@
 //! refusal that swallowed a valid value would fail here too.
 //!
 //! Every request goes through the awsQuery protocol on the multi-service router (see
-//! `super::wire`), so what is asserted is the emulator's HTTP behaviour.
+//! `super::wire`), so what is asserted is the emulator's HTTP behaviour. One class needs a
+//! second service behind that front door: whether the account holds an instance under the id
+//! a request named is Amazon EC2's to say, so the rows of the `InvalidInstance` class below
+//! run with EC2 mounted beside this service on the same engine.
 
-use super::wire::{call, emulator, error_message, find, kid_text, param, parse, Element, Wire};
+use super::wire::{
+    call, emulator, emulator_with_ec2, error_message, find, kid_text, launch_instance, members,
+    param, parse, Element, Wire,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request below is signed for.
@@ -459,5 +465,151 @@ async fn a_value_on_the_published_bound_is_accepted() {
             "case {case:?}: the stored timeout must be the accepted one, got {}",
             described.body
         );
+    }
+}
+
+/// The ids the rows below name that the account holds no instance for, one per FORM such a
+/// value comes in: EC2's 17-hexadecimal-digit id form, its older 8-digit form, and a value
+/// that is no instance id at all. Taken from EC2's own id forms
+/// (`service_com_amazonaws_ec2_amazonec2::state::instance_ids_and_instance_types`), because
+/// what makes each of them no endpoint is that EC2 resolves none of them, not how it is
+/// spelled.
+const IDS_NO_INSTANCE_CARRIES: [(&str, &str); 3] = [
+    ("EC2's 17-hexadecimal-digit id form", "i-0f1e2d3c4b5a69780"),
+    ("EC2's older 8-hexadecimal-digit id form", "i-1a2b3c4d"),
+    ("a value that is no instance id at all", "not-an-instance"),
+];
+
+/// The refusal class an instance id EC2 holds no instance for earns, which is why this one
+/// test mounts Amazon EC2 beside this service.
+///
+/// An instance is EC2's resource, so whether the account holds one under the id a request
+/// names is EC2's to say, and an id it holds none for names no endpoint at all: the
+/// modelled `InvalidEndPointException` — HTTP 400 `InvalidInstance` in the same awsQuery
+/// envelope as every other refusal here — with nothing of the request taking effect. The
+/// rows differ along the FORM of the id, along the operation that named it, and along
+/// whether it sits beside an instance EC2 does hold; the end-to-end table over EC2's own
+/// inventory, including an instance of another Region, is
+/// `core/router/tests/all/elb_classic_instances_resolve_in_ec2.rs`.
+#[tokio::test]
+async fn an_id_ec2_holds_no_instance_for_is_refused_as_an_invalid_endpoint() {
+    let (router, _engine) = emulator_with_ec2();
+    let name = "invalid-endpoint-elb";
+    let created = create(&router, name, &in_zone()).await;
+    assert_eq!(
+        created.status, 200,
+        "the fixture must be created, got {}",
+        created.body
+    );
+    // One backend EC2 DOES hold, launched through its own API: it is what the rows put
+    // beside an unknown id, and what the registered set must still hold afterwards.
+    let held = launch_instance(&router, REGION, "a backend EC2 holds").await;
+    let registered = call(
+        &router,
+        REGION,
+        "RegisterInstancesWithLoadBalancer",
+        &[
+            param("LoadBalancerName", name),
+            param("Instances.member.1.InstanceId", &held),
+        ],
+    )
+    .await;
+    assert_eq!(
+        registered.status, 200,
+        "an instance EC2 holds must be registered, got {}",
+        registered.body
+    );
+
+    for (form, unknown) in IDS_NO_INSTANCE_CARRIES {
+        // (the case, the action, the ids the request names, in order)
+        let rows: [(String, &str, Vec<&str>); 5] = [
+            (
+                format!("a registration naming an id EC2 holds no instance for, in {form}"),
+                "RegisterInstancesWithLoadBalancer",
+                vec![unknown],
+            ),
+            (
+                format!("a registration naming it beside one EC2 holds, in {form}"),
+                "RegisterInstancesWithLoadBalancer",
+                vec![held.as_str(), unknown],
+            ),
+            (
+                format!("a deregistration naming it, in {form}"),
+                "DeregisterInstancesFromLoadBalancer",
+                vec![unknown],
+            ),
+            (
+                format!("a health read naming it, in {form}"),
+                "DescribeInstanceHealth",
+                vec![unknown],
+            ),
+            (
+                format!("a health read naming it beside a registered instance, in {form}"),
+                "DescribeInstanceHealth",
+                vec![held.as_str(), unknown],
+            ),
+        ];
+
+        for (case, action, ids) in rows {
+            let mut params = vec![param("LoadBalancerName", name)];
+            for (slot, id) in ids.iter().enumerate() {
+                params.push(param(
+                    &format!("Instances.member.{}.InstanceId", slot + 1),
+                    id,
+                ));
+            }
+            let refused = call(&router, REGION, action, &params).await;
+            assert_eq!(
+                (
+                    refused.status,
+                    refused.error_code(),
+                    refused.content_type.as_str()
+                ),
+                (400, "InvalidInstance".to_string(), "text/xml"),
+                "case {case:?}: expected the modelled InvalidInstance envelope, got {} with {}",
+                refused.status,
+                refused.body
+            );
+            let stated = error_message(&refused);
+            if action == "DescribeInstanceHealth" {
+                // The sentence a health read is worded with names the instance it could not
+                // find, and nothing else.
+                assert_eq!(
+                    stated,
+                    format!("Could not find EC2 instance {unknown}."),
+                    "case {case:?}: expected the health read's own sentence, got {stated:?}"
+                );
+            } else {
+                // A registration states the EC2 fault it ran into, relayed whole.
+                assert!(
+                    stated.contains(unknown)
+                        && stated.contains("(Service: AmazonEC2; Status Code: 400; Error Code: \
+                                            InvalidInstanceID.")
+                        && stated.ends_with("; Proxy: null)"),
+                    "case {case:?}: expected EC2's own sentence about {unknown} and the context \
+                     of the call that raised it, got {stated:?}"
+                );
+            }
+
+            // Nothing of a refused request took effect: the one instance EC2 holds is still
+            // the whole registered set, neither added to nor deregistered from.
+            let health = call(
+                &router,
+                REGION,
+                "DescribeInstanceHealth",
+                &[param("LoadBalancerName", name)],
+            )
+            .await;
+            let doc = parse(&health.body);
+            assert_eq!(
+                members(health.result(&doc), "InstanceStates")
+                    .iter()
+                    .filter_map(|state| kid_text(state, "InstanceId"))
+                    .collect::<Vec<String>>(),
+                vec![held.clone()],
+                "case {case:?}: a refused request must leave the registered set as it was, got {}",
+                health.body
+            );
+        }
     }
 }

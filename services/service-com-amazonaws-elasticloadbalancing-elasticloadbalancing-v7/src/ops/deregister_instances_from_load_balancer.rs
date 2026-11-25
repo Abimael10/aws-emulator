@@ -109,6 +109,20 @@ pub struct DeregisterInstancesFromLoadBalancer<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// The refusal a request naming a load balancer this region holds none of earns, stated
+/// over the name the request carried — the modelled `AccessPointNotFoundException`, which
+/// this handler resolves the record more than once for.
+fn load_balancer_not_found(load_balancer_name: &str) -> DeregisterInstancesFromLoadBalancerError {
+    DeregisterInstancesFromLoadBalancerErrorModeled::AccessPointNotFoundException(
+        AccessPointNotFoundException {
+            message: Some(format!(
+                "There is no ACTIVE Load Balancer named '{load_balancer_name}'"
+            )),
+        },
+    )
+    .into()
+}
+
 impl<Eng> DeregisterInstancesFromLoadBalancer<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -179,22 +193,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::region_from_request(ctx.parts());
+        // The load balancer is this service's OWN resource, so it is resolved first: a
+        // request naming none of this region's load balancers is answered about that
+        // before anything is asked of EC2 about the instances it named.
+        {
+            let guard = state.lock();
+            if guard
+                .load_balancers_in(&region)
+                .and_then(|records| records.get(&input.load_balancer_name))
+                .is_none()
+            {
+                return Err(load_balancer_not_found(&input.load_balancer_name));
+            }
+        }
+
+        // An instance is EC2's resource, so whether the account holds one under each id
+        // this request names is EC2's to say ([`crate::state::resolve_instances`]): an id
+        // it holds no instance for names no endpoint to deregister, so the request is
+        // refused with the EC2 fault it ran into relayed whole and NOTHING of the batch is
+        // removed. No lock is held across the read, and with no EC2 to ask nothing is
+        // refused.
+        let named: Vec<String> = requested.iter().cloned().collect();
+        if let crate::state::InstanceInventory::Absent { refusal, .. } =
+            crate::state::resolve_instances(ctx, &region, &named).await
+        {
+            return Err(
+                DeregisterInstancesFromLoadBalancerErrorModeled::InvalidEndPointException(
+                    InvalidEndPointException {
+                        message: Some(crate::state::relayed_network_refusal_message(&refusal)),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let mut guard = state.lock();
         let Some(record) = guard
             .load_balancers_in_mut(&region)
             .and_then(|records| records.get_mut(&input.load_balancer_name))
         else {
-            return Err(
-                DeregisterInstancesFromLoadBalancerErrorModeled::AccessPointNotFoundException(
-                    AccessPointNotFoundException {
-                        message: Some(format!(
-                            "There is no ACTIVE Load Balancer named '{}'",
-                            input.load_balancer_name
-                        )),
-                    },
-                )
-                .into(),
-            );
+            return Err(load_balancer_not_found(&input.load_balancer_name));
         };
 
         record.deregister_instances(&requested);

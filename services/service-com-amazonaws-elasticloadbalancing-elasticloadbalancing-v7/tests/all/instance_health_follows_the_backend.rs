@@ -23,12 +23,14 @@
 //! The rows differ along what the rule generalises over: the target's protocol (all four),
 //! the port it names (the one the backend serves and one it does not), its ping path (one the
 //! backend holds a document at and one it does not), what the backend is doing (serving,
-//! running no server at all, stopped, terminated, an id the account holds no instance for)
-//! and what the load balancer's two thresholds are configured to, including both bounds
+//! running no server at all, stopped, terminated) and what the load balancer's two thresholds
+//! are configured to, including both bounds
 //! `HealthyThreshold`/`UnhealthyThreshold` are modelled with (`@range(min: 2, max: 10)`).
 //! Every backend is launched, stopped and terminated through EC2's OWN API on the same
 //! engine, so what a row asserts rests on what EC2's own reader reports rather than on a
-//! value this suite made up.
+//! value this suite made up — and an id EC2 holds no instance for is no row here at all,
+//! because such an id cannot be registered: that refusal is pinned in
+//! `core/router/tests/all/elb_classic_instances_resolve_in_ec2.rs`.
 //!
 //! Where a row stands on its load balancer's timeline is PLACED: the stored registration is
 //! stamped so that exactly as many checks as the row is about have fallen due
@@ -97,8 +99,6 @@ enum Backend {
     Stopped,
     /// A serving instance that was then terminated through EC2.
     Terminated,
-    /// An id the account holds no instance for at all.
-    Absent,
 }
 
 /// One row: a load balancer, the target and thresholds its health check is configured with,
@@ -268,12 +268,16 @@ fn health_cases() -> Vec<Case> {
             expected: Reported::Terminated,
         },
         Case {
-            // `UnhealthyThreshold` at the maximum the member is modelled with.
-            name: "an-id-the-account-holds-no-instance-for",
+            // `UnhealthyThreshold` at the maximum the member is modelled with: the run of
+            // unanswered checks the verdict waits for is the caller's configuration. The
+            // backend is one EC2 DOES hold — an id it holds no instance for cannot be
+            // registered at all, which
+            // `core/router/tests/all/elb_classic_instances_resolve_in_ec2.rs` pins.
+            name: "a-backend-answering-no-check-at-the-highest-threshold",
             target: "HTTP:80/ping",
             healthy_threshold: 2,
             unhealthy_threshold: 10,
-            backend: Backend::Absent,
+            backend: Backend::Idle,
             expected: Reported::FailedChecks,
         },
     ]
@@ -283,9 +287,6 @@ fn health_cases() -> Vec<Case> {
 /// names: its instance id.
 async fn seed_backend(router: &MultiServiceRouter, case: &Case) -> String {
     let user_data = match case.backend {
-        // An id of the right form that EC2 holds no instance for: nothing was launched for
-        // this row.
-        Backend::Absent => return "i-00000000000000bad".to_string(),
         Backend::Serving { port, paths } => Some(serving_user_data(port, paths)),
         // Stopped and terminated backends DID serve while they were up, so what the row
         // asserts is the condition the instance's own state puts it in rather than a server

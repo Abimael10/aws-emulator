@@ -1032,6 +1032,181 @@ pub async fn resolve_instance_targets(
     InstanceTargets::Resolved(resolved)
 }
 
+/// The prefix of every EC2 error code that says a value names no instance of the account:
+/// `InvalidInstanceID.NotFound` for an id inside the form EC2 issues that nothing was
+/// launched under, and `InvalidInstanceID.Malformed` for a value that is no instance id at
+/// all. Both say the same thing about a registration — it names no instance of this
+/// account.
+const INSTANCE_ID_REFUSAL_PREFIX: &str = "InvalidInstanceID.";
+
+/// The EC2 code for an id the account holds no instance for, which is what a read that
+/// resolved without reporting one of the ids ran into.
+const INSTANCE_ID_NOT_FOUND: &str = "InvalidInstanceID.NotFound";
+
+/// What a refusal CALLS an instance id, for the sentence it states when EC2 worded none.
+const INSTANCE_ID_NOUN: &str = "instance ID";
+
+/// What EC2 says about every instance id a request named, as the refusal a caller states.
+///
+/// The sibling of [`InstanceTargets`] for the callers that need the EC2 FAULT rather than
+/// the VPC each instance is in: Elastic Load Balancing reports the refusal EC2 answered
+/// rather than restating it, so the fault travels with the id it was answered for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstanceInventory {
+    /// EC2 resolved every id the request named.
+    Resolved,
+    /// EC2 holds no instance for one of them: the FIRST such id in the order the request
+    /// named them — the one the caller has to fix before any answer about the rest matters
+    /// — and the refusal EC2 answered for it.
+    Absent {
+        instance_id: String,
+        refusal: NetworkRefusal,
+    },
+    /// Nothing is known: there is no EC2 to ask, or it answered something else.
+    Unknown,
+}
+
+/// Whether EC2 holds an instance for every id of `instance_ids`.
+///
+/// An instance is EC2's resource, so whether one exists at all is EC2's to say, and it is
+/// asked in as few reads as its own bound on a describe allows
+/// ([`INSTANCE_IDS_PER_READ`]). EC2 refuses a read naming an id the account holds no
+/// instance for WHOLE, so such a read says nothing about the other ids in it: its ids are
+/// then resolved one at a time and the first that names no instance is the one reported.
+/// Any other failure is this emulator failing to ask rather than EC2 reporting a bad
+/// instance, so it says nothing ([`InstanceInventory::Unknown`]) and nothing is refused on
+/// that silence.
+pub async fn resolve_instances(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    instance_ids: &[String],
+) -> InstanceInventory {
+    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
+    for chunk in instance_ids.chunks(INSTANCE_IDS_PER_READ) {
+        let answer = ec2(ctx, region)
+            .describe_instances()
+            .set_instance_ids(Some(chunk.to_vec()))
+            .send()
+            .await;
+        let error = match answer {
+            Ok(output) => {
+                let reported: Vec<&str> = output
+                    .reservations()
+                    .iter()
+                    .flat_map(::aws_sdk_ec2::types::Reservation::instances)
+                    .filter_map(::aws_sdk_ec2::types::Instance::instance_id)
+                    .collect();
+                // A read that resolved but reports no instance for an id the request named
+                // says the same thing the refusal below does.
+                let unresolved: Vec<&str> = chunk
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|id| !reported.contains(id))
+                    .collect();
+                if let Some(first) = unresolved.first() {
+                    return InstanceInventory::Absent {
+                        instance_id: (*first).to_string(),
+                        refusal: NetworkRefusal::worded(
+                            INSTANCE_ID_NOT_FOUND,
+                            Some(unresolved_ids_message(INSTANCE_ID_NOUN, &unresolved)),
+                        ),
+                    };
+                }
+                continue;
+            }
+            Err(error) => error,
+        };
+        let code = error
+            .as_service_error()
+            .and_then(ProvideErrorMetadata::code)
+            .unwrap_or_default()
+            .to_string();
+        if !code.starts_with(INSTANCE_ID_REFUSAL_PREFIX) {
+            ::tracing::debug!(
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the instances a request named could not be resolved against EC2"
+            );
+            return InstanceInventory::Unknown;
+        }
+        // The read was refused on one of its ids, and EC2 says nothing about which. Ask
+        // about them one at a time and stop at the first the account holds no instance for.
+        for instance_id in chunk {
+            match instance_inventory_of(ctx, region, instance_id).await {
+                InstanceInventory::Resolved => continue,
+                absent_or_unknown => return absent_or_unknown,
+            }
+        }
+        // Every id resolved on its own, so what the refused read ran into is not something
+        // this service learned about the ids it named.
+        return InstanceInventory::Unknown;
+    }
+    InstanceInventory::Resolved
+}
+
+/// [`resolve_instances`] for ONE id, which is how a read EC2 refused for the ids it was
+/// given as a whole is narrowed to the one id at fault.
+async fn instance_inventory_of(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    instance_id: &str,
+) -> InstanceInventory {
+    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
+    let answer = ec2(ctx, region)
+        .describe_instances()
+        .instance_ids(instance_id)
+        .send()
+        .await;
+    let error = match answer {
+        Ok(output) => {
+            let found = output
+                .reservations()
+                .iter()
+                .flat_map(::aws_sdk_ec2::types::Reservation::instances)
+                .any(|instance| instance.instance_id() == Some(instance_id));
+            if found {
+                return InstanceInventory::Resolved;
+            }
+            return InstanceInventory::Absent {
+                instance_id: instance_id.to_string(),
+                refusal: NetworkRefusal::worded(
+                    INSTANCE_ID_NOT_FOUND,
+                    Some(unresolved_ids_message(INSTANCE_ID_NOUN, &[instance_id])),
+                ),
+            };
+        }
+        Err(error) => error,
+    };
+    let refused = error.as_service_error();
+    let code = refused
+        .and_then(ProvideErrorMetadata::code)
+        .unwrap_or_default()
+        .to_string();
+    if code.starts_with(INSTANCE_ID_REFUSAL_PREFIX) {
+        // EC2 worded this refusal around the instance id it would not resolve, so the
+        // sentence is carried along with the code: it is what names that id to the caller.
+        let detail = refused
+            .and_then(ProvideErrorMetadata::message)
+            .map(str::to_string)
+            .unwrap_or_else(|| unresolved_ids_message(INSTANCE_ID_NOUN, &[instance_id]));
+        return InstanceInventory::Absent {
+            instance_id: instance_id.to_string(),
+            refusal: NetworkRefusal::answered(
+                code,
+                Some(detail),
+                error.raw_response().map(|response| response.status().as_u16()),
+            ),
+        };
+    }
+    ::tracing::debug!(
+        %instance_id,
+        error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+        "the instance a request named could not be resolved against EC2"
+    );
+    InstanceInventory::Unknown
+}
+
 /// The subnet of `subnets` whose CIDR blocks hold `address`, if any.
 pub fn containing_subnet(subnets: &[SubnetFacts], address: IpAddr) -> Option<&SubnetFacts> {
     subnets

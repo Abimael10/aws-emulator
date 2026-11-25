@@ -38,8 +38,8 @@ use service_com_amazonaws_ec2_amazonec2 as ec2_service;
 use service_com_amazonaws_elasticloadbalancing_elasticloadbalancing_v7 as elb_service;
 
 use crate::support::{
-    borrowed, classic_elb_query, emulator_with_classic_elb, p, query, tag_value, tag_values,
-    REGION,
+    borrowed, classic_elb_query, ec2_query, element_body, emulator_with_classic_elb, p, query,
+    tag_value, tag_values, REGION,
 };
 
 /// The launch template every group in this suite launches from, seeded into the account's own
@@ -134,6 +134,37 @@ fn poll_budget() -> Duration {
 /// the smallest the member admits, so a registration reaches `InService` in as few checks as
 /// Elastic Load Balancing will take.
 const HEALTHY_THRESHOLD: i32 = 2;
+
+/// The image a launch outside a group names. Any well-formed image id: what this suite needs
+/// of such an instance is that Amazon EC2 HOLDS it.
+const AMI: &str = "ami-0123456789abcdef0";
+
+/// Launch ONE instance of the account's own Amazon EC2, outside every group here, and answer
+/// the id EC2 minted for it.
+///
+/// An instance is EC2's resource, and Elastic Load Balancing resolves every instance id a
+/// registration names against EC2, so the instance a CALLER's own registration names is one
+/// launched through EC2's own API rather than an id this suite made up.
+async fn launch_caller_instance(router: &MultiServiceRouter) -> String {
+    let (status, body) = ec2_query(
+        router,
+        "RunInstances",
+        &[
+            p("ImageId", AMI),
+            p("MinCount", "1"),
+            p("MaxCount", "1"),
+            p("Placement.AvailabilityZone", ZONE),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "RunInstances expected 200, got {status}: {body}"
+    );
+    element_body(&body, "instanceId")
+        .unwrap_or_else(|| panic!("RunInstances must report an instance: {body}"))
+        .to_string()
+}
 
 /// One emulator with the three services on ONE engine: a group's instances are the account's
 /// own Amazon EC2 instances, and the load balancers it is attached to and the registrations
@@ -796,14 +827,16 @@ async fn the_group_instances_are_registered_with_every_attached_load_balancer() 
         create_load_balancer(&router, name).await;
     }
     // A registration a CALLER of Elastic Load Balancing made itself, which no reconcile of
-    // this service's own registrations may touch.
-    let caller_instance = "i-0caller0caller000";
+    // this service's own registrations may touch. The instance is one Amazon EC2 holds: an
+    // instance is EC2's resource, so a registration naming an id it holds none for is
+    // refused rather than stored.
+    let caller_instance = launch_caller_instance(&router).await;
     let (status, body) = elb_query(
         &router,
         "RegisterInstancesWithLoadBalancer",
         &[
             p("LoadBalancerName", "clb-a"),
-            p("Instances.member.1.InstanceId", caller_instance),
+            p("Instances.member.1.InstanceId", &caller_instance),
         ],
     )
     .await;
@@ -826,7 +859,7 @@ async fn the_group_instances_are_registered_with_every_attached_load_balancer() 
     // Every instance of the group is registered with BOTH load balancers, beside the
     // caller's own registration.
     let mut with_caller = instances.clone();
-    with_caller.push(caller_instance.to_string());
+    with_caller.push(caller_instance.clone());
     settled_registrations(&router, "both attached", "clb-a", &with_caller).await;
     settled_registrations(&router, "both attached", "clb-b", &instances).await;
     settled_attachment_state(&router, "both attached", group, "clb-a", ADDED).await;
@@ -848,7 +881,7 @@ async fn the_group_instances_are_registered_with_every_attached_load_balancer() 
         &router,
         "scaled in",
         "clb-a",
-        &[caller_instance.to_string()],
+        std::slice::from_ref(&caller_instance),
     )
     .await;
     settled_registrations(&router, "scaled in", "clb-b", &[]).await;
@@ -869,7 +902,7 @@ async fn the_group_instances_are_registered_with_every_attached_load_balancer() 
         &router,
         "detached",
         "clb-a",
-        &[caller_instance.to_string()],
+        std::slice::from_ref(&caller_instance),
     )
     .await;
 }

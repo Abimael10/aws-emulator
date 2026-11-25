@@ -147,8 +147,10 @@ async fn one_answer_carries_each_registration_s_own_verdict() {
     let (router, engine) = emulator_with_ec2();
 
     // Three backends a check can tell apart: one whose own server answers the check, one
-    // EC2 reports stopped, and an id of the right form it holds no instance for. Each state
-    // is reached through EC2's own API.
+    // EC2 reports stopped, and one EC2 reports running whose guest started no server at
+    // all. Each state is reached through EC2's own API — an id EC2 holds no instance for is
+    // none of them, because such an id cannot be registered at all
+    // (`core/router/tests/all/elb_classic_instances_resolve_in_ec2.rs`).
     let serving = launch_serving_instance(
         &router,
         REGION,
@@ -157,9 +159,9 @@ async fn one_answer_carries_each_registration_s_own_verdict() {
     )
     .await;
     let stopped = launch_instance(&router, REGION, "stopped").await;
+    let idle = launch_instance(&router, REGION, "idle").await;
     settle_ec2_transition().await;
     move_instance(&router, REGION, "stopped", "StopInstances", &stopped).await;
-    let absent = "i-00000000000000bad".to_string();
 
     let created = call(
         &router,
@@ -208,7 +210,7 @@ async fn one_answer_carries_each_registration_s_own_verdict() {
         configured.body
     );
 
-    let fleet = vec![serving.clone(), stopped.clone(), absent.clone()];
+    let fleet = vec![serving.clone(), stopped.clone(), idle.clone()];
     register(&router, &fleet).await;
 
     // One member per registered instance, in registration order — and no check has fallen
@@ -238,7 +240,7 @@ async fn one_answer_carries_each_registration_s_own_verdict() {
         vec![
             (serving.clone(), in_service()),
             (stopped.clone(), registration_in_progress()),
-            (absent.clone(), registration_in_progress()),
+            (idle.clone(), registration_in_progress()),
         ],
         "after {HEALTHY_THRESHOLD} checks only the answering backend has a verdict, got \
          {partway:?}"
@@ -256,7 +258,7 @@ async fn one_answer_carries_each_registration_s_own_verdict() {
         vec![
             (serving.clone(), in_service()),
             (stopped.clone(), stopped_backend()),
-            (absent.clone(), failed_health_checks()),
+            (idle.clone(), failed_health_checks()),
         ],
         "after {UNHEALTHY_THRESHOLD} checks each member must carry its own verdict, got \
          {settled:?}"
@@ -280,7 +282,7 @@ async fn one_answer_carries_each_registration_s_own_verdict() {
         vec![
             (serving.clone(), in_service()),
             (stopped.clone(), stopped_backend()),
-            (absent.clone(), failed_health_checks()),
+            (idle.clone(), failed_health_checks()),
             (joining.clone(), registration_in_progress()),
         ],
         "a registration made later must carry its own timeline, got {mixed:?}"
@@ -295,7 +297,7 @@ async fn one_answer_carries_each_registration_s_own_verdict() {
         vec![
             (serving, in_service()),
             (stopped, stopped_backend()),
-            (absent, failed_health_checks()),
+            (idle, failed_health_checks()),
             (joining, in_service()),
         ],
         "the later registration must reach its own verdict, got {caught_up:?}"

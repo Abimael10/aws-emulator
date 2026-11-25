@@ -216,6 +216,11 @@ pub use load_balancer_endpoint::*;
 mod instance_zones;
 pub use instance_zones::*;
 
+/// Whether EC2 holds an instance for each id a request names, which is what decides whether
+/// a registration — or a health read — names an endpoint at all.
+mod instance_inventory;
+pub use instance_inventory::*;
+
 /// The health of one instance with respect to one load balancer, as the three members of
 /// `InstanceState` report it together.
 ///
