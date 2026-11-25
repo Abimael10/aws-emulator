@@ -407,9 +407,10 @@ struct AddressedCall {
 /// Every operation of this service that is ADDRESSED to an app instance, to one of its
 /// users or to one of its bots, built over the three ARNs given.
 ///
-/// `DescribeAppInstanceBot` is not here: it answers the permanent refusal for ANY bot ARN
-/// it holds no record for, so it cannot tell the two cases below apart.
-/// `DescribeAppInstanceAdmin` is out for the same reason: the grant it addresses is the
+/// `DescribeAppInstanceBot` is not here: it reports a bot ARN it holds no record of as
+/// ABSENT, in the modelled 404 `NotFoundException` its own model declares, rather than
+/// with the unknown-ARN refusal the rows below expect.
+/// `DescribeAppInstanceAdmin` is out for another reason: the grant it addresses is the
 /// resource it resolves, so it answers the permanent refusal for any pair of ARNs it
 /// holds no promotion for.
 ///

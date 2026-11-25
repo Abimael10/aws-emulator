@@ -153,26 +153,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A reporting operation: it reads the stored bot and writes nothing.
         //
-        // This service answers a describe addressed to an ARN it holds no resource for
-        // with the permanent 403 refusal rather than with a missing-resource or
-        // malformed-input one: resolving the addressed ARN is an AUTHORIZATION decision,
-        // so "this ARN names no such resource" is reported as a request the caller may
-        // not make — the one forbidden-request sentence, with nothing interpolated into
-        // it, exactly as the sibling `DescribeAppInstanceAdmin` answers an identity it
-        // holds no admin grant for. The refusal is therefore the SAME whatever left the
-        // ARN unresolvable (a bot never minted, one deleted, one cascaded away with its
-        // parent `AppInstance`, or an ARN naming another resource kind, account or
-        // region), so the answer discloses nothing a caller could use to probe for
-        // resources it may not read — which is what the 403 class means here and what
-        // the `NotFoundException` the model also declares for this operation would not.
+        // An `AppInstanceBotArn` this service holds no bot for is reported as ABSENT, in
+        // the shape this operation's model gives that answer: the model declares
+        // `NotFoundException` (404) here — "one or more of the resources in the request
+        // does not exist in the system" — so the absence sentence this service words the
+        // same way for every missing resource is carried by that 404 class rather than by
+        // the 400 `BadRequestException` the sibling bot operations have to borrow it for,
+        // their models declaring no 404 shape.
+        //
+        // The permanent 403 refusal stays reserved for the one condition it states
+        // across this service: an ARN at or under an `AppInstance` this store has
+        // DELETED, where the instance that would authorize the read is gone, so a bot
+        // cascaded away with its parent is refused as a request this caller may no longer
+        // make rather than reported as a bot that never was.
         let Some(record) = state.bot(&input.app_instance_bot_arn) else {
-            return Err(DescribeAppInstanceBotErrorModeled::ForbiddenException(
-                ForbiddenException {
-                    code: Some("Forbidden".to_string()),
-                    message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
-                },
-            )
-            .into());
+            return Err(match state.unresolved_arn(&input.app_instance_bot_arn) {
+                crate::state::UnresolvedArn::DeletedAppInstance => {
+                    DescribeAppInstanceBotErrorModeled::ForbiddenException(ForbiddenException {
+                        code: Some("Forbidden".to_string()),
+                        message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
+                    })
+                    .into()
+                }
+                crate::state::UnresolvedArn::NeverExisted => {
+                    DescribeAppInstanceBotErrorModeled::NotFoundException(NotFoundException {
+                        code: Some("NotFound".to_string()),
+                        message: Some(format!(
+                            "AppInstanceBot {} does not exist",
+                            input.app_instance_bot_arn
+                        )),
+                    })
+                    .into()
+                }
+            });
         };
 
         Ok(DescribeAppInstanceBotOutput {
