@@ -34,7 +34,10 @@
 //!
 //! `tests/all/log_group_target_delivery.rs` is the suite for what a log-group target
 //! RECEIVES and which documents admit the write; this one is the suite for what a
-//! write that group refused is reported as.
+//! write that group refused is reported as, and
+//! `tests/all/log_group_target_batch_window_partition.rs` — which reuses the wiring
+//! and the readers below — is the suite for one BATCH whose entries fall on both
+//! sides of that window at once.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
@@ -58,29 +61,30 @@ const PUT_LOG_EVENTS: &str = "logs:PutLogEvents";
 /// The condition EventBridge names on a dead letter for a call whose parameters the
 /// target would not take, spelled out here rather than imported from the service so a
 /// wrong value in the service would fail this suite.
-const INVALID_PARAMETER: &str = "INVALID_PARAMETER";
+pub(crate) const INVALID_PARAMETER: &str = "INVALID_PARAMETER";
 
 /// The condition it names for a batch call the target answered without holding the
 /// event it carried. Spelled out for the same reason.
-const EVENTS_IN_BATCH_REQUEST_REJECTED: &str = "EVENTS_IN_BATCH_REQUEST_REJECTED";
+pub(crate) const EVENTS_IN_BATCH_REQUEST_REJECTED: &str = "EVENTS_IN_BATCH_REQUEST_REJECTED";
 
 /// The dead-letter attributes that account for a RETRIED delivery, and the two bounds
 /// either of which ends one (the members of `RetryPolicy`). Spelled out for the same
 /// reason.
-const RETRY_ATTEMPTS: &str = "RETRY_ATTEMPTS";
-const EXHAUSTED_RETRY_CONDITION: &str = "EXHAUSTED_RETRY_CONDITION";
-const MAXIMUM_RETRY_ATTEMPTS: &str = "MaximumRetryAttempts";
+pub(crate) const RETRY_ATTEMPTS: &str = "RETRY_ATTEMPTS";
+pub(crate) const EXHAUSTED_RETRY_CONDITION: &str = "EXHAUSTED_RETRY_CONDITION";
+pub(crate) const MAXIMUM_RETRY_ATTEMPTS: &str = "MaximumRetryAttempts";
 const MAXIMUM_EVENT_AGE: &str = "MaximumEventAgeInSeconds";
 
 /// The attributes a dead letter of a delivery nothing retried carries, and no others.
-const UNRETRIED_ATTRIBUTES: [&str; 4] = ["ERROR_CODE", "ERROR_MESSAGE", "RULE_ARN", "TARGET_ARN"];
+pub(crate) const UNRETRIED_ATTRIBUTES: [&str; 4] =
+    ["ERROR_CODE", "ERROR_MESSAGE", "RULE_ARN", "TARGET_ARN"];
 
 /// Seconds in one hour and in one day, the units the rows state a `Time` offset in.
-const HOUR: i64 = 60 * 60;
-const DAY: i64 = 24 * HOUR;
+pub(crate) const HOUR: i64 = 60 * 60;
+pub(crate) const DAY: i64 = 24 * HOUR;
 
 /// The `detail` every event below carries.
-const DETAIL: &str = r#"{"orderId":"A-1"}"#;
+pub(crate) const DETAIL: &str = r#"{"orderId":"A-1"}"#;
 
 /// One CloudWatch Logs call (`Logs_20140328`, awsJson1_1).
 async fn logs(emulator: &Emulator, operation: &str, body: &Value) -> (u16, Value) {
@@ -90,7 +94,7 @@ async fn logs(emulator: &Emulator, operation: &str, body: &Value) -> (u16, Value
 /// A log group called `name` carrying `retention_days` when the row states one, and a
 /// resource policy granting this service both calls the write is made of. Answers the
 /// ARN `DescribeLogGroups` reports for it, which is the ARN the target carries.
-async fn given_log_group(
+pub(crate) async fn given_log_group(
     emulator: &Emulator,
     case: &str,
     name: &str,
@@ -158,7 +162,7 @@ async fn given_log_group(
 }
 
 /// Every log event the group `group` holds, as `FilterLogEvents` reports them.
-async fn written(emulator: &Emulator, case: &str, group: &str) -> Vec<Value> {
+pub(crate) async fn written(emulator: &Emulator, case: &str, group: &str) -> Vec<Value> {
     let (status, body) = logs(emulator, "FilterLogEvents", &json!({ "logGroupName": group })).await;
     assert_eq!(
         status, 200,
@@ -200,7 +204,7 @@ async fn publish_at(emulator: &Emulator, case: &str, at: i64) -> String {
 
 /// Now, in the epoch seconds an `awsJson1_1` timestamp carries, read off the same
 /// clock the services stamp their own records with — so no row depends on a date.
-fn epoch_now() -> i64 {
+pub(crate) fn epoch_now() -> i64 {
     let now = ::std::time::SystemTime::now()
         .duration_since(::std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -210,15 +214,26 @@ fn epoch_now() -> i64 {
 
 /// The value of the `name` message attribute of `message`, or `None` when it carries
 /// none.
-fn attribute(message: &Value, name: &str) -> Option<String> {
+pub(crate) fn attribute(message: &Value, name: &str) -> Option<String> {
     message["MessageAttributes"][name]["StringValue"]
         .as_str()
         .map(ToString::to_string)
 }
 
+/// The names of every message attribute `message` carries, sorted — which is what an
+/// assertion about the attributes a dead letter carries AND CARRIES NO OTHERS reads.
+pub(crate) fn attribute_names(message: &Value) -> Vec<String> {
+    let mut names: Vec<String> = message["MessageAttributes"]
+        .as_object()
+        .map(|attributes| attributes.keys().cloned().collect())
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
 /// The sentence EventBridge words for a `putLogEvents` it could not complete, whose
 /// one variable part is the name of the group the target names.
-fn put_log_events_failure(group: &str) -> String {
+pub(crate) fn put_log_events_failure(group: &str) -> String {
     format!("Could not complete putLogEvents call for {group}.")
 }
 
@@ -254,7 +269,7 @@ async fn given_wiring(
 
 /// What the delivery of one row must come to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Expected {
+pub(crate) enum Expected {
     /// The group held the event, so nothing is dead-lettered.
     Written,
     /// One dead letter under this condition.
@@ -426,10 +441,7 @@ async fn a_refused_log_group_write_is_dead_lettered_in_eventbridges_own_vocabula
         // retries at all and carries those four attributes and no others; the
         // retryable one is retried under the policy and names both.
         if expected_code == INVALID_PARAMETER {
-            let carried: Vec<String> = message["MessageAttributes"]
-                .as_object()
-                .map(|attributes| attributes.keys().cloned().collect())
-                .unwrap_or_default();
+            let carried = attribute_names(message);
             assert_eq!(
                 carried.len(),
                 UNRETRIED_ATTRIBUTES.len(),
