@@ -3131,3 +3131,283 @@ async fn a_submitted_job_run_is_observable_in_flight_past_a_client_poll_interval
         );
     }
 }
+
+/// The milliseconds one second of a reported epoch-seconds timestamp holds.
+///
+/// Every timestamp member of every shape this API reports targets `Date`, a bare
+/// `timestamp` carrying no `@timestampFormat` of its own
+/// (`smithy_query(query="shape",shape="Date")`), and this service speaks restJson1
+/// (`smithy_query(query="service_info")`), so each one travels in that protocol's default
+/// form — an epoch-seconds NUMBER whose sub-second part is at most three fractional
+/// digits. The resolution is written out here rather than read from `crate::state`, so a
+/// finer one in `src/` cannot make this suite pass.
+const REPORTED_MILLIS_PER_SECOND: f64 = 1_000.0;
+
+/// How far from a whole millisecond a reported epoch-seconds number may land.
+///
+/// A binary `f64` holding an instant of the present era is exact to well under a
+/// thousandth of a millisecond, while a reading carried at microsecond resolution or
+/// finer lands tenths of a millisecond away from one — so this admits the former and
+/// rejects the latter.
+const MILLISECOND_TOLERANCE: f64 = 0.01;
+
+/// The six instants `JobRun` reports: `createdAt` and `updatedAt`, which are `@required`,
+/// the attempt-scoped pair, and the two the run's own lifecycle fills in.
+///
+/// Source: `smithy_query(query="shape",shape="JobRun")`.
+const JOB_RUN_INSTANTS: &[&str] = &[
+    "createdAt",
+    "updatedAt",
+    "startedAt",
+    "endedAt",
+    "attemptCreatedAt",
+    "attemptUpdatedAt",
+];
+
+/// The instants `JobRunSummary` reports, which are the stored run's own.
+const JOB_RUN_SUMMARY_INSTANTS: &[&str] = &[
+    "createdAt",
+    "updatedAt",
+    "attemptCreatedAt",
+    "attemptUpdatedAt",
+];
+
+/// `reported`, asserted to be an instant as this service reports one: a positive
+/// epoch-seconds number carrying a whole number of milliseconds and nothing finer.
+/// Answers the seconds it names, so a caller can order two of them.
+fn reported_instant(case: &str, label: &str, reported: &Value) -> f64 {
+    let seconds = reported.as_f64().unwrap_or_else(|| {
+        panic!("case {case:?}: {label} must be an epoch-seconds number, got {reported:?}")
+    });
+    assert!(
+        seconds.is_finite() && seconds > 0.0,
+        "case {case:?}: {label} must name an instant after the epoch, got {reported:?}"
+    );
+    let millis = seconds * REPORTED_MILLIS_PER_SECOND;
+    assert!(
+        (millis - millis.round()).abs() < MILLISECOND_TOLERANCE,
+        "case {case:?}: {label} must carry no resolution finer than a millisecond, got \
+         {reported:?}"
+    );
+    seconds
+}
+
+/// The application once it reports `state`, which the clock owes it — polled for the
+/// CONDITION rather than waited out, and panicking only past [`JOB_RUN_REST_DEADLINE`].
+async fn application_in_state(
+    router: &MultiServiceRouter,
+    application_id: &str,
+    state: &str,
+) -> Answer {
+    let deadline = Instant::now() + JOB_RUN_REST_DEADLINE;
+    loop {
+        let answer = get_application(router, application_id).await;
+        if answer.at("/application/state").as_str() == Some(state) {
+            return answer;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "application {application_id} never reached {state}, last saw {:?}",
+            answer.at("/application/state")
+        );
+        tokio::time::sleep(JOB_RUN_REST_POLL).await;
+    }
+}
+
+/// The same, for the session a start left behind.
+async fn session_in_state(
+    router: &MultiServiceRouter,
+    application_id: &str,
+    session_id: &str,
+    state: &str,
+) -> Answer {
+    let deadline = Instant::now() + JOB_RUN_REST_DEADLINE;
+    loop {
+        let answer = super::session_lifecycle::get_session(router, application_id, session_id).await;
+        if answer.at("/session/state").as_str() == Some(state) {
+            return answer;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "session {session_id} never reached {state}, last saw {:?}",
+            answer.at("/session/state")
+        );
+        tokio::time::sleep(JOB_RUN_REST_POLL).await;
+    }
+}
+
+/// RULE: every instant this service records is reported at the resolution its wire
+/// timestamp form carries — epoch seconds at MILLISECOND resolution — however fine the
+/// reading of the host clock it came from was, and a read reports the same value again.
+///
+/// The rows span what the rule generalises over: the SHAPE the instant is reported on
+/// (`Application`, `ApplicationSummary`, `JobRun`, `JobRunSummary`, `Session`), the MEMBER
+/// (the creation instant, the update instant, the attempt-scoped pair, the instant a run
+/// moved to `RUNNING`, the instant it was terminated, the instant a session has been idle
+/// from), and WHERE the instant came from (the call that stored it, a transition the clock
+/// owed, and the instant the run's own execution answered at).
+#[tokio::test]
+async fn every_reported_instant_carries_at_most_millisecond_resolution() {
+    use super::session_lifecycle::{minimal_session, session_application, start_session};
+
+    let router = emulator();
+
+    // An application: the instant its create stored, and the instant the transition the
+    // clock owed it moved it on.
+    let created = create_application(&router, minimal_create("tok-millis")).await;
+    assert_eq!(
+        created.status, 200,
+        "case a created application: CreateApplication expected 200, got {} with {:?}",
+        created.status, created.body
+    );
+    let application_id = created
+        .at("/applicationId")
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let settled = application_in_state(&router, &application_id, "CREATED").await;
+    let application_created_at = reported_instant(
+        "a created application",
+        "createdAt",
+        &settled.at("/application/createdAt"),
+    );
+    reported_instant(
+        "a created application",
+        "updatedAt",
+        &settled.at("/application/updatedAt"),
+    );
+
+    start_application(&router, &application_id).await;
+    let running = application_in_state(&router, &application_id, "STARTED").await;
+    let application_updated_at = reported_instant(
+        "an application the clock has started",
+        "updatedAt",
+        &running.at("/application/updatedAt"),
+    );
+    assert!(
+        application_updated_at >= application_created_at,
+        "case an application the clock has started: updatedAt {application_updated_at} must \
+         be at or after createdAt {application_created_at}"
+    );
+
+    // ... and the listing's summary reports those same stored instants, not a fresh
+    // reading of the clock. This emulator holds exactly the one application so far.
+    let listed = list_applications(&router, "").await;
+    for member in ["createdAt", "updatedAt"] {
+        let summarised = listed.at(&format!("/applications/0/{member}"));
+        reported_instant("an application summary", member, &summarised);
+        assert_eq!(
+            summarised,
+            running.at(&format!("/application/{member}")),
+            "case an application summary: {member} must be the stored instant, got \
+             {summarised:?}"
+        );
+    }
+
+    // A job run: the instants its submit stored and the ones its own lifecycle filled in,
+    // read once it has come to rest.
+    let submitted = start_job_run(&router, &application_id, minimal_job_run("job-millis")).await;
+    let job_run_id = submitted
+        .at("/jobRunId")
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let accepted = get_job_run(&router, &application_id, &job_run_id).await;
+    for member in ["createdAt", "updatedAt", "attemptCreatedAt", "attemptUpdatedAt"] {
+        reported_instant(
+            "a submitted job run",
+            member,
+            &accepted.at(&format!("/jobRun/{member}")),
+        );
+    }
+
+    let rested = settled_job_run(&router, &application_id, &job_run_id).await;
+    let mut instants: BTreeMap<&str, f64> = BTreeMap::new();
+    for member in JOB_RUN_INSTANTS {
+        instants.insert(
+            member,
+            reported_instant(
+                "a job run that has come to rest",
+                member,
+                &rested.at(&format!("/jobRun/{member}")),
+            ),
+        );
+    }
+    // The order the lifecycle puts them in survives being reported at this resolution:
+    // `startedAt` is "the date and time when the job moved to the RUNNING state" and
+    // `endedAt` "when the job was terminated", so neither precedes the submit.
+    assert!(
+        instants["createdAt"] <= instants["startedAt"]
+            && instants["startedAt"] <= instants["endedAt"],
+        "case a job run that has come to rest: expected createdAt <= startedAt <= endedAt, \
+         got {instants:?}"
+    );
+
+    // A read reports the same values again — the instants are stored, not re-derived.
+    let again = get_job_run(&router, &application_id, &job_run_id).await;
+    for member in JOB_RUN_INSTANTS {
+        assert_eq!(
+            again.at(&format!("/jobRun/{member}")),
+            rested.at(&format!("/jobRun/{member}")),
+            "case a job run read twice: {member} must not move, got {:?} then {:?}",
+            rested.at(&format!("/jobRun/{member}")),
+            again.at(&format!("/jobRun/{member}"))
+        );
+    }
+
+    // ... and so does the listing's summary of that run.
+    let listed_runs = list_job_runs(&router, &application_id, "").await;
+    let summaries = listed_runs
+        .body
+        .get("jobRuns")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let summary = summaries
+        .iter()
+        .find(|entry| entry["id"].as_str() == Some(job_run_id.as_str()))
+        .unwrap_or_else(|| {
+            panic!("case a job run summary: the listing must report run {job_run_id}")
+        });
+    for member in JOB_RUN_SUMMARY_INSTANTS {
+        let summarised = summary[*member].clone();
+        reported_instant("a job run summary", member, &summarised);
+        assert_eq!(
+            summarised,
+            rested.at(&format!("/jobRun/{member}")),
+            "case a job run summary: {member} must be the stored instant, got {summarised:?}"
+        );
+    }
+
+    // A session, whose instants the same conversion stamps: the ones its start stored, and
+    // the ones the clock owed it when it came up.
+    let (session_application_id, _arn) = session_application(&router, "tok-millis-session").await;
+    let session = start_session(
+        &router,
+        &session_application_id,
+        minimal_session("sess-millis"),
+    )
+    .await;
+    let session_id = session
+        .at("/sessionId")
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let submitted_session =
+        super::session_lifecycle::get_session(&router, &session_application_id, &session_id).await;
+    for member in ["createdAt", "updatedAt"] {
+        reported_instant(
+            "a submitted session",
+            member,
+            &submitted_session.at(&format!("/session/{member}")),
+        );
+    }
+    let live = session_in_state(&router, &session_application_id, &session_id, "STARTED").await;
+    for member in ["createdAt", "updatedAt", "startedAt", "idleSince"] {
+        reported_instant(
+            "a session the clock has started",
+            member,
+            &live.at(&format!("/session/{member}")),
+        );
+    }
+}

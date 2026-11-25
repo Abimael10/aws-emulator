@@ -294,7 +294,7 @@ pub fn driver_log_text(record: &JobRunRecord) -> String {
         ),
     ];
     for event in &record.log_events {
-        let at = DateTime::from(event.at)
+        let at = crate::state::now_timestamp(event.at)
             .fmt(::aws_smithy_types::date_time::Format::DateTime)
             .unwrap_or_default();
         let level = level_for(&event.state);

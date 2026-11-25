@@ -857,7 +857,7 @@ impl JobRunRecord {
             let Some(pending) = self.pending.pop_front() else {
                 break;
             };
-            let at = DateTime::from(pending.due);
+            let at = now_timestamp(pending.due);
             // The total time the run spent QUEUED is closed as it LEAVES that state:
             // `queuedDurationMilliseconds` is "the total time for a job in the QUEUED state
             // in milliseconds", so it is the span between the two due instants rather than
@@ -1014,7 +1014,7 @@ impl SessionRecord {
             if now < pending.due {
                 return None;
             }
-            let at = DateTime::from(pending.due);
+            let at = now_timestamp(pending.due);
             self.session.state = pending.state;
             if let Some(details) = pending.state_details {
                 self.session.state_details = details;
@@ -1119,7 +1119,7 @@ impl ApplicationRecord {
                 if let Some(details) = pending.state_details.as_ref() {
                     self.application.state_details = Some(details.clone());
                 }
-                self.application.updated_at = DateTime::from(pending.due);
+                self.application.updated_at = now_timestamp(pending.due);
                 if self.application.state == "STARTED" {
                     // The application came up at the due instant, so that is the instant
                     // from which it has been idle: the span `autoStopConfiguration`
@@ -1154,7 +1154,7 @@ impl ApplicationRecord {
             if now >= due {
                 self.application.state = "STOPPED".to_string();
                 self.application.state_details = Some(AUTO_STOPPED_STATE_DETAILS.to_string());
-                self.application.updated_at = DateTime::from(due);
+                self.application.updated_at = now_timestamp(due);
             }
         }
     }
@@ -2296,9 +2296,33 @@ pub fn session_id_invalid() -> ValidationException {
     }
 }
 
-/// Now, as the wire timestamp type every modelled timestamp member uses.
+/// An instant — `now`, or one the clock owed — as the wire timestamp every modelled
+/// timestamp member of this API reports it as: epoch seconds at MILLISECOND resolution.
+///
+/// Every timestamp member here targets `Date`, a bare `timestamp` with no
+/// `@timestampFormat` of its own (`smithy_query(query="shape",shape="Date")`), so it
+/// travels in this protocol's default form — an epoch-seconds NUMBER — and that form
+/// carries no finer resolution than a millisecond: an instant with no sub-second part is
+/// a bare integer, and one with a sub-second part carries at most three fractional
+/// digits. The host clock ticks finer than that, so the reading a clock offers and the
+/// timestamp a member reports are not the same resolution, and the ONE conversion
+/// between them lives here rather than in each record's projection: a handler or a
+/// settle records the result and every read of that record reports the same value.
+///
+/// Truncation, never rounding: the millisecond an instant falls in is the one it is
+/// reported in, so a reported timestamp never names an instant that has not happened
+/// yet, and reporting two instants never reverses their order. Converting an
+/// already-reported value again changes nothing, so a timestamp derived from one is
+/// stable too. An instant before the epoch, which only a clock set before 1970 could
+/// produce, is reported as the epoch rather than panicking.
+#[must_use]
 pub fn now_timestamp(now: SystemTime) -> DateTime {
-    DateTime::from(now)
+    let millis = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|since_epoch| i64::try_from(since_epoch.as_millis()).ok())
+        .unwrap_or_default();
+    DateTime::from_millis(millis)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -2310,4 +2334,90 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsEmrserverlessAwstoledowebserviceState>)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RULE: a reported instant carries at most millisecond resolution, and the
+    /// milliseconds it carries are the instant's own — whatever the host clock it was read
+    /// off ticks at.
+    #[test]
+    fn a_reported_instant_carries_milliseconds() {
+        // The rows span what the rule generalises over: the epoch itself, a whole second,
+        // a whole millisecond, and the sub-millisecond ticks a host clock offers but no
+        // timestamp of this wire carries.
+        let cases = [
+            ("the epoch", Duration::from_secs(0), 0, 0),
+            (
+                "a whole second",
+                Duration::from_secs(1_700_000_000),
+                1_700_000_000,
+                0,
+            ),
+            (
+                "a whole millisecond",
+                Duration::from_millis(1_700_000_000_123),
+                1_700_000_000,
+                123_000_000,
+            ),
+            (
+                "a microsecond past a millisecond",
+                Duration::from_micros(1_700_000_000_123_456),
+                1_700_000_000,
+                123_000_000,
+            ),
+            (
+                "a nanosecond past a millisecond",
+                Duration::from_nanos(1_700_000_000_123_456_789),
+                1_700_000_000,
+                123_000_000,
+            ),
+        ];
+        for (case, since_epoch, expected_secs, expected_nanos) in cases {
+            let reported = now_timestamp(SystemTime::UNIX_EPOCH + since_epoch);
+            assert_eq!(
+                reported.secs(),
+                expected_secs,
+                "case {case:?}: expected {expected_secs} epoch seconds, got {reported:?}"
+            );
+            assert_eq!(
+                reported.subsec_nanos(),
+                expected_nanos,
+                "case {case:?}: expected {expected_nanos} subsecond nanoseconds, got \
+                 {reported:?}"
+            );
+        }
+    }
+
+    /// RULE: reporting an instant that has already been reported changes nothing, so a
+    /// timestamp this service derives from one it stored keeps its value.
+    #[test]
+    fn reporting_a_reported_instant_is_stable() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_nanos(1_700_000_000_987_654_321);
+        let once = now_timestamp(at);
+        let twice = now_timestamp(SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_987));
+        assert_eq!(
+            (twice.secs(), twice.subsec_nanos()),
+            (once.secs(), once.subsec_nanos()),
+            "expected a reported instant to be stable under a second reporting, got \
+             {twice:?} instead of {once:?}"
+        );
+    }
+
+    /// RULE: a span the clock owes keeps its whole length through the conversion, so a
+    /// transition due a fixed span after a call is reported exactly that far after it.
+    #[test]
+    fn a_due_instant_keeps_its_span_from_the_instant_it_was_scheduled_at() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_nanos(1_700_000_000_123_456_789);
+        let scheduled = now_timestamp(now);
+        let due = now_timestamp(due_at(now, JOB_RUN_STAGE_TRANSITION));
+        let span = due.as_secs_f64() - scheduled.as_secs_f64();
+        assert!(
+            (span - JOB_RUN_STAGE_TRANSITION.as_secs_f64()).abs() < 1e-6,
+            "expected the reported span to be {:?}, got {span} seconds",
+            JOB_RUN_STAGE_TRANSITION
+        );
+    }
 }
