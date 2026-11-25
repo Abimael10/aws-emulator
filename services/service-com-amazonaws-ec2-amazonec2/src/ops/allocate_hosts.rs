@@ -5,6 +5,21 @@
 //! [`crate::state`], where every describe of a host reads them back. This is the ONLY
 //! file to touch for this operation.
 //!
+//! A host is allocated either in the signed Region or on an Outpost of it: `OutpostArn`
+//! names that Outpost and `AssetIds` the hardware assets of it to allocate on — one host
+//! per asset, each carrying the asset it sits on — so a caller that has an Outpost can put
+//! Amazon EC2 capacity on its hardware, which is what the Outposts service reports as
+//! running on that Outpost.
+//!
+//! What this operation does NOT check about an Outpost: whether it EXISTS. An Outpost is
+//! hardware Amazon Web Services installs in the customer's facility and no operation of
+//! this service creates one, so this store holds no Outpost inventory and no asset
+//! inventory either: `OutpostArn` is held to the form of an Outpost of this Region and
+//! account ([`crate::state::outpost_id_of_arn_in_region`]) and `AssetIds` to the shape of
+//! the list the model documents, and both are then stored as the reference the caller
+//! supplied. The service that owns the hardware answers what is installed on it and what
+//! runs there.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -178,7 +193,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{
             availability_zones_in_region, host_limit_exceeded, host_payload_bytes,
             instance_family_is_modelled, instance_family_of, instance_type_is_modelled,
-            invalid_request, request_region, require_service_state, system_time_to_date_time,
+            invalid_request, outpost_id_of_arn_in_region, request_region, require_service_state,
+            system_time_to_date_time,
             tag_list_bytes, tags_from_specifications, unsupported_host_instance_family,
             unsupported_host_instance_type, ALLOWS_MULTIPLE_INSTANCE_TYPES_OFF,
             ALLOWS_MULTIPLE_INSTANCE_TYPES_ON, AMD_SEV_SNP_DISABLED,
@@ -289,43 +305,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // "This parameter is supported only if you specify OutpostArn"
-        // (`AllocateHostsRequest$AssetIds`), and an Outpost is hardware AWS installs in a
-        // customer's own facility: no operation of this service creates one, so an ARN or
-        // an asset id a caller names here can only name an Outpost the account does not
-        // have. The value is refused rather than ignored and answered with a host in the
-        // Region instead.
-        if let Some(outpost_arn) = input.outpost_arn.as_deref() {
-            return Err(Scaffolded::invalid_parameter_value(format!(
-                "Invalid value '{outpost_arn}' for outpostArn. \
-                 This account holds no such Outpost"
+        // "The Amazon Resource Name (ARN) of the Amazon Web Services Outpost on which to
+        // allocate the Dedicated Host […] If you are allocating the Dedicated Host in a
+        // Region, omit this parameter" (`AllocateHostsRequest$OutpostArn`): a host is
+        // allocated either in the Region or on an Outpost of it, and the ARN is the one
+        // member that says which. A value that is no ARN of an Outpost of THIS Region and
+        // account could name no Outpost a host of this account could sit on
+        // ([`crate::state::outpost_id_of_arn_in_region`]), so it is refused rather than
+        // ignored and answered with a host in the Region instead.
+        let outpost_arn = match input.outpost_arn.as_deref() {
+            Some(outpost_arn)
+                if outpost_id_of_arn_in_region(outpost_arn, &region).is_none() =>
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{}' for outpostArn. \
+                     It must be the ARN of an Outpost of this Region",
+                    crate::state::echoed_resource_id(outpost_arn)
+                )));
+            }
+            held => held.map(str::to_string),
+        };
+        // "The IDs of the Outpost hardware assets on which to allocate the Dedicated
+        // Hosts […] This parameter is supported only if you specify OutpostArn. If you are
+        // allocating the Dedicated Hosts in a Region, omit this parameter"
+        // (`AllocateHostsRequest$AssetIds`): naming hardware without naming the Outpost it
+        // is installed in asks for a host on no Outpost at all, which is the request being
+        // invalid rather than something to answer with a host in the Region.
+        //
+        // Every value the list carries is a value the caller sent, so none is dropped: an
+        // empty one names no hardware asset, and one named twice asks for two hosts on one
+        // asset where "Amazon EC2 allocates a Dedicated Host on each specified hardware
+        // asset" allocates one — each is refused rather than silently reducing the batch
+        // the caller asked for.
+        // One Dedicated Host is allocated on each asset named, and this emulator stores at
+        // most [`MAX_STORED_DEDICATED_HOSTS`] hosts, so a list naming more assets than that
+        // asks for a batch the store could never hold. It is refused HERE, off the length of
+        // the list the request carries and before anything reads, copies or walks it, so no
+        // length of request can make this call do that work.
+        let named_assets = input.asset_ids.as_deref().unwrap_or_default();
+        if named_assets.len() > MAX_STORED_DEDICATED_HOSTS {
+            return Err(host_limit_exceeded(format!(
+                "This emulator holds at most {MAX_STORED_DEDICATED_HOSTS} Dedicated Hosts, \
+                 so it cannot allocate one on each of {} hardware assets",
+                named_assets.len()
             )));
         }
-        if let Some(asset_id) = input.asset_ids.iter().flatten().next() {
+        let asset_ids: Vec<String> = named_assets.to_vec();
+        if let Some(asset_id) = asset_ids.first().filter(|_| outpost_arn.is_none()) {
             return Err(Scaffolded::invalid_parameter_value(format!(
-                "Invalid value '{asset_id}' for assetId. \
-                 assetIds is supported only together with outpostArn, \
-                 and this account holds no Outpost"
+                "Invalid value '{}' for assetId. \
+                 assetIds is supported only together with outpostArn",
+                crate::state::echoed_resource_id(asset_id)
             )));
+        }
+        // The assets named so far, so the walk costs one lookup per entry rather than a
+        // second walk of the list.
+        let mut named: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+        for asset_id in &asset_ids {
+            if asset_id.is_empty() {
+                return Err(Scaffolded::invalid_parameter_value(
+                    "Invalid value '' for assetId. It must name a hardware asset of the Outpost",
+                ));
+            }
+            if !named.insert(asset_id.as_str()) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{}' for assetId. \
+                     One Dedicated Host is allocated on each asset named, \
+                     so an asset may be named only once",
+                    crate::state::echoed_resource_id(asset_id)
+                )));
+            }
         }
 
         // "The number of Dedicated Hosts to allocate to your account with these
-        // parameters" (`AllocateHostsRequest$Quantity`). It may be omitted only when
-        // `AssetIds` names the hardware to allocate on, which is refused above, so a
-        // request reaching here has to carry it — and a count below one allocates nothing,
-        // which is not something to answer with an empty success.
-        let Some(requested_quantity) = input.quantity else {
-            return Err(Scaffolded::missing_parameter(
-                "quantity must be specified: it is the number of Dedicated Hosts to allocate",
-            ));
-        };
-        let Some(quantity) = usize::try_from(requested_quantity)
-            .ok()
-            .filter(|count| *count > 0)
-        else {
-            return Err(Scaffolded::invalid_parameter_value(format!(
-                "Invalid value '{requested_quantity}' for quantity. It must be at least 1"
-            )));
+        // parameters" (`AllocateHostsRequest$Quantity`), and a count below one allocates
+        // nothing, which is not something to answer with an empty success.
+        //
+        // "If you are allocating the Dedicated Hosts on an Outpost, and you specify
+        // AssetIds, you can omit this parameter. In this case, Amazon EC2 allocates a
+        // Dedicated Host on each specified hardware asset. If you specify both AssetIds
+        // and Quantity, then the value that you specify for Quantity must be equal to the
+        // number of asset IDs specified" (`$Quantity`): the hardware named is then what
+        // says how many hosts there are, so a count beside it that says anything else is a
+        // value that cannot hold given the other member's
+        // ([`crate::state::invalid_parameter_combination`]).
+        let quantity = match (input.quantity, asset_ids.len()) {
+            (None, 0) => {
+                return Err(Scaffolded::missing_parameter(
+                    "quantity must be specified: it is the number of Dedicated Hosts to allocate",
+                ))
+            }
+            (None, assets) => assets,
+            (Some(requested_quantity), assets) => {
+                let Some(quantity) = usize::try_from(requested_quantity)
+                    .ok()
+                    .filter(|count| *count > 0)
+                else {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{requested_quantity}' for quantity. It must be at least 1"
+                    )));
+                };
+                if assets > 0 && quantity != assets {
+                    return Err(crate::state::invalid_parameter_combination(format!(
+                        "Invalid value '{requested_quantity}' for quantity. \
+                         It must be equal to the number of asset IDs specified ({assets})"
+                    )));
+                }
+                quantity
+            }
         };
 
         // "The tags to apply to the Dedicated Host during creation"
@@ -369,11 +456,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_else(|| AMD_SEV_SNP_DISABLED.to_string());
 
         // The caller-chosen bytes ONE host of this batch retains for the process's
-        // lifetime: its tags and the client token the token map keeps, counted by the ONE
-        // definition of that charge ([`host_payload_bytes`], asserted below against each
-        // record this call stores).
-        let bytes_per_host =
-            tag_list_bytes(&tags).saturating_add(input.client_token.as_deref().map_or(0, str::len));
+        // lifetime, less the hardware asset it is allocated on: its tags, the client
+        // token the token map keeps, and the Outpost ARN it reports — every host of the
+        // batch carries that one, so it is charged per host. Counted by the ONE definition
+        // of that charge ([`host_payload_bytes`], asserted below against each record this
+        // call stores).
+        let shared_bytes_per_host = tag_list_bytes(&tags)
+            .saturating_add(input.client_token.as_deref().map_or(0, str::len))
+            .saturating_add(outpost_arn.as_deref().map_or(0, str::len));
+        // The asset id ONE host of this batch carries, which is caller-chosen text the
+        // record keeps: the hosts of one batch are allocated on DIFFERENT assets, so each is
+        // charged its own and a host allocated on no named asset carries none.
+        let bytes_of_asset = |index: usize| {
+            asset_ids
+                .get(index)
+                .map_or(0, |asset_id: &String| asset_id.len())
+        };
+        // What those asset ids cost the batch together — summed over the ASSETS NAMED,
+        // never over the count, so no quantity a request carries can make this walk.
+        let bytes_of_assets = asset_ids
+            .iter()
+            .map(String::len)
+            .fold(0usize, usize::saturating_add);
 
         let state = require_service_state(&*self.engine)?;
         let mut store = state.lock();
@@ -401,9 +505,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What the whole batch costs the byte budget: the caller-chosen bytes of each host
         // plus the fixed overhead the store charges per record, so the gate asks for exactly
         // what the inserts below charge and a batch of hosts carrying no tags is not free.
-        let payload_bytes = bytes_per_host
+        let payload_bytes = shared_bytes_per_host
             .saturating_add(STORED_RECORD_OVERHEAD_BYTES)
-            .saturating_mul(quantity);
+            .saturating_mul(quantity)
+            .saturating_add(bytes_of_assets);
         if replayed.is_none() && store.would_exceed_stored_bytes(payload_bytes) {
             return Err(host_limit_exceeded(format!(
                 "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
@@ -423,7 +528,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let allocation_time = system_time_to_date_time(::std::time::SystemTime::now());
         let owner_id = ::engine::emulator_account_id().to_string();
         let mut host_ids: Vec<String> = Vec::with_capacity(quantity);
-        for _ in 0..quantity {
+        for index in 0..quantity {
             let host_id = store.next_id("h");
             let host = Host {
                 host_id: Some(host_id),
@@ -489,10 +594,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // A host resource group is created through Resource Groups, not through
                 // EC2, so no host this emulator allocates is a member of one.
                 member_of_service_linked_resource_group: Some(false),
-                // An Outpost host is one allocated on an Outpost, which a request naming
-                // one is refused for above.
-                outpost_arn: None,
-                asset_id: None,
+                // "The Amazon Resource Name (ARN) of the Amazon Web Services Outpost on
+                // which the Dedicated Host is allocated" (`Host$OutpostArn`) and "the ID of
+                // the Outpost hardware asset on which the Dedicated Host is allocated"
+                // (`$AssetId`): the Outpost the request named, and — where it named the
+                // hardware to allocate on — the one asset THIS host of the batch is
+                // allocated on, "a Dedicated Host on each specified hardware asset"
+                // (`$AssetIds`). A host allocated in the Region is on neither.
+                outpost_arn: outpost_arn.clone(),
+                asset_id: asset_ids.get(index).cloned(),
                 cpu_options: Some(HostCpuOptions {
                     amd_sev_snp: Some(amd_sev_snp.clone()),
                 }),
@@ -500,7 +610,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The bytes each record retains are charged at the insert, so no path can store
             // them uncharged — and the batch gate above asked for exactly this many per
             // host.
-            debug_assert_eq!(host_payload_bytes(&host), bytes_per_host);
+            debug_assert_eq!(
+                host_payload_bytes(&host),
+                shared_bytes_per_host.saturating_add(bytes_of_asset(index))
+            );
             // The insert enforces the store's count ceiling for itself, so it can refuse —
             // which the batch gate above has already made room for, so a refusal here means
             // this handler and the store disagree rather than that the request was wrong.

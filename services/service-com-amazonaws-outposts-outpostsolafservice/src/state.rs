@@ -41,6 +41,7 @@ mod billing;
 mod capacity;
 mod catalog;
 mod conflicts;
+mod ec2_instances;
 mod lifecycle;
 mod quotes;
 mod store;
@@ -60,6 +61,7 @@ pub use catalog::{
     RACK_SCALING_TYPE_SINGLE_RACK, RACK_UNIT_HEIGHT_1U, RACK_UNIT_HEIGHT_2U, RACK_UNIT_HEIGHT_42U,
     SUPPORTED_STORAGE_EBS, SUPPORTED_STORAGE_S3,
 };
+pub use ec2_instances::{sync_ec2_outpost_instances, Ec2InstancesByOutpost};
 pub use store::ComAmazonawsOutpostsOutpostsolafserviceState;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -320,8 +322,8 @@ pub const BLOCKING_OUTPOST_ORDER_CANCELLABLE: &str = "OUTPOST_ORDER_CANCELLABLE"
 /// reported as, from the modelled enum's values.
 ///
 /// AWS documents that an Outpost's instances have to be gone before it can be
-/// decommissioned, and the store's record of an instance running on an Outpost is
-/// [`OutpostRecord::instances`] — so an Outpost that holds one blocks its own
+/// decommissioned, and which instances are running on an Outpost is
+/// [`OutpostRecord::running_instances`] — so an Outpost that holds one blocks its own
 /// decommission. See
 /// [`ComAmazonawsOutpostsOutpostsolafserviceState::blocking_resource_types`].
 pub const BLOCKING_EC2_INSTANCE: &str = "EC2_INSTANCE";
@@ -561,9 +563,9 @@ pub struct OutpostRecord {
     /// out names no unit of what went in and the page that resumes from it drops
     /// nothing.
     pub asset_sequence_base: u64,
-    /// The Amazon EC2 instances RUNNING on this Outpost — what
-    /// `ListBlockingInstancesForCapacityTask` weighs a capacity task against, and what
-    /// `ListAssetInstances` reports
+    /// The Amazon EC2 instances RUNNING on this Outpost that Amazon EC2 itself does not
+    /// hold — what `ListBlockingInstancesForCapacityTask` weighs a capacity task against,
+    /// and what `ListAssetInstances` reports, beside [`Self::ec2_instances`]
     /// — in the order they were recorded, which is the order a page of them is cut in
     /// ([`BLOCKING_INSTANCE_PAGE`], [`ASSET_INSTANCE_PAGE`]).
     ///
@@ -572,18 +574,37 @@ pub struct OutpostRecord {
     /// them under `/outposts/{OutpostIdentifier}/…`), so deleting the Outpost takes its
     /// instances with it.
     ///
-    /// An instance is launched through Amazon EC2 — `RunInstances` with the Outpost's
-    /// ARN — and not by any call in THIS API, so `CreateOutpost` leaves this empty and
-    /// nothing here is ever invented: it holds only the instances that were actually
-    /// recorded for the Outpost, exactly as [`OutpostRecord::assets`] holds only
-    /// recorded hardware, and an Outpost nobody has launched an instance on is reported
-    /// as having none.
+    /// An instance is launched through Amazon EC2 and not by any call in THIS API, so
+    /// `CreateOutpost` leaves this empty and nothing here is ever invented: an instance a
+    /// caller launches on this Outpost's hardware is one Amazon EC2 holds, and this service
+    /// reads it off that service's own answer ([`Self::ec2_instances`]) rather than keeping
+    /// a copy of it here. What this list is for is an instance running on the Outpost that
+    /// the Amazon EC2 store cannot express — one of ANOTHER account, or one an Amazon Web
+    /// Services service owns ([`AssetInstance::aws_service_name`]) — which the Outpost
+    /// reports exactly as it reports the hardware recorded on it.
     ///
     /// The modelled [`AssetInstance`] is the shape this service reports an instance as
     /// (`ListAssetInstances$AssetInstances`) and carries every member the narrower
     /// `BlockingInstance` projection does, so the two lists read ONE record of an
     /// instance rather than two copies of it.
     pub instances: Vec<AssetInstance>,
+    /// The Amazon EC2 instances Amazon EC2 holds as running on this Outpost's hardware: the
+    /// ones on the Dedicated Hosts allocated on the Outpost this record's own `OutpostArn`
+    /// names, as that service answers for them.
+    ///
+    /// DERIVED, and the one thing on this record that is: no request of this service writes
+    /// it, and `CreateOutpost` leaves it empty. It is recomputed wholesale from Amazon EC2's
+    /// own store at the seam every operation of this service reaches this store through
+    /// ([`sync_ec2_outpost_instances`]), so an instance that was launched, stopped or
+    /// terminated through Amazon EC2 is reported here exactly as that service holds it at
+    /// the instant this service answers — which is why it is held apart from
+    /// [`Self::instances`], the instances recorded on the Outpost itself, rather than mixed
+    /// into them where a refresh would drop them.
+    ///
+    /// Every report of what runs on this Outpost reads the two together, through the ONE
+    /// reading of that question ([`Self::running_instances`]), so no two operations can
+    /// answer it differently.
+    pub ec2_instances: Vec<AssetInstance>,
     /// The renewal contracts bought for this Outpost, in the order they were
     /// created.
     ///
@@ -637,6 +658,25 @@ impl OutpostRecord {
                 asset,
             )
         })
+    }
+
+    /// The Amazon EC2 instances running on this Outpost: the ones Amazon EC2 holds on the
+    /// Dedicated Hosts allocated on it ([`Self::ec2_instances`]) and the ones recorded on
+    /// the Outpost itself ([`Self::instances`]).
+    ///
+    /// The ONE reading of that question, so the two lists over an Outpost's instances, the
+    /// capacity a task is weighed against, and what blocks a delete or a decommission
+    /// cannot answer it differently. The instances recorded on the Outpost come first and
+    /// what Amazon EC2 holds after them, which is the order a page of them is cut in
+    /// ([`ASSET_INSTANCE_PAGE`], [`BLOCKING_INSTANCE_PAGE`]).
+    pub fn running_instances(&self) -> impl Iterator<Item = &AssetInstance> {
+        self.instances.iter().chain(self.ec2_instances.iter())
+    }
+
+    /// Whether any Amazon EC2 instance is running on this Outpost. See
+    /// [`Self::running_instances`].
+    pub fn runs_an_instance(&self) -> bool {
+        self.running_instances().next().is_some()
     }
 
     /// Record `form_factor` as this Outpost's hardware type, and with it the install
@@ -2496,12 +2536,23 @@ fn seed_nanos() -> u128 {
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.
+///
+/// Answering also refreshes every Outpost's record of the Amazon EC2 instances running on
+/// it from the store of the service that owns an instance
+/// ([`sync_ec2_outpost_instances`]), because that record is DERIVED rather than written by
+/// any request: this is the one seam every operation of this service reaches the store
+/// through, so refreshing it here is what makes each of them — the two lists over an
+/// Outpost's instances, the capacity a task is weighed against, and what blocks a delete or
+/// a decommission — answer from what Amazon EC2 holds at the instant it is served, and
+/// never from a projection a writer left behind.
 pub fn service_state<Eng: Send + Sync + 'static>(
     engine: &Eng,
 ) -> Option<::engine::ServiceState<ComAmazonawsOutpostsOutpostsolafserviceState>> {
-    (engine as &dyn ::std::any::Any)
+    let state = (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
-        .map(::engine::InMemoryEngine::state::<ComAmazonawsOutpostsOutpostsolafserviceState>)
+        .map(::engine::InMemoryEngine::state::<ComAmazonawsOutpostsOutpostsolafserviceState>)?;
+    sync_ec2_outpost_instances(engine, &state);
+    Some(state)
 }
 
 /// The region to mint this request's ARNs in: the region of its SigV4 credential
@@ -4181,21 +4232,21 @@ pub const ASSET_PAGE: &str = "assets";
 /// The KIND a `ListBlockingInstancesForCapacityTask` page token is stamped with.
 ///
 /// What it pages through is what ONE capacity task of ONE Outpost would need
-/// stopped, cut out of that Outpost's own recorded order
-/// ([`OutpostRecord::instances`]) — so the stamp carries this kind together with
+/// stopped, cut out of that Outpost's own order of what runs on it
+/// ([`OutpostRecord::running_instances`]) — so the stamp carries this kind together with
 /// both resources the list is cut from ([`nested_page_kind`]). An instance is
 /// launched through Amazon EC2 and no call in this API adds one to that order,
-/// removes one from it or reorders it, so the n-th instance recorded on an Outpost
+/// removes one from it or reorders it, so the n-th instance running on an Outpost
 /// stays the n-th for as long as the Outpost holds it and the boundary such a token
 /// carries names that one instance. See [`ASSET_PAGE`].
 pub const BLOCKING_INSTANCE_PAGE: &str = "blockingInstances";
 
 /// The stamp a `ListAssetInstances` page token carries.
 ///
-/// What it pages through is every instance recorded as running on one Outpost,
+/// What it pages through is every instance running on one Outpost,
 /// belonging to all accounts and narrowed by its own four filters — a different
 /// list from the one `ListBlockingInstancesForCapacityTask` cuts out of the same
-/// recorded order ([`BLOCKING_INSTANCE_PAGE`]), which reports only one account's
+/// order ([`BLOCKING_INSTANCE_PAGE`]), which reports only one account's
 /// and drops what a capacity task excludes — so a token issued for one of them is
 /// not a boundary of the other, and the stamp carries this kind together with the
 /// Outpost the list was cut from ([`nested_page_kind`]). See [`ASSET_PAGE`].

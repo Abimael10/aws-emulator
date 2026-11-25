@@ -485,7 +485,7 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         let mut held_unstoppable: i64 = 0;
         for instance in record
             .iter()
-            .flat_map(|record| record.instances.iter())
+            .flat_map(|record| record.running_instances())
             .filter(|instance| in_scope(instance.asset_id.as_deref()))
         {
             let Some(&vcpus) = instance

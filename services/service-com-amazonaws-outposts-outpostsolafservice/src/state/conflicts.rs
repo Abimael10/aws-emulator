@@ -189,7 +189,7 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     /// * the members of the Outpost's OWN record, which are attributes of the
     ///   Outpost rather than work on it and go away with it: its private
     ///   connectivity configuration, its renewal pricing, its installed assets and
-    ///   the instances recorded as running on it. None has an identity outside the
+    ///   the instances running on it. None has an identity outside the
     ///   Outpost, so removing the Outpost leaves nothing of them behind to dangle.
     /// * an installation connection started for one of those assets, which is a
     ///   tunnel to hardware of this Outpost rather than work the service owes on it,
@@ -345,9 +345,11 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     ///
     /// * [`BLOCKING_EC2_INSTANCE`] — an Amazon EC2 instance still running on the
     ///   Outpost, which AWS requires to be gone before an Outpost can be
-    ///   decommissioned. The store's record of such an instance is
-    ///   [`OutpostRecord::instances`]; an Outpost nobody has launched an instance on
-    ///   holds none, so it reports none. The instances a capacity task names in
+    ///   decommissioned. Which instances those are is
+    ///   [`OutpostRecord::running_instances`] — the instances Amazon EC2 holds on the
+    ///   Dedicated Hosts allocated on this Outpost, and the ones recorded on the Outpost
+    ///   itself; an Outpost nobody has launched an instance on holds none, so it reports
+    ///   none. The instances a capacity task names in
     ///   `InstancesToExclude` are the caller's own input and never a record of a
     ///   running instance.
     ///
@@ -376,7 +378,7 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         }
         let instance_running = self
             .outpost(region, outpost_id)
-            .is_some_and(|record| !record.instances.is_empty());
+            .is_some_and(OutpostRecord::runs_an_instance);
         if instance_running {
             blocking.insert(BLOCKING_EC2_INSTANCE.to_string());
         }

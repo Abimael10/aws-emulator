@@ -1,21 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBlockingInstancesForCapacityTask
-//! IMPLEMENTED: reports the Amazon EC2 instances recorded as running on the Outpost the
+//! IMPLEMENTED: reports the Amazon EC2 instances running on the Outpost the
 //! `OutpostIdentifier` names — resolved from either the bare id or the full ARN the
 //! modelled label pattern accepts — that the capacity task the route names would need
 //! stopped: the ones running on the hardware that task configures (the one asset it
 //! named, or every asset of the Outpost when it named none) and belonging to the
 //! account that initiated the task, less every instance that task's
-//! `InstancesToExclude` names, in the Outpost's own recorded order, cut into pages of at
+//! `InstancesToExclude` names, in the Outpost's own order, cut into pages of at
 //! most `MaxResults` with the modelled `NextToken` the next page resumes from.
 //!
-//! A read, and one that writes NOTHING: it answers from
-//! [`crate::state::OutpostRecord::instances`], so a caller that lists a task's blocking
-//! instances sees exactly what the next caller does. An instance is launched through
-//! Amazon EC2 against the Outpost and by no call in THIS API, so this operation invents
-//! none: an Outpost nobody has launched an instance on is answered with no blocking
-//! instance, exactly as `ListAssets` answers an Outpost with no installed hardware.
+//! A read, and one that writes NOTHING of its own: it answers from
+//! [`crate::state::OutpostRecord::running_instances`], so a caller that lists a task's
+//! blocking instances sees exactly what the next caller does. An instance is launched
+//! through Amazon EC2 and by no call in THIS API, so this operation invents none: what runs
+//! on the Outpost's hardware is what Amazon EC2 holds on the Dedicated Hosts allocated on
+//! that Outpost, read off that service's own store at this service's one store seam
+//! ([`crate::state::sync_ec2_outpost_instances`]), and an Outpost nobody has launched an
+//! instance on is answered with no blocking instance, exactly as `ListAssets` answers an
+//! Outpost with no installed hardware.
 //!
 //! ## Shape of an operation
 //!
@@ -217,10 +220,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let size = crate::state::page_size(input.max_results);
 
         // A read, so the guard is taken immutably: which instances are running on the
-        // Outpost and which the task excludes are both facts already recorded, not a
-        // transition the clock owes, so there is nothing here for this call to
-        // materialise and nothing for it to write. The task's STATUS is not part of
-        // this answer, so an unsettled progression cannot change what it reports.
+        // Outpost is a fact the service that owns an instance already holds — refreshed onto
+        // this Outpost's record at the store seam this handler reached the store through
+        // (`crate::state::service_state`) — and which the task excludes is one the task
+        // recorded, so there is nothing here for this call to materialise and nothing for it
+        // to write. The task's STATUS is not part of this answer, so an unsettled
+        // progression cannot change what it reports.
         let store = state.lock();
         // The list is nested under an Outpost
         // (`/outposts/{OutpostIdentifier}/capacity/{CapacityTaskId}/blockingInstances`),
@@ -250,16 +255,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `crate::state::ExcludedInstances`).
         let exclude = crate::state::ExcludedInstances::of(task.instances_to_exclude.as_ref());
         // The boundary this list pages on is an instance's place in the Outpost's own
-        // recorded order — the one `ListAssetInstances` pages that order by: no call in
-        // this API adds an instance to it, removes one from it or reorders it, so the
-        // n-th instance recorded on an Outpost stays that one instance. It is the place
-        // in the WHOLE recorded order, not in what this task's own selection leaves, so
-        // the boundary names the same instance whatever a page was narrowed to.
+        // order — the one `ListAssetInstances` pages that order by, and stable across reads
+        // for the reason stated there. It is the place in the WHOLE order, not in what this
+        // task's own selection leaves, so the boundary names the same instance whatever a
+        // page was narrowed to.
         let (blocking_instances, next_token) = crate::state::page(
             &stamp,
             record
-                .instances
-                .iter()
+                .running_instances()
                 .enumerate()
                 // Which instances a task would need stopped is the rule
                 // `crate::state::instance_can_be_stopped` states, and the same one
@@ -284,7 +287,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(ListBlockingInstancesForCapacityTaskOutput {
             // "A list of all running Amazon EC2 instances on the Outpost. Stopping one
             // or more of these instances can free up the capacity needed to run the
-            // capacity task": the ones recorded for this Outpost that this task would
+            // capacity task": the ones running on this Outpost that this task would
             // need stopped, which may be none at all.
             blocking_instances: Some(blocking_instances),
             next_token,
@@ -292,7 +295,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The `BlockingInstance` projection of a recorded instance.
+/// The `BlockingInstance` projection of one instance running on the Outpost.
 ///
 /// `BlockingInstance` is the narrower of the two shapes this service reports an instance
 /// as: it carries the three members of [`AssetInstance`] that identify the instance and

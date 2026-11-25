@@ -8,6 +8,9 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# Amazon EC2 owns an instance and the Dedicated Hosts an account's Outpost capacity is
+# allocated as, so what runs on an Outpost is read off that service's own store.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

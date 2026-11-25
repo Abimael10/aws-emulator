@@ -1,19 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAssetInstances
-//! IMPLEMENTED: reports the Amazon EC2 instances recorded as running on the Outpost the
+//! IMPLEMENTED: reports the Amazon EC2 instances running on the Outpost the
 //! `OutpostIdentifier` names — resolved from either the bare id or the full ARN the
 //! modelled label pattern accepts — belonging to ALL accounts, narrowed to the ones
-//! every `*Filter` the caller sent accepts, in the Outpost's own recorded order, cut
+//! every `*Filter` the caller sent accepts, in the Outpost's own order, cut
 //! into pages of at most `MaxResults` with the modelled `NextToken` the next page
 //! resumes from.
 //!
-//! A read, and one that writes NOTHING: it answers from
-//! [`crate::state::OutpostRecord::instances`], so a caller that lists an Outpost's asset
-//! instances sees exactly what the next caller does. An instance is launched through
-//! Amazon EC2 against the Outpost and by no call in THIS API, so this operation invents
-//! none: an Outpost nobody has launched an instance on is answered with no instance,
-//! exactly as `ListAssets` answers an Outpost with no installed hardware.
+//! A read, and one that writes NOTHING of its own: it answers from
+//! [`crate::state::OutpostRecord::running_instances`], so a caller that lists an Outpost's
+//! asset instances sees exactly what the next caller does. An instance is launched through
+//! Amazon EC2 and by no call in THIS API, so this operation invents none: what runs on the
+//! Outpost's hardware is the instances Amazon EC2 holds on the Dedicated Hosts allocated on
+//! that Outpost, read off that service's own store at this service's one store seam
+//! ([`crate::state::sync_ec2_outpost_instances`]), and an Outpost nobody has launched an
+//! instance on is answered with no instance, exactly as `ListAssets` answers an Outpost
+//! with no installed hardware.
 //!
 //! "Does not include Amazon EBS or Amazon S3 instances" needs no exclusion of its own:
 //! the modelled `AWSServiceName` enum an instance's owning service is drawn from
@@ -209,9 +212,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let size = crate::state::page_size(input.max_results);
 
         // A read, so the guard is taken immutably: which instances are running on the
-        // Outpost is a fact already recorded rather than a transition the clock owes, so
-        // there is nothing here for this call to materialise and nothing for it to
-        // write.
+        // Outpost is a fact the service that owns an instance already holds, refreshed onto
+        // this Outpost's record at the store seam this handler reached the store through
+        // (`crate::state::service_state`), so there is nothing here for this call to
+        // materialise and nothing for it to write.
         let store = state.lock();
         // The list is nested under an Outpost
         // (`/outposts/{OutpostIdentifier}/assetInstances`), so the parent is resolved
@@ -220,15 +224,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not of the bare id an ARN resolved to.
         let record = store.outpost(&region, &outpost_id).ok_or_else(not_found)?;
         // The boundary this list pages on is an instance's place in the Outpost's own
-        // recorded order: an instance is launched through Amazon EC2 and no call in
-        // this API adds one to that order, removes one from it or reorders it, so the
-        // n-th instance recorded on an Outpost stays that one instance and a boundary
-        // naming it names an instance rather than wherever a page happened to stop.
+        // order: the instances recorded on the Outpost, then the ones Amazon EC2 holds on
+        // its hardware in one stable order
+        // (`crate::state::Ec2InstancesByOutpost`), so two reads of one Outpost cut their
+        // pages at the same instance. What runs on an Outpost changes only when Amazon EC2
+        // launches an instance on it or takes one off its hardware — never by a call in
+        // this API — so a caller paging this list walks the instances that were running on
+        // the Outpost while it paged.
         let (asset_instances, next_token) = crate::state::page(
             &stamp,
             record
-                .instances
-                .iter()
+                .running_instances()
                 .enumerate()
                 .filter(|(_, instance)| matches_filters(instance, &input))
                 .map(|(position, instance)| (position as u64, instance.clone())),
@@ -238,7 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(ListAssetInstancesOutput {
             // "List of instances owned by all accounts on the Outpost": the ones
-            // recorded for this Outpost that match every filter, which may be none at
+            // running on this Outpost that match every filter, which may be none at
             // all.
             asset_instances: Some(asset_instances),
             next_token,

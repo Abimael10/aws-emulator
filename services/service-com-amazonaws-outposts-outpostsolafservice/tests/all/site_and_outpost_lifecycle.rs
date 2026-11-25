@@ -88,6 +88,15 @@ pub(crate) struct Outposts {
     engine: Arc<engine::InMemoryEngine>,
 }
 
+/// Another service of this emulator a case drives beside this one. See
+/// [`Outposts::serving`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Sibling {
+    /// Amazon EC2, which owns an instance and the Dedicated Hosts an account's Outpost
+    /// capacity is allocated as.
+    AmazonEc2,
+}
+
 /// One answer from the emulator: the status, the wire error code as BOTH restJson1
 /// carries it (the body's `__type` discriminator and the `x-amzn-errortype` header,
 /// which is how restJson1 resolves an error shape), and the parsed body.
@@ -242,10 +251,84 @@ pub(crate) fn mark_outpost_active(outposts: &Outposts, outpost_id: &str) {
 
 impl Outposts {
     pub(crate) fn new() -> Self {
+        Self::serving(&[])
+    }
+
+    /// The same emulator with Amazon EC2 mounted BESIDE this service, over the one shared
+    /// engine — the way the router assembles every service of this emulator.
+    ///
+    /// Amazon EC2 is the service that owns an instance: the capacity a caller puts on an
+    /// Outpost's hardware is a Dedicated Host allocated through `AllocateHosts` and the
+    /// instances launched onto it through `RunInstances`, and what this service reports as
+    /// running on an Outpost is read off that service's own store. So a case about an
+    /// Outpost's instances drives BOTH services, each over its own front door
+    /// ([`Outposts::ec2`]), and no store is poked to put an instance there.
+    pub(crate) fn with_amazon_ec2() -> Self {
+        Self::serving(&[Sibling::AmazonEc2])
+    }
+
+    /// One emulator serving this service and the `siblings` a case drives beside it, all
+    /// over ONE shared engine: the one constructor, so the services a case is given and the
+    /// engine they share cannot drift apart.
+    fn serving(siblings: &[Sibling]) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        for sibling in siblings {
+            match sibling {
+                Sibling::AmazonEc2 => {
+                    router.register_service(
+                        service_com_amazonaws_ec2_amazonec2::EmulatedService::new(Arc::clone(
+                            &engine,
+                        )),
+                    );
+                }
+            }
+        }
         Self { router, engine }
+    }
+
+    /// One `ec2Query` call to the Amazon EC2 service mounted beside this one, in
+    /// [`HOME_REGION`]: `Action=<operation>` and `params` as form fields, answered with
+    /// the HTTP status and the XML body.
+    ///
+    /// EC2 speaks `ec2Query` — an `application/x-www-form-urlencoded` POST answered with
+    /// XML — and the envelope is selected by the `ec2` signing name in the credential
+    /// scope, so the hop carries one of those rather than this service's.
+    pub(crate) async fn ec2(&self, action: &str, params: &[(&str, &str)]) -> (u16, String) {
+        let mut body = format!("Action={action}&Version=2016-11-15");
+        for (name, value) in params {
+            body.push('&');
+            body.push_str(name);
+            body.push('=');
+            body.push_str(&form_value(value));
+        }
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential=AKIDTESTOUTPOSTS/20260101/{HOME_REGION}/ec2/aws4_request, \
+             SignedHeaders=host;x-amz-date, Signature=0000000000000000000000000000000000000000"
+        );
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!("https://ec2.{HOME_REGION}.amazonaws.com/"))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("authorization", authorization)
+            .body(bytes::Bytes::from(body))
+            .expect("the test request is well formed");
+        let response = self.router.dispatch(request).await;
+        (
+            response.status().as_u16(),
+            String::from_utf8_lossy(response.body()).to_string(),
+        )
+    }
+
+    /// One `ec2Query` call that must succeed, answering its XML body.
+    pub(crate) async fn ec2_ok(&self, action: &str, params: &[(&str, &str)]) -> String {
+        let (status, body) = self.ec2(action, params).await;
+        assert_eq!(
+            status, 200,
+            "{action} must succeed, got HTTP {status} with body {body}"
+        );
+        body
     }
 
     /// This service's store in that shared engine. See [`Outposts::engine`].
@@ -589,6 +672,44 @@ pub(crate) fn segment(value: &str) -> String {
 /// Percent-encode a value for use as ONE query-string parameter value.
 pub(crate) fn query_value(value: &str) -> String {
     segment(value)
+}
+
+/// Percent-encode the characters that are significant in an
+/// `application/x-www-form-urlencoded` body, leaving everything else as a client's own
+/// encoder would — the `:` and `/` of an ARN travel literally, as they do from an AWS SDK.
+///
+/// What [`Outposts::ec2`] puts one form field's value on the wire with.
+fn form_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| match c {
+            '&' => "%26".to_string(),
+            '=' => "%3D".to_string(),
+            '+' => "%2B".to_string(),
+            '%' => "%25".to_string(),
+            ' ' => "%20".to_string(),
+            ';' => "%3B".to_string(),
+            other => other.to_string(),
+        })
+        .collect()
+}
+
+/// The text of the first `<name>…</name>` element of an `ec2Query` response body, or
+/// `None` when it carries none — how a case reads one value back out of the XML envelope
+/// Amazon EC2 answers with.
+pub(crate) fn xml_element(xml: &str, name: &str) -> Option<String> {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    Some(xml[start..end].to_string())
+}
+
+/// The text of the first `<name>` element, or a panic naming the case when the response
+/// carries none: a case that reads an id Amazon EC2 minted needs its absence to fail.
+pub(crate) fn xml_required(case: &str, xml: &str, name: &str) -> String {
+    xml_element(xml, name)
+        .unwrap_or_else(|| panic!("case {case:?}: no <{name}> in the EC2 response {xml}"))
 }
 
 /// A string member, read as the empty string when absent — which is what a client

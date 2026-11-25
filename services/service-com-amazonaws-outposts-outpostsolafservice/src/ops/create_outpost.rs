@@ -318,6 +318,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // not by this call, so a just-created Outpost runs none and
                 // `ListBlockingInstancesForCapacityTask` reports none for it.
                 instances: Vec::new(),
+                // What Amazon EC2 holds running on this Outpost's hardware is read off
+                // that service's own store at every call of this one
+                // (`crate::state::sync_ec2_outpost_instances`), so there is nothing for
+                // the create to record: nothing has been launched on an Outpost this call
+                // has only just registered.
+                ec2_instances: Vec::new(),
                 // A renewal renews a subscription the Outpost's orders hold, and
                 // `CreateRenewal` is the call that buys one, so a just-created
                 // Outpost carries no renewal contract.

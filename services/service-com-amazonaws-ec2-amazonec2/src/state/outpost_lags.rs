@@ -68,6 +68,56 @@ pub fn outpost_id_of_arn(arn: &str) -> Option<&str> {
         .filter(|outpost_id| !outpost_id.is_empty())
 }
 
+/// The most characters an `OutpostArn` a REQUEST carries may hold.
+///
+/// The form this service can resolve one in —
+/// `arn:<partition>:outposts:<region>:<12-digit account>:outpost/op-<17 hex digits>` — is
+/// well inside this with every partition and Region name AWS publishes, so a longer value
+/// names no Outpost whatever its fields say. The ARN is caller-chosen text a record KEEPS
+/// (`host_payload_bytes` charges it), and its partition and Region fields are unconstrained
+/// text of the ARN's own, so the length is bounded here rather than left to the
+/// request-body cap.
+pub const MAX_OUTPOST_ARN_CHARS: usize = 128;
+
+/// The Outpost id an ARN a REQUEST carries names, when that ARN is one of an Outpost of
+/// `region` held by the account this emulator serves — and `None` for any other value.
+///
+/// The one reading of a caller-supplied `OutpostArn`
+/// (`AllocateHostsRequest$OutpostArn`, whose member the model leaves an unconstrained
+/// string): an ARN EC2 could resolve is
+/// `arn:<partition>:outposts:<region>:<account>:outpost/op-<hex>`, the form the one
+/// `OutpostArn` pattern this model carries spells out (see [`OUTPOST_ID_PREFIX`]), no longer
+/// than [`MAX_OUTPOST_ARN_CHARS`], with the
+/// Region of the request's own credential scope — an Outpost is part of one Region's
+/// inventory and of no other's — and the account the caller is.
+///
+/// Whether that Outpost EXISTS is not EC2's answer to give: an Outpost is hardware Amazon
+/// Web Services installs in the customer's facility and no operation of this service
+/// creates one, so this store holds no Outpost inventory and an ARN is read here for the
+/// Outpost it NAMES and no more. The service that owns the hardware is the one that
+/// answers what runs on it.
+pub fn outpost_id_of_arn_in_region<'a>(arn: &'a str, region: &str) -> Option<&'a str> {
+    if arn.len() > MAX_OUTPOST_ARN_CHARS {
+        return None;
+    }
+    if arn_field(arn, 2)? != OUTPOST_ARN_SERVICE {
+        return None;
+    }
+    if arn_region(arn)? != region {
+        return None;
+    }
+    if arn_field(arn, 4)? != ::engine::emulator_account_id() {
+        return None;
+    }
+    let (resource_type, outpost_id) = arn_resource(arn)?;
+    (resource_type == OUTPOST_ARN_RESOURCE
+        && prefixed_id_is_well_formed(OUTPOST_ID_PREFIX, outpost_id))
+    .then_some(outpost_id)
+}
+
+/// The service segment an Outposts ARN carries, from that same `OutpostArn` pattern.
+const OUTPOST_ARN_SERVICE: &str = "outposts";
+
 /// Whether `id` is a well-formed Outpost LAG id — one EC2 could have issued.
 ///
 /// `<prefix>-<8 or 17 lowercase hex digits>`, read by the one generic id reader

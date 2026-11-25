@@ -1628,16 +1628,19 @@ pub fn mac_host_view(host: &Host) -> Option<MacHost> {
     })
 }
 
-/// The caller-chosen bytes one stored Dedicated Host holds: its tags and the `ClientToken`
-/// the token map keeps for it. Everything else on the record — the id, the zone, the
-/// family, the states, the account — is derived by this module or bounded by the model, so
-/// it is fixed-size.
+/// The caller-chosen bytes one stored Dedicated Host holds: its tags, the `ClientToken`
+/// the token map keeps for it, the Outpost it was allocated on and the Outpost hardware
+/// asset it sits on. Everything else on the record — the id, the zone, the family, the
+/// states, the account — is derived by this module or bounded by the model, so it is
+/// fixed-size.
 ///
 /// The ONE definition of that charge: `AllocateHosts` asks it before the write and charges
 /// exactly it, and a removal path must give back the same number.
 pub fn host_payload_bytes(host: &Host) -> usize {
     tag_list_bytes(host.tags.as_deref().unwrap_or_default())
         .saturating_add(host.client_token.as_deref().map_or(0, str::len))
+        .saturating_add(host.outpost_arn.as_deref().map_or(0, str::len))
+        .saturating_add(host.asset_id.as_deref().map_or(0, str::len))
 }
 
 /// Whether `id` is a well-formed Dedicated Host id.

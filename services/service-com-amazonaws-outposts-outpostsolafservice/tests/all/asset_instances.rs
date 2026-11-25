@@ -33,23 +33,43 @@
 //!    range, and a `NextToken` this service did not issue for THIS list are 400
 //!    `ValidationException`.
 //!
-//! Where the recorded instances come from: an instance is launched through Amazon EC2 —
-//! `RunInstances` against the Outpost — and by no call in THIS API, so each row RECORDS
-//! its instances on the stored Outpost and then asks over the wire. The instances are
-//! the rows' own data; the emulator is never expected to produce an instance of its own.
+//! 5. The list reports what AMAZON EC2 holds running on the Outpost's hardware: the
+//!    instances on every Dedicated Host allocated on that Outpost (`AllocateHosts` with
+//!    `OutpostArn`, optionally naming the `AssetIds` to allocate on), each with the
+//!    instance id, instance type and owning account EC2 holds for it and the hardware
+//!    asset EC2 allocated its host on — and nothing EC2 does not hold: capacity in the
+//!    Region is on no Outpost, an asset id the Outpost does not hold names none of its
+//!    hardware, and an instance leaves the list when EC2 reports it off its host.
+//!
+//! Where the instances come from: an instance is launched through Amazon EC2 and by no
+//! call in THIS API. The rows of rule 5 launch theirs through that service, over its own
+//! front door, on the hardware this Outpost's own order installed
+//! ([`crate::site_and_outpost_lifecycle::Outposts::with_amazon_ec2`]). The rows of rules 1
+//! to 4 record instances the Amazon EC2 store cannot express — of another account, or
+//! owned by an Amazon Web Services service — on the stored Outpost, which the Outpost
+//! reports exactly as it reports the hardware recorded on it; those instances are the
+//! rows' own data and the emulator is never expected to produce one of them itself.
+
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
 use service_com_amazonaws_outposts_outpostsolafservice::ops::types::{
     AssetInstance, A_W_S_SERVICE_NAME_VALUES,
 };
+use service_com_amazonaws_outposts_outpostsolafservice::state::{
+    ASSET_TYPE_COMPUTE, BLOCKING_EC2_INSTANCE, DECOMMISSION_STATUS_BLOCKED,
+    DECOMMISSION_STATUS_SKIPPED, FORM_FACTOR_RACK,
+};
 
 use crate::blocking_instances::{
     instance, instance_id, own_account, record, running, OTHER_ACCOUNT, THIRD_ACCOUNT,
 };
+use crate::capacity_task_lifecycle::{pool, start_ok};
+use crate::outpost_decommission::decommission;
 use crate::site_and_outpost_lifecycle::{
-    query_value, refusal, segment, settle, text, Outposts, Refusal, ABSENT_OUTPOST_ID,
-    ABSENT_SITE_ID, OUTPOST_ARN_PREFIX,
+    install_hardware, orderable_site, query_value, refusal, segment, settle, text, xml_required,
+    Outposts, Refusal, ABSENT_OUTPOST_ID, ABSENT_SITE_ID, OUTPOST_ARN_PREFIX,
 };
 
 /// The route `ListAssetInstances` binds, for one Outpost identifier form and one query
@@ -723,4 +743,386 @@ async fn a_not_found_refusal_echoes_the_identifier_the_request_supplied() {
             "case {case:?}: expected the identifier echo {expected:?}, got {actual:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Rule 5: the Amazon EC2 instances running on the Outpost's hardware.
+//
+// Amazon EC2 owns an instance, and the capacity a caller puts on an Outpost is a Dedicated
+// Host allocated on its hardware. So the rows below drive BOTH services over their own
+// front doors — `AllocateHosts` and `RunInstances` through Amazon EC2's `ec2Query`
+// endpoint, `ListAssetInstances` through this service's — and assert that what this
+// service reports is what that service holds.
+// ---------------------------------------------------------------------------------------
+
+/// The AMI every launch below names: Amazon EC2 stores the id a launch is given, so an id
+/// of the long form is all a launch needs.
+const AMI: &str = "ami-0123456789abcdef0";
+
+/// An asset id of the modelled `AssetIdInput` form (`^\d{10}$`) that no Outpost this
+/// emulator installs hardware on holds: the ten-digit slots one Outpost's units take are
+/// derived from its own creation order, so a slot this high belongs to no Outpost a case
+/// creates.
+const ASSET_NO_OUTPOST_HOLDS: &str = "9999999999";
+
+/// How generously a case waits for a transition Amazon EC2's own clock owes before giving
+/// up on it: far longer than the span itself, so a loaded host cannot fail a case that is
+/// only ever waiting for a condition it polls for.
+const CLOCK_DEADLINE: Duration = Duration::from_secs(120);
+
+/// How often such a case looks again.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Where one Dedicated Host of a row is allocated.
+#[derive(Debug, Clone, Copy)]
+enum Allocation {
+    /// On the Outpost, on the compute unit at this position of its installed hardware.
+    Asset(usize),
+    /// On the Outpost, naming no hardware asset at all: "if you specify OutpostArn, you
+    /// can optionally specify AssetIds" (`AllocateHostsRequest$OutpostArn`).
+    Unnamed,
+    /// On the Outpost, naming a hardware asset the Outpost does not hold.
+    Foreign,
+    /// In the Region, which is capacity on no Outpost at all.
+    Region,
+}
+
+/// One Dedicated Host a row allocates through Amazon EC2, and how many instances it
+/// launches onto it.
+#[derive(Debug, Clone, Copy)]
+struct Placement {
+    allocation: Allocation,
+    instance_type: &'static str,
+    instances: usize,
+}
+
+/// See [`Placement`].
+const fn placement(
+    allocation: Allocation,
+    instance_type: &'static str,
+    instances: usize,
+) -> Placement {
+    Placement {
+        allocation,
+        instance_type,
+        instances,
+    }
+}
+
+/// One Availability Zone of the Region every call here is addressed to, as Amazon EC2
+/// publishes that Region's zones — read from that service rather than written out, so a
+/// host is allocated in a zone it really serves.
+fn zone() -> String {
+    ::service_com_amazonaws_ec2_amazonec2::state::availability_zones_in_region(
+        crate::site_and_outpost_lifecycle::HOME_REGION,
+    )
+    .first()
+    .map(|zone| zone.zone_name.clone())
+    .expect("the Region this suite calls in publishes an Availability Zone")
+}
+
+/// One site and one Outpost on it whose ordered hardware has been INSTALLED, as that
+/// Outpost's `(OutpostId, OutpostArn)` and the `AssetId`s of its compute units.
+///
+/// The hardware is what Amazon EC2 capacity is allocated on, so it is ordered over the
+/// wire (the order path [`install_hardware`] drives) and read back over the wire
+/// (`ListAssets`): the asset ids a row names are the ones this Outpost really reports.
+async fn an_outpost_holding_hardware(
+    outposts: &Outposts,
+    name: &str,
+) -> (String, String, Vec<String>) {
+    let site = outposts
+        .create_site(&orderable_site(&format!("{name}-site")))
+        .await;
+    let created = outposts
+        .create_outpost(&json!({
+            "Name": name,
+            "SiteId": text(&site, "SiteId"),
+            "SupportedHardwareType": FORM_FACTOR_RACK,
+        }))
+        .await;
+    let (outpost_id, outpost_arn) = (text(&created, "OutpostId"), text(&created, "OutpostArn"));
+    install_hardware(outposts, &outpost_id).await;
+    let held = outposts
+        .ok(
+            "GET",
+            &format!("/outposts/{}/assets?MaxResults=1000", segment(&outpost_id)),
+            None,
+        )
+        .await;
+    let compute: Vec<String> = held["Assets"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter(|asset| text(asset, "AssetType") == ASSET_TYPE_COMPUTE)
+        .map(|asset| text(asset, "AssetId"))
+        .collect();
+    assert!(
+        compute.len() >= 2,
+        "the installed hardware of {name} must hold at least two compute units for a row \
+         to allocate on, got {held}"
+    );
+    (outpost_id, outpost_arn, compute)
+}
+
+/// Allocate the Dedicated Host `placement` names through Amazon EC2, launch its instances
+/// onto it, and answer the `AssetInstance` this service must report for each — in launch
+/// order, and none at all for a host allocated in the Region.
+///
+/// Every value in the expectation is one Amazon EC2 answered: the instance ids are the ones
+/// its launches minted, the asset id is the one the allocation named, and the account is the
+/// one every request of this emulator arrives as.
+async fn allocate_and_launch(
+    outposts: &Outposts,
+    outpost_arn: &str,
+    compute: &[String],
+    placement: &Placement,
+    case: &str,
+) -> Vec<Value> {
+    let zone = zone();
+    let asset = match placement.allocation {
+        Allocation::Asset(position) => Some(compute[position].clone()),
+        Allocation::Foreign => Some(ASSET_NO_OUTPOST_HOLDS.to_string()),
+        Allocation::Unnamed | Allocation::Region => None,
+    };
+    let mut params: Vec<(&str, &str)> = vec![
+        ("InstanceType", placement.instance_type),
+        ("AvailabilityZone", zone.as_str()),
+    ];
+    if !matches!(placement.allocation, Allocation::Region) {
+        params.push(("OutpostArn", outpost_arn));
+    }
+    match asset.as_deref() {
+        // "If you specify this parameter, you can omit Quantity. In this case, Amazon EC2
+        // allocates a Dedicated Host on each specified hardware asset"
+        // (`AllocateHostsRequest$AssetIds`).
+        Some(asset_id) => params.push(("AssetId.1", asset_id)),
+        None => params.push(("Quantity", "1")),
+    }
+    let allocated = outposts.ec2_ok("AllocateHosts", &params).await;
+    let host_ids = xml_required(case, &allocated, "hostIdSet");
+    let host_id = xml_required(case, &host_ids, "item");
+
+    let mut reported = Vec::new();
+    for _ in 0..placement.instances {
+        // One launch per instance, so the order the instances were launched in is the order
+        // their ids were minted in.
+        let launched = outposts
+            .ec2_ok(
+                "RunInstances",
+                &[
+                    ("ImageId", AMI),
+                    ("MinCount", "1"),
+                    ("MaxCount", "1"),
+                    ("InstanceType", placement.instance_type),
+                    ("Placement.HostId", host_id.as_str()),
+                ],
+            )
+            .await;
+        let instance_id = xml_required(case, &launched, "instanceId");
+        if matches!(placement.allocation, Allocation::Region) {
+            continue;
+        }
+        let mut expected = serde_json::Map::new();
+        expected.insert("InstanceId".to_string(), json!(instance_id));
+        expected.insert("InstanceType".to_string(), json!(placement.instance_type));
+        if let Allocation::Asset(position) = placement.allocation {
+            expected.insert("AssetId".to_string(), json!(compute[position]));
+        }
+        expected.insert("AccountId".to_string(), json!(own_account()));
+        reported.push(Value::Object(expected));
+    }
+    // The instances of ONE host, in the order this service reports them: instance-id
+    // order, which is the one stable order its EC2 answer can be read in.
+    reported.sort_by_key(|instance| text(instance, "InstanceId"));
+    reported
+}
+
+/// The `InstanceId`s of a set of expected projections, in that order.
+fn expected_ids(expected: &[Value]) -> Vec<String> {
+    expected.iter().map(|item| text(item, "InstanceId")).collect()
+}
+
+/// Rule 5: the list reports exactly what Amazon EC2 holds running on the Outpost's
+/// hardware, with the members that service holds for each instance.
+///
+/// The rows differ along everything the rule generalises over: how many hosts the Outpost
+/// holds (none, one, two) and how many instances run on each (none, one, two, three),
+/// which instance type each runs, which hardware asset the host sits on (one unit, another
+/// unit, no unit named, a unit the Outpost does not hold), and whether the capacity is on
+/// the Outpost at all (a host in the Region beside one on the Outpost).
+#[tokio::test]
+async fn the_list_reports_what_amazon_ec2_holds_running_on_the_outposts_hardware() {
+    let outposts = Outposts::with_amazon_ec2();
+    let rows: Vec<(&str, Vec<Placement>)> = vec![
+        ("no Amazon EC2 capacity on the Outpost at all", Vec::new()),
+        (
+            "a host on the Outpost's first compute unit, nothing launched onto it",
+            vec![placement(Allocation::Asset(0), "m5.4xlarge", 0)],
+        ),
+        (
+            "one instance on a host on the first compute unit",
+            vec![placement(Allocation::Asset(0), "m5.4xlarge", 1)],
+        ),
+        (
+            "three instances on one host",
+            vec![placement(Allocation::Asset(0), "c5.4xlarge", 3)],
+        ),
+        (
+            "two hosts, each on its own compute unit, running different instance types",
+            vec![
+                placement(Allocation::Asset(0), "m5.4xlarge", 2),
+                placement(Allocation::Asset(1), "c5.4xlarge", 1),
+            ],
+        ),
+        (
+            "a host allocated on the Outpost naming no hardware asset",
+            vec![placement(Allocation::Unnamed, "m5.4xlarge", 2)],
+        ),
+        (
+            "a host naming a hardware asset the Outpost does not hold",
+            vec![placement(Allocation::Foreign, "m5.4xlarge", 1)],
+        ),
+        (
+            "a host in the Region beside one on the Outpost",
+            vec![
+                placement(Allocation::Region, "m5.4xlarge", 2),
+                placement(Allocation::Asset(1), "c5.4xlarge", 1),
+            ],
+        ),
+    ];
+
+    for (index, (case, placements)) in rows.iter().enumerate() {
+        let (outpost_id, outpost_arn, compute) =
+            an_outpost_holding_hardware(&outposts, &format!("ec2-capacity-{index}")).await;
+        let mut expected: Vec<Value> = Vec::new();
+        for placement in placements {
+            expected.extend(
+                allocate_and_launch(&outposts, &outpost_arn, &compute, placement, case).await,
+            );
+        }
+
+        for identifier in [&outpost_id, &outpost_arn] {
+            let case = &format!("{case} read by {identifier}");
+            let reply = outposts.ok("GET", &route(identifier, ""), None).await;
+            assert_eq!(
+                reported(&reply, case),
+                expected,
+                "case {case:?}: the list must report what Amazon EC2 holds on this Outpost's \
+                 hardware, field for field, got {reply}"
+            );
+        }
+    }
+}
+
+/// Rule 5 reaches the OTHER answers that are about what runs on an Outpost: the instances
+/// a capacity task would need stopped, and the `EC2_INSTANCE` resource a decommission is
+/// blocked by — and each of them follows Amazon EC2, so an instance terminated through that
+/// service leaves all three answers.
+#[tokio::test]
+async fn amazon_ec2_decides_the_blocking_instances_and_what_blocks_a_decommission() {
+    let outposts = Outposts::with_amazon_ec2();
+    let (outpost_id, outpost_arn, compute) =
+        an_outpost_holding_hardware(&outposts, "ec2-blocking").await;
+
+    // Nothing has been launched on the Outpost yet, so nothing of this kind blocks its
+    // decommission: the order that installed its hardware has already been fulfilled.
+    let idle = decommission(&outposts, &outpost_id, &json!({ "ValidateOnly": true })).await;
+    assert_eq!(
+        text(&idle, "Status"),
+        DECOMMISSION_STATUS_SKIPPED,
+        "an Outpost nothing runs on has nothing to clear, got {idle}"
+    );
+
+    let expected = allocate_and_launch(
+        &outposts,
+        &outpost_arn,
+        &compute,
+        &placement(Allocation::Asset(0), "m5.4xlarge", 2),
+        "blocking",
+    )
+    .await;
+    let launched = expected_ids(&expected);
+
+    // A capacity task of the whole Outpost: every instance of the initiating account
+    // running on it is one it would need stopped.
+    let task = text(
+        &start_ok(
+            &outposts,
+            &outpost_id,
+            &json!({ "InstancePools": [pool("m5.4xlarge", 1)] }),
+        )
+        .await,
+        "CapacityTaskId",
+    );
+    let blocking = outposts
+        .ok(
+            "GET",
+            &format!(
+                "/outposts/{}/capacity/{}/blockingInstances",
+                segment(&outpost_id),
+                segment(&task)
+            ),
+            None,
+        )
+        .await;
+    let blocking_ids: Vec<String> = blocking["BlockingInstances"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|item| text(item, "InstanceId"))
+        .collect();
+    assert_eq!(
+        blocking_ids, launched,
+        "the instances a task would need stopped are the ones Amazon EC2 holds running on \
+         the Outpost, expected {launched:?}, got {blocking}"
+    );
+
+    let blocked = decommission(&outposts, &outpost_id, &json!({ "ValidateOnly": true })).await;
+    assert_eq!(
+        (
+            text(&blocked, "Status"),
+            blocked["BlockingResourceTypes"].clone()
+        ),
+        (
+            DECOMMISSION_STATUS_BLOCKED.to_string(),
+            json!([BLOCKING_EC2_INSTANCE])
+        ),
+        "a running instance must block the decommission as {BLOCKING_EC2_INSTANCE}, got \
+         {blocked}"
+    );
+
+    // Terminated through Amazon EC2, the instances leave their host when that service's own
+    // clock says they have, so the case looks again until the Outpost reports none rather
+    // than waiting a fixed time for it.
+    for instance_id in &launched {
+        outposts
+            .ec2_ok("TerminateInstances", &[("InstanceId.1", instance_id)])
+            .await;
+    }
+    let deadline = Instant::now() + CLOCK_DEADLINE;
+    loop {
+        let reply = outposts.ok("GET", &route(&outpost_id, ""), None).await;
+        if reported(&reply, "terminated").is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a terminated instance must leave the Outpost's list, still got {reply}"
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    let cleared = decommission(&outposts, &outpost_id, &json!({ "ValidateOnly": true })).await;
+    assert_eq!(
+        (
+            text(&cleared, "Status"),
+            cleared.get("BlockingResourceTypes").cloned()
+        ),
+        (DECOMMISSION_STATUS_SKIPPED.to_string(), None),
+        "once nothing runs on the Outpost, nothing of this kind blocks its decommission, \
+         got {cleared}"
+    );
 }
