@@ -55,6 +55,8 @@
 //!   policies allow the object operation;
 //! * [`iam_auth_token`] — the authentication token an IAM-authenticated login presents in
 //!   place of a password;
+//! * [`proxy_client_auth`] — whether a client presenting such a token to a DB PROXY that
+//!   requires IAM authentication may connect as the database user it names;
 //! * [`read_only`] — the statements an endpoint that serves no writes refuses, and how each
 //!   engine words that refusal;
 //! * [`pg_code_block`] — the anonymous `DO` block a PostgreSQL client sends, and the server
@@ -113,6 +115,10 @@ pub mod pg_numeric;
 pub mod pg_server;
 pub mod pg_sessions;
 pub mod pg_wire;
+/// WHAT a client authenticates to a DB PROXY with, where that proxy's `Auth` requires IAM
+/// authentication of connections to it, and whether the principal behind its token may
+/// connect as the database user it names.
+pub mod proxy_client_auth;
 /// A DB PROXY's endpoint: the address `DBProxy$Endpoint` publishes, and the sessions a
 /// client opens on it.
 pub mod proxy_endpoint;
@@ -776,6 +782,11 @@ pub async fn open_engine_endpoint<Eng: Send + Sync + 'static>(
             // And the IAM store the role those statements act under is resolved against, on
             // that same engine.
             iam: engine_s3_role::iam_store(engine),
+            // A session on a resource's OWN endpoint reaches no proxy, so no proxy decides
+            // its client's credential; the authorizer is carried all the same, because what
+            // it reads are two other services' stores on this same engine and an endpoint
+            // opened here outlives every request that changes a policy.
+            connect_authorizer: proxy_client_auth::ConnectAuthorizer::of_engine(engine),
             generation: generation_rx.clone(),
             next_connection_id: Arc::clone(&next_connection_id),
             callback: callback.clone(),

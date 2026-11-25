@@ -91,29 +91,88 @@ pub enum TokenRefusal {
     Unsigned,
 }
 
+/// The ACCESS KEY ID the credential scope of `token` names: the key the presigned request was
+/// signed with, which is the credential the token speaks for.
+///
+/// `<key>/<date>/<region>/<service>/aws4_request` — the key is the first segment, as SigV4
+/// writes the scope. `None` for a value that is not a presigned request, or one carrying no
+/// credential at all.
+///
+/// A READING OF THE TEXT, and nothing else: WHO that key speaks for is a question for the
+/// services that hold credentials ([`super::proxy_client_auth`]), which is where a login
+/// authenticated by a proxy's IAM setting takes it.
+#[must_use]
+pub fn signing_access_key_id(token: &str) -> Option<String> {
+    let fields = query_fields(token)?;
+    let credential = field_of(&fields, "X-Amz-Credential")?;
+    let key = credential.split('/').next().unwrap_or_default();
+    (!key.is_empty()).then(|| key.to_string())
+}
+
+/// The query fields of a presigned request, each as `(name, value)`.
+fn query_fields(token: &str) -> Option<Vec<(String, String)>> {
+    let (_authority, rest) = token.split_once('/')?;
+    let query = rest.strip_prefix('?')?;
+    Some(
+        ::form_urlencoded::parse(query.as_bytes())
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect(),
+    )
+}
+
+/// The value of the field `name`, read however the request spelled its name.
+fn field_of<'f>(fields: &'f [(String, String)], name: &str) -> Option<&'f str> {
+    fields
+        .iter()
+        .find(|(held, _)| held.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
 /// Whether `token` is an authentication token generated for `target`, as of `now`.
 pub fn admits(token: &str, target: &TokenTarget<'_>, now: SystemTime) -> Result<(), TokenRefusal> {
-    let (authority, rest) = token.split_once('/').ok_or(TokenRefusal::Malformed)?;
-    let query = rest.strip_prefix('?').ok_or(TokenRefusal::Malformed)?;
+    admits_at_one_of(
+        token,
+        &[(target.host, target.port)],
+        target.region,
+        target.user,
+        now,
+    )
+}
+
+/// [`admits`] for an endpoint that answers at SEVERAL addresses: whether `token` was generated
+/// for `user` in `region` at ANY of `addresses`, as of `now`.
+///
+/// One endpoint, several pairs a client may legitimately have generated the token for. A DB
+/// instance publishes its address and its port as two members, so a client composes exactly
+/// one pair from them; `DBProxy$Endpoint` publishes ONE member carrying no port, so the client
+/// completes it with the port of the databases the proxy's engine family names — and in this
+/// emulator the published member carries the port of the listener as well, so the forms a
+/// client can arrive with are several addresses OF ONE endpoint rather than several endpoints.
+/// Which pairs those are is the caller's reading ([`super::wire_session`]); every other claim
+/// the token carries is read here exactly once, for every address.
+pub fn admits_at_one_of(
+    token: &str,
+    addresses: &[(&str, u16)],
+    region: &str,
+    user: &str,
+    now: SystemTime,
+) -> Result<(), TokenRefusal> {
+    let (authority, _rest) = token.split_once('/').ok_or(TokenRefusal::Malformed)?;
     let (host, port) = authority.rsplit_once(':').ok_or(TokenRefusal::Malformed)?;
     let port: u16 = port.parse().map_err(|_| TokenRefusal::Malformed)?;
-    let fields: Vec<(String, String)> = ::form_urlencoded::parse(query.as_bytes())
-        .map(|(name, value)| (name.to_string(), value.to_string()))
-        .collect();
-    let field = |name: &str| {
-        fields
-            .iter()
-            .find(|(held, _)| held.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.as_str())
-    };
+    let fields = query_fields(token).ok_or(TokenRefusal::Malformed)?;
+    let field = |name: &str| field_of(&fields, name);
 
     if field("Action").ok_or(TokenRefusal::Malformed)? != TOKEN_ACTION {
         return Err(TokenRefusal::NotAConnectToken);
     }
-    if !host.eq_ignore_ascii_case(target.host) || port != target.port {
+    let names_the_endpoint = addresses
+        .iter()
+        .any(|(named, at)| host.eq_ignore_ascii_case(named) && port == *at);
+    if !names_the_endpoint {
         return Err(TokenRefusal::AnotherEndpoint);
     }
-    if field("DBUser").ok_or(TokenRefusal::Malformed)? != target.user {
+    if field("DBUser").ok_or(TokenRefusal::Malformed)? != user {
         return Err(TokenRefusal::AnotherUser);
     }
     if field("X-Amz-Algorithm").ok_or(TokenRefusal::Malformed)? != SIGV4_ALGORITHM {
@@ -124,7 +183,7 @@ pub fn admits(token: &str, target: &TokenTarget<'_>, now: SystemTime) -> Result<
     let credential = field("X-Amz-Credential").ok_or(TokenRefusal::Malformed)?;
     let scope: Vec<&str> = credential.split('/').collect();
     let scoped = scope.len() == 5
-        && scope.get(2) == Some(&target.region)
+        && scope.get(2) == Some(&region)
         && scope.get(3) == Some(&TOKEN_SIGNING_SERVICE)
         && scope.get(4) == Some(&"aws4_request");
     if !scoped {
@@ -364,5 +423,45 @@ mod tests {
             Err(TokenRefusal::OutsideItsWindow),
             "case the token after its lifetime: expected it to be outside its window"
         );
+    }
+
+    /// RULE: the credential a token was signed with is the FIRST segment of its credential
+    /// scope, which is the key the principal behind the token is resolved by; a value carrying
+    /// no such scope names no credential at all.
+    ///
+    /// The rows differ along what the token carries: a scope naming a long-term key, one
+    /// naming a session key, a presigned request carrying no credential field, and a password
+    /// that is no token.
+    #[test]
+    fn the_key_a_token_was_signed_with_is_the_first_segment_of_its_scope() {
+        let rows: Vec<(&str, String, Option<String>)> = vec![
+            (
+                "the token the client generated",
+                generated().token(),
+                Some("AKIAEXAMPLE".to_string()),
+            ),
+            (
+                "a scope naming a session key",
+                generated().token().replace("AKIAEXAMPLE", "ASIASESSIONKEY"),
+                Some("ASIASESSIONKEY".to_string()),
+            ),
+            (
+                "a presigned request carrying no credential",
+                "127.0.0.1:5432/?Action=connect&DBUser=iamuser".to_string(),
+                None,
+            ),
+            (
+                "a password that is not a token at all",
+                "a-password".to_string(),
+                None,
+            ),
+        ];
+        for (case, token, expected) in rows {
+            let found = signing_access_key_id(&token);
+            assert_eq!(
+                found, expected,
+                "case {case:?}: expected {expected:?}, got {found:?}"
+            );
+        }
     }
 }

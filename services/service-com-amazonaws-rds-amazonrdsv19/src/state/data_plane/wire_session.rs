@@ -221,6 +221,11 @@ pub struct SessionContext {
     /// acts under live ([`super::engine_s3_role`]). `None` when no IAM is reachable from
     /// this engine, which is evidence of nothing and refuses nothing.
     pub iam: Option<::engine::ServiceState<super::engine_s3_role::IamState>>,
+    /// WHO a client that authenticates to a DB PROXY with IAM speaks for, and what that
+    /// principal may do ([`super::proxy_client_auth`]): the IAM and token-service stores on
+    /// that same engine, which is where a `rds-db:connect` grant is read from. It refuses
+    /// nothing on an engine carrying neither.
+    pub connect_authorizer: super::proxy_client_auth::ConnectAuthorizer,
     /// The engine's run: a session ends when this changes (a reboot, a stop).
     pub generation: watch::Receiver<u64>,
     /// The connection ids this endpoint has handed out.
@@ -389,6 +394,13 @@ impl SessionContext {
             wire: facts.wire,
             database: could_be.then(|| resolved_database(facts, database)).flatten(),
             engine: Arc::clone(engine),
+            // The PROXY's own half, for a session pooled through one: what its `Auth` says
+            // about this client's credential, beside the stores that say who a token speaks
+            // for.
+            proxy: facts
+                .proxy_client_auth
+                .clone()
+                .map(|auth| (auth, self.connect_authorizer.clone())),
         }
     }
 }
@@ -719,6 +731,9 @@ pub(super) fn facts_of(record: RecordFacts, database: &Arc<InstanceDatabase>) ->
         // anything about it; [`super::proxy_endpoint::proxy_session`] is what writes this on
         // the facts of one that was pooled through one.
         tls_required_by_proxy: false,
+        // Nor does any proxy decide what credential such a session presents; the same
+        // `proxy_session` is what writes this on the facts of a pooled one.
+        proxy_client_auth: None,
         // A resource with no listener of its own is reached through a name this machine does
         // not resolve, so the host a refusal names is this machine.
         endpoint_host: record
@@ -1009,6 +1024,15 @@ pub struct InstanceFacts {
     /// ([`super::proxy_endpoint::PROXY_REQUIRES_TLS_MESSAGE`]), while the database refuses a
     /// session its own parameter group does not admit in the engine's.
     pub tls_required_by_proxy: bool,
+    /// What the DB PROXY the session arrived through decides about the CLIENT's own
+    /// credential: which of its database users authenticate with IAM, and the resource a
+    /// grant for each of them is written over
+    /// ([`super::proxy_client_auth::ProxyClientAuth`]).
+    ///
+    /// `None` for a session on a resource's OWN endpoint, which reaches no proxy: there the
+    /// credential a login presents is the database's own, and the IAM half of it is the
+    /// resource's `EnableIAMDatabaseAuthentication` ([`Self::iam_database_authentication_enabled`]).
+    pub proxy_client_auth: Option<super::proxy_client_auth::ProxyClientAuth>,
     /// The host the instance's listener is bound to, which is the host a refusal names.
     pub endpoint_host: String,
     /// The port that listener published, which is the port an authentication token has to
@@ -1189,10 +1213,18 @@ pub fn admit(
     if facts.requires_secure_transport && !encrypted {
         return Err(LoginRefusal::PlaintextRefused);
     }
-    let as_master = facts
-        .master_username
-        .as_ref()
-        .is_some_and(|master| master == user)
+    // "Whether to require or disallow Amazon Web Services Identity and Access Management
+    // (IAM) authentication for connections to the proxy" (`UserAuthConfigInfo$IAMAuth`): the
+    // client's hop ends at the proxy, so where that proxy REQUIRES IAM authentication of a
+    // login as this user the only credential that admits it is an authentication token — the
+    // database's own password authenticates nothing on that hop, whatever the database would
+    // have admitted it for.
+    let only_a_token_admits = iam.is_some_and(|iam| iam.requires_a_token(user));
+    let as_master = !only_a_token_admits
+        && facts
+            .master_username
+            .as_ref()
+            .is_some_and(|master| master == user)
         && match (&facts.password, proof) {
             (Some(stored), PasswordProof::Cleartext(password)) => {
                 stored.accepts_cleartext(user, password)
@@ -1262,6 +1294,19 @@ pub struct IamLogin {
     database: Option<String>,
     /// The databases behind this endpoint, for that one read.
     engine: Arc<InstanceDatabase>,
+    /// The PROXY's own half, for a session pooled through a DB proxy: what that proxy's
+    /// `Auth` says about the credential a client logging in as this user presents, and the
+    /// stores that say WHO the token it presents speaks for
+    /// ([`super::proxy_client_auth`]).
+    ///
+    /// `None` for a session on a resource's own endpoint, which reaches no proxy. It is
+    /// independent of the three fields above: a proxy authenticates its own clients whether
+    /// or not the database behind it serves IAM database authentication, and the user it
+    /// admits is the one its `Auth` names — the database's master user included.
+    proxy: Option<(
+        super::proxy_client_auth::ProxyClientAuth,
+        super::proxy_client_auth::ConnectAuthorizer,
+    )>,
 }
 
 /// Prints the decision's inputs; the engine handle has no formatted form of its own.
@@ -1271,6 +1316,7 @@ impl std::fmt::Debug for IamLogin {
             .debug_struct("IamLogin")
             .field("enabled", &self.enabled)
             .field("database", &self.database)
+            .field("proxy", &self.proxy.as_ref().map(|(auth, _)| auth))
             .finish_non_exhaustive()
     }
 }
@@ -1286,16 +1332,140 @@ impl IamLogin {
     /// account whose plugin is the IAM one.
     #[must_use]
     pub fn expects_a_token(&self, user: &str) -> bool {
+        if self.requires_a_token(user) {
+            // The PROXY requires it of this client, whatever the database behind it would
+            // have asked for: the client's hop ends at the proxy, so the credential it is
+            // asked for is the one the proxy admits.
+            return true;
+        }
         self.enabled && self.database.is_some() && self.engine_admits(user)
+    }
+
+    /// Whether a token is the ONLY credential that admits a login as `user` here: the DB
+    /// PROXY the session arrived through requires IAM authentication of connections to it for
+    /// that database user, so no password of the database behind it admits one
+    /// ([`admit`]).
+    #[must_use]
+    pub fn requires_a_token(&self, user: &str) -> bool {
+        self.proxy
+            .as_ref()
+            .is_some_and(|(auth, _)| auth.requires_a_token(user))
     }
 
     /// Whether `token` authenticates `user` on this endpoint, as of now.
     ///
+    /// Either half admits the login, and each is read on its own terms: the DATABASE's, where
+    /// the resource serves IAM database authentication and the engine records this user as
+    /// enabled for it, and the PROXY's, where the proxy the session arrived through
+    /// authenticates its clients with IAM. A session on a resource's own endpoint has only the
+    /// first; one pooled through a proxy whose `Auth` leaves IAM authentication disabled has
+    /// only the second to fail.
+    #[must_use]
+    pub fn admits(&self, facts: &InstanceFacts, user: &str, token: &str) -> bool {
+        self.proxy_admits(facts, user, token) || self.engine_admits_token(facts, user, token)
+    }
+
+    /// The PROXY's half: whether the proxy this session arrived through admits `token` as the
+    /// credential of a client connecting as `user`.
+    ///
+    /// Every part has to hold, in an order that reads the cheapest evidence first and WRITES
+    /// NOTHING:
+    ///
+    /// * the proxy's `Auth` admits a token for that database user at all
+    ///   ([`super::proxy_client_auth::ProxyClientAuth::admits_a_token`]);
+    /// * the token was generated for an address THIS proxy's endpoint answers at, for this
+    ///   user and in this moment — a client mints a token for the address it then dials, and
+    ///   the address a session arrived on is the proxy's own;
+    /// * the principal that signed it is allowed `rds-db:connect` on that user's `dbuser`
+    ///   resource, which is the grant that separates an authorized client from an
+    ///   unauthorized one;
+    /// * the DATABASE behind the proxy holds a login for that user — the proxy presents the
+    ///   credentials of its `Auth` secret to log in as it, so a user that database has no
+    ///   login for is a session the proxy cannot open.
+    fn proxy_admits(&self, facts: &InstanceFacts, user: &str, token: &str) -> bool {
+        let Some((auth, authorizer)) = self.proxy.as_ref() else {
+            return false;
+        };
+        if !auth.admits_a_token(user) {
+            return false;
+        }
+        // The addresses THIS proxy's endpoint answers at, which are the pairs a client can
+        // have generated its token for. `DBProxy$Endpoint` carries no port member, so a client
+        // completes the published value with the port of the databases the proxy's engine
+        // family names ([`super::proxy_endpoint::wire_engine_port`]) — and the value this
+        // emulator publishes carries the port of the listener too, so a client may take the
+        // whole published authority as the host it completes. Every one of them names this one
+        // endpoint, which is the endpoint the session arrived on.
+        let family_port = super::proxy_endpoint::wire_engine_port(facts.wire);
+        let published = ::service_common::data_plane_addressing::host_port_authority(
+            &facts.endpoint_host,
+            facts.endpoint_port,
+        );
+        let addresses: [(&str, u16); 3] = [
+            (facts.endpoint_host.as_str(), facts.endpoint_port),
+            (facts.endpoint_host.as_str(), family_port),
+            (published.as_str(), family_port),
+        ];
+        let now = ::std::time::SystemTime::now();
+        if let Err(refusal) = super::iam_auth_token::admits_at_one_of(
+            token,
+            &addresses,
+            auth.region(),
+            user,
+            now,
+        ) {
+            // The credential itself is never logged: what a reader needs is which claim of
+            // the token did not hold.
+            ::tracing::debug!(
+                db_instance_identifier = %facts.identifier,
+                ?refusal,
+                "a session on a DB proxy endpoint presented an authentication token that \
+                 endpoint does not admit"
+            );
+            return false;
+        }
+        let Some(access_key_id) = super::iam_auth_token::signing_access_key_id(token) else {
+            return false;
+        };
+        if !authorizer.allows(
+            &access_key_id,
+            super::proxy_client_auth::CONNECT_ACTION,
+            &auth.dbuser_arn(user),
+            now,
+        ) {
+            return false;
+        }
+        self.database_holds_a_login_for(facts, user)
+    }
+
+    /// Whether the database behind this endpoint holds a login for `user`: its master user,
+    /// or a role or account its own engine holds — a login role on the PostgreSQL wire
+    /// ([`super::pg_grants::holds_login_role`]), an account on the MySQL one
+    /// ([`super::mysql_accounts::holds_account_for`]).
+    ///
+    /// A READ of the catalogs, which are not created here, so a login decided before any
+    /// session has run on this database leaves nothing behind.
+    fn database_holds_a_login_for(&self, facts: &InstanceFacts, user: &str) -> bool {
+        if facts.master_username.as_deref() == Some(user) {
+            return true;
+        }
+        match facts.wire {
+            EngineWire::Postgres => super::pg_grants::holds_login_role(
+                &self.engine,
+                &resolved_database(facts, None).unwrap_or_default(),
+                user,
+            ),
+            EngineWire::MySql => super::mysql_accounts::holds_account_for(&self.engine, user),
+        }
+    }
+
+    /// The DATABASE's half: whether `token` authenticates `user` as a database user the
+    /// resource itself has enabled for IAM database authentication.
+    ///
     /// `false` unless every half holds, so neither a token on a resource that does not serve
     /// IAM authentication, nor a token for another endpoint, user or moment, nor a user
     /// nothing enabled admits anybody.
-    #[must_use]
-    pub fn admits(&self, facts: &InstanceFacts, user: &str, token: &str) -> bool {
+    fn engine_admits_token(&self, facts: &InstanceFacts, user: &str, token: &str) -> bool {
         if !self.enabled {
             return false;
         }

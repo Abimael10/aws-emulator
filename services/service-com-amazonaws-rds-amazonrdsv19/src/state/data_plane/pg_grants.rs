@@ -842,6 +842,24 @@ pub fn is_member_of(
     Ok(!found.rows.is_empty())
 }
 
+/// Whether the database `db_name` holds a LOGIN ROLE named `user`: a role of `pg_roles` that
+/// may log in, which is what a client connecting as that user is resolved to.
+///
+/// A READ, and nothing else, for the same reason
+/// [`user_authenticates_with_a_token`] is one: the catalogs are not created here, so a login
+/// decided before any session has run on this database leaves nothing behind, and a database
+/// whose catalog does not exist yet holds no role — which is what the unreadable case answers.
+#[must_use]
+pub fn holds_login_role(database: &InstanceDatabase, db_name: &str, user: &str) -> bool {
+    database
+        .execute(
+            db_name,
+            "SELECT 1 FROM pg_roles WHERE rolname = ? AND rolcanlogin",
+            &[Some(user.to_string())],
+        )
+        .is_ok_and(|found| !found.rows.is_empty())
+}
+
 /// Whether the database user `user` of `db_name` is one enabled for IAM database
 /// authentication: a role that may log in and is a member of
 /// [`IAM_AUTHENTICATION_ROLE`] — the engine-side half of

@@ -405,6 +405,27 @@ pub fn authenticates_with_a_token(database: &InstanceDatabase, user: &str) -> bo
         .is_ok_and(|found| !found.rows.is_empty())
 }
 
+/// Whether this server holds an ACCOUNT for the user name `user`, whatever host pattern it
+/// was created with — the catalog's own answer to "is there a login by this name", which is
+/// what a client connecting as that name is resolved to.
+///
+/// A READ, and nothing else, for the same reason [`authenticates_with_a_token`] is one: the
+/// catalog is not created here, so a login decided before any session has created an account
+/// leaves nothing behind, and a server whose catalog does not exist yet holds no account.
+///
+/// The host pattern is not matched, for the same reason that function does not match it: no
+/// session of this endpoint has a client address to match one against.
+#[must_use]
+pub fn holds_account_for(database: &InstanceDatabase, user: &str) -> bool {
+    database
+        .execute(
+            ACCOUNT_DATABASE,
+            "SELECT 1 FROM user WHERE User = ?",
+            &[Some(user.to_string())],
+        )
+        .is_ok_and(|found| !found.rows.is_empty())
+}
+
 /// Create the catalog tables if this instance has not held an account yet, in the system
 /// schema they belong to — which is created with them, as a MySQL server comes with it.
 fn ensure_catalogs(

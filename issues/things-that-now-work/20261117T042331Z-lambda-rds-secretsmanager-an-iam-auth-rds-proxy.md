@@ -40,3 +40,40 @@ Corroborating, not graded: lambda__rds__secretsmanager.lambda-rds-connect-via-pr
 5. Invoke the granted function; its handler calls generate_db_auth_token for the proxy endpoint and connects with pymysql over TLS, then runs `SELECT 1`.
    Expected: {'ok': True, 'value': 1}. Observed: {'ok': False, 'mysql_error_code': 2003}.
 6. Invoke the ungranted function and expect {'ok': False, 'mysql_error_code': 1045} — unreachable today, since step 5 already fails.
+
+## Resolution
+
+FIXED — a DB proxy now authenticates the CLIENT hop itself, per database user its `Auth`
+names. "Whether to require or disallow … IAM authentication for connections to the proxy"
+(`UserAuthConfigInfo$IAMAuth`) is read off the proxy record when a session on its endpoint is
+admitted: where it is `REQUIRED` the proxy asks the client for an authentication token and no
+password of the database behind it admits the connection; where it is `ENABLED` either
+credential does; where it is `DISABLED` — or the user is not one the proxy logs in as — the
+proxy decides nothing and the database's own credential stands, as before.
+
+A token admits the connection only when every part holds: it was generated for an address this
+proxy's endpoint answers at, for that database user, in the proxy's Region and inside its
+window; the IAM identity that SIGNED it (the session the token's access key was minted for, or
+the IAM user that owns it) is allowed `rds-db:connect` on
+`arn:aws:rds-db:<region>:<account>:dbuser:<proxy id>/<database user>`, the proxy being named by
+the id its own `DBProxyArn` carries; and the database behind the proxy holds a login for that
+user. Anything else takes the engine's own access-denied refusal (MySQL 1045) and runs no
+statement. The grant is read through IAM's own accessors and the principal through the token
+service's own session registry, both on the shared engine, so a document
+`iam:PutRolePolicy` wrote is in force on the next connection; a principal nothing readable
+bounds (no IAM mounted, the account's own published credential, a role this account's IAM holds
+no record of, an attachment whose document it does not hold) is admitted, the same deliberate
+non-refusal this crate's control-plane gate takes.
+
+Residual, unchanged: the behavioral check's own handler drives this with a vendored `pymysql`
+and does not reach a verdict inside the check's 60 s budget. What the proxy's wire serves is
+observable from the same vantage point without it — an in-VPC function that reads
+`DBProxy$Endpoint`, negotiates TLS in band and speaks the MySQL protocol opens a session on the
+published endpoint in well under a second
+(`services/service-com-amazonaws-lambda-awsgirapiservice/tests/all/handler_rds_proxy_native_session.rs`)
+— so what remains is the cost of that package in the guest runtime rather than anything the
+proxy plane decides. The published endpoint still carries the port the core assigned the
+proxy's listener, because `DBProxy$Endpoint` has no port member and a per-proxy address needs a
+core listener that takes one; that is the core gap recorded as the residual of
+`issues/things-that-now-work/20261109T135215Z-lambda-rds-secretsmanager-db-proxy-endpoints-are-published.md`,
+and the token check accepts every address a client composes from that published value.

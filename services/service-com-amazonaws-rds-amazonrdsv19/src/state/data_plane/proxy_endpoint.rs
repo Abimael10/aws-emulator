@@ -237,6 +237,11 @@ pub async fn open_proxy_endpoint<Eng: Send + Sync + 'static>(
         })?,
         objects: super::mysql_s3_load::object_store(engine),
         iam: super::engine_s3_role::iam_store(engine),
+        // WHO a client that authenticates to this proxy with IAM speaks for, and what that
+        // principal may do: the IAM and token-service stores on this same engine, which is
+        // where the `rds-db:connect` grant a session on this endpoint is admitted on lives
+        // ([`super::proxy_client_auth`]).
+        connect_authorizer: super::proxy_client_auth::ConnectAuthorizer::of_engine(engine),
         generation: generation_rx,
         next_connection_id: Arc::new(AtomicU32::new(1)),
         callback,
@@ -487,6 +492,17 @@ pub(super) fn proxy_session(
     // engine's. A database that requires an encrypted session keeps requiring one, since the
     // proxy presents its traffic to that database as it stands.
     facts.tls_required_by_proxy = require_tls;
+    // And what the proxy decides about the CLIENT's own credential: "whether to require or
+    // disallow Amazon Web Services Identity and Access Management (IAM) authentication for
+    // connections to the proxy" (`UserAuthConfigInfo$IAMAuth`) is the proxy's question about
+    // the hop that ends at it, so it travels with the facts this session is admitted against
+    // ([`super::proxy_client_auth`]). The proxy is named by the id its own `DBProxyArn`
+    // carries, which is the id a client derives the `dbuser` resource of a grant from.
+    facts.proxy_client_auth = Some(super::proxy_client_auth::ProxyClientAuth::new(
+        proxy.region.clone(),
+        proxy.arn_resource_id(),
+        proxy.auth.clone(),
+    ));
     // A read-only endpoint serves no writing statement, exactly as a reader endpoint of a DB
     // cluster does ([`super::read_only`]); an endpoint that serves read/write work leaves the
     // database's own answer as it stands, so a session on the writer of a cluster still

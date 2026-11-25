@@ -705,6 +705,20 @@ impl DbProxyRecord {
         )
     }
 
+    /// The ID the proxy's own `DBProxyArn` names it by: the resource segment that ARN ends
+    /// with.
+    ///
+    /// This is how a client addresses the proxy in a resource of ANOTHER namespace — the
+    /// `dbuser` resource an IAM policy grants `rds-db:connect` on
+    /// (`super::data_plane::proxy_client_auth::ProxyClientAuth::dbuser_arn`) — because
+    /// `DBProxyArn` is the only place the control plane publishes that id. Read off
+    /// [`Self::arn`] rather than written out a second time, so the id a grant is scoped by and
+    /// the ARN a client derives it from cannot drift apart.
+    pub fn arn_resource_id(&self) -> String {
+        let arn = self.arn();
+        arn.rsplit(':').next().unwrap_or_default().to_string()
+    }
+
     /// `DBProxyTargetGroup$TargetGroupArn` for this proxy's one target group.
     pub fn target_group_arn(&self) -> String {
         emulator_server::emulator_arn(
