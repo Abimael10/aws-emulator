@@ -282,6 +282,27 @@ pub async fn delivered_stamped_over(
     write_events(callback, region, log_group, log_stream, &stamped, true).await
 }
 
+/// [`delivered_into_held_group_over`] for records that each carry the instant it OBSERVED,
+/// which is what [`delivered_stamped_over`] is for [`delivered_over`]: the records go into the
+/// log group CloudWatch Logs already holds under that name, no group is created, and each
+/// record is ingested at the instant it reports rather than at the instant it is handed over.
+///
+/// `events` are `(instant in epoch milliseconds, record)` pairs, in any order; see
+/// [`delivered_stamped_over`] for how a batch of them is split and ordered.
+pub async fn delivered_stamped_into_held_group_over(
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    log_group: &str,
+    log_stream: &str,
+    events: &[(i64, String)],
+) -> bool {
+    let stamped: Vec<(i64, &str)> = events
+        .iter()
+        .map(|(at, record)| (*at, record.as_str()))
+        .collect();
+    write_events(callback, region, log_group, log_stream, &stamped, false).await
+}
+
 /// [`delivered`] into a destination the service delivering is POINTED AT rather than one it
 /// publishes itself: the records go into the log group CloudWatch Logs already holds under
 /// that name, and no group is created.

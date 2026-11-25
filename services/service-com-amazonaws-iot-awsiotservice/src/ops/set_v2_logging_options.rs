@@ -202,7 +202,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A set replaces the account's options in full: the request carries every
         // member the reader reports, so one a caller omits is one the configured
-        // options do not have.
+        // options do not have — including the `defaultLogLevel` the broker's own events are
+        // logged at ([`crate::state::v2_logging::broker_logs`]), which an account logging at a
+        // level is one whose last set stated.
         state.lock().v2_logging_options = Some(crate::state::V2LoggingOptions::configured(
             input.role_arn,
             input.default_log_level,

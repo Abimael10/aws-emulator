@@ -49,6 +49,10 @@ use ::tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use ::tokio::sync::mpsc::Receiver;
 use ::tokio::sync::Notify;
 
+use super::session_logs::{
+    self, Outcome, CONNECT_EVENT, DISCONNECT_EVENT, PUBLISH_IN_EVENT, PUBLISH_OUT_EVENT,
+    SUBSCRIBE_EVENT, UNSUBSCRIBE_EVENT,
+};
 use super::{
     endpoint, lifecycle, now_millis, Delivery, DirectMessage, LiveConnection, MqttBrokerState,
     MAX_PENDING_DELIVERIES,
@@ -221,6 +225,17 @@ async fn serve_mqtt(
         // A session is keyed by its client id, so a connection that names none cannot be
         // reported on at all: MQTT's own refusal for an unusable client id.
         let _ = write_connack(version, &mut writer, protocol::Connack::ClientIdNotValid).await;
+        // A refused CONNECT is still a connect event: an operator looking for why a device
+        // never appeared reads the refusal rather than nothing at all.
+        session_logs::reported(
+            &state,
+            CONNECT_EVENT,
+            &client_id,
+            None,
+            Outcome::Refused(UNUSABLE_CLIENT_ID),
+            now_millis(),
+        )
+        .await;
         return;
     }
     if connect
@@ -354,6 +369,15 @@ async fn serve_mqtt(
         // The protocol's own "server unavailable" — what a broker at its connection quota
         // answers — and no session was opened.
         let _ = write_connack(version, &mut writer, protocol::Connack::ServerUnavailable).await;
+        session_logs::reported(
+            &state,
+            CONNECT_EVENT,
+            &client_id,
+            None,
+            Outcome::Refused(SESSION_TABLE_FULL),
+            opened_at,
+        )
+        .await;
         return;
     };
     let connection_id = opening.connection_id;
@@ -367,7 +391,7 @@ async fn serve_mqtt(
     )
     .await
     {
-        close_session(&state, &client_id, connection_id, CONNECTION_LOST);
+        close_session(&state, &client_id, connection_id, CONNECTION_LOST).await;
         return;
     }
 
@@ -385,6 +409,17 @@ async fn serve_mqtt(
         opening.version_number,
         opened_at,
     );
+    // ... and what it REPORTS about it, for whatever logs this broker's session events
+    // ([`session_logs`]): the session is open, so the event carries its own record.
+    session_logs::reported(
+        &state,
+        CONNECT_EVENT,
+        &client_id,
+        None,
+        Outcome::Served,
+        opened_at,
+    )
+    .await;
 
     // What the session was holding for this client while it was away is written to it now,
     // which is what a persistent session is FOR — each under its own packet identifier,
@@ -396,9 +431,18 @@ async fn serve_mqtt(
         // A redelivery is a message forwarded by ordinary publishing, so its RETAIN flag
         // is clear: only the push that answers a new subscription carries one.
         if !write_publish(version, &mut writer, &message, packet_id, false).await {
-            close_session(&state, &client_id, connection_id, CONNECTION_LOST);
+            close_session(&state, &client_id, connection_id, CONNECTION_LOST).await;
             return;
         }
+        session_logs::reported(
+            &state,
+            PUBLISH_OUT_EVENT,
+            &client_id,
+            Some(&message.topic),
+            Outcome::Served,
+            now_millis(),
+        )
+        .await;
     }
 
     let reason = serve_session(
@@ -416,9 +460,36 @@ async fn serve_mqtt(
     )
     .await;
     if let Some(reason) = reason {
-        close_session(&state, &client_id, connection_id, reason);
+        close_session(&state, &client_id, connection_id, reason).await;
     }
 }
+
+/// Why a CONNECT the broker could open no session for was refused, as the log record of that
+/// event reports it: a connection that named no client id, and one that arrived when the
+/// session table was full ([`MAX_SESSIONS`]).
+const UNUSABLE_CLIENT_ID: &str = "the connection named no client id";
+
+/// See [`UNUSABLE_CLIENT_ID`].
+const SESSION_TABLE_FULL: &str = "the broker holds as many sessions as it will";
+
+/// Why a PUBLISH the broker refused was refused, as the log record of that event reports it:
+/// a publication at a QoS the broker does not serve, one whose topic is no topic name, and one
+/// larger than the broker's own message quota.
+const UNSERVED_PUBLISH_QOS: &str = "the publication asked for a QoS the broker does not serve";
+
+/// See [`UNSERVED_PUBLISH_QOS`].
+const PUBLISH_TOPIC_INVALID: &str = "the publication names no topic";
+
+/// See [`UNSERVED_PUBLISH_QOS`].
+const PUBLISH_TOO_LARGE: &str = "the publication is larger than the broker's message quota";
+
+/// Why a topic filter a SUBSCRIBE asked for was refused, as the log record of that event
+/// reports it: a filter that is no filter at all, and one past the session's subscription
+/// quota ([`MAX_SUBSCRIPTIONS_PER_SESSION`]).
+const SUBSCRIBE_FILTER_INVALID: &str = "the subscription names no topic filter";
+
+/// See [`SUBSCRIBE_FILTER_INVALID`].
+const SUBSCRIBE_QUOTA_EXCEEDED: &str = "the session holds as many subscriptions as it will";
 
 /// Answer one open session's packets, and hand it the deliveries the broker makes to it,
 /// until the connection ends.
@@ -477,6 +548,15 @@ where
                 if !write_publish(version, writer, &delivery.message, packet_id, false).await {
                     return Some(CONNECTION_LOST);
                 }
+                session_logs::reported(
+                    state,
+                    PUBLISH_OUT_EVENT,
+                    client_id,
+                    Some(&delivery.message.topic),
+                    Outcome::Served,
+                    now_millis(),
+                )
+                .await;
                 continue;
             }
             packet = read_packet(version, reader, buffer) => packet,
@@ -496,6 +576,15 @@ where
                 if message.qos > MAX_GRANTED_QOS {
                     // AWS IoT Core supports QoS 0 and 1 only, so there is no exchange
                     // this broker could complete for a QoS 2 publication.
+                    session_logs::reported(
+                        state,
+                        PUBLISH_IN_EVENT,
+                        client_id,
+                        Some(&message.topic),
+                        Outcome::Refused(UNSERVED_PUBLISH_QOS),
+                        now_millis(),
+                    )
+                    .await;
                     return Some(CONNECTION_LOST);
                 }
                 if !::mqttbytes::valid_topic(&message.topic) {
@@ -503,12 +592,30 @@ where
                     // subscription wildcard, which only a filter may — is a protocol
                     // violation, and MQTT 3.1.1 gives a server no way to refuse one
                     // packet: the connection ends.
+                    session_logs::reported(
+                        state,
+                        PUBLISH_IN_EVENT,
+                        client_id,
+                        Some(&message.topic),
+                        Outcome::Refused(PUBLISH_TOPIC_INVALID),
+                        now_millis(),
+                    )
+                    .await;
                     return Some(CONNECTION_LOST);
                 }
                 if message.payload.len() > MAX_PAYLOAD_BYTES {
                     // Larger than the broker's own message quota, so there is no
                     // publication to make; the packet was framed, so the connection ends
                     // rather than the message being delivered in part.
+                    session_logs::reported(
+                        state,
+                        PUBLISH_IN_EVENT,
+                        client_id,
+                        Some(&message.topic),
+                        Outcome::Refused(PUBLISH_TOO_LARGE),
+                        now_millis(),
+                    )
+                    .await;
                     return Some(CONNECTION_LOST);
                 }
                 let at_least_once = message.qos >= MAX_GRANTED_QOS;
@@ -520,6 +627,17 @@ where
                 // (`$aws/rules/<ruleName>/<topic>`) is published to nobody at all — and
                 // both are then evaluated by the account's topic rules.
                 super::served_publication(state, &message).await;
+                // ... and what the broker REPORTS about having taken it, for whatever logs
+                // its session events: the topic, never the payload.
+                session_logs::reported(
+                    state,
+                    PUBLISH_IN_EVENT,
+                    client_id,
+                    Some(&message.topic),
+                    Outcome::Served,
+                    message.delivered_at_millis,
+                )
+                .await;
                 // A publication on a topic the broker RESERVES for one of its own
                 // exchanges is served as well as carried: a device's report on a command
                 // execution's reserved response topic is applied to that execution and
@@ -555,6 +673,14 @@ where
                 // matching below and the reserved-topic replay after it.
                 let mut subscribed: ::std::collections::BTreeMap<String, i32> =
                     ::std::collections::BTreeMap::new();
+                // What each DISTINCT filter of this packet became: `None` for one the session
+                // now subscribes to, and the reason it was refused for one it does not. The
+                // events reported below are read off this, so a packet that repeated an entry
+                // reports it ONCE, and the table is bounded by the subscriptions a session may
+                // hold ([`MAX_SUBSCRIPTIONS_PER_SESSION`]) — a client-chosen batch of filters
+                // cannot multiply the records one packet leaves.
+                let mut outcomes: ::std::collections::BTreeMap<String, Option<&'static str>> =
+                    ::std::collections::BTreeMap::new();
                 {
                     let mut held = state.lock();
                     // The session this connection opened, while it is still this
@@ -578,12 +704,22 @@ where
                             || !::mqttbytes::valid_filter(&filter.path)
                         {
                             granted.push(protocol::Grant::TopicFilterInvalid);
+                            if outcomes.len() < MAX_SUBSCRIPTIONS_PER_SESSION {
+                                outcomes
+                                    .entry(filter.path.clone())
+                                    .or_insert(Some(SUBSCRIBE_FILTER_INVALID));
+                            }
                             continue;
                         }
                         if session.subscriptions.len() >= MAX_SUBSCRIPTIONS_PER_SESSION
                             && !session.subscriptions.contains_key(&filter.path)
                         {
                             granted.push(protocol::Grant::QuotaExceeded);
+                            if outcomes.len() < MAX_SUBSCRIPTIONS_PER_SESSION {
+                                outcomes
+                                    .entry(filter.path.clone())
+                                    .or_insert(Some(SUBSCRIBE_QUOTA_EXCEEDED));
+                            }
                             continue;
                         }
                         let qos = filter.qos.clamp(0, MAX_GRANTED_QOS);
@@ -591,6 +727,7 @@ where
                         granted.push(protocol::Grant::Qos(qos));
                         let subscribed_qos = subscribed.entry(filter.path.clone()).or_insert(qos);
                         *subscribed_qos = (*subscribed_qos).max(qos);
+                        outcomes.insert(filter.path.clone(), None);
                     }
                 }
                 if !write_packet(writer, |buffer| {
@@ -599,6 +736,20 @@ where
                 .await
                 {
                     return Some(CONNECTION_LOST);
+                }
+                // What the broker reports about each filter this packet asked for, once the
+                // client has been told what became of them: a subscription it now holds, and a
+                // filter it was refused with the reason for it.
+                for (filter, refusal) in &outcomes {
+                    session_logs::reported(
+                        state,
+                        SUBSCRIBE_EVENT,
+                        client_id,
+                        Some(filter),
+                        refusal.map_or(Outcome::Served, Outcome::Refused),
+                        now_millis(),
+                    )
+                    .await;
                 }
                 // What the new subscriptions are answered with out of the retain store: the
                 // topics they cover, matched OFF the store's lock over the bounded list of
@@ -656,11 +807,19 @@ where
                 }
             }
             protocol::ClientPacket::Unsubscribe { packet_id, filters } => {
+                // The DISTINCT filters the packet gave up, which is what the session dropped
+                // and what is reported below — bounded by the subscriptions a session may
+                // hold, for the reason the SUBSCRIBE above states.
+                let mut unsubscribed: ::std::collections::BTreeSet<String> =
+                    ::std::collections::BTreeSet::new();
                 {
                     let mut held = state.lock();
                     let session = held.sessions.get_mut(client_id)?;
                     for filter in &filters {
                         session.subscriptions.remove(filter);
+                        if unsubscribed.len() < MAX_SUBSCRIPTIONS_PER_SESSION {
+                            unsubscribed.insert(filter.clone());
+                        }
                     }
                 }
                 if !write_packet(writer, |buffer| {
@@ -669,6 +828,17 @@ where
                 .await
                 {
                     return Some(CONNECTION_LOST);
+                }
+                for filter in &unsubscribed {
+                    session_logs::reported(
+                        state,
+                        UNSUBSCRIBE_EVENT,
+                        client_id,
+                        Some(filter),
+                        Outcome::Served,
+                        now_millis(),
+                    )
+                    .await;
                 }
             }
             protocol::ClientPacket::PingReq => {
@@ -723,7 +893,11 @@ fn retained_topics_answering(
 /// Only the session this connection still owns is written: a client id another connection
 /// has taken over belongs to that connection, and a session the service disconnected
 /// already carries its own reason.
-fn close_session(
+///
+/// It also REPORTS the end of the session for whatever logs this broker's session events
+/// ([`session_logs`]), which is why it awaits: a report is a call of its own, made once the
+/// store's guard is gone.
+async fn close_session(
     state: &::engine::ServiceState<MqttBrokerState>,
     client_id: &str,
     connection_id: u64,
@@ -755,6 +929,18 @@ fn close_session(
         ended
     };
     lifecycle::publish_session_ended(state, &ended, at_millis);
+    // The end of a session is an event the broker SERVED — a client's own goodbye, a
+    // connection that was lost, a client id taken over — and the reason it carries is the one
+    // the session record and its disconnect event report, so one vocabulary covers all three.
+    session_logs::reported(
+        state,
+        DISCONNECT_EVENT,
+        client_id,
+        None,
+        Outcome::ServedFor(reason),
+        at_millis,
+    )
+    .await;
 }
 
 /// Read the opening CONNECT: the MQTT version it announces, and what it asks for.

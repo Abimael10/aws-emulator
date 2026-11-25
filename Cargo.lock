@@ -16077,6 +16077,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "uuid",
  "x509-cert",
  "zip",
 ]

@@ -127,6 +127,12 @@ base64 = "0.22"
 # clause with (`state::policy_document_conditions`).
 ipnet = "2"
 
+# `uuid`: the `traceId` one V2 logging entry carries identifies that ENTRY
+# (`state::v2_logging::broker_logs`), so it is a version-4 UUID drawn from the maintained
+# generator every other minted identifier in this workspace comes from rather than derived from
+# the session or the event.
+uuid = { version = "1", features = ["v4"] }
+
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 

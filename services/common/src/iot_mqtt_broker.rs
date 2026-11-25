@@ -29,6 +29,8 @@
 //! * [`lifecycle`] — what the broker itself PUBLISHES about a session: the presence events a
 //!   connect and a disconnect make, and the client's own last will on a termination that was
 //!   not its own DISCONNECT.
+//! * [`session_logs`] — what the broker REPORTS about every session event it serves, for the
+//!   service that holds the account's logging options to log.
 //! * [`endpoint`] — the socket the core opens for it and the `host:port` that socket is
 //!   published at, which is the address `DescribeEndpoint` answers with.
 //! * [`commands`] — the reserved `$aws/commands/*` topics of the IoT Commands data plane:
@@ -45,6 +47,7 @@ pub mod commands;
 pub mod endpoint;
 pub mod https_plane;
 pub mod lifecycle;
+pub mod session_logs;
 pub mod wire;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -58,6 +61,7 @@ use ::tokio::sync::Notify;
 
 pub use basic_ingest::{ingested, BasicIngest};
 pub use endpoint::{ensure_broker_endpoint, published_broker_endpoint};
+pub use session_logs::{SessionEvent, SessionLogSink};
 /// The MQTT codec this broker reads and writes the protocol with, re-exported: a client
 /// of this emulator written in this workspace speaks the same wire through it rather than
 /// through a second declaration of the codec.
@@ -516,6 +520,9 @@ pub struct MqttBrokerState {
     /// What the publications this broker takes are evaluated by, once the service that owns
     /// the account's topic rules has installed it — see [`PublicationSink`].
     rules: Option<Arc<dyn PublicationSink>>,
+    /// What the session events this broker serves are LOGGED by, once the service that owns
+    /// the account's logging options has installed it — see [`session_logs::SessionLogSink`].
+    session_logs: Option<Arc<dyn session_logs::SessionLogSink>>,
     /// How many connections this broker has accepted, which is what the next one is
     /// identified by ([`LiveConnection::id`]).
     connections_accepted: u64,
@@ -579,6 +586,27 @@ impl MqttBrokerState {
     #[must_use]
     pub fn publication_sink(&self) -> Option<Arc<dyn PublicationSink>> {
         self.rules.clone()
+    }
+
+    /// Install what the session events this broker serves are LOGGED by, keeping the first for
+    /// the same reason [`Self::install_publication_sink`] does: the account's logging options
+    /// are one record, so a sink a later call would install reads the same options out of the
+    /// same store as the one already here.
+    ///
+    /// Called by the service that owns those options, on the call that publishes the address a
+    /// device then connects to — so a session opened on this broker's wire is logged from the
+    /// moment that address exists.
+    pub fn install_session_log_sink(&mut self, logs: Arc<dyn session_logs::SessionLogSink>) {
+        if self.session_logs.is_none() {
+            self.session_logs = Some(logs);
+        }
+    }
+
+    /// What the session events this broker serves are logged by, or `None` while nothing has
+    /// installed a sink — see [`session_logs::SessionLogSink`].
+    #[must_use]
+    pub fn session_log_sink(&self) -> Option<Arc<dyn session_logs::SessionLogSink>> {
+        self.session_logs.clone()
     }
 
     /// Identify the next connection: a number no other connection of this broker carries,

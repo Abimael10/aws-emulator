@@ -27,6 +27,11 @@ use std::collections::BTreeMap;
 
 use crate::ops::types::LogEventConfiguration;
 
+// What those options make the MESSAGE BROKER's own session events DELIVER — which events are
+// logged, what each entry says and which CloudWatch Logs group it goes into — lives in
+// `state/v2_logging/broker_logs.rs`, beside the record that configures it.
+pub mod broker_logs;
+
 /// How many per-event-type overrides one set of V2 logging options may carry.
 ///
 /// `LogEventConfigurations` carries no modelled length and the list is one a CALLER

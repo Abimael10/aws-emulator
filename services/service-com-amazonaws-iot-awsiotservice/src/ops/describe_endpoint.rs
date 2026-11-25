@@ -307,6 +307,12 @@ async fn published_endpoint_address<Eng: Send + Sync + 'static>(
         crate::state::rules_engine::broker_publications::install_rules_engine(
             engine, ctx, region,
         );
+        // ... and what the SESSIONS opened on it are LOGGED by: the account's V2 logging
+        // options, which decide whether each of the broker's own events is delivered into
+        // CloudWatch Logs and at what level
+        // ([`crate::state::v2_logging::broker_logs`]) — installed by the same call, so a
+        // device that connects to the address is logged from the moment it exists.
+        crate::state::v2_logging::broker_logs::install_session_logging(engine, ctx, region);
         if let Some(broker) =
             ::service_common::iot_mqtt_broker::ensure_broker_endpoint(&**engine, ctx.callback())
                 .await
