@@ -205,8 +205,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Enables or disables bearer token authentication for the specified log group":
         // the request's boolean IS the new state, so a put of the state the group is
-        // already in is accepted and changes nothing.
-        group.bearer_token_authentication_enabled = input.bearer_token_authentication_enabled;
+        // already in is accepted and changes nothing. A group this has been called for is
+        // CONFIGURED either way, which is what the stored `Some` records: a group it disabled
+        // is not the same as one it was never called for
+        // (`crate::state::LogGroupRecord::bearer_token_authentication_enabled`).
+        group.bearer_token_authentication_enabled =
+            Some(input.bearer_token_authentication_enabled);
 
         Ok(PutBearerTokenAuthenticationOutput)
     }

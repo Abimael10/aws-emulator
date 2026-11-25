@@ -110,12 +110,12 @@
 //! * `ResourceAlreadyExistsException` (HTTP 400) — The specified resource already exists.
 //! * `ResourceNotFoundException` (HTTP 400) — The specified resource does not exist.
 //! * `ServiceUnavailableException` (HTTP 500) — The service cannot complete the request.
-//! * `AccessDeniedException` (HTTP 400) — widened in through `extra_errors` (see below): the
-//!   code recorded CloudWatch Logs answers a create whose destination bucket's own policy does
-//!   not let this service make the calls the export makes on that bucket
-//!   (`crate::state::export_destination`). It is the PERMISSION class rather than the
-//!   incorrectly-stated-parameter class an absent bucket takes: the bucket is named correctly
-//!   and what is missing is a grant in its policy.
+//!
+//! A destination bucket whose own policy does not let this service make the calls the export
+//! makes on it is refused as an incorrectly-stated `destination`
+//! (`InvalidParameterException`), which is the class this operation MODELS for it: its error
+//! set above carries no permission code, so a refusal under one an SDK generated from this
+//! model never matches (`crate::state::export_destination`).
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -131,10 +131,7 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatchlogs-logs-201
 // here — hence the `CreateExportTaskError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error(
-    "com.amazonaws.cloudwatchlogs#CreateExportTask",
-    extra_errors = ["AccessDeniedException"]
-)]
+#[smithy_macros::operation_error("com.amazonaws.cloudwatchlogs#CreateExportTask")]
 #[derive(Debug)]
 pub enum CreateExportTaskErrorModeled {
     InvalidParameterException(InvalidParameterException),
@@ -143,13 +140,6 @@ pub enum CreateExportTaskErrorModeled {
     ResourceAlreadyExistsException(ResourceAlreadyExistsException),
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceUnavailableException(ServiceUnavailableException),
-    // Widened in through `extra_errors`: the SERVICE models `AccessDeniedException` ("You
-    // don't have sufficient permissions to perform this action"), which is the code RECORDED
-    // CloudWatch Logs answers a destination whose own policy does not let this service make
-    // the calls an export makes on it — a permission refusal rather than a malformed
-    // parameter, and one this operation's own `errors` list omits. See
-    // `crate::state::export_destination`.
-    AccessDeniedException(AccessDeniedException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -224,16 +214,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The permission refusal: the request is well formed and names a bucket that is there,
-        // and the account has not granted the export what it needs on that bucket. Recorded
-        // CloudWatch Logs answers that class under the permission code rather than the
-        // parameter one, which is why this channel exists beside `invalid` above.
-        let access_denied = |message: String| {
-            CreateExportTaskError::from(CreateExportTaskErrorModeled::AccessDeniedException(
-                AccessDeniedException {
-                    message: Some(message),
-                },
-            ))
-        };
+        // and the account has not granted the export what it needs on that bucket. The CLASS it
+        // travels under is this operation's own — its modelled error set carries no permission
+        // code, so the `destination` the service cannot act on is refused as the incorrectly
+        // stated parameter it is, under `invalid` above.
 
         // The log group the export reads is resolved FIRST: a group this account does not
         // hold is the more specific client error, and resolution must not mint a task id.
@@ -289,18 +273,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::EXPORT_DESTINATION_BUCKET_MISSING_MESSAGE.to_string(),
                 ));
             }
-            // A destination whose policy withholds one of those calls is a PERMISSION refusal,
-            // which is the class `AccessDeniedException` carries, rather than a parameter
-            // stated incorrectly: the bucket is named correctly and the account has not granted
-            // the export what it needs on it. The sentence names the call that was withheld,
-            // because that is the grant a client has to go and write.
+            // A destination whose policy withholds one of those calls is refused as a
+            // `destination` this service cannot act on — the class this operation MODELS —
+            // rather than under a permission code its error set does not carry. The sentence
+            // names the call that was withheld, because that is the grant a client has to go
+            // and write.
             crate::state::export_destination::DestinationResolution::AclReadWithheld => {
-                return Err(access_denied(
+                return Err(invalid(
                     crate::state::EXPORT_DESTINATION_ACL_READ_WITHHELD_MESSAGE.to_string(),
                 ));
             }
             crate::state::export_destination::DestinationResolution::ObjectWriteWithheld => {
-                return Err(access_denied(
+                return Err(invalid(
                     crate::state::EXPORT_DESTINATION_OBJECT_WRITE_WITHHELD_MESSAGE.to_string(),
                 ));
             }

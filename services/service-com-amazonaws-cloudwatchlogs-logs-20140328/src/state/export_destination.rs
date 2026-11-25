@@ -217,6 +217,13 @@ const EXPORT_CALLS: [ExportCall; 2] = [ExportCall::AclRead, ExportCall::ObjectWr
 /// write, the canned ACL the export writes its objects with. A statement conditioned on any
 /// other key cannot be decided, and the shared evaluation reads an undecided statement as
 /// granting nothing.
+///
+/// The log group it is made for is published under BOTH ARN forms one log group is named by
+/// ([`crate::state::log_group_source_arn_forms`]) — the one ending in the `:*` that covers the
+/// group's streams and the one without it — because a destination policy's grant may be scoped
+/// to the group by either and both name the same group: the call is withheld only when NO form
+/// of it is allowed, exactly as the sibling gate over a Lambda destination's own permission
+/// decides one ([`super::lambda_destination`]).
 fn withheld_call(
     policy: &str,
     region: &str,
@@ -226,23 +233,27 @@ fn withheld_call(
 ) -> Option<ExportCall> {
     let principals = export_principals(region);
     let account = ::engine::emulator_account_id().to_string();
+    let source_arns = crate::state::log_group_source_arn_forms(log_group_arn);
     EXPORT_CALLS.into_iter().find(|call| {
         let resource = call_resource(*call, bucket, destination_prefix);
-        let context = call_context(*call, &account, log_group_arn);
-        let request =
-            Request::new(call.action(), &resource, &principals).with_context(&context);
-        resource_decision(policy, &request) != Decision::Allowed
+        !source_arns.iter().any(|source_arn| {
+            let context = call_context(*call, &account, source_arn);
+            let request =
+                Request::new(call.action(), &resource, &principals).with_context(&context);
+            resource_decision(policy, &request) == Decision::Allowed
+        })
     })
 }
 
 /// The condition keys this hop carries for `call`: the account the export is made in and the
-/// log group it is made for, and — for the write — the canned ACL the export writes its objects
+/// log group it is made for — as the ONE form of that group's ARN this decision is being taken
+/// under ([`withheld_call`]) — and, for the write, the canned ACL the export writes its objects
 /// with. The keys a documented destination policy scopes its grant by, and the whole of what
 /// this hop publishes (see the module docs).
-fn call_context(call: ExportCall, account: &str, log_group_arn: &str) -> Vec<(String, String)> {
+fn call_context(call: ExportCall, account: &str, source_arn: &str) -> Vec<(String, String)> {
     let mut context = vec![
         (SOURCE_ACCOUNT_KEY.to_string(), account.to_string()),
-        (SOURCE_ARN_KEY.to_string(), log_group_arn.to_string()),
+        (SOURCE_ARN_KEY.to_string(), source_arn.to_string()),
     ];
     if call == ExportCall::ObjectWrite {
         context.push((

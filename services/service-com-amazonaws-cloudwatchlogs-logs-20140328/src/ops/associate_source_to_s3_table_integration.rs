@@ -6,9 +6,10 @@
 //! unique identifier it is stored under — the stored one when the pair already has access,
 //! because an association IS that pairing. Refuses a `dataSource` whose name or type is not
 //! spelled in letters, digits and underscores and one that names no type at all; refuses an
-//! `integrationArn` this service cannot resolve an integration of this account from; and
-//! refuses an associate past this emulator's association cap. This is the ONLY file to touch
-//! for this operation.
+//! `integrationArn` that could name no integration of this account as a parameter stated
+//! incorrectly and one that names an integration the account does not hold as a resource that
+//! does not exist; and refuses an associate past this emulator's association cap. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -202,13 +203,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The ARN has to name an S3 Table Integration this caller holds: the integrations of
         // an account are the records of the service that owns them, so the ARN is resolved
-        // where they live and the rung it fails is what the refusal states.
-        if let Some(message) = crate::state::unresolved_integration_message(
-            &*self.engine,
-            &region,
-            &input.integration_arn,
-        ) {
-            return Err(invalid(message));
+        // where they live and the rung it fails is what the refusal states — and the CLASS it
+        // travels under is that rung's own: an ARN that could name no integration of this
+        // account is a parameter stated incorrectly, while a handle the account holds nothing
+        // under names a resource that does not exist.
+        match crate::state::unresolved_integration(&*self.engine, &region, &input.integration_arn)
+        {
+            Some(crate::state::UnresolvedIntegration::NotFound(message)) => {
+                return Err(
+                    AssociateSourceToS3TableIntegrationErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            Some(unresolved @ crate::state::UnresolvedIntegration::Invalid(_)) => {
+                return Err(invalid(unresolved.message()));
+            }
+            None => {}
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {

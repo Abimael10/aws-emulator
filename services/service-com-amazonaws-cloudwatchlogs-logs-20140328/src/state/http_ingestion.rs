@@ -222,24 +222,50 @@ pub struct ReadRecords {
 /// At most one record PAST [`MAX_RECORDS_PER_REQUEST`] is read: a batch that carries more
 /// than the maximum is refused whole, so one record past it is all that has to be seen and
 /// a longer body is not walked.
+///
+/// A body that is not JSON at all is read, at the OpenTelemetry endpoint alone, as the
+/// PROTOBUF encoding of that protocol's export request — the two encodings carry the same
+/// message, and an OTLP exporter writes either ([`super::open_telemetry`]).
 #[must_use]
 pub fn read_records(endpoint: Endpoint, body: &[u8]) -> ReadRecords {
-    let Ok(document) = ::serde_json::from_slice::<Value>(body) else {
-        return ReadRecords {
-            records: Vec::new(),
-            unreadable: 1,
-        };
+    let unreadable = ReadRecords {
+        records: Vec::new(),
+        unreadable: 1,
     };
-    let items: Vec<&Value> = match endpoint {
-        Endpoint::OpenTelemetry => open_telemetry_log_records(&document),
-        Endpoint::HttpLogCollector | Endpoint::StructuredJson => match &document {
-            Value::Array(items) => items.iter().take(MAX_RECORDS_PER_REQUEST + 1).collect(),
-            other => vec![other],
+    let items: Vec<Value> = match ::serde_json::from_slice::<Value>(body) {
+        Ok(document) => match endpoint {
+            Endpoint::OpenTelemetry => open_telemetry_log_records(&document)
+                .into_iter()
+                .cloned()
+                .collect(),
+            Endpoint::HttpLogCollector | Endpoint::StructuredJson => match document {
+                Value::Array(items) => {
+                    items.into_iter().take(MAX_RECORDS_PER_REQUEST + 1).collect()
+                }
+                other => vec![other],
+            },
+        },
+        // The OpenTelemetry protocol defines the SAME export request in two encodings, and a
+        // body that is not JSON at all is the other one: it is read as the protobuf message
+        // that protocol names, and its records are projected onto the JSON encoding the other
+        // branch above already reads ([`super::open_telemetry`]). Every other form here is
+        // this service's own and is JSON alone.
+        Err(_) => match endpoint {
+            Endpoint::OpenTelemetry => {
+                match super::open_telemetry::export_request_log_records(
+                    body,
+                    MAX_RECORDS_PER_REQUEST,
+                ) {
+                    Some(records) => records,
+                    None => return unreadable,
+                }
+            }
+            Endpoint::HttpLogCollector | Endpoint::StructuredJson => return unreadable,
         },
     };
     let mut read = ReadRecords::default();
     for item in items {
-        match record_of(endpoint, item) {
+        match record_of(endpoint, &item) {
             Some(record) => read.records.push(record),
             None => read.unreadable += 1,
         }
@@ -503,6 +529,33 @@ pub fn no_destination_message() -> String {
 #[must_use]
 pub fn message_body(message: &str) -> String {
     ::serde_json::json!({ "message": message }).to_string()
+}
+
+/// The sentence every request these endpoints may not ingest FOR is refused with: one that
+/// presents no bearer credential, one presenting a token the account never issued or no longer
+/// holds, one addressed to a log group bearer token authentication was never enabled on, and
+/// one whose user IAM does not allow the ingestion. The answer says only that the credential
+/// did not authenticate the request, never which of the four it was.
+///
+/// RECORDED behaviour: this is the text CloudWatch Logs answers such a request with — the
+/// whole sentence is fixed and carries nothing of the request or of the credential it
+/// presented.
+pub const AUTHENTICATION_FAILED_MESSAGE: &str =
+    "Authentication failed: Please make sure your API Key is valid.";
+
+/// The sentence a request addressed to a log group bearer token authentication was explicitly
+/// DISABLED on is refused with: that group does not take this operation, which is a different
+/// refusal from one whose credential did not authenticate
+/// ([`AUTHENTICATION_FAILED_MESSAGE`]) — "when enabled on a log group, bearer token
+/// authentication is enabled on operations until it is explicitly disabled"
+/// (`LogGroup$bearerTokenAuthenticationEnabled`), so a group it was turned off on has STATED
+/// that it does not serve them.
+///
+/// RECORDED behaviour: the fixed text is the service's own and its ONE variable part is the
+/// log group the request addressed, taken from the request.
+#[must_use]
+pub fn unsupported_for_log_group_message(log_group: &str) -> String {
+    format!("This operation is not supported for log group: {log_group}")
 }
 
 #[cfg(test)]

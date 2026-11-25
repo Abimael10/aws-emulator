@@ -24,11 +24,20 @@
 //! ([`crate::state::identity_authorization::refusal_for_identity`]): an ingestion is
 //! `logs:PutLogEvents` on the log stream the request addressed. A request carrying no bearer
 //! credential, one presenting a token the account never issued or no longer holds, one
-//! addressed to a log group that has not had bearer token authentication enabled on it
+//! addressed to a log group that has never had bearer token authentication enabled on it
 //! (`PutBearerTokenAuthentication`, "when enabled on a log group, bearer token
 //! authentication is enabled on operations until it is explicitly disabled"), and one whose
-//! user IAM does not allow that action are all forbidden: none of them is a request this
-//! endpoint may ingest for, and the answer says only that, never which of the four it was.
+//! user IAM does not allow that action are all refused as requests whose credential did not
+//! authenticate an ingestion: none of them is a request this endpoint may ingest for, and the
+//! answer says only that, never which of the four it was. A log group bearer token
+//! authentication was explicitly DISABLED on is a different refusal — that group has stated
+//! that it does not serve the operation, which is a fault of the request's destination rather
+//! than of its credential.
+//!
+//! WHAT a refusal or an acceptance is SERIALIZED as is the protocol of the endpoint it
+//! arrived at ([`refusal`], [`accepted`]): the two record-shaped forms are this service's own
+//! and answer in its one-member JSON envelope, while `/v1/logs` serves OTLP/HTTP and answers
+//! in that protocol's own protobuf messages ([`crate::state::open_telemetry`]).
 //!
 //! WHAT it ingests is the one ingestion this service already performs: the records the body
 //! carried become one batch of log events handed to `crate::ops::put_log_events`, so the
@@ -49,15 +58,11 @@ use ::smithy_server_runtime::{
 use ::std::sync::Arc;
 
 use crate::state::http_ingestion::{self as ingestion, Endpoint, Record};
+use crate::state::open_telemetry as otlp;
 
 /// What a request this endpoint may not ingest for is refused with: `403`, the status a
-/// credential that does not authorize a request is refused with, over the one-member
-/// envelope these endpoints report a refusal in.
+/// credential that does not authorize a request is refused with.
 const FORBIDDEN_STATUS: u16 = 403;
-
-/// AWS's own word for a request whose credential does not authorize it at an HTTP front
-/// door, which is what a missing, unknown or disabled bearer credential is here.
-const FORBIDDEN_MESSAGE: &str = "Forbidden";
 
 /// The operation an ingestion over these endpoints performs, which is the action it is
 /// decided against: `logs:PutLogEvents`, the one ingestion this service performs.
@@ -196,24 +201,33 @@ impl<Eng: Send + Sync + 'static> HttpIngestion<Eng> {
     }
 
     /// Whether the log group `log_group` has bearer token authentication enabled, which is
-    /// what makes it a destination these endpoints ingest into. `false` for a group this
-    /// account does not hold: there is no group to have enabled it.
-    fn bearer_token_authentication_enabled(&self, log_group: &str) -> bool {
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return false;
-        };
+    /// what makes it a destination these endpoints ingest into.
+    ///
+    /// THREE answers, because the group states three things: `Some(true)` for a group it is
+    /// enabled on, `Some(false)` for one it was explicitly DISABLED on, and `None` for one
+    /// nothing has been stated for — which a group this account does not hold is too, there
+    /// being no group to have stated anything. The last two are refused differently
+    /// ([`HttpIngestion::serve`]).
+    fn bearer_token_authentication(&self, log_group: &str) -> Option<bool> {
+        let state = crate::state::service_state(&*self.engine)?;
         let store = state.lock();
         store
             .log_groups
             .get(log_group)
-            .is_some_and(|group| group.bearer_token_authentication_enabled)
+            .and_then(|group| group.bearer_token_authentication_enabled)
     }
 
     /// What a request this endpoint REFUSES is answered with, and the audit record of that
     /// refusal: every refusal is recorded the way the served write is, naming what it
     /// addressed and the status it was answered with — and nothing of the credential it
     /// presented.
-    fn refused(&self, status: u16, message: &str, log_group: Option<&str>) -> RtResponse {
+    fn refused(
+        &self,
+        endpoint: Endpoint,
+        status: u16,
+        message: &str,
+        log_group: Option<&str>,
+    ) -> RtResponse {
         ::tracing::info!(
             audit = true,
             operation = PUT_LOG_EVENTS_OPERATION,
@@ -222,14 +236,19 @@ impl<Eng: Send + Sync + 'static> HttpIngestion<Eng> {
             status = status,
             "an ingestion over an HTTP endpoint was refused"
         );
-        response(status, &ingestion::message_body(message))
+        refusal(endpoint, status, message)
     }
 
-    /// What a request this endpoint may not ingest for is answered with: the answer says
-    /// only that the request is forbidden — not which of its credential, its destination or
-    /// its grants was the reason.
-    fn forbidden(&self, log_group: Option<&str>) -> RtResponse {
-        self.refused(FORBIDDEN_STATUS, FORBIDDEN_MESSAGE, log_group)
+    /// What a request whose credential did not authenticate an ingestion for the destination
+    /// it addressed is answered with: the sentence says only that, never which of the
+    /// credential, the destination or the grants was the reason.
+    fn authentication_failed(&self, endpoint: Endpoint, log_group: Option<&str>) -> RtResponse {
+        self.refused(
+            endpoint,
+            FORBIDDEN_STATUS,
+            ingestion::AUTHENTICATION_FAILED_MESSAGE,
+            log_group,
+        )
     }
 
     /// Serve one request to an HTTP ingestion endpoint.
@@ -243,10 +262,10 @@ impl<Eng: Send + Sync + 'static> HttpIngestion<Eng> {
         // endpoint may not ingest for is refused whatever it carries, and the refusal says
         // nothing about whether the group it named exists.
         let Some(token) = presented_token(req) else {
-            return self.forbidden(None);
+            return self.authentication_failed(endpoint, None);
         };
         let Some(identity) = self.authenticated_identity(token) else {
-            return self.forbidden(None);
+            return self.authentication_failed(endpoint, None);
         };
         // WHERE the records go: a record is ingested into a log stream of a log group, so a
         // request that names neither in its headers nor in its query string addresses no
@@ -254,13 +273,28 @@ impl<Eng: Send + Sync + 'static> HttpIngestion<Eng> {
         // and is reported as one.
         let Some(destination) = addressed_destination(req) else {
             return self.refused(
+                endpoint,
                 BAD_REQUEST_STATUS,
                 &ingestion::no_destination_message(),
                 None,
             );
         };
-        if !self.bearer_token_authentication_enabled(&destination.log_group) {
-            return self.forbidden(Some(&destination.log_group));
+        // WHAT the destination states about bearer token authentication, which is three
+        // things and not two: a group it is enabled on takes the ingestion, a group nothing
+        // has been stated for does not authenticate the credential at all, and a group it was
+        // explicitly DISABLED on has stated that it does not serve the operation — a
+        // different refusal, under the status its own class carries.
+        match self.bearer_token_authentication(&destination.log_group) {
+            Some(true) => {}
+            Some(false) => {
+                return self.refused(
+                    endpoint,
+                    BAD_REQUEST_STATUS,
+                    &ingestion::unsupported_for_log_group_message(&destination.log_group),
+                    Some(&destination.log_group),
+                );
+            }
+            None => return self.authentication_failed(endpoint, Some(&destination.log_group)),
         }
         // WHAT that principal may do: the ingestion is `logs:PutLogEvents` on the log
         // stream the request addressed, decided against the IAM user the presented
@@ -281,7 +315,7 @@ impl<Eng: Send + Sync + 'static> HttpIngestion<Eng> {
         )
         .is_some()
         {
-            return self.forbidden(Some(&destination.log_group));
+            return self.authentication_failed(endpoint, Some(&destination.log_group));
         }
         let read = ingestion::read_records(endpoint, req.body().bytes().unwrap_or_default());
         let carried = read.records.len() + read.unreadable;
@@ -289,6 +323,7 @@ impl<Eng: Send + Sync + 'static> HttpIngestion<Eng> {
         // maximum is refused before anything of it is ingested.
         if carried > ingestion::MAX_RECORDS_PER_REQUEST {
             return self.refused(
+                endpoint,
                 BAD_REQUEST_STATUS,
                 &ingestion::too_many_records_message(),
                 Some(&destination.log_group),
@@ -297,6 +332,7 @@ impl<Eng: Send + Sync + 'static> HttpIngestion<Eng> {
         // A batch carrying no record at all is refused: there was nothing to ingest.
         if read.records.is_empty() {
             return self.refused(
+                endpoint,
                 BAD_REQUEST_STATUS,
                 ingestion::ALL_EVENTS_INVALID_MESSAGE,
                 Some(&destination.log_group),
@@ -328,13 +364,13 @@ impl<Eng: Send + Sync + 'static> HttpIngestion<Eng> {
             )
             .await;
         let answered = match ingested {
-            Ok(output) => accepted(carried, read.records.len(), &output),
+            Ok(output) => accepted(endpoint, carried, read.records.len(), &output),
             // A refusal of the BATCH is the ingestion's own, reported under the status its
             // CLASS answers with and worded as the modelled operation words it, in the
-            // envelope these endpoints report a refusal in.
+            // encoding the endpoint it arrived at answers in.
             Err(refused) => {
                 let (status, message) = refusal_answer(&refused);
-                response(status, &ingestion::message_body(&message))
+                refusal(endpoint, status, &message)
             }
         };
         // The audit record of the write this request performed: what it addressed, how many
@@ -357,6 +393,7 @@ impl<Eng: Send + Sync + 'static> HttpIngestion<Eng> {
 /// The answer to a batch the ingestion accepted: the records it refused, counted from what
 /// the ingestion reported back and from the records the body carried no event in.
 fn accepted(
+    endpoint: Endpoint,
     carried: usize,
     handed_over: usize,
     output: &crate::ops::types::PutLogEventsOutput,
@@ -366,20 +403,81 @@ fn accepted(
     // A record the body carried no log event in was never handed over, so it is refused
     // too: the count a partial success reports is of the records the REQUEST carried.
     let rejected = carried.saturating_sub(handed_over) + refusals.total();
-    if rejected == 0 {
-        return response(OK_STATUS, ingestion::ACCEPTED_BODY);
-    }
     if rejected >= carried {
         // Nothing of the batch was ingested after all, so there is no partial success.
-        return response(
+        return refusal(
+            endpoint,
             BAD_REQUEST_STATUS,
-            &ingestion::message_body(ingestion::ALL_EVENTS_INVALID_MESSAGE),
+            ingestion::ALL_EVENTS_INVALID_MESSAGE,
         );
     }
+    let reason = ingestion::window_refusal_document(&refusals);
+    match endpoint {
+        // The OpenTelemetry endpoint answers its protocol's own response message, which
+        // carries the partial success of the batch where there is one and is the EMPTY message
+        // where there is not ([`crate::state::open_telemetry`]).
+        Endpoint::OpenTelemetry => protobuf(
+            OK_STATUS,
+            otlp::export_response_body(u64::try_from(rejected).unwrap_or(u64::MAX), &reason),
+        ),
+        Endpoint::HttpLogCollector | Endpoint::StructuredJson => {
+            if rejected == 0 {
+                return json(OK_STATUS, ingestion::ACCEPTED_BODY.to_string());
+            }
+            json(OK_STATUS, ingestion::partial_success_body(rejected, &reason))
+        }
+    }
+}
+
+/// What a REFUSED request of `endpoint` is answered with: the status its class carries, over
+/// the body the PROTOCOL that endpoint speaks reports a refusal in.
+///
+/// The two record-shaped forms are this service's own and report one in its one-member JSON
+/// envelope. The OpenTelemetry endpoint serves OTLP/HTTP, whose refusal is a protobuf
+/// `google.rpc.Status` carrying the canonical code of the class and the sentence
+/// ([`crate::state::open_telemetry`]): an OTLP exporter decodes that message to learn whether
+/// to retry or to re-authenticate, and a JSON document decodes to nothing under it.
+fn refusal(endpoint: Endpoint, status: u16, message: &str) -> RtResponse {
+    match endpoint {
+        Endpoint::OpenTelemetry => protobuf(
+            status,
+            otlp::status_body(otlp::rpc_code_for_status(status), message),
+        ),
+        Endpoint::HttpLogCollector | Endpoint::StructuredJson => {
+            json(status, ingestion::message_body(message))
+        }
+    }
+}
+
+/// One JSON answer of these endpoints: a JSON body under the status it is reported with.
+fn json(status: u16, body: String) -> RtResponse {
+    response(status, ::aws_smithy_types::body::SdkBody::from(body), "application/json")
+}
+
+/// One answer in the OpenTelemetry protocol's protobuf encoding.
+fn protobuf(status: u16, body: Vec<u8>) -> RtResponse {
     response(
-        OK_STATUS,
-        &ingestion::partial_success_body(rejected, &ingestion::window_refusal_document(&refusals)),
+        status,
+        ::aws_smithy_types::body::SdkBody::from(body),
+        otlp::PROTOBUF_MEDIA_TYPE,
     )
+}
+
+/// One response of these endpoints: `body` under `status`, carried as `content_type`.
+fn response(
+    status: u16,
+    body: ::aws_smithy_types::body::SdkBody,
+    content_type: &'static str,
+) -> RtResponse {
+    let mut response = RtResponse::new(
+        ::aws_smithy_runtime_api::http::StatusCode::try_from(status)
+            .expect("the status is a constant of this module"),
+        body,
+    );
+    response
+        .headers_mut()
+        .insert("content-type", content_type);
+    response
 }
 
 /// The status and the sentence a modelled refusal of the ingestion is reported with, so the
@@ -419,19 +517,6 @@ fn refusal_answer(refused: &crate::ops::put_log_events::PutLogEventsError) -> (u
         status,
         message.unwrap_or_else(|| ingestion::ALL_EVENTS_INVALID_MESSAGE.to_string()),
     )
-}
-
-/// One response of these endpoints: a JSON body under the status it is reported with.
-fn response(status: u16, body: &str) -> RtResponse {
-    let mut response = RtResponse::new(
-        ::aws_smithy_runtime_api::http::StatusCode::try_from(status)
-            .expect("the status is a constant of this module"),
-        ::aws_smithy_types::body::SdkBody::from(body.to_string()),
-    );
-    response
-        .headers_mut()
-        .insert("content-type", "application/json");
-    response
 }
 
 impl<Eng: Send + Sync + 'static> ErasedOperation for HttpIngestion<Eng> {

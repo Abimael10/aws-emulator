@@ -109,6 +109,15 @@ uuid = "1"
 # generates, so this service keeps no second reading of which endpoints the account has
 # (`state::syslog_vpc_endpoint`).
 aws-sdk-ec2 = { version = "1", default-features = false }
+# `prost`: the OTLP logs endpoint of the HTTP ingestion surface speaks the OpenTelemetry
+# protocol, whose request and response messages — and the `google.rpc.Status` a rejection
+# carries — are protobuf, so this maintained codec encodes and decodes them
+# (`state::open_telemetry`).
+prost = "0.14"
+# `base64`: the protobuf JSON mapping the OpenTelemetry protocol adopts carries a bytes-valued
+# attribute as base64, which is how a record that arrived as protobuf is projected onto that
+# encoding (`state::open_telemetry`).
+base64 = "0.22"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -159,6 +168,10 @@ service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # on the shared engine and mount that service beside this one to create one through its API.
 # Already a dependency of `src/`; an integration test reaches it only through this list.
 service-com-amazonaws-observabilityadmin-observabilityadmin = { workspace = true }
+# The OTLP endpoint answers in the OpenTelemetry protocol's protobuf messages, so the suite
+# about that surface writes its export requests and decodes its answers the way a client does.
+# Already a dependency of `src/`; an integration test reaches it only through this list.
+prost = "0.14"
 
 [lints]
 workspace = true

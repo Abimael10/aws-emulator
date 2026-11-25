@@ -11,8 +11,12 @@
 //! authentication enabled on it. Each record is stored as the document it arrived as, and
 //! the batch is answered with an empty JSON object when every record of it was ingested, a
 //! partial success naming how many records were refused and per class how many when only
-//! some were, and `400 {"message":"All events were invalid"}` when none was. A request this
-//! endpoint may not ingest for is `403 {"message":"Forbidden"}` and stores nothing.//!
+//! some were, and `400 {"message":"All events were invalid"}` when none was. A request whose
+//! credential did not authenticate an ingestion for the destination it addressed is refused
+//! `403` with the sentence that says so and stores nothing, and one addressed to a log group
+//! bearer token authentication was explicitly DISABLED on is refused `400` with the sentence
+//! naming that group.
+//!
 //! Each case drives the endpoints the way a client does — an unsigned `POST` with an
 //! `Authorization: Bearer` header — and reads what was ingested back through
 //! `GetLogEvents`, so a record that was not stored cannot pass. The API key and the IAM user
@@ -51,8 +55,20 @@ const ACCEPTED: &str = "{}";
 /// The whole sentence a batch with nothing to ingest is refused with.
 const ALL_EVENTS_INVALID: &str = "All events were invalid";
 
-/// The whole sentence a request this endpoint may not ingest for is refused with.
-const FORBIDDEN: &str = "Forbidden";
+/// The whole sentence a request whose credential did not authenticate an ingestion for the
+/// destination it addressed is refused with. Stated here independently of the crate under
+/// test.
+///
+/// `pub(crate)` because the OpenTelemetry suite drives the same authorization step and states
+/// this sentence once rather than transcribing it again.
+pub(crate) const AUTHENTICATION_FAILED: &str =
+    "Authentication failed: Please make sure your API Key is valid.";
+
+/// The whole sentence a request addressed to a log group bearer token authentication was
+/// explicitly DISABLED on is refused with: its one variable part is that group's name.
+pub(crate) fn unsupported_for_log_group(log_group: &str) -> String {
+    format!("This operation is not supported for log group: {log_group}")
+}
 
 /// Milliseconds in one day, for the timestamps the ingestion window rows state.
 const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -689,14 +705,16 @@ async fn a_batch_over_the_documented_maximum_is_refused_whole() {
 }
 
 /// RULE: only a request presenting an ACTIVE CloudWatch Logs API key the account issued,
-/// addressed to a log group with bearer token authentication enabled, may ingest; every
-/// other request is `403 {"message":"Forbidden"}` and stores nothing.
+/// addressed to a log group with bearer token authentication enabled, may ingest; a request
+/// whose credential did not authenticate one is `403` with the sentence saying so, a request
+/// addressed to a group bearer token authentication was explicitly DISABLED on is `400` with
+/// the sentence naming that group, and neither stores anything.
 ///
 /// The rows span what can be wrong about the credential (absent, another scheme, a secret
 /// the account never issued, a credential of another service, one made inactive, one
 /// deleted) and about the destination (a group that never enabled bearer token
-/// authentication, and one that has disabled it again), and close with the request that
-/// IS admitted, so no row passes merely because nothing is ever ingested.
+/// authentication, and — as its own refusal — one that has disabled it again), and close with
+/// the request that IS admitted, so no row passes merely because nothing is ever ingested.
 #[tokio::test]
 async fn only_an_active_logs_api_key_on_a_bearer_enabled_group_may_ingest() {
     let aws = Emulator::new();
@@ -810,11 +828,6 @@ async fn only_an_active_logs_api_key_on_a_bearer_enabled_group_may_ingest() {
             never,
             Some(credential.clone()),
         ),
-        (
-            "a group that has disabled it again",
-            disabled,
-            Some(credential.clone()),
-        ),
     ];
     for (case, group, presented) in &rows {
         let (status, answered) = post(
@@ -828,8 +841,11 @@ async fn only_an_active_logs_api_key_on_a_bearer_enabled_group_may_ingest() {
         .await;
         assert_eq!(
             (status, answered.as_str()),
-            (403, json!({"message": FORBIDDEN}).to_string().as_str()),
-            "case {case:?}: expected the forbidden refusal, got {status} with {answered:?}"
+            (
+                403,
+                json!({"message": AUTHENTICATION_FAILED}).to_string().as_str()
+            ),
+            "case {case:?}: expected the authentication refusal, got {status} with {answered:?}"
         );
         let read_back = stored(&aws, group, stream).await;
         assert!(
@@ -837,6 +853,35 @@ async fn only_an_active_logs_api_key_on_a_bearer_enabled_group_may_ingest() {
             "case {case:?}: a refused request stores nothing, got {read_back:?}"
         );
     }
+    // A group bearer token authentication was explicitly DISABLED on is its OWN refusal: that
+    // group has stated it does not serve the operation, which is a fault of the destination
+    // rather than of the credential.
+    let (status, answered) = post(
+        &aws,
+        COLLECTOR_PATH,
+        disabled,
+        stream,
+        Some(&credential),
+        r#"{"event": "refused"}"#,
+    )
+    .await;
+    assert_eq!(
+        (status, answered.as_str()),
+        (
+            400,
+            json!({"message": unsupported_for_log_group(disabled)})
+                .to_string()
+                .as_str()
+        ),
+        "case a group that has disabled it again: expected the unsupported refusal, got \
+         {status} with {answered:?}"
+    );
+    let read_back = stored(&aws, disabled, stream).await;
+    assert!(
+        read_back.is_empty(),
+        "case a group that has disabled it again: a refused request stores nothing, got \
+         {read_back:?}"
+    );
     // The admitted request, for contrast: the same body, on the same group, with the
     // account's own active CloudWatch Logs API key.
     let (status, answered) = post(
@@ -916,7 +961,7 @@ async fn a_superseded_or_expired_secret_authenticates_nothing() {
     .await;
     assert_eq!(
         (status, answered.as_str()),
-        (403, json!({"message": FORBIDDEN}).to_string().as_str()),
+        (403, json!({"message": AUTHENTICATION_FAILED}).to_string().as_str()),
         "case the superseded secret: got {status} with {answered:?}"
     );
     let (status, answered) = post(
@@ -957,7 +1002,7 @@ async fn a_superseded_or_expired_secret_authenticates_nothing() {
     .await;
     assert_eq!(
         (status, answered.as_str()),
-        (403, json!({"message": FORBIDDEN}).to_string().as_str()),
+        (403, json!({"message": AUTHENTICATION_FAILED}).to_string().as_str()),
         "case an expired credential: got {status} with {answered:?}"
     );
     let read_back = stored(&aws, group, stream).await;

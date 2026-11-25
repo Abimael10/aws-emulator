@@ -7,12 +7,13 @@
 //! service, that the permissions that work needs are granted — here the destination bucket's
 //! own policy, which is the only document that can grant a service principal anything — and
 //! answers the refusal of that class when one of them is not, leaving no export task behind.
-//! The class is a PERMISSION refusal: `AccessDeniedException` (smithy_query shape
-//! AccessDeniedException: "you don't have sufficient permissions to perform this action",
-//! httpError 400), which is the code recorded CloudWatch Logs answers for a destination whose
-//! policy withholds one of these calls — the bucket is named correctly and what is missing is a
-//! grant in its policy, so it is not the incorrectly-stated-parameter refusal a bucket that is
-//! not there takes (that half is the sibling suite's subject).
+//! The class is the one the OPERATION MODELS for a `destination` the service cannot act on:
+//! `InvalidParameterException` (smithy_query: operation CreateExportTask, errors are
+//! InvalidParameterException / LimitExceededException / OperationAbortedException /
+//! ResourceAlreadyExistsException / ResourceNotFoundException / ServiceUnavailableException —
+//! there is no permission code among them, so a refusal under one an SDK generated from this
+//! model would never match), the same code a bucket that is not there takes (that half is the
+//! sibling suite's subject).
 //! `CreateExportTask` states the requirement itself — "you must use credentials that have
 //! permission to write to the S3 bucket that you specify as the destination" — and an export
 //! establishes it, as the CloudWatch Logs service principal, by READING the destination
@@ -25,7 +26,8 @@
 //! partition-wide spelling, another service, the account itself), WHICH of the two calls it
 //! grants (each alone, both, an action wildcard over them), WHICH resource (the bucket, the
 //! objects in it, a prefix of them, every resource), what it CONDITIONS the grant on (the
-//! account the export is made in, another account, the log group it is made for, the canned ACL
+//! account the export is made in, another account, the log groups of the account, the ONE log
+//! group it is made for under each of the two ARN forms that group is named by, the canned ACL
 //! the export writes with), and whether a `Deny` of one of those calls sits beside the grant.
 //! The recorded cases — a bucket whose policy grants CloudWatch Logs nothing, and one that
 //! grants it the ACL read alone — are two rows.
@@ -70,10 +72,9 @@ const OBJECT_WRITE_WITHHELD_MESSAGE: &str =
 /// a value, the default is exportedlogs" (`CreateExportTask$destinationPrefix`).
 const DEFAULT_PREFIX: &str = "exportedlogs";
 
-/// The code a call this account's policies do not permit is refused under — the recorded answer
-/// for a destination whose policy withholds one of the export's own calls, written out here
-/// rather than read from the service.
-const ACCESS_DENIED: &str = "AccessDeniedException";
+/// The code a `destination` CloudWatch Logs cannot act on is refused under — the one class this
+/// operation models for it, written out here rather than read from the service.
+const INVALID_PARAMETER: &str = "InvalidParameterException";
 
 /// The emulator with the two services this suite exercises, mounted on ONE engine exactly as
 /// `core/router/src/lib.rs` mounts them.
@@ -256,6 +257,19 @@ fn logs_principal() -> Value {
 /// The bucket itself, and the objects under `prefix` in it, as the ARNs a statement names.
 fn bucket_arn() -> String {
     format!("arn:aws:s3:::{BUCKET}")
+}
+
+/// The ARN of the log group every export here is made for, in the TWO forms one log group is
+/// named by: with the trailing `:*` that covers the streams under it (the form a log group's own
+/// `arn` member carries — "this version of the ARN includes a trailing :* after the log group
+/// name") and without it (the form `logGroupArn` carries). A destination policy's grant may be
+/// scoped to the group by either.
+fn log_group_arn(wildcard_suffix: bool) -> String {
+    let suffix = if wildcard_suffix { ":*" } else { "" };
+    format!(
+        "arn:aws:logs:{REGION}:{}:log-group:{GROUP}{suffix}",
+        account()
+    )
 }
 
 fn objects_arn(prefix: &str) -> String {
@@ -506,6 +520,83 @@ fn rows() -> Vec<Row> {
             refusal: Some(OBJECT_WRITE_WITHHELD_MESSAGE),
         },
         Row {
+            // The documented setup scoped to the ONE log group the export is made for, named
+            // by the ARN form that log group's own `arn` member carries: the trailing `:*`.
+            // Both ARN forms name the same group, so either scopes the grant to it.
+            case: "both calls conditioned on the one log group, by its ARN with the trailing \
+                   wildcard",
+            policy: Some(policy(
+                documented_grant(logs_principal(), DEFAULT_PREFIX)
+                    .into_iter()
+                    .map(|one| {
+                        conditioned(
+                            one,
+                            json!({"StringEquals": {
+                                "aws:SourceAccount": account(),
+                                "aws:SourceArn": log_group_arn(true),
+                            }}),
+                        )
+                    })
+                    .collect(),
+            )),
+            prefix: None,
+            refusal: None,
+        },
+        Row {
+            case: "both calls conditioned on the one log group, by its ARN without the \
+                   trailing wildcard",
+            policy: Some(policy(
+                documented_grant(logs_principal(), DEFAULT_PREFIX)
+                    .into_iter()
+                    .map(|one| {
+                        conditioned(
+                            one,
+                            json!({"StringEquals": {
+                                "aws:SourceAccount": account(),
+                                "aws:SourceArn": log_group_arn(false),
+                            }}),
+                        )
+                    })
+                    .collect(),
+            )),
+            prefix: None,
+            refusal: None,
+        },
+        Row {
+            case: "both calls conditioned, under the ARN operator, on the one log group by its \
+                   ARN with the trailing wildcard",
+            policy: Some(policy(
+                documented_grant(logs_principal(), DEFAULT_PREFIX)
+                    .into_iter()
+                    .map(|one| {
+                        conditioned(
+                            one,
+                            json!({"ArnEquals": {"aws:SourceArn": log_group_arn(true)}}),
+                        )
+                    })
+                    .collect(),
+            )),
+            prefix: None,
+            refusal: None,
+        },
+        Row {
+            // Another log group's `:*` ARN is still another group: neither form of the group
+            // the export is made for matches it.
+            case: "the ACL read conditioned on another log group's wildcard ARN",
+            policy: Some(policy(vec![
+                conditioned(
+                    statement(logs_principal(), json!("s3:GetBucketAcl"), bucket.clone()),
+                    json!({"StringEquals": {
+                        "aws:SourceArn":
+                            format!("arn:aws:logs:{REGION}:{}:log-group:/other/group:*", account()),
+                    }}),
+                ),
+                statement(logs_principal(), json!("s3:PutObject"), objects.clone()),
+            ])),
+            prefix: None,
+            refusal: Some(ACL_READ_WITHHELD_MESSAGE),
+        },
+        Row {
             case: "the write conditioned on the canned ACL the export writes its objects with",
             policy: Some(policy(vec![
                 statement(logs_principal(), json!("s3:GetBucketAcl"), bucket.clone()),
@@ -613,9 +704,9 @@ async fn an_export_task_is_created_only_for_a_destination_that_grants_the_export
             Some(expected) => {
                 assert_eq!(
                     (status, error_code(&body).as_str()),
-                    (400, ACCESS_DENIED),
+                    (400, INVALID_PARAMETER),
                     "case {case:?}: a destination that withholds one of the export's calls must \
-                     be refused 400 {ACCESS_DENIED}, got {status} with {body}"
+                     be refused 400 {INVALID_PARAMETER}, got {status} with {body}"
                 );
                 assert_eq!(
                     refusal_message(&body),

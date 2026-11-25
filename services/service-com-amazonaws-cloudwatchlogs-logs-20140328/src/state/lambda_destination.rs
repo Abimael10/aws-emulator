@@ -140,23 +140,19 @@ fn permits_invocation(
     let principals = service_principals(region);
     let published = [SOURCE_ARN_CONDITION_KEY, SOURCE_ACCOUNT_CONDITION_KEY];
     let account = super::arn_account_id(log_group_arn).map(str::to_string);
-    source_arn_forms(log_group_arn).iter().any(|source_arn| {
-        let mut context = vec![(SOURCE_ARN_CONDITION_KEY.to_string(), source_arn.clone())];
-        if let Some(account) = account.clone() {
-            context.push((SOURCE_ACCOUNT_CONDITION_KEY.to_string(), account));
-        }
-        let request = iam::Request::new(INVOKE_FUNCTION_ACTION, function_arn, &principals)
-            .with_context(&context)
-            .with_published_keys(&published);
-        policy.is_some_and(|policy| iam::resource_decision(policy, &request) == Decision::Allowed)
-    })
-}
-
-/// The two forms of a log group's ARN a permission may name it by: the one that ends in the
-/// `:*` covering the group's streams, and the one that does not.
-fn source_arn_forms(log_group_arn: &str) -> [String; 2] {
-    let bare = log_group_arn.strip_suffix(":*").unwrap_or(log_group_arn);
-    [format!("{bare}:*"), bare.to_string()]
+    super::log_group_source_arn_forms(log_group_arn)
+        .iter()
+        .any(|source_arn| {
+            let mut context = vec![(SOURCE_ARN_CONDITION_KEY.to_string(), source_arn.clone())];
+            if let Some(account) = account.clone() {
+                context.push((SOURCE_ACCOUNT_CONDITION_KEY.to_string(), account));
+            }
+            let request = iam::Request::new(INVOKE_FUNCTION_ACTION, function_arn, &principals)
+                .with_context(&context)
+                .with_published_keys(&published);
+            policy
+                .is_some_and(|policy| iam::resource_decision(policy, &request) == Decision::Allowed)
+        })
 }
 
 /// What the function `arn` names answered when its resource-based policy was read:

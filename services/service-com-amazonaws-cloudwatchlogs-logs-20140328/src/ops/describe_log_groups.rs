@@ -487,8 +487,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         log_group_arn: Some(group.log_group_arn.clone()),
                         deletion_protection_enabled: (!pattern_search)
                             .then_some(group.deletion_protection_enabled),
-                        bearer_token_authentication_enabled: (!pattern_search)
-                            .then_some(group.bearer_token_authentication_enabled),
+                        // A group nothing has been stated for is not enabled, which is what the
+                        // member reports: the three-state store keeps the never-configured case
+                        // apart only for the data plane's two refusals
+                        // (`crate::state::LogGroupRecord::bearer_token_authentication_enabled`).
+                        bearer_token_authentication_enabled: (!pattern_search).then_some(
+                            group.bearer_token_authentication_enabled.unwrap_or(false),
+                        ),
                     })
                     .collect(),
             ),

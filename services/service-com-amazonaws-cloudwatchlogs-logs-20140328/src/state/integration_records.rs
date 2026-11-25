@@ -797,36 +797,109 @@ pub fn integration_not_found_arn_message(arn: &str) -> String {
     format!("Integration not found: {arn}")
 }
 
+/// The resource an INTEGRATION OF THIS SERVICE carries in its ARN:
+/// `integration:{integrationName}` — the resource `PutIntegration` establishes, `GetIntegration`
+/// reads and `DeleteIntegration` removes — under this service's own ARN vendor.
+const LOGS_INTEGRATION_RESOURCE_PREFIX: &str = "integration:";
+/// See [`LOGS_INTEGRATION_RESOURCE_PREFIX`].
+const LOGS_ARN_VENDOR: &str = "logs";
+
+/// The name of the integration OF THIS SERVICE that `arn` names, or `None` for an ARN of any
+/// other resource.
+fn logs_integration_name(arn: &str) -> Option<&str> {
+    let (service, resource) = arn_service_and_resource(arn)?;
+    if service != LOGS_ARN_VENDOR {
+        return None;
+    }
+    resource
+        .strip_prefix(LOGS_INTEGRATION_RESOURCE_PREFIX)
+        .filter(|name| !name.is_empty())
+}
+
+/// The refusal for an `integrationArn` that names an integration OF THIS SERVICE the account
+/// does not hold, or `None` for an ARN of another resource and for one naming an integration
+/// the account does hold.
+///
+/// An ARN of this form names an INTEGRATION — the resource this service's own integration
+/// operations establish — so addressing one that was never created, or one that has been
+/// deleted, is being asked about a resource that does not exist rather than stating the member
+/// incorrectly: the NOT-FOUND class, worded as this service words a missing integration
+/// ([`integration_not_found_arn_message`]). An integration the account DOES hold under that
+/// name is a real resource of the wrong KIND for this family, which the resource-form rung
+/// states ([`not_an_s3_table_integration_arn_message`]).
+fn unheld_logs_integration_message<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
+    engine: &Eng,
+    arn: &str,
+) -> Option<String> {
+    let name = logs_integration_name(arn)?;
+    let held = super::service_state(engine)
+        .is_some_and(|state| state.lock().integrations.contains_key(name));
+    (!held).then(|| integration_not_found_arn_message(arn))
+}
+
+/// WHY an `integrationArn` resolved to no S3 Table Integration, which is what decides the
+/// CLASS the refusal travels under: an ARN that names no integration of this account is a
+/// parameter stated incorrectly, while one that IS such a handle and names an integration the
+/// account does not hold is a resource that does not exist ([`unresolved_integration`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnresolvedIntegration {
+    /// The ARN could name no integration this caller holds: another resource type, another
+    /// account, or another service, partition or Region.
+    Invalid(String),
+    /// The ARN is the handle of an integration this caller could hold, and the account holds
+    /// none under it.
+    NotFound(String),
+}
+
+impl UnresolvedIntegration {
+    /// The sentence this refusal states.
+    #[must_use]
+    pub fn message(self) -> String {
+        match self {
+            Self::Invalid(message) | Self::NotFound(message) => message,
+        }
+    }
+}
+
 /// The refusal an operation of this family answers for an `integrationArn` it cannot resolve
 /// an S3 Table Integration from, or `None` when the account holds the one it names.
 ///
 /// ONE ladder, shared by the associate and the reader so the two cannot disagree about which
-/// ARN names which integration, each rung worded as this service words it: a resource that
-/// is not an integration's is told the form one carries, another account's integration is
-/// told that access is not given across accounts, an ARN of another service, partition or
-/// Region is told it names no integration, and a handle the account holds nothing under is
-/// told the integration is not there.
+/// ARN names which integration, each rung worded as this service words it: an integration of
+/// THIS service's own that the account does not hold is told the integration is not there, a
+/// resource that is not an integration's is told the form one carries, another account's
+/// integration is told that access is not given across accounts, an ARN of another service,
+/// partition or Region is told it names no integration, and a handle the account holds nothing
+/// under is told the integration is not there.
+///
+/// The rungs that say an INTEGRATION is not there are the NOT-FOUND class and the rest are the
+/// parameter-validity one: an ARN that names an integration — of either family this service
+/// resolves one from — is addressing a resource, and an account that holds none under it is
+/// being asked about one that does not exist, which is the class `ResourceNotFoundException`
+/// ("the specified resource does not exist") carries and which every operation of this family
+/// models. An ARN that could name no integration at all states the member incorrectly.
 ///
 /// The value has already been read as an ARN by the caller
 /// ([`malformed_arn_message`]), which is what the length and the parse are stated by.
-pub fn unresolved_integration_message<
-    Eng: ::std::marker::Send + ::std::marker::Sync + 'static,
->(
+pub fn unresolved_integration<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
     engine: &Eng,
     region: &str,
     arn: &str,
-) -> Option<String> {
+) -> Option<UnresolvedIntegration> {
+    if let Some(message) = unheld_logs_integration_message(engine, arn) {
+        return Some(UnresolvedIntegration::NotFound(message));
+    }
     if let Some(message) = not_an_s3_table_integration_arn_message(arn) {
-        return Some(message);
+        return Some(UnresolvedIntegration::Invalid(message));
     }
     if let Some(message) = cross_account_integration_message(arn) {
-        return Some(message);
+        return Some(UnresolvedIntegration::Invalid(message));
     }
     if let Some(message) = invalid_integration_arn_message(region, arn) {
-        return Some(message);
+        return Some(UnresolvedIntegration::Invalid(message));
     }
     (!holds_s3_table_integration(engine, region, arn))
-        .then(|| integration_not_found_arn_message(arn))
+        .then(|| UnresolvedIntegration::NotFound(integration_not_found_arn_message(arn)))
 }
 
 /// The fixed sentences CloudWatch Logs refuses a data source whose NAME or whose TYPE

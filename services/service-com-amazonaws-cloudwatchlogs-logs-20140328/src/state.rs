@@ -351,6 +351,10 @@ pub mod log_stream_creation;
 /// `crate::service::http_ingestion`.
 pub mod http_ingestion;
 
+/// The OpenTelemetry protocol's own wire encoding, which the OTLP logs endpoint of that
+/// ingestion surface reads a request body in and answers in.
+pub mod open_telemetry;
+
 /// Per-service state for com-amazonaws-cloudwatchlogs-logs-20140328. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
@@ -2219,8 +2223,14 @@ pub struct LogGroupRecord {
     /// (`LogGroup$bearerTokenAuthenticationEnabled`: "Indicates whether bearer token
     /// authentication is enabled for this log group. When enabled, bearer token
     /// authentication is allowed on operations until it is explicitly disabled.").
-    /// `PutBearerTokenAuthentication` is what moves it; a new group is not enabled.
-    pub bearer_token_authentication_enabled: bool,
+    ///
+    /// THREE states, not two: `None` for a group `PutBearerTokenAuthentication` has never
+    /// been called for, `Some(true)` for one it enabled and `Some(false)` for one it
+    /// explicitly DISABLED. The two refusals the bearer-token data plane answers are not the
+    /// same refusal, which is why the never-configured state is kept apart from the disabled
+    /// one ([`crate::service::http_ingestion`]). A new group is in neither: nothing has been
+    /// stated for it.
+    pub bearer_token_authentication_enabled: Option<bool>,
     /// The volume the service's metering last MEASURED for this group, which is the figure
     /// `LogGroup$storedBytes` reports.
     ///
@@ -2298,7 +2308,7 @@ impl LogGroupRecord {
             kms_key_id: None,
             log_group_class: DEFAULT_LOG_GROUP_CLASS.to_string(),
             deletion_protection_enabled: false,
-            bearer_token_authentication_enabled: false,
+            bearer_token_authentication_enabled: None,
             metered_bytes: 0,
             metered_through_ms: creation_time_ms,
             tags: BTreeMap::new(),
@@ -3050,6 +3060,21 @@ pub fn log_group_arn(region: &str, name: &str, wildcard_suffix: bool) -> String 
     ::engine::emulator_arn("logs", region, &resource)
 }
 
+/// The TWO ARN forms one log group is named by, longest first: the `arn` the group reports,
+/// which ends in the `:*` that covers the streams under it ("this version of the ARN includes
+/// a trailing :* after the log group name"), and the `logGroupArn` without it
+/// ([`log_group_arn`]).
+///
+/// Both name the SAME log group, so a document written against this group — a grant another
+/// service's resource policy scopes to it by a condition key, say — names it whichever form it
+/// was written with. Every gate of this crate that publishes a log group's ARN as the value of
+/// such a key therefore offers both forms, so none of them can come to accept one spelling and
+/// refuse the other.
+pub fn log_group_source_arn_forms(log_group_arn: &str) -> [String; 2] {
+    let bare = log_group_arn.strip_suffix(":*").unwrap_or(log_group_arn);
+    [format!("{bare}:*"), bare.to_string()]
+}
+
 /// A log stream's ARN.
 pub fn log_stream_arn(region: &str, group_name: &str, stream_name: &str) -> String {
     ::engine::emulator_arn(
@@ -3787,12 +3812,14 @@ pub const EXPORT_DESTINATION_BUCKET_MISSING_MESSAGE: &str =
 /// it names the call that was refused and the permission a client has to grant, and carries
 /// nothing of the request.
 ///
-/// The CODE it travels under is the PERMISSION one — recorded CloudWatch Logs answers a
-/// destination whose policy withholds one of the export's own calls with
-/// `AccessDeniedException` ("you don't have sufficient permissions to perform this action"),
-/// not with the incorrectly-stated-parameter code the absent-bucket refusal above carries: the
-/// bucket is named correctly and what is missing is a grant. Both sentences below travel that
-/// way ([`crate::ops::create_export_task`]).
+/// The CODE it travels under is the one `CreateExportTask` models for a parameter the service
+/// cannot act on: the operation's own error set is `InvalidParameterException`,
+/// `LimitExceededException`, `OperationAbortedException`, `ResourceAlreadyExistsException`,
+/// `ResourceNotFoundException` and `ServiceUnavailableException` (smithy_query: operation
+/// CreateExportTask), and `AccessDeniedException` is NOT among them — so a refusal of the
+/// destination travels as `InvalidParameterException`, the same code the absent-bucket refusal
+/// above carries, and an SDK's generated error handling matches it. Both sentences below travel
+/// that way ([`crate::ops::create_export_task`]).
 pub const EXPORT_DESTINATION_ACL_READ_WITHHELD_MESSAGE: &str =
     "GetBucketAcl call on the given bucket failed. Please check if CloudWatch Logs has been \
      granted permission to perform this operation.";
