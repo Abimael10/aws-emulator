@@ -1463,7 +1463,7 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         config: DistributionConfig,
         tags: TagSet,
         now: SystemTime,
-        edge_endpoint: Option<EdgeEndpoint>,
+        edge_address: Option<EdgeAddress>,
     ) -> Result<CreatedDistribution, CreateRefusal> {
         // "The value of Quantity and the size of Items don't match", and then the published
         // per-list quotas: the refusals a configuration carries BY ITSELF, read through the
@@ -1626,13 +1626,15 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         }
 
         let id = self.allocate_distribution_id();
-        // The domain name a VIEWER is handed: the address of the listener this
-        // distribution's edge is served on, so a client that dials what it was told reaches
-        // this distribution ([`EdgeEndpoint`]). A distribution with no listener of its own —
-        // a multi-tenant one, which reports no domain at all, and a create on an engine that
-        // vends no listeners — carries the name CloudFront's own zone would give it.
-        let domain_name = match &edge_endpoint {
-            Some(endpoint) => endpoint.authority().to_string(),
+        // The domain name a VIEWER is handed: an address this emulator ANSWERS at, so a
+        // client that dials what it was told reaches this distribution — the endpoint the
+        // create was reached at with this distribution named in the reserved data-plane path,
+        // or the address of a listener of its own ([`EdgeAddress`]). A distribution with no
+        // address of this emulator to publish — a multi-tenant one, which reports no domain at
+        // all, and a create on an engine that is served nowhere and vends no listeners —
+        // carries the name CloudFront's own zone would give it.
+        let domain_name = match &edge_address {
+            Some(address) => address.published_domain_name(&id),
             None => self.allocate_domain_name(),
         };
         let etag = self.next_etag();
@@ -1670,9 +1672,10 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             replayed: false,
         };
         self.caller_references.insert(caller_reference, id.clone());
-        // The listener now has a distribution to serve, and its handle is held for as long
-        // as that distribution is: dropping it closes the port.
-        if let Some(endpoint) = edge_endpoint {
+        // A listener this distribution was given now has a distribution to serve, and its
+        // handle is held for as long as that distribution is: dropping it closes the port. A
+        // distribution published on the emulator's own endpoint holds no socket at all.
+        if let Some(EdgeAddress::Listener(endpoint)) = edge_address {
             endpoint.serves(&id);
             self.edge_endpoints.insert(id.clone(), endpoint);
         }

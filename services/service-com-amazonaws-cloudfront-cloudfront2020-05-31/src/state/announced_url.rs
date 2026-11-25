@@ -50,12 +50,36 @@ pub fn announced_base(ctx: &::smithy_server_runtime::OperationContext<'_>) -> St
         Some(scheme) if !scheme.is_empty() => scheme,
         _ => "https://",
     };
-    match reached_emulator_endpoint(ctx.parts())
-        .or_else(|| ::service_common::data_plane_addressing::served_endpoint_authority(base))
-    {
+    match announced_endpoint_authority(ctx) {
         Some(authority) => format!("{scheme}{authority}"),
         None => format!("https://{SERVICE_ENDPOINT}"),
     }
+}
+
+/// The `host[:port]` of THIS EMULATOR's own endpoint, for the request `ctx` is serving — the
+/// address every value this service announces for a caller to dial is rooted at — or `None`
+/// for a request this emulator has no address of its own to name to.
+///
+/// The one reading behind [`announced_base`] and the one a distribution's published
+/// `DomainName` follows ([`crate::state::published_edge_address`]), so a `Location` header and
+/// an edge domain minted by the same call cannot name two different endpoints: the endpoint
+/// the request REALLY reached first (a client configured with one local endpoint URL resolves
+/// nothing else, so it is handed back the very address it is already talking to, port
+/// included), and the address this process is served at behind it, so a resource created
+/// through an in-process call of another service is announced an address that caller's own
+/// client can reach too.
+///
+/// `None` is the one case where there is no endpoint of this process to name: a caller that
+/// resolves AWS's own hostnames, reaching an emulator served on no port at all
+/// ([`::smithy_server_runtime::UNSERVED_URL_BASE`]).
+#[must_use]
+pub fn announced_endpoint_authority(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> Option<String> {
+    let endpoint = ctx.endpoint();
+    let base = endpoint.as_str().trim_end_matches('/');
+    reached_emulator_endpoint(ctx.parts())
+        .or_else(|| ::service_common::data_plane_addressing::served_endpoint_authority(base))
 }
 
 /// The fully qualified URI a `Location` header reports for `path`: the resource's own path

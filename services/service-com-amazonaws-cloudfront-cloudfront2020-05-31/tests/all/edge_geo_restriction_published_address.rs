@@ -248,7 +248,8 @@ async fn the_geo_restriction_decides_a_viewer_of_an_oac_signed_origin() {
             .unwrap_or_else(|error| panic!("setup {setup}: granting {action}: {error}"));
     }
     topology.awaited_deployment(served_case, &id).await;
-    let answered = Answered::of_stating(served_case, &domain, "GET", OPEN_PATH, &[]).await;
+    let answered =
+        Answered::through(&topology.router, served_case, &domain, "GET", OPEN_PATH, &[]).await;
     assert_eq!(
         answered.status, 200,
         "case {served_case:?}: expected the signed origin's answer through the edge, got {} \
@@ -290,7 +291,8 @@ async fn the_geo_restriction_decides_a_viewer_of_an_oac_signed_origin() {
             .unwrap_or_else(|error| panic!("setup {setup}: granting {action}: {error}"));
     }
     topology.awaited_deployment(refused_case, &id).await;
-    let refused = Answered::of_stating(refused_case, &domain, "GET", OPEN_PATH, &[]).await;
+    let refused =
+        Answered::through(&topology.router, refused_case, &domain, "GET", OPEN_PATH, &[]).await;
     assert_eq!(
         refused.status, 403,
         "case {refused_case:?} ({viewers_country:?}): expected CloudFront's own 403, got {} \

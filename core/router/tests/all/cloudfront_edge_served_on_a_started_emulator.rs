@@ -7,14 +7,22 @@
 //!
 //! RULE: **the value a distribution publishes as `Distribution$DomainName` is an address the
 //! client that read it can dial; once the distribution reports `Deployed`, a viewer request
-//! dialled there — over either scheme that one address serves — is answered out of the
-//! distribution's own origin (the object's bytes for a key the origin holds, the origin's own
-//! refusal for one it does not), and every answer served there is counted into THAT
-//! distribution's `AWS/CloudFront` series, dimensioned `DistributionId` beside `Region=Global`,
-//! with the DEFAULT series published for every distribution and the ADDITIONAL ones (the cache
-//! hit rate, the origin latency and the per-status-code error rates) published and listed
-//! exactly while that distribution's monitoring subscription carries
-//! `RealtimeMetricsSubscriptionStatus` `Enabled`.**
+//! dialled there is answered out of the distribution's own origin (the object's bytes for a key
+//! the origin holds, the origin's own refusal for one it does not), and every answer served
+//! there is counted into THAT distribution's `AWS/CloudFront` series, dimensioned
+//! `DistributionId` beside `Region=Global`, with the DEFAULT series published for every
+//! distribution and the ADDITIONAL ones (the cache hit rate, the origin latency and the
+//! per-status-code error rates) published and listed exactly while that distribution's
+//! monitoring subscription carries `RealtimeMetricsSubscriptionStatus` `Enabled`.**
+//!
+//! The address a distribution created THROUGH a started emulator publishes is that emulator's
+//! own endpoint, with the distribution named in the reserved data-plane path beneath it: the
+//! endpoint is the one address a client of that process has, and the whole surface is served
+//! there. The core terminates TLS on it, as it does on every endpoint this emulator publishes,
+//! so the viewer rows below dial it over `https`; the plaintext half of an address belongs to a
+//! per-resource listener, which is what a distribution publishes when there is no endpoint of
+//! this emulator to name, and both halves of one are pinned by
+//! [`crate::cloudfront_dialled_edge_scheme_publishes_its_series`].
 //!
 //! The sibling suites pin that rule on a router a test assembles in its own process
 //! ([`crate::cloudfront_dialled_edge_scheme_publishes_its_series`], whose vocabulary for a
@@ -50,7 +58,6 @@ use serde_json::{json, Value};
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::service::edge_metrics;
 
 use crate::cfn_deployed_pipeline_on_a_started_emulator::Started;
-use crate::cloudfront_dialled_edge_address_over_a_private_s3_origin::is_dialable;
 use crate::cloudfront_dialled_edge_scheme_publishes_its_series::{
     dimensions, fold, source_arn_condition, window, Held, Served, Tally, CACHING_OPTIMIZED,
     ENABLED, ORIGIN_REFUSAL_STATUS, PERIOD, TOLERANCE,
@@ -143,11 +150,42 @@ fn cloudwatch(started: &Started, case: &str, operation: &str, body: &Value) -> V
     serde_json::from_str(&text).unwrap_or(Value::Null)
 }
 
-/// One viewer request made by DIALLING `authority` — the address the distribution published —
-/// over `scheme`, carrying no credential of any kind, which is what a client handed a domain
-/// name sends. It goes over the client that trusts the certificate this start published.
-fn dial(started: &Started, case: &str, scheme: &str, authority: &str, key: &str) -> Served {
-    let url = format!("{scheme}://{authority}/{key}");
+/// Whether `domain` is the address the client that read it reaches this emulator at: the HOST
+/// of the endpoint it is served on, with the distribution named in the reserved data-plane path
+/// beneath it — what a distribution created through a request to that endpoint publishes. A
+/// domain name states no port, so the host is held to being the one the endpoint this suite
+/// started answers on and the port a viewer dials is that endpoint's own
+/// ([`viewer_authority`]).
+fn is_the_served_endpoints_host(started: &Started, domain: &str) -> bool {
+    let Some((host, path)) = domain.split_once('/') else {
+        return false;
+    };
+    let served_host = started
+        .authority()
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    host == served_host && path.starts_with("_aws/cloudfront/")
+}
+
+/// The authority a viewer DIALS the published `domain` at, and the path it asks `key` for: a
+/// domain name carries no port, so the port is the one of the endpoint this client reached the
+/// emulator on, and the path the published name carries names the distribution.
+fn viewer_authority(started: &Started, domain: &str) -> (String, String) {
+    match domain.split_once('/') {
+        Some((_host, path)) => (started.authority(), format!("/{path}")),
+        None => (domain.to_string(), String::new()),
+    }
+}
+
+/// One viewer request made by DIALLING the address the distribution published — at the endpoint
+/// this client reached the emulator on ([`viewer_authority`]) — over `scheme`, carrying no
+/// credential of any kind, which is what a client handed a domain name sends. It goes over the
+/// client that trusts the certificate this start published.
+fn dial(started: &Started, case: &str, scheme: &str, domain: &str, key: &str) -> Served {
+    let (authority, path) = viewer_authority(started, domain);
+    let url = format!("{scheme}://{authority}{path}/{key}");
     let answered = started
         .client()
         .get(&url)
@@ -292,12 +330,11 @@ struct Driven {
 }
 
 /// The traffic every row drives at the address it was handed: a read the origin answers, the
-/// same read again (which the edge cache answers), the same read over the OTHER half of that
-/// one address, and a read of a key the origin refuses.
-fn driven() -> [Driven; 4] {
+/// same read again (which the edge cache answers), and a read of a key the origin refuses.
+fn driven() -> [Driven; 3] {
     [
         Driven {
-            case: "a read the origin answers, over the encrypted half",
+            case: "a read the origin answers",
             scheme: "https",
             key: PRESENT_KEY,
             status: 200,
@@ -305,12 +342,6 @@ fn driven() -> [Driven; 4] {
         Driven {
             case: "the same read again, which the edge cache answers",
             scheme: "https",
-            key: PRESENT_KEY,
-            status: 200,
-        },
-        Driven {
-            case: "the same read over the plaintext half of the one address",
-            scheme: "http",
             key: PRESENT_KEY,
             status: 200,
         },
@@ -438,11 +469,13 @@ fn the_started_emulators_published_edge_serves_and_fills_its_series() {
     for (row, (id, domain, _arn)) in table.iter().zip(subjects.iter()) {
         let case = row.case;
         awaited_deployment(&started, case, id);
-        // The published name is an address the client that read it can dial, which is what the
-        // rows below dial.
+        // The published name names the HOST of the endpoint this client reached the emulator
+        // on, with the distribution in the reserved path, which is what the rows below dial.
         assert!(
-            is_dialable(domain),
-            "case {case:?}: expected a published address the client can dial, got {domain:?}"
+            is_the_served_endpoints_host(&started, domain),
+            "case {case:?}: expected the published address to name the host of the endpoint \
+             this emulator is served on ({}), got {domain:?}",
+            started.authority()
         );
         if row.subscribed {
             subscribe(&started, case, id);

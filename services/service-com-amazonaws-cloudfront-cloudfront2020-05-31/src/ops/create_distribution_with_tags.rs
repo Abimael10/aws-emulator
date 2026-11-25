@@ -509,10 +509,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message,
             )));
         }
-        let edge_endpoint = if crate::state::is_multi_tenant(&distribution_config) {
+        let edge_address = if crate::state::is_multi_tenant(&distribution_config) {
             None
         } else {
-            crate::state::open_edge_endpoint(&*self.engine, ctx.callback().clone()).await
+            crate::state::published_edge_address(&*self.engine, ctx).await
         };
         let created = {
             let mut store = state.lock();
@@ -521,7 +521,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The create itself is the shared path `CreateDistribution` runs: this operation
             // differs only in the tag set it stores alongside the new record.
             store
-                .create_distribution(distribution_config, tags, now, edge_endpoint)
+                .create_distribution(distribution_config, tags, now, edge_address)
                 .map_err(create_refusal)?
         };
 

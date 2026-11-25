@@ -227,7 +227,8 @@ async fn the_country_the_edge_reports_is_the_country_it_restricts_the_viewer_by(
         .created_distribution(case, &config_xml(reference, &origin, &restrictions("none", &[])))
         .await;
     topology.awaited_deployment(case, &id).await;
-    let baseline = Answered::of_stating(case, &domain, "GET", OPEN_PATH, &[]).await;
+    let baseline =
+        Answered::through(&topology.router, case, &domain, "GET", OPEN_PATH, &[]).await;
     let reported = country_of(case, &baseline);
     assert!(
         baseline.body.contains(ORIGIN_MARKER),
@@ -323,7 +324,8 @@ async fn the_country_the_edge_reports_is_the_country_it_restricts_the_viewer_by(
         // path a client handed a domain name asks for first.
         for path in ["/", OPEN_PATH] {
             let case = &format!("{case} at {path}");
-            let served = Answered::of_stating(case, &domain, "GET", path, &[]).await;
+            let served =
+                Answered::through(&topology.router, case, &domain, "GET", path, &[]).await;
             if row.refused {
                 assert_eq!(
                     served.status, 403,

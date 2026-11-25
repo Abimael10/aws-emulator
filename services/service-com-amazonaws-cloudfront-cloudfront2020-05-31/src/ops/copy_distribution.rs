@@ -445,20 +445,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::state::store_unavailable());
         };
         let now = SystemTime::now();
-        // The listener the copy's edge is served on, opened BEFORE the store lock is taken:
-        // binding a socket is asynchronous and a lock held across an await would make this
-        // future non-`Send`. The handle is a local this function owns, so every path out of
-        // here that does not store a distribution — each refusal below, and the create's own
-        // — DROPS it, and dropping it closes the port ([`crate::state::EdgeEndpoint`]); the
-        // bound on how many distributions this emulator holds is read first, so a create it
-        // refuses for capacity opens nothing at all. A copy is always a STANDARD
-        // distribution — it is created `Staging`, a member only a standard distribution has
-        // — so it always has a domain name of its own to publish.
+        // The address the copy's edge is published at, settled BEFORE the store lock is
+        // taken: opening a listener for it binds a socket, which is asynchronous, and a lock
+        // held across an await would make this future non-`Send`. Any handle it carries is a
+        // local this function owns, so every path out of here that does not store a
+        // distribution — each refusal below, and the create's own — DROPS it, and dropping it
+        // closes the port ([`crate::state::EdgeEndpoint`]); the bound on how many
+        // distributions this emulator holds is read first, so a create it refuses for
+        // capacity opens nothing at all. A copy is always a STANDARD distribution — it is
+        // created `Staging`, a member only a standard distribution has — so it always has a
+        // domain name of its own to publish.
         if state.lock().at_distribution_capacity() {
             return Err(create_refusal(crate::state::too_many_distributions()));
         }
-        let edge_endpoint =
-            crate::state::open_edge_endpoint(&*self.engine, ctx.callback().clone()).await;
+        let edge_address = crate::state::published_edge_address(&*self.engine, ctx).await;
         // EVERYTHING THIS REQUEST READS AND WRITES OF THE STORE IS WEIGHED UNDER ONE GUARD,
         // which is released as the block ends: the grant that follows the standard logging
         // the copy runs under awaits, and a guard held across an await would make this
@@ -549,7 +549,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `CreateDistribution` creates one — and, like that operation, this request
             // carries no tag set, so the copy starts with no tags.
             let created = store
-                .create_distribution(config, crate::state::TagSet::new(), now, edge_endpoint)
+                .create_distribution(config, crate::state::TagSet::new(), now, edge_address)
                 .map_err(create_refusal)?;
             (created, logging)
         };

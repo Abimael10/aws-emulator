@@ -74,7 +74,7 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::EmulatedService;
 use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 
 use crate::distribution_lifecycle::{
-    is_reachable_authority, API_VERSION, AUTHORIZATION, HOST, POLL_INTERVAL, READY_DEADLINE,
+    is_served_edge_address, API_VERSION, AUTHORIZATION, HOST, POLL_INTERVAL, READY_DEADLINE,
 };
 use crate::edge_request_metrics::{cloudwatch, now_secs, window, PERIOD};
 use crate::edge_signed_access::{
@@ -572,8 +572,9 @@ impl Topology {
             "setup {case}: the created distribution reports no Id or ARN: {raw}"
         );
         assert!(
-            is_reachable_authority(&domain),
-            "setup {case}: expected an address a viewer can dial, got {domain:?}"
+            is_served_edge_address(&domain),
+            "setup {case}: expected an address a viewer can reach this emulator at, got \
+             {domain:?}"
         );
         (id, arn, domain)
     }
@@ -718,6 +719,54 @@ impl Answered {
         headers: &[(&str, &str)],
     ) -> Self {
         let raw = dial_with(domain, method, path_and_query, domain, headers).await;
+        Self::read(case, raw)
+    }
+
+    /// [`Answered::of_stating`] for the address a distribution published on the emulator's
+    /// OWN endpoint — `{authority}/_aws/cloudfront/{id}`, which is what a distribution minted
+    /// by a request that reached that endpoint publishes.
+    ///
+    /// A viewer composes `https://<DomainName>/<object>` and dials the authority it names,
+    /// which is this emulator's own front door: a suite DECLARES that endpoint without
+    /// binding a socket for it, so the composed request is sent through the front door in
+    /// process — the same request a client dialling that address would deliver there. A
+    /// published name that is a listener of this process is dialled over that socket as ever.
+    pub(crate) async fn through(
+        router: &MultiServiceRouter,
+        case: &str,
+        domain: &str,
+        method: &str,
+        path_and_query: &str,
+        headers: &[(&str, &str)],
+    ) -> Self {
+        if !domain.contains('/') {
+            return Self::of_stating(case, domain, method, path_and_query, headers).await;
+        }
+        let (authority, path) = viewer_target(domain, path_and_query);
+        let mut request = ::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", authority);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let request = request
+            .body(::bytes::Bytes::new())
+            .unwrap_or_else(|error| panic!("case {case:?}: the viewer request is malformed: {error}"));
+        let response = router.dispatch(request).await;
+        // The answer as it would come off the connection, so one reading serves a viewer that
+        // dialled a socket and one that reached the front door.
+        let status = response.status();
+        let mut raw = format!(
+            "HTTP/1.1 {} {}\r\n",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or_default()
+        );
+        for (name, value) in response.headers().iter() {
+            raw.push_str(&format!("{name}: {}\r\n", value.to_str().unwrap_or_default()));
+        }
+        raw.push_str("\r\n");
+        raw.push_str(&String::from_utf8_lossy(&response.into_body()));
         Self::read(case, raw)
     }
 
@@ -1300,7 +1349,15 @@ async fn an_oac_signs_a_function_url_origin_named_by_its_published_authority() {
 
     // The viewer's own query travels to the origin, which is what says the request the
     // function served is this one.
-    let through_the_edge = Answered::of(case, &domain, "GET", &format!("{OPEN_PATH}?nonce=abc")).await;
+    let through_the_edge = Answered::through(
+        &topology.router,
+        case,
+        &domain,
+        "GET",
+        &format!("{OPEN_PATH}?nonce=abc"),
+        &[],
+    )
+    .await;
     assert_eq!(
         through_the_edge.status, 200,
         "case {case:?}: expected the origin named by its published authority ({origin:?}, \
@@ -1468,6 +1525,20 @@ fn restrictions(restriction_type: &str, locations: &[&str]) -> String {
     )
 }
 
+/// The authority a viewer DIALS for the published name `domain`, and the request path it sends
+/// for the object `path`: `https://<DomainName>/<object>` as a client composes it, split back
+/// into the two things the wire carries.
+///
+/// A name that is a listener's `host:port` carries no path, so the object path is the request
+/// path; one published on the emulator's own endpoint carries the distribution's reserved path,
+/// which the object path follows.
+pub(crate) fn viewer_target(domain: &str, path: &str) -> (String, String) {
+    match domain.split_once('/') {
+        Some((authority, prefix)) => (authority.to_string(), format!("/{prefix}{path}")),
+        None => (domain.to_string(), path.to_string()),
+    }
+}
+
 /// One VIEWER request to `domain`, carrying no credential and stating `country` the way
 /// CloudFront states it — a client of a distribution, addressing the domain the distribution
 /// published.
@@ -1477,10 +1548,11 @@ async fn viewer(
     path: &str,
     country: Option<&str>,
 ) -> (u16, String, String) {
+    let (authority, path) = viewer_target(domain, path);
     let mut builder = ::http::Request::builder()
         .method("GET")
-        .uri(format!("https://{domain}{path}"))
-        .header("host", domain);
+        .uri(format!("https://{authority}{path}"))
+        .header("host", authority);
     if let Some(country) = country {
         builder = builder.header(VIEWER_COUNTRY_HEADER, country);
     }

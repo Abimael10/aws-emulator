@@ -137,7 +137,8 @@ pub(crate) async fn awaited_deployment(router: &MultiServiceRouter, case: &str, 
 
 /// Whether `domain` is an address a client on the machine this emulator runs on can DIAL:
 /// the `host:port` of the listener a distribution's edge is served on, which is what a
-/// distribution publishes as its `DomainName`.
+/// distribution publishes as its `DomainName` when there is no endpoint of this emulator to
+/// name instead ([`is_served_edge_address`] is the whole rule).
 ///
 /// A name under CloudFront's own zone resolves to nothing here, so a distribution that
 /// reported one would publish an address no viewer could reach; what it reports instead is
@@ -147,6 +148,31 @@ pub(crate) async fn awaited_deployment(router: &MultiServiceRouter, case: &str, 
 /// `pub(crate)` so every suite that reads a published domain name holds it to the one rule.
 pub(crate) fn is_reachable_authority(domain: &str) -> bool {
     domain.parse::<std::net::SocketAddr>().is_ok()
+}
+
+/// The reserved data-plane path a distribution published on the emulator's OWN endpoint is
+/// named under, ahead of its id: `{authority}/_aws/cloudfront/{id}`.
+///
+/// Spelled as a client reading the published name sees it — what it appends its own object
+/// path to.
+pub(crate) const EDGE_PATH_PREFIX: &str = "_aws/cloudfront/";
+
+/// Whether `domain` is an address a viewer composing `https://<domain>/<object>` reaches this
+/// emulator at: the HOST of the endpoint this emulator is served at, with the distribution
+/// named in the reserved data-plane path beneath it — a domain name states no port, so the
+/// port a viewer dials is the one its client reaches this emulator on — or the `host:port` of
+/// a listener of its own ([`is_reachable_authority`]), which is what a distribution created
+/// through a request that reached no endpoint of this emulator publishes.
+///
+/// `pub(crate)` for the reason [`is_reachable_authority`] is: one rule about a published
+/// address, read by every suite that reads one.
+pub(crate) fn is_served_edge_address(domain: &str) -> bool {
+    match domain.split_once('/') {
+        Some((host, path)) => {
+            !host.is_empty() && !host.contains(':') && path.starts_with(EDGE_PATH_PREFIX)
+        }
+        None => is_reachable_authority(domain),
+    }
 }
 
 // ---------------------------------------------------------------------------
