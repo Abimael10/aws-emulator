@@ -463,6 +463,14 @@ impl Link {
         self.request_outstanding() && self.peer_gateway_id == gateway_id
     }
 
+    /// Whether `gateway_id` is the end this link was opened FROM — the end that
+    /// asked for the link rather than the end the request was put to. The
+    /// request is answered by the OTHER end, so an acceptance is never this
+    /// end's to give.
+    pub fn opened_from(&self, gateway_id: &str) -> bool {
+        self.gateway_id == gateway_id
+    }
+
     /// Whether this link has reached a status nothing moves it out of: the peer
     /// declined the request, the link could not be established, or it is gone.
     pub fn terminal(&self) -> bool {
@@ -479,6 +487,16 @@ impl Link {
         format!(
             "link {} on gateway {} is {} and cannot be {}",
             self.link_id, gateway_id, self.status, transition
+        )
+    }
+
+    /// The message this service's `ConflictException` carries when the end the
+    /// link was opened FROM asks to accept it: the acceptance is the answer of
+    /// the end the request was put to, and the record names which end that is.
+    pub fn opener_cannot_accept_message(&self, gateway_id: &str) -> String {
+        format!(
+            "link {} was requested by gateway {} and can be accepted only by gateway {}",
+            self.link_id, gateway_id, self.peer_gateway_id
         )
     }
 }

@@ -4,11 +4,13 @@
 //!
 //! Answers an outstanding link request in the affirmative: the stored link moves
 //! to `ACCEPTED`, the clock owes it `ACTIVE`, and the settings this call carries
-//! are what every later reader of the link reports. A link whose request is no
-//! longer outstanding cannot be accepted -> `ConflictException` (409), except a
-//! repeat of this `@idempotent` call on a link it has already accepted, which is
-//! answered with that record. An id that names no link on the addressed gateway
-//! -> `ResourceNotFoundException` (404).
+//! are what every later reader of the link reports. The acceptance is the answer
+//! of the end the request was PUT TO, so a call addressed to the end the link
+//! was opened from is refused -> `ConflictException` (409). A link whose request
+//! is no longer outstanding cannot be accepted -> `ConflictException` (409),
+//! except a repeat of this `@idempotent` call on a link it has already accepted,
+//! which is answered with that record. An id that names no link on the addressed
+//! gateway -> `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -196,6 +198,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        if link.opened_from(&gateway_id) {
+            // A link is opened from one end and answered by the OTHER: the
+            // acceptance that establishes it is the answer of the end the
+            // request was put to, so the end that asked for the link has no
+            // acceptance to give, whatever status the record is in.
+            return Err(AcceptLinkErrorModeled::ConflictException(ConflictException {
+                message: link.opener_cannot_accept_message(&gateway_id),
+            })
+            .into());
+        }
 
         if link.request_outstanding() {
             // The request is answered: the link is accepted now, and coming up

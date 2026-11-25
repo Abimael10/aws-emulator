@@ -9,9 +9,11 @@
 //! being what every later reader reports; a link in any other status cannot be
 //! answered at all, beyond a repeat of the call that already put it there. The
 //! tables span what the rules generalise over — which of the link's two ends
-//! addresses the call, whether the request has settled yet, which of the
+//! addresses the decline, whether the request has settled yet, which of the
 //! accept's optional members the call states, and every member of the modelled
-//! `LinkStatus` enum.
+//! `LinkStatus` enum. The accept is addressed to the end the request was put
+//! to, because that is the only end whose acceptance establishes the link;
+//! which end may accept at all is covered in `link_accept_end.rs`.
 //!
 //! The decline's own consequence is covered here too: a link that has reached a
 //! terminal status occupies the gateway pair no longer, so the two gateways can
@@ -518,14 +520,12 @@ async fn a_reject_of_a_link_the_gateway_is_not_an_end_of_is_not_found() {
     );
 }
 
-/// One accept row: which end answers the request, whether the clock has settled
-/// `PENDING_REQUEST` -> `REQUESTED` first, and which of `AcceptLink`'s optional
-/// members the call states.
+/// One accept row: whether the clock has settled `PENDING_REQUEST` ->
+/// `REQUESTED` first, and which of `AcceptLink`'s optional members the call
+/// states. Every row addresses the end the request was put to, the end the
+/// operation's documentation describes as accepting it.
 struct AcceptRow {
     name: &'static str,
-    /// `true` for the gateway the request was put to (the end the operation's
-    /// documentation describes as accepting it), `false` for the opener.
-    from_peer: bool,
     settle_first: bool,
     /// The `customerProvidedId` of the `attributes` the accept states, or `None`
     /// to leave the attributes the create stored in place.
@@ -541,7 +541,6 @@ struct AcceptRow {
 const ACCEPT_ROWS: &[AcceptRow] = &[
     AcceptRow {
         name: "the peer accepts an unsettled request with only the required settings",
-        from_peer: true,
         settle_first: false,
         customer_provided_id: None,
         timeout_in_millis: None,
@@ -549,7 +548,6 @@ const ACCEPT_ROWS: &[AcceptRow] = &[
     },
     AcceptRow {
         name: "the peer accepts a settled request, stating every optional member",
-        from_peer: true,
         settle_first: true,
         customer_provided_id: Some("accepted-fabric"),
         timeout_in_millis: Some(100),
@@ -557,15 +555,13 @@ const ACCEPT_ROWS: &[AcceptRow] = &[
     },
     AcceptRow {
         name: "the peer accepts a settled request, stating attributes only",
-        from_peer: true,
         settle_first: true,
         customer_provided_id: Some("fabric_2"),
         timeout_in_millis: None,
         error_log: 12.5,
     },
     AcceptRow {
-        name: "the opener accepts its own settled request, stating the timeout only",
-        from_peer: false,
+        name: "the peer accepts a settled request, stating the timeout only",
         settle_first: true,
         customer_provided_id: None,
         timeout_in_millis: Some(5000),
@@ -596,11 +592,8 @@ async fn accepting_an_outstanding_request_drives_the_link_to_accepted_and_then_a
         let case = row.name;
         let fabric = Fabric::new();
         let pair = fabric.linked_pair("token").await;
-        let (addressed, other) = if row.from_peer {
-            (&pair.responder_id, &pair.requester_id)
-        } else {
-            (&pair.requester_id, &pair.responder_id)
-        };
+        // The acceptance is the answer of the end the request was put to.
+        let (addressed, other) = (&pair.responder_id, &pair.requester_id);
         if row.settle_first {
             // The move to REQUESTED is owed by the clock: poll for it.
             fabric
@@ -921,7 +914,6 @@ async fn only_a_live_link_occupies_the_gateway_pair_it_joins() {
 /// that changes a member and a row that leaves it alone cannot be confused.
 const UPDATE_BASELINE: AcceptRow = AcceptRow {
     name: "the configuration an update row starts from",
-    from_peer: true,
     settle_first: false,
     customer_provided_id: Some("baseline-fabric"),
     timeout_in_millis: Some(1000),
