@@ -346,13 +346,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         // `DeleteAutomatedBackups`: "Specifies whether to remove automated backups
-        // immediately after the DB instance is deleted." What the service DOES with the
-        // member absent is what a client reads back: an instance that was keeping automated
-        // backups leaves them behind as a RETAINED automated backup
+        // immediately after the DB instance is deleted ... The default is to remove
+        // automated backups immediately after the DB instance is deleted." So the member
+        // decides whether the instance's automated backups OUTLIVE it, and its DEFAULT is to
+        // remove them: a backup is kept behind as a RETAINED automated backup
         // (`DBInstanceAutomatedBackup$Status` `retained` is "automated backups for deleted
         // instances", discoverable by the source instance's `DbiResourceId` until it is
-        // explicitly deleted), and only a delete that ASKED to remove them removes them.
-        // Only an instance that HAS an automated backup leaves one behind — one whose
+        // explicitly deleted) only where the request asked for exactly that, by sending the
+        // member FALSE. An absent member takes the documented default, so a plain delete
+        // leaves no backup for the report to find.
+        // Only an instance that HAS an automated backup leaves one behind at all — one whose
         // `BackupRetentionPeriod` is zero keeps no backups to retain, and a cluster member's
         // data is the cluster's (`DbInstanceRecord::has_automated_backup`).
         //
@@ -360,13 +363,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // properties that existed at the time you deleted the source instance". It is kept
         // only once every refusal below has been answered, so a delete that is refused
         // retains nothing.
-        let retained = match input.delete_automated_backups == Some(true) {
-            true => None,
-            false => store
+        let retained = match input.delete_automated_backups == Some(false) {
+            true => store
                 .db_instances
                 .get(&key)
                 .filter(|instance| instance.has_automated_backup())
                 .map(crate::state::RetainedInstanceBackupRecord::of),
+            false => None,
         };
         // The region's RETAINED automated backup allowance, read before the delete is
         // accepted: "the quota for retained automated backups was exceeded. This prevents

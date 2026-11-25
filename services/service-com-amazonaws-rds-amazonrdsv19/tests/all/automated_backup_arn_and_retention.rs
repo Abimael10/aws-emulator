@@ -240,8 +240,10 @@ struct RetentionCase {
 }
 
 /// RULE: deleting an instance that was keeping automated backups leaves a `retained` backup
-/// behind, addressable until it is explicitly deleted, unless the delete asked to remove
-/// them; an instance that kept none leaves none.
+/// behind, addressable until it is explicitly deleted, ONLY where the delete asked to keep
+/// them (`DeleteAutomatedBackups` false) — "the default is to remove automated backups
+/// immediately after the DB instance is deleted"; an instance that kept none leaves none
+/// either way.
 #[tokio::test]
 async fn a_deleted_instance_leaves_its_automated_backup_unless_the_delete_removed_it() {
     // The rows span what the rule generalises over: the ways the delete may spell its
@@ -254,7 +256,7 @@ async fn a_deleted_instance_leaves_its_automated_backup_unless_the_delete_remove
             engine: "postgres",
             retention: 1,
             delete_automated_backups: None,
-            expects_retained: true,
+            expects_retained: false,
         },
         RetentionCase {
             case: "a delete that asked to keep them",

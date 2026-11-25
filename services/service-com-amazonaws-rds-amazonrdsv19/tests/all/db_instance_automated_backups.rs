@@ -13,10 +13,11 @@
 //! backups are being kept for it — which `BackupRetentionPeriod` decides, "to disable
 //! automated backups, set this value to 0", and which a member of a DB cluster never has
 //! one of, because the cluster holds the data. That backup is reported `active` while the
-//! instance is still there ("automated backups for current instances"), it OUTLIVES the
-//! instance as `retained` ("automated backups for deleted instances") unless the delete
-//! asked to remove it (`DeleteAutomatedBackups` true), which is the only way it goes with
-//! the instance. A retained backup is found by every reference
+//! instance is still there ("automated backups for current instances"), and it OUTLIVES the
+//! instance as `retained` ("automated backups for deleted instances") only where the delete
+//! asked to keep it (`DeleteAutomatedBackups` false) — "the default is to remove automated
+//! backups immediately after the DB instance is deleted", so a delete that names no setting
+//! takes them with the instance. A retained backup is found by every reference
 //! the report accepts (`DbiResourceId`, `DBInstanceIdentifier`, the backups' own ARN, the
 //! `status` / `db-instance-id` / `dbi-resource-id` filters), `DeleteDBInstanceAutomatedBackup`
 //! removes it and nothing reports it afterwards, the backup of a LIVE instance refuses that
@@ -136,7 +137,10 @@ pub(crate) async fn describe_instance(router: &MultiServiceRouter, identifier: &
 }
 
 /// `DescribeDBInstanceAutomatedBackups` with the members one case names.
-async fn describe_backups(
+///
+/// `pub(crate)` for the same reason [`available_instance`] is: the sibling suites of this one
+/// test target read the report through this call rather than growing a second copy of it.
+pub(crate) async fn describe_backups(
     router: &MultiServiceRouter,
     query: &[(&str, String)],
 ) -> (u16, String) {
@@ -177,8 +181,9 @@ enum DeleteSetting {
     Keep,
     /// `DeleteAutomatedBackups=true`.
     Drop,
-    /// The member is not sent at all, which keeps the backups: the service removes them
-    /// only where the request asked it to.
+    /// The member is not sent at all, which REMOVES the backups: "the default is to remove
+    /// automated backups immediately after the DB instance is deleted", so they are kept
+    /// only where the request asked for exactly that.
     Default,
 }
 
@@ -265,13 +270,13 @@ async fn an_instance_keeps_an_automated_backup_while_it_lives_and_after_a_delete
             expects_retained_backup: false,
         },
         Case {
-            case: "a delete that named no setting, which keeps them",
+            case: "a delete that named no setting, which takes the documented default",
             identifier: "emu-iab-default",
             engine: "mysql",
             retention: Some(2),
             delete_setting: DeleteSetting::Default,
             expects_active_backup: true,
-            expects_retained_backup: true,
+            expects_retained_backup: false,
         },
     ];
 
