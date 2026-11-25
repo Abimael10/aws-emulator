@@ -6,31 +6,39 @@
 //! RULE: the three computed counters a topic reports are a function of its subscription
 //! store and of the clock alone. `SubscriptionsConfirmed` and `SubscriptionsPending` follow
 //! a subscribe or an unsubscribe at once, while the deletion a call performed is taken up
-//! by `SubscriptionsDeleted` on the span the emulator OWES that transition
-//! (`state::SUBSCRIPTION_DELETION_SETTLES_AFTER`): a read taken straight after the
-//! `Unsubscribe` still reports the count from before it, and a client looking again sees
-//! every deletion counted once the clock has made it due — never a number that stays put.
+//! by `SubscriptionsDeleted` only once the clock has made it due, on the span this service
+//! lags that count by (`state::SUBSCRIPTION_DELETION_SETTLES_AFTER`): a client that
+//! unsubscribes and then polls the three counters until the confirmed and pending ones have
+//! settled keeps reading the deleted count from BEFORE the unsubscribe, however many times
+//! it looks, and a client that keeps polling sees every deletion counted once the clock has
+//! made it due — never a number that is lost.
 //!
 //! The rows differ along what the rule generalises over: how many subscriptions a topic
 //! holds, how many of them are unsubscribed, and whether the ones left behind are confirmed
 //! (an `sqs` endpoint, which SNS confirms itself) or awaiting confirmation (an `email`
 //! endpoint, which it does not).
 //!
-//! Every call goes over the wire through the router the emulator serves in production, and
-//! nothing here waits out a span: each case LOOKS AGAIN for the count it expects, inside a
-//! deadline generous enough to say nothing about how fast this host runs.
+//! Every call goes over the wire through the router the emulator serves in production.
+//! Nothing here waits a span out: the change is one the CLOCK owes, so each case reads the
+//! instants the topic holds its uncounted deletions at and moves them into the past, which
+//! is what the clock would have done — so the suite says nothing about how fast this host
+//! runs.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
+
+use service_com_amazonaws_sns_amazonsimplenotificationservice::state::SUBSCRIPTION_DELETION_SETTLES_AFTER;
 
 use super::topics_subscriptions_publish::{attribute_map, Sns};
 
-/// How long a case looks again for a count the clock owes before it gives up. Generous: it
-/// bounds a span the service owes, not the host's speed.
-const DEADLINE: Duration = Duration::from_secs(60);
+/// How many times a case reads the counters again while asserting the deleted count stands:
+/// a client's convergence loop over the other two counters, which have already settled.
+const CONVERGENCE_READS: usize = 5;
 
-/// How often a case looks again while it waits.
-const LOOK_AGAIN: Duration = Duration::from_millis(50);
+/// How much earlier than the span a due instant is allowed to be when it is read back, so
+/// the assertion says the deletion is held for a lag of that order without bounding how
+/// fast this host ran between the two calls.
+const SLACK: Duration = Duration::from_secs(10);
 
 /// The three computed counters of `topic`, as the strings `GetTopicAttributes` reports.
 async fn counters(sns: &Sns, case: &str, topic: &str) -> HashMap<String, String> {
@@ -87,22 +95,16 @@ async fn subscribe(sns: &Sns, case: &str, topic: &str, protocol: &str, endpoint:
         .unwrap_or_else(|| panic!("case {case:?}: no SubscriptionArn in {}", answer.body))
 }
 
-/// Look again until `name` reports at least `wanted` for `topic`, and hand back what the
-/// read that satisfied it saw.
-async fn counted_at_least(sns: &Sns, case: &str, topic: &str, name: &str, wanted: u64) -> u64 {
-    let deadline = Instant::now() + DEADLINE;
-    loop {
-        let seen = counter(sns, case, topic, name).await;
-        if seen >= wanted {
-            return seen;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "case {case:?}: {name} must reach {wanted} once the clock has made the deletions \
-             due, still reporting {seen}"
-        );
-        tokio::time::sleep(LOOK_AGAIN).await;
-    }
+/// The instants `topic` holds its not-yet-counted deletions at, read from the store the
+/// counters are computed from.
+fn settling_at(sns: &Sns, case: &str, topic: &str) -> Vec<SystemTime> {
+    let store = sns.state();
+    let store = store.lock();
+    store
+        .topics
+        .get(topic)
+        .map(|held| held.subscriptions_deleting.clone())
+        .unwrap_or_else(|| panic!("case {case:?}: the topic must be held"))
 }
 
 /// One row: how many `sqs` endpoints (confirmed on subscribe) and how many `email`
@@ -234,24 +236,50 @@ async fn an_unsubscribe_is_counted_into_subscriptions_deleted_once_the_clock_mak
              alone, got {after:?}"
         );
 
-        if row.unsubscribed == 0 {
-            // Nothing was deleted, so nothing is ever counted.
+        // The deleted count is NOT part of the unsubscribe: a client polling the other two
+        // counters to settlement keeps reading the count from before it, however many
+        // times it looks.
+        for read in 0..CONVERGENCE_READS {
+            let seen = counters(&sns, case, &topic).await;
             assert_eq!(
-                after["SubscriptionsDeleted"], "0",
-                "case {case:?}: a topic nothing was unsubscribed from counts no deletion, got \
-                 {after:?}"
+                seen["SubscriptionsDeleted"], "0",
+                "case {case:?} (read {read}): the deleted count must stand until the clock \
+                 makes the deletion due, got {seen:?}"
+            );
+        }
+
+        if row.unsubscribed == 0 {
+            // Nothing was deleted, so nothing is ever counted — and the topic holds no
+            // deletion waiting to be.
+            assert!(
+                settling_at(&sns, case, &topic).is_empty(),
+                "case {case:?}: a topic nothing was unsubscribed from holds no settling \
+                 deletion"
             );
             continue;
         }
 
-        let deleted = counted_at_least(
-            &sns,
-            case,
-            &topic,
-            "SubscriptionsDeleted",
-            row.unsubscribed as u64,
-        )
-        .await;
+        // Each deletion is held against the instant the count is due to take it up, which
+        // is the span this service lags the count by ahead of the call that performed it.
+        let settling = settling_at(&sns, case, &topic);
+        assert_eq!(
+            settling.len(),
+            row.unsubscribed,
+            "case {case:?}: expected one settling deletion per unsubscribe, got {settling:?}"
+        );
+        let earliest_due = SystemTime::now() + SUBSCRIPTION_DELETION_SETTLES_AFTER - SLACK;
+        for (at, due) in settling.iter().enumerate() {
+            assert!(
+                *due >= earliest_due,
+                "case {case:?}: deletion {at} must be held for the whole span, due at \
+                 {due:?}"
+            );
+        }
+
+        // Once the clock has made them due, the count reports them — every one, exactly
+        // once.
+        sns.make_the_deletions_due(case, &topic);
+        let deleted = counter(&sns, case, &topic, "SubscriptionsDeleted").await;
         assert_eq!(
             deleted, row.unsubscribed as u64,
             "case {case:?}: every deletion is counted exactly once, got {deleted}"
@@ -318,14 +346,20 @@ async fn a_removed_subscription_is_gone_from_the_store_the_counters_are_read_fro
     );
 
     // The pending one is still there — the topic still counts it — and the deletion is
-    // taken up on the clock's span.
+    // taken up once the clock has made it due.
     let still_pending = counter(&sns, case, &topic, "SubscriptionsPending").await;
     assert_eq!(
         still_pending, 1,
         "case {case:?}: the subscription that was not removed must still be counted, got \
          {still_pending}"
     );
-    let deleted = counted_at_least(&sns, case, &topic, "SubscriptionsDeleted", 1).await;
+    assert_eq!(
+        counter(&sns, case, &topic, "SubscriptionsDeleted").await,
+        0,
+        "case {case:?}: the deleted count stands until the clock makes the deletion due"
+    );
+    sns.make_the_deletions_due(case, &topic);
+    let deleted = counter(&sns, case, &topic, "SubscriptionsDeleted").await;
     assert_eq!(
         deleted, 1,
         "case {case:?}: the one deletion is counted exactly once, got {deleted}"

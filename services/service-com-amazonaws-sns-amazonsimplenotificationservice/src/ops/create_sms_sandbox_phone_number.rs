@@ -163,13 +163,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// `VerifySMSSandboxPhoneNumber` can check a caller's code against the delivered
     /// one, and `DeleteSMSSandboxPhoneNumber` can remove it.
     ///
-    /// What the call is judged on is its own input and this account's sandbox: the
-    /// destination number's FORM and the number of records the sandbox already holds.
-    /// The one-time password of a sandbox verification is sent by AWS itself, so the
-    /// registration does not depend on the account holding an origination entity of its
-    /// own — the inventory `ListOriginationNumbers` reports is a listing of the
-    /// account's DEDICATED numbers, and an account that holds none still registers and
-    /// verifies a sandbox destination number.
+    /// The operation does TWO things — it "[a]dds a destination phone number to an Amazon
+    /// Web Services account in the SMS sandbox and sends a one-time password (OTP) to that
+    /// phone number" — and they are judged apart. The registration is judged on its own
+    /// input and on this account's sandbox: the destination number's FORM and the number of
+    /// records the sandbox already holds. The SEND is judged on what the account has to
+    /// send FROM: a text message leaves from an origination entity, so an account whose
+    /// inventory holds none able to carry SMS has the send refused under the operation's
+    /// modelled user error ([`state::sms_origination`]) — AFTER the number is registered,
+    /// because only the send failed and the registration is what every operation
+    /// downstream of it (the listing, the verification, the delete) acts on.
     ///
     /// A number the sandbox ALREADY holds keeps the record it has — and with it the
     /// verification status it reached: the operation adds a destination number, and
@@ -177,9 +180,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// "this number is already in the sandbox", so the call succeeds.
     ///
     /// What it does NOT keep is the code: this operation "sends a one-time password
-    /// (OTP) to that phone number" on every call it answers, so a repeat delivers a
-    /// FRESH one — which is the whole reason a caller repeats it — and the superseded
-    /// code stops verifying.
+    /// (OTP) to that phone number" on every call that reaches the send, so a repeat
+    /// mints a FRESH one — which is the whole reason a caller repeats it — and the
+    /// superseded code stops verifying.
     async fn handle(
         &self,
         input: Self::Input,
@@ -238,7 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The code travels by SMS, which is out of band for this emulator, so the
         // record it was delivered to is the only place it can be read from. Minted
-        // only now, on a call that will be answered.
+        // only now, on a call that got this far.
         let delivered = store.next_sandbox_one_time_password();
         match store.sandbox_phone_numbers.get_mut(&input.phone_number) {
             Some(record) => record.one_time_password = delivered,
@@ -256,6 +259,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 );
             }
+        }
+
+        // The SEND, last: the number is registered either way, and what is left to judge
+        // is whether this account holds an origination entity the one-time password could
+        // leave from. An account that holds none has the message carried by nothing, and
+        // the caller is told that — the failure of the send alone, which takes nothing
+        // back.
+        if !state::sms_origination::can_send_sms(&store) {
+            return Err(CreateSMSSandboxPhoneNumberErrorModeled::UserErrorException(
+                UserErrorException {
+                    message: Some(state::sms_origination::NO_ORIGINATION_ENTITIES.to_string()),
+                },
+            )
+            .into());
         }
 
         Ok(CreateSMSSandboxPhoneNumberOutput {})

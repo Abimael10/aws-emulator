@@ -75,6 +75,9 @@ pub mod deactivated_subscription;
 /// The links this service hands a subscriber to FOLLOW — a `SubscribeURL`, an
 /// `UnsubscribeURL` — and the request following one is read as.
 pub mod visited_link;
+/// The ONE paginator every listing of this service cuts its pages with: how a listing
+/// SPELLS its continuation token, and whether serving a page settles that another follows.
+pub mod listing_continuation;
 mod message_structure;
 /// The rules a topic's TAG set is held to, shared by the operations that write one.
 mod tags;
@@ -459,12 +462,13 @@ pub const EFFECTIVE_DELIVERY_POLICY_ATTRIBUTE: &str = "EffectiveDeliveryPolicy";
 /// until the confirmed and pending counts had settled still read `0` deleted on every one
 /// of those reads.
 ///
-/// The span is this emulator's own — AWS documents no period for it — and it is the
-/// standard span this emulator owes a transition the clock makes due: non-zero, so a read
-/// taken straight after the `Unsubscribe` still reports the count from before it, and short
-/// enough that a client's ordinary convergence loop over the three counters observes the
-/// deletion being taken up rather than timing out on a number that never moves.
-pub const SUBSCRIPTION_DELETION_SETTLES_AFTER: Duration = Duration::from_secs(3);
+/// The span is this emulator's own — AWS documents no period for it — and it is read off
+/// what the recording shows about WHEN the count moves: a client that unsubscribed and then
+/// polled the three counters until the confirmed and pending ones had settled read the
+/// pre-`Unsubscribe` deleted count on every read of a loop that ran for over a minute and a
+/// half, so the lag is longer than a convergence loop over the other two counters, while
+/// staying a lag a client that keeps polling sees end rather than a number that never moves.
+pub const SUBSCRIPTION_DELETION_SETTLES_AFTER: Duration = Duration::from_secs(180);
 
 /// How many not-yet-counted deletions ONE topic holds the instants of.
 ///
@@ -4930,34 +4934,28 @@ pub fn addresses_fifo_queue(arn: &str) -> bool {
 
 /// One page of `items` starting at `token`, plus the token of the page after it.
 ///
-/// `token` is the opaque `NextToken` a previous page returned — the index of the
+/// `token` is the opaque `NextToken` a previous page returned — the position of the
 /// first item of this page, spelled exactly as this function mints it. `None` is
 /// returned for a token that is not one this function produced (another spelling of a
 /// number included, since the token is opaque and only this spelling is handed out),
 /// which each caller reports as its own modelled error.
+///
+/// The listing knows as it cuts the page whether another follows, so the token comes back
+/// only while items remain. The ONE paginator behind this lives in
+/// [`listing_continuation`], beside the policy the account-wide subscription listing
+/// reports its own pages under.
 pub fn paginate<T>(
     items: Vec<T>,
     token: Option<&str>,
     page_size: usize,
 ) -> Option<(Vec<T>, Option<String>)> {
-    let start: usize = match token {
-        Some(token) => {
-            let start: usize = token.parse().ok()?;
-            // A token this function minted reads back as the same text: a signed,
-            // zero-padded or otherwise respelled number is not one it handed out.
-            if token != start.to_string() {
-                return None;
-            }
-            start
-        }
-        None => 0,
-    };
-    if start > items.len() {
-        return None;
-    }
-    let end = (start + page_size).min(items.len());
-    let next = (end < items.len()).then(|| end.to_string());
-    Some((items.into_iter().skip(start).take(end - start).collect(), next))
+    listing_continuation::page(
+        items,
+        token,
+        page_size,
+        listing_continuation::Spelling::Position,
+        listing_continuation::Continuation::WhileItemsRemain,
+    )
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

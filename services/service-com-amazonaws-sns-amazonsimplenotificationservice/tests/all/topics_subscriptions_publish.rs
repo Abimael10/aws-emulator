@@ -151,6 +151,24 @@ impl Sns {
     pub(crate) fn state(&self) -> ::engine::ServiceState<SnsState> {
         self.engine.state::<SnsState>()
     }
+
+    /// Do for `topic` what the CLOCK would have done: move every instant it holds an
+    /// uncounted subscription deletion at into the past, so the next read of the topic's
+    /// counters is the read a client taking it after the lag makes.
+    ///
+    /// `pub(crate)` so every suite that asserts a deletion being taken up drives the
+    /// clock through the SAME seam rather than waiting a span out — a wait would say
+    /// something about how fast this host runs, and nothing about the service.
+    pub(crate) fn make_the_deletions_due(&self, case: &str, topic: &str) {
+        let store = self.state();
+        let mut store = store.lock();
+        let held = store
+            .topics
+            .get_mut(topic)
+            .unwrap_or_else(|| panic!("case {case:?}: the topic must be held"));
+        let due = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
+        held.subscriptions_deleting = held.subscriptions_deleting.iter().map(|_| due).collect();
+    }
 }
 
 /// Decode the five XML entities the response envelope escapes (`xml_escape` in

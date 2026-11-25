@@ -19,10 +19,10 @@
 //! whose topic does not exist — against each operation that resolves a subscription by ARN.
 //!
 //! Every call goes over the wire through the router the emulator serves in production, and
-//! nothing here waits out a span: the counter assertion LOOKS AGAIN inside a deadline
-//! generous enough to say nothing about how fast this host runs.
-
-use std::time::{Duration, Instant};
+//! nothing here waits out a span: the deletion the counter assertion is about is a change
+//! the CLOCK owes, so the instant the topic holds it at is moved into the past through the
+//! harness's own seam rather than waited for — which is what the clock would have done, and
+//! says nothing about how fast this host runs.
 
 use super::topics_subscriptions_publish::{attribute_map, Answer, Sns};
 
@@ -33,13 +33,6 @@ const NOT_FOUND: &str = "NotFound";
 /// The sentence SNS refuses a `SubscriptionArn` that resolves to no subscription with.
 /// Entirely fixed text: the resource kind, and nothing of the request.
 const SUBSCRIPTION_DOES_NOT_EXIST: &str = "Subscription does not exist";
-
-/// How long the deletion-counter assertion looks again before it gives up. Generous: it
-/// bounds a span the service owes, not the host's speed.
-const DEADLINE: Duration = Duration::from_secs(60);
-
-/// How often it looks again while it waits.
-const LOOK_AGAIN: Duration = Duration::from_millis(50);
 
 /// Subscribe an `sqs` endpoint on `topic` and hand back the subscription's ARN. SNS
 /// confirms an `sqs` subscription itself, so the ARN is a real one from the first call.
@@ -221,17 +214,10 @@ async fn a_repeated_unsubscribe_succeeds_and_the_deletion_is_counted_once() {
     assert_lookup_miss(case, &arn, &get_attributes(&sns, &arn).await);
 
     // And the deletion the FIRST call performed is accounted for exactly once: the
-    // counter follows the subscriptions actually removed, not the calls made.
-    let deadline = Instant::now() + DEADLINE;
-    loop {
-        let answer = sns.call("GetTopicAttributes", &[("TopicArn", &topic)]).await;
-        assert_eq!(
-            answer.status, 200,
-            "case {case:?}: GetTopicAttributes expected 200, got {} / {}",
-            answer.status, answer.body
-        );
-        let counters = attribute_map(&answer);
-        let deleted = counters
+    // counter follows the subscriptions actually removed, not the calls made. It stands
+    // until the clock makes the deletion due …
+    let deleted = |answer: &Answer| -> String {
+        attribute_map(answer)
             .get("SubscriptionsDeleted")
             .cloned()
             .unwrap_or_else(|| {
@@ -239,19 +225,24 @@ async fn a_repeated_unsubscribe_succeeds_and_the_deletion_is_counted_once() {
                     "case {case:?}: expected a SubscriptionsDeleted counter, got {}",
                     answer.body
                 )
-            });
-        if deleted == "1" {
-            break;
-        }
-        assert_eq!(
-            deleted, "0",
-            "case {case:?}: one removed subscription is one deletion, got {deleted}"
-        );
-        assert!(
-            Instant::now() < deadline,
-            "case {case:?}: SubscriptionsDeleted must reach 1 once the clock has made the \
-             deletion due, still reporting {deleted}"
-        );
-        tokio::time::sleep(LOOK_AGAIN).await;
-    }
+            })
+    };
+    let before = sns.call("GetTopicAttributes", &[("TopicArn", &topic)]).await;
+    assert_eq!(
+        deleted(&before),
+        "0",
+        "case {case:?}: the deleted count stands until the clock makes the deletion due, got \
+         {}",
+        before.body
+    );
+
+    // … and reports the ONE deletion the three calls performed between them once it is.
+    sns.make_the_deletions_due(case, &topic);
+    let after = sns.call("GetTopicAttributes", &[("TopicArn", &topic)]).await;
+    assert_eq!(
+        deleted(&after),
+        "1",
+        "case {case:?}: one removed subscription is one deletion, got {}",
+        after.body
+    );
 }

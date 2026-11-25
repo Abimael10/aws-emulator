@@ -28,7 +28,9 @@
 //! lengths) and the call repeated, which is what the per-call request id is read from.
 //! The accepted forms are driven through the same call as the control.
 
-use super::sms_sandbox_phone_numbers::{accepted_number_forms, reported_numbers};
+use super::sms_sandbox_phone_numbers::{
+    accepted_number_forms, given_an_origination_number, reported_numbers,
+};
 use super::topics_subscriptions_publish::{Answer, Sns};
 
 /// The sentence the SMS service states for a `destinationPhoneNumber` argument that is
@@ -242,6 +244,10 @@ async fn the_tail_names_a_fresh_request_id_for_each_call() {
 #[tokio::test]
 async fn a_destination_the_sms_service_accepts_is_still_registered() {
     let sns = Sns::new();
+    // An account that holds an entity the one-time password can be sent from, so the
+    // destination number itself is plainly what the call is judged on; what the inventory
+    // decides is held in `sms_sandbox_origination_entities.rs`.
+    given_an_origination_number(&sns);
 
     for (case, number) in accepted_number_forms() {
         let answer = sns

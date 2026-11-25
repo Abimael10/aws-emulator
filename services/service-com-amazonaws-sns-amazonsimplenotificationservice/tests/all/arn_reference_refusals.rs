@@ -31,8 +31,6 @@
 //! part, the protocol an endpoint was refused for, and the number of subscriptions a
 //! topic's counters are read over. The cases the wire corpus recorded are one row each.
 
-use std::time::{Duration, SystemTime};
-
 use service_com_amazonaws_sns_amazonsimplenotificationservice::state::account_resolution::{
     ARN_MEMBERS, NO_ACCOUNT_CODE, NO_ACCOUNT_MESSAGE, NO_ACCOUNT_STATUS,
 };
@@ -918,17 +916,8 @@ async fn the_deleted_subscription_count_settles_after_the_unsubscribe() {
 
         // Once the instant each deletion is due at has passed, the count reports them —
         // the clock owes the change, so the due instants are moved into the past rather
-        // than waited for.
-        {
-            let store = sns.state();
-            let mut store = store.lock();
-            let held = store
-                .topics
-                .get_mut(&topic)
-                .unwrap_or_else(|| panic!("case {case:?}: the topic must be held"));
-            let due = SystemTime::now() - Duration::from_secs(1);
-            held.subscriptions_deleting = held.subscriptions_deleting.iter().map(|_| due).collect();
-        }
+        // than waited for, through the harness's own seam.
+        sns.make_the_deletions_due(case, &topic);
         let settled = sns.call("GetTopicAttributes", &[("TopicArn", topic.as_str())]).await;
         assert_eq!(
             counters(&settled),
@@ -1003,23 +992,23 @@ async fn a_topics_uncounted_deletions_are_bounded() {
     );
 }
 
-/// The account-wide subscription listing reports a `NextToken` exactly while
-/// subscriptions remain to report: "Token to pass along to the next ListSubscriptions
-/// request. This element is returned if there are more subscriptions to retrieve"
-/// (`smithy_query(query="doc", shape="ListSubscriptionsResponse", member="NextToken")`).
+/// The account-wide subscription listing reports a `NextToken` on every page that reported
+/// a subscription — whether or not that page exhausted the listing — and none on the page
+/// that reports nothing, which is where a caller's walk ends. What a client can rely on is
+/// that the member is there to pass back and that passing it back is served.
 ///
 /// The rows differ in how many subscriptions the account holds either side of the page
 /// size, which is what the rule generalises over.
 #[tokio::test]
-async fn the_account_wide_listing_reports_a_token_exactly_while_subscriptions_remain() {
-    // (case, subscriptions held, whether the first page carries a token)
-    let rows: &[(&str, usize, bool)] = &[
-        ("no subscriptions", 0, false),
-        ("fewer than one page", 1, false),
-        ("one page and one more", PAGE_SIZE + 1, true),
+async fn the_account_wide_listing_reports_a_token_on_every_page_that_reported_something() {
+    // (case, subscriptions held, how many of them the first page reports)
+    let rows: &[(&str, usize)] = &[
+        ("no subscriptions", 0),
+        ("fewer than one page", 1),
+        ("one page and one more", PAGE_SIZE + 1),
     ];
 
-    for (index, (case, held, token_expected)) in rows.iter().enumerate() {
+    for (index, (case, held)) in rows.iter().enumerate() {
         let sns = Sns::new();
         let topic = sns.topic(&format!("token-rule-{index:02}")).await;
         for at in 0..*held {
@@ -1041,43 +1030,61 @@ async fn the_account_wide_listing_reports_a_token_exactly_while_subscriptions_re
             );
         }
 
-        let first = sns.call("ListSubscriptions", &[]).await;
-        assert_eq!(
-            first.status, 200,
-            "case {case:?}: expected 200, got {} / {}",
-            first.status, first.body
-        );
-        let reported = first.elements("SubscriptionArn").len();
-        assert_eq!(
-            reported,
-            (*held).min(PAGE_SIZE),
-            "case {case:?}: expected a page of {}, got {reported}",
-            (*held).min(PAGE_SIZE)
-        );
-        let token = first.element("NextToken");
-        assert_eq!(
-            token.is_some(),
-            *token_expected,
-            "case {case:?}: a token comes back exactly while subscriptions remain, got {}",
-            first.body
-        );
-
-        // The token it does mint reports the remainder, and that page carries none.
-        if let Some(token) = token {
-            let second = sns
-                .call("ListSubscriptions", &[("NextToken", token.as_str())])
-                .await;
+        // Walk every page: each one reports at most a page's worth, carries a token
+        // exactly while it reported something, and the pages together hold the account's
+        // subscriptions once each.
+        let mut walked = 0usize;
+        let mut pages = 0usize;
+        let mut token: Option<String> = None;
+        loop {
+            let params: Vec<(&str, &str)> = match token.as_deref() {
+                Some(token) => vec![("NextToken", token)],
+                None => Vec::new(),
+            };
+            let answer = sns.call("ListSubscriptions", &params).await;
             assert_eq!(
-                second.elements("SubscriptionArn").len(),
-                held - PAGE_SIZE,
-                "case {case:?}: the second page reports the remainder, got {}",
-                second.body
+                answer.status, 200,
+                "case {case:?} (page {pages}): expected 200, got {} / {}",
+                answer.status, answer.body
             );
+            let reported = answer.elements("SubscriptionArn").len();
+            assert_eq!(
+                reported,
+                (held - walked).min(PAGE_SIZE),
+                "case {case:?} (page {pages}): expected a page of {}, got {reported}",
+                (held - walked).min(PAGE_SIZE)
+            );
+            walked += reported;
+            pages += 1;
+            token = answer.element("NextToken");
+            assert_eq!(
+                token.is_some(),
+                reported > 0,
+                "case {case:?} (page {pages}): a token comes back exactly while the page \
+                 reported something, got {}",
+                answer.body
+            );
+            if token.is_none() {
+                break;
+            }
             assert!(
-                second.element("NextToken").is_none(),
-                "case {case:?}: the last page carries no token, got {}",
-                second.body
+                pages < 8,
+                "case {case:?}: the pages must run out, got {pages} of them"
             );
         }
+        assert_eq!(
+            walked, *held,
+            "case {case:?}: the pages must report every subscription, got {walked}"
+        );
+        let expected_pages = if *held == 0 {
+            1
+        } else {
+            held.div_ceil(PAGE_SIZE) + 1
+        };
+        assert_eq!(
+            pages, expected_pages,
+            "case {case:?}: expected one page per page's worth plus the empty one, got \
+             {pages}"
+        );
     }
 }

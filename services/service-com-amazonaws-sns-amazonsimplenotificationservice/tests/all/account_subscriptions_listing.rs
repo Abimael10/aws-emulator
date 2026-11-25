@@ -14,9 +14,11 @@
 //! 2. each listed subscription carries the stored record's `Owner`, `Protocol`,
 //!    `Endpoint` and `TopicArn`, and its own ARN unless it is still awaiting
 //!    confirmation, where the `PendingConfirmation` sentinel stands in its place;
-//! 3. the listing is a page of up to 100 with an opaque `NextToken`, the pages
-//!    partition the account's subscriptions, and a token the service did not mint is
-//!    refused with `InvalidParameterException` (HTTP 400, `InvalidParameter`);
+//! 3. the listing is a page of up to 100, every page that reports a subscription comes
+//!    back with an opaque `NextToken` — whether or not that page exhausted the listing —
+//!    the pages partition the account's subscriptions, the walk ends on the page that
+//!    reports nothing, and a token the service did not mint is refused with
+//!    `InvalidParameterException` (HTTP 400, `InvalidParameter`);
 //! 4. reading the listing changes nothing a later caller sees, and what it reports
 //!    follows the store: an unsubscribed subscription, and one deleted with its topic,
 //!    leave it.
@@ -487,8 +489,10 @@ async fn list_subscriptions_follows_the_store_as_subscriptions_go() {
 }
 
 /// The listing is paginated at [`PAGE_SIZE`]: the pages partition the account's
-/// subscriptions with no repeat and no gap, only the last page has no `NextToken`, and
-/// a token the service did not mint is refused with HTTP 400 / `InvalidParameter`.
+/// subscriptions with no repeat and no gap, every page that reports a subscription carries
+/// a `NextToken` — the page that exhausts the listing included, which serves one empty page
+/// and ends the walk — and a token the service did not mint is refused with HTTP 400 /
+/// `InvalidParameter`.
 #[tokio::test]
 async fn list_subscriptions_pages_at_the_documented_size_and_refuses_a_token_it_did_not_mint() {
     let sns = Sns::new();
@@ -511,9 +515,9 @@ async fn list_subscriptions_pages_at_the_documented_size_and_refuses_a_token_it_
 
     let (listed, pages) = sns.all_listed_subscription_arns("just over two pages").await;
     assert_eq!(
-        pages, 3,
+        pages, 4,
         "case \"just over two pages\": {total} subscriptions at {PAGE_SIZE} a page is 3 \
-         pages, got {pages}"
+         pages of subscriptions and the empty page that ends the walk, got {pages}"
     );
     assert_eq!(
         listed.len(),
@@ -622,7 +626,7 @@ async fn list_subscriptions_pages_at_the_documented_size_and_refuses_a_token_it_
     let (after, pages_after) = sns.all_listed_subscription_arns("after the refusals").await;
     assert_eq!(
         (after.len(), pages_after),
-        (total, 3),
+        (total, 4),
         "case \"after the refusals\": the listing must be untouched, got {} over {} pages",
         after.len(),
         pages_after

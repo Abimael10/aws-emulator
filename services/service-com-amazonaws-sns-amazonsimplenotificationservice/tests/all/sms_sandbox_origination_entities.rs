@@ -1,28 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end cover for what an SMS sandbox registration is judged on, and what it is
-//! NOT judged on: this account's dedicated origination-entity inventory.
+//! End-to-end cover for the TWO effects of an SMS sandbox registration, and what each of
+//! them is judged on.
 //!
-//! The RULE asserted here: a sandbox destination number "sends a one-time password (OTP)
-//! to that phone number" (`CreateSMSSandboxPhoneNumber` doc) from AWS's own side, so the
-//! registration is judged on its own input and on this account's sandbox — never on the
-//! account's DEDICATED origination entities, which `ListOriginationNumbers` reports and
-//! which an account acquires out of band. A registration is therefore served, and the
-//! destination number reported pending with a one-time password delivered to it, whether
-//! the account holds no entity at all, entities that cannot send SMS, or SMS-capable
-//! ones — and the inventory the listing reports is unchanged by it.
+//! The RULE asserted here: the operation "[a]dds a destination phone number to an Amazon
+//! Web Services account in the SMS sandbox and sends a one-time password (OTP) to that
+//! phone number" (`CreateSMSSandboxPhoneNumber` doc) — two effects, judged apart. The
+//! REGISTRATION is judged on its own input and on this account's sandbox, so the
+//! destination number is registered pending whatever else the account holds and reads
+//! back from `ListSMSSandboxPhoneNumbers`. The SEND is judged on what the account has to
+//! send a text message FROM: an SMS message leaves from an origination entity, so an
+//! account whose inventory holds none able to carry SMS has the send fail, and SNS reports
+//! that failure under the operation's modelled user error (`UserErrorException`, awsQuery
+//! code `UserError`, HTTP 400) with the fixed sentence
+//! `state::sms_origination::NO_ORIGINATION_ENTITIES`. The refusal takes nothing back: it
+//! is the message that was not carried, not the registration.
 //!
-//! The rows differ along what the rule generalises over: the destination-number FORM
-//! (both branches of the modelled pattern and both published length bounds, from the
-//! sandbox suite's own catalog), the CAPABILITIES of the entities the account holds
-//! (none at all, an entity that can only place a voice call or carry MMS, one that can
-//! send SMS, and several together), and whether the sandbox already holds the number.
+//! The rows differ along what the rule generalises over: the CAPABILITIES of the entities
+//! the account holds (none at all, an entity that can only place a voice call or carry
+//! MMS, one that can send SMS, several together, and every modelled capability at once),
+//! the destination-number FORM (both branches of the modelled pattern and both published
+//! length bounds, from the sandbox suite's own catalog), whether the sandbox already holds
+//! the number, and whether an entity is acquired or given up out of band between two
+//! calls.
 //!
-//! The registration is also read back through `ListSMSSandboxPhoneNumbers` and carried
-//! through the whole verification state machine on an account holding NO entity, because
-//! the registration is what every operation downstream of it acts on: a registration the
-//! listing does not report leaves the sandbox a dead end, with nothing to verify and
-//! nothing to delete.
+//! The registration is also carried through the whole verification state machine on an
+//! account holding NO entity, because the registration is what every operation downstream
+//! of it acts on: a registration the listing does not report leaves the sandbox a dead
+//! end, with nothing to verify and nothing to delete.
 //!
 //! Every call goes over the wire through the router the emulator serves in production,
 //! so nothing but persisted state carries information between calls.
@@ -63,134 +68,80 @@ async fn register(sns: &Sns, number: &str) -> Answer {
         .await
 }
 
-/// Assert the registration was served and left the number pending with a password of
-/// its own.
-fn assert_registered(case: &str, sns: &Sns, number: &str, answer: &Answer) {
-    assert_eq!(
-        answer.status, 200,
-        "case {case:?}: expected the registration to be served, got {} / {}",
-        answer.status, answer.body
-    );
+/// Assert the destination number is registered and pending with a password of its own —
+/// which is the half of the call the account's inventory does not decide.
+fn assert_registered(case: &str, sns: &Sns, number: &str) {
     let state = sns.state();
     let state = state.lock();
     let record = state
         .sandbox_phone_numbers
         .get(number)
-        .unwrap_or_else(|| panic!("case {case:?}: the served registration must store a record"));
+        .unwrap_or_else(|| panic!("case {case:?}: the registration must store a record"));
     assert_eq!(
         record.status, SANDBOX_NUMBER_PENDING,
         "case {case:?}: expected a pending destination number, got {record:?}"
     );
     assert!(
         !record.one_time_password.is_empty(),
-        "case {case:?}: the served registration must deliver a one-time password"
+        "case {case:?}: the registration must mint a one-time password"
     );
 }
 
-/// An account holding no origination entity registers a sandbox destination number all
-/// the same, whatever form that number takes — which is what makes the verification
-/// flow reachable at all.
-#[tokio::test]
-async fn a_registration_is_served_while_the_account_holds_no_origination_entity() {
-    let sns = Sns::new();
-
-    for (case, number) in accepted_number_forms() {
-        let answer = register(&sns, &number).await;
-        assert_registered(case, &sns, &number, &answer);
+/// Assert the SEND half of the call was answered as `carried` says: served when the
+/// account holds an entity able to carry the one-time password, and otherwise refused as
+/// that send failing — 400 with the operation's modelled user error and its fixed
+/// sentence, with none of the (`@sensitive`) destination number echoed back.
+fn assert_send(case: &str, number: &str, carried: bool, answer: &Answer) {
+    if carried {
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: an account able to send expects the call to be served, got {} / {}",
+            answer.status, answer.body
+        );
+        return;
     }
-
-    // Nothing the registrations did put an entity in the inventory the listing reports.
+    assert_eq!(
+        answer.status, 400,
+        "case {case:?}: an account with nothing to send from expects 400, got {} / {}",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        answer.code(),
+        "UserError",
+        "case {case:?}: expected the UserError code, got {}",
+        answer.body
+    );
+    assert_eq!(
+        answer.element("Message").as_deref(),
+        Some(sms_origination::NO_ORIGINATION_ENTITIES),
+        "case {case:?}: expected the fixed send-failure sentence, got {}",
+        answer.body
+    );
     assert!(
-        sns.state().lock().origination_numbers.is_empty(),
-        "the registrations must not write an origination entity, got {:?}",
-        sns.state().lock().origination_numbers
+        !answer.body.contains(number),
+        "case {case:?}: the destination number is a sensitive member, so the refusal must \
+         not echo it, got {}",
+        answer.body
     );
 }
 
-/// What the inventory holds does not decide the registration: every capability set — and
-/// none at all — leaves the destination number pending just the same.
-#[tokio::test]
-async fn the_origination_inventory_does_not_decide_the_registration() {
-    // (case, the capabilities the account's entities hold). The capability names are the
-    // values the modelled `NumberCapability` enum accepts
-    // (`crate::ops::types::NUMBER_CAPABILITY_VALUES`).
-    let rows: &[(&str, &[&[&str]])] = &[
-        ("no entity at all", &[]),
-        ("one voice-only entity", &[&["VOICE"]]),
-        ("one MMS-only entity", &[&["MMS"]]),
-        ("two entities, neither able to send SMS", &[&["VOICE"], &["MMS"]]),
-        ("one SMS-capable entity", &[&[sms_origination::SMS_CAPABILITY]]),
-        ("one entity able to send SMS and MMS", &[&["MMS", "SMS"]]),
-        ("two entities, one of them able to send SMS", &[&["VOICE"], &["SMS"]]),
-        ("an entity with every modelled capability", &[NUMBER_CAPABILITY_VALUES]),
-    ];
-
-    let destination = "+447700900123";
-    for (case, inventory) in rows {
-        let sns = Sns::new();
-        for (at, capabilities) in inventory.iter().enumerate() {
-            seed_origination(&sns, &format!("+1206555{at:04}"), capabilities);
-        }
-
-        let answer = register(&sns, destination).await;
-        assert_registered(case, &sns, destination, &answer);
-    }
-}
-
-/// The registration is judged the same on EVERY call, the repeat of one the sandbox
-/// already holds included: an inventory emptied out of band stops nothing, and the
-/// repeat supersedes the one-time password of the record it keeps.
-#[tokio::test]
-async fn a_repeat_registration_is_served_once_the_inventory_holds_no_sms_entity() {
-    let sns = Sns::new();
-    let origination = "+12065550199";
-    let destination = "+12065550100";
-    seed_origination(&sns, origination, &[sms_origination::SMS_CAPABILITY]);
-
-    let served = register(&sns, destination).await;
-    assert_eq!(
-        served.status, 200,
-        "the first registration must be served, got {} / {}",
-        served.status, served.body
-    );
-    let delivered = sns.state().lock().sandbox_phone_numbers[destination]
-        .one_time_password
-        .clone();
-
-    sns.state().lock().origination_numbers.remove(origination);
-
-    for (case, number) in [
-        ("a number the sandbox already holds", destination),
-        ("a number the sandbox does not hold", "+447700900123"),
-    ] {
-        let answer = register(&sns, number).await;
-        assert_registered(case, &sns, number, &answer);
-    }
-
-    let state = sns.state();
-    let state = state.lock();
-    assert_eq!(
-        state.sandbox_phone_numbers.len(),
-        2,
-        "expected one record per registered number, got {:?}",
-        state.sandbox_phone_numbers
-    );
-    assert_ne!(
-        state.sandbox_phone_numbers[destination].one_time_password, delivered,
-        "a repeat registration must deliver a fresh one-time password"
-    );
-}
-
-/// The inventory states the flow below is driven against, each labelled: the capability
+/// The inventory states every table below is driven over, each labelled: the capability
 /// names are the values the modelled `NumberCapability` enum accepts
 /// (`crate::ops::types::NUMBER_CAPABILITY_VALUES`), and the first row is the account a
 /// freshly booted emulator serves — one holding no entity at all.
 const INVENTORY_ROWS: &[(&str, &[&[&str]])] = &[
     ("no entity at all", &[]),
     ("one voice-only entity", &[&["VOICE"]]),
+    ("one MMS-only entity", &[&["MMS"]]),
+    ("two entities, neither able to send SMS", &[&["VOICE"], &["MMS"]]),
     (
         "one SMS-capable entity",
         &[&[sms_origination::SMS_CAPABILITY]],
+    ),
+    ("one entity able to send SMS and MMS", &[&["MMS", "SMS"]]),
+    (
+        "two entities, one of them able to send SMS",
+        &[&["VOICE"], &[sms_origination::SMS_CAPABILITY]],
     ),
     (
         "an entity with every modelled capability beside a voice-only one",
@@ -205,19 +156,86 @@ fn seed_inventory(sns: &Sns, inventory: &[&[&str]]) {
     }
 }
 
-/// Assert the registration's two effects were judged APART: the call is either served,
-/// or refused only as the one-time-password SEND failing — which AWS reports under the
-/// operation's modelled user error (`UserErrorException`, awsQuery `UserError`, HTTP
-/// 400) — and never as the registration not having happened.
-fn assert_send_judged_apart(case: &str, answer: &Answer) {
-    let served = answer.status == 200;
-    let send_refused = answer.status == 400 && answer.code() == "UserError";
-    assert!(
-        served || send_refused,
-        "case {case:?}: expected the registration to be served, or refused only as the \
-         one-time password send failing, got {} / {}",
-        answer.status,
-        answer.body
+/// Whether `inventory` holds an entity a text message could leave from.
+fn carries_sms(inventory: &[&[&str]]) -> bool {
+    inventory
+        .iter()
+        .any(|capabilities| capabilities.contains(&sms_origination::SMS_CAPABILITY))
+}
+
+/// What the inventory decides is the SEND: an account holding an entity able to carry a
+/// text message has the registration served, and one holding none is told the one-time
+/// password could not be sent — while the destination number is registered pending either
+/// way.
+#[tokio::test]
+async fn the_origination_inventory_decides_the_send_and_not_the_registration() {
+    for (inventory_case, inventory) in INVENTORY_ROWS {
+        for (form, number) in accepted_number_forms() {
+            let case = format!("{inventory_case} / {form}");
+            let sns = Sns::new();
+            seed_inventory(&sns, inventory);
+
+            let answer = register(&sns, &number).await;
+            assert_send(&case, &number, carries_sms(inventory), &answer);
+            assert_registered(&case, &sns, &number);
+
+            // Nothing the registration did put an entity in the inventory the listing
+            // reports: the two stores are separate.
+            assert_eq!(
+                sns.state().lock().origination_numbers.len(),
+                inventory.len(),
+                "case {case:?}: the registration must leave the inventory alone"
+            );
+        }
+    }
+}
+
+/// The inventory is read at every call: an entity acquired out of band carries the next
+/// registration, one given up stops carrying it, and a number the sandbox already holds is
+/// judged the same way — keeping the record it has and superseding its one-time password.
+#[tokio::test]
+async fn each_registration_is_judged_on_the_inventory_as_it_then_stands() {
+    let sns = Sns::new();
+    let origination = "+12065550199";
+    let destination = "+12065550100";
+    let other = "+447700900123";
+
+    // With nothing to send from, the send is refused and the number is registered.
+    let refused = register(&sns, destination).await;
+    assert_send("no entity yet", destination, false, &refused);
+    assert_registered("no entity yet", &sns, destination);
+    let first_password = delivered_code(&sns, destination);
+
+    // An entity acquired out of band carries the next send, the repeat of a number the
+    // sandbox already holds included.
+    seed_origination(&sns, origination, &[sms_origination::SMS_CAPABILITY]);
+    let served = register(&sns, destination).await;
+    assert_send("an entity acquired", destination, true, &served);
+    assert_registered("an entity acquired", &sns, destination);
+    assert_ne!(
+        delivered_code(&sns, destination),
+        first_password,
+        "a repeat registration must mint a fresh one-time password"
+    );
+
+    // And one given up stops carrying it.
+    sns.state().lock().origination_numbers.remove(origination);
+    for (case, number) in [
+        ("the entity given up, a number the sandbox holds", destination),
+        ("the entity given up, a number it does not", other),
+    ] {
+        let answer = register(&sns, number).await;
+        assert_send(case, number, false, &answer);
+        assert_registered(case, &sns, number);
+    }
+
+    let state = sns.state();
+    let state = state.lock();
+    assert_eq!(
+        state.sandbox_phone_numbers.len(),
+        2,
+        "expected one record per registered number, got {:?}",
+        state.sandbox_phone_numbers
     );
 }
 
@@ -234,7 +252,7 @@ async fn a_registration_reaches_the_sandbox_listing_as_pending_whatever_the_inve
         for (form, number) in accepted_number_forms() {
             let case = format!("{inventory_case} / {form}");
             let answer = register(&sns, &number).await;
-            assert_send_judged_apart(&case, &answer);
+            assert_send(&case, &number, carries_sms(inventory), &answer);
             assert_eq!(
                 listed_status(&sns, &number).await.as_deref(),
                 Some(SANDBOX_NUMBER_PENDING),
@@ -244,7 +262,7 @@ async fn a_registration_reaches_the_sandbox_listing_as_pending_whatever_the_inve
         }
 
         // The listing reports one entry per registered number and nothing else: the
-        // account's dedicated entities are a separate inventory.
+        // account's entities are a separate inventory.
         let listing = sns.call("ListSMSSandboxPhoneNumbers", &[]).await;
         assert_eq!(
             reported_numbers(&listing).len(),
@@ -282,10 +300,11 @@ fn codes_other_than(delivered: &str) -> Vec<(&'static str, String)> {
 }
 
 /// The whole verification state machine runs from a registration made by an account
-/// holding NO origination entity: the number is reported pending, a code that was not
-/// delivered to it is refused as a failed verification and leaves it pending, a number
-/// the sandbox never held is refused as a lookup miss instead, the delivered code moves
-/// it to verified, and the delete takes it back out of the listing.
+/// holding NO origination entity — the account whose send was refused: the number is
+/// reported pending, a code that was not delivered to it is refused as a failed
+/// verification and leaves it pending, a number the sandbox never held is refused as a
+/// lookup miss instead, the code the registration minted moves it to verified, and the
+/// delete takes it back out of the listing.
 #[tokio::test]
 async fn the_verification_flow_runs_from_a_registration_made_with_no_origination_entity() {
     let sns = Sns::new();
@@ -313,7 +332,7 @@ async fn the_verification_flow_runs_from_a_registration_made_with_no_origination
 
     for (case, number) in accepted_number_forms() {
         let answer = register(&sns, &number).await;
-        assert_send_judged_apart(case, &answer);
+        assert_send(case, &number, false, &answer);
         assert_eq!(
             listed_status(&sns, &number).await.as_deref(),
             Some(SANDBOX_NUMBER_PENDING),
@@ -351,7 +370,7 @@ async fn the_verification_flow_runs_from_a_registration_made_with_no_origination
         let verified = verify(&sns, &number, &delivered).await;
         assert_eq!(
             verified.status, 200,
-            "case {case:?}: expected the delivered code to verify the number, got {} / {}",
+            "case {case:?}: expected the minted code to verify the number, got {} / {}",
             verified.status, verified.body
         );
         assert_eq!(

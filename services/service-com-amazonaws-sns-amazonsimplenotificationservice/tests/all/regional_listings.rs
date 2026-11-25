@@ -195,13 +195,37 @@ async fn an_account_wide_listing_reports_only_the_answering_regions_records() {
                 case.region,
                 answer.body
             );
-            assert_eq!(
-                answer.element("NextToken"),
-                None,
-                "case {:?} {action}: one page holds every record of the region, got {}",
-                case.region,
-                answer.body
-            );
+            // One page holds every record of the region. The account-wide subscription
+            // listing hands a continuation token back for any page that reported
+            // something all the same, so what is asserted there is that the page it
+            // serves next reports nothing.
+            match answer.element("NextToken") {
+                None => assert!(
+                    *action != "ListSubscriptions" || want.is_empty(),
+                    "case {:?} {action}: a page that reported {} record(s) must carry a \
+                     NextToken, got {}",
+                    case.region,
+                    want.len(),
+                    answer.body
+                ),
+                Some(token) => {
+                    assert_eq!(
+                        *action, "ListSubscriptions",
+                        "case {:?} {action}: one page holds every record of the region, got {}",
+                        case.region, answer.body
+                    );
+                    let beyond = sns
+                        .call_in_region(case.region, action, &[("NextToken", token.as_str())])
+                        .await;
+                    assert!(
+                        reported(&beyond, tag).is_empty(),
+                        "case {:?} {action}: the page past the region's records must report \
+                         none, got {}",
+                        case.region,
+                        beyond.body
+                    );
+                }
+            }
         }
 
         // A subscription is reported by the region of the TOPIC it extends, whatever

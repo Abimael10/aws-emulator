@@ -64,7 +64,13 @@ const RAW_DELIVERY_HEADER: &str = "x-amz-sns-rawdelivery";
 /// How long a wait for a recorded request or a dead letter lasts before a case fails: far
 /// longer than any delivery here takes, so a loaded machine does not fail a case the emulator
 /// would have served.
-const DEADLINE: Duration = Duration::from_secs(60);
+///
+/// The longest schedule a case waits out — the published opening phases plus the two retries
+/// the case's own policy states ([`SCHEDULED_ATTEMPTS`]) — is some fifteen seconds of
+/// emulator time, so this is an order of magnitude of room: a whole-workspace test run has
+/// been seen to stretch that schedule past a minute, which is the host's speed and not the
+/// service's.
+const DEADLINE: Duration = Duration::from_secs(180);
 
 /// How often such a wait looks again.
 const LOOK_INTERVAL: Duration = Duration::from_millis(25);

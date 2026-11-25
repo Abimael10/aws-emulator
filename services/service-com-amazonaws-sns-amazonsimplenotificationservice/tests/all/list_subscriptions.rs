@@ -7,9 +7,11 @@
 //! The rule covered: `ListSubscriptions` reports, from persisted state, every
 //! subscription the account holds over EVERY topic — each with the members SNS
 //! publishes for a subscription (its ARN, owner, protocol, endpoint and topic) — one
-//! page of at most the documented page size at a time, with an opaque `NextToken`
-//! while subscriptions remain, and it changes nothing a later caller sees. A
-//! `NextToken` it did not mint is refused with `InvalidParameterException` (HTTP 400).
+//! page of at most the documented page size at a time, and it changes nothing a later
+//! caller sees. Every page that reports a subscription comes back with an opaque
+//! `NextToken`, whether or not it exhausted the listing, and passing that token back is
+//! served: the walk ends on the page that reports nothing. A `NextToken` the listing did
+//! not mint is refused with `InvalidParameterException` (HTTP 400).
 //!
 //! Every assertion runs over a SET of inputs: several topics, every protocol SNS
 //! addresses (so both the confirmed and the pending halves of the model are listed),
@@ -379,9 +381,9 @@ async fn the_account_wide_listing_follows_the_stored_subscriptions() {
 
 /// The listing pages at the documented page size, over the whole account rather than
 /// one topic: a full page carries a `NextToken`, the pages together hold every
-/// subscription exactly once, the last page carries no token — and a token the listing
-/// never minted is refused with HTTP 400 `InvalidParameter` and the sentence SNS states
-/// for the member.
+/// subscription exactly once, the page that exhausts the listing carries a token too —
+/// which serves an empty page and ends the walk — and a token the listing never minted is
+/// refused with HTTP 400 `InvalidParameter` and the sentence SNS states for the member.
 #[tokio::test]
 async fn the_account_wide_listing_pages_at_the_documented_page_size() {
     let sns = Sns::new();
@@ -416,19 +418,41 @@ async fn the_account_wide_listing_pages_at_the_documented_page_size() {
         )
     });
 
-    let second = list(&sns, "the last page", &[("NextToken", &token)]).await;
+    let second = list(&sns, "the last page of subscriptions", &[("NextToken", &token)]).await;
     let second_page = reported(&second);
     assert_eq!(
         second_page.len(),
         total - PAGE_SIZE,
-        "case \"the last page\": expected the remainder {}, got {}",
+        "case \"the last page of subscriptions\": expected the remainder {}, got {}",
         total - PAGE_SIZE,
         second_page.len()
     );
+    let last_token = second.element("NextToken").unwrap_or_else(|| {
+        panic!(
+            "case \"the last page of subscriptions\": a page that reported subscriptions must \
+             carry a NextToken, got {}",
+            second.body
+        )
+    });
+
+    // The token that page served is accepted, and the page it serves reports nothing and
+    // ends the walk.
+    let beyond = list(
+        &sns,
+        "the page past the listing",
+        &[("NextToken", &last_token)],
+    )
+    .await;
     assert!(
-        second.element("NextToken").is_none(),
-        "case \"the last page\": the last page must carry no NextToken, got {}",
-        second.body
+        reported(&beyond).is_empty(),
+        "case \"the page past the listing\": expected an empty page, got {}",
+        beyond.body
+    );
+    assert!(
+        beyond.element("NextToken").is_none(),
+        "case \"the page past the listing\": a page that reported nothing must carry no \
+         NextToken, got {}",
+        beyond.body
     );
 
     let mut all = first_page.clone();
@@ -457,13 +481,21 @@ async fn the_account_wide_listing_pages_at_the_documented_page_size() {
         repeat.body
     );
 
-    // A token this listing did not mint: not a number, a negative index, a position
-    // past the end, and one past the largest index it could have minted.
+    // A token this listing did not mint: text that is not one at all, a position spelled
+    // as a bare number, a base64 run that decodes to something else, and the token a
+    // page served with one character of it changed.
+    let tampered = {
+        let mut bytes = last_token.clone().into_bytes();
+        bytes[0] = if bytes[0] == b'A' { b'B' } else { b'A' };
+        String::from_utf8(bytes).expect("a base64 token is ASCII")
+    };
     for bad in [
         "not-a-token",
         "-1",
         "99999999999999999999",
-        &(total + 1).to_string(),
+        &total.to_string(),
+        "MA==",
+        tampered.as_str(),
     ] {
         let answer = sns
             .call("ListSubscriptions", &[("NextToken", bad)])
@@ -493,12 +525,96 @@ async fn the_account_wide_listing_pages_at_the_documented_page_size() {
     }
 }
 
+/// A token the listing MINTED keeps resolving: one served for a position the account's
+/// subscriptions have since shrunk past reports what is there NOW — nothing — rather than
+/// being refused as a parameter the caller got wrong, which is the answer reserved for a
+/// value the listing never minted.
+///
+/// The rows differ in how much of the listing is removed while the caller holds the token,
+/// which is what the rule generalises over.
+#[tokio::test]
+async fn a_token_the_listing_minted_still_resolves_once_the_listing_has_shrunk() {
+    // (case, how many of the three subscriptions survive the removal)
+    let rows: &[(&str, usize)] = &[
+        ("every subscription removed", 0),
+        ("all but one removed", 1),
+        ("one removed", 2),
+    ];
+
+    for (row, (case, surviving)) in rows.iter().enumerate() {
+        let sns = Sns::new();
+        let topic = sns.topic(&format!("shrunk-{row:02}")).await;
+        let mut arns = Vec::new();
+        for index in 0..3 {
+            arns.push(
+                subscribe(
+                    &sns,
+                    case,
+                    &topic,
+                    "sqs",
+                    &format!("arn:aws:sqs:us-east-1:000000000000:shrunk-{row}-{index}"),
+                )
+                .await,
+            );
+        }
+
+        // The page reports all three and hands back the token for the position past them.
+        let served = list(&sns, case, &[]).await;
+        assert_eq!(
+            reported(&served).len(),
+            arns.len(),
+            "case {case:?}: expected the whole listing on one page, got {}",
+            served.body
+        );
+        let token = served.element("NextToken").unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: a page that reported subscriptions must carry a NextToken, \
+                 got {}",
+                served.body
+            )
+        });
+
+        for arn in arns.iter().take(arns.len() - surviving) {
+            unsubscribe(&sns, case, arn).await;
+        }
+
+        let beyond = list(&sns, case, &[("NextToken", &token)]).await;
+        assert!(
+            reported(&beyond).is_empty(),
+            "case {case:?}: the token's page must report what is left past the position it \
+             names, got {}",
+            beyond.body
+        );
+        assert!(
+            beyond.element("NextToken").is_none(),
+            "case {case:?}: a page that reported nothing must carry no NextToken, got {}",
+            beyond.body
+        );
+
+        // And the listing itself still reports the survivors, with a token of their own.
+        let again = list(&sns, case, &[]).await;
+        assert_eq!(
+            reported(&again).len(),
+            *surviving,
+            "case {case:?}: expected the {surviving} surviving subscription(s), got {}",
+            again.body
+        );
+        assert_eq!(
+            again.element("NextToken").is_some(),
+            *surviving > 0,
+            "case {case:?}: a token comes back exactly while the page reported something, \
+             got {}",
+            again.body
+        );
+    }
+}
+
 /// Walk every page of the account-wide listing, answering the subscriptions it reports
 /// in document order together with the size of each page it took.
 ///
-/// Checks, on each page, the two things the operation's own documentation fixes: a page
-/// carries at most the documented page size, and a `NextToken` comes back exactly while
-/// subscriptions remain — so a page that carries one is a full page.
+/// Checks, on each page, the two things the listing fixes: a page carries at most the
+/// documented page size, and a `NextToken` comes back exactly while the page reported
+/// something — so the walk ends on the page that reports nothing.
 async fn walk(sns: &Sns, case: &str) -> (Vec<Listed>, Vec<usize>) {
     let mut found: Vec<Listed> = Vec::new();
     let mut sizes: Vec<usize> = Vec::new();
@@ -517,18 +633,20 @@ async fn walk(sns: &Sns, case: &str) -> (Vec<Listed>, Vec<usize>) {
             page.len()
         );
         sizes.push(page.len());
+        let reported_something = !page.is_empty();
         found.extend(page);
         token = answer.element("NextToken");
-        if token.is_none() {
-            return (found, sizes);
-        }
         assert_eq!(
-            *sizes.last().expect("a page was just walked"),
-            PAGE_SIZE,
-            "case {case:?}: page {} carries a NextToken, so it must be a full page, got {}",
+            token.is_some(),
+            reported_something,
+            "case {case:?}: page {} carries a NextToken exactly while it reported a \
+             subscription, got {}",
             sizes.len(),
             answer.body
         );
+        if token.is_none() {
+            return (found, sizes);
+        }
         assert!(
             sizes.len() < 64,
             "case {case:?}: the pages must run out, got {} of them",
@@ -588,7 +706,7 @@ const REMOVALS: &[(&str, Removal)] = &[
 /// Every page is computed from the subscriptions the store holds WHEN THE PAGE IS ASKED
 /// FOR: after any set of removals, walking the pages reports exactly the subscriptions
 /// that are left, once each, in the order the survivors already had, paged at the
-/// documented size with a token only while more remain.
+/// documented size and ending on the page that reports nothing.
 ///
 /// The rows run over a store seeded past two page boundaries and walk it down to empty,
 /// so the removals land before a page boundary, across one, and on a whole page — the
@@ -713,12 +831,19 @@ async fn the_pages_follow_the_store_as_subscriptions_are_removed() {
             distinct.len(),
             walked.len()
         );
+        // One page per page's worth of survivors, plus the page that reports nothing and
+        // ends the walk; an empty listing is that page and nothing else.
+        let pages = if expected.is_empty() {
+            1
+        } else {
+            expected.len().div_ceil(PAGE_SIZE) + 1
+        };
         assert_eq!(
             sizes.len(),
-            expected.len().div_ceil(PAGE_SIZE).max(1),
-            "case {case:?}: {} subscriptions at {PAGE_SIZE} a page is {} page(s), got {sizes:?}",
+            pages,
+            "case {case:?}: {} subscriptions at {PAGE_SIZE} a page is {pages} page(s), got \
+             {sizes:?}",
             expected.len(),
-            expected.len().div_ceil(PAGE_SIZE).max(1)
         );
 
         // Walking the pages changed nothing a later caller sees.

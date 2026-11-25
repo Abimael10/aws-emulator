@@ -138,6 +138,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// A pure REPORT of persisted state: nothing here writes. The operation takes no
     /// scoping input but the pagination token, so the regional endpoint the request
     /// reached IS the scope of the listing.
+    ///
+    /// Every page that reports a subscription comes back with a continuation token,
+    /// whether or not it exhausted the listing: this listing does not settle on the page it
+    /// serves whether anything follows it, so the caller is handed the position past what it
+    /// has seen and takes one more page — which reports whatever arrived since, carries no
+    /// token of its own and ends the walk
+    /// ([`state::listing_continuation::continued_page`]). A token this service never
+    /// minted is no position in the listing and is refused as the bad parameter it is.
     async fn handle(
         &self,
         input: Self::Input,
@@ -180,9 +188,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(state::listed_subscription)
             .collect();
 
-        let Some((page, next_token)) =
-            state::paginate(all, input.next_token.as_deref(), state::PAGE_SIZE)
-        else {
+        let Some((page, next_token)) = state::listing_continuation::continued_page(
+            all,
+            input.next_token.as_deref(),
+            state::PAGE_SIZE,
+        ) else {
             return Err(ListSubscriptionsErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(state::INVALID_NEXT_TOKEN_REFUSAL.to_string()),
