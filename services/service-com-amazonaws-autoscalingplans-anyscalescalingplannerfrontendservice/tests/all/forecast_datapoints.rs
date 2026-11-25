@@ -41,7 +41,7 @@ use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice
 
 use crate::forecast_data::MILLIS_PER_SECOND;
 use crate::scaling_plan_lifecycle::{
-    instruction, now_secs, stack_source, Emulator, DAY_SECONDS as DAY,
+    hour_of_day, instruction, now_secs, stack_source, Emulator, DAY_SECONDS as DAY,
 };
 
 /// The operation under test.
@@ -406,7 +406,13 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-/// An emulator holding one `Active` plan whose instructions are `instructions`.
+/// An emulator holding one `Active` plan whose instructions are `instructions`, with the
+/// load-metric history its forecast is computed from published for every resource it covers.
+///
+/// A forecast is issued from "historical data points from a specified CloudWatch load
+/// metric", so the history comes first: without it the plan has no past to predict from and
+/// every read below is empty, which is the rule
+/// [`a_resource_with_no_load_metric_history_has_no_forecast`] pins.
 async fn emulator_with(plan: &str, instructions: Vec<Value>) -> Emulator {
     let emulator = Emulator::new();
     emulator
@@ -420,7 +426,191 @@ async fn emulator_with(plan: &str, instructions: Vec<Value>) -> Emulator {
         )
         .await;
     emulator.make_all_due();
+    emulator.publish_load_history(plan);
     emulator
+}
+
+/// A forecast is issued from the load metric's HISTORY, so a resource whose load metric this
+/// emulator holds no history for has no forecast, and one it does hold history for is
+/// forecast from exactly what was published.
+///
+/// `GetScalingPlanResourceForecastData` answers "predicted values, or data points, that are
+/// calculated using historical data points from a specified CloudWatch load metric", and its
+/// output's `Datapoints` member is `@required`
+/// (`smithy_query(query="operation",operation="GetScalingPlanResourceForecastData")`), so a
+/// resource with no such history answers 200 with that member present and EMPTY — nothing of
+/// the stored instruction stands in for the missing past. Once the metric's history is
+/// published, the load forecast of an hour is the load that history holds for the same hour of
+/// day, and the other three data types follow from it as the model defines.
+///
+/// Rows differ along what the rule generalises over: the FORM of the load metric
+/// specification — every `LoadMetricType` the model lists (mirrored as
+/// `LOAD_METRIC_TYPE_VALUES`), with the resource label the Application Load Balancer type
+/// carries, and a customized specification of the caller's own metric — crossed with every
+/// `ForecastDataType`, over two capacity bands.
+#[tokio::test]
+async fn a_resource_with_no_load_metric_history_has_no_forecast() {
+    // (case, the load metric specification members of the instruction)
+    // Source for the metric types: `smithy_query(query="shape",shape="LoadMetricType")`, and
+    // the resource label's format is `PredefinedLoadMetricSpecification$ResourceLabel`'s own
+    // ("app/<load-balancer-name>/<load-balancer-id>/targetgroup/<target-group-name>/<target-group-id>").
+    let specifications: Vec<(&str, Value)> = vec![
+        (
+            "the group's total CPU utilization",
+            json!({ "PredefinedLoadMetricType": "ASGTotalCPUUtilization" }),
+        ),
+        (
+            "the group's total network in",
+            json!({ "PredefinedLoadMetricType": "ASGTotalNetworkIn" }),
+        ),
+        (
+            "the group's total network out",
+            json!({ "PredefinedLoadMetricType": "ASGTotalNetworkOut" }),
+        ),
+        (
+            "an Application Load Balancer target group's request count",
+            json!({
+                "PredefinedLoadMetricType": "ALBTargetGroupRequestCount",
+                "ResourceLabel":
+                    "app/my-lb/1234567890abcdef/targetgroup/my-tg/abcdef1234567890"
+            }),
+        ),
+    ];
+    // The day of load history a row publishes, one value per hour of day: distinct per hour,
+    // so the forecast cannot match it by accident.
+    let published: Vec<f64> = (0..Emulator::HOURS_OF_DAY)
+        .map(|hour| 100.0 + 10.0 * hour as f64)
+        .collect();
+    let window = settled_window();
+
+    for (bands, (min_capacity, max_capacity)) in [(0_i64, 4_i64), (2, 20)].into_iter().enumerate() {
+        for (label, specification) in &specifications {
+            let case = format!("{label} over the band {min_capacity}..{max_capacity}");
+            let plan = format!("history-{bands}");
+            let mut built = instruction(
+                FORECAST_SERVICE_NAMESPACE,
+                RESOURCE,
+                FORECAST_SCALABLE_DIMENSION,
+                min_capacity,
+                max_capacity,
+                "ASGAverageCPUUtilization",
+                50.0,
+            );
+            built["PredefinedLoadMetricSpecification"] = specification.clone();
+            built["ScheduledActionBufferTime"] = json!(0);
+
+            // No history yet: the plan is Active and its instruction configures predictive
+            // scaling, and every forecast data type still answers the empty list.
+            let emulator = Emulator::new();
+            emulator
+                .ok(
+                    "CreateScalingPlan",
+                    json!({
+                        "ScalingPlanName": plan,
+                        "ApplicationSource": stack_source(1),
+                        "ScalingInstructions": [built],
+                    }),
+                )
+                .await;
+            emulator.make_all_due();
+            for data_type in FORECAST_DATA_TYPE_VALUES {
+                let got = points(&emulator, &plan, RESOURCE, data_type, window).await;
+                assert!(
+                    got.is_empty(),
+                    "case {case} / {data_type} with no history: expected no data point, got \
+                     {got:?}"
+                );
+            }
+
+            // History published for the metric the instruction names: the load forecast of
+            // each interval is what that hour of day was observed carrying.
+            emulator.publish_hourly_load(&plan, &published);
+            let load = points(&emulator, &plan, RESOURCE, "LoadForecast", window).await;
+            assert!(
+                !load.is_empty(),
+                "case {case}: a published metric history is forecast from, got nothing"
+            );
+            for (at, value) in &load {
+                let expected = published[hour_of_day(*at) as usize];
+                assert_close(*value, expected, &format!("{case} / LoadForecast at {at}"));
+            }
+            let capacity = points(&emulator, &plan, RESOURCE, "CapacityForecast", window).await;
+            assert_eq!(
+                capacity.len(),
+                load.len(),
+                "case {case}: the capacity forecast covers the same intervals as the load \
+                 forecast, got {capacity:?} against {load:?}"
+            );
+            for ((at, forecast), (_, observed)) in capacity.iter().zip(&load) {
+                assert_close(
+                    *forecast,
+                    whole_units(observed / 50.0),
+                    &format!("{case} / CapacityForecast at {at}"),
+                );
+            }
+        }
+    }
+
+    // A history published for ANOTHER metric is no history for this one: the forecast follows
+    // the metric the instruction names.
+    let plan = "other-metric";
+    let mut built = instruction(
+        FORECAST_SERVICE_NAMESPACE,
+        RESOURCE,
+        FORECAST_SCALABLE_DIMENSION,
+        1,
+        10,
+        "ASGAverageCPUUtilization",
+        50.0,
+    );
+    built["CustomizedLoadMetricSpecification"] = json!({
+        "MetricName": "Requests",
+        "Namespace": "Workload",
+        "Statistic": "Sum",
+    });
+    let emulator = Emulator::new();
+    emulator
+        .ok(
+            "CreateScalingPlan",
+            json!({
+                "ScalingPlanName": plan,
+                "ApplicationSource": stack_source(1),
+                "ScalingInstructions": [built.clone()],
+            }),
+        )
+        .await;
+    emulator.make_all_due();
+    let other = "sibling-metric";
+    let mut sibling = built.clone();
+    sibling["CustomizedLoadMetricSpecification"] = json!({
+        "MetricName": "OtherRequests",
+        "Namespace": "Workload",
+        "Statistic": "Sum",
+    });
+    emulator
+        .ok(
+            "CreateScalingPlan",
+            json!({
+                "ScalingPlanName": other,
+                "ApplicationSource": stack_source(2),
+                "ScalingInstructions": [sibling],
+            }),
+        )
+        .await;
+    emulator.make_all_due();
+    emulator.publish_hourly_load(other, &published);
+    let got = points(&emulator, plan, RESOURCE, "LoadForecast", window).await;
+    assert!(
+        got.is_empty(),
+        "case a history published for another metric: expected no forecast for the metric the \
+         instruction names, got {got:?}"
+    );
+    // ... while the plan whose own metric was published is forecast.
+    let sibling_forecast = points(&emulator, other, RESOURCE, "LoadForecast", window).await;
+    assert!(
+        !sibling_forecast.is_empty(),
+        "case the plan whose own metric was published: expected a forecast, got nothing"
+    );
 }
 
 /// A window of whole forecast intervals, hour-aligned and well inside the span over which

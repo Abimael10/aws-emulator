@@ -218,7 +218,8 @@ fn shapes() -> Vec<Shape> {
     ]
 }
 
-/// An emulator holding one `Active` plan whose single instruction is `instruction`.
+/// An emulator holding one `Active` plan whose single instruction is `instruction`, with the
+/// load-metric history its forecast is computed from published for the resource it covers.
 async fn emulator_with(plan: &str, instruction: Value) -> Emulator {
     let emulator = Emulator::new();
     emulator
@@ -232,6 +233,7 @@ async fn emulator_with(plan: &str, instruction: Value) -> Emulator {
         )
         .await;
     emulator.make_all_due();
+    emulator.publish_load_history(plan);
     emulator
 }
 
@@ -362,6 +364,11 @@ async fn two_plans_differing_only_in_buffer_time_report_the_same_capacities_at_o
             .await;
     }
     emulator.make_all_due();
+    // Each plan's forecast is computed from its load metric's history, so both have that
+    // history published — the two instructions differ only in their buffer time, so both
+    // carry the same published load.
+    emulator.publish_load_history(buffered);
+    emulator.publish_load_history(defaulted);
 
     // The member round-trips: the plan that was created with it carries it back, and the
     // plan created without it carries nothing.

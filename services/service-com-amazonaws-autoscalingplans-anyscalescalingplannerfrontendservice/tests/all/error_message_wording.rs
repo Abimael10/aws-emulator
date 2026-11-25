@@ -61,16 +61,18 @@ const APPLICATION_SOURCES_CONFLICT: &str =
     "Application sources cannot be provided with scaling plan names or version";
 
 /// AWS's fixed text for a minimum capacity below the floor of the band an instruction
-/// registers. The sentence interpolates nothing: the floor it names is part of the wording.
+/// registers. The sentence interpolates nothing: the 1 it names is part of the wording and
+/// not the floor the refusal is drawn at — a minimum of 0 is accepted.
 const MINIMUM_CAPACITY_BELOW_FLOOR: &str = "Minimum capacity cannot be less than 1";
 
 /// AWS's fixed text for the OTHER relation the capacity pair has to satisfy, kept here so
 /// the rows below can assert that the two refusals are not interchangeable.
 const MAXIMUM_CAPACITY_BELOW_MINIMUM: &str = "Maximum capacity cannot be less than minimum capacity";
 
-/// The least capacity a scaling instruction may set as the floor of its band, as the
-/// sentence above words it.
-const CAPACITY_FLOOR: i64 = 1;
+/// The least capacity a scaling instruction may set as the floor of its band: a capacity
+/// counts units of a resource, so no end of the band is negative, and a resource that scales
+/// to nothing registers a minimum of zero.
+const CAPACITY_FLOOR: i64 = 0;
 
 /// The plan name the refused writes below name — no create that breaks a capacity relation
 /// may leave a plan behind under it.
@@ -366,12 +368,12 @@ async fn application_sources_beside_the_name_selector_are_refused_in_awss_words(
 /// `ScalingInstruction$MinCapacity` and `$MaxCapacity` both target `ResourceCapacity`, an
 /// integer the model gives no `@range`
 /// (`smithy_query(query="shape",shape="ResourceCapacity,ScalingInstruction")`), so the
-/// service states the band's rules itself: the floor of the band is one unit, and the
-/// maximum does not sit below the minimum. The rows differ along what the rule generalises
-/// over — how far below the floor the minimum is (one unit, one negative unit, far down,
-/// the smallest value the member's type carries), whether the maximum is above the floor,
-/// below it or below the minimum as well, WHICH instruction in the list carries the band,
-/// and which operation carries the list — and every one of them is answered HTTP 400,
+/// service states the band's rules itself: a capacity counts units of the resource, so no end
+/// of the band is negative, and the maximum does not sit below the minimum. The rows differ
+/// along what the rule generalises over — how far below the floor the minimum is (one unit,
+/// far down, the smallest value the member's type carries), whether the maximum is above the
+/// floor, below it or below the minimum as well, WHICH instruction in the list carries the
+/// band, and which operation carries the list — and every one of them is answered HTTP 400,
 /// `ValidationException`, with the fixed sentence for that error class.
 #[tokio::test]
 async fn a_minimum_capacity_below_the_floor_is_refused_in_awss_words() {
@@ -379,14 +381,12 @@ async fn a_minimum_capacity_below_the_floor_is_refused_in_awss_words() {
 
     let below_floor: Vec<(&str, i64, i64)> = vec![
         ("one unit below the floor", CAPACITY_FLOOR - 1, 10),
-        ("a band of no width below the floor", 0, 0),
-        ("a negative minimum", -1, 10),
         ("a far negative minimum", -1_000, 1_000),
         // `ResourceCapacity` is a Smithy `integer`, so this is the smallest value the
         // member can carry at all.
         ("the smallest minimum the member carries", i64::from(i32::MIN), 10),
         ("a whole band below the floor", -5, -1),
-        ("below the floor and inverted as well", 0, -1),
+        ("below the floor and inverted as well", -5, -10),
     ];
 
     for (label, min, max) in below_floor {
@@ -466,7 +466,7 @@ async fn a_minimum_capacity_below_the_floor_is_refused_in_awss_words() {
     // refusal is about the minimum alone and not about every capacity pair the service
     // turns down.
     for (label, min, max) in [
-        ("inverted by one unit at the floor", CAPACITY_FLOOR, 0),
+        ("inverted by one unit at the floor", CAPACITY_FLOOR, CAPACITY_FLOOR - 1),
         ("inverted by one unit above the floor", 5, 4),
         ("inverted far above the floor", 10, 2),
     ] {
@@ -493,11 +493,13 @@ async fn a_minimum_capacity_below_the_floor_is_refused_in_awss_words() {
         );
     }
 
-    // The control: a minimum AT the floor, and above it, is accepted \u2014 the rule refuses the
-    // values below the floor, not the member.
+    // The control: a minimum AT the floor, and above it, is accepted — the rule refuses the
+    // values below the floor, not the member. A zero minimum is the ordinary configuration of
+    // a resource that scales to nothing, so it is one of these rows and not a refusal.
     for (n, (label, min, max)) in [
         ("a band at the floor", CAPACITY_FLOOR, CAPACITY_FLOOR),
         ("a wide band from the floor", CAPACITY_FLOOR, 10_000),
+        ("a band one unit above the floor", CAPACITY_FLOOR + 1, 10),
         ("a minimum far above the floor", 1_000, 2_000),
     ]
     .into_iter()

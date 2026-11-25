@@ -75,11 +75,16 @@ const TARGET_VALUE: f64 = 40.0;
 /// an instruction a forecast at all
 /// (`smithy_query(query="doc",shape="ScalingInstruction",member="PredefinedLoadMetricSpecification")`:
 /// "This parameter or a CustomizedLoadMetricSpecification is required when configuring
-/// predictive scaling"). The member's own enum does not depend on the scalable dimension
-/// (source: `smithy_query(query="shape",shape="LoadMetricType")`, mirrored as
-/// `LOAD_METRIC_TYPE_VALUES`), so every row below configures predictive scaling with the
-/// same one.
-const LOAD_METRIC_TYPE: &str = "ASGTotalCPUUtilization";
+/// predictive scaling"). A CUSTOMIZED specification is used here because it names its metric
+/// outright — "The name of the metric", "The namespace of the metric", with the only
+/// statistic the member allows — so one and the same load metric belongs to a resource of
+/// every kind a row names, whereas the predefined types name a metric of one kind of resource
+/// (an Auto Scaling group's total, a load balancer target group's request count).
+const LOAD_METRIC_NAMESPACE: &str = "Workload";
+/// See [`LOAD_METRIC_NAMESPACE`].
+const LOAD_METRIC_NAME: &str = "TotalLoad";
+/// `CustomizedLoadMetricSpecification$Statistic`: "The only valid value is Sum."
+const LOAD_METRIC_STATISTIC: &str = "Sum";
 
 /// How many whole forecast periods the window of the served rows spans.
 const WINDOW_PERIODS: i64 = 3;
@@ -208,8 +213,11 @@ fn predictive_instruction(row: &Row) -> Value {
         row.metric,
         TARGET_VALUE,
     );
-    value["PredefinedLoadMetricSpecification"] =
-        json!({ "PredefinedLoadMetricType": LOAD_METRIC_TYPE });
+    value["CustomizedLoadMetricSpecification"] = json!({
+        "MetricName": LOAD_METRIC_NAME,
+        "Namespace": LOAD_METRIC_NAMESPACE,
+        "Statistic": LOAD_METRIC_STATISTIC,
+    });
     // A scheduled scaling action's run time is buffered ahead of the interval it
     // provisions for, so every row pins the buffer at the same value and the instants two
     // rows report are the same ones.
@@ -320,6 +328,9 @@ async fn a_consistent_triple_its_plan_instructs_is_forecast_from_that_instructio
             )
             .await;
         emulator.make_all_due();
+        // The forecast is computed from the load metric's history, so each row's resource has
+        // that history published for it before the reads below.
+        emulator.publish_load_history(&plan);
 
         // Round trip: the instruction the create stored reaches the resource read, which
         // is what the forecast below is issued from.

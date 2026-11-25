@@ -181,6 +181,10 @@ async fn emulator_with(shape: Shape, member: &Member) -> Emulator {
             .await;
     }
     emulator.make_all_due();
+    // Both plans' forecasts are computed from the load metric's history, so it is published
+    // for each of them before any forecast is read.
+    emulator.publish_load_history(OMITTED_PLAN);
+    emulator.publish_load_history(EXPLICIT_PLAN);
     emulator
 }
 

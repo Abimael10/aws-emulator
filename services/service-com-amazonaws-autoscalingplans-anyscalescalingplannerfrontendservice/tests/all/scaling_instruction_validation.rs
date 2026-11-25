@@ -122,14 +122,6 @@ fn refused_instruction_lists() -> Vec<(&'static str, Value)> {
             json!([with(&[("MinCapacity", json!(4)), ("MaxCapacity", json!(3))])]),
         ),
         (
-            "a minimum capacity below the floor of a band",
-            json!([with(&[("MinCapacity", json!(0))])]),
-        ),
-        (
-            "a band of no width below that floor",
-            json!([with(&[("MinCapacity", json!(0)), ("MaxCapacity", json!(0))])]),
-        ),
-        (
             "a negative minimum capacity",
             json!([with(&[("MinCapacity", json!(-1)), ("MaxCapacity", json!(10))])]),
         ),
@@ -422,10 +414,18 @@ fn accepted_instruction_lists() -> Vec<(&'static str, Value)> {
         ),
         (
             "a minimum capacity at the floor of a band",
-            json!([with(&[("MinCapacity", json!(1))])]),
+            json!([with(&[("MinCapacity", json!(0))])]),
         ),
         (
             "a band of no width at that floor",
+            json!([with(&[("MinCapacity", json!(0)), ("MaxCapacity", json!(0))])]),
+        ),
+        (
+            "a minimum capacity one unit above the floor",
+            json!([with(&[("MinCapacity", json!(1))])]),
+        ),
+        (
+            "a band of no width one unit above that floor",
             json!([with(&[("MinCapacity", json!(1)), ("MaxCapacity", json!(1))])]),
         ),
         (
@@ -862,17 +862,19 @@ async fn describe_scaling_plan_resources_reports_an_empty_set_for_a_lookup_that_
 /// `ScalingInstruction$MinCapacity` and `$MaxCapacity` both target `ResourceCapacity`, an
 /// integer the model gives no `@range`
 /// (`smithy_query(query="shape",shape="ResourceCapacity,ScalingInstruction")`), so the service
-/// states the band's rules itself: the floor of the band is one unit, and its maximum does not
-/// sit below its minimum. A band inside both is applied, and read back exactly as it was
-/// written. The rows differ along what that rule generalises over: the VALUE of the minimum
-/// (the floor itself, a few units up, far up) and the WIDTH of the band (nothing, one unit,
+/// states the band's rules itself: a capacity counts units of the resource, so no end of the
+/// band is negative, and its maximum does not sit below its minimum. A band inside both is
+/// applied, and read back exactly as it was written. The rows differ along what that rule
+/// generalises over: the VALUE of the minimum (the floor itself, which is a resource that
+/// scales to nothing, a few units up, far up) and the WIDTH of the band (nothing, one unit,
 /// wide).
 #[tokio::test]
 async fn a_capacity_band_is_applied_as_given_whatever_its_minimum() {
     for (label, min, max) in [
-        ("a band at the floor", 1, 1),
-        ("a band one unit wide at the floor", 1, 2),
-        ("a wide band from the floor", 1, 10_000),
+        ("a band at the floor", 0, 0),
+        ("a band one unit wide at the floor", 0, 1),
+        ("a wide band from the floor", 0, 10_000),
+        ("a band one unit above the floor", 1, 1),
         ("a minimum several units up", 5, 25),
         ("a minimum far up, of no width", 1_000, 1_000),
     ] {
@@ -968,7 +970,7 @@ async fn a_capacity_band_is_applied_as_given_whatever_its_minimum() {
                     "ScalingPlanName": "my-plan",
                     "ApplicationSource": stack_source(1),
                     "ScalingInstructions": json!([with(&[
-                        ("MinCapacity", json!(0)),
+                        ("MinCapacity", json!(-1)),
                         ("MaxCapacity", json!(max)),
                     ])]),
                 }),
@@ -977,7 +979,7 @@ async fn a_capacity_band_is_applied_as_given_whatever_its_minimum() {
         assert_eq!(
             (status, code.as_str()),
             (400, "ValidationException"),
-            "case {label:?} (0..{max}): a minimum below the floor is refused, got {status} / \
+            "case {label:?} (-1..{max}): a negative minimum is refused, got {status} / \
              {code:?}"
         );
     }
@@ -1050,6 +1052,9 @@ async fn a_forecast_only_plan_over_a_narrow_band_is_reachable() {
     // asserted by [`crate::forecast_datapoints`].
     let issued_at = now_secs();
     let window = (issued_at - 3_600, issued_at + 4 * 3_600);
+    // The forecast is computed from the load metric's history, so both plans' resources have
+    // that history published for them before the reads below.
+    emulator.publish_load_history("forecast-only");
     let twin = Emulator::new();
     let twin_instructions = json!([with(&[
         ("MinCapacity", json!(5)),
@@ -1071,6 +1076,7 @@ async fn a_forecast_only_plan_over_a_narrow_band_is_reachable() {
     )
     .await;
     twin.make_all_due();
+    twin.publish_load_history("forecast-only");
 
     for data_type in FORECAST_DATA_TYPE_VALUES {
         let got = points(

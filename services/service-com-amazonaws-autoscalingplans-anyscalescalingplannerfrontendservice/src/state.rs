@@ -15,6 +15,10 @@ pub mod wire_refusals;
 /// The target tracking scaling policies a plan installs in the service that owns them.
 pub mod application_auto_scaling;
 
+/// The load metric history a predictive-scaling forecast is computed from, and the metric
+/// identity a scaling instruction's load metric specification names.
+pub mod load_metric_history;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
@@ -1014,17 +1018,27 @@ pub const TARGET_TRACKING_ENTRIES: &str = "target tracking configurations";
 // `ScalingInstruction$MinCapacity` and `$MaxCapacity` both target `ResourceCapacity`,
 // declared `{"type": "integer"}` with no `@range`
 // (`smithy_query(query="shape",shape="ResourceCapacity")`), so the MODEL bounds neither
-// member and the service states the floor itself: a scaling instruction registers a band a
-// scalable resource is kept inside, and the floor of that band is one task, instance or unit
-// — the service refuses a minimum below it in its own prose
+// member and the floor is the service's own: a scaling instruction registers a band a
+// scalable resource is kept inside, and a capacity counts units of that resource, so no end
+// of the band can be NEGATIVE — there is no such thing as minus one task, instance or
+// provisioned unit. A minimum below that floor is refused in the service's own prose
 // ([`MINIMUM_CAPACITY_BELOW_FLOOR`]). The other relation the pair has to satisfy is the
 // cross-member one, stated beside it in [`validate_scaling_instruction`].
 
 /// The least capacity a scaling instruction may set as the floor of the band it registers.
-pub const MIN_RESOURCE_CAPACITY: i32 = 1;
+///
+/// ZERO is a capacity like any other: the ordinary configuration of a resource that scales to
+/// nothing (an Auto Scaling group whose `MinSize` is 0), and necessarily so for a plan whose
+/// `PredictiveScalingMode` only forecasts, which scales nothing at all — so a zero minimum is
+/// ADMITTED and only a negative one is refused.
+pub const MIN_RESOURCE_CAPACITY: i32 = 0;
 
 /// The sentence a `MinCapacity` below [`MIN_RESOURCE_CAPACITY`] is refused with, naming the
 /// member in prose the way this service words a capacity relation.
+///
+/// Entirely FIXED text: no part of it is interpolated from the request or from state, and the
+/// literal 1 in it is the service's own wording of the refusal rather than the floor the
+/// refusal is drawn at — a minimum of 0 is accepted and answers nothing at all.
 pub const MINIMUM_CAPACITY_BELOW_FLOOR: &str = "Minimum capacity cannot be less than 1";
 
 /// The sentence an inverted capacity band is refused with, worded the same way.

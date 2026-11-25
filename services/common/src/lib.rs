@@ -443,6 +443,11 @@ pub mod connect_instance_registry;
 /// cannot see a past window at all unless it was recorded as it happened.
 pub mod db_activity_samples;
 pub mod db_data_sources;
+/// The METRIC DATAPOINTS a publisher gave CloudWatch — written by the service a publish is
+/// stored in and read by the services whose own answers are computed from a metric's
+/// HISTORY, which they measure none of themselves and cannot see a past window of at all
+/// unless it was recorded as it happened.
+pub mod published_metric_data;
 /// What each GRAPH DB CLUSTER this emulator provisioned runs — its engine version and the
 /// feature configuration its create settled — written by the graph control plane that
 /// provisions a cluster and read by the graph DATA plane, which answers for a cluster it

@@ -91,6 +91,9 @@ async fn with_predictive_plan() -> Emulator {
         )
         .await;
     emulator.make_all_due();
+    // A forecast is computed from the load metric's history, so that history is published
+    // for the resource this plan instructs before any read.
+    emulator.publish_load_history(STORED_PLAN);
     emulator
 }
 

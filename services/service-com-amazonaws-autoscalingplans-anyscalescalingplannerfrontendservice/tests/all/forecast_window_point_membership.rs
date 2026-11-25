@@ -222,6 +222,9 @@ async fn emulator_with(buffer: Option<i64>) -> Emulator {
         )
         .await;
     emulator.make_all_due();
+    // A forecast is computed from the load metric's history, so the resource this plan
+    // instructs has that history published for it before any read.
+    emulator.publish_load_history(PLAN);
     emulator
 }
 

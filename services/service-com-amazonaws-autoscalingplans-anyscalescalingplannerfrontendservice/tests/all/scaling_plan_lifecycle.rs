@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
+use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice::ops::get_scaling_plan_resource_forecast_data::FORECAST_INTERVAL_SECONDS;
 use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice::state::{
     self as plan_state, ComAmazonawsAutoscalingplansAnyscalescalingplannerfrontendserviceState as PlanState,
     PendingOutcome, MAX_RESULTS_MAX, MAX_RESULTS_MIN, MAX_SCALING_PLANS, SETTLE_AFTER,
@@ -51,6 +52,27 @@ pub(crate) fn error_message(body: &Value) -> &str {
 ///
 /// `pub(crate)` so every suite measures a day the same way.
 pub(crate) const DAY_SECONDS: i64 = 86_400;
+
+/// Hours in a day, for the published load history's daily cycle.
+const HOURS_PER_DAY: i64 = 24;
+
+/// The hour of day, in UTC, the published load history peaks at; it troughs twelve hours
+/// later. The TEST's shape for a resource's load, not the service's.
+const PEAK_HOUR_UTC: f64 = 12.0;
+
+/// How far the published load of one hour sits above and below the day's mean, as a fraction
+/// of it — again the test's own shape, which the forecast then reports back.
+const DAILY_SWING: f64 = 0.5;
+
+/// The hour of day, in UTC, an instant given as whole epoch seconds falls in — the index a
+/// published day of load history is read by.
+///
+/// `pub(crate)` so a suite reading a forecast back indexes its own published day the same way.
+pub(crate) fn hour_of_day(at_secs: i64) -> i64 {
+    at_secs
+        .div_euclid(FORECAST_INTERVAL_SECONDS)
+        .rem_euclid(HOURS_PER_DAY)
+}
 
 /// Now, as the epoch seconds an `awsJson1_1` timestamp is carried as.
 ///
@@ -165,6 +187,99 @@ impl Emulator {
                 .unwrap_or_else(|| panic!("plan {name:?} has no pending transition"));
             pending.due_at = SystemTime::now() + Duration::from_secs(3600);
         });
+    }
+
+    /// What was published at each hour of the day, by hour of day in UTC.
+    ///
+    /// `pub(crate)` so a suite that chooses its own history reads it back by the same index.
+    pub(crate) const HOURS_OF_DAY: usize = HOURS_PER_DAY as usize;
+
+    /// Publish the LOAD METRIC HISTORY a plan's forecast is computed from, one observation
+    /// per hour of the day before now, carrying `by_hour_of_day[hour]` for the hour of day it
+    /// falls in.
+    ///
+    /// `GetScalingPlanResourceForecastData` answers "predicted values, or data points, that
+    /// are calculated using historical data points from a specified CloudWatch load metric",
+    /// so a forecast exists only for a resource whose load metric this emulator holds history
+    /// for — in production, the metric data its publisher gave CloudWatch. A suite that reads
+    /// a forecast therefore publishes that history first, standing in for the publisher, into
+    /// the directory the two services share, for every load metric the stored plan's
+    /// instructions name. These are the TEST's numbers: the service invents none of them.
+    ///
+    /// `pub(crate)` so every suite that needs a forecast publishes its history the same way.
+    pub(crate) fn publish_hourly_load(&self, name: &str, by_hour_of_day: &[f64]) {
+        for instruction in self.stored_instructions(name) {
+            self.publish_day(&instruction, by_hour_of_day);
+        }
+    }
+
+    /// Publish a day of load history for `name` shaped as a daily cycle around the middle of
+    /// the capacity band each instruction registers — the shape a suite that only needs SOME
+    /// history to forecast from uses, so every hour of the day is covered, the series varies
+    /// over the day, and two resources whose bands differ carry different load.
+    pub(crate) fn publish_load_history(&self, name: &str) {
+        for instruction in self.stored_instructions(name) {
+            let middle_of_band =
+                (f64::from(instruction.min_capacity) + f64::from(instruction.max_capacity)) / 2.0;
+            let per_unit = instruction
+                .target_tracking_configurations
+                .iter()
+                .map(|configuration| configuration.target_value)
+                .filter(|target| *target > 0.0)
+                .fold(f64::INFINITY, f64::min);
+            let per_unit = if per_unit.is_finite() { per_unit } else { 1.0 };
+            let day: Vec<f64> = (0..HOURS_PER_DAY)
+                .map(|hour| {
+                    let phase = (hour as f64 - PEAK_HOUR_UTC) / HOURS_PER_DAY as f64
+                        * std::f64::consts::TAU;
+                    middle_of_band * per_unit * (1.0 + DAILY_SWING * phase.cos())
+                })
+                .collect();
+            self.publish_day(&instruction, &day);
+        }
+    }
+
+    /// The scaling instructions the plan `name` holds.
+    fn stored_instructions(
+        &self,
+        name: &str,
+    ) -> Vec<service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice::ops::types::ScalingInstruction>
+    {
+        self.with_state(|state| {
+            state
+                .scaling_plans
+                .get(name)
+                .map(|plan| plan.scaling_instructions.clone())
+        })
+        .unwrap_or_else(|| panic!("no stored plan named {name:?}"))
+    }
+
+    /// Publish one day of history for the load metric ONE instruction names, carrying
+    /// `by_hour_of_day[hour]` at each hour of the day before now. An instruction that names
+    /// no load metric — one configuring no predictive scaling — has nothing to publish.
+    fn publish_day(
+        &self,
+        instruction: &service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice::ops::types::ScalingInstruction,
+        by_hour_of_day: &[f64],
+    ) {
+        assert_eq!(
+            by_hour_of_day.len(),
+            Self::HOURS_OF_DAY,
+            "case publishing load history: one value per hour of the day is needed, got {}",
+            by_hour_of_day.len()
+        );
+        let Some(series) = plan_state::load_metric_history::load_metric_series(instruction) else {
+            return;
+        };
+        let directory = service_common::published_metric_data::published_metric_data(&*self.engine)
+            .expect("the shared published-metric directory");
+        let current_interval =
+            now_secs().div_euclid(FORECAST_INTERVAL_SECONDS) * FORECAST_INTERVAL_SECONDS;
+        for hours_ago in 0..HOURS_PER_DAY {
+            let at = current_interval - hours_ago * FORECAST_INTERVAL_SECONDS;
+            let observed = by_hour_of_day[hour_of_day(at) as usize];
+            directory.lock().publish(series.clone(), at, observed);
+        }
     }
 
     /// Make every plan's pending transition due, so the next call settles it.

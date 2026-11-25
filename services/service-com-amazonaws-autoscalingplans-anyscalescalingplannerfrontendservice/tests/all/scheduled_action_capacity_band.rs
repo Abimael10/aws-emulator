@@ -247,7 +247,8 @@ fn rows() -> Vec<Row> {
     ]
 }
 
-/// An emulator holding one `Active` plan whose single instruction is `instruction`.
+/// An emulator holding one `Active` plan whose single instruction is `instruction`, with the
+/// load-metric history its forecast is computed from published for the resource it covers.
 async fn emulator_with(instruction: Value) -> Emulator {
     let emulator = Emulator::new();
     emulator
@@ -261,6 +262,7 @@ async fn emulator_with(instruction: Value) -> Emulator {
         )
         .await;
     emulator.make_all_due();
+    emulator.publish_load_history(PLAN);
     emulator
 }
 

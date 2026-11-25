@@ -546,6 +546,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // store below.
         let published = crate::state::metric_stream_export::published_series(&ingest);
 
+        // The same observations as this metric's HISTORY, for the services whose own answers
+        // are computed from one: a predictive forecast measures no metric itself, and the
+        // store below is keyed by a type private to this crate, so what a reader can see is
+        // the shared directory ([`::service_common::published_metric_data`]). The sum of each
+        // observation is the quantity it contributes to a span of the series, which is what a
+        // reader aggregates over its own period.
+        let history: Vec<(::service_common::published_metric_data::MetricSeries, i64, f64)> =
+            ingest
+                .iter()
+                .flat_map(|(key, observations)| {
+                    observations.iter().map(|datum| {
+                        (
+                            ::service_common::published_metric_data::MetricSeries::new(
+                                key.namespace.clone(),
+                                key.metric_name.clone(),
+                                key.dimensions.clone(),
+                            ),
+                            datum.timestamp_secs as i64,
+                            datum.sum,
+                        )
+                    })
+                })
+                .collect();
+
         // The lock is taken for the ingest only: an alarm evaluation takes it itself, and the
         // notifications it owes are delivered with it released.
         {
@@ -580,6 +604,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // An alarm is evaluated FROM these datapoints, so storing one of the series it
             // watches is what makes its evaluation due.
             store.make_alarms_due(&written, now);
+        }
+
+        // Recorded for the readers of this metric's history only once the batch is stored, so
+        // a publish this operation refused leaves no history behind either. Taken with this
+        // service's own store released, which is the lock order that directory states.
+        if let Some(directory) =
+            ::service_common::published_metric_data::published_metric_data(&*self.engine)
+        {
+            let mut directory = directory.lock();
+            for (series, at_secs, sum) in history {
+                directory.publish(series, at_secs, sum);
+            }
         }
 
         // A metric stream "can automatically stream CloudWatch metrics to Amazon Web Services

@@ -216,7 +216,9 @@ async fn the_forecast_read_and_the_plan_resource_walk_name_a_resource_by_the_sam
         "case every row is its own scalable resource: expected {expected:?}, got {reported:?}"
     );
 
-    // The read path's view: each row's forecast is issued from that row's instruction.
+    // The read path's view: each row's forecast is issued from that row's instruction, once
+    // the history that forecast is computed from is published for every resource covered.
+    emulator.publish_load_history(PLAN);
     let window = settled_window();
     let mut capacity_curves: Vec<(&'static str, Vec<(i64, f64)>)> = Vec::new();
     for row in &rows {

@@ -13,13 +13,16 @@
 //!   instruction configures it, and refuses it otherwise with the modelled
 //!   `ValidationException` (HTTP 400);
 //! * the READ path (`GetScalingPlanResourceForecastData`) has a forecast to report exactly
-//!   when the stored instruction configures it, and an empty `Datapoints` list otherwise.
+//!   when the stored instruction configures it AND this emulator holds history for the load
+//!   metric it names — the forecast being "calculated using historical data points from a
+//!   specified CloudWatch load metric" — and an empty `Datapoints` list otherwise.
 //!
 //! So the table below drives BOTH paths from the same row and asserts they agree: a row
 //! the write path accepts the conditional members of is a row the forecast path reports
-//! data points for, and a row it refuses them on is a row with no forecast at all. Rows
-//! differ along what the rule generalises over: which load metric specification carries
-//! the instruction into predictive scaling, and which form and value it takes.
+//! data points for once that history is published, and a row it refuses them on is a row
+//! with no forecast at all. Rows differ along what the rule generalises over: which load
+//! metric specification carries the instruction into predictive scaling, and which form and
+//! value it takes.
 //!
 //! Nothing here builds a second harness or a second builder: the router and error-body
 //! readers (`Emulator`, `error_code`, `error_message`, `stack_source`), the instruction
@@ -38,6 +41,11 @@ use crate::forecast_data::{asg_request, current_hour_start, datapoints, ONLY_VER
 use crate::scaling_instruction_validation::with;
 use crate::scaling_mode_conditional_members::predictive_only_fragment;
 use crate::scaling_plan_lifecycle::{error_code, error_message, stack_source, Emulator};
+
+/// The `LoadMetricType` whose metric is identified through a resource label rather than by
+/// the Auto Scaling group the instruction names
+/// (`smithy_query(query="shape",shape="PredefinedLoadMetricSpecification")`).
+const ALB_LOAD_METRIC_TYPE: &str = "ALBTargetGroupRequestCount";
 
 /// The read path under test.
 const FORECAST_OPERATION: &str = "GetScalingPlanResourceForecastData";
@@ -66,12 +74,19 @@ fn rows() -> Vec<Row> {
     }];
 
     for metric_type in LOAD_METRIC_TYPE_VALUES {
+        // The Application Load Balancer type identifies its metric through a resource
+        // label — "the final portion of the load balancer ARN and the final portion of the
+        // target group ARN into a single value"
+        // (`smithy_query(query="shape",shape="PredefinedLoadMetricSpecification")`) — so the
+        // row for that type carries one and names a metric like every other row.
+        let mut specification = json!({ "PredefinedLoadMetricType": metric_type });
+        if *metric_type == ALB_LOAD_METRIC_TYPE {
+            specification["ResourceLabel"] =
+                json!("app/my-lb/1234567890abcdef/targetgroup/my-tg/abcdef1234567890");
+        }
         rows.push(Row {
             label: format!("a predefined load metric of type {metric_type}"),
-            load_members: vec![(
-                "PredefinedLoadMetricSpecification",
-                json!({ "PredefinedLoadMetricType": metric_type }),
-            )],
+            load_members: vec![("PredefinedLoadMetricSpecification", specification)],
             configures_predictive_scaling: true,
         });
     }
@@ -162,11 +177,15 @@ async fn datapoint_count(emulator: &Emulator, data_type: &str) -> usize {
     datapoints(&body).len()
 }
 
-/// An emulator holding one settled plan whose instruction list is `instructions`.
+/// An emulator holding one settled plan whose instruction list is `instructions`, with the
+/// load-metric history a forecast of it is computed from published for every resource it
+/// covers — a forecast is "calculated using historical data points from a specified
+/// CloudWatch load metric", so without that history no row would have one.
 async fn emulator_holding(instructions: &Value) -> Emulator {
     let emulator = Emulator::new();
     emulator.ok("CreateScalingPlan", create_body(instructions)).await;
     emulator.make_all_due();
+    emulator.publish_load_history(PLAN);
     emulator
 }
 
