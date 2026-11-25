@@ -8,17 +8,19 @@
 //! operations model no argument error
 //! (`smithy_query(query="operation",operation="GetFieldLevelEncryptionConfig")` reports
 //! `errors: [AccessDenied, NoSuchFieldLevelEncryptionConfig]`) — so the MESSAGE is what tells
-//! the two conditions apart, and what decides it is the WIDTH a value of the identifier
-//! alphabet is written at — for the routes that read a form at all. A value written in the
-//! identifier ALPHABET (digits and uppercase letters, carrying no separator and no lower case)
-//! at the width an identifier is ISSUED at is written as one, so it is carried through to the
-//! STORE whatever body or namespace letter it carries — WHICH identifier was ever issued, and
-//! for which kind, is a property of the store — and the record the store holds none under is the
-//! ABSENT resource ("The specified field level encryption config/profile does not exist."). A
-//! value of that alphabet at any OTHER width claims to be an identifier of this mint and is
-//! none, so there is nothing in it to resolve: it earns the unreadable-identifier sentence ("Id
-//! format is invalid"). A value written OUTSIDE the alphabet claims to be no identifier of this
-//! mint at all, so it has no form to be wrong and is resolved against the store like any other.
+//! the two conditions apart, and what decides it is whether the value could be an identifier
+//! CloudFront ISSUED FOR THE ADDRESSED KIND at all — for the routes that read a form at all. A
+//! value written in the identifier ALPHABET (digits and uppercase letters, carrying no separator
+//! and no lower case) is carried through to the STORE whatever body or width it carries — WHICH
+//! identifier was ever issued is a property of the store, and the width this service issues at
+//! is one width CloudFront writes an identifier in rather than the only one — and the record the
+//! store holds none under is the ABSENT resource ("The specified field level encryption
+//! config/profile does not exist."). A value of that alphabet written exactly the way an
+//! identifier is ISSUED — at that width — under the namespace letter of ANOTHER kind this
+//! service issues identifiers under IS that kind's identifier, so no record of the addressed
+//! kind could answer to it and it earns the unreadable-identifier sentence ("Id format is
+//! invalid"); so does a value written OUTSIDE the alphabet, which claims to be no identifier of
+//! this mint at all and leaves nothing to resolve.
 //! `GetFieldLevelEncryption`, the
 //! configuration's RESOURCE read, reads NO form of the value at all — its own recorded contract
 //! — so there every value is carried through to the store and the absent resource is the only
@@ -33,16 +35,18 @@
 //! * the values of the kind's own minted form the store holds nothing for: one of the
 //!   kind's own namespace that was never minted and the minted id with its last character
 //!   changed — each the ABSENT resource on every route;
-//! * the values of the alphabet at the ISSUED width the store never issued: the sibling kind's
-//!   own minted id, a public key id, the `E`-prefixed namespace the other CloudFront entity ids
-//!   are drawn from, and a letter no kind of this service mints — each carried through to the
-//!   store, which reports the record absent;
 //! * the values of the alphabet at a width this service issues no identifier at: this kind's own
 //!   namespace letter over a body one character short of and one character past it, and an
-//!   unminted namespace letter over a far longer body — each the identifier reported UNREADABLE;
+//!   unminted namespace letter over a far longer body — each carried through to the store, which
+//!   reports the record absent, since a value of another width names no kind of its own;
+//! * the values of the alphabet at the ISSUED width that were issued for ANOTHER kind: the
+//!   sibling kind's own minted id, a public key id and the `E`-prefixed namespace the other
+//!   CloudFront entity ids are drawn from — each the identifier reported UNREADABLE;
+//! * the value of the alphabet at the issued width under a letter no kind of this service mints
+//!   under, which says nothing about the kind that issued it — carried through to the store;
 //! * and the values written outside the alphabet: a minted id in lower case, a body outside the
-//!   id alphabet, a UUID, a bare word and the resource's own caller reference — each carried
-//!   through to the store as well, since no identifier of this mint is written that way.
+//!   id alphabet, a UUID, a bare word and the resource's own caller reference — each the
+//!   identifier reported UNREADABLE, since no identifier of this mint is written that way.
 //!
 //! Each kind's width and alphabet are read off an id this emulator really MINTED rather than
 //! written out here, so the table cannot drift from what the service issues.
@@ -281,26 +285,31 @@ impl Shape {
     }
 
     /// A value written in the identifier alphabet at a WIDTH this service issues no identifier
-    /// at: it claims to be an identifier of this mint and no identifier of it could be written
-    /// that way, so every route that reads the form reports the identifier unreadable.
-    fn mis_width(case: impl Into<String>, id: impl Into<String>, absent: &'static str) -> Self {
-        Self {
-            case: case.into(),
-            id: id.into(),
-            expected: UNREADABLE_IDENTIFIER,
-            absent,
-        }
-    }
-
-    /// A value written in the identifier alphabet at the ISSUED width that the store never
-    /// issued — under another kind's namespace letter, or under one no kind of this service
-    /// mints: WHICH identifier was ever issued, and for which kind, is the store's to say, so
-    /// every route carries it through to the store.
-    fn misread(case: impl Into<String>, id: impl Into<String>, absent: &'static str) -> Self {
+    /// at: the width this service issues at is one width CloudFront writes an identifier in
+    /// rather than the only one, so such a value names no kind of its own and every route
+    /// carries it through to the store.
+    fn other_width(case: impl Into<String>, id: impl Into<String>, absent: &'static str) -> Self {
         Self {
             case: case.into(),
             id: id.into(),
             expected: absent,
+            absent,
+        }
+    }
+
+    /// A value written in the identifier alphabet at the ISSUED width under the namespace letter
+    /// of ANOTHER kind this service issues identifiers under: it IS that kind's identifier, so
+    /// no record of the addressed kind could answer to it and every route that reads the form
+    /// reports the identifier unreadable.
+    fn another_kinds_identifier(
+        case: impl Into<String>,
+        id: impl Into<String>,
+        absent: &'static str,
+    ) -> Self {
+        Self {
+            case: case.into(),
+            id: id.into(),
+            expected: UNREADABLE_IDENTIFIER,
             absent,
         }
     }
@@ -318,13 +327,13 @@ impl Shape {
     }
 
     /// A value written OUTSIDE that alphabet, which claims to be no identifier of this mint at
-    /// all: there is no identifier in it whose form could be wrong, so every route resolves it
-    /// against the store and reports the resource absent.
+    /// all: there is nothing in it for the service to resolve, so every route that reads the
+    /// form reports the identifier unreadable.
     fn foreign(case: impl Into<String>, id: impl Into<String>, absent: &'static str) -> Self {
         Self {
             case: case.into(),
             id: id.into(),
-            expected: absent,
+            expected: UNREADABLE_IDENTIFIER,
             absent,
         }
     }
@@ -379,33 +388,33 @@ fn shapes(kind: Kind, stored: &Stored, public_key: &str) -> Vec<Shape> {
             absent,
         ),
         // Values of the identifier alphabet at a width this service issues no identifier at.
-        Shape::mis_width(
+        Shape::other_width(
             "this kind's prefix with a body one character short",
             format!("{prefix}{}", &body[..body.len() - 1]),
             absent,
         ),
-        Shape::mis_width(
+        Shape::other_width(
             "this kind's prefix with a body one character too long",
             format!("{prefix}{body}A"),
             absent,
         ),
         // Values of the alphabet at the ISSUED width under another kind's namespace letter.
-        Shape::misread(
+        Shape::another_kinds_identifier(
             "the sibling field-level encryption kind's own minted id",
             sibling,
             absent,
         ),
-        Shape::misread(
+        Shape::another_kinds_identifier(
             "a public key id this service minted",
             public_key,
             absent,
         ),
-        Shape::misread(
+        Shape::another_kinds_identifier(
             "the namespace every other CloudFront entity id is drawn from",
             format!("E{body}"),
             absent,
         ),
-        Shape::mis_width(
+        Shape::other_width(
             "a namespace letter no kind of this service mints and a far longer body",
             format!("W{body}{body}"),
             absent,
@@ -469,8 +478,8 @@ fn assert_refusal(answer: &Answer, case: &str, code: &str, message: &str) {
 /// Every operation addressed by a field-level encryption identifier answers its one not-found
 /// code for an identifier it cannot resolve, and the identifier's FORM decides which of that
 /// code's two sentences on every route that READS one: the unreadable-identifier sentence for a
-/// value written as an identifier of this service's mint that the addressed kind's issued form
-/// rules out, and the absent-resource sentence for every other value — while the configuration's
+/// value that could never be an identifier issued for the addressed kind, and the
+/// absent-resource sentence for every value that could be one — while the configuration's
 /// RESOURCE read, which reads no form, answers the absent-resource sentence for every value.
 #[tokio::test]
 async fn a_path_identifier_that_resolves_to_nothing_earns_the_sentence_its_form_decides() {

@@ -1237,39 +1237,46 @@ pub const ISSUED_ENTITY_ID_LEN: usize = ID_BODY_LEN + 1;
 /// alone decides about such an identifier, and the whole of what separates the two sentences
 /// the one not-found code carries.
 ///
-/// A value is READ as an identifier of this mint when it is written the way one is ISSUED: in
-/// the characters CloudFront writes an identifier in ([`is_entity_id_form`] — decimal digits
-/// and uppercase ASCII letters, carrying no separator and no lower case) at the WIDTH every
-/// identifier of this mint is issued at ([`ISSUED_ENTITY_ID_LEN`]). Such a value is carried
-/// through to the STORE — WHICH identifier was ever issued is a property of the store rather
-/// than of the value — and the record the store holds none under is the resource that is ABSENT.
+/// A route refuses the form of every value that could never be an identifier CloudFront issued
+/// FOR THIS KIND, which the value alone says in two ways:
 ///
-/// A value written in that alphabet at ANY OTHER WIDTH claims to be an identifier of this mint
-/// and is none: no identifier CloudFront ever issued is written that way, so there is nothing in
-/// it for the service to resolve and it is the identifier a route reports it cannot READ
-/// ([`invalid_id_format`]).
+/// * it is written OUTSIDE the characters CloudFront writes an identifier in
+///   ([`is_entity_id_form`] — decimal digits and uppercase ASCII letters, carrying no separator
+///   and no lower case): in lower case, around a separator, as a UUID or as a word, it claims to
+///   be no identifier of this mint at all, so there is nothing in it for the service to resolve;
+/// * or it is written exactly the way an identifier is ISSUED — that alphabet at the width every
+///   identifier of this mint is issued at ([`ISSUED_ENTITY_ID_LEN`]) — under the NAMESPACE
+///   LETTER of ANOTHER kind this service issues identifiers under ([`identifies_a_namespace`]).
+///   Such a value IS an identifier of that other kind, and no record of the addressed kind could
+///   ever answer to it.
 ///
-/// A value written OUTSIDE that alphabet — in lower case, around a separator, as a UUID or as a
-/// word — makes no claim to be an identifier of this mint at all, so there is no identifier in
-/// it whose form could be wrong: the recorded answers of this surface resolve it against the
-/// store and report the resource ABSENT.
+/// Either way the route reports the identifier it cannot READ ([`invalid_id_format`]).
 ///
-/// The WIDTH is the whole of the form these routes read. The namespace letter is not: WHICH kind
-/// an identifier of the issued width was issued for is a property of the STORE rather than of
-/// the value, so such a value is carried through to it whether the leading letter is the
-/// addressed kind's own, another kind's of this service, or one no kind of it mints under.
+/// EVERY other value is carried through to the STORE, and the record the store holds none under
+/// is the resource that is ABSENT: a value under the addressed kind's OWN letter, since WHICH
+/// identifier of this kind was ever issued is a property of the store rather than of the value;
+/// a value under a letter no kind of this service issues an identifier under, which says nothing
+/// about the kind it was issued for; and a value of this alphabet at any OTHER WIDTH, whatever
+/// letter it opens with, since the width this service issues an identifier at is one width
+/// CloudFront writes one in, never the only one, so such a value was issued as an identifier of
+/// no kind this service could name and the store is what answers for it.
 ///
 /// So the two refusals keep the conditions they describe: a value this reports `true` for is
 /// the identifier a route reports it cannot READ, and every other value the store holds nothing
 /// under is the resource that is ABSENT.
 ///
-/// `prefix` is the namespace letter the addressed kind mints under, kept in the signature
-/// because it NAMES the kind this question is asked for; the identifiers of the family whose
-/// four members share ONE namespace letter ([`ENTITY_ID_PREFIX`]) read their own form instead
-/// ([`ComAmazonawsCloudfrontCloudfront20200531State::unresolved_origin_access_control`]).
+/// `prefix` is the namespace letter the addressed kind mints under; the identifiers of the
+/// family whose four members share ONE namespace letter ([`ENTITY_ID_PREFIX`]) read their own
+/// form instead
+/// ([`ComAmazonawsCloudfrontCloudfront20200531State::unresolved_origin_access_control`]),
+/// since there the letter says nothing about which of the four kinds issued the identifier.
 pub fn id_format_refused_for(prefix: char, value: &str) -> bool {
-    let _ = prefix;
-    is_entity_id_form(value) && value.len() != ISSUED_ENTITY_ID_LEN
+    if !is_entity_id_form(value) {
+        return true;
+    }
+    value.len() == ISSUED_ENTITY_ID_LEN
+        && identifies_a_namespace(value)
+        && !value.starts_with(prefix)
 }
 
 /// Whether `body` is [`ID_BODY_LEN`] characters of the id alphabet — the body every

@@ -11,16 +11,17 @@
 //! `string` `@httpLabel` with no `@pattern` and no `@length`), so the MESSAGE is the whole of
 //! what separates the two conditions, and it is decided before the store is consulted:
 //!
-//! * the unreadable-identifier sentence ("Id format is invalid") is reserved for a value that is
-//!   WRITTEN as an identifier of this service's mint — in the identifier alphabet, digits and
-//!   uppercase letters with no separator and no lower case — and yet is not written the way the
-//!   addressed kind's identifiers are ISSUED: at another width, or under the namespace letter of
-//!   another kind this service issues identifiers under;
-//! * every other value the store holds no record under earns the absent-record sentence, both a
-//!   value of the kind's issued form (which identifier of that form was ever issued is a
-//!   property of the store) and a value that claims to be no identifier of this mint at all —
-//!   lower-cased, hyphenated, underscored, mixed-case — in which there is no identifier whose
-//!   form could be wrong;
+//! * the unreadable-identifier sentence ("Id format is invalid") is the answer to a value that
+//!   could never be an identifier CloudFront issued for the addressed kind: one written OUTSIDE
+//!   the identifier alphabet — digits and uppercase letters with no separator and no lower case
+//!   — which claims to be no identifier of this mint at all, and one written exactly the way an
+//!   identifier is ISSUED, that alphabet at the issued width, under the namespace letter of
+//!   ANOTHER kind this service issues identifiers under, which makes it that kind's identifier;
+//! * every value that COULD be an identifier of the addressed kind and that the store holds no
+//!   record under earns the absent-record sentence: a value of the kind's own issued form (which
+//!   identifier of that form was ever issued is a property of the store), a value of the
+//!   alphabet at any other width, and a value under a letter no kind of this service issues an
+//!   identifier under;
 //! * and `GetFieldLevelEncryption`, the configuration's RESOURCE read, reads NO form at all —
 //!   its own recorded contract — so there every value is carried through to the store and earns
 //!   the absent-record sentence, which is what the shared oracle answers for it.
@@ -30,7 +31,7 @@
 //!
 //! * the same body at the same WIDTH written in the identifier alphabet and written in lower
 //!   case, over widths from one short of the issued width to three times it — so the case alone
-//!   decides whether the form is read, and the width decides only within the alphabet;
+//!   decides whether the value is an identifier at all;
 //! * the LEADING LETTER at the issued width: the kind's own, the sibling field-level encryption
 //!   kind's, the public key's, the one every other CloudFront entity id is drawn from, a letter
 //!   this service issues nothing under, and a digit;
@@ -63,10 +64,10 @@ fn body(width: usize) -> String {
 
 
 
-/// The CASE a value is written in decides whether its form is read at all: at every width, the
-/// same body written in the identifier alphabet is refused on its form unless it is of the
-/// kind's issued form, while the lower-cased value of that very width is carried through to the
-/// store and reported as the absent record.
+/// The CASE a value is written in decides whether it is an identifier of this mint at all: at
+/// every width, the same body written in the identifier alphabet is carried through to the store
+/// unless it is another kind's issued identifier, while the lower-cased value of that very width
+/// claims to be no identifier and is reported UNREADABLE by every route that reads the form.
 #[tokio::test]
 async fn the_case_a_value_is_written_in_decides_whether_its_form_is_read() {
     let router = emulator();

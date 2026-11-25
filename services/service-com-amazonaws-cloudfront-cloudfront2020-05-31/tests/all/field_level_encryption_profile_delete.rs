@@ -604,9 +604,10 @@ async fn a_profile_a_configuration_names_cannot_be_deleted() {
 /// An id the store holds no field-level encryption profile for is
 /// `NoSuchFieldLevelEncryptionProfile`, whatever shape the id takes — never a 204, which would
 /// claim something was removed. The MESSAGE says which condition the delete found: the
-/// identifier's shape is judged before the store is consulted, so a value written as an
-/// identifier of this service's mint that no profile id could be is the identifier CloudFront
-/// cannot read, while every other id the store holds nothing for is the absent profile.
+/// identifier's shape is judged before the store is consulted, so a value that could never be an
+/// identifier issued for a profile — written outside the alphabet an identifier is written in,
+/// or written as another kind's issued identifier — is the identifier CloudFront cannot read,
+/// while every other id the store holds nothing for is the absent profile.
 #[tokio::test]
 async fn an_id_no_profile_holds_is_refused() {
     let router = emulator();
@@ -622,7 +623,7 @@ async fn an_id_no_profile_holds_is_refused() {
     let mut flipped: Vec<char> = known.chars().collect();
     let last = flipped.len() - 1;
     flipped[last] = if flipped[last] == 'A' { 'B' } else { 'A' };
-    let absent: [(&str, String, &str); 6] = [
+    let absent: [(&str, String, &str); 7] = [
         (
             "a profile id never minted",
             "P0000000000000".to_string(),
@@ -636,21 +637,26 @@ async fn an_id_no_profile_holds_is_refused() {
         (
             "a known id in lower case",
             known.to_lowercase(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_PROFILE_ID_MESSAGE,
         ),
         (
             "a token that is no profile id",
             "not-a-profile-id".to_string(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_PROFILE_ID_MESSAGE,
         ),
         (
             "the caller reference rather than the id",
             "fle-profile-the-only-one".to_string(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_PROFILE_ID_MESSAGE,
         ),
         (
             "an identifier of this mint's alphabet at no issued width",
             "PBOGUSPROFILEID0000".to_string(),
+            NO_SUCH_PROFILE_MESSAGE,
+        ),
+        (
+            "a public key's issued identifier, of another kind's namespace",
+            keys[0].clone(),
             UNREADABLE_PROFILE_ID_MESSAGE,
         ),
     ];

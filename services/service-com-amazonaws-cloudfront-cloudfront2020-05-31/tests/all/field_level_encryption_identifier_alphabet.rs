@@ -8,13 +8,14 @@
 //! own not-found error and `AccessDenied` are all these operations model
 //! (`smithy_query(query="operation",operation="GetFieldLevelEncryption,GetFieldLevelEncryptionConfig,GetFieldLevelEncryptionProfile,GetFieldLevelEncryptionProfileConfig")`)
 //! — so the MESSAGE is what tells the two conditions apart. A value written in the identifier
-//! alphabet claims to be an identifier this service issued and is therefore judged on its form
-//! by every route that reads one, which
+//! alphabet claims to be an identifier this service issued, so it is carried through to the
+//! STORE and reports the record ABSENT — unless it is written exactly as an identifier is ISSUED
+//! under another kind's namespace letter, which
 //! `field_level_encryption_identifier_width_and_namespace.rs` states and [`unresolved_answer`]
-//! decides — the configuration's RESOURCE read reads no form at all, so there every value is
-//! carried through to the store; a value carrying a character that alphabet does not admit
-//! claims to be no identifier of this mint at all, so it is resolved against the store and
-//! reports the record ABSENT.
+//! decides; the configuration's RESOURCE read reads no form at all, so there every value is
+//! carried through to the store. A value carrying a character that alphabet does not admit
+//! claims to be no identifier of this mint at all, so there is nothing in it to resolve and
+//! every route that reads the form reports the identifier UNREADABLE.
 //!
 //! The rows vary the dimensions the rule generalises over: the WIDTH (one character, the width
 //! this service issues, one short of it, one past it, and far beyond it), the LEADING LETTER
@@ -162,8 +163,10 @@ fn outside_the_alphabet(kind: Kind, seeded: &Seeded) -> Vec<(String, String)> {
 }
 
 /// RULE: a value written in the identifier alphabet claims to be an identifier this service
-/// issued, so it is carried through to the STORE whatever body, width or namespace letter it
-/// carries, and one the store holds no record for is the record reported ABSENT, through every
+/// issued, so it is carried through to the STORE whatever body or width it carries — unless it
+/// is written exactly as an identifier is ISSUED under the namespace letter of another kind this
+/// service issues identifiers under, which makes it that kind's identifier ([`unresolved_answer`])
+/// — and one the store holds no record for is the record reported ABSENT, through every
 /// operation addressed by an identifier of either kind.
 #[tokio::test]
 async fn a_value_of_the_identifier_alphabet_is_carried_through_to_the_store() {

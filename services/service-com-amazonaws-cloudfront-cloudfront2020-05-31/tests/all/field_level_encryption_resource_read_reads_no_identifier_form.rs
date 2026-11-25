@@ -40,10 +40,12 @@
 //!
 //! The CONTRAST, in the second case below: how much of the form a route reads is each route's
 //! own recorded contract, so the CONFIGURATION document read of the same record
-//! (`GET /2020-05-31/field-level-encryption/{Id}/config`) still refuses the values written in the
-//! alphabet of an identifier of this service's mint at a width it issues none at — as the
-//! identifier it cannot read — where this route reports the configuration absent. The two routes
-//! keep their own answers, and a blanket loosening of either fails this suite.
+//! (`GET /2020-05-31/field-level-encryption/{Id}/config`) still refuses the values that could
+//! never be an identifier issued for a configuration — a value written outside the alphabet an
+//! identifier of this service's mint is written in, and a value written exactly as an identifier
+//! is ISSUED under another kind's namespace letter — as the identifier it cannot read, where
+//! this route reports the configuration absent. The two routes keep their own answers, and a
+//! blanket loosening of either fails this suite.
 //!
 //! The wire harness, the document builders, the create paths, the identifier-alphabet body
 //! ([`crate::field_level_encryption_identifier_alphabet::body`]) and the refusal assertion
@@ -58,7 +60,7 @@ use crate::field_level_encryption_config_lifecycle::{
 };
 use crate::field_level_encryption_identifier_alphabet::body;
 use crate::field_level_encryption_identifier_width_and_namespace::{
-    assert_refusal, in_the_identifier_alphabet,
+    assert_refusal, could_be_issued_for_the_kind,
 };
 use crate::field_level_encryption_profile_lifecycle::{store_profile, upload_key};
 
@@ -237,14 +239,15 @@ fn identifiers_the_store_holds_nothing_for(stored: &Stored) -> Vec<(String, Stri
 }
 
 /// The rows above that the CONFIGURATION document read of the same record refuses on their
-/// FORM: a value written IN the alphabet this service writes an identifier in at a width it
-/// issues no identifier at, which claims to be an identifier of this mint that none of them
-/// could be ([`in_the_identifier_alphabet`]).
+/// FORM: every value that could never be an identifier issued for a configuration — one written
+/// outside the alphabet an identifier is written in, and one written exactly as an identifier is
+/// ISSUED under the namespace letter of another kind this service issues identifiers under
+/// ([`could_be_issued_for_the_kind`]).
 fn refused_on_their_form_by_the_document_read(stored: &Stored) -> Vec<(String, String)> {
-    let issued_width = stored.id.len();
+    let minted = stored.id.clone();
     identifiers_the_store_holds_nothing_for(stored)
         .into_iter()
-        .filter(|(_, id)| in_the_identifier_alphabet(id) && id.len() != issued_width)
+        .filter(|(_, id)| !could_be_issued_for_the_kind(id, &minted))
         .collect()
 }
 
@@ -288,9 +291,9 @@ async fn every_identifier_the_store_cannot_resolve_is_the_absent_configuration()
 }
 
 /// The CONTRAST: the CONFIGURATION document read of the same record keeps its own recorded
-/// contract, reporting every one of those values that is written IN the alphabet this service
-/// writes an identifier in at a width it issues none at as the identifier it cannot READ — so
-/// the rule above is about this one route rather than a refusal dropped from the whole surface.
+/// contract, reporting every one of those values that could never be an identifier issued for a
+/// configuration as the identifier it cannot READ — so the rule above is about this one route
+/// rather than a refusal dropped from the whole surface.
 #[tokio::test]
 async fn the_configuration_document_read_keeps_its_own_identifier_contract() {
     let router = emulator();

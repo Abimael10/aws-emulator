@@ -79,3 +79,30 @@ Fixed vs variable message text: for both not-found classes the entire sentence i
 4. Step task#5: call DeleteFieldLevelEncryptionConfig with a well-formed absent config id. Observe the same substituted message.
 5. Step task#6: call DeleteFieldLevelEncryptionProfile with a well-formed absent profile id. Observe the same substituted message.
 6. Fixture cloudfront-fle-profile-lifecycle, step task#3, reproduces the profile read case after a delete.
+
+## Resolution
+
+All four causes are closed; the replay reports all four of this issue's keys `fixed` and both
+graded fixtures passing end to end.
+
+What separates the two sentences the one not-found code carries is whether the submitted value
+could be an identifier CloudFront ISSUED FOR THE ADDRESSED KIND
+(`state::id_format_refused_for`). Only two things about a value say it could not: it is written
+outside the alphabet an identifier is written in (digits and uppercase letters, no separator and
+no lower case), or it is written exactly the way an identifier is issued — that alphabet at the
+width every identifier of this mint is issued at — under the namespace letter of another kind
+this service issues identifiers under, which makes it that kind's identifier. Every other value
+is carried through to the store, and the record the store holds none under is the record reported
+ABSENT: the kind's own letter at any width, a letter no kind of this service issues an identifier
+under, and any value of the alphabet at a width no identifier is issued at, since the width this
+service issues at is one width CloudFront writes an identifier in rather than the only one.
+
+The condition was previously read as the WIDTH alone, which answered the unreadable-identifier
+sentence for every value of the alphabet written at another width — the shape all four recorded
+probes of `cloudfront-field-level-encryption-errors` take — and answered the absent-record
+sentence for another kind's issued identifier, which is the opposite substitution reported by
+`20261117T051410Z-cloudfront-getfieldlevelencryptionprofile-answers-the-not-found-message-for-an.md`.
+Both halves now follow from the one rule, on every operation addressed by one of these
+identifiers: the configuration's `/config` read, the profile's two reads, and the update and the
+delete of each. The configuration's RESOURCE read (`GetFieldLevelEncryption`) keeps its own
+recorded contract of reading no form at all.

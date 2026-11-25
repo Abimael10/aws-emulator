@@ -1478,10 +1478,11 @@ async fn an_id_no_configuration_holds_is_refused_by_the_configuration_reader() {
     // configuration's own id with a character changed, an id of the alphabet at no issued width
     // (a bare digit and a 15-character one), and a value outside the identifier alphabet. A
     // value written the way this service ISSUES an identifier — the identifier alphabet at the
-    // issued width — is carried through to the store whatever namespace letter it carries, since
-    // WHICH identifier was ever issued is the store's to say; a value outside that alphabet
-    // claims to be no identifier of this mint, so it is carried through as well; and a value of
-    // the alphabet at no issued width is the identifier the service cannot READ.
+    // issued width — under ANOTHER kind's namespace letter IS that kind's identifier, so it is
+    // the identifier the service cannot READ, and so is a value outside that alphabet, which
+    // claims to be no identifier of this mint at all; a value of the alphabet at no issued width
+    // names no kind of its own, so it is carried through to the store, since WHICH identifier
+    // was ever issued is the store's to say.
     let mut mangled: Vec<char> = stored_id.chars().collect();
     if let Some(last) = mangled.last_mut() {
         *last = if *last == 'A' { 'B' } else { 'A' };
@@ -1489,12 +1490,12 @@ async fn an_id_no_configuration_holds_is_refused_by_the_configuration_reader() {
     let mangled: String = mangled.into_iter().collect();
     for (case, expected) in [
         ("C3V3PVOY5NSBVE", NO_SUCH_CONFIG_MESSAGE),
-        ("EDFDVBD6EXAMPLE", UNREADABLE_ID_MESSAGE),
-        ("E2QWRUHAPOMQZL", NO_SUCH_CONFIG_MESSAGE),
-        (profile.as_str(), NO_SUCH_CONFIG_MESSAGE),
+        ("EDFDVBD6EXAMPLE", NO_SUCH_CONFIG_MESSAGE),
+        ("E2QWRUHAPOMQZL", UNREADABLE_ID_MESSAGE),
+        (profile.as_str(), UNREADABLE_ID_MESSAGE),
         (mangled.as_str(), NO_SUCH_CONFIG_MESSAGE),
-        ("not-a-configuration-id", NO_SUCH_CONFIG_MESSAGE),
-        ("0", UNREADABLE_ID_MESSAGE),
+        ("not-a-configuration-id", UNREADABLE_ID_MESSAGE),
+        ("0", NO_SUCH_CONFIG_MESSAGE),
     ] {
         let answer = get_config_document(&router, case).await;
         assert_eq!(

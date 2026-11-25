@@ -25,13 +25,13 @@
 //!   nor the width of its body says which of them issued it: those routes read the identifier
 //!   ALPHABET (digits and uppercase letters, no separator and no lower case) and nothing more;
 //! * a field-level encryption configuration's and a profile's identifiers come from namespaces
-//!   of their OWN (`C` and `P`), so those routes read the WIDTH a value of that alphabet is
-//!   written at: one as wide as an identifier this service issues is carried through to the
-//!   store whatever namespace letter it carries — WHICH identifier was ever issued, and for
-//!   which kind, stays the store's to say — while one of the alphabet at any other width claims
-//!   to be an identifier of this mint that none of them could be, and is unreadable. A value
-//!   outside the alphabet is no identifier of the mint at all and claims no form for them to
-//!   refuse, so they resolve it against the store.
+//!   of their OWN (`C` and `P`), so those routes read the NAMESPACE LETTER of a value written
+//!   exactly the way an identifier is ISSUED — that alphabet at the width this service issues one
+//!   at: under another kind's letter such a value IS that kind's identifier, so no record of the
+//!   addressed kind could answer to it and it is unreadable, while a value of the alphabet at any
+//!   other width, or under a letter no kind of this service issues one under, names no kind of
+//!   its own and is carried through to the store. A value outside the alphabet is no identifier
+//!   of the mint at all, so it too is unreadable.
 //!
 //! The rows are the CROSSOVER: four resource kinds are created through their own APIs, and
 //! each one's really-minted identifier is then submitted to every other kind's route, beside
@@ -123,6 +123,19 @@ impl Route {
         }
     }
 
+    /// The namespace letter the addressed kind's identifiers are ISSUED under, where the kind
+    /// has one of its own — asserted against the identifiers the creates in [`live`] really
+    /// answered with. An origin access control has none of its own: its kind shares [`
+    /// ISSUED_NAMESPACES`]'s `E` with the distributions and the origin access identities, so the
+    /// letter says nothing about which of them issued the identifier.
+    fn own_namespace(self) -> Option<char> {
+        match self {
+            Self::OriginAccessControl | Self::OriginAccessControlConfig => None,
+            Self::FieldLevelEncryptionConfig => Some('C'),
+            Self::FieldLevelEncryptionProfile => Some('P'),
+        }
+    }
+
     /// The sentence this route owes `id` when nothing of its kind answers to it.
     ///
     /// How much of the value a route reads is the resource kind's own recorded contract. The
@@ -130,18 +143,21 @@ impl Route {
     /// from the namespace its kind SHARES with the distributions: a value written in it is
     /// carried through to the store, so the record it holds none under is reported ABSENT, and
     /// a value outside it is the identifier the route reports it cannot READ. The field-level
-    /// encryption routes read the WIDTH instead: a value of the alphabet at the width this
-    /// service issues an identifier at is carried through to the store whatever namespace letter
-    /// it carries, one of the alphabet at any other width is the identifier they cannot read,
-    /// and a value outside the alphabet claims to be no identifier of this mint at all, so it is
-    /// carried through to the store too.
+    /// encryption routes read the NAMESPACE LETTER as well, of a value written exactly the way
+    /// an identifier is ISSUED: under another kind's letter at that width the value IS that
+    /// kind's identifier and is unreadable, while a value of the alphabet at any other width, or
+    /// under a letter no kind of this service issues one under, is carried through to the store;
+    /// a value outside the alphabet is no identifier of this mint at all, so it is unreadable
+    /// there too.
     fn expected(self, id: &str) -> &'static str {
-        let unreadable = match self {
-            Self::OriginAccessControl | Self::OriginAccessControlConfig => {
+        let unreadable = match self.own_namespace() {
+            None => !in_the_identifier_alphabet(id),
+            Some(own) => {
                 !in_the_identifier_alphabet(id)
-            }
-            Self::FieldLevelEncryptionConfig | Self::FieldLevelEncryptionProfile => {
-                in_the_identifier_alphabet(id) && id.len() != MINTED_ID_WIDTH
+                    || (id.len() == MINTED_ID_WIDTH
+                        && id.chars().next().is_some_and(|letter| {
+                            letter != own && ISSUED_NAMESPACES.contains(&letter)
+                        }))
             }
         };
         if unreadable {
@@ -274,6 +290,19 @@ async fn live(router: &MultiServiceRouter) -> Live {
                 .is_some_and(|letter| ISSUED_NAMESPACES.contains(&letter)),
             "case {case}: expected a minted identifier under a namespace letter this service \
              issues one under, got {id:?}"
+        );
+    }
+
+    // And the two kinds whose identifiers come from a namespace of their OWN really carry the
+    // letter the table reads their routes against ([`Route::own_namespace`]).
+    for (route, id) in [
+        (Route::FieldLevelEncryptionConfig, &live.config),
+        (Route::FieldLevelEncryptionProfile, &live.profile),
+    ] {
+        let own = route.own_namespace().expect("this kind has its own namespace");
+        assert!(
+            id.starts_with(own),
+            "case {route:?}: expected the minted identifier to open with {own:?}, got {id:?}"
         );
     }
     live

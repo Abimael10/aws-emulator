@@ -24,14 +24,15 @@
 //!
 //! The id travels in the path on four of those operations and in a submitted DOCUMENT on the
 //! other two. An id borne by a document addresses nothing, so any id the store holds no profile
-//! for is the absent profile there; an id that ADDRESSES the operation is read for its ISSUED
-//! FORM first, and a value of the identifier alphabet at a width no identifier of this mint is
-//! issued at is the identifier reported unreadable under that same one not-found code — these
-//! operations model no argument error. A value written outside that alphabet claims to be no
-//! identifier of this mint at all, so it has no form to be wrong and is the absent profile
-//! wherever it travels. The rows below span those shapes — another namespace of this service, a
-//! value of no minted id's alphabet, a caller reference — beside well-formed profile ids nothing
-//! answers to.
+//! for is the absent profile there; an id that ADDRESSES the operation is read for whether it
+//! could be an identifier issued FOR A PROFILE first, and one that could not — a value written
+//! outside the alphabet an identifier is written in, and a value written exactly as an
+//! identifier is ISSUED under another kind's namespace letter — is the identifier reported
+//! unreadable under that same one not-found code; these operations model no argument error. A
+//! value of the alphabet at any other width names no kind of its own, so it is carried through
+//! to the store and is the absent profile. The rows below span those shapes — another namespace
+//! of this service, a value of no minted id's alphabet, a caller reference — beside well-formed
+//! profile ids nothing answers to.
 //!
 //! Every message is also asserted NOT to be the documentation prose of its error shape
 //! (`smithy_query(query="doc",shape="NoSuchFieldLevelEncryptionProfile")` and
@@ -59,6 +60,10 @@ const NO_SUCH_PROFILE_MESSAGE: &str = "The specified field level encryption prof
 const PROFILE_IN_USE_MESSAGE: &str =
     "The field level encryption profile is currently associated with a field level encryption \
      config. Please disassociate the profile before deleting.";
+
+/// The sentence an operation ADDRESSED by a profile `Id` answers a value that could never be an
+/// identifier issued for a profile, naming the member that carried it.
+const UNREADABLE_IDENTIFIER: &str = "Id format is invalid";
 
 /// The MODEL's documentation prose for those two error shapes — what the shapes say ABOUT the
 /// condition, which is not what the service answers with. Source:
@@ -200,11 +205,12 @@ fn assert_refusal(answer: &Answer, case: &str, status: u16, code: &str, message:
 // ---------------------------------------------------------------------------
 
 /// Every path that reports a field-level encryption profile id as naming nothing answers
-/// `NoSuchFieldLevelEncryptionProfile`, with the unreadable-identifier sentence where the id is
-/// written OUTSIDE the alphabet this service writes an identifier in, and the absent-profile
-/// wire sentence for every id written inside it — while an id that travels in a submitted
-/// DOCUMENT as a mapping's `ProfileId` addresses nothing, so it reports the absent profile
-/// whatever shape it takes.
+/// `NoSuchFieldLevelEncryptionProfile`, with the unreadable-identifier sentence where the id
+/// could never be one issued for a profile — written outside the alphabet this service writes an
+/// identifier in, or written as another kind's issued identifier — and the absent-profile wire
+/// sentence for every id that could be one — while an id that travels in a submitted DOCUMENT as
+/// a mapping's `ProfileId` addresses nothing, so it reports the absent profile whatever shape it
+/// takes.
 #[tokio::test]
 async fn every_path_that_reports_a_missing_profile_sends_the_wire_sentence() {
     let router = emulator();
@@ -242,17 +248,17 @@ async fn every_path_that_reports_a_missing_profile_sends_the_wire_sentence() {
         (
             "a stored id in lower case",
             known.to_lowercase(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_IDENTIFIER,
         ),
         (
             "a token that is no profile id",
             "not-a-profile-id".to_string(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_IDENTIFIER,
         ),
         (
             "the caller reference rather than the id",
             "fle-profile-message-known".to_string(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_IDENTIFIER,
         ),
     ];
 
@@ -343,11 +349,11 @@ async fn every_path_that_reports_a_missing_profile_sends_the_wire_sentence() {
 }
 
 /// A READ of a profile answers its one not-found code for every `Id` it cannot resolve, and
-/// the ALPHABET the identifier is written in decides the sentence: a value written in the
-/// alphabet this service writes an identifier in is carried through to the STORE — another
-/// resource kind's minted id included, since WHICH kind an identifier was issued for is the
-/// store's to say — so it reports the profile that is ABSENT, while a value written outside
-/// that alphabet is the identifier reported UNREADABLE.
+/// whether the value could be an identifier issued FOR A PROFILE decides the sentence: a value
+/// written in the alphabet this service writes an identifier in is carried through to the STORE,
+/// so it reports the profile that is ABSENT, while a value written outside that alphabet — and a
+/// value written exactly as an identifier is ISSUED under ANOTHER kind's namespace letter, which
+/// makes it that kind's identifier — is the identifier reported UNREADABLE.
 ///
 /// The rows span the shapes an `Id` takes outside a profile id's: the namespaces of this
 /// service a profile id's is disjoint from, taking two of them from ids this emulator really
@@ -373,22 +379,22 @@ async fn a_profile_read_answers_one_sentence_for_every_id_it_cannot_resolve() {
         (
             "the sibling configuration's own id",
             config_id.clone(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_IDENTIFIER,
         ),
         (
             "a public key id this service minted",
             key.clone(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_IDENTIFIER,
         ),
         (
             "a distribution id's namespace",
             "E1234567890ABC".to_string(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_IDENTIFIER,
         ),
         (
             "a UUID, the namespace the policy kinds are keyed by",
             "00000000-0000-0000-0000-000000000000".to_string(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_IDENTIFIER,
         ),
         (
             "a profile id never minted",
@@ -398,17 +404,17 @@ async fn a_profile_read_answers_one_sentence_for_every_id_it_cannot_resolve() {
         (
             "the stored id in lower case",
             known.to_lowercase(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_IDENTIFIER,
         ),
         (
             "a bare word",
             "not-a-profile-id".to_string(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_IDENTIFIER,
         ),
         (
             "the profile's caller reference rather than its id",
             "fle-profile-kinds-known".to_string(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_IDENTIFIER,
         ),
     ];
 

@@ -66,6 +66,10 @@ use crate::public_key_lifecycle::is_wire_timestamp;
 /// rather than taken from the crate, so a reworded refusal fails this suite.
 const NO_SUCH_PROFILE_MESSAGE: &str = "The specified field level encryption profile does not exist.";
 
+/// The sentence an operation ADDRESSED by a configuration `Id` answers a value that could never
+/// be an identifier issued for a configuration, naming the member that carried it.
+const UNREADABLE_ID_MESSAGE: &str = "Id format is invalid";
+
 // ---------------------------------------------------------------------------
 // Calling the update
 // ---------------------------------------------------------------------------
@@ -971,10 +975,11 @@ async fn an_update_whose_mapping_list_passes_its_bound_is_refused() {
 
 /// An id no stored configuration holds is `NoSuchFieldLevelEncryptionConfig` (HTTP 404) whatever
 /// shape the id takes and whatever the `If-Match` header carries, and the refused update creates
-/// nothing under it. The MESSAGE follows the id's ISSUED FORM, judged before the store is
-/// consulted: a value written as an identifier of this service's mint that CloudFront issues no
-/// configuration id as is the identifier the service cannot read, and every other value the
-/// store holds nothing for is the absent configuration.
+/// nothing under it. The MESSAGE follows the id's FORM, judged before the store is consulted: a
+/// value that could never be an identifier issued for a configuration — written outside the
+/// alphabet an identifier is written in, or written as another kind's issued identifier — is the
+/// identifier the service cannot read, and every value that could be one and the store holds
+/// nothing for is the absent configuration.
 #[tokio::test]
 async fn an_id_no_configuration_holds_is_refused() {
     let router = emulator();
@@ -994,7 +999,7 @@ async fn an_id_no_configuration_holds_is_refused() {
     let mut flipped: Vec<char> = id.chars().collect();
     let last = flipped.len() - 1;
     flipped[last] = if flipped[last] == 'A' { 'B' } else { 'A' };
-    let candidates: [(&str, String, &str); 5] = [
+    let candidates: [(&str, String, &str); 6] = [
         (
             "an id never minted",
             "C3V3PVOY5NSBVE".to_string(),
@@ -1006,19 +1011,24 @@ async fn an_id_no_configuration_holds_is_refused() {
             NO_SUCH_FIELD_LEVEL_ENCRYPTION_CONFIG_MESSAGE,
         ),
         (
+            "an id of this mint's alphabet at no issued width",
+            "CNEVERMINTEDATALL".to_string(),
+            NO_SUCH_FIELD_LEVEL_ENCRYPTION_CONFIG_MESSAGE,
+        ),
+        (
             "the existing id in lower case",
             id.to_lowercase(),
-            NO_SUCH_FIELD_LEVEL_ENCRYPTION_CONFIG_MESSAGE,
+            UNREADABLE_ID_MESSAGE,
         ),
         (
             "a profile id where a configuration id belongs",
             profile.clone(),
-            NO_SUCH_FIELD_LEVEL_ENCRYPTION_CONFIG_MESSAGE,
+            UNREADABLE_ID_MESSAGE,
         ),
         (
             "a token of no configuration id's shape",
             "not-a-configuration".to_string(),
-            NO_SUCH_FIELD_LEVEL_ENCRYPTION_CONFIG_MESSAGE,
+            UNREADABLE_ID_MESSAGE,
         ),
     ];
 

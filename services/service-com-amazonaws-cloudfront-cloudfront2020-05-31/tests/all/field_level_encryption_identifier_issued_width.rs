@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The WIDTH an identifier of this service's mint is written at is what separates the two
-//! sentences a field-level encryption not-found code carries, end to end over HTTP.
+//! The WIDTH an identifier of this service's mint is written at is where the NAMESPACE LETTER
+//! decides which of the two sentences a field-level encryption not-found code carries, end to
+//! end over HTTP.
 //!
-//! The rule under test: an operation addressed by a field-level encryption `Id` reads the FORM
-//! this service ISSUES an identifier in — the identifier alphabet (digits and uppercase letters,
-//! no separator and no lower case) at the width every identifier of this mint is issued at. A
-//! value written that way is carried through to the STORE whatever body or namespace letter it
-//! carries, and the record the store holds none under is the record reported ABSENT; a value of
-//! that alphabet at ANY OTHER width claims to be an identifier of this mint that none of them
-//! could be, so it is the identifier the service reports it cannot READ ("Id format is
-//! invalid"); and a value written OUTSIDE the alphabet claims to be no identifier of this mint
-//! at all, so it has no form to be wrong and is resolved against the store like any other.
+//! The rule under test: an operation addressed by a field-level encryption `Id` reports the
+//! identifier it cannot READ ("Id format is invalid") for every value that could never be an
+//! identifier CloudFront issued for its kind — a value written OUTSIDE the identifier alphabet
+//! (digits and uppercase letters, no separator and no lower case), and a value written exactly
+//! the way an identifier is ISSUED, that alphabet at the width every identifier of this mint is
+//! issued at, under ANOTHER kind's namespace letter, which makes it that other kind's
+//! identifier. Every other value is carried through to the STORE — the kind's own letter at any
+//! width, and any letter at a width no identifier is issued at, since that width names no kind
+//! of its own — and the record the store holds none under is the record reported ABSENT.
 //! These routes model one not-found code and no argument error
 //! (`smithy_query(query="operation",operation="GetFieldLevelEncryptionConfig,GetFieldLevelEncryptionProfile,GetFieldLevelEncryptionProfileConfig")`
 //! reports the kind's not-found error and `AccessDenied` and nothing else), so the message is
@@ -21,16 +22,18 @@
 //! else held fixed:
 //!
 //! * the WIDTH, at the boundary: the issued width, one character short of it and one past it,
-//!   under the addressed kind's own namespace letter — so only the width differs between the
-//!   absent record and the unreadable identifier;
+//!   under the addressed kind's own namespace letter — every one of them the absent record,
+//!   since the width alone says nothing about which kind an identifier was issued for;
 //! * the same three widths with the body LOWER-CASED, which takes every one of them outside the
-//!   alphabet and so back to the absent record — the case alone deciding whether the width is
-//!   read;
-//! * the NAMESPACE LETTER at the issued width: the kind's own, the sibling kind's, the one every
-//!   other CloudFront entity id is drawn from, a letter no kind of this service mints under and
-//!   a leading digit — every one of them the absent record, since which kind an identifier of
-//!   the issued width was issued for is the store's to say;
-//! * and the same letters at a width no identifier is issued at — every one of them unreadable.
+//!   alphabet and so to the unreadable identifier — the case alone deciding whether the value
+//!   is an identifier at all;
+//! * the NAMESPACE LETTER at the issued width: the kind's own and a letter no kind of this
+//!   service mints under — both the absent record — against the sibling kind's and the one every
+//!   other CloudFront entity id is drawn from, both unreadable, since at the issued width a
+//!   letter another kind issues under makes the value that kind's identifier; a leading digit
+//!   names no kind either;
+//! * and the same letters at a width no identifier is issued at — every one of them carried
+//!   through to the store.
 //!
 //! The issued width and the namespace letters are read off identifiers this emulator really
 //! issued, so no width and no letter here is written out by hand. The harness is the one
@@ -41,7 +44,8 @@
 use crate::distribution_lifecycle::emulator;
 use crate::field_level_encryption_config_lifecycle::get_config;
 use crate::field_level_encryption_identifier_width_and_namespace::{
-    address, assert_refusal, seed, Kind, Seeded, UNREADABLE_IDENTIFIER,
+    address, assert_refusal, could_be_issued_for_the_kind, namespace_letter_of, seed, Kind,
+    Seeded, UNREADABLE_IDENTIFIER,
 };
 use crate::field_level_encryption_profile_lifecycle::get_profile;
 
@@ -68,17 +72,13 @@ struct Row {
 /// letters at the issued width and at another.
 fn rows(kind: Kind, seeded: &Seeded) -> Vec<Row> {
     let minted = seeded.minted(kind);
-    let letter = minted.chars().next().expect("a minted id is not empty");
+    let letter = namespace_letter_of(minted);
     let issued = minted.len();
     let sibling = match kind {
         Kind::Config => Kind::Profile,
         Kind::Profile => Kind::Config,
     };
-    let sibling_letter = seeded
-        .minted(sibling)
-        .chars()
-        .next()
-        .expect("a minted id is not empty");
+    let sibling_letter = namespace_letter_of(seeded.minted(sibling));
 
     let mut rows: Vec<Row> = Vec::new();
     // The WIDTH boundary under the kind's own letter, and the same bodies lower-cased.
@@ -90,13 +90,13 @@ fn rows(kind: Kind, seeded: &Seeded) -> Vec<Row> {
         let written = format!("{letter}{}", body(width - 1));
         rows.push(Row {
             case: format!("{label} in the identifier alphabet"),
-            unreadable: width != issued,
+            unreadable: false,
             id: written.clone(),
         });
         rows.push(Row {
             case: format!("{label} in lower case"),
             id: written.to_lowercase(),
-            unreadable: false,
+            unreadable: true,
         });
     }
     // The NAMESPACE LETTER, at the issued width and at one no identifier is issued at.
@@ -107,15 +107,16 @@ fn rows(kind: Kind, seeded: &Seeded) -> Vec<Row> {
         ("a namespace letter no kind of this service mints", 'W'),
         ("a leading digit", '7'),
     ] {
+        let at_the_issued_width = format!("{opening}{}", body(issued - 1));
         rows.push(Row {
             case: format!("{label} at the issued width"),
-            id: format!("{opening}{}", body(issued - 1)),
-            unreadable: false,
+            unreadable: !could_be_issued_for_the_kind(&at_the_issued_width, minted),
+            id: at_the_issued_width,
         });
         rows.push(Row {
             case: format!("{label} at twice the issued width"),
             id: format!("{opening}{}", body(issued * 2 - 1)),
-            unreadable: true,
+            unreadable: false,
         });
     }
     for row in &rows {
@@ -128,9 +129,10 @@ fn rows(kind: Kind, seeded: &Seeded) -> Vec<Row> {
     rows
 }
 
-/// RULE: the width a value of the identifier alphabet is written at decides which of the one
-/// not-found code's two sentences every operation addressed by a field-level encryption
-/// identifier answers, and a value outside that alphabet is resolved against the store.
+/// RULE: whether a value could be an identifier CloudFront issued for the addressed kind — the
+/// identifier alphabet, and at the issued width the kind's own namespace letter — decides which
+/// of the one not-found code's two sentences every operation addressed by a field-level
+/// encryption identifier answers.
 #[tokio::test]
 async fn the_issued_width_decides_which_sentence_an_unresolved_identifier_earns() {
     let router = emulator();
@@ -142,7 +144,7 @@ async fn the_issued_width_decides_which_sentence_an_unresolved_identifier_earns(
                 let case = format!("{operation} with {} ({:?})", row.case, row.id);
                 // The configuration's RESOURCE read reads no form at all, so it reports the
                 // record absent for every value — which is what its own suite states; the
-                // routes that read a form follow the width.
+                // routes that read a form follow the rule above.
                 let expected = if row.unreadable && operation != "GetFieldLevelEncryption" {
                     UNREADABLE_IDENTIFIER
                 } else {

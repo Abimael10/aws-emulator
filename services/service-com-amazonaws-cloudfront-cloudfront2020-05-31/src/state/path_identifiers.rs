@@ -21,13 +21,15 @@
 //!   is one width CloudFront writes one in, never the only width, and WHICH identifier of that
 //!   alphabet was ever issued is a property of the STORE alone — while a value written outside
 //!   that alphabet is the identifier the route reports it cannot READ;
-//! * the field-level encryption CONFIGURATION DOCUMENT routes read the WHOLE form their
-//!   record's ids are ISSUED in — the kind's namespace letter over an identifier body of the
-//!   issued width — of a value that is written as an identifier of this mint at all, and read
-//!   no form of a value that is not ([`super::unresolved_field_level_encryption_config`],
-//!   [`super::unresolved_field_level_encryption_profile`]), while that configuration's
-//!   resource read reads no form at all and reports every id it cannot resolve as the
-//!   configuration that is absent ([`super::no_such_field_level_encryption_config`]);
+//! * the field-level encryption CONFIGURATION DOCUMENT routes refuse the form of every value
+//!   that could never be an identifier issued for their kind — one written outside the alphabet
+//!   an identifier is written in, and one written exactly as an ISSUED identifier (that
+//!   alphabet at the issued width) under another kind's namespace letter, which makes it that
+//!   other kind's identifier ([`super::unresolved_field_level_encryption_config`],
+//!   [`super::unresolved_field_level_encryption_profile`]); every other value is carried
+//!   through to the store, while that configuration's resource read reads no form at all and
+//!   reports every id it cannot resolve as the configuration that is absent
+//!   ([`super::no_such_field_level_encryption_config`]);
 //! * the ORIGIN ACCESS CONTROL reads the ALPHABET and nothing more
 //!   ([`ComAmazonawsCloudfrontCloudfront20200531State::unresolved_origin_access_control`]).
 //!

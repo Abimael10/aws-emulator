@@ -944,9 +944,9 @@ async fn a_comment_past_the_published_bound_is_refused() {
 
 /// An id no stored profile carries names no profile, whatever shape it has: both readers
 /// answer `NoSuchFieldLevelEncryptionProfile` (404), with the sentence the id's SHAPE earns —
-/// the unreadable identifier for a value written as an identifier of this service's mint that
-/// no profile id could be, the absent profile for every other id — and a stored profile is
-/// still read at its own id.
+/// the unreadable identifier for a value that could never be an identifier issued for a profile,
+/// the absent profile for every value that could be one — and a stored profile is still read at
+/// its own id.
 #[tokio::test]
 async fn an_id_no_profile_holds_is_refused_by_both_readers() {
     let router = emulator();
@@ -970,24 +970,22 @@ async fn an_id_no_profile_holds_is_refused_by_both_readers() {
     // never minted, an id in another namespace at the width this service issues one at, an id
     // of the alphabet at no issued width, and a value of no CloudFront identifier form at all.
     // A value written the way this service ISSUES an identifier — the identifier alphabet at
-    // the issued width — is carried through to the STORE whatever namespace letter it carries,
-    // so it is the profile reported absent, and so is a value outside that alphabet, which
-    // claims to be no identifier of this mint; a value of the alphabet at no issued width is the
-    // identifier the service cannot READ.
+    // the issued width — under ANOTHER kind's namespace letter is that kind's identifier, so it
+    // is the identifier the service cannot READ, and so is a value outside that alphabet, which
+    // claims to be no identifier of this mint at all; a value of the alphabet at no issued width
+    // names no kind of its own, so it is carried through to the STORE and is the profile
+    // reported absent.
     for (case, expected) in [
         (
             "P280MFCLSYOCVU",
             NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
         ),
+        ("E2QWRUHAPOMQZL", UNREADABLE_PROFILE_ID_MESSAGE),
         (
-            "E2QWRUHAPOMQZL",
+            "EDFDVBD6EXAMPLE",
             NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
         ),
-        ("EDFDVBD6EXAMPLE", UNREADABLE_PROFILE_ID_MESSAGE),
-        (
-            "not-a-profile-id",
-            NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
-        ),
+        ("not-a-profile-id", UNREADABLE_PROFILE_ID_MESSAGE),
     ] {
         for (reader, answer) in [
             ("GetFieldLevelEncryptionProfile", get_profile(&router, case).await),
