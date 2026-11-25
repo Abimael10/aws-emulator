@@ -287,6 +287,38 @@ pub enum WriteDestination {
     /// `UNLOAD (<query>) TO '<location>' WITH (…)`: the rows are written at the location,
     /// and nothing is registered.
     Unload(UnloadStatement),
+    /// `INSERT INTO <name> [(<column>, …)] <query>`: the rows are APPENDED to a table the
+    /// Data Catalog already holds, as one new object under that table's own location and in
+    /// the format that table's data is already stored in.
+    Insert(InsertStatement),
+}
+
+impl WriteDestination {
+    /// Whether WHERE this statement writes is settled BEFORE its query runs.
+    ///
+    /// A statement that DEFINES the object it writes over is held to its destination first:
+    /// a destination that already holds objects is refused rather than written over, and
+    /// nothing about that refusal depends on the rows the query would produce. An `INSERT`
+    /// writes into a table that is already there and refuses no destination of its own, so
+    /// the names its query reads are resolved first, exactly as a plain read's are.
+    #[must_use]
+    pub fn is_settled_before_the_query(&self) -> bool {
+        match self {
+            Self::Table(..) | Self::Unload(..) => true,
+            Self::Insert(..) => false,
+        }
+    }
+}
+
+/// An `INSERT INTO <table> <query>` statement, as its target and its column list state it.
+#[derive(Debug, Clone)]
+pub struct InsertStatement {
+    /// The table the rows are appended to.
+    pub target: Relation,
+    /// The columns the statement writes, folded the way the catalog folds a column name and
+    /// in the order the statement listed them; EMPTY where it listed none, which writes the
+    /// table's own columns in the table's own order.
+    pub columns: Vec<String>,
 }
 
 /// A `CREATE TABLE … AS <query>` statement, as its name and properties state it.
@@ -912,12 +944,13 @@ fn counts_rows(statement: &SqlStatement) -> bool {
 ///
 /// Athena documents the three classes `StatementType` names: a statement that queries or
 /// changes DATA is DML, one that DEFINES an object is DDL, and everything else — the
-/// statements that ask the engine about itself or set up a session — is UTILITY.
+/// statements that ask the engine about itself or set up a session — is UTILITY. The class a
+/// statement belongs to follows from the FORM its grammar gives it, not from what running it
+/// touches: a `CREATE TABLE` is a definition whichever way it states the rows the table will
+/// hold, so the `AS <query>` form is DDL beside the plain one, and `UNLOAD`, which defines
+/// nothing and only writes rows a query produced, is DML.
 fn statement_type_of(statement: &SqlStatement) -> &'static str {
     match statement {
-        // `CREATE TABLE AS SELECT` defines a table AND writes the rows a query
-        // produced, and Athena classifies it with the statements that manipulate data.
-        SqlStatement::CreateTable(create) if create.query.is_some() => STATEMENT_TYPE_DML,
         SqlStatement::Query(..)
         | SqlStatement::Insert(..)
         | SqlStatement::Update { .. }
@@ -927,6 +960,8 @@ fn statement_type_of(statement: &SqlStatement) -> &'static str {
         // DATA rather than one that defines an object: Athena documents it among its DML
         // statements.
         | SqlStatement::Unload { .. } => STATEMENT_TYPE_DML,
+        // Including the `AS <query>` form: see the rule above — the statement DEFINES a
+        // table, and the query it embeds says what rows it holds.
         SqlStatement::CreateTable(..)
         | SqlStatement::CreateView { .. }
         | SqlStatement::CreateIndex(..)
@@ -948,9 +983,9 @@ fn statement_type_of(statement: &SqlStatement) -> &'static str {
 /// whose kind cannot be named reports none rather than a guess.
 fn substatement_type_of(statement: &SqlStatement) -> Option<&'static str> {
     Some(match statement {
-        // A `CREATE TABLE AS SELECT` is named after both halves of what it does; see
-        // `statement_type_of`, which classifies it with the statements that manipulate
-        // data for the same reason.
+        // A `CREATE TABLE AS SELECT` is named after both halves of what it does, which is
+        // the finer kind this member reports beside the DDL class `statement_type_of` puts
+        // the statement's FORM in.
         SqlStatement::CreateTable(create) if create.query.is_some() => {
             SUBSTATEMENT_CREATE_TABLE_AS_SELECT
         }
@@ -1026,6 +1061,29 @@ fn plan_of(sql: &str, statement: SqlStatement, context: &QueryContext) -> Plan {
                 location: to.value.clone(),
                 format: string_option(&with, FORMAT_PROPERTY),
                 at: statement_start(sql),
+            });
+            written_over(SqlStatement::Query(query), destination, context)
+        }
+        // `INSERT INTO <table> <query>`: the rows a query produced, APPENDED to a table the
+        // Data Catalog already holds.
+        SqlStatement::Insert(insert) => {
+            let target = match &insert.table {
+                ::sqlparser::ast::TableObject::TableName(name) => relation_of(name, context),
+                // A form whose target is not a NAME addresses no catalog table.
+                _ => None,
+            };
+            let (Some(target), Some(query)) = (target, insert.source.clone()) else {
+                // A name that addresses no catalog relation, and a form that writes no rows
+                // of a query at all, are read as whatever else the statement is.
+                return read_plan(SqlStatement::Insert(insert), context);
+            };
+            let destination = WriteDestination::Insert(InsertStatement {
+                target,
+                columns: insert
+                    .columns
+                    .iter()
+                    .map(|column| glue_state::fold_name(&column.value))
+                    .collect(),
             });
             written_over(SqlStatement::Query(query), destination, context)
         }
@@ -2243,6 +2301,18 @@ mod tests {
                 "SHOW PARTITIONS sales.events",
                 "show partitions sales.events",
             ),
+            // `INSERT INTO` writes its rows into a table the catalog already holds, so it is
+            // planned as the query it writes plus that table as its destination.
+            (
+                "literal rows appended to a table",
+                "INSERT INTO sales.events VALUES (1, 'desk')",
+                "insert into sales.events over ",
+            ),
+            (
+                "the rows of a query appended under a column list",
+                "INSERT INTO sales.rollup (item, day) SELECT item, day FROM sales.events",
+                "insert into sales.rollup columns item,day over sales.events",
+            ),
         ];
 
         for (case, sql, expected) in cases {
@@ -2346,6 +2416,16 @@ mod tests {
                             "unload to {} as {}",
                             unload.location,
                             unload.format.as_deref().unwrap_or("no format")
+                        ),
+                        WriteDestination::Insert(insert) => format!(
+                            "insert into {}.{}{}",
+                            insert.target.database,
+                            insert.target.table,
+                            if insert.columns.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" columns {}", insert.columns.join(","))
+                            }
                         ),
                     },
                     writing

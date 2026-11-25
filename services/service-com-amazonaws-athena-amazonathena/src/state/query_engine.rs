@@ -50,11 +50,12 @@ use std::time::{Duration, Instant};
 use crate::ops::types::{ColumnInfo, Datum, Row};
 
 /// The `StatementType` of a statement that queries or changes DATA: Athena classifies
-/// `SELECT`, `INSERT`, `UPDATE`, `DELETE` and `CREATE TABLE AS SELECT` as DML. One of
+/// `SELECT`, `INSERT`, `UPDATE` and `DELETE` as DML. One of
 /// `STATEMENT_TYPE_VALUES` in [`crate::ops::types`] (the model's `StatementType` enum).
 pub const STATEMENT_TYPE_DML: &str = "DML";
 /// The `StatementType` of a statement that DEFINES an object — `CREATE`, `ALTER`,
-/// `DROP` — see [`STATEMENT_TYPE_DML`].
+/// `DROP`, a `CREATE TABLE` whichever way it states the rows the table holds — see
+/// [`STATEMENT_TYPE_DML`].
 pub const STATEMENT_TYPE_DDL: &str = "DDL";
 /// The `StatementType` of everything else Athena accepts, such as `SHOW`, `DESCRIBE`,
 /// `EXPLAIN` and `USE` — see [`STATEMENT_TYPE_DML`].

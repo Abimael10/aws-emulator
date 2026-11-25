@@ -17,7 +17,9 @@
 //! `CREATE TABLE AS SELECT`) and along the class the failure belongs to (a write target the
 //! statement's data catalog does not hold, and a relation a read inside the statement cannot
 //! resolve), with a plain `SELECT` of the same dropped table as the READ row of the same
-//! condition. Each row is started against the catalog state the seeding leaves behind: a
+//! condition. Each row carries the `StatementType` its own statement's FORM is classified in,
+//! because the pair a client branches on is reported beside that class and not instead of it.
+//! Each row is started against the catalog state the seeding leaves behind: a
 //! database, an external table over stored objects that is READ BACK while it is registered,
 //! and then dropped.
 //!
@@ -35,7 +37,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::state::catalog_sql::{
     ERROR_CATEGORY_USER, ERROR_TYPE_ENTITY_NOT_FOUND,
 };
-use service_com_amazonaws_athena_amazonathena::state::query_engine::STATEMENT_TYPE_DML;
+use service_com_amazonaws_athena_amazonathena::state::query_engine::{
+    STATEMENT_TYPE_DDL, STATEMENT_TYPE_DML,
+};
 use service_com_amazonaws_athena_amazonathena::state::{
     DEFAULT_QUERY_DATABASE, QUERY_STATE_FAILED, QUERY_STATE_SUCCEEDED,
 };
@@ -205,6 +209,10 @@ struct Case {
     /// member is THERE as an integer inside the modelled range — which is what a client that
     /// branches on the (category, type) pair reads.
     error_type: Option<i64>,
+    /// The `StatementType` Athena classifies the submitted statement in, which follows from
+    /// the FORM its grammar gives it: a statement that manipulates DATA is DML, and one that
+    /// DEFINES an object — a `CREATE TABLE`, including the `AS <query>` form — is DDL.
+    statement_type: &'static str,
 }
 
 /// Every FAILED data-manipulating statement reports an `AthenaError` carrying the integer
@@ -221,24 +229,28 @@ async fn every_failed_data_manipulating_statement_reports_an_error_type_beside_i
             sql: format!("INSERT INTO {DATABASE}.{TABLE} VALUES (40, 'qux')"),
             missing: TABLE,
             error_type: None,
+            statement_type: STATEMENT_TYPE_DML,
         },
         Case {
             name: "an INSERT of a constant projection into the dropped table",
             sql: format!("INSERT INTO {DATABASE}.{TABLE} SELECT 41, 'quux'"),
             missing: TABLE,
             error_type: None,
+            statement_type: STATEMENT_TYPE_DML,
         },
         Case {
             name: "an UPDATE of the dropped table",
             sql: format!("UPDATE {DATABASE}.{TABLE} SET name = 'qux' WHERE id = 40"),
             missing: TABLE,
             error_type: None,
+            statement_type: STATEMENT_TYPE_DML,
         },
         Case {
             name: "a DELETE from the dropped table",
             sql: format!("DELETE FROM {DATABASE}.{TABLE} WHERE id = 40"),
             missing: TABLE,
             error_type: None,
+            statement_type: STATEMENT_TYPE_DML,
         },
         Case {
             name: "an INSERT whose projection reads a table the catalog does not hold",
@@ -247,6 +259,7 @@ async fn every_failed_data_manipulating_statement_reports_an_error_type_beside_i
             ),
             missing: ABSENT_TABLE,
             error_type: not_found,
+            statement_type: STATEMENT_TYPE_DML,
         },
         Case {
             name: "a CREATE TABLE AS SELECT reading a table the catalog does not hold",
@@ -255,12 +268,16 @@ async fn every_failed_data_manipulating_statement_reports_an_error_type_beside_i
             ),
             missing: ABSENT_TABLE,
             error_type: not_found,
+            // A `CREATE TABLE` DEFINES a table, which is the class its form puts it in
+            // whichever way it states the rows the table holds.
+            statement_type: STATEMENT_TYPE_DDL,
         },
         Case {
             name: "a SELECT of the same dropped table, which is the READ path",
             sql: format!("SELECT id, name FROM {DATABASE}.{TABLE}"),
             missing: TABLE,
             error_type: not_found,
+            statement_type: STATEMENT_TYPE_DML,
         },
     ];
 
@@ -279,12 +296,13 @@ async fn every_failed_data_manipulating_statement_reports_an_error_type_beside_i
             "case {name:?}: {:?} must settle FAILED, got {found}",
             case.sql
         );
-        // Every row is a statement Athena classifies as DML, so what the rows below assert
-        // is the classification of the DATA path and not of some other kind of statement.
+        // What each row's statement is CLASSIFIED as, so what the rows below assert is the
+        // classification of a statement of that class and not of some other kind.
         assert_eq!(
             found["StatementType"].as_str(),
-            Some(STATEMENT_TYPE_DML),
-            "case {name:?}: expected the {STATEMENT_TYPE_DML} statement type, got {found}"
+            Some(case.statement_type),
+            "case {name:?}: expected the {} statement type, got {found}",
+            case.statement_type
         );
         let error = found["Status"]["AthenaError"].clone();
         let error_type = error["ErrorType"].as_i64();

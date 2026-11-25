@@ -649,6 +649,10 @@ pub mod json_reference_path;
 /// caller-supplied string, for every service that has to decide whether a value is a token
 /// at all before it reads a claim out of it.
 pub mod jwt;
+/// The ONE translation of the JVM datetime-formatter PATTERN notation an AWS API takes from
+/// a caller (`yyyy-MM-dd'T'HH:mm:ss`) into the format the date library reads and writes a
+/// datetime under, so two services cannot read one pattern's letters differently.
+pub mod java_date_pattern;
 /// The SIGNING half of that reading, for every emulated service that IS an OIDC issuer:
 /// the key pair it signs with, the public JWK its key set publishes, and the compact
 /// serialization a signed token travels in — held once so that what one issuer signs and

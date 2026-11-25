@@ -41,8 +41,15 @@ pub enum OutputFormat {
     Parquet,
     /// `JSON`: one JSON document per line, whose members are the columns.
     Json,
-    /// `TEXTFILE`: one line per row, fields separated by Hive's own default separator.
-    Text,
+    /// `TEXTFILE`: one line per row, fields separated by one character.
+    Text {
+        /// What separates two fields of a row: Hive's own default separator for a statement
+        /// that names the format itself ([`super::data::DEFAULT_FIELD_DELIMITER`]), and
+        /// otherwise the separator the table whose data is being written reads its own
+        /// records with ([`OutputFormat::of_stored`]) — so an object written here is read
+        /// back as the rows that were written.
+        separator: char,
+    },
 }
 
 /// The `format` value Athena's property takes for each format, so the name a statement
@@ -50,7 +57,12 @@ pub enum OutputFormat {
 const FORMAT_NAMES: &[(&str, OutputFormat)] = &[
     ("PARQUET", OutputFormat::Parquet),
     ("JSON", OutputFormat::Json),
-    ("TEXTFILE", OutputFormat::Text),
+    (
+        "TEXTFILE",
+        OutputFormat::Text {
+            separator: TEXT_SEPARATOR,
+        },
+    ),
 ];
 
 /// The format a `CREATE TABLE … AS <query>` that declares none writes: Athena's documented
@@ -62,9 +74,9 @@ pub const DEFAULT_TABLE_FORMAT: OutputFormat = OutputFormat::Parquet;
 /// (`super::data`'s own default null text).
 const TEXT_NULL: &str = "\\N";
 
-/// What separates two fields of a TEXTFILE object: Hive's own default field separator, the
-/// ASCII unit separator — the separator a table whose SerDe names none is read with
-/// ([`super::data::DEFAULT_FIELD_DELIMITER`]).
+/// What separates two fields of a TEXTFILE object a statement writes by NAME: Hive's own
+/// default field separator, the ASCII unit separator — the separator a table whose SerDe
+/// names none is read with ([`super::data::DEFAULT_FIELD_DELIMITER`]).
 const TEXT_SEPARATOR: char = super::data::DEFAULT_FIELD_DELIMITER;
 
 /// The value a partition key carries in a path when the rows of that partition have NO
@@ -97,6 +109,17 @@ impl OutputFormat {
             })
     }
 
+    /// The format an object APPENDED to a table's own data is written in: the one that
+    /// table's records are held in, so what this writes is what that table's own reader
+    /// reads back ([`super::data::StoredFormat`]).
+    pub fn of_stored(stored: super::data::StoredFormat) -> Self {
+        match stored {
+            super::data::StoredFormat::Parquet => Self::Parquet,
+            super::data::StoredFormat::Json => Self::Json,
+            super::data::StoredFormat::Delimited { separator } => Self::Text { separator },
+        }
+    }
+
     /// The extension the objects of this format carry, so an object says what it holds —
     /// including the compression it is written under, which is what a reader of such an
     /// object picks its decompressor by.
@@ -104,7 +127,7 @@ impl OutputFormat {
         match self {
             Self::Parquet => "parquet",
             Self::Json => "json.gz",
-            Self::Text => "txt.gz",
+            Self::Text { .. } => "txt.gz",
         }
     }
 
@@ -114,7 +137,7 @@ impl OutputFormat {
             // Both are binary: a Parquet file is a columnar container, and the two text
             // formats are written as the gzip stream their extension names.
             Self::Parquet => "application/octet-stream",
-            Self::Json | Self::Text => "application/gzip",
+            Self::Json | Self::Text { .. } => "application/gzip",
         }
     }
 
@@ -128,7 +151,7 @@ impl OutputFormat {
                 // Hive's `STORED AS JSONFILE` is text read by the JSON SerDe, which is how
                 // a table of one JSON document per line is stored.
                 Self::Json => "JSONFILE",
-                Self::Text => "TEXTFILE",
+                Self::Text { .. } => "TEXTFILE",
             }
             .to_string(),
         )
@@ -144,7 +167,7 @@ impl OutputFormat {
         match self {
             Self::Parquet => parquet_object(sheet),
             Self::Json => gzipped(json_object(sheet)),
-            Self::Text => gzipped(text_object(sheet)),
+            Self::Text { separator } => gzipped(text_object(sheet, separator)),
         }
     }
 }
@@ -419,14 +442,14 @@ fn gzipped(body: Vec<u8>) -> Result<Vec<u8>, Failure> {
         })
 }
 
-/// One object of delimited TEXT: one line per row, the fields separated by Hive's own
-/// default separator and a NULL written as the text Hive writes one as.
-fn text_object(sheet: &Sheet<'_>) -> Vec<u8> {
+/// One object of delimited TEXT: one line per row, the fields separated by `separator` and a
+/// NULL written as the text Hive writes one as.
+fn text_object(sheet: &Sheet<'_>, separator: char) -> Vec<u8> {
     let mut text = String::new();
     for row in &sheet.rows {
         for (position, value) in row.iter().enumerate() {
             if position > 0 {
-                text.push(TEXT_SEPARATOR);
+                text.push(separator);
             }
             text.push_str(value.unwrap_or(TEXT_NULL));
         }
@@ -738,7 +761,9 @@ mod tests {
         let cases: Vec<(&str, OutputFormat, Vec<&str>)> = vec![
             (
                 "delimited text writes Hive's own null text",
-                OutputFormat::Text,
+                OutputFormat::Text {
+                    separator: TEXT_SEPARATOR,
+                },
                 vec!["north", "\\N", "9007199254740993"],
             ),
             (
@@ -844,7 +869,12 @@ mod tests {
             ("PARQUET", Some(OutputFormat::Parquet)),
             ("parquet", Some(OutputFormat::Parquet)),
             (" JSON ", Some(OutputFormat::Json)),
-            ("TEXTFILE", Some(OutputFormat::Text)),
+            (
+                "TEXTFILE",
+                Some(OutputFormat::Text {
+                    separator: TEXT_SEPARATOR,
+                }),
+            ),
             ("ORC", None),
             ("AVRO", None),
             ("", None),

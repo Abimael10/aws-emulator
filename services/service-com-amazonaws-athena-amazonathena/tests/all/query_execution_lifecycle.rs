@@ -286,9 +286,9 @@ fn query_cases() -> Vec<QueryCase> {
         QueryCase {
             case: "a definition statement that writes the rows a query produced",
             sql: "CREATE TABLE lifecycle_ctas AS SELECT 1 AS n UNION ALL SELECT 2",
-            // `CREATE TABLE AS SELECT` manipulates data as well as defining a table,
-            // which is the class Athena puts it in.
-            statement_type: query_engine::STATEMENT_TYPE_DML,
+            // A `CREATE TABLE` DEFINES a table, which is the class its own form puts it in
+            // whichever way it states the rows the table holds.
+            statement_type: query_engine::STATEMENT_TYPE_DDL,
             columns: Some(vec![]),
             rows: Some(vec![]),
         },

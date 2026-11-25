@@ -223,10 +223,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => {
                     return Err(invalid_request(
                         crate::state::ERROR_CODE_INVALID_INPUT,
-                        format!(
-                            "Query result type {QUERY_RESULT_TYPE_DATA_MANIFEST} is not \
-                             available: this query wrote no data manifest"
-                        ),
+                        crate::state::no_data_manifest(&input.query_execution_id),
                     ))
                 }
             },

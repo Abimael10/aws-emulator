@@ -25,6 +25,7 @@ use ::service_com_amazonaws_s3_amazons3::state as s3_state;
 
 use super::ddl;
 use super::hive_types;
+use super::partition_projection;
 use super::statement::{self, DeclaredColumn, Relation};
 use super::Failure;
 use crate::state::lake_formation::ReadScope;
@@ -227,6 +228,11 @@ pub struct DataSource {
     /// ([`Self::pruned`]), which is what makes a filtered read of a partitioned table scan
     /// only the partitions it can read rows from.
     partition_filter: Vec<Option<Vec<String>>>,
+    /// The values each PARTITION KEY takes under the projection this table DECLARES, in key
+    /// order, or `None` for a table whose partitions are the ones the catalog records
+    /// ([`partition_projection`]). A value outside the projection addresses no partition of
+    /// the table, so the prefix naming it is no part of the table's data.
+    projection: Option<Vec<partition_projection::KeyProjection>>,
 }
 
 /// One PARTITION of a catalog table as a read of it addresses it: the values that address
@@ -521,7 +527,15 @@ impl DataSource {
             return Err(Failure::invalid_column_type(&column.name, &column.data_type));
         }
         let location = storage.and_then(|storage| storage.location.clone());
-        let partition_keys = ddl::partition_key_columns(table).len();
+        let partition_keys = ddl::partition_key_columns(table);
+        let projection = partition_projection::declared(
+            &table_parameters,
+            &partition_keys
+                .iter()
+                .map(|column| column.name.clone())
+                .collect::<Vec<String>>(),
+        );
+        let partition_keys = partition_keys.len();
         Ok(Self {
             relation: relation.clone(),
             local_name: relation.local_name(),
@@ -531,6 +545,7 @@ impl DataSource {
             // Every partition of the table is scanned, until the statement's own predicate
             // narrows which of them can hold a row it reads.
             partition_filter: vec![None; partition_keys],
+            projection,
             partition_keys,
             partitions: partition_splits(table, location.as_deref()),
             columns,
@@ -777,6 +792,14 @@ impl DataSource {
                         None => continue,
                     },
                 };
+                // An object whose partition can hold no row this read answers with is not
+                // scanned either: the partition is outside what the table PROJECTS, so it is
+                // no partition of the table at all, or outside what the statement's own
+                // predicate admits — the same rule a read of the catalog's own partitions
+                // applies before it lists one ([`Self::scans`]).
+                if !self.admits(&partition) || !self.projects(&partition) {
+                    continue;
+                }
                 // What this read SCANNED is charged before the object is decoded: the
                 // cutoff the query's workgroup sets and this emulator's own cap are both
                 // measured on the stored data a read goes through
@@ -921,7 +944,9 @@ impl DataSource {
     ///   partition's own values;
     /// * a partitioned table whose partitions the catalog holds none of — the table whose
     ///   partitions Athena PROJECTS rather than registers — is read under its own location,
-    ///   and the partition a row belongs to is the one its object's path names.
+    ///   and the partition a row belongs to is the one its object's path names, which is
+    ///   judged against the declared projection where the objects are listed
+    ///   ([`Self::projects`]).
     fn scans(&self, location: &str) -> Vec<Scan> {
         if self.partition_keys == 0 || self.partitions.is_empty() {
             return vec![Scan {
@@ -931,12 +956,32 @@ impl DataSource {
         }
         self.partitions
             .iter()
-            .filter(|partition| self.admits(&partition.values))
+            .filter(|partition| {
+                self.admits(&partition.values) && self.projects(&partition.values)
+            })
             .map(|partition| Scan {
                 location: partition.location.clone(),
                 values: Some(partition.values.clone()),
             })
             .collect()
+    }
+
+    /// Whether the partition addressed by `values` is one of the partitions this table
+    /// PROJECTS.
+    ///
+    /// A table whose properties declare partition projection has its partitions computed
+    /// from those properties, so a value outside what they declare addresses no partition of
+    /// the table and the prefix naming it holds none of its data. A table that declares no
+    /// projection projects nothing, and every partition of it is its own
+    /// ([`partition_projection`]).
+    fn projects(&self, values: &[String]) -> bool {
+        let Some(projection) = self.projection.as_deref() else {
+            return true;
+        };
+        projection
+            .iter()
+            .zip(values)
+            .all(|(key, value)| key.admits(value))
     }
 
     /// Whether a partition addressed by `values` can hold a row the statement reads.
@@ -1373,7 +1418,7 @@ pub fn engine_type(data_type: &str) -> &'static str {
 /// A property a client wrote through the catalog API carries whatever name that client
 /// spelled, so a reader that matched the name byte for byte would miss the same property
 /// under another spelling of its case.
-fn property<'held>(
+pub(super) fn property<'held>(
     parameters: &'held HashMap<String, String>,
     name: &str,
 ) -> Option<&'held str> {
@@ -1398,6 +1443,54 @@ fn is_iceberg(
         || library.trim().eq_ignore_ascii_case(ICEBERG_SERDE)
         || input_format
             .is_some_and(|format| format.trim().eq_ignore_ascii_case(ICEBERG_INPUT_FORMAT))
+}
+
+/// How the objects at one catalog table's location hold their records, as a WRITER of
+/// another such object needs to know it.
+///
+/// A statement that APPENDS to a table's data has to write what that table's own reader
+/// reads, so the format comes off the catalog entry rather than off the statement: the
+/// columnar format, one JSON document per line, or delimited text with the character that
+/// separates two of its fields. A quoted-text SerDe's quote character is not carried, because
+/// what a writer has to get right for the records to read back is the separator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredFormat {
+    /// The columnar Parquet format.
+    Parquet,
+    /// One JSON document per line, whose members are the columns.
+    Json,
+    /// One record per line, fields separated by a character.
+    Delimited {
+        /// What separates two fields.
+        separator: char,
+    },
+}
+
+/// How the objects at `table`'s location hold their records, or `None` for a storage format
+/// this emulator does not WRITE — which is every format it does not read, and the quoted-text
+/// SerDe whose quoting a writer here does not reproduce.
+#[must_use]
+pub fn stored_format(table: &glue_state::TableEntry) -> Option<StoredFormat> {
+    let storage = table.storage_descriptor.as_ref();
+    let serde = storage.and_then(|storage| storage.serde_info.as_ref());
+    let parameters: HashMap<String, String> = serde
+        .and_then(|serde| serde.parameters.clone())
+        .unwrap_or_default();
+    let library = serde
+        .and_then(|serde| serde.serialization_library.clone())
+        .unwrap_or_else(|| ddl::LAZY_SIMPLE_SERDE.to_string());
+    let input_format = storage.and_then(|storage| storage.input_format.clone());
+    match decoder_of(&library, input_format.as_deref(), &parameters)? {
+        Decoder::Parquet => Some(StoredFormat::Parquet),
+        Decoder::Json => Some(StoredFormat::Json),
+        Decoder::Delimited {
+            separator,
+            quote: None,
+        } => Some(StoredFormat::Delimited { separator }),
+        // A SerDe that QUOTES its fields reads records this writer does not write: the rows
+        // it wrote would read back as other rows wherever a value carries the separator.
+        Decoder::Delimited { .. } => None,
+    }
 }
 
 /// How a table stored with the SerDe `library` under the input format `input_format` is

@@ -2704,6 +2704,19 @@ pub fn results_not_readable(state: &str) -> String {
     }
 }
 
+/// The message a read of a query's DATA MANIFEST answers with when that query generates
+/// none.
+///
+/// Only the statements that WRITE their output have a manifest, which Athena states by
+/// naming those statements and then the query that is not one of them: fixed text either
+/// side of the `QueryExecutionId` the request addressed, which is its one variable part.
+pub fn no_data_manifest(id: &str) -> String {
+    format!(
+        "Manifest files are only available for INSERT, CTAS (CREATE TABLE AS SELECT), and \
+         UNLOAD queries. query {id} does not generate a manifest file."
+    )
+}
+
 /// The message a paginated read refuses a `NextToken` it did not mint with.
 ///
 /// Amazon Athena calls that value a nextPageToken inside this sentence and words the

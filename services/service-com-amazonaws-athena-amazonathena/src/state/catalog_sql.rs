@@ -44,6 +44,8 @@ pub mod hive_column_types;
 pub mod hive_types;
 /// Reading INTO a column whose value is a structure rather than one scalar.
 pub mod nested_values;
+/// The partitions a table PROJECTS rather than registers, as its properties declare them.
+pub mod partition_projection;
 /// The objects a statement WRITES, and the format and layout they are written in.
 pub mod query_output;
 /// What one submitted statement is, and the plan for running it.
@@ -202,6 +204,11 @@ const TARGET_DIRECTORY_EXISTS: &str = "Target directory already exists";
 /// RECORDED behaviour, like the code and the wording in front of it: the same fixture's
 /// execution reports this type beside [`ERROR_CATEGORY_USER`].
 pub const ERROR_TYPE_PATH_ALREADY_EXISTS: i32 = 1109;
+
+/// What Athena's message for a statement it will not perform at all opens with: the class a
+/// form of a statement Athena does not support belongs to. Fixed text, and the error code a
+/// client reads off the message.
+const NOT_SUPPORTED: &str = "NOT_SUPPORTED";
 
 /// What Athena's message for a TABLE PROPERTY a statement cannot be performed under opens
 /// with: the class a `partitioned_by` that does not match the query's own columns, and a
@@ -703,6 +710,49 @@ impl Failure {
         ))
     }
 
+    /// An `INSERT INTO` names a VIEW, which is not a relation rows can be appended to.
+    ///
+    /// Athena's class for a statement it will not perform at all, worded like its other
+    /// analysis failures: the `NOT_SUPPORTED: ` prefix is the code a client reads off the
+    /// message, the sentence after it is fixed text stating what is not supported, and the
+    /// line and column are where the statement named the view.
+    pub fn insert_into_a_view(target: &Relation) -> Self {
+        Self::user(format!(
+            "{NOT_SUPPORTED}: line {}:{}: Inserting into views is not supported",
+            target.at.line, target.at.column
+        ))
+    }
+
+    /// An `INSERT INTO` whose query projects a different number of values than the statement
+    /// writes columns.
+    ///
+    /// Athena's analysis refuses it in the class it reports for a statement whose values do
+    /// not fit the columns they are written into, worded like its other analysis failures: the
+    /// class prefix, the line and column the statement named the table at, and then the
+    /// sentence stating both counts — the columns the statement writes and the values its
+    /// query projects.
+    pub fn insert_column_count(at: Position, columns: usize, projected: usize) -> Self {
+        Self::user(format!(
+            "{TYPE_MISMATCH}: line {}:{}: Insert query has mismatched column count: Table \
+             has {columns} columns but query has {projected} columns",
+            at.line, at.column
+        ))
+    }
+
+    /// An `INSERT INTO` whose column list names a column its target table does not declare.
+    ///
+    /// The same class an unresolvable column anywhere else in a statement is reported in
+    /// ([`Self::column_not_found`]), in the words Athena's analysis states it for a column
+    /// written into: fixed text either side of the column the statement named, and the line
+    /// and column it named the table at.
+    pub fn insert_column_not_found(at: Position, column: &str) -> Self {
+        Self::user(format!(
+            "{COLUMN_NOT_FOUND}: line {}:{}: Insert column name does not exist in target \
+             table: {column}",
+            at.line, at.column
+        ))
+    }
+
     /// This failure as the outcome of a run that produced nothing.
     pub fn outcome(self) -> Outcome {
         // A LIMIT in force on the query stopped the run, which interrupts the query rather
@@ -830,6 +880,14 @@ pub fn execute<Eng: Send + Sync + 'static>(
         Plan::Written(writing) if defines_a_table_of_the_engines_own(engine, &writing) => {
             query_engine::run(handle, sql, reading.counts_rows, parameters)
         }
+        // An `INSERT INTO` naming a table the DATA CATALOG holds nothing for, which an
+        // earlier statement defined in this engine database, appends its rows there \u2014 the
+        // same reading [`drops_a_table_of_the_engines_own`] takes of a drop.
+        Plan::Written(writing)
+            if inserts_into_a_table_of_the_engines_own(engine, handle, &writing, context) =>
+        {
+            query_engine::run(handle, sql, reading.counts_rows, parameters)
+        }
         Plan::Catalog(statement) => {
             let started = Instant::now();
             let outcome = match perform(engine, &statement, now) {
@@ -891,13 +949,21 @@ pub fn execute<Eng: Send + Sync + 'static>(
         Plan::Written(writing) => {
             let started = Instant::now();
             let WritingStatement { query, destination } = *writing;
-            // WHERE the output goes is resolved BEFORE the query runs: a destination that
-            // already holds objects is refused rather than written over, and nothing about
-            // that refusal depends on the rows the query would produce.
-            let output = match resolved_destination(engine, &destination, submission) {
-                Ok(output) => output,
-                Err(failure) => return refused(failure, started),
-            };
+            // WHERE the output goes is resolved BEFORE the query runs for a statement that
+            // DEFINES what it writes over: a destination that already holds objects is
+            // refused rather than written over, and nothing about that refusal depends on
+            // the rows the query would produce. A statement that APPENDS to a table that is
+            // already there refuses no destination of its own, so its target is resolved
+            // after the query, where the names the query reads are resolved first
+            // ([`WriteDestination::is_settled_before_the_query`]).
+            let settled = destination.is_settled_before_the_query();
+            let mut output = None;
+            if settled {
+                output = match resolved_destination(engine, &destination, submission) {
+                    Ok(output) => Some(output),
+                    Err(failure) => return refused(failure, started),
+                };
+            }
             match resolved_sql(engine, handle, query, context, access, scan_cutoff, sql) {
                 Ok(prepared) => {
                     // The query is run exactly as any other read is, and measured the same
@@ -914,6 +980,23 @@ pub fn execute<Eng: Send + Sync + 'static>(
                     );
                     completion.planning_time = planning_time;
                     classify_unresolvable_name(&mut completion, sql, &prepared.hidden_columns);
+                    // A run that produced no rows to write is left exactly as the engine
+                    // reported it, so the destination of such a statement is never resolved.
+                    if !matches!(completion.outcome, Outcome::Succeeded { .. }) {
+                        return completion;
+                    }
+                    let output = match output {
+                        Some(output) => output,
+                        None => match resolved_destination(engine, &destination, submission) {
+                            Ok(output) => output,
+                            Err(failure) => {
+                                return Completion {
+                                    outcome: failure.outcome(),
+                                    ..completion
+                                }
+                            }
+                        },
+                    };
                     // What the query produced is now in hand: it is WRITTEN rather than
                     // answered with, and what the statement defines over it is registered.
                     written(engine, &destination, &output, completion, submission)
@@ -989,7 +1072,109 @@ fn resolved_destination<Eng: Send + Sync + 'static>(
             }
             Ok(output)
         }
+        WriteDestination::Insert(insert) => {
+            // The target is the table the catalog ALREADY holds: where its data lives and
+            // the format its objects are stored in are its own, not the statement's.
+            let target = insert_target(engine, insert)?;
+            let output = Destination::of(
+                &target.location,
+                OutputFormat::of_stored(target.format),
+                submission.id,
+                insert.target.at,
+            )?;
+            if output.bucket_is_absent(engine) {
+                return Err(Failure::destination_not_writable(&output.written));
+            }
+            // A location already holding objects is NOT refused here: this statement
+            // APPENDS one object to the table's data, which is what the objects already
+            // there are. The object is named after the execution, so it replaces none of
+            // them.
+            Ok(output)
+        }
     }
+}
+
+/// What the Data Catalog holds for the table an `INSERT INTO` appends to.
+#[derive(Debug, Clone)]
+struct InsertTarget {
+    /// Where the table's data lives, as its storage descriptor records it.
+    location: String,
+    /// The format its objects hold their records in, which is the format the appended
+    /// object is written in so the table's own reader reads it back.
+    format: data::StoredFormat,
+    /// The table's columns, in order: the storage descriptor's, and then the partition keys
+    /// ([`ddl::relation_columns`]).
+    columns: Vec<DeclaredColumn>,
+    /// How many of the LAST [`Self::columns`] are partition keys, whose values decide which
+    /// directory under the location a row's object goes in.
+    partition_keys: usize,
+    /// Whether the table's partitions are PROJECTED from its own properties rather than
+    /// recorded in the catalog ([`partition_projection`]): a partition of such a table is
+    /// not registered when its data is written, because the properties are what says which
+    /// partitions the table has.
+    projects_partitions: bool,
+}
+
+/// What the catalog holds for `insert`'s target, or why nothing can be appended to it.
+///
+/// A name the catalog resolves nothing for is the not-found refusal for the relation, exactly
+/// as a READ of that name reports it; a VIEW is not a relation rows can be appended to; and a
+/// table whose data this emulator could not write back in the format the table's own reader
+/// reads is reported rather than written as something else.
+fn insert_target<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    insert: &statement::InsertStatement,
+) -> Result<InsertTarget, Failure> {
+    let catalog_id = catalog_id_of(engine, &insert.target.catalog, insert.target.at)?;
+    let Some(state) = glue_state::service_state(engine) else {
+        return Err(Failure::emulator(CATALOG_UNREACHABLE));
+    };
+    let store = state.lock();
+    let database = match store.database(&catalog_id, &insert.target.database) {
+        Some(database) => database,
+        // A database the catalog SERVES without holding a record of it holds no relation at
+        // all, so what the statement named is the relation that is not there.
+        None if served_without_record(&insert.target.database) => {
+            return Err(Failure::table_not_found(&insert.target))
+        }
+        None => return Err(Failure::schema_not_found(&insert.target)),
+    };
+    let Some(table) = database.tables.get(&insert.target.table) else {
+        return Err(Failure::table_not_found(&insert.target));
+    };
+    if ddl::is_view(table) {
+        return Err(Failure::insert_into_a_view(&insert.target));
+    }
+    let location = table
+        .storage_descriptor
+        .as_ref()
+        .and_then(|storage| storage.location.clone())
+        .map(|location| location.trim().to_string())
+        .filter(|location| !location.is_empty())
+        .ok_or_else(|| Failure::user(statement::NO_TABLE_LOCATION.to_string()))?;
+    let format = data::stored_format(table).ok_or_else(|| {
+        Failure::emulator(format!(
+            "the data of {}.{} is stored in a format this emulator's query engine does not \
+             write, so no statement can append rows to it",
+            insert.target.database, insert.target.table
+        ))
+    })?;
+    let keys: Vec<String> = ddl::partition_key_columns(table)
+        .iter()
+        .map(|column| column.name.clone())
+        .collect();
+    let projects_partitions = partition_projection::declared(
+        &table.parameters.clone().unwrap_or_default(),
+        &keys,
+    )
+    .is_some();
+    Ok(InsertTarget {
+        location,
+        format,
+        columns: ddl::relation_columns(table),
+        partition_keys: keys.len(),
+        projects_partitions,
+    })
 }
 
 /// Where the data of the table a `CREATE TABLE … AS <query>` defines is written: the
@@ -1056,11 +1241,19 @@ fn written<Eng: Send + Sync + 'static>(
         } => {
             let outcome = match write_output(engine, destination, output, &result, submission) {
                 Ok(written_objects) => Outcome::Succeeded {
+                    // "The number of rows inserted with a CREATE TABLE AS SELECT, INSERT
+                    // INTO, or UPDATE statement": a statement that APPENDS rows to a table
+                    // counts the rows it appended, which are the rows its query produced.
+                    update_count: match destination {
+                        WriteDestination::Insert(..) => {
+                            Some(i64::try_from(result.rows.len()).unwrap_or(i64::MAX))
+                        }
+                        WriteDestination::Table(..) | WriteDestination::Unload(..) => None,
+                    },
                     // The rows were WRITTEN, not returned: a read of this execution's
                     // results reports the empty result set rather than the rows of the
                     // query that produced the objects.
                     result: StoredResultSet::default(),
-                    update_count: None,
                     data_scanned_bytes,
                     input_rows,
                     written_objects,
@@ -1117,7 +1310,157 @@ fn write_output<Eng: Send + Sync + 'static>(
         WriteDestination::Table(table) => {
             written_table(engine, table, output, result, submission).map(Some)
         }
+        WriteDestination::Insert(insert) => {
+            written_insert(engine, insert, output, result, submission).map(Some)
+        }
     }
+}
+
+/// APPEND the rows `result` holds to the table an `INSERT INTO` names: one new object per
+/// partition they fall into, under that table's own location.
+///
+/// The object carries the table's OWN columns, in the table's own order: a value the query
+/// produced goes into the column the statement's column list puts it in, and a column the
+/// statement writes nothing for carries no value — because that is how the table's reader
+/// reads the fields back, positionally against the columns the catalog declares. The rows are
+/// grouped by the values of the partition keys, which are the LAST columns of the table, so
+/// each object lands in the Hive directory its partition's values name, exactly as a read of
+/// that table resolves one.
+///
+/// The object is named after the EXECUTION, so it replaces no object already under the
+/// location: a second `INSERT` adds a second object and a later read answers with the union
+/// of the rows.
+fn written_insert<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    insert: &statement::InsertStatement,
+    output: &Destination,
+    result: &StoredResultSet,
+    submission: &Submission<'_>,
+) -> Result<Vec<String>, Failure> {
+    // The target is read again rather than carried from the destination resolution: what the
+    // write needs of it is the COLUMNS the rows are laid out against, and the catalog's guard
+    // is taken once for each read and released before the objects are written.
+    let target = insert_target(engine, insert)?;
+    let data_columns = target.columns.len().saturating_sub(target.partition_keys);
+    let keys: Vec<String> = target
+        .columns
+        .iter()
+        .skip(data_columns)
+        .map(|column| column.name.clone())
+        .collect();
+    let writes = insert_columns(&target, insert, result.column_info.len())?;
+    let columns: Vec<SheetColumn<'_>> = target
+        .columns
+        .iter()
+        .map(|column| SheetColumn {
+            name: column.name.as_str(),
+            data_type: data::engine_type(&column.data_type),
+        })
+        .collect();
+    let produced = sheet_values(result);
+    let mut values: Vec<Vec<Option<&str>>> = Vec::with_capacity(produced.len());
+    for row in &produced {
+        let mut laid_out: Vec<Option<&str>> = vec![None; target.columns.len()];
+        for (at, value) in row.iter().enumerate() {
+            let Some(column) = writes.get(at).copied() else {
+                continue;
+            };
+            if let Some(cell) = laid_out.get_mut(column) {
+                *cell = *value;
+            }
+        }
+        values.push(laid_out);
+    }
+    let partitions = query_output::partitioned(&values, keys.len())?;
+    let mut objects = Vec::new();
+    let mut directories: Vec<(Vec<String>, String)> = Vec::new();
+    for partition in &partitions {
+        // A partition with no row of its own is no partition this statement wrote: nothing
+        // was written there, so there is no object and no record for it.
+        if partition.rows.is_empty() {
+            continue;
+        }
+        let sheet = Sheet {
+            columns: columns[..data_columns].to_vec(),
+            rows: partition
+                .rows
+                .iter()
+                .filter_map(|at| values.get(*at))
+                .map(|row| row.iter().take(data_columns).copied().collect())
+                .collect(),
+        };
+        let directory = query_output::partition_directory(output, &keys, &partition.values);
+        objects.push(query_output::object_of(output, &directory, &sheet)?);
+        if !partition.values.is_empty() {
+            directories.push((partition.values.clone(), directory));
+        }
+    }
+    let written = query_output::store(engine, objects, submission.encryption)?;
+
+    // The partitions the appended rows belong to are registered once their objects are
+    // really there, exactly as a `CREATE TABLE … AS <query>` registers the ones it wrote —
+    // unless the table's partitions are PROJECTED, in which case its own properties say
+    // which partitions it has and the catalog holds none of them.
+    if !directories.is_empty() && !target.projects_partitions {
+        let catalog_id = catalog_id_of(engine, &insert.target.catalog, insert.target.at)?;
+        let Some(state) = glue_state::service_state(engine) else {
+            return Err(Failure::emulator(CATALOG_UNREACHABLE));
+        };
+        let mut store = state.lock();
+        ddl::register_partitions(
+            &mut store,
+            &catalog_id,
+            &insert.target,
+            &directories,
+            submission.now,
+        )?;
+    }
+    Ok(written)
+}
+
+/// Which of the target table's columns each value the query produced is written into, in
+/// projection order.
+///
+/// The statement's own column list says it where it has one, and otherwise the values go into
+/// the table's columns in the table's own order — which is what an `INSERT` with no column
+/// list writes. A list naming a column the table does not declare, and a projection of a
+/// different number of values than the statement writes columns, are refused: either would
+/// write a row into columns the statement did not name.
+fn insert_columns(
+    target: &InsertTarget,
+    insert: &statement::InsertStatement,
+    projected: usize,
+) -> Result<Vec<usize>, Failure> {
+    if insert.columns.is_empty() {
+        if projected != target.columns.len() {
+            return Err(Failure::insert_column_count(
+                insert.target.at,
+                target.columns.len(),
+                projected,
+            ));
+        }
+        return Ok((0..target.columns.len()).collect());
+    }
+    if projected != insert.columns.len() {
+        return Err(Failure::insert_column_count(
+            insert.target.at,
+            insert.columns.len(),
+            projected,
+        ));
+    }
+    insert
+        .columns
+        .iter()
+        .map(|named| {
+            target
+                .columns
+                .iter()
+                .position(|column| glue_state::fold_name(&column.name) == *named)
+                .ok_or_else(|| {
+                    Failure::insert_column_not_found(insert.target.at, named)
+                })
+        })
+        .collect()
 }
 
 /// Write the data of the table a `CREATE TABLE … AS <query>` defines, and register the
@@ -1545,6 +1888,47 @@ fn defines_a_table_of_the_engines_own<Eng: Send + Sync + 'static>(
     store
         .database(&catalog_id, &table.target.database)
         .is_none()
+}
+
+/// Whether `writing` is an `INSERT INTO` whose target the DATA CATALOG holds no table for,
+/// and which therefore appends its rows to a table of the ENGINE's own.
+///
+/// The same reading [`drops_a_table_of_the_engines_own`] takes of a drop: a `CREATE TABLE`
+/// that declares no location defines its table in the engine database the query's context
+/// addresses, so a write into a name the catalog resolves no table for goes where that
+/// create put it — either because the catalog holds no database of that name at all, or
+/// because the database it holds has no such table while THIS engine database does. A name
+/// the catalog does resolve is a catalog table: the rows are appended to its own data, which
+/// includes the catalog's own table-does-not-exist refusal for one it no longer holds.
+fn inserts_into_a_table_of_the_engines_own<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    handle: &DatabaseHandle,
+    writing: &WritingStatement,
+    context: &QueryContext,
+) -> bool {
+    let WriteDestination::Insert(insert) = &writing.destination else {
+        return false;
+    };
+    let Ok(catalog_id) = catalog_id_of(engine, &insert.target.catalog, insert.target.at) else {
+        return false;
+    };
+    let Some(state) = glue_state::service_state(engine) else {
+        return false;
+    };
+    let recorded = {
+        let store = state.lock();
+        store
+            .database(&catalog_id, &insert.target.database)
+            .map(|database| database.tables.contains_key(&insert.target.table))
+    };
+    // The catalog holding the table settles it: the rows go into that table's own data.
+    // Otherwise the name may be a table an earlier statement defined in THIS engine
+    // database, which is where a read of that name resolves it too (see `resolved_sql`) —
+    // and a name NEITHER holds is the catalog's own not-found refusal, reported in Athena's
+    // words rather than the engine's.
+    recorded != Some(true)
+        && insert.target.database == glue_state::fold_name(&context.database)
+        && query_engine::holds_relation(handle, &insert.target.table)
 }
 
 /// Forget the PARTITION INDEX records of the tables a drop removed.
