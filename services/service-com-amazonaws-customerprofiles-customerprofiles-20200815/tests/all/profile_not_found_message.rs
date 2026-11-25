@@ -35,7 +35,7 @@ const OTHER_DOMAIN: &str = "elsewheredom";
 
 /// The service's fixed profile-not-found sentence, with the request's `ProfileId` as its
 /// one variable part.
-fn expected_message(profile_id: &str) -> String {
+pub(crate) fn expected_message(profile_id: &str) -> String {
     format!("Profile with profileId {profile_id} is not found in the domain")
 }
 

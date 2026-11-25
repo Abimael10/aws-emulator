@@ -194,12 +194,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // read reports rather than appearing only once something else writes.
             domain.expire_profile_objects(now);
             // The history is the profile's own, so a profile this domain does not hold has
-            // none to report: it is the absent resource, not an empty page. Worded with
-            // the sentence this service reports an absent profile with wherever one is
-            // addressed by id (`crate::state::profile_not_found`), so the same unheld id
-            // reads the same whichever operation was called.
+            // none to report: it is the absent resource, not an empty page. This listing
+            // words that absence with its OWN sentence, which names the domain the id was
+            // looked for in as well as the id — not the service's generic by-id sentence
+            // (`crate::state::profile_not_found`) the per-profile writes use.
             if !domain.profiles.contains_key(&input.profile_id) {
-                return Err(not_found(crate::state::profile_not_found(&input.profile_id)));
+                return Err(not_found(profile_not_found_in_domain(
+                    &input.profile_id,
+                    &input.domain_name,
+                )));
             }
 
             let listed = domain
@@ -243,6 +246,16 @@ fn invalid_page() -> ListProfileHistoryRecordsError {
         )),
     })
     .into()
+}
+
+/// The `ResourceNotFoundException` message this operation words an absent profile with: a
+/// fixed sentence whose variable parts are BOTH identifiers the request carried — the
+/// `ProfileId` whose history was asked for and the `DomainName` it was looked for in.
+/// Specific to this listing: the operations that WRITE one profile report an id the domain
+/// does not hold with the service's generic by-id sentence
+/// ([`crate::state::profile_not_found`]), which names no domain.
+fn profile_not_found_in_domain(profile_id: &str, domain_name: &str) -> String {
+    format!("Profile {profile_id} not found in domain {domain_name}")
 }
 
 /// A domain or profile the request names is not stored.

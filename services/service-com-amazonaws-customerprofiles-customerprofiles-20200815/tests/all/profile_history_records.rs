@@ -57,10 +57,12 @@ fn caller_principal() -> String {
     ::service_common::caller_principal::ambient_user_arn()
 }
 
-/// The sentence this service reports an absent profile with, wherever one is addressed by
-/// id (`tests/all/profile_not_found_message.rs` pins it across those operations).
-fn profile_not_found(profile_id: &str) -> String {
-    format!("Profile with profileId {profile_id} is not found in the domain")
+/// The sentence THIS listing reports an absent profile with: both the id asked for and the
+/// domain it was looked for in (`tests/all/profile_history_not_found_message.rs` spans the
+/// rule, and `tests/all/profile_not_found_message.rs` pins the DIFFERENT generic by-id
+/// sentence the per-profile writes use).
+fn profile_not_found(profile_id: &str, domain: &str) -> String {
+    format!("Profile {profile_id} not found in domain {domain}")
 }
 
 /// `ListProfileHistoryRecords` over the wire:
@@ -615,9 +617,9 @@ async fn a_page_size_walks_the_whole_history_in_order() {
 
 /// A listing answers from the store, so a domain or profile the store does not hold is the
 /// absent resource rather than an empty page — including a profile whose deletion took its
-/// history with it. The sentence is the one this service reports that resource's absence
-/// with wherever it is addressed, so the same unheld name or id reads the same whichever
-/// operation was called.
+/// history with it. An absent domain reads with the sentence this service reports a domain's
+/// absence with wherever one is addressed; an absent profile reads with THIS listing's own
+/// sentence, which names the domain the id was looked for in as well as the id.
 #[tokio::test]
 async fn a_domain_or_profile_the_store_does_not_hold_is_not_found() {
     let emulator = Emulator::new();
@@ -643,19 +645,19 @@ async fn a_domain_or_profile_the_store_does_not_hold_is_not_found() {
             "a profile id nothing created",
             domain,
             unknown_id(1),
-            profile_not_found(&unknown_id(1)),
+            profile_not_found(&unknown_id(1), domain),
         ),
         (
             "another unheld profile id",
             domain,
             unknown_id(2),
-            profile_not_found(&unknown_id(2)),
+            profile_not_found(&unknown_id(2), domain),
         ),
         (
             "a profile whose delete took its history",
             domain,
             deleted.clone(),
-            profile_not_found(&deleted),
+            profile_not_found(&deleted, domain),
         ),
     ];
 
