@@ -16,6 +16,9 @@
 //! * a tag write persists onto the STORED record of the resource the ARN names, whatever
 //!   kind of resource that is, and a later read reports exactly what was written: the keys
 //!   a write carried are added or replaced and the ones it did not name are left alone;
+//! * a tag removal takes off the stored record exactly the keys it NAMES, whatever their
+//!   values were, and leaves every other tag of that resource alone; a key the resource
+//!   does not carry takes nothing off and is still a success;
 //! * a well-formed `AscResourceArn` naming a resource the store does not hold is a
 //!   `ResourceNotFoundException` (404) rather than a tag held against nothing.
 //!
@@ -29,6 +32,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use bytes::Bytes;
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde_json::{json, Value};
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
 use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts;
@@ -219,6 +223,29 @@ impl Emulator {
         .await
     }
 
+    /// `UntagResource` for `resource_arn`, signed with `access_key_id`.
+    ///
+    /// `tagKeys` is an `@httpQuery("tagKeys")` list
+    /// (`smithy_query(query="operation", operation="UntagResource", model_path="services/service-com-amazonaws-supplychain-galaxypublicapigateway/smithy-model/com-amazonaws-supplychain-galaxypublicapigateway.json")`),
+    /// so every key travels as its own `tagKeys=` parameter of the DELETE.
+    async fn untag_as(
+        &self,
+        access_key_id: &str,
+        resource_arn: &str,
+        tag_keys: &[String],
+    ) -> (u16, Value) {
+        let query: Vec<String> = tag_keys
+            .iter()
+            .map(|key| format!("tagKeys={}", query_encoded(key)))
+            .collect();
+        let mut path = format!("/api/tags/{}", encoded(resource_arn));
+        if !query.is_empty() {
+            path.push('?');
+            path.push_str(&query.join("&"));
+        }
+        self.send_as(access_key_id, "DELETE", &path, None).await
+    }
+
     /// `ListTagsForResource` for `resource_arn`, signed with `access_key_id`.
     async fn list_tags_as(&self, access_key_id: &str, resource_arn: &str) -> (u16, Value) {
         self.send_as(
@@ -261,6 +288,14 @@ fn encoded(arn: &str) -> String {
     arn.replace('%', "%25")
         .replace(':', "%3A")
         .replace('/', "%2F")
+}
+
+/// One query-parameter VALUE. `tagKeys` is `@httpQuery`, so a tag key carrying a space or
+/// one of the separators a query string gives meaning to (`&`, `=`, `/`, `:`) reaches the
+/// server only percent-encoded; the encoding is the maintained `percent-encoding` crate's,
+/// over everything outside the alphanumerics, which is what an SDK does to a query value.
+fn query_encoded(value: &str) -> String {
+    utf8_percent_encode(value, NON_ALPHANUMERIC).to_string()
 }
 
 /// The ARN of one instance, as this service mints it.
@@ -703,6 +738,12 @@ async fn an_arn_naming_no_stored_resource_is_a_not_found() {
                 "ListTagsForResource",
                 emulator.list_tags_as(ACCOUNT_KEY_ID, &arn).await,
             ),
+            (
+                "UntagResource",
+                emulator
+                    .untag_as(ACCOUNT_KEY_ID, &arn, &["team".to_string()])
+                    .await,
+            ),
         ]
         .map(|(what, (status, body))| (what, status, body))
         {
@@ -728,4 +769,225 @@ async fn an_arn_naming_no_stored_resource_is_a_not_found() {
             .is_empty(),
         "case \"the live instance\": a refused tag call must persist nothing"
     );
+}
+
+/// The tags a removal starts from.
+///
+/// The keys differ in FORM — plain, carrying the separators a query string gives meaning
+/// to, spaced, and at each published bound of `TagKey`'s length (`min: 1, max: 128`, from
+/// `smithy_query(query="shape", shape="TagKey", model_path="services/service-com-amazonaws-supplychain-galaxypublicapigateway/smithy-model/com-amazonaws-supplychain-galaxypublicapigateway.json")`) —
+/// because the keys to remove travel in the query string while the keys to write travel in
+/// the body, and the removal is BY KEY.
+fn seeded_tags() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("team".to_string(), "sim2real".to_string()),
+        ("tier".to_string(), "dev".to_string()),
+        ("cost:center/sub&unit".to_string(), "17".to_string()),
+        ("owner name".to_string(), "supply chain".to_string()),
+        ("k".to_string(), String::new()),
+        ("K".repeat(128), "the longest key the model admits".to_string()),
+    ])
+}
+
+/// RULE: a tag removal takes off the stored record of the resource the ARN names exactly
+/// the keys it NAMES, whatever their values were, and leaves every other tag of that
+/// resource alone; a key the resource does not carry takes nothing off and is still a
+/// success, so the operation can be replayed.
+#[tokio::test]
+async fn a_tag_removal_takes_off_only_the_keys_it_names() {
+    let emulator = Emulator::new();
+    let instance_id = emulator.given_instance("untag-round-trip").await;
+    emulator.given_namespace(&instance_id, "orders").await;
+    emulator
+        .given_dataset(&instance_id, "default", "shipments")
+        .await;
+
+    // One per kind of resource an `AscResourceArn` of this service names.
+    let resources = [
+        ("the instance itself", instance_arn(&instance_id)),
+        (
+            "a data lake namespace",
+            format!("{}/namespaces/orders", instance_arn(&instance_id)),
+        ),
+        (
+            "a data lake dataset",
+            format!(
+                "{}/namespaces/default/datasets/shipments",
+                instance_arn(&instance_id)
+            ),
+        ),
+    ];
+
+    for (resource, arn) in resources {
+        let seeded = seeded_tags();
+        let (status, body) = emulator
+            .tag_as(ACCOUNT_KEY_ID, &arn, json!(seeded.clone()))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {resource:?}: TagResource expected 200, got {status} with {body}"
+        );
+
+        // Rows differ along WHICH keys one removal names, and how many: one of several, a
+        // key the resource never carried, the same key twice, keys whose form the query
+        // string must escape, the keys at the length bounds, and every key that is left —
+        // applied in order to the same resource, so each row also asserts what the rows
+        // before it left behind.
+        let rows: Vec<(&str, Vec<String>)> = vec![
+            ("one key of several", vec!["tier".to_string()]),
+            (
+                "a key the resource does not carry",
+                vec!["never-written".to_string()],
+            ),
+            (
+                "the same key named twice",
+                vec!["team".to_string(), "team".to_string()],
+            ),
+            (
+                "keys whose form the query string must escape",
+                vec![
+                    "cost:center/sub&unit".to_string(),
+                    "owner name".to_string(),
+                ],
+            ),
+            (
+                "the shortest and the longest key the model admits",
+                vec!["k".to_string(), "K".repeat(128)],
+            ),
+            (
+                "every key, when the resource carries none",
+                seeded.keys().cloned().collect(),
+            ),
+        ];
+
+        let mut expected = seeded.clone();
+        for (row, keys) in rows {
+            let case = format!("{resource}, {row}");
+            let (status, body) = emulator.untag_as(ACCOUNT_KEY_ID, &arn, &keys).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: UntagResource expected 200, got {status} with {body}"
+            );
+            for key in &keys {
+                expected.remove(key);
+            }
+            let reported = emulator.tags_of(&case, &arn).await;
+            assert_eq!(
+                reported, expected,
+                "case {case:?}: expected the tags the removal did not name, got {reported:?}"
+            );
+        }
+    }
+
+    // A removal reaches only the resource its ARN names: the same key on another resource
+    // of the same instance survives it.
+    let namespace_arn = format!("{}/namespaces/orders", instance_arn(&instance_id));
+    for arn in [&instance_arn(&instance_id), &namespace_arn] {
+        let (status, body) = emulator
+            .tag_as(ACCOUNT_KEY_ID, arn, json!({ "shared": "both" }))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case \"independence\": TagResource expected 200, got {status} with {body}"
+        );
+    }
+    let (status, body) = emulator
+        .untag_as(ACCOUNT_KEY_ID, &namespace_arn, &["shared".to_string()])
+        .await;
+    assert_eq!(
+        status, 200,
+        "case \"independence\": UntagResource expected 200, got {status} with {body}"
+    );
+    assert_eq!(
+        emulator
+            .tags_of("independence", &instance_arn(&instance_id))
+            .await,
+        BTreeMap::from([("shared".to_string(), "both".to_string())]),
+        "case \"independence\": a namespace's removal must not reach the instance's tags"
+    );
+    assert!(
+        emulator
+            .tags_of("independence", &namespace_arn)
+            .await
+            .is_empty(),
+        "case \"independence\": the namespace's own key must be gone"
+    );
+
+    // A key one character past `TagKey`'s published maximum is outside what the model
+    // admits, so the request is refused (400 `ValidationException`) and no tag is reached.
+    let case = "a key one past the longest the model admits";
+    let instance = instance_arn(&instance_id);
+    let (status, body) = emulator
+        .untag_as(ACCOUNT_KEY_ID, &instance, &["K".repeat(129)])
+        .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (400, "ValidationException"),
+        "case {case:?}: expected 400 ValidationException, got {status} with {body}"
+    );
+    assert_eq!(
+        emulator.tags_of(case, &instance).await,
+        BTreeMap::from([("shared".to_string(), "both".to_string())]),
+        "case {case:?}: a refused removal must take nothing off"
+    );
+}
+
+/// RULE: the tag removal is decided against the calling principal's identity-based policies
+/// under its OWN action name before anything is removed, so a principal no readable
+/// document grants `scn:UntagResource` to is answered 403 with IAM's own sentence and the
+/// resource keeps every tag it carried; a principal a matching `Allow` covers is served.
+#[tokio::test]
+async fn a_tag_removal_is_decided_against_the_callers_identity_policies() {
+    let action = format!("{ACTION_PREFIX}:UntagResource");
+    let rows = documents_in_force(&action, "arn:aws:scn:us-east-1:000000000000:instance/x").len();
+    for row in 0..rows {
+        let emulator = Emulator::new();
+        given_session(&emulator.engine);
+        let instance_id = emulator.given_instance("untag-authorization").await;
+        let arn = instance_arn(&instance_id);
+        let (status, body) = emulator
+            .tag_as(ACCOUNT_KEY_ID, &arn, json!({ "team": "sim2real" }))
+            .await;
+        assert_eq!(
+            status, 200,
+            "row {row}: TagResource expected 200, got {status} with {body}"
+        );
+
+        let mut in_force = documents_in_force(&action, &arn);
+        let (case, document, refusal) = in_force.remove(row);
+        given_role_policy(&emulator.engine, document.as_ref());
+
+        let (status, body) = emulator
+            .untag_as(SESSION_KEY_ID, &arn, &["team".to_string()])
+            .await;
+        match refusal {
+            Some(refusal) => {
+                assert_eq!(
+                    (status, error_code(&body).as_str()),
+                    (403, "AccessDeniedException"),
+                    "case {case:?}: expected 403 AccessDeniedException, got {status} with {body}"
+                );
+                assert_eq!(
+                    error_message(&body),
+                    not_authorized(&session_arn(), &action, &arn, refusal),
+                    "case {case:?}: expected IAM's refusal wording, got {body}"
+                );
+                assert_eq!(
+                    emulator.tags_of(case, &arn).await,
+                    BTreeMap::from([("team".to_string(), "sim2real".to_string())]),
+                    "case {case:?}: a refused removal must take nothing off"
+                );
+            }
+            None => {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: an authorized caller is served, got {status} with {body}"
+                );
+                assert!(
+                    emulator.tags_of(case, &arn).await.is_empty(),
+                    "case {case:?}: an authorized removal must persist"
+                );
+            }
+        }
+    }
 }
