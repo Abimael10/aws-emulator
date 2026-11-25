@@ -170,6 +170,23 @@
 //! carry ([`MAX_CAPTURED_BYTES`]), and how much output it may deliver
 //! ([`super::MAX_CONTAINER_LOG_LINES`]). The filesystem holds its own
 //! ([`super::container_filesystem`]).
+//!
+//! # A duration the program STATES is not time this emulator spends
+//!
+//! The seconds in a `sleep` are a caller's word about how long its program took, so this
+//! session does not spend them out of this emulator's wall clock while the program still has
+//! a command to run: the wait is taken as STATED and the next command runs at once
+//! ([`ContainerShell::states_a_wait_rather_than_spending_it`]). Otherwise a container's own
+//! words would decide how long this emulator takes to answer everything that waits on its
+//! task — the AWS Batch job whose dependents are held until this container ends, the
+//! deployment whose stabilisation is watched, the client polling the task — and the bound on
+//! that has to be the emulator's, like every bound above.
+//!
+//! The wait a program has nothing left to do but sit in is another thing entirely: a wait it
+//! ENDS on, a wait with no end of its own (`sleep infinity`, a foreground server), or one it
+//! goes round a loop on, is the container WAITING for something else to end it — the stop its
+//! task is sent, a file another container writes — which is how a container stays up. Those
+//! are honoured, up to the run's own deadline.
 
 use std::collections::BTreeMap;
 use std::pin::Pin;
@@ -702,6 +719,14 @@ pub struct ContainerShell {
     /// decides whether a `break` or a `continue` has a loop to leave at all
     /// ([`Self::run_loop_control`]).
     loop_depth: usize,
+    /// How many commands of the program are still TO COME after the one being run — counted
+    /// over the sequences the walk is inside, so it is zero only while the command being run
+    /// is the last thing the program has to do.
+    ///
+    /// What [`Self::states_a_wait_rather_than_spending_it`] reads: a wait between two of a
+    /// program's own steps is a duration the program STATES, while the wait a program ends on
+    /// is the container waiting for something else.
+    commands_to_come: usize,
     /// The loop the program asked to leave and how many enclosing loops it is leaving —
     /// `None` while no `break` or `continue` is in flight. Set by those commands and taken by
     /// the loop that honours it ([`Self::taken_loop_control`]).
@@ -806,6 +831,7 @@ impl ContainerShell {
             condition_depth: 0,
             compound_depth: 0,
             loop_depth: 0,
+            commands_to_come: 0,
             loop_control: None,
             negated_pipeline: false,
             serving,
@@ -1032,8 +1058,12 @@ impl ContainerShell {
                 return EXIT_SYNTAX_ERROR;
             };
             let mut status = EXIT_SUCCESS;
-            for complete_command in &program.complete_commands {
+            let last = program.complete_commands.len().saturating_sub(1);
+            for (index, complete_command) in program.complete_commands.iter().enumerate() {
+                let followed = index < last;
+                self.enter_followed(followed);
                 status = self.run_complete_command(complete_command).await;
+                self.leave_followed(followed);
                 if self.stopped() {
                     return status;
                 }
@@ -1050,8 +1080,12 @@ impl ContainerShell {
     ) -> ShellFuture<'a, i32> {
         Box::pin(async move {
             let mut status = EXIT_SUCCESS;
-            for item in &command.0 {
+            let last = command.0.len().saturating_sub(1);
+            for (index, item) in command.0.iter().enumerate() {
+                let followed = index < last;
+                self.enter_followed(followed);
                 status = self.run_and_or_list(&item.0).await;
+                self.leave_followed(followed);
                 if self.stopped() {
                     return status;
                 }
@@ -1350,8 +1384,12 @@ impl ContainerShell {
     ) -> ShellFuture<'a, i32> {
         Box::pin(async move {
             let mut status = EXIT_SUCCESS;
-            for item in &list.0 {
+            let last = list.0.len().saturating_sub(1);
+            for (index, item) in list.0.iter().enumerate() {
+                let followed = index < last;
+                self.enter_followed(followed);
                 status = self.run_and_or_list(&item.0).await;
+                self.leave_followed(followed);
                 if self.stopped() || self.loop_control.is_some() {
                     return status;
                 }
@@ -1528,6 +1566,41 @@ impl ContainerShell {
         })
     }
 
+    /// Record that the command about to run is FOLLOWED by more of the program, where
+    /// `followed` says it is — the counted twin of [`Self::leave_followed`], called around
+    /// every place the walk runs one element of a sequence.
+    fn enter_followed(&mut self, followed: bool) {
+        if followed {
+            self.commands_to_come = self.commands_to_come.saturating_add(1);
+        }
+    }
+
+    /// Undo one [`Self::enter_followed`].
+    fn leave_followed(&mut self, followed: bool) {
+        if followed {
+            self.commands_to_come = self.commands_to_come.saturating_sub(1);
+        }
+    }
+
+    /// Whether a wait the program states in seconds is a duration this session only STATES,
+    /// rather than one it spends out of this emulator's own wall clock.
+    ///
+    /// It is, exactly when the program has a NEXT command to run: the seconds in a `sleep`
+    /// are a caller's word about how long its program took, and spending them would let that
+    /// word decide how long this emulator takes to answer everything waiting on the task —
+    /// the job whose dependents are held until this container ends, the deployment whose
+    /// stabilisation is watched, the client polling the task. So the wait is taken as stated
+    /// and the program goes on to that command, which is what the container then reports.
+    ///
+    /// It is NOT, where the program has nothing left to do but wait — the wait it ends on, and
+    /// the wait inside a loop it is going round. Such a wait states no duration of the
+    /// program's own work: it is the container WAITING for something else to end it (the stop
+    /// its task is sent, a file another container writes), which is how a container stays up,
+    /// so it is honoured until the run's own deadline.
+    fn states_a_wait_rather_than_spending_it(&self) -> bool {
+        self.commands_to_come > 0 && self.loop_depth == 0
+    }
+
     /// The action this session has recorded for the termination signal, under any of the
     /// names a program may have written it as ([`SIGTERM_NAMES`]).
     fn trap_action(&self) -> Option<String> {
@@ -1673,7 +1746,13 @@ impl ContainerShell {
         list: &'a ::brush_parser::ast::AndOrList,
     ) -> ShellFuture<'a, (i32, bool)> {
         Box::pin(async move {
+            // Every pipeline but the last of the list is followed by one the program may
+            // still run, so what the walk is inside decides whether a wait one of them
+            // states is spent ([`Self::states_a_wait_rather_than_spending_it`]).
+            let followed = !list.additional.is_empty();
+            self.enter_followed(followed);
             let mut status = self.run_pipeline(&list.first).await;
+            self.leave_followed(followed);
             // The first pipeline is the last one when the list holds no other.
             let mut ran_last = list.additional.is_empty();
             let last = list.additional.len().saturating_sub(1);
@@ -1681,6 +1760,8 @@ impl ContainerShell {
                 if self.stopped() {
                     break;
                 }
+                let followed = index < last;
+                self.enter_followed(followed);
                 let ran = match next {
                     ::brush_parser::ast::AndOr::And(pipeline) => {
                         if status == EXIT_SUCCESS {
@@ -1699,6 +1780,7 @@ impl ContainerShell {
                         }
                     }
                 };
+                self.leave_followed(followed);
                 if ran {
                     ran_last = index == last;
                 }
@@ -2605,6 +2687,13 @@ impl ContainerShell {
     /// wait is clamped to what this run has left ([`Self::wait_for`]), so it never outlives
     /// the bound the emulator gave the run. An argument that is no duration at all is the
     /// utility's usage failure.
+    ///
+    /// The seconds a program states between two of its own steps are a duration this session
+    /// STATES rather than one it spends ([`Self::states_a_wait_rather_than_spending_it`]): the
+    /// program's next command runs at once, so what the container reports is still its own
+    /// program's outcome while nothing waiting on the task is held by a caller's word. The
+    /// wait a program ENDS on is honoured, because that one is the container waiting for
+    /// something else.
     async fn run_sleep(&mut self, arguments: &[String]) -> i32 {
         let Some(argument) = arguments.first() else {
             return EXIT_FAILURE;
@@ -2620,6 +2709,7 @@ impl ContainerShell {
                 .ok()
                 .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
             {
+                Some(_) if self.states_a_wait_rather_than_spending_it() => Some(Duration::ZERO),
                 Some(waiting) => Some(waiting),
                 None => return EXIT_FAILURE,
             }
