@@ -42,7 +42,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::dynamodb_table_resources::{describe_table, dynamodb, failure_reasons};
 use crate::stack_lifecycle::{
-    create_stack, describe_stack, output_value, router, xml_text, ACCOUNT_ID, REGION,
+    create_stack, describe_stack, output_value, router, stream_arn_in, xml_text, REGION,
 };
 
 /// The `StackStatus` a deployment of this estate settles on.
@@ -285,10 +285,7 @@ async fn a_stack_declared_streaming_table_exists_with_its_destination_active() {
         let stream_arn = output_value(&described, "StreamArn").unwrap_or_default();
         assert_eq!(
             stream_arn,
-            format!(
-                "arn:aws:kinesis:{REGION}:{ACCOUNT_ID}:stream/{}",
-                stream_name(&row)
-            ),
+            stream_arn_in(REGION, &stream_name(&row)),
             "case {case:?}: expected the stack's StreamArn output to be the data stream's own \
              ARN, got {stream_arn:?}"
         );

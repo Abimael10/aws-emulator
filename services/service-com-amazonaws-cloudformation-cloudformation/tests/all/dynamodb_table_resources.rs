@@ -33,26 +33,45 @@ use smithy_server_runtime::MultiServiceRouter;
 const DYNAMODB_JSON: &str = "application/x-amz-json-1.0";
 
 /// Call one DynamoDB operation through the same router, signed for `dynamodb` the way a
-/// client's SDK signs it: the status and the parsed answer document.
+/// client's SDK signs it, in the Region this target's stacks are deployed in: the status and
+/// the parsed answer document.
 ///
 /// The ONE DynamoDB caller of this crate's suites, so no suite spells that calling
 /// convention twice: `cdk_deployed_table_estate.rs` reads a table deployed through a change
 /// set back through it, and `dynamodb_table_settings.rs` reads the properties DynamoDB
-/// applies through a call of its own back through it.
+/// applies through a call of its own back through it. A suite whose stacks span SEVERAL
+/// Regions reads each Region's tables through [`dynamodb_in`].
 pub(crate) async fn dynamodb(
     router: &MultiServiceRouter,
     operation: &str,
     request: &Value,
 ) -> (u16, Value) {
+    dynamodb_in(router, REGION, operation, request).await
+}
+
+/// [`dynamodb`], signed for `region`: Amazon DynamoDB is Regional and "table names must be
+/// unique within each Region" (the `CreateTable` doc), so the credential scope of the request
+/// is what decides which Region's tables the call reaches.
+///
+/// The Region travels for the suites whose stacks span SEVERAL of them: the global table a
+/// stack declares has a replica per Region (`dynamodb_global_table_resources.rs`), and a
+/// streaming estate deployed in two Regions is read back in each of them
+/// (`dynamodb_kinesis_streaming_estate_lifecycle.rs`).
+pub(crate) async fn dynamodb_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    request: &Value,
+) -> (u16, Value) {
     let http_request = http::Request::builder()
         .method("POST")
-        .uri(format!("https://dynamodb.{REGION}.amazonaws.com/"))
+        .uri(format!("https://dynamodb.{region}.amazonaws.com/"))
         .header("content-type", DYNAMODB_JSON)
         .header("x-amz-target", format!("DynamoDB_20120810.{operation}"))
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/dynamodb/\
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/dynamodb/\
                  aws4_request, SignedHeaders=host;x-amz-target, Signature=0123456789abcdef"
             ),
         )

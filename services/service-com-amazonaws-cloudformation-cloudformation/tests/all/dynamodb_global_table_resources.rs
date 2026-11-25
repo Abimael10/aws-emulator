@@ -25,13 +25,10 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::dynamodb_table_resources::failure_reasons;
+use crate::dynamodb_table_resources::{dynamodb_in, failure_reasons};
 use crate::stack_lifecycle::{
     call, create_stack, member, router, settled_stack, xml_blocks, xml_text, ACCOUNT_ID, REGION,
 };
-
-/// The awsJson version Amazon DynamoDB's model declares (`awsJson1_0`).
-const DYNAMODB_JSON: &str = "application/x-amz-json-1.0";
 
 /// The Region the replica of a two-Region group lives in, and the third Region a wider group
 /// adds.
@@ -47,41 +44,12 @@ const THIRD_REGION: &str = "eu-west-1";
 const REPLICATED_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 const REPLICATED_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// Call one DynamoDB operation through the same router IN `region`, signed for `dynamodb`
-/// the way a client's SDK signs it.
-///
-/// The Region travels because a global table spans Regions: the suite over one table
-/// (`dynamodb_table_resources.rs`) calls in the Region the stack is deployed in and needs no
-/// other, while every assertion here is about which Region answers what.
-async fn dynamodb_in(
-    router: &MultiServiceRouter,
-    region: &str,
-    operation: &str,
-    request: &Value,
-) -> (u16, Value) {
-    let http_request = http::Request::builder()
-        .method("POST")
-        .uri(format!("https://dynamodb.{region}.amazonaws.com/"))
-        .header("content-type", DYNAMODB_JSON)
-        .header("x-amz-target", format!("DynamoDB_20120810.{operation}"))
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/dynamodb/\
-                 aws4_request, SignedHeaders=host;x-amz-target, Signature=0123456789abcdef"
-            ),
-        )
-        .body(bytes::Bytes::from(request.to_string()))
-        .expect("a well-formed DynamoDB request");
-    let response = router.dispatch(http_request).await;
-    let status = response.status().as_u16();
-    let body = response.into_body().to_vec();
-    let document: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-    (status, document)
-}
-
 /// The `Table` description DynamoDB answers for `name` in `region`, or `Null` where that
 /// service holds no such table there.
+///
+/// The Region travels because a global table spans Regions: every assertion here is about
+/// which Region answers what, which is why the calls go through the crate's Region-scoped
+/// DynamoDB caller ([`dynamodb_in`]) rather than the Region the stack was deployed in.
 async fn described_in(router: &MultiServiceRouter, region: &str, name: &str) -> Value {
     let (status, document) =
         dynamodb_in(router, region, "DescribeTable", &json!({"TableName": name})).await;

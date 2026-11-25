@@ -220,6 +220,54 @@ pub(crate) async fn sns_in(
     (status, body)
 }
 
+/// One Kinesis operation over the same router, signed for `kinesis` in `region` the way a
+/// client's SDK signs it: the status and the parsed answer document.
+///
+/// The ONE Kinesis caller of this crate's suites, beside the DynamoDB one
+/// ([`crate::dynamodb_table_resources::dynamodb_in`]): a data stream a stack CREATES lives in
+/// Amazon Kinesis Data Streams, so every suite that creates or reads one back goes through
+/// that service's own wire here — its model declares `awsJson1_1` and its service shape gives
+/// the `X-Amz-Target` prefix `Kinesis_20131202`. The Region travels because a stack deploys
+/// its resources in the Region the call that created it was signed for, which is the Region
+/// its stream ARNs carry.
+pub(crate) async fn kinesis_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    request: &serde_json::Value,
+) -> (u16, serde_json::Value) {
+    let http_request = http::Request::builder()
+        .method("POST")
+        .uri(format!("https://kinesis.{region}.amazonaws.com/"))
+        .header("content-type", "application/x-amz-json-1.1")
+        .header("x-amz-target", format!("Kinesis_20131202.{operation}"))
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/kinesis/aws4_request, \
+                 SignedHeaders=host;x-amz-target, Signature=0123456789abcdef"
+            ),
+        )
+        .body(bytes::Bytes::from(request.to_string()))
+        .expect("a well-formed Kinesis request");
+    let response = router.dispatch(http_request).await;
+    let status = response.status().as_u16();
+    let body = response.into_body().to_vec();
+    let document: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+    (status, document)
+}
+
+/// The ARN of a Kinesis data stream in `region`
+/// (`arn:<partition>:kinesis:<region>:<account>:stream/<name>`), which is what that service's
+/// own `Fn::GetAtt Arn` resolves to.
+///
+/// HERE for the reason [`kinesis_in`] is: more than one suite names such a stream — a table's
+/// `KinesisStreamSpecification` destination, a log group's subscription filter — so the one
+/// form of that ARN lives beside the account id it carries.
+pub(crate) fn stream_arn_in(region: &str, name: &str) -> String {
+    format!("arn:aws:kinesis:{region}:{ACCOUNT_ID}:stream/{name}")
+}
+
 /// One awsQuery call to Amazon RDS over the same router, answered with the HTTP status and
 /// the XML body.
 ///

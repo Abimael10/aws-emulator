@@ -28,7 +28,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::dynamodb_table_resources::{describe_table, dynamodb, failure_reasons};
 use crate::stack_lifecycle::{
-    call, create_stack, describe_stack, member, router, xml_text, ACCOUNT_ID, REGION,
+    call, create_stack, describe_stack, kinesis_in, member, router, stream_arn_in, xml_text,
+    REGION,
 };
 
 /// The `StackStatus` values the rows settle on.
@@ -121,10 +122,10 @@ struct Row {
     reported: Vec<Reported>,
 }
 
-/// The ARN of the Kinesis data stream the replicating rows name
-/// (`arn:<partition>:kinesis:<region>:<account>:stream/<name>`).
+/// The ARN of the Kinesis data stream the replicating rows name, in the Region this suite's
+/// stacks are deployed in.
 fn stream_arn(name: &str) -> String {
-    format!("arn:aws:kinesis:{REGION}:{ACCOUNT_ID}:stream/{name}")
+    stream_arn_in(REGION, name)
 }
 
 /// Create the Kinesis data stream `name` through the Kinesis service's own wire, so the
@@ -134,28 +135,16 @@ fn stream_arn(name: &str) -> String {
 /// no stream in `ENABLE_FAILED` rather than replicating to nothing — so the stream a row
 /// declares exists before the stack is deployed, exactly as it must in an account.
 async fn create_stream(router: &MultiServiceRouter, name: &str) {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(format!("https://kinesis.{REGION}.amazonaws.com/"))
-        .header("content-type", "application/x-amz-json-1.1")
-        .header("x-amz-target", "Kinesis_20131202.CreateStream")
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/kinesis/aws4_request, \
-                 SignedHeaders=host;x-amz-target, Signature=0123456789abcdef"
-            ),
-        )
-        .body(bytes::Bytes::from(
-            json!({"StreamName": name, "ShardCount": 1}).to_string(),
-        ))
-        .expect("a well-formed Kinesis request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let body = String::from_utf8(response.into_body().to_vec()).unwrap_or_default();
+    let (status, answered) = kinesis_in(
+        router,
+        REGION,
+        "CreateStream",
+        &json!({"StreamName": name, "ShardCount": 1}),
+    )
+    .await;
     assert_eq!(
         status, 200,
-        "creating the Kinesis stream {name:?}: expected HTTP 200, got {status} with {body}"
+        "creating the Kinesis stream {name:?}: expected HTTP 200, got {status} with {answered}"
     );
 }
 

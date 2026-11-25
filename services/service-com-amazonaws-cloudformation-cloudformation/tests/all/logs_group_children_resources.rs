@@ -25,8 +25,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::stack_lifecycle::{
-    call, create_stack, describe_stack, member, router, settled_stack, wait_for_the_transition,
-    xml_blocks, xml_text, ACCOUNT_ID, REGION,
+    call, create_stack, describe_stack, member, router, settled_stack, stream_arn_in,
+    wait_for_the_transition, xml_blocks, xml_text, ACCOUNT_ID, REGION,
 };
 
 /// The awsJson version Amazon CloudWatch Logs's model declares (`awsJson1_1`), and the
@@ -173,7 +173,7 @@ async fn failure_reasons(router: &MultiServiceRouter, stack: &str) -> Vec<String
 /// The ARN of the Kinesis data stream a row's filter delivers to, as that service's own
 /// `Fn::GetAtt Arn` resolves it.
 fn stream_arn(name: &str) -> String {
-    format!("arn:aws:kinesis:{REGION}:{ACCOUNT_ID}:stream/{name}")
+    stream_arn_in(REGION, name)
 }
 
 /// The ARN of the role a row's filter delivers under.
