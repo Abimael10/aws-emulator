@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The names a statement uses, and what `columnMetadata` says about where a
-//! result column lives.
+//! The names a statement uses, the SCHEMA those names are resolved in, and what
+//! `columnMetadata` says about where a result column lives.
 //!
 //! Every call goes through the router, so routing, restJson1 deserialization, the
 //! handler and serialization are all exercised; the client harness is the one
@@ -330,4 +330,160 @@ async fn column_metadata_reports_where_a_column_lives_and_whether_a_null_fits() 
             case.nullable
         );
     }
+}
+
+/// The database every catalog read below runs against, and so the name those reads report
+/// as the catalog a relation belongs to.
+const CATALOG_DATABASE: &str = "catalogdb";
+
+/// RULE: a relation name qualified by `information_schema` names a VIEW OF THE DATABASE'S
+/// OWN SCHEMA, which every PostgreSQL database has, so a statement reading one is answered
+/// with the result set computed from the objects that database holds — never as a relation
+/// the database does not have. `information_schema.tables` carries one row per table or
+/// view, `information_schema.columns` one row per column of one, and the values in a row
+/// are the schema's own: the catalog the call addressed, PostgreSQL's default schema, the
+/// relation's name and its kind.
+///
+/// The rows differ along the catalog relation read, the SPELLING it is read with (lower
+/// case, upper case, the relation delimited, through an alias, with the column qualified
+/// by schema and relation) and whether the database holds the relation being asked about —
+/// which is what a client testing for an object branches on.
+#[tokio::test]
+async fn a_catalog_relation_is_read_out_of_the_databases_own_schema() {
+    // (case, the statement, the count before the relation is created, the count after)
+    //
+    // The counts come from the catalog views' own definitions: `information_schema.tables`
+    // holds "one row for each table or view in the current database", so a table is one
+    // row, and `information_schema.columns` "one row for each column in a table or view",
+    // so the relation created below — of two columns — is two rows.
+    let cases: [(&str, &str, i64, i64); 7] = [
+        (
+            "the read a client tests for a table with",
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'pets'",
+            0,
+            1,
+        ),
+        (
+            "the same read spelled in upper case",
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'pets'",
+            0,
+            1,
+        ),
+        (
+            "the same read with the catalog relation delimited",
+            "SELECT COUNT(*) FROM information_schema.\"tables\" WHERE table_name = 'pets'",
+            0,
+            1,
+        ),
+        (
+            "the same read through an alias",
+            "SELECT COUNT(*) FROM information_schema.tables AS held \
+             WHERE held.table_name = 'pets'",
+            0,
+            1,
+        ),
+        (
+            "the same read with the column qualified by schema and relation",
+            "SELECT COUNT(*) FROM information_schema.tables \
+             WHERE information_schema.tables.table_name = 'pets'",
+            0,
+            1,
+        ),
+        (
+            "the columns the relation declares",
+            "SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'pets'",
+            0,
+            2,
+        ),
+        (
+            "a relation the database does not hold",
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'absent'",
+            0,
+            0,
+        ),
+    ];
+
+    let api = DataApi::new();
+    for phase in ["before the relation exists", "after it exists"] {
+        if phase == "after it exists" {
+            api.run(json!({
+                "database": CATALOG_DATABASE,
+                "sql": "CREATE TABLE pets (id INT NOT NULL, name VARCHAR(32))",
+            }))
+            .await;
+            api.run(json!({
+                "database": CATALOG_DATABASE,
+                "sql": "CREATE VIEW grown AS SELECT id FROM pets",
+            }))
+            .await;
+        }
+        for (case, sql, before, after) in cases {
+            let wanted = if phase == "before the relation exists" {
+                before
+            } else {
+                after
+            };
+            let (status, body) = api
+                .execute(json!({"database": CATALOG_DATABASE, "sql": sql}))
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?} {phase}: a read of the database's own catalog is served, got \
+                 {status} {body}"
+            );
+            assert_eq!(
+                body["records"][0][0]["longValue"].as_i64(),
+                Some(wanted),
+                "case {case:?} {phase}: expected one record holding a longValue of {wanted}, \
+                 got {body}"
+            );
+        }
+    }
+
+    // What each row CARRIES: the objects the database holds, with the values its schema
+    // holds for them — and nothing else, so the engine's own bookkeeping is in no answer.
+    let listed = api
+        .run(json!({
+            "database": CATALOG_DATABASE,
+            "sql": "SELECT table_catalog, table_schema, table_name, table_type \
+                    FROM information_schema.tables ORDER BY table_name",
+        }))
+        .await;
+    assert_eq!(
+        listed["records"],
+        json!([
+            [
+                {"stringValue": CATALOG_DATABASE},
+                {"stringValue": "public"},
+                {"stringValue": "grown"},
+                {"stringValue": "VIEW"},
+            ],
+            [
+                {"stringValue": CATALOG_DATABASE},
+                {"stringValue": "public"},
+                {"stringValue": "pets"},
+                {"stringValue": "BASE TABLE"},
+            ],
+        ]),
+        "case \"every relation of the database\": expected the table and the view it holds, \
+         got {listed}"
+    );
+
+    let declared = api
+        .run(json!({
+            "database": CATALOG_DATABASE,
+            "sql": "SELECT column_name, ordinal_position, is_nullable \
+                    FROM information_schema.columns WHERE table_name = 'pets' \
+                    ORDER BY ordinal_position",
+        }))
+        .await;
+    assert_eq!(
+        declared["records"],
+        json!([
+            [{"stringValue": "id"}, {"longValue": 1}, {"stringValue": "NO"}],
+            [{"stringValue": "name"}, {"longValue": 2}, {"stringValue": "YES"}],
+        ]),
+        "case \"the columns of one relation\": expected each column at the position it was \
+         declared at, with whether it admits a null, got {declared}"
+    );
 }

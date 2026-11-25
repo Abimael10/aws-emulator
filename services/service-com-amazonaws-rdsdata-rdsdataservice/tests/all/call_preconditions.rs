@@ -22,6 +22,9 @@
 //!   against `secretsmanager:GetSecretValue` on the secret it authenticates with, before it
 //!   resolves anything, so an identity no policy grants either is refused 403
 //!   ([`every_operation_is_authorized_against_the_cluster_first`]);
+//! * that secret authorization is decided BEFORE the statement runs, so a call it refuses
+//!   leaves the database exactly as it was
+//!   ([`a_statement_the_secret_grant_does_not_cover_never_runs`]);
 //! * the cluster the call addresses is decided BEFORE the transaction the call names, so a
 //!   call on a cluster that serves no Data API is the endpoint refusal whatever its
 //!   `transactionId` is — and the transaction it named is still running afterwards
@@ -1042,6 +1045,165 @@ async fn every_operation_is_authorized_against_the_cluster_first() {
         json!([[{"longValue": 1}]]),
         "case the account's own credential: expected the call served, got {served}"
     );
+}
+
+/// RULE: the read of the secret a call authenticates with is authorized BEFORE the
+/// statement runs, so a caller no document in force entitles to that secret is refused
+/// HTTP 403 `AccessDeniedException` and the database is left exactly as it was — and the
+/// SAME call, once a document grants that read, is served and its effect is in the
+/// database.
+///
+/// The rows differ along the effect the refused statement would have had: a definition
+/// that creates a relation, a write that adds a row, and a definition that drops one. Each
+/// effect is measured through a read of the database itself, as a caller the IAM store
+/// holds no policies for.
+#[tokio::test]
+async fn a_statement_the_secret_grant_does_not_cover_never_runs() {
+    let cloud = Cloud::new();
+    let (cluster, secret) = cloud.create_cluster("secret-gated-cluster", true).await;
+    let (_, access_key_id) = cloud.create_user("secret-less-caller").await;
+    // Everything of this service on this cluster, and nothing at all of Secrets Manager:
+    // the policy of a caller missing exactly the grant on the secret.
+    cloud
+        .put_user_policy(
+            "secret-less-caller",
+            &json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Action": "rds-data:*",
+                    "Resource": cluster,
+                }],
+            }),
+        )
+        .await;
+
+    // The relation the write and the drop below address, created as the account's own
+    // credential — which is not a principal the IAM store holds policies for.
+    cloud
+        .run(json!({
+            "resourceArn": cluster,
+            "secretArn": secret,
+            "database": DATABASE,
+            "sql": "CREATE TABLE ledger (id INT)",
+        }))
+        .await;
+
+    // (case, the statement the ungranted caller issues, the read that measures its effect,
+    //  what that read answers while the statement has NOT run, what it answers once it has)
+    let cases: [(&str, &str, &str, i64, i64); 3] = [
+        (
+            "a definition that creates a relation",
+            "CREATE TABLE IF NOT EXISTS audit (id int)",
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'audit'",
+            0,
+            1,
+        ),
+        (
+            "a write that adds a row",
+            "INSERT INTO ledger (id) VALUES (1)",
+            "SELECT COUNT(*) FROM ledger",
+            0,
+            1,
+        ),
+        (
+            "a definition that drops a relation",
+            "DROP TABLE ledger",
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'ledger'",
+            1,
+            0,
+        ),
+    ];
+
+    for (case, sql, measure, untouched, _) in cases {
+        let (status, body) = cloud
+            .call_as(
+                &access_key_id,
+                "/Execute",
+                json!({
+                    "resourceArn": cluster,
+                    "secretArn": secret,
+                    "database": DATABASE,
+                    "sql": sql,
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 403,
+            "case {case}: expected HTTP 403, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "AccessDeniedException",
+            "case {case}: expected AccessDeniedException, got {body}"
+        );
+        let measured = cloud
+            .run(json!({
+                "resourceArn": cluster,
+                "secretArn": secret,
+                "database": DATABASE,
+                "sql": measure,
+            }))
+            .await;
+        assert_eq!(
+            measured["records"][0][0]["longValue"].as_i64(),
+            Some(untouched),
+            "case {case}: a refused call runs nothing, so the database must still answer \
+             {untouched}, got {measured}"
+        );
+    }
+
+    // The same statements, once a document in force grants the read of that secret: each
+    // is served and its effect is in the database — so the grant is what refused them.
+    cloud
+        .put_user_policy(
+            "secret-less-caller",
+            &json!({
+                "Version": "2012-10-17",
+                "Statement": [
+                    {"Effect": "Allow", "Action": "rds-data:*", "Resource": cluster},
+                    {
+                        "Effect": "Allow",
+                        "Action": "secretsmanager:GetSecretValue",
+                        "Resource": secret,
+                    },
+                ],
+            }),
+        )
+        .await;
+    for (case, sql, measure, _, ran) in cases {
+        let (status, body) = cloud
+            .call_as(
+                &access_key_id,
+                "/Execute",
+                json!({
+                    "resourceArn": cluster,
+                    "secretArn": secret,
+                    "database": DATABASE,
+                    "sql": sql,
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case} with the secret granted: expected the call served, got {status} \
+             {body}"
+        );
+        let measured = cloud
+            .run(json!({
+                "resourceArn": cluster,
+                "secretArn": secret,
+                "database": DATABASE,
+                "sql": measure,
+            }))
+            .await;
+        assert_eq!(
+            measured["records"][0][0]["longValue"].as_i64(),
+            Some(ran),
+            "case {case} with the secret granted: expected the statement's effect ({ran}), \
+             got {measured}"
+        );
+    }
 }
 
 /// The modelled maximum length of `transactionId`: the member targets `Id`, which carries
