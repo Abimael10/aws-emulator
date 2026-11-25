@@ -2565,3 +2565,177 @@ async fn a_processable_job_runs_to_complete_and_reports_what_it_produced() {
         }
     }
 }
+
+/// The status the end of a job's run reaches is decided by what that run ESTABLISHED, so the
+/// finish is applied only once the run has been MADE: while the run is still owed to the job
+/// and nothing has established what it produced, the clock owes the finish again a step later
+/// rather than resolving it as a failure. A job whose transcode nothing has attempted yet has
+/// not failed at it.
+///
+/// The driver that makes those runs makes a bounded number of them per pass, so a job
+/// submitted beside others is routinely settled before its own run has been claimed — which
+/// must not report it in `ERROR`.
+///
+/// The rows span what the rule generalises over: HOW MANY runs the store is owed at the same
+/// instant — one job alone, a handful, and more than twice as many as any one pass of the
+/// driver makes, so they cover both the job whose run is made first and the jobs whose runs
+/// are left for a later pass — and WHEN the finish comes due relative to those runs, a span
+/// the driver comfortably fits inside and one so short that every job's finish is already due
+/// at the instant its run is owed. Both spans are pinned STATE, not a race: whatever the
+/// finish is owed at, it lands on the run's result and never ahead of it.
+///
+/// Nothing here polls the service while it waits: each row waits on the STORE the handlers
+/// write to ([`Emulator::await_run`]), so the only thing that can make these runs is the
+/// store's own clock pump — exactly the client that pump exists for, one that submits a job
+/// and then makes no further MediaConvert call. The media is REAL, muxed by the `media_probe`
+/// suite's ISO base media writer into a bucket of an S3 mounted beside MediaConvert on one
+/// engine, and every produced file is read back out of that same S3.
+#[tokio::test]
+async fn every_job_owed_a_run_at_once_waits_for_its_own_run() {
+    use super::media_probe::{create_bucket, iso_bmff, put_object, s3_uri, VideoTrack, BUCKET};
+
+    /// The input every job of a row reads: one small video track, so a row costs the number
+    /// of jobs it submits rather than the size of what each of them carries.
+    fn media() -> Vec<u8> {
+        iso_bmff(
+            b"isom",
+            Some(VideoTrack {
+                width: 320,
+                height: 240,
+                timescale: 30_000,
+                frames: 10,
+                sample_duration: 1_000,
+            }),
+            None,
+        )
+    }
+
+    /// A settle span so short that a job's finish is due at the very instant the job begins,
+    /// which is the instant its run starts being owed: the run cannot have been made yet, so
+    /// every row pinned to this span settles a finish over a result that is not in.
+    const FINISH_DUE_AT_ONCE: Duration = Duration::from_millis(2);
+
+    // (case, how many jobs are submitted together before any of them is read, the span the
+    // whole run is owed in)
+    let rows: [(&str, usize, Duration); 6] = [
+        (
+            "one job, whose run is the first the driver makes",
+            1,
+            SHORT_SETTLE,
+        ),
+        ("a handful of jobs submitted together", 5, SHORT_SETTLE),
+        (
+            "more jobs at once than one pass of the driver runs, twice over",
+            9,
+            SHORT_SETTLE,
+        ),
+        (
+            "one job whose finish is due the instant its run is owed",
+            1,
+            FINISH_DUE_AT_ONCE,
+        ),
+        (
+            "a handful of jobs whose finishes are due the instant their runs are owed",
+            5,
+            FINISH_DUE_AT_ONCE,
+        ),
+        (
+            "more jobs than one pass runs, every finish due the instant its run is owed",
+            9,
+            FINISH_DUE_AT_ONCE,
+        ),
+    ];
+
+    for (case, count, span) in rows {
+        // Each row gets its own emulator, so the jobs it counts are the only runs that store
+        // is owed.
+        let emulator = Emulator::with_settle_span(span)
+            .mount(service_com_amazonaws_s3_amazons3::EmulatedService::new);
+        create_bucket(&emulator).await;
+
+        // Every input is written and every job submitted BEFORE any of them is read, so the
+        // store comes to owe `count` runs at the same instant.
+        let mut jobs = Vec::new();
+        for index in 0..count {
+            let key = format!("many/{index}.mp4");
+            put_object(&emulator, &key, &media()).await;
+            let created = emulator
+                .create_job(json!({
+                    "role": ROLE,
+                    "settings": {
+                        "inputs": [{ "fileInput": s3_uri(&key) }],
+                        "outputGroups": [{
+                            "name": "File Group",
+                            "outputs": [{
+                                "nameModifier": "_out",
+                                "containerSettings": { "container": "MP4" }
+                            }],
+                            "outputGroupSettings": {
+                                "type": "FILE_GROUP_SETTINGS",
+                                "fileGroupSettings": {
+                                    "destination": format!("s3://{BUCKET}/many-out-{index}/")
+                                }
+                            }
+                        }]
+                    }
+                }))
+                .await;
+            assert_eq!(
+                created.status, 201,
+                "case {case:?} job {index}: CreateJob must succeed, got {} with body {}",
+                created.status, created.body
+            );
+            jobs.push(created.string("/job/id"));
+        }
+
+        for (index, id) in jobs.iter().enumerate() {
+            // The CONDITION, not a span, and read off the store rather than over the wire:
+            // the due instants are stored and never slept for by a handler, and reading the
+            // store makes no MediaConvert request, so the wait itself cannot be what makes
+            // the run.
+            emulator.await_run(&format!("{case}, job {index}"), id).await;
+            let read = emulator.get_job(id).await;
+            assert_eq!(
+                read.string("/job/status"),
+                "COMPLETE",
+                "case {case:?} job {index}: a job whose transcode this service can perform \
+                 must reach COMPLETE however many runs the store was owed at once, got {}",
+                read.body
+            );
+            assert_eq!(
+                read.at("/job/errorMessage"),
+                &Value::Null,
+                "case {case:?} job {index}: a job that completed failed at nothing, so it \
+                 carries no ErrorMessage, got {}",
+                read.body
+            );
+            assert_eq!(
+                read.at("/job/errorCode"),
+                &Value::Null,
+                "case {case:?} job {index}: a job that completed carries no ErrorCode, got \
+                 {}",
+                read.body
+            );
+            // And the status is backed by the file the run really wrote, read back out of
+            // the S3 that owns it.
+            let key = format!("many-out-{index}/{index}_out.mp4");
+            let (status, _, body) = emulator
+                .rest("s3", "GET", &format!("/{BUCKET}/{key}"), Vec::new())
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?} job {index}: the completed job's output {key:?} must be in \
+                 the destination it named, got {status} {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(
+                body.get(4..8),
+                Some(b"ftyp".as_slice()),
+                "case {case:?} job {index}: the output {key:?} must be an ISO base media \
+                 file, got {} bytes starting {:?}",
+                body.len(),
+                body.get(..8)
+            );
+        }
+    }
+}

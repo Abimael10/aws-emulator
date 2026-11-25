@@ -170,7 +170,9 @@ impl ComAmazonawsMediaconvertMediaconvertState {
     /// status the second step reaches is decided by the
     /// job's RUN ([`JobRunRecord`], made while the job is `PROGRESSING`): a run that
     /// produced the outputs the job's settings describe ends it in `COMPLETE`, and a run
-    /// that failed, or a job nothing ran at all, ends it in `ERROR` with the reason.
+    /// that failed, or a job nothing ran at all, ends it in `ERROR` with the reason. A job
+    /// whose run is not in yet has not finished at all — nothing has established what it
+    /// produced — so its finish is owed again a step later instead.
     ///
     /// A job whose queue is `PAUSED` does not begin ("jobs in that queue won't begin"):
     /// it keeps `SUBMITTED` and is left with no due instant for that exit, and
@@ -197,6 +199,11 @@ impl ComAmazonawsMediaconvertMediaconvertState {
         // Read before the record is borrowed for writing: the step the finish is owed after
         // is the same one the start was owed after.
         let settles_after = self.job_run_step();
+        // And whether a driver is still making this store's runs: the clock pump makes every
+        // run the clock owes with no request waiting on it ([`drive_job_clock`]), so while it
+        // holds this store's claim a run that has not been made yet is a run still to come.
+        // Without one, nothing will ever make it.
+        let a_driver_is_running = self.clock_pump_running;
         let Some(job) = self.jobs.get_mut(id) else {
             return;
         };
@@ -208,12 +215,21 @@ impl ComAmazonawsMediaconvertMediaconvertState {
         }
         let begins = job.status == JOB_STATUS_SUBMITTED;
         let ends = job.status == JOB_STATUS_PROGRESSING;
-        // A job whose RUN is still being made has not finished: its outputs are being
-        // produced right now ([`JobRecord::run_claimed_at`]), so the finish is owed again a
-        // span later rather than applied over a result that is not in yet. A claim a driver
-        // abandoned is taken again by the next pass, so nothing is left running for ever.
-        if ends && job.run.is_none() && job.run_claimed_at.is_some() {
-            let next = now.checked_add(settles_after);
+        // A job whose RUN has not been MADE yet has not finished: its outputs are being
+        // produced right now ([`JobRecord::run_claimed_at`]), or the run is still owed to it
+        // and a driver has yet to get to it ([`run_due_job_runs`] makes a bounded number of
+        // runs per pass, so a job submitted beside others waits for a later one). Either way
+        // no result is in, so the finish is owed again a span later rather than resolved over
+        // a result that is not there — a job whose transcode nothing has attempted yet is not
+        // a job that failed at it. A claim a driver abandoned is taken again by the next pass
+        // and the pump keeps waking while any job is owed a step, so nothing is left running
+        // for ever; a store no driver makes runs for is the one case nothing will ever run,
+        // and such a job reaches the no-engine failure below.
+        if ends && job.run.is_none() && (job.run_claimed_at.is_some() || a_driver_is_running) {
+            // Strictly LATER than the instant this settle was handed, whatever the span is
+            // pinned to, so the drain that popped this entry cannot pop its replacement in
+            // the same pass.
+            let next = now.checked_add(settles_after.max(Duration::from_millis(1)));
             job.settles_at = next;
             if let Some(next) = next {
                 self.pending.insert((next, id.to_string()));

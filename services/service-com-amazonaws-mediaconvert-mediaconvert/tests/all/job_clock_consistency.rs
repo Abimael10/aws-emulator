@@ -268,7 +268,15 @@ async fn a_job_that_stops_waiting_is_owed_nothing_further() {
         let id = created.string("/job/id");
 
         match row.terminal {
-            Terminal::Settle => advance(&emulator, row.advance_by),
+            Terminal::Settle => {
+                advance(&emulator, row.advance_by);
+                // The jump above takes the job out of `SUBMITTED`, and the END of its run
+                // waits for the run itself — nothing can run a transcode inside a settle, so
+                // a READ is what makes the run the clock has owed since the job began. The
+                // clock pass past the end of that run is then what applies it.
+                emulator.get_job(&id).await;
+                advance(&emulator, row.advance_by + row.settle_span);
+            }
             Terminal::Cancel => {
                 let cancelled = emulator.cancel_job(&id).await;
                 assert_eq!(
@@ -635,9 +643,14 @@ async fn a_job_in_a_paused_queue_is_owed_no_exit_from_submitted() {
             "case {case:?}: once its queue is ACTIVE the job must leave SUBMITTED, got {}",
             begun.body
         );
+        // The read above is also what makes the run the clock has owed the job since it
+        // began — nothing can run a transcode inside a settle — and the end of the run is
+        // applied by the pass past it, after which the clock owes the job nothing at all.
+        advance(&emulator, 4 * MINUTE);
+        emulator.get_job(&id).await;
         assert_nothing_due(
             case,
-            "once the released job has left SUBMITTED",
+            "once the released job's run has ended",
             job_clock(&emulator, &id),
         );
     }
@@ -712,9 +725,14 @@ async fn a_held_job_waits_its_whole_span_from_the_moment_it_can_begin() {
         "case a job released by a hop: a span past the hop it must have begun, got {}",
         begun.body
     );
+    // That read is also what makes the run the clock has owed the job since it began — nothing
+    // can run a transcode inside a settle — and the end of the run is applied by the pass past
+    // it, after which the clock owes the job nothing at all.
+    advance(&emulator, MINUTE + 2 * span + Duration::from_secs(30));
+    emulator.get_job(&id).await;
     assert_nothing_due(
         "a job released by a hop",
-        "once the whole span past its hop has passed",
+        "once its whole run past the hop has ended",
         job_clock(&emulator, &id),
     );
 }
