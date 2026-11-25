@@ -9,7 +9,8 @@
 //! * a shell token is minted only for a MicroVM that was RUN with the AWS-managed
 //!   `SHELL_INGRESS` network connector attached — whichever spelling the launch named it
 //!   by, wherever in the list it sits — and every other MicroVM is refused with the
-//!   modelled `ValidationException` (HTTP 400);
+//!   modelled `ValidationException` (HTTP 400) carrying the service's own fixed refusal
+//!   sentence;
 //! * the refusals of the operation's own address are the MicroVM's: an identifier this
 //!   region holds no MicroVM for is 404, and a MicroVM that accepts no further connection
 //!   is 409;
@@ -33,7 +34,7 @@ use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::microvm_endpoint
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::microvm_network::connector_state;
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::microvm_shell::SHELL_STATUS_HEADER;
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
-    managed_network_connector_arn, no_shell_ingress_message,
+    managed_network_connector_arn,
     ComAmazonawsLambdamicrovmsLambdamicrovmsState as MicrovmState, DEFAULT_INGRESS_NETWORK_CONNECTOR,
     SHELL_INGRESS_NETWORK_CONNECTOR,
 };
@@ -43,6 +44,14 @@ use crate::microvm_lifecycle::{
     call, emulator_with_engine, image_body, poll_until_microvm_state, run_microvm, PAST_THE_SPAN,
     REGION,
 };
+
+/// The sentence the service refuses a shell token for a MicroVM the shell connector is
+/// not attached to with, spelled out here rather than read off the implementation so the
+/// WORDING is what the test pins. Entirely fixed text: it interpolates no request value,
+/// no MicroVM identifier and no connector reference, so every refused row carries exactly
+/// this.
+const NO_SHELL_INGRESS_MESSAGE: &str =
+    "Shell access requires SHELL_INGRESS network connector to be configured on the MicroVM.";
 
 /// Create the image `name` with `extra` and wait out its asynchronous build, so a MicroVM
 /// can be launched from it.
@@ -236,10 +245,12 @@ async fn a_shell_token_is_minted_only_for_a_microvm_the_shell_connector_is_attac
                     Some("ValidationException"),
                     "case {case:?}: expected ValidationException, got {response}"
                 );
+                // The sentence has no variable part: whichever MicroVM was addressed and
+                // whatever its launch attached, the exact match above is the same one.
                 assert_eq!(
                     response["message"].as_str(),
-                    Some(no_shell_ingress_message().as_str()),
-                    "case {case:?}: expected the requirement's own sentence, got {response}"
+                    Some(NO_SHELL_INGRESS_MESSAGE),
+                    "case {case:?}: expected the service's own refusal sentence, got {response}"
                 );
             }
         }

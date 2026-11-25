@@ -223,7 +223,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // attached." The connectors the MicroVM is attached to are the ones RunMicrovm
         // persisted for it, so the requirement is read off the record rather than off this
         // request: a MicroVM reached through any other ingress connector has no shell to
-        // authenticate to, which the input does not satisfy.
+        // authenticate to, which the input does not satisfy. What the refusal SAYS is the
+        // service's own sentence for the condition
+        // (`crate::state::no_shell_ingress_message`), not the documentation above.
         if !crate::state::attaches_shell_ingress(&vm.ingress_network_connectors) {
             return Err(
                 CreateMicrovmShellAuthTokenErrorModeled::ValidationException(

@@ -1163,8 +1163,9 @@ pub const IMAGE_IN_USE_REFUSAL: &str = "Cannot delete microvm image with running
 
 /// The AWS-managed network connector that carries a MicroVM's interactive SHELL.
 ///
-/// `CreateMicrovmShellAuthToken` documents "The MicroVM must have been run with the
-/// SHELL_INGRESS network connector attached", so a MicroVM reaches its shell through
+/// `CreateMicrovmShellAuthToken` documents the CONDITION "The MicroVM must have been run
+/// with the SHELL_INGRESS network connector attached" — the requirement, not the wording
+/// of the refusal ([`no_shell_ingress_message`]) — so a MicroVM reaches its shell through
 /// this ingress connector and through no other — the same managed namespace
 /// [`DEFAULT_INGRESS_NETWORK_CONNECTOR`] and [`DEFAULT_EGRESS_NETWORK_CONNECTOR`]
 /// belong to.
@@ -1212,15 +1213,15 @@ pub fn attaches_shell_ingress(connectors: &[String]) -> bool {
 /// 400: the MicroVM the request addressed was not run with the connector its shell is
 /// carried by, so there is no shell to authenticate to.
 ///
-/// The sentence is the requirement `CreateMicrovmShellAuthToken` states in its own
-/// documentation, verbatim: "The MicroVM must have been run with the SHELL_INGRESS
-/// network connector attached." It carries no variable part, because the condition is a
-/// property of the MicroVM the address already names rather than of anything the request
-/// chose.
+/// The sentence is the service's own rejection text for the condition, which states what
+/// the caller must configure rather than restating the operation's documentation. It
+/// carries no variable part — no MicroVM identifier and no connector reference — because
+/// the condition is a property of the MicroVM the address already names rather than of
+/// anything the request chose.
 pub fn no_shell_ingress_message() -> String {
     format!(
-        "The MicroVM must have been run with the {SHELL_INGRESS_NETWORK_CONNECTOR} \
-         network connector attached."
+        "Shell access requires {SHELL_INGRESS_NETWORK_CONNECTOR} network connector to be \
+         configured on the MicroVM."
     )
 }
 
