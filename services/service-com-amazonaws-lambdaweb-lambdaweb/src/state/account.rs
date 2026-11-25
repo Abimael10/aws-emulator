@@ -6,9 +6,11 @@
 //! The usage is DERIVED from the same records every other handler reads
 //! (`ComAmazonawsLambdawebLambdawebState::functions`), never counted into a
 //! separate field — so a create or a delete moves it with no counter to keep in
-//! step. The per-function revision quota it reports is the very constant
-//! `CreateWebFunctionRevision` refuses at; the remaining three are allowances the
-//! model publishes no value for, documented one by one below.
+//! step — and only from the records of the Region the reading call was signed for,
+//! which is the Region the usage is reported for. The per-function revision quota
+//! it reports is the very constant `CreateWebFunctionRevision` refuses at; the
+//! remaining three are allowances the model publishes no value for, documented one
+//! by one below.
 
 use crate::ops::types::{AccountQuotas, AccountUsage};
 
@@ -65,16 +67,22 @@ pub fn account_quotas() -> AccountQuotas {
 }
 
 impl ComAmazonawsLambdawebLambdawebState {
-    /// The current web function usage: how many web functions are stored.
+    /// The current web function usage in `region`: how many web functions stored
+    /// for the account belong to that Region.
+    ///
+    /// `functionCount` is "The number of web functions in your account in the
+    /// current AWS Region" (source: `smithy_query(query="shape",
+    /// shape="AccountUsage")`), and a web function belongs to the Region its own
+    /// ARN names, so the count is taken over
+    /// [`ComAmazonawsLambdawebLambdawebState::functions_in_region`] rather than
+    /// over the whole store, which holds every Region's functions together.
     ///
     /// "This count includes web functions in all states, not only functions in
-    /// the `Active` state" (source: `smithy_query(query="shape",
-    /// shape="AccountUsage")`), so every stored record counts whatever its
-    /// [`super::FunctionState`] is — which also makes the count exactly the
-    /// number of functions `ListWebFunctions` reports with no filter.
-    pub fn account_usage(&self) -> AccountUsage {
+    /// the `Active` state" (same source), so every record of that Region counts
+    /// whatever its [`super::FunctionState`] is.
+    pub fn account_usage(&self, region: &str) -> AccountUsage {
         AccountUsage {
-            function_count: as_count_member(self.functions.len()),
+            function_count: as_count_member(self.functions_in_region(region).count()),
         }
     }
 }

@@ -9,15 +9,16 @@
 //! `functionCount` that is not computed from persisted state cannot pass.
 //!
 //! The rule under test is that `accountUsage.functionCount` is the number of web
-//! functions stored for the account, in every state — so it is exactly the size
-//! of the unfiltered listing, and only an operation that adds or removes a stored
-//! web function moves it — while `accountQuotas` reports the fixed allowances this
-//! emulator applies, `maxRevisionsPerFunction` being the bound the revision create
-//! path refuses at. The tests are tables: the rows differ along the axes the rule
+//! functions stored for the account IN THE REGION the read was signed for, in
+//! every state — so it is exactly the size of that Region's share of the stored
+//! set, and only an operation that adds or removes a web function of that Region
+//! moves it — while `accountQuotas` reports the fixed allowances this emulator
+//! applies, `maxRevisionsPerFunction` being the bound the revision create path
+//! refuses at. The tests are tables: the rows differ along the axes the rule
 //! generalises over (how many functions are stored, the form of their names,
 //! whether they carry a revision, which ones are deleted, how long after the
 //! create the settings are read, which other operation ran just before the read,
-//! and which Region's credential scope signed it).
+//! and which Region's credential scope signed the create and the read).
 
 use std::time::{Duration, Instant};
 
@@ -45,12 +46,12 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// shape="ThrottleConfig")`), so the account-level total can be no smaller.
 const LARGEST_SUPPORTED_ENDPOINT_RATE_LIMIT: i64 = 10_000;
 
-/// `GET /web-account-settings` — the operation's modelled URI
+/// `GET /web-account-settings` signed for `region` — the operation's modelled URI
 /// (`smithy_query(query="operation", operation="GetWebAccountSettings")`:
 /// `GET /2025-03-07/web-account-settings`).
-async fn settings(emulator: &Emulator, case: &str) -> Reply {
+async fn settings_in(emulator: &Emulator, region: &str, case: &str) -> Reply {
     let reply = emulator
-        .send("GET", "/web-account-settings", REGION, None)
+        .send("GET", "/web-account-settings", region, None)
         .await;
     assert_eq!(
         reply.status, 200,
@@ -58,6 +59,11 @@ async fn settings(emulator: &Emulator, case: &str) -> Reply {
         reply.status, reply.body
     );
     reply
+}
+
+/// `GET /web-account-settings` signed for the suite's usual Region.
+async fn settings(emulator: &Emulator, case: &str) -> Reply {
+    settings_in(emulator, REGION, case).await
 }
 
 /// `accountUsage.functionCount` as the wire answer reports it.
@@ -88,8 +94,10 @@ fn quota(reply: &Reply, member: &str, case: &str) -> i64 {
         })
 }
 
-/// Create a web function named `name`, optionally with an initial revision.
-async fn create_function(emulator: &Emulator, name: &str, with_revision: bool) {
+/// Create a web function named `name` in `region`, optionally with an initial
+/// revision. The Region the create is signed for is the Region the function
+/// belongs to: its minted `functionArn` names it.
+async fn create_function_in(emulator: &Emulator, region: &str, name: &str, with_revision: bool) {
     let mut body = json!({ "functionName": name });
     if with_revision {
         body["revisionConfig"] = json!({
@@ -97,24 +105,36 @@ async fn create_function(emulator: &Emulator, name: &str, with_revision: bool) {
             "serviceConfig": { "executionRoleArn": role_arn(name) },
         });
     }
-    let reply = emulator.send("PUT", "/web-functions", REGION, Some(body)).await;
+    let reply = emulator
+        .send("PUT", "/web-functions", region, Some(body))
+        .await;
     assert_eq!(
         reply.status, 202,
-        "case {name}: CreateWebFunction expected 202, got {} with {:?}",
+        "case {name} in {region}: CreateWebFunction expected 202, got {} with {:?}",
         reply.status, reply.body
     );
 }
 
-/// Delete the web function named `name`.
-async fn delete_function(emulator: &Emulator, name: &str) {
+/// Create a web function named `name` in the suite's usual Region.
+async fn create_function(emulator: &Emulator, name: &str, with_revision: bool) {
+    create_function_in(emulator, REGION, name, with_revision).await;
+}
+
+/// Delete the web function named `name`, signed for `region`.
+async fn delete_function_in(emulator: &Emulator, region: &str, name: &str) {
     let reply = emulator
-        .send("DELETE", &format!("/web-functions/{name}"), REGION, None)
+        .send("DELETE", &format!("/web-functions/{name}"), region, None)
         .await;
     assert_eq!(
         reply.status, 204,
-        "case {name}: DeleteWebFunction expected 204, got {} with {:?}",
+        "case {name} in {region}: DeleteWebFunction expected 204, got {} with {:?}",
         reply.status, reply.body
     );
+}
+
+/// Delete the web function named `name` in the suite's usual Region.
+async fn delete_function(emulator: &Emulator, name: &str) {
+    delete_function_in(emulator, REGION, name).await;
 }
 
 /// Look at `GetWebFunction` until the function reports `Active` — the transition
@@ -473,6 +493,142 @@ async fn the_quotas_do_not_depend_on_which_region_signed_the_request() {
                  got {quotas:?} after {baseline:?}"
             ),
         }
+    }
+}
+
+#[tokio::test]
+async fn the_reported_usage_counts_only_the_functions_of_the_region_that_signed_the_read() {
+    let emulator = Emulator::new();
+
+    // "The number of web functions in your account in the current AWS Region"
+    // (model: shape AccountUsage, member functionCount), and a web function
+    // belongs to the Region its own `functionArn` names. The rule generalises over
+    // which Region signed a create and over how many functions each Region holds,
+    // so the rows differ along the Region's form (two-word, three-word) and along
+    // the count — including a Region that holds none at all.
+    let rows: Vec<(&str, &[&str])> = vec![
+        ("us-east-1", &["east-one", "east-two"]),
+        ("eu-west-1", &["west-one"]),
+        (
+            "ap-southeast-2",
+            &["south-one", "south-two", "south-three"],
+        ),
+        ("us-west-2", &[]),
+    ];
+
+    for (region, names) in &rows {
+        for name in *names {
+            create_function_in(&emulator, region, name, false).await;
+            // The function's own ARN is what says which Region it belongs to, so
+            // the row's Region is the one the created resource reports.
+            let read = emulator
+                .send("GET", &format!("/web-functions/{name}"), region, None)
+                .await;
+            assert_eq!(
+                read.string("functionArn"),
+                Some(expected_arn(region, name)),
+                "case {name} in {region}: expected the ARN to name the Region the create \
+                 was signed for, got {:?}",
+                read.body
+            );
+        }
+    }
+
+    let mut counted = 0i64;
+    for (region, names) in &rows {
+        let case = format!("{} function(s) in {region}", names.len());
+        let reply = settings_in(&emulator, region, &case).await;
+        let expected = i64::try_from(names.len()).expect("the row's count fits an i64");
+        assert_eq!(
+            function_count(&reply, &case),
+            expected,
+            "case {case}: expected functionCount {expected} for the Region that signed the \
+             read, got {:?}",
+            reply.body
+        );
+        counted += expected;
+    }
+
+    // Every stored function is counted in exactly ONE Region, so the Regions'
+    // counts add up to the whole stored set.
+    let stored = rows.iter().map(|(_, names)| names.len()).sum::<usize>();
+    let stored = i64::try_from(stored).expect("the store's size fits an i64");
+    assert_eq!(
+        counted, stored,
+        "case every Region: expected the per-Region counts to add up to the {stored} stored \
+         function(s), got {counted}"
+    );
+}
+
+#[tokio::test]
+async fn a_create_or_a_delete_moves_only_the_usage_of_its_own_region() {
+    let emulator = Emulator::new();
+
+    // The rows are the Regions a function is created in; the one that signed the
+    // create is the only Region whose reported usage may move.
+    let home = "eu-central-1";
+    let elsewhere = ["us-east-1", "ap-northeast-1"];
+    for (index, region) in elsewhere.iter().enumerate() {
+        create_function_in(&emulator, region, &format!("elsewhere-{index}"), false).await;
+    }
+
+    for region in elsewhere {
+        let case = format!("before the create, in {region}");
+        let reply = settings_in(&emulator, region, &case).await;
+        assert_eq!(
+            function_count(&reply, &case),
+            1,
+            "case {case}: expected functionCount 1, got {:?}",
+            reply.body
+        );
+    }
+    let case = format!("before the create, in {home}");
+    let reply = settings_in(&emulator, home, &case).await;
+    assert_eq!(
+        function_count(&reply, &case),
+        0,
+        "case {case}: expected functionCount 0, got {:?}",
+        reply.body
+    );
+
+    create_function_in(&emulator, home, "home-fn", true).await;
+    let case = format!("after the create, in {home}");
+    let reply = settings_in(&emulator, home, &case).await;
+    assert_eq!(
+        function_count(&reply, &case),
+        1,
+        "case {case}: expected functionCount 1, got {:?}",
+        reply.body
+    );
+    for region in elsewhere {
+        let case = format!("after the create, in {region}");
+        let reply = settings_in(&emulator, region, &case).await;
+        assert_eq!(
+            function_count(&reply, &case),
+            1,
+            "case {case}: a create in another Region must not move this one's usage, got {:?}",
+            reply.body
+        );
+    }
+
+    delete_function_in(&emulator, home, "home-fn").await;
+    let case = format!("after the delete, in {home}");
+    let reply = settings_in(&emulator, home, &case).await;
+    assert_eq!(
+        function_count(&reply, &case),
+        0,
+        "case {case}: expected functionCount 0, got {:?}",
+        reply.body
+    );
+    for region in elsewhere {
+        let case = format!("after the delete, in {region}");
+        let reply = settings_in(&emulator, region, &case).await;
+        assert_eq!(
+            function_count(&reply, &case),
+            1,
+            "case {case}: a delete in another Region must not move this one's usage, got {:?}",
+            reply.body
+        );
     }
 }
 

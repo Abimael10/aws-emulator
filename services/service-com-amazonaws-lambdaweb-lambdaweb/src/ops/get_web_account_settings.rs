@@ -3,10 +3,12 @@
 //! @op GetWebAccountSettings
 //!
 //! This account's web function quotas and its current usage. A read: the
-//! `functionCount` it reports is counted from the stored web functions, and the
-//! quotas are the allowances this emulator reports — the per-function revision one
-//! being the bound the revision create path refuses at. The only write it makes is
-//! materialising the state transitions the clock had already made due.
+//! `functionCount` it reports is counted from the stored web functions of the
+//! Region the call was signed for — every member of `accountUsage` is documented
+//! for "the current AWS Region" — and the quotas are the allowances this emulator
+//! reports, the per-function revision one being the bound the revision create path
+//! refuses at. The only write it makes is materialising the state transitions the
+//! clock had already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -140,9 +142,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The operation takes no input: the account and Region it reports on are
-        // the ones the request was made against.
-        let _ = (&input, ctx);
+        // The operation takes no input: the account it reports on is the one the
+        // request was made against, and the Region is the one it was signed for —
+        // which is what the usage below is counted over, since every member of
+        // `accountUsage` is documented for "the current AWS Region".
+        let _ = &input;
+        let region = crate::state::request_region(ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetWebAccountSettingsErrorModeled::InternalServerException(InternalServerException {
@@ -154,12 +159,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // owed, which were due whether or not anybody asked for the settings.
         state.materialise_due_transitions(::std::time::SystemTime::now());
 
-        // The usage is counted from the stored functions on every call, so a
-        // create or a delete moves it with no counter to keep in step; the quotas
-        // are the allowances this emulator reports for the account.
+        // The usage is counted from the stored functions of the Region this call
+        // was signed for on every call, so a create or a delete in that Region
+        // moves it with no counter to keep in step — and a function of another
+        // Region never does; the quotas are the allowances this emulator reports
+        // for the account, which every Region shares.
         Ok(GetWebAccountSettingsOutput {
             account_quotas: crate::state::account_quotas(),
-            account_usage: state.account_usage(),
+            account_usage: state.account_usage(&region),
         })
     }
 }

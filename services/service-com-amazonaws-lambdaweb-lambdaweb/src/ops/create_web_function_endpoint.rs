@@ -340,12 +340,12 @@ fn revision_weights_for(
 
 /// The HOME Region of `function`: "the Region where you created the web function",
 /// which is the Region its stored ARN names — the one the `endpointType` and
-/// `regions` rules are stated against. A stored ARN whose Region field is not a
-/// Region label leaves the Region the call was signed for.
+/// `regions` rules are stated against. Read through the one helper every reader of
+/// a function's Region uses ([`crate::state::WebFunction::home_region`]), so a
+/// stored ARN whose Region field is not a Region label leaves the Region the call
+/// was signed for.
 fn home_region(function: &crate::state::WebFunction, signed_for: &str) -> String {
-    ::service_common::arn::region_of(&function.function_arn, crate::state::ARN_NAMESPACE)
-        .unwrap_or(signed_for)
-        .to_string()
+    function.home_region(signed_for).to_string()
 }
 
 /// The `CreateWebFunctionEndpoint` operation.

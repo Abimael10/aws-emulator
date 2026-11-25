@@ -367,6 +367,19 @@ impl WebFunction {
         Some(modeled_tag_map(&self.tags))
     }
 
+    /// The Region this web function belongs to: "the Region where you created the
+    /// web function", which is the Region its own stored ARN names.
+    ///
+    /// A web function is a REGIONAL resource — the create mints its ARN in the
+    /// Region the call was signed for ([`function_arn`]) — so the stored ARN is
+    /// where the Region it belongs to is recoverable from, for every reader that
+    /// has to tell one Region's functions from another's. A stored ARN whose Region
+    /// field is not a Region label names no Region, and leaves `signed_for`: the
+    /// Region the reading call was made in.
+    pub fn home_region<'value>(&'value self, signed_for: &'value str) -> &'value str {
+        ::service_common::arn::region_of(&self.function_arn, ARN_NAMESPACE).unwrap_or(signed_for)
+    }
+
     /// The revision this function's `latestRevisionId` names, if it still has one.
     pub fn latest_revision(&self) -> Option<&Revision> {
         self.latest_revision_id
@@ -489,6 +502,27 @@ impl ComAmazonawsLambdawebLambdawebState {
         for function in self.functions.values_mut() {
             function.materialise_due(now);
         }
+    }
+
+    /// The stored web functions that belong to `region` — the ones whose own ARN
+    /// names it ([`WebFunction::home_region`]).
+    ///
+    /// The store holds every Region's functions together, so a reader that reports
+    /// on ONE Region takes this view of it rather than the whole map. Walks the
+    /// same `functionName` order `functions` is keyed in.
+    ///
+    /// A record is read against [`DEFAULT_REGION`] rather than against the Region
+    /// the asking call was signed for, so each stored function belongs to exactly
+    /// ONE Region — the one its ARN names, or, for an ARN that names no Region
+    /// label at all, the Region a request that names none is treated as having been
+    /// made in — and the Regions' views partition the store between them.
+    pub fn functions_in_region<'view>(
+        &'view self,
+        region: &'view str,
+    ) -> impl Iterator<Item = &'view WebFunction> + 'view {
+        self.functions
+            .values()
+            .filter(move |function| function.home_region(DEFAULT_REGION) == region)
     }
 
     /// Close the listener of every endpoint this store no longer holds.
