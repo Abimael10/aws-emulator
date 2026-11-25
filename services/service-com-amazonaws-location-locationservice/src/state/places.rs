@@ -35,9 +35,14 @@ pub const MAX_SEARCH_RESULT_LIMIT: i32 = 50;
 /// The member a refusal about the requested bias position names.
 pub const BIAS_POSITION_MEMBER: &str = "BiasPosition";
 
-/// The member a refusal about the requested place identifier names, as the model
-/// spells it on `GetPlaceRequest`.
-pub const PLACE_ID_MEMBER: &str = "PlaceId";
+/// The field name a refusal about the requested place identifier reports.
+///
+/// `ValidationExceptionField$Name` is "The field name where the invalid entry was
+/// detected" — the field of the REQUEST, which for an identifier read from the
+/// URI is the path parameter the place read is addressed by rather than the
+/// modelled member name. The member name stays where the model puts it: quoted
+/// inside the refusal's own sentence ([`crate::state::PLACE_ID_NOT_VALID`]).
+pub const PLACE_ID_FIELD: &str = "placeID";
 
 /// The member a refusal about the requested bounding box names.
 pub const FILTER_BBOX_MEMBER: &str = "FilterBBox";
@@ -145,27 +150,35 @@ pub struct RankedPlace {
 /// [`MINIMUM_SHARE_OF_QUERY`] of its own terms about it; how much it accounted for
 /// is the relevance. Two equally relevant records are ordered by how near they are
 /// to the bias position when the request named one — the member's "preference for
-/// places that are closer to a specified position" — and otherwise by their own
-/// label, so one query always answers in one order.
+/// places that are closer to a specified position" — then by how completely the
+/// query described the record itself ([`described_share`]), so text naming a
+/// locality answers that locality ahead of the places inside it, and otherwise by
+/// their own label, so one query always answers in one order.
 pub fn search_text(
     text: &str,
     narrowing: &Narrowing<'_>,
     bias: Option<[f64; 2]>,
 ) -> Vec<RankedPlace> {
     let query = terms(text);
-    let mut ranked: Vec<RankedPlace> = PLACES
+    // Each candidate is carried with how completely the query described the record
+    // itself, which orders records the query accounted for equally well.
+    let mut ranked: Vec<(RankedPlace, f64)> = PLACES
         .iter()
         .filter(|record| admitted(record, narrowing))
         .filter_map(|record| {
-            let relevance = relevance_of(record, &query)?;
-            Some(RankedPlace {
-                record,
-                relevance,
-                distance: bias.map(|from| great_circle_metres(from, record.position)),
-            })
+            let held = searchable_terms(record);
+            let relevance = relevance_of(&held, &query)?;
+            Some((
+                RankedPlace {
+                    record,
+                    relevance,
+                    distance: bias.map(|from| great_circle_metres(from, record.position)),
+                },
+                described_share(&held, &query),
+            ))
         })
         .collect();
-    ranked.sort_by(|left, right| {
+    ranked.sort_by(|(left, left_described), (right, right_described)| {
         right
             .relevance
             .total_cmp(&left.relevance)
@@ -173,9 +186,10 @@ pub fn search_text(
                 (Some(near), Some(far)) => near.total_cmp(&far),
                 _ => ::std::cmp::Ordering::Equal,
             })
+            .then_with(|| right_described.total_cmp(left_described))
             .then_with(|| label(left.record, None).cmp(&label(right.record, None)))
     });
-    ranked
+    ranked.into_iter().map(|(place, _)| place).collect()
 }
 
 /// The record one of `data_source`'s place identifiers names, or `None` when that
@@ -257,6 +271,11 @@ pub fn projected_place(
             .unit_number
             .filter(|_| data_source == PROVIDER_ESRI || data_source == PROVIDER_GRAB)
             .map(str::to_string),
+        // "The Amazon Location categories that describe this Place": every record
+        // carries at least the category its own granularity makes it, so the
+        // member is reported for every place and `PlaceCategoryList`'s `len 1..10`
+        // holds. The guard is what keeps a record with no category out of the
+        // response rather than reporting an empty list no client could read.
         categories: (!record.categories.is_empty())
             .then(|| record.categories.iter().map(|c| (*c).to_string()).collect()),
         // The dataset's categories are all Amazon Location categories, so no
@@ -275,7 +294,8 @@ pub fn projected_place(
 /// Assembled from the record's own components in that order — the name, the street
 /// line, the municipality, the region, the postal code, then the country — so a
 /// place with no name or no street reads as its address alone, and nothing is
-/// invented for a component the place does not have.
+/// invented for a component the place does not have. A component is written ONCE:
+/// a record whose own name IS its municipality — a city — does not repeat it.
 pub fn label(record: &PlaceRecord, language: Option<&str>) -> String {
     let street_line = match (record.address_number, record.street) {
         (Some(number), Some(street)) => Some(format!("{number} {street}")),
@@ -283,10 +303,14 @@ pub fn label(record: &PlaceRecord, language: Option<&str>) -> String {
         // A number with no street names no line of an address.
         (_, None) => None,
     };
+    let municipality = (!record
+        .name
+        .is_some_and(|name| name.eq_ignore_ascii_case(record.municipality)))
+    .then(|| record.municipality.to_string());
     [
         named(record, language).map(str::to_string),
         street_line,
-        Some(record.municipality.to_string()),
+        municipality,
         record.region.map(str::to_string),
         record.postal_code.map(str::to_string),
         Some(record.country.to_string()),
@@ -352,24 +376,43 @@ fn admitted(record: &PlaceRecord, narrowing: &Narrowing<'_>) -> bool {
     true
 }
 
-/// How relevant `record` is to `query`, or `None` when the query accounted for too
-/// little of it to be a geocode of that text.
+/// How relevant a record whose own terms are `held` is to `query`, or `None` when
+/// the query accounted for too little of it to be a geocode of that text.
 ///
 /// The share of the query's terms the record accounted for: a query whose every
 /// term named something about the place scores 1, and one that also named
 /// something else scores lower, which is the ordering
 /// `SearchForTextResult$Relevance` describes.
-fn relevance_of(record: &PlaceRecord, query: &[String]) -> Option<f64> {
+fn relevance_of(held: &[String], query: &[String]) -> Option<f64> {
     if query.is_empty() {
         return None;
     }
-    let components = searchable_terms(record);
     let matched = query
         .iter()
-        .filter(|term| components.iter().any(|held| held == *term))
+        .filter(|term| held.iter().any(|term_of_place| term_of_place == *term))
         .count();
     let share = matched as f64 / query.len() as f64;
     (share >= MINIMUM_SHARE_OF_QUERY).then_some(share)
+}
+
+/// How completely `query` described the place whose own terms are `held`: the
+/// share of the PLACE's terms the query named.
+///
+/// The other half of "if more fields for an address match […] the relevance score
+/// is closer to 1": a query accounts for every term of the place it NAMES, and
+/// only for some terms of a place that merely lies inside it, so text naming a
+/// locality is answered by that locality ahead of the addresses and points of
+/// interest within it, which share its municipality, region and country but little
+/// else.
+fn described_share(held: &[String], query: &[String]) -> f64 {
+    if held.is_empty() {
+        return 0.0;
+    }
+    let matched = held
+        .iter()
+        .filter(|term_of_place| query.iter().any(|term| term == *term_of_place))
+        .count();
+    matched as f64 / held.len() as f64
 }
 
 /// Every term a query can name this record by: its names, its address components,
@@ -388,8 +431,30 @@ fn searchable_terms(record: &PlaceRecord) -> Vec<String> {
     text.push(record.country);
     text.extend(country_name(record.country));
     text.extend(record.postal_code);
-    text.extend(record.categories.iter().copied());
-    text.into_iter().flat_map(terms).collect()
+    let mut held: Vec<String> = text.into_iter().flat_map(terms).collect();
+    held.extend(record.categories.iter().flat_map(|category| category_terms(category)));
+    held
+}
+
+/// The words of an Amazon Location category name, which is what a query naming a
+/// kind of place — "coffee", "museum" — can match it by.
+///
+/// A published category is a PascalCase name whose last word is the `Type` marker
+/// every one of them carries ([`CATEGORIES`]), so the words are the name's own
+/// case boundaries with that marker dropped: the marker describes no place and
+/// would otherwise be a term every record shares.
+fn category_terms(category: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    for character in category.chars() {
+        match words.last_mut() {
+            Some(word) if !character.is_uppercase() => word.push(character),
+            _ => words.push(character.to_lowercase().collect()),
+        }
+    }
+    if words.last().is_some_and(|word| word == "type") {
+        words.pop();
+    }
+    words
 }
 
 /// The terms a piece of text carries: its words, lowercased, with everything that
@@ -473,6 +538,15 @@ mod tests {
                 "record {:?} names the country {:?}, which the dataset has no name for",
                 label(record, None),
                 record.country
+            );
+            // `PlaceCategoryList` is `len 1..10`, and every place is at least of
+            // the kind its granularity makes it, so a record describes itself by
+            // between one and ten published categories.
+            assert!(
+                (1..=10).contains(&record.categories.len()),
+                "record {:?} carries {} categories, outside the modelled 1..10",
+                label(record, None),
+                record.categories.len()
             );
             for category in record.categories {
                 assert!(

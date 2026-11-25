@@ -381,12 +381,12 @@ async fn every_filter_narrows_the_results_it_is_given() {
         ),
         (
             "one category",
-            json!({ "FilterCategories": ["monument"] }),
+            json!({ "FilterCategories": ["HistoricalMonumentType"] }),
             &["Eiffel Tower"],
         ),
         (
             "a category no place carries",
-            json!({ "FilterCategories": ["not_a_published_category"] }),
+            json!({ "FilterCategories": ["NotAPublishedCategoryType"] }),
             &[],
         ),
     ];
@@ -421,8 +421,8 @@ async fn every_filter_narrows_the_results_it_is_given() {
 }
 
 /// RULE: `MaxResults` caps how many of the matched places are answered, and the
-/// summary echoes the limit only when the request named one; an absent limit
-/// answers every match up to the documented default of 50.
+/// summary reports the limit the answer was served under — the request's own value
+/// when it named one, the documented default of 50 when it named none.
 ///
 /// The rows run the limit from its modelled minimum through the match count to its
 /// modelled maximum, plus the request that names no limit at all.
@@ -434,16 +434,18 @@ async fn max_results_caps_the_answer() {
     // The query matches these four places, so a limit below four is visible as a
     // shorter answer and one above it changes nothing.
     let matched = 4;
-    let rows: [(Option<i64>, usize); 6] = [
-        (Some(1), 1),
-        (Some(2), 2),
-        (Some(3), 3),
-        (Some(4), matched),
-        (Some(50), matched),
-        (None, matched),
+    // (the limit the request names, the results it is served, the limit the
+    // summary reports)
+    let rows: [(Option<i64>, usize, i64); 6] = [
+        (Some(1), 1, 1),
+        (Some(2), 2, 2),
+        (Some(3), 3, 3),
+        (Some(4), matched, 4),
+        (Some(50), matched, 50),
+        (None, matched, 50),
     ];
 
-    for (limit, expected) in rows {
+    for (limit, expected, reported) in rows {
         let case = format!("MaxResults {limit:?}");
         let body = match limit {
             Some(most) => json!({ "Text": "tower", "MaxResults": most }),
@@ -457,10 +459,13 @@ async fn max_results_caps_the_answer() {
             expected,
             "case {case:?}: expected {expected} results, got {names:?}"
         );
+        let summarised = summary(&case, &answer)
+            .get("MaxResults")
+            .and_then(Value::as_i64);
         assert_eq!(
-            summary(&case, &answer).get("MaxResults").and_then(Value::as_i64),
-            limit,
-            "case {case:?}: the summary echoes the limit the request named"
+            summarised,
+            Some(reported),
+            "case {case:?}: the summary reports the effective limit, expected {reported}, got {summarised:?}"
         );
     }
 }

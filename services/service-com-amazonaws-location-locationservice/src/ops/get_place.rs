@@ -212,7 +212,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 GetPlaceErrorModeled::ValidationException(
                     crate::state::field_validation_exception(
-                        crate::state::places::PLACE_ID_MEMBER,
+                        // The entry names the REQUEST's own field — the path
+                        // parameter this read is addressed by — while the sentence
+                        // quotes the modelled member.
+                        crate::state::places::PLACE_ID_FIELD,
                         crate::state::PLACE_ID_NOT_VALID.to_string(),
                     ),
                 )

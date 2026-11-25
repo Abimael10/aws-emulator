@@ -283,6 +283,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_or(crate::state::places::DEFAULT_SEARCH_RESULT_LIMIT, |most| {
                 most.clamp(1, crate::state::places::MAX_SEARCH_RESULT_LIMIT) as usize
             });
+        // The summary reports the limit this answer was actually served under, so
+        // the member it carries is the EFFECTIVE limit rather than the request's
+        // own member.
+        let effective_limit = i32::try_from(limit).unwrap_or(i32::MAX);
 
         let matched = crate::state::places::search_text(&input.text, &narrowing, bias);
         let results: Vec<SearchForTextResult> = matched
@@ -318,14 +322,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(SearchPlaceIndexForTextOutput {
             summary: SearchPlaceIndexForTextSummary {
                 // The summary "echoes the input values for BiasPosition, FilterBBox,
-                // FilterCountries, Language, MaxResults, and Text", so each member
-                // is reported exactly as the request sent it — absent when the
-                // request named it not at all.
+                // FilterCountries, Language, MaxResults, and Text", so a member the
+                // request carried is reported exactly as it sent it — and absent
+                // when the request named it not at all.
                 text: input.text,
                 bias_position: input.bias_position,
                 filter_b_box: input.filter_b_box,
                 filter_countries: input.filter_countries,
-                max_results: input.max_results,
+                // "Contains the optional result count limit specified in the
+                // request": the limit the answer was served under, which is the
+                // request's own value when it named one and the member's
+                // documented default when it named none — the page size a client
+                // reads off the summary rather than has to guess.
+                max_results: Some(effective_limit),
                 result_b_box,
                 // "The geospatial data provider attached to the place index resource
                 // specified in the request."
