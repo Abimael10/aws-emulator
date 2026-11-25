@@ -403,6 +403,13 @@ fn authorize(
 /// nothing about the action, nothing in force states anything about the request and the
 /// decision belongs to the cluster it reached — which on a domain with fine-grained access
 /// control is that domain's master user and role mappings ([`super::fgac`]).
+///
+/// Naming an ACCOUNT in the access policy's `Principal` is not naming a principal: a
+/// statement that ALLOWS an account delegates the decision to that account's own
+/// identity-based policies rather than granting any principal of it, while one that DENIES
+/// the account refuses each of them ([`granting_spellings`], [`denying_spellings`]). So a
+/// domain whose access policy grants only its account admits exactly the requests the
+/// signing principal's identity policies allow, and refuses every other.
 pub fn iam_decision(
     domain: &Domain,
     principal_arn: &str,
@@ -411,8 +418,12 @@ pub fn iam_decision(
     identity: IdentityPolicies<'_>,
 ) -> Result<(), WriteRefusal> {
     let action = format!("{}:{action_name}", super::ARN_NAMESPACE);
-    let principals = principal_spellings(principal_arn);
-    let request = iam::Request::new(&action, resource, &principals);
+    // The identities the principal IS, which are the spellings a statement GRANTS it by
+    // ([`granting_spellings`]), and those same spellings beside the ones a statement names its
+    // whole ACCOUNT by, which a `Deny` is decided with as well ([`denying_spellings`]).
+    let granting = granting_spellings(principal_arn);
+    let denying = denying_spellings(principal_arn, &granting);
+    let request = iam::Request::new(&action, resource, &granting);
     let identity_decision = identity
         .documents
         .map(|documents| iam::identity_decision(documents, &request))
@@ -422,9 +433,10 @@ pub fn iam_decision(
         // position as carrying none.
         !policy.trim().is_empty()
     });
-    let resource_decision = access_policy
-        .map(|policy| iam::resource_decision(policy, &request))
-        .unwrap_or(Decision::NotStated);
+    let said = access_policy.map_or_else(AccessPolicySaid::default, |policy| {
+        access_policy_said(policy, &request, &denying)
+    });
+    let resource_decision = said.decision;
     if iam::is_allowed(identity_decision, resource_decision) {
         return Ok(());
     }
@@ -480,9 +492,10 @@ pub fn iam_decision(
         // ([`not_authorized`]), and WHICH of IAM's rules refused follows the policy that
         // refused: an explicit `Deny` names the side it was read from, and with neither side
         // allowing, the sentence names the kind of policy that would have had to allow — the
-        // domain's own access policy where it carries one, and the principal's identity
-        // policies otherwise. Every value in it comes from the request and from the stored
-        // policy.
+        // domain's own access policy where it carries one, the principal's identity policies
+        // where the access policy DELEGATED the decision to them by granting the account
+        // alone, and those same identity policies where the domain carries no access policy.
+        // Every value in it comes from the request and from the stored policy.
         message: match (identity_decision, resource_decision) {
             (_, Decision::Denied) => not_authorized(
                 principal_arn,
@@ -494,7 +507,7 @@ pub fn iam_decision(
                 &action,
                 EXPLICIT_DENY_IN_AN_IDENTITY_POLICY,
             ),
-            _ if access_policy.is_some() => not_authorized(
+            _ if access_policy.is_some() && !said.delegated => not_authorized(
                 principal_arn,
                 &action,
                 &format!("because no resource-based policy allows the {action} action"),
@@ -536,20 +549,77 @@ fn index_resource(domain_arn: &str, index_name: &str) -> String {
     format!("{domain_arn}/{index_name}")
 }
 
-/// The spellings a resource policy's `Principal` element names this principal by: the
-/// identities the principal IS — its own ARN, and for an assumed-role session the IAM role
-/// it is a session of, the one reading of that pair this crate has
-/// ([`super::fgac::identities`]) — and the account spellings a statement about the whole
-/// account uses.
+/// The spellings a statement of the access policy GRANTS this principal by: the identities
+/// the principal IS — its own ARN, and for an assumed-role session the IAM role it is a
+/// session of, the one reading of that pair this crate has ([`super::fgac::identities`]).
 ///
 /// A resource policy is written with the identity a client CREATED, which for a role is the
 /// role's own ARN rather than any one session of it, so a statement naming a role is about
-/// every session of that role: without the role spelling, a policy that explicitly denies a
-/// role would state nothing about the requests that role actually makes.
-fn principal_spellings(principal_arn: &str) -> Vec<String> {
-    let mut spellings = super::fgac::identities(principal_arn);
+/// every session of that role: without the role spelling, a policy that names a role would
+/// state nothing about the requests that role actually makes.
+///
+/// The spellings that name the whole ACCOUNT are NOT among them, because naming an account is
+/// not naming a principal: a statement allowing an account delegates the decision to that
+/// account's own identity-based policies instead of granting any principal of it (the rule
+/// the shared evaluator publishes with those spellings,
+/// [`iam::account_principals`]). [`denying_spellings`] is the set a `Deny` is decided with.
+fn granting_spellings(principal_arn: &str) -> Vec<String> {
+    super::fgac::identities(principal_arn)
+}
+
+/// The spellings a statement of the access policy REFUSES this principal by: the identities
+/// it IS ([`granting_spellings`], passed in as `granting` so the two sets cannot drift) and
+/// the spellings its whole ACCOUNT is named by, since a statement that denies an account
+/// refuses each of its principals.
+fn denying_spellings(principal_arn: &str, granting: &[String]) -> Vec<String> {
+    let mut spellings = granting.to_vec();
     spellings.extend(iam::account_principals(principal_arn));
     spellings
+}
+
+/// What a domain's ACCESS POLICY says about one request: the decision it states about the
+/// principal that made it, and whether the only grant of the request it carries is to that
+/// principal's ACCOUNT.
+#[derive(Debug, Default, Clone, Copy)]
+struct AccessPolicySaid {
+    /// IAM's decision from this document for the principal itself: `Denied` where a statement
+    /// refuses it or its account, `Allowed` where one grants the principal, and `NotStated`
+    /// otherwise — a document granting the account alone among them.
+    decision: Decision,
+    /// Whether the document grants the request to the principal's whole ACCOUNT while
+    /// granting the principal itself nothing, which is the delegation above: what decides such
+    /// a request is the account's own identity-based policies, so a refusal of it names those
+    /// rather than this document.
+    delegated: bool,
+}
+
+/// What the access policy `policy` says about the request `request` — asked TWICE, because
+/// the two effects are decided over different principal sets ([`granting_spellings`],
+/// [`denying_spellings`]): the deny with the account's own spellings among them, and the
+/// grant with the principal's alone.
+fn access_policy_said(
+    policy: &str,
+    request: &iam::Request<'_>,
+    denying: &[String],
+) -> AccessPolicySaid {
+    let about_the_account = iam::resource_decision(
+        policy,
+        &iam::Request {
+            principals: denying,
+            ..*request
+        },
+    );
+    if about_the_account == Decision::Denied {
+        return AccessPolicySaid {
+            decision: Decision::Denied,
+            delegated: false,
+        };
+    }
+    let decision = iam::resource_decision(policy, request);
+    AccessPolicySaid {
+        delegated: decision != Decision::Allowed && about_the_account == Decision::Allowed,
+        decision,
+    }
 }
 
 /// The index `index_name` names on `domain`, CREATED with `mappings` if the domain does

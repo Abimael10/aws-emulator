@@ -25,8 +25,9 @@
 //! no mapping binds, the account's own credential), what it asks for (the cluster's health
 //! and banner, an index create, a document write, a count, a search), and what the policies
 //! in force state (nothing at all, an explicit identity-side `Deny`, an access policy that
-//! allows somebody else) — so neither the verdict nor the envelope a refusal carries is one a
-//! fixed answer would give.
+//! allows somebody else, and one that names the caller's whole ACCOUNT — which grants no
+//! principal of it and leaves that account's identity policies deciding) — so neither the
+//! verdict nor the envelope a refusal carries is one a fixed answer would give.
 //!
 //! Every case drives the real wire path — an HTTP request through the multi-service router
 //! into the mounted service, sent to the address the control plane PUBLISHED for the domain.
@@ -107,9 +108,29 @@ fn allows_someone_else(domain: &str) -> String {
     .to_string()
 }
 
+/// An identity-based policy that allows every data-plane action of this service — the grant
+/// that decides a request where the domain's access policy names the whole ACCOUNT, which
+/// grants no principal of it on its own.
+fn identity_grant() -> Value {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{ "Effect": "Allow", "Action": "es:ESHttp*", "Resource": "*" }],
+    })
+}
+
+/// The master user of the domain whose access policy delegates to the account, and the access
+/// key id of its session. It carries the identity grant that delegation leaves deciding.
+const DELEGATED_MASTER_ROLE: &str = "unpoliced-rooted-master";
+const DELEGATED_MASTER_KEY: &str = "ASIAEXAMPLEUNPOLRTM1";
+
+/// A role of the same account that domain's cluster binds to no role, carrying that same
+/// identity grant — so IAM admits its requests and what is left to decide is the cluster's.
+const DELEGATED_UNMAPPED_ROLE: &str = "unpoliced-rooted-unmapped";
+const DELEGATED_UNMAPPED_KEY: &str = "ASIAEXAMPLEUNPOLRTU1";
+
 /// An access policy that allows this service's data-plane actions to the ACCOUNT ROOT — the
-/// delegation a client writes when the authorization it wants is the cluster's, naming the
-/// account rather than each principal of it.
+/// delegation a client writes when the decision it wants taken is IAM's, naming the account
+/// rather than each principal of it.
 fn allows_the_account_root(domain: &str) -> String {
     json!({
         "Version": "2012-10-17",
@@ -274,19 +295,28 @@ async fn a_domain_with_no_policies_at_all_serves_every_principal_it_can_resolve(
     }
 }
 
-/// RULE (the same reading where the domain DOES carry an access policy, and that policy
-/// delegates to the account): a statement naming the account root is about every principal of
-/// that account, so the master role's session is allowed by it and the cluster is still what
-/// decides — the master is served and a principal no mapping binds is refused
-/// `security_exception`, not IAM's envelope.
+/// RULE (the same reading where the domain DOES carry an access policy, and that policy names
+/// the caller's whole ACCOUNT): naming an account is not naming a principal, so such a
+/// statement grants no principal of it by itself and delegates the decision to that account's
+/// own identity-based policies — a session whose role holds the grant is served, after which
+/// the CLUSTER is what decides and refuses a role no mapping binds with `security_exception`,
+/// while a session the delegation leaves with no grant at all is refused by IAM with the
+/// sentence naming the side that would have had to allow it.
 #[tokio::test]
-async fn an_access_policy_about_the_account_root_leaves_the_cluster_deciding() {
+async fn an_access_policy_about_the_account_root_delegates_to_the_identity_policies() {
     let emulator = Emulator::new();
     given_principals(&emulator);
+    for (role, key) in [
+        (DELEGATED_MASTER_ROLE, DELEGATED_MASTER_KEY),
+        (DELEGATED_UNMAPPED_ROLE, DELEGATED_UNMAPPED_KEY),
+    ] {
+        given_session(&emulator, role, SESSION, key);
+        given_role_policy(&emulator, role, identity_grant());
+    }
     let domain = "unpoliced-rooted";
     let created = emulator
         .create({
-            let mut body = create_body(domain, Some(role_arn(MASTER_ROLE)));
+            let mut body = create_body(domain, Some(role_arn(DELEGATED_MASTER_ROLE)));
             body["AccessPolicies"] = Value::String(allows_the_account_root(domain));
             body
         })
@@ -299,17 +329,25 @@ async fn an_access_policy_about_the_account_root_leaves_the_cluster_deciding() {
     settled_domain(&emulator, domain).await;
     let address = published_endpoint(&emulator, domain, domain).await;
 
-    let served = at_address(&emulator, &address, MASTER_KEY, "GET", "/_cluster/health", None).await;
+    let served = at_address(
+        &emulator,
+        &address,
+        DELEGATED_MASTER_KEY,
+        "GET",
+        "/_cluster/health",
+        None,
+    )
+    .await;
     assert_eq!(
         served.status, 200,
-        "case \"the master role's session reading the cluster health\": expected the cluster \
-         health, got {} with {:?}",
+        "case \"the master role's session, whose identity policy allows the action\": expected \
+         the cluster health, got {} with {:?}",
         served.status, served.body
     );
     let refused = at_address(
         &emulator,
         &address,
-        UNMAPPED_KEY,
+        DELEGATED_UNMAPPED_KEY,
         "POST",
         &format!("/{INDEX}/_search"),
         Some(json!({})),
@@ -318,10 +356,34 @@ async fn an_access_policy_about_the_account_root_leaves_the_cluster_deciding() {
     assert_eq!(
         (refused.status, error_type(&refused)),
         (403, "security_exception".to_string()),
-        "case \"a session of a role no mapping binds searching\": expected the cluster's own \
-         refusal, got {} with {:?}",
+        "case \"a session of a role the identity side admits and no mapping binds\": expected \
+         the cluster's own refusal, got {} with {:?}",
         refused.status,
         refused.body
+    );
+    let delegated = at_address(
+        &emulator,
+        &address,
+        UNMAPPED_KEY,
+        "GET",
+        "/_cluster/health",
+        None,
+    )
+    .await;
+    assert_eq!(
+        (delegated.status, refusal_message(&delegated)),
+        (
+            403,
+            format!(
+                "User: {} is not authorized to perform: es:ESHttpGet because no identity-based \
+                 policy allows the es:ESHttpGet action",
+                session_arn(UNMAPPED_ROLE, SESSION)
+            )
+        ),
+        "case \"a session the account-wide statement grants nothing\": expected IAM's own \
+         refusal, got {} with {:?}",
+        delegated.status,
+        delegated.body
     );
 }
 

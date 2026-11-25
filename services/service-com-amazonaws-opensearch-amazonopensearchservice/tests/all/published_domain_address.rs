@@ -17,10 +17,12 @@
 //!   a domain publishes an address for and every reader that publishes one;
 //! * **a domain's access policy decides each principal its statements NAME, and a statement
 //!   naming an IAM role is about every session of that role** — because a resource policy is
-//!   written with the identity a client created, which for a role is the role's own ARN. An
-//!   explicit `Deny` wins over every allow, and the refusal is AWS's own 403 `Message`
-//!   naming the principal, the action and which rule refused. The rows span the spellings
-//!   a `Principal` element names a caller by and both effects;
+//!   written with the identity a client created, which for a role is the role's own ARN. A
+//!   statement naming the whole ACCOUNT names no principal of it: it delegates the decision to
+//!   that account's own identity-based policies. An explicit `Deny` wins over every allow, and
+//!   the refusal is AWS's own 403 `Message` naming the principal, the action and which rule
+//!   refused. The rows span the spellings a `Principal` element names a caller by and both
+//!   effects;
 //! * **a refresh reports the shards of the indexes it ran on**, computed from each index's
 //!   own settings and the domain's node count, over a table of shard and replica counts.
 //!
@@ -773,7 +775,11 @@ struct PolicyRow {
 
 /// The table: every spelling a `Principal` element names a caller by, both effects, and a
 /// statement about another principal or another resource — read by a session whose role
-/// carries NO identity policy, so each row is decided by the access policy alone.
+/// carries NO identity policy, so each row is decided by the access policy alone. A statement
+/// naming the caller's whole ACCOUNT grants it nothing on its own: it delegates the decision
+/// to the identity policies in force on the caller, which this reader has none of
+/// (`tests/all/data_plane_account_delegated_access_policy.rs` reads that delegation over the
+/// documents a principal does carry).
 const POLICY_ROWS: &[PolicyRow] = &[
     PolicyRow {
         case: "an allow naming the role the session speaks for",
@@ -792,20 +798,23 @@ const POLICY_ROWS: &[PolicyRow] = &[
         clause: None,
     },
     PolicyRow {
+        // Naming the ACCOUNT is not naming a principal: the statement delegates the decision
+        // to that account's own identity-based policies, and this reader carries none — so
+        // the refusal names the side that would have had to allow it.
         case: "an allow naming the account root",
         domain: "acl-row-root",
         statements: r#"{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::@ACCOUNT@:root"},
                         "Action":"es:ESHttp*","Resource":"@DOMAIN@/*"}"#,
-        status: 200,
-        clause: None,
+        status: 403,
+        clause: Some("because no identity-based policy allows the es:ESHttpGet action"),
     },
     PolicyRow {
         case: "an allow naming the bare account id",
         domain: "acl-row-account",
         statements: r#"{"Effect":"Allow","Principal":{"AWS":"@ACCOUNT@"},
                         "Action":"es:ESHttp*","Resource":"@DOMAIN@/*"}"#,
-        status: 200,
-        clause: None,
+        status: 403,
+        clause: Some("because no identity-based policy allows the es:ESHttpGet action"),
     },
     PolicyRow {
         case: "an allow naming every principal",
