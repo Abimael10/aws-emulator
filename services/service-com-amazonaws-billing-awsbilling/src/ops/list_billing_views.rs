@@ -8,6 +8,12 @@
 //! A request that names no `maxResults` asks for the page size the member
 //! documents a default for, not for the whole result set, so a page never
 //! carries more than one page size of views.
+//! The `nextToken` is a position among the views ONE request selected, so every
+//! filter above travels in it and a token replayed with another filter — which
+//! selects other views than the walk the token came from — is a
+//! `ValidationException` (400) rather than a page silently missing the views
+//! sorting at or below the cursor. `maxResults` is no part of a selection, so a
+//! caller may change the page size between pages.
 //! The `activeTimeRange` filter selects views by the period the resource behind
 //! them was active, so the account's default view — which has no such resource —
 //! is listed whatever range the caller asks about. The range itself must run
@@ -100,6 +106,8 @@
 //! * `ThrottlingException` (HTTP 429) — The request was denied due to request throttling.
 //! * `ValidationException` (HTTP 400) — The input fails to satisfy the constraints specified
 //!   by an Amazon Web Services service.
+
+use std::collections::BTreeSet;
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -264,28 +272,123 @@ fn check_active_time_range(range: &ActiveTimeRange) -> Result<(), ListBillingVie
     Ok(())
 }
 
+/// What each request member that NARROWS the sequence this read walks names, as
+/// the refusal of a token minted while walking another sequence words it, in the
+/// order a `nextToken` carries their values.
+const SCOPE_ARNS: &str = "set of billing view ARNs";
+const SCOPE_BILLING_VIEW_TYPES: &str = "set of billing view types";
+const SCOPE_NAMES: &str = "name search";
+const SCOPE_OWNER_ACCOUNT: &str = "owner account";
+const SCOPE_SOURCE_ACCOUNT: &str = "source account";
+const SCOPE_ACTIVE_TIME_RANGE: &str = "active time range";
+
+/// Separates the values of one list-valued filter inside that filter's scope
+/// field. No modeled value either list carries spells it: `BillingViewArn`'s
+/// pattern admits no comma and `BillingViewType` declares none with one.
+const SCOPE_VALUE_SEPARATOR: &str = ",";
+
+/// Separates the two members of one `names` search inside that filter's scope
+/// field. `SearchValue`'s pattern (`^[a-zA-Z0-9_\+=\.\-@ ]+$`) admits neither
+/// this nor [`SCOPE_VALUE_SEPARATOR`], so a search reads back whole.
+const SCOPE_SEARCH_SEPARATOR: char = ':';
+
+/// A list-valued filter as the one scope field a `nextToken` carries for it: its
+/// values in one canonical order, joined, and the empty string for a filter that
+/// narrows nothing.
+///
+/// Both list filters test SET MEMBERSHIP ([`matches_filters`]), so two requests
+/// naming the same values in a different order — or one of them twice — select
+/// the same views and share a scope; and a filter that is absent or empty
+/// selects every view, which is one and the same sequence either way.
+fn set_filter_scope(values: Option<&[String]>) -> String {
+    values
+        .unwrap_or_default()
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<&str>>()
+        .into_iter()
+        .collect::<Vec<&str>>()
+        .join(SCOPE_VALUE_SEPARATOR)
+}
+
+/// The `names` filter as its one scope field: each search as its option and its
+/// value, in one canonical order, and the empty string for a request that
+/// searches no name. Every search has to hold ([`matches_filters`]), so what the
+/// filter selects does not depend on the order they arrive in.
+fn names_filter_scope(searches: Option<&[StringSearch]>) -> String {
+    searches
+        .unwrap_or_default()
+        .iter()
+        .map(|search| {
+            format!(
+                "{}{SCOPE_SEARCH_SEPARATOR}{}",
+                search.search_option, search.search_value
+            )
+        })
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect::<Vec<String>>()
+        .join(SCOPE_VALUE_SEPARATOR)
+}
+
+/// The `activeTimeRange` filter as its one scope field — both bounds, the period
+/// the caller asks the views to have been active over — and the empty string for
+/// a request that asks about no period, which lists every view whenever it came
+/// into existence.
+fn active_time_range_scope(range: Option<&ActiveTimeRange>) -> String {
+    range.map_or_else(String::new, |range| {
+        format!(
+            "{}..{}",
+            crate::state::date_time_secs(&range.active_after_inclusive),
+            crate::state::date_time_secs(&range.active_before_inclusive)
+        )
+    })
+}
+
 /// The ARN a `nextToken` resumes after, or a `ValidationException` when the
-/// token is not one THIS read issued under this store's key — one this service
-/// cannot read back, one a caller assembled, and one it minted for another of
-/// its paginated reads, whose payload is a cut point of another sequence and
-/// names no view in this one. The token format and the refusal's wording live
-/// in `crate::state`, shared with every other paginated read.
-fn decode_page_token(
+/// token is no cut point of the sequence THIS request selects: one this service
+/// cannot read back, one a caller assembled, one it minted for another of its
+/// paginated reads, and one it minted while walking another selection of views.
+///
+/// A cursor is a position among the views the request selects, so a token is
+/// usable only by a request that selects the same ones: every member that
+/// narrows the walk travels in the token beside the cursor and is compared with
+/// the resuming request. Applying a cut point of another selection to this walk
+/// would skip every view of it sorting at or below that cursor — views the walk
+/// the token came from never reported — and answer that truncated page with a
+/// 200, so the request is refused the way this crate's other filtered paginated
+/// reads refuse a token "issued for another set of filters". `maxResults` is
+/// deliberately NOT part of the scope: a page size is how much of one walk a
+/// caller takes, not which views the walk is over.
+///
+/// The token format and the unusable-token wording live in `crate::state`,
+/// shared with every other paginated read.
+fn cut_point(
     key: &crate::state::PageTokenKey,
     read_by: &str,
     token: &str,
+    scope: &[(&str, &str)],
 ) -> Result<String, ListBillingViewsError> {
-    crate::state::decode_page_token(key, read_by, token).ok_or_else(|| {
-        ListBillingViewsErrorModeled::ValidationException(ValidationException {
-            message: crate::state::PAGE_TOKEN_REFUSAL.to_string(),
-            reason: crate::state::VALIDATION_REASON_CANNOT_PARSE.to_string(),
-            field_list: Some(vec![ValidationExceptionField {
-                name: "nextToken".to_string(),
-                message: crate::state::PAGE_TOKEN_FIELD_REFUSAL.to_string(),
-            }]),
-        })
-        .into()
-    })
+    match crate::state::decode_scoped_page_token(key, read_by, token, scope) {
+        crate::state::ScopedPageToken::Cursor(cursor) => Ok(cursor),
+        crate::state::ScopedPageToken::OtherSequence(names) => Err(invalid_field(
+            "nextToken",
+            &format!("the pagination token was issued for another {names}"),
+        )),
+        crate::state::ScopedPageToken::Unusable => {
+            Err(
+                ListBillingViewsErrorModeled::ValidationException(ValidationException {
+                    message: crate::state::PAGE_TOKEN_REFUSAL.to_string(),
+                    reason: crate::state::VALIDATION_REASON_CANNOT_PARSE.to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "nextToken".to_string(),
+                        message: crate::state::PAGE_TOKEN_FIELD_REFUSAL.to_string(),
+                    }]),
+                })
+                .into(),
+            )
+        }
+    }
 }
 
 /// Whether `view` satisfies every filter the request carries. A filter the
@@ -414,11 +517,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The page resumes strictly after the last ARN the previous page
         // returned, so a view inserted or removed between pages cannot make the
         // walk skip or repeat another one.
+        // The sequence this request selects, which every `nextToken` of this
+        // walk is bound to: each member that narrows which views the walk holds,
+        // so a cut point of ANOTHER selection is refused rather than applied to
+        // this one, which would drop every view of it sorting at or below that
+        // cursor (see [`cut_point`]).
         // The key the store's tokens are authenticated under, taken off the
         // store by value so the walk below can borrow the views it reports.
         let page_key = state.page_token_key();
+        let arns_scope = set_filter_scope(input.arns.as_deref());
+        let types_scope = set_filter_scope(input.billing_view_types.as_deref());
+        let names_scope = names_filter_scope(input.names.as_deref());
+        let range_scope = active_time_range_scope(input.active_time_range.as_ref());
+        let scope = [
+            (SCOPE_ARNS, arns_scope.as_str()),
+            (SCOPE_BILLING_VIEW_TYPES, types_scope.as_str()),
+            (SCOPE_NAMES, names_scope.as_str()),
+            (
+                SCOPE_OWNER_ACCOUNT,
+                input.owner_account_id.as_deref().unwrap_or_default(),
+            ),
+            (
+                SCOPE_SOURCE_ACCOUNT,
+                input.source_account_id.as_deref().unwrap_or_default(),
+            ),
+            (SCOPE_ACTIVE_TIME_RANGE, range_scope.as_str()),
+        ];
         let resume_after = match input.next_token.as_deref() {
-            Some(token) => Some(decode_page_token(&page_key, Self::NAME, token)?),
+            Some(token) => Some(cut_point(&page_key, Self::NAME, token, &scope)?),
             None => None,
         };
 
@@ -447,9 +573,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clamp(MIN_MAX_RESULTS, MAX_MAX_RESULTS);
         let next_token = if matched.len() > limit {
             matched.truncate(limit);
-            matched
-                .last()
-                .map(|view| crate::state::encode_page_token(&page_key, Self::NAME, &view.arn))
+            matched.last().map(|view| {
+                crate::state::encode_scoped_page_token(&page_key, Self::NAME, &scope, &view.arn)
+            })
         } else {
             None
         };

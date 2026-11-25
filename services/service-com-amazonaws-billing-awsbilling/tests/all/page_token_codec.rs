@@ -9,7 +9,8 @@
 //! one acceptance rule decide every `nextToken` this service issues and takes
 //! back. Each read adds only its own payload on top — the walked view and the
 //! entries that walk has reported for `ListSourceViewsForBillingView`, the ARN
-//! a page ended at for `ListBillingViews` — which travels beside the NAME of
+//! a page ended at, with the filters that select the walk, for
+//! `ListBillingViews` — which travels beside the NAME of
 //! the read that minted the token, under an authenticator the store computes
 //! with a secret of its own, so a token is taken back only by the read that
 //! issued it (see `token_scope.rs`).
@@ -35,6 +36,12 @@ use smithy_server_runtime::MultiServiceRouter;
 // `error_code` — already exists for the billing-view lifecycle suite, so this
 // module reuses it instead of building a second one.
 use crate::billing_views::{call, emulator_with_engine, error_code, plant_source_views, ACCOUNT_ID};
+
+/// How many request members narrow which views `ListBillingViews` walks
+/// (`arns`, `billingViewTypes`, `names`, `ownerAccountId`, `sourceAccountId`
+/// and `activeTimeRange`), and so how many scope fields its payload carries
+/// ahead of the cut point — each empty for the unfiltered walk this suite pages.
+const LIST_BILLING_VIEWS_FILTERS: usize = 6;
 
 /// A pattern-valid `BillingViewArn` for a source view with resource id `id`.
 fn source_arn(id: &str) -> String {
@@ -267,7 +274,15 @@ async fn walks(
             operation: "ListBillingViews",
             issued: issued_token(router, "ListBillingViews", &views_base).await,
             base: views_base,
-            payload: every_view[0].clone(),
+            // The payload a page of one view ends at: one field per filter
+            // member that selects which views are walked — each empty, because
+            // this request names none of them — and then the ARN the page ended
+            // at.
+            payload: format!(
+                "{}{}",
+                "#".repeat(LIST_BILLING_VIEWS_FILTERS),
+                every_view[0]
+            ),
             expected_after: every_view[1..].to_vec(),
         },
     ]

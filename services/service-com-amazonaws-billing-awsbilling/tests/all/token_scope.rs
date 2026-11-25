@@ -24,11 +24,11 @@
 //!
 //! The second half of the suite is about the other half of that one rule: WHICH
 //! SEQUENCE a token is a cut point in. A read handed its own token under request
-//! members naming another sequence — another billing view, another period,
-//! another billing month — refuses it rather than comparing that cursor against
-//! the keys of the walk the request asks for; a member that only narrows one and
-//! the same walk leaves the cursor a cut point of it, and the page size is no
-//! part of a sequence at all.
+//! members selecting another sequence — another billing view, another period,
+//! another billing month, another set of billing-view filters — refuses it
+//! rather than comparing that cursor against the keys of the walk the request
+//! asks for; the page size is no part of a sequence at all, so a caller may
+//! change it between pages.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -668,9 +668,10 @@ async fn the_preference_read_refuses_a_cut_point_of_its_own_walk_a_caller_assemb
 // The rows below are about the other half of it: a read handed its OWN token
 // under request members that select another sequence refuses it, instead of
 // comparing a cursor of that other sequence against the keys of this one — a
-// comparison that answers an empty page for a walk that is not empty, or
-// restarts it. A member that only NARROWS one and the same walk leaves the
-// cursor a cut point of it, and `maxResults` is no part of a sequence at all.
+// comparison that answers an empty page for a walk that is not empty, drops
+// every entry sorting at or below the cursor, or restarts the walk. Every
+// member that selects or narrows the sequence counts; `maxResults` is no part
+// of a sequence at all.
 // ---------------------------------------------------------------------------
 
 /// One replay of a `nextToken` a read really issued: the request it is replayed
@@ -724,12 +725,6 @@ fn assert_other_sequence_refusal(case: &str, status: u16, refused: &Value, issue
         Some("nextToken"),
         "case {case:?}: expected the fieldList to name nextToken, got {refused:?}"
     );
-}
-
-/// Whether `reported` is a contiguous TAIL of `walk`: what a cursor of one
-/// ordered sequence leaves of a narrowed view of that same sequence.
-fn is_tail(walk: &[String], reported: &[String]) -> bool {
-    walk.len() >= reported.len() && walk[walk.len() - reported.len()..] == *reported
 }
 
 /// Record the two-segment timeline [`seed`] gives the caller's PRIMARY view for
@@ -974,73 +969,73 @@ async fn a_support_charge_token_is_a_cut_point_in_one_billing_month() {
 }
 
 #[tokio::test]
-async fn a_token_still_resumes_a_read_whose_members_only_narrow_one_sequence() {
+async fn a_billing_view_token_is_a_cut_point_in_one_selection_of_views() {
     let (router, engine) = emulator_with_engine();
     seed(&engine);
     // Two CUSTOM views beside the account's PRIMARY one, so the billing-view
-    // list has a walk of three and a type filter narrows it.
+    // list has a walk of three and a type filter selects a strict part of it.
     plant_source_views(
         &engine,
         &[source_arn("narrowing-a"), source_arn("narrowing-b")],
     );
 
-    // Each row is a read whose members only choose which entries of ONE ordered
-    // walk are reported: the type of the account's billing views. The cursor is
-    // still a position in that one walk, so the narrowed request resumes from it
-    // rather than refusing it, and what it reports is exactly the tail of its
-    // own walk that follows the cursor — which each row names.
-    //
-    // `ListBusinessSupportSubscriptionHistory` is NOT a row here: a request that
-    // names another `billingMonth` asks about another PERIOD, which selects
-    // contracts the walked period does not hold rather than a subset of them, so
-    // that read refuses such a token — see
-    // `business_support_subscription_history_token_scope.rs`. Neither is
-    // `GetCreditAllocationHistory`: its `startDate`/`endDate` choose WHICH
-    // billing months the walk covers rather than which entries of one walk are
-    // reported, so a range that differs by a month selects other allocations and
-    // that read refuses such a token — see
-    // `credit_allocation_history_token_scope.rs`.
-    let rows: Vec<(&'static str, Value, Value, Vec<String>)> = vec![
+    let read = Read {
+        operation: "ListBillingViews",
+        base: json!({}),
+    };
+    let (every, token) = whole_walk_and_first_token(&router, &read).await;
+
+    // The token resumes the selection it was minted for, whatever page size the
+    // next request asks for: a page size is no part of a selection.
+    for (case, mut resumed) in [
+        ("the walked selection again", read.base.clone()),
         (
-            "ListBillingViews",
-            json!({}),
-            json!({ "billingViewTypes": ["PRIMARY"] }),
-            // The walk ascends by ARN and the cursor is the first CUSTOM view
-            // (`billingview/narrowing-a` sorts below `billingview/primary`), so
-            // the account's PRIMARY view is what the type filter leaves after
-            // it.
-            vec![PRIMARY_ARN.to_string()],
+            "the walked selection with a larger page size",
+            json!({ "maxResults": 100 }),
         ),
-    ];
-
-    for (operation, base, narrowed, expected_after) in rows {
-        let read = Read { operation, base };
-        let (_, token) = whole_walk_and_first_token(&router, &read).await;
-
-        let (status, whole) = call(&router, operation, &narrowed).await;
+    ] {
+        resumed["nextToken"] = json!(token.clone());
+        let (status, body) = call(&router, read.operation, &resumed).await;
         assert_eq!(
-            status, 200,
-            "case {operation:?}: expected 200 for the narrowed walk, got {status} {whole:?}"
-        );
-        let narrowed_walk = entries(operation, &whole);
-
-        let mut resumed = narrowed.clone();
-        resumed["nextToken"] = json!(token);
-        let (status, body) = call(&router, operation, &resumed).await;
-        assert_eq!(
-            status, 200,
-            "case {operation:?}: expected 200 for a cursor of the same walk, got {status} {body:?}"
-        );
-        let reported = entries(operation, &body);
-        assert_eq!(
-            reported, expected_after,
-            "case {operation:?}: expected the entries of the narrowed walk {narrowed_walk:?} \
-             that follow the cursor, got {reported:?}"
-        );
-        assert!(
-            !reported.is_empty() && is_tail(&narrowed_walk, &reported),
-            "case {operation:?}: the cursor must leave a non-empty tail of the narrowed walk \
-             {narrowed_walk:?}, got {reported:?}"
+            (status, entries(read.operation, &body)),
+            (200, every[1..].to_vec()),
+            "case {case:?}: expected the views after the cursor, got {status} {body:?}"
         );
     }
+
+    // The same token under a filter: `billingViewTypes` selects other views than
+    // the walk the token came from, so the cursor is a cut point of another
+    // sequence and the read refuses it. Honouring it would answer an empty,
+    // token-less page for a selection that holds a view, because the account's
+    // PRIMARY view sorts above the cursor only by accident of the ARN order —
+    // `billing_views_token_scope.rs` spans the whole class of filters.
+    let narrowed = json!({ "billingViewTypes": ["PRIMARY"] });
+    let mut refused_request = narrowed.clone();
+    refused_request["nextToken"] = json!(token.clone());
+    let (status, refused) = call(&router, read.operation, &refused_request).await;
+    assert_other_sequence_refusal(
+        "the unfiltered token replayed under a type filter",
+        status,
+        &refused,
+        "set of billing view types",
+    );
+
+    // What the refusal kept: the narrowed selection still reports every view it
+    // holds, and the token still resumes the walk it was minted for.
+    let (status, body) = call(&router, read.operation, &narrowed).await;
+    assert_eq!(
+        (status, entries(read.operation, &body)),
+        (200, vec![PRIMARY_ARN.to_string()]),
+        "case \"the narrowed selection after the refusal\": expected its own whole walk, \
+         got {status} {body:?}"
+    );
+    let mut resumed = read.base.clone();
+    resumed["nextToken"] = json!(token);
+    let (status, body) = call(&router, read.operation, &resumed).await;
+    assert_eq!(
+        (status, entries(read.operation, &body)),
+        (200, every[1..].to_vec()),
+        "case \"the walked selection after the refusal\": expected the views after the cursor, \
+         got {status} {body:?}"
+    );
 }
