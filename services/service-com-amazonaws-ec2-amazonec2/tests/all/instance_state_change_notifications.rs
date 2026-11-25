@@ -446,6 +446,87 @@ async fn until_state(router: &MultiServiceRouter, case: &str, instance_id: &str,
     }
 }
 
+/// Look at `instance_id` until it reports `state`, WITHOUT waiting anything out between asks,
+/// so the call that acts on the instance next is made in the very instant the clock's move
+/// fell due — the tightest a client can be, and the one a client polling for a state is.
+async fn until_state_at_once(
+    router: &MultiServiceRouter,
+    case: &str,
+    instance_id: &str,
+    state: &str,
+) {
+    let deadline = Instant::now() + DELIVERY_BUDGET;
+    loop {
+        let body = ec2_ok(
+            router,
+            case,
+            "DescribeInstances",
+            &indexed("InstanceId", &[instance_id]),
+        )
+        .await;
+        if elements(&body, "name").iter().any(|name| name == state) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: {instance_id} must reach {state}, got {body}"
+        );
+    }
+}
+
+/// THE RULE where the caller is as FAST as a caller can be: a state the instance ENTERED is
+/// announced whatever moves it on next, so a start made in the very instant the stop it was
+/// waiting for completed leaves all four of those moves announced.
+///
+/// The move an event reports is a fact of the instance's history, not a reading of where the
+/// instance is when the event goes out: the stop's `stopped` is published for the move the
+/// clock made, even though by then this caller has already put the instance back into
+/// `pending`.
+#[tokio::test]
+async fn the_states_an_instance_entered_are_announced_however_fast_the_next_call_comes() {
+    let router = emulator();
+    let case = "a start made the instant the stop completes";
+    let url = watched_queue(&router, case, "immediate-restart-moves").await;
+    let mut watcher = Watcher {
+        url,
+        by_instance: BTreeMap::new(),
+    };
+
+    let instance_id = launch(&router, case, &[]).await;
+    // The launch's own two moves, taken off the queue so the stop and the start below are read
+    // on their own.
+    watcher.events_for(&router, case, &instance_id, 2).await;
+    until_state(&router, case, &instance_id, "running").await;
+
+    ec2_ok(
+        &router,
+        case,
+        "StopInstances",
+        &indexed("InstanceId", &[&instance_id]),
+    )
+    .await;
+    until_state_at_once(&router, case, &instance_id, "stopped").await;
+    ec2_ok(
+        &router,
+        case,
+        "StartInstances",
+        &indexed("InstanceId", &[&instance_id]),
+    )
+    .await;
+
+    // All four moves, as a SET: the order two publications made in the same instant reach one
+    // queue in is the bus's, while which moves were announced is this service's.
+    let delivered = watcher.events_for(&router, case, &instance_id, 4).await;
+    let mut announced = states(case, &instance_id, &delivered);
+    announced.sort();
+    assert_eq!(
+        announced,
+        vec!["pending", "running", "stopped", "stopping"],
+        "case {case:?}: every state {instance_id} entered is announced, whatever moved it on \
+         next, got {announced:?}"
+    );
+}
+
 /// One row of the launch table: the case, the Amazon EBS members the launch's root device
 /// entry carries, and the states the instance must announce, in order.
 type LaunchRow = (&'static str, Vec<(&'static str, String)>, Vec<&'static str>);

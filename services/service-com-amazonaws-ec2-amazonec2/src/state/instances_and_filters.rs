@@ -616,15 +616,29 @@ impl ComAmazonawsEc2Amazonec2State {
         // this walk because each reaches the account's interfaces as well as the instance.
         let mut stopped: Vec<String> = Vec::new();
         let mut started: Vec<String> = Vec::new();
+        // Every move this sweep APPLIED: recorded after the walk below, for the publications
+        // that report those moves ([`crate::state::AppliedInstanceMove`]).
+        let mut applied: Vec<(String, InstanceStateName, Instant)> = Vec::new();
         for instance in self.instances.values_mut() {
-            let due = instance
+            // EVERY move the clock has already made due, in the order they fell due: a chain
+            // whose whole span has passed (`shutting-down` -> `terminated`) is applied in ONE
+            // sweep, so a reader is told where the instance IS and not where it was one move
+            // ago, and the event of each of those moves finds the move recorded. The walk is
+            // bounded by the chain itself: [`InstanceRecord::state_after`] gives `terminated`
+            // no successor, so at most the two moves of one chain are applied here, and a move
+            // still in its span ends it.
+            while let Some((state, due_at, reason)) = instance
                 .pending_transition
                 .as_ref()
                 .filter(|pending| now >= pending.due_at)
-                .map(|pending| (pending.to, pending.due_at, pending.reason.clone()));
-            if let Some((state, due_at, reason)) = due {
+                .map(|pending| (pending.to, pending.due_at, pending.reason.clone()))
+            {
                 instance.state = state;
                 instance.pending_transition = None;
+                // The state the instance ENTERED, recorded so the event that move is
+                // published as reports a move this store really made, whatever the instance
+                // does next.
+                applied.push((instance.instance_id.clone(), state, due_at));
                 // The reason the move was made FOR, where the move carried one: it is the
                 // reason for the transition that has just happened, so it is recorded as that
                 // transition is applied rather than while the instance was still on its way.
@@ -669,6 +683,11 @@ impl ComAmazonawsEc2Amazonec2State {
         }
         for address in released {
             self.release_private_ip(&address);
+        }
+        // The moves this sweep made, recorded for the events they are published as: the walk
+        // above held this store's instances, so they are written once it has let go of them.
+        for (instance_id, state, due_at) in applied {
+            self.record_applied_instance_move(&instance_id, state, due_at);
         }
         // "The public IPv4 address is released when you stop… your instance" and a new one is
         // assigned when it starts again (the EC2 User Guide's "Public IPv4 addresses"): both

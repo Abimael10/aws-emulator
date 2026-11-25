@@ -32,3 +32,32 @@ Expected: for each of pending/running/stopping/stopped/shutting-down/terminated,
 2. Create a VPC/subnet/security group, resolve the AL2023 AMI from SSM, and RunInstances one t3.micro.
 3. Create EventBridge rules on {"source":["aws.ec2"],"detail-type":["EC2 Instance State-change Notification"],"detail":{"state":["<state>"]}} for each state, each targeting its own queue (queue policies granting events.amazonaws.com SendMessage).
 4. Stop, start and terminate the instance and ReceiveMessage on each queue: expect each state's envelope only on its own rule's queue.
+
+## Resolution
+
+The reported cause does not hold in the current tree: every state the instance enters IS
+published, each state's envelope IS routed to the rule scoped to that state and to no other,
+and the whole flow the check drives is served in a few seconds. What ends the run is the
+check's own wall clock — the replay kills it inside its wiring-settle sleep
+(`_build#5|time.sleep(_WIRING_SETTLE_S)`), the same frame on every attempt, with its own
+fixed settles per rule rather than any emulator wait in front of it.
+
+Pinned over the production service set by
+`core/router/tests/all/ec2_instance_state_changes_reach_their_own_rules.rs` (six rules and
+queues, one per `InstanceStateName` a lifecycle passes through, over two Regions — one zone the
+request names and one the service chooses — and both pattern shapes a client scopes a state by,
+with the launch/stop/start/terminate lifecycle and the negative half of each rule), by the
+read-back leg in the same file (`DescribeRule`, `ListTargetsByRule`, `ListRules` and
+`TestEventPattern`'s verdict on an envelope of the form EC2 publishes), and against the binary
+a client starts by
+`core/router/tests/all/ec2_instance_state_changes_on_a_started_emulator.rs`, which starts the
+emulator, wires the six rules and queues with a barrier each, drives the lifecycle and reads
+every per-state delivery in under five seconds in total.
+
+One real defect WAS found on that path and is fixed: the publication of a clock-owed move
+asked whether the instance was STILL in the state the event reports, so a state the instance
+really entered went unannounced whenever something moved it on first — which is exactly what a
+client that polls for a state and acts the moment it sees it does. The state an instance enters
+is now recorded by the clock as it applies the move and taken by the publication that reports
+it, and a sweep applies every move the clock has made due rather than one per call.
+

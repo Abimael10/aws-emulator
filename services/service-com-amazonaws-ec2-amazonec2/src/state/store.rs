@@ -1565,6 +1565,20 @@ pub struct ComAmazonawsEc2Amazonec2State {
     pub reservation_order: Vec<String>,
     /// Instances by `InstanceId`.
     pub instances: HashMap<String, InstanceRecord>,
+    /// The instance state moves this store's CLOCK has applied and nothing has reported yet,
+    /// oldest first.
+    ///
+    /// A state an instance ENTERED is a fact of that instance's history, and the event that
+    /// move is published as reports that fact ([`InstanceStateNotification`]): the publication
+    /// is made once the move falls due, and by then a caller may already have moved the
+    /// instance on, so what it asks this store is whether the move HAPPENED rather than where
+    /// the instance is now. Each entry is written by [`Self::materialize_due_transitions`] as
+    /// it applies the move — the one place an owed instance move is made — and taken again by
+    /// the publication that reports it ([`Self::take_applied_instance_move`]), so one move is
+    /// reported exactly once. Bounded by [`MAX_RECORDED_INSTANCE_MOVES`], which is what keeps
+    /// a move nothing reports from growing this store. Starts EMPTY: a fresh account holds no
+    /// instance, so this clock has moved none.
+    pub applied_instance_moves: VecDeque<AppliedInstanceMove>,
     /// The ClassicLink link of each LINKED EC2-Classic instance, by the `InstanceId` it is
     /// a link of: only what the link itself adds (the VPC and the security groups), since
     /// the tags and group names `ClassicLinkInstance` also reports belong to the instance
@@ -4015,6 +4029,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             reservations: HashMap::new(),
             reservation_order: Vec::new(),
             instances: HashMap::new(),
+            // A fresh account holds no instance, so this store's clock has moved none.
+            applied_instance_moves: VecDeque::new(),
             // A fresh account holds no EC2-Classic instance, so nothing is linked to a
             // ClassicLink-enabled VPC either.
             classic_link_instances: BTreeMap::new(),
