@@ -3,18 +3,19 @@
 //! A Slack channel configuration write made BEFORE the account adds the Slack workspace
 //! it names.
 //!
-//! `ConflictException`'s own documentation states that condition first, and states it
-//! over all three channel-configuration writes together: "Add, update, or delete a Slack
-//! channel configuration before you add a Slack workspace to your Amazon Web Services
-//! account" (`smithy_query(query="doc", shape="ConflictException")`). Each of
+//! `ConflictException`'s own documentation states that condition first: "Add, update, or
+//! delete a Slack channel configuration before you add a Slack workspace to your Amazon
+//! Web Services account" (`smithy_query(query="doc", shape="ConflictException")`). Each of
 //! `CreateSlackChannelConfiguration`, `UpdateSlackChannelConfiguration` and
 //! `DeleteSlackChannelConfiguration` binds that error (HTTP 409)
 //! (`smithy_query(query="operation",
 //! operation="CreateSlackChannelConfiguration,UpdateSlackChannelConfiguration,DeleteSlackChannelConfiguration",
 //! model_path="services/service-com-amazonaws-supportapp-supportapp/smithy-model/com-amazonaws-supportapp-supportapp.json")`),
-//! so each answers it for a `teamId` the account's Slack workspace registry does not
-//! hold — before it looks any configuration up, which is why the modelled
-//! `ResourceNotFoundException` (404) is reachable only inside a registered workspace.
+//! and it is the answer of the write that ADDS a configuration: a `teamId` the account's
+//! registry does not hold has no workspace to add one to. The two writes that act on a
+//! configuration which must already EXIST settle their answer on the resource the request
+//! identifies instead, so an unregistered workspace — which holds no configuration at all
+//! — draws the modelled `ResourceNotFoundException` (404) from them.
 //! A client branches on the two: the 409 tells it to add the workspace first, the 404
 //! that the channel was never configured.
 //!
@@ -24,7 +25,7 @@
 //! or registered and then removed, over `teamId` forms at both published `len 1..256`
 //! bounds — and the second test drives each pair through the whole lifecycle, so the
 //! answer is read from the registry at every call rather than decided once. The third
-//! pins what still precedes the precondition: a request the model itself refuses.
+//! pins what still precedes both: a request the model itself refuses.
 //!
 //! Every assertion goes over the wire through the same router the production emulator
 //! mounts, reusing the harness in [`crate::slack_channel_configurations`], so an answer
@@ -34,8 +35,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_supportapp_supportapp::state::MAX_SLACK_WORKSPACE_CONFIGURATIONS;
 
 use crate::channel_configuration_workspace_precondition::{
-    assert_workspace_conflict, assert_writes_on_an_unregistered_workspace, create_body,
-    team_ids, update_body,
+    assert_channel_not_found, assert_workspace_conflict,
+    assert_writes_on_an_unregistered_workspace, create_body, team_ids, update_body,
 };
 use crate::error_message_templates::{not_found, refusal};
 use crate::slack_channel_configurations::{role_arn, Emulator};
@@ -109,7 +110,7 @@ async fn arrange(label: &str, team_id: &str, channel_id: &str, state: Registry, 
 }
 
 #[tokio::test]
-async fn every_channel_configuration_write_before_the_workspace_is_the_conflict() {
+async fn every_channel_configuration_write_before_the_workspace_is_refused() {
     // Rows: which registry state the named workspace is in, how much the account holds
     // besides it, and the form and length of the ids. Each row drives all three writes.
     let rows: [(&str, String, String, Registry, usize); 7] = [
@@ -179,7 +180,7 @@ async fn every_channel_configuration_write_before_the_workspace_is_the_conflict(
         }
 
         // Nothing was written for the pair, and the other workspaces' configurations
-        // are untouched: the conflict is a refusal, not a partial write.
+        // are untouched: each refusal is a refusal, not a partial write.
         assert!(
             emulator.listed(&team_id, &channel_id).await.is_none(),
             "case {label:?}: a refused write must store nothing for the pair, got {}",
@@ -195,12 +196,12 @@ async fn every_channel_configuration_write_before_the_workspace_is_the_conflict(
 }
 
 #[tokio::test]
-async fn adding_the_workspace_is_what_makes_the_resource_answers_reachable() {
-    // The registry is read at EVERY write, so one pair walks the whole lifecycle: the
-    // conflict before the workspace is added, the miss for a channel that is not
-    // configured inside it, HTTP 200 for the channel that is, the miss again once it is
-    // deleted, and the conflict again once the workspace itself goes. Rows differ in the
-    // team id form and length.
+async fn adding_the_workspace_is_what_makes_the_create_reachable() {
+    // The registry is read at EVERY create, so one pair walks the whole lifecycle: the
+    // conflict before the workspace is added, the miss from the two writes that need a
+    // configuration, HTTP 200 for all three once the workspace is there and the channel
+    // configured, the miss again once it is deleted, and the create's conflict again once
+    // the workspace itself goes. Rows differ in the team id form and length.
     for (label, team_id) in team_ids() {
         let emulator = Emulator::new();
         let channel_id = "C01234A5BCD";
@@ -220,7 +221,7 @@ async fn adding_the_workspace_is_what_makes_the_resource_answers_reachable() {
         );
 
         // Inside the registered workspace the two writes that act on an EXISTING
-        // configuration report the miss — the answer that was unreachable a moment ago.
+        // configuration report the same miss they reported before it was registered.
         for (operation, reply) in [
             (
                 "UpdateSlackChannelConfiguration",
@@ -273,7 +274,7 @@ async fn adding_the_workspace_is_what_makes_the_resource_answers_reachable() {
             "case {case:?}: expected {expected:?}, got {message:?}"
         );
 
-        // And removing the workspace takes the precondition back with it.
+        // And removing the workspace takes the create's precondition back with it.
         assert_eq!(
             emulator.delete_workspace(&team_id).await.status,
             200,
@@ -366,10 +367,11 @@ async fn a_request_the_model_refuses_is_refused_before_the_precondition() {
 }
 
 #[tokio::test]
-async fn the_conflict_is_stated_over_the_team_the_request_named() {
-    // The message is built from the request's `teamId` and the account the emulator
-    // presents, so two writes naming different unregistered workspaces in the same
-    // account draw two different messages, each naming its own team.
+async fn each_refusal_is_stated_over_the_resource_the_request_named() {
+    // The conflict's message is built from the request's `teamId` and the account the
+    // emulator presents, and the miss's from the pair the request named, so two writes
+    // naming different unregistered workspaces in the same account draw two different
+    // messages, each naming its own team.
     let emulator = Emulator::new();
     let registered = "T012ABCDEFG";
     assert_eq!(
@@ -379,15 +381,23 @@ async fn the_conflict_is_stated_over_the_team_the_request_named() {
     );
 
     for team_id in ["T99999ZZZZZ", "t012abcdefg", &"T".repeat(SLACK_ID_MAX_LEN)] {
+        let channel_id = "C01234A5BCD";
         assert_workspace_conflict(
+            &format!("create naming {team_id:?}"),
+            team_id,
+            &emulator.create(create_body(team_id, channel_id)).await,
+        );
+        assert_channel_not_found(
             &format!("delete naming {team_id:?}"),
             team_id,
-            &emulator.delete(team_id, "C01234A5BCD").await,
+            channel_id,
+            &emulator.delete(team_id, channel_id).await,
         );
-        assert_workspace_conflict(
+        assert_channel_not_found(
             &format!("update naming {team_id:?}"),
             team_id,
-            &emulator.update(update_body(team_id, "C01234A5BCD")).await,
+            channel_id,
+            &emulator.update(update_body(team_id, channel_id)).await,
         );
     }
 }

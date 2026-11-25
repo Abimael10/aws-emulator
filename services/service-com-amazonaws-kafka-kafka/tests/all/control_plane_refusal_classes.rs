@@ -5,10 +5,11 @@
 //!
 //! Three rules, each asserted over a TABLE rather than over one recorded request:
 //!
-//! 1. `CreateClusterV2` names EXACTLY ONE cluster type. A body naming both selects two
-//!    clusters at once and is refused on the BODY with HTTP 400 `BadRequestException`, the
-//!    sentence stating that only one of the two may be given and no `invalidParameter`,
-//!    because either member would have fixed the request. The decision is taken on the
+//! 1. `CreateClusterV2` names EXACTLY ONE cluster type. A body naming both asks for two
+//!    clusters at once, so it describes no one cluster the service can read it as, and is
+//!    refused on the BODY with HTTP 400 `BadRequestException`, the service's invalid-body
+//!    sentence and no `invalidParameter`, because either member would have fixed the request.
+//!    The decision is taken on the
 //!    SELECTION alone, ahead of anything inside either block, and no refused create registers
 //!    a cluster.
 //! 2. An operation that READS one cluster resolves the cluster reference it is handed, so
@@ -33,11 +34,10 @@ use serde_json::{json, Value};
 
 use crate::kafka_harness::{pct, ClusterRequest, Emulator, Reply, ACCOUNT, REGION};
 
-/// MSK's sentence for a create whose body names both cluster types. Written out here rather
-/// than read from the service's own constant, so this suite pins the wording instead of the
-/// code under test.
-const ONE_CLUSTER_TYPE_MESSAGE: &str =
-    "You can specify only one cluster type, either provisioned or serverless.";
+/// MSK's sentence for a create whose body names both cluster types — a body it cannot read as
+/// a create of either kind. Written out here rather than read from the service's own constant,
+/// so this suite pins the wording instead of the code under test.
+const INVALID_REQUEST_BODY_MESSAGE: &str = "Invalid request body";
 
 /// The service's one sentence for a resource it does not hold (the apostrophe is U+2019, as
 /// MSK writes it).
@@ -88,12 +88,13 @@ fn serverless(configurations: usize) -> Value {
 }
 
 /// Assert `reply` is the body-level refusal: HTTP 400 `BadRequestException`, MSK's
-/// selection sentence as the WHOLE message, and no member named.
-fn assert_one_cluster_type(reply: &Reply, case: &str) {
+/// invalid-body sentence as the WHOLE message, and no member named.
+fn assert_invalid_request_body(reply: &Reply, case: &str) {
     assert_eq!(
         (reply.status, reply.error_code(), reply.error_message()),
-        (400, "BadRequestException", ONE_CLUSTER_TYPE_MESSAGE),
-        "case {case}: expected a 400 BadRequestException {ONE_CLUSTER_TYPE_MESSAGE:?}, got {} {}",
+        (400, "BadRequestException", INVALID_REQUEST_BODY_MESSAGE),
+        "case {case}: expected a 400 BadRequestException {INVALID_REQUEST_BODY_MESSAGE:?}, \
+         got {} {}",
         reply.status,
         reply.body
     );
@@ -115,13 +116,13 @@ async fn listed_under(emulator: &Emulator, name: &str) -> usize {
         .unwrap_or_default()
 }
 
-/// RULE 1: a `CreateClusterV2` body naming BOTH cluster types is refused with the sentence
-/// stating that only one of the two may be given — whatever the two blocks ask for, and
+/// RULE 1: a `CreateClusterV2` body naming BOTH cluster types is refused with the service's
+/// invalid-body sentence — whatever the two blocks ask for, and
 /// whether or not a named block would itself have been refused, because the selection is
 /// decided ahead of either block's own members. No such create registers a cluster, and a
 /// body naming exactly one kind is served.
 #[tokio::test]
-async fn naming_both_cluster_types_states_the_rule_that_only_one_may_be_given() {
+async fn naming_both_cluster_types_is_refused_as_an_invalid_body() {
     let emulator = Emulator::new();
 
     // The rows differ in the broker software, the broker type, the broker count, how many VPC
@@ -199,7 +200,7 @@ async fn naming_both_cluster_types_states_the_rule_that_only_one_may_be_given() 
 
     for (case, body) in &rows {
         let reply = emulator.create_cluster_v2(body.clone()).await;
-        assert_one_cluster_type(&reply, case);
+        assert_invalid_request_body(&reply, case);
         let name = body["clusterName"].as_str().unwrap_or_default();
         assert_eq!(
             listed_under(&emulator, name).await,

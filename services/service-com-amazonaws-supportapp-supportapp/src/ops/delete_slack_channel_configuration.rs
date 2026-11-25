@@ -5,20 +5,17 @@
 //! Removes a Slack channel configuration from this service's store. The output shape
 //! has no members, so the removal is the operation's only effect: a later
 //! `ListSlackChannelConfigurations` no longer reports it and a later
-//! `UpdateSlackChannelConfiguration` of it answers `ResourceNotFoundException`. Nothing
-//! is stored for a pair that was never configured, so deleting one is that same 404
-//! once the account's workspace registry admits the request at all.
+//! `UpdateSlackChannelConfiguration` of it answers `ResourceNotFoundException`.
 //!
-//! `ConflictException`'s documentation names this operation in the condition it states
-//! first, together with the other two channel-configuration writes: "Add, update, or
-//! delete a Slack channel configuration before you add a Slack workspace to your Amazon
-//! Web Services account." So the account's workspace registry is what is settled first
-//! against the account's state: a `teamId` the account has not registered is that
-//! documented `ConflictException` (409), and the modelled `ResourceNotFoundException`
-//! (404) is the answer only within a registered workspace, for a channel the account
-//! holds no configuration for — which is also what a repeated delete answers. The two
-//! are the answers a caller branches on: one tells it to add the Slack workspace first,
-//! the other that the channel was never configured. See
+//! This operation acts on a configuration that must ALREADY EXIST, so the resource the
+//! request identifies is what settles the answer: a `(teamId, channelId)` pair this account
+//! holds no configuration for is the modelled `ResourceNotFoundException` (404), whatever
+//! the account's workspace registry holds for that `teamId` — there is nothing to remove
+//! either way, and a workspace the account has not registered holds no configuration of its
+//! own. That is also what a repeated delete answers. The `ConflictException` (409) its
+//! documentation words over the three channel-configuration writes is the answer of the one
+//! that ADDS a configuration TO a workspace (`CreateSlackChannelConfiguration`), which is
+//! the call a workspace has to be registered for. See
 //! [`crate::state::ComAmazonawsSupportappSupportappState::unregistered_workspace_conflict`].
 //!
 //! ## Shape of an operation
@@ -202,31 +199,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        // The precondition `ConflictException` documents for this very operation: "Add,
-        // update, or delete a Slack channel configuration before you add a Slack
-        // workspace to your Amazon Web Services account." A channel configuration lives
-        // inside a Slack workspace registered to this account, so a `teamId` that is not
-        // in the account's workspace registry has no workspace to remove a channel
-        // configuration from, and that is the conflict — settled before the pair is
-        // looked up, so the miss below is never reported for an account that has to add
-        // the workspace first.
-        if let Some(message) = store.unregistered_workspace_conflict(&input.team_id) {
-            return Err(
-                DeleteSlackChannelConfigurationErrorModeled::ConflictException(ConflictException {
-                    message: Some(message),
-                })
-                .into(),
-            );
-        }
-
-        // Within a registered workspace, a pair this account holds no configuration for
-        // is the modelled `ResourceNotFoundException`, which is also what a repeated
-        // delete answers. WHICH configuration the pair names, and how a miss is worded,
-        // is the state module's rule
+        // The configuration the request IDENTIFIES is resolved first, and a pair this
+        // account holds none for is the modelled `ResourceNotFoundException` — "the
+        // specified resource is missing or doesn't exist, such as an account alias, Slack
+        // channel configuration, or Slack workspace configuration" — whatever the account's
+        // workspace registry holds for the `teamId`: there is no configuration to remove
+        // either way, and that is what this answer tells the caller. It is also what a
+        // repeated delete answers. WHICH configuration the pair names, and how a miss is
+        // worded, is the state module's rule
         // ([`crate::state::ComAmazonawsSupportappSupportappState::remove_channel_configuration`]);
         // this handler only lifts the answer it gives into this operation's error enum.
-        if let Err(message) =
-            store.remove_channel_configuration(&input.team_id, &input.channel_id)
+        if let Err(message) = store.remove_channel_configuration(&input.team_id, &input.channel_id)
         {
             return Err(
                 DeleteSlackChannelConfigurationErrorModeled::ResourceNotFoundException(

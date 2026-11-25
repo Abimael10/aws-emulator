@@ -25,7 +25,7 @@
 use serde_json::{json, Value};
 
 use crate::create_cluster_v2_body_refusal::{
-    assert_one_cluster_type, listed_names_in, provisioned, serverless,
+    assert_invalid_request_body, listed_names_in, provisioned, serverless,
 };
 use crate::kafka_harness::{Emulator, REGION};
 use crate::refusal_wording::PARAMETERS_NOT_VALID;
@@ -43,9 +43,8 @@ const BROKER_NODES_MIN: i64 = 1;
 const BROKER_NODES_MAX: i64 = 15;
 
 /// The wire name of the parameter MSK blames when a create names NEITHER cluster type, which
-/// a refusal taken on the BODY never names: the selection refusal carries no
-/// `invalidParameter` at all, and its sentence states the two kinds as part of its own fixed
-/// text rather than as a report of what the request sent.
+/// a refusal taken on the BODY never names: the invalid-body refusal carries no
+/// `invalidParameter` at all, and its sentence says nothing of what the request sent.
 const CLUSTER_TYPE_PARAMETER: &str = "clusterType";
 
 /// A region OTHER than the harness default, so one row shows the sentence is the service's own
@@ -199,10 +198,10 @@ async fn the_body_refusal_sentence_is_fixed_whatever_the_request_says() {
         let reply = emulator
             .call_in(row.region, "POST", "/api/v2/clusters", Some(row.body.clone()))
             .await;
-        assert_one_cluster_type(&reply, case);
+        assert_invalid_request_body(&reply, case);
         assert!(
             !reply.error_message().contains(CLUSTER_TYPE_PARAMETER),
-            "case {case}: the selection sentence states the two kinds, not the parameter name, \
+            "case {case}: the invalid-body sentence names no parameter, \
              got {:?}",
             reply.error_message()
         );

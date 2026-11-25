@@ -1,19 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The launch parameters a launch-template write SPECIFIED, as against the form fields it
-//! sent.
+//! The launch parameters a launch-template write stores, as against the values its fields
+//! carried.
 //!
 //! The rule under test: EC2 speaks `ec2Query`, where a request's parameters are
-//! `application/x-www-form-urlencoded` fields, so a field carrying no text cannot be told
-//! from a field the request never sent. A launch parameter supplied with no text is therefore
-//! a parameter the request DID NOT SPECIFY: the stored version carries nothing for it, every
-//! read reports nothing for it, a version that names a `SourceVersion` inherits the source's
-//! value for it rather than blanking it ("if you specify additional launch parameters for the
-//! new version, they overwrite any corresponding launch parameters inherited from the source
-//! version", `CreateLaunchTemplateVersionRequest$SourceVersion`), and a request whose every
-//! parameter carries no text has specified none at all — "you must specify at least one
-//! parameter for the launch template data"
-//! (`smithy_query(query="shape",shape="RequestLaunchTemplateData")`).
+//! `application/x-www-form-urlencoded` fields. A launch template is the set of launch
+//! parameters a client gave it, so each parameter is STORED AND REPORTED as the request sent
+//! it — a field carrying no text included, which reads back as a parameter carrying no text.
+//! A field with no text sets no VALUE, though, and that is what decides the two questions
+//! about it:
+//!
+//! * "you must specify at least one parameter for the launch template data"
+//!   (`smithy_query(query="shape",shape="RequestLaunchTemplateData")`) asks whether the
+//!   request NAMED a parameter, which a pair list carries whether or not it holds text: a
+//!   request sending one parameter with no text has named one, and only a request naming none
+//!   at all is refused;
+//! * "if you specify additional launch parameters for the new version, they overwrite any
+//!   corresponding launch parameters inherited from the source version"
+//!   (`CreateLaunchTemplateVersionRequest$SourceVersion`) asks what a new version overwrites
+//!   its source with, and a field with no text carries nothing to overwrite one with, so the
+//!   source's parameter stands.
 //!
 //! Both writes of launch template data are driven, because the rule is about the data rather
 //! than about one operation, and every stored version is read back through
@@ -51,8 +57,8 @@ struct TextParameter {
 
 /// Every member `RequestLaunchTemplateData` targets a string with, taken from the shape
 /// itself (`smithy_query(query="shape",shape="RequestLaunchTemplateData")`): `KernelId`,
-/// `ImageId`, `InstanceType`, `KeyName`, `RamDiskId` and `UserData` — so the parameter a
-/// client's key-pair fix spells is one row of six rather than the subject.
+/// `ImageId`, `InstanceType`, `KeyName`, `RamDiskId` and `UserData` — so the parameter one
+/// recorded client sent with no text is one row of six rather than the subject.
 ///
 /// `InstanceInitiatedShutdownBehavior` is the shape's remaining text member and is NOT a row:
 /// it targets an enum, whose membership the request walk judges before the handler runs, so a
@@ -108,8 +114,8 @@ fn data(member: &str, value: &str) -> (String, String) {
     p(&format!("LaunchTemplateData.{member}"), value)
 }
 
-/// A parameter of the data OTHER than `member`, so a request that sends `member` with no text
-/// still specifies something: the data has to carry at least one parameter.
+/// A parameter of the data OTHER than `member`, so a row can carry a second parameter beside
+/// the one it drives.
 fn anchor(member: &str) -> (String, String) {
     if member == "InstanceType" {
         data("ImageId", "ami-0fffffffffffffff0")
@@ -163,12 +169,14 @@ fn reported(case: &str, body: &str, element: &str) -> Option<String> {
 }
 
 /// The same reading of ONE version of a template, taken through
-/// `DescribeLaunchTemplateVersions` — the projection a client reads back.
+/// `DescribeLaunchTemplateVersions` — the projection a client reads back. `selector` is the
+/// `LaunchTemplateVersion` the request names, which may be a number or one of the two aliases
+/// the operation documents (`$Latest`, `$Default`).
 async fn described(
     case: &str,
     router: &MultiServiceRouter,
     launch_template_id: &str,
-    version_number: i64,
+    selector: &str,
     element: &str,
 ) -> Option<String> {
     let body = ok(
@@ -177,7 +185,7 @@ async fn described(
         "DescribeLaunchTemplateVersions",
         &[
             p("LaunchTemplateId", launch_template_id),
-            p("LaunchTemplateVersion.1", &version_number.to_string()),
+            p("LaunchTemplateVersion.1", selector),
         ],
     )
     .await;
@@ -200,11 +208,16 @@ fn templates_held(engine: &engine::InMemoryEngine) -> usize {
     engine.state::<Ec2State>().lock().launch_templates.len()
 }
 
-/// A parameter sent with no text is not specified: neither create stores it, and neither the
-/// create's own body nor the read-back reports it — while the same parameter sent WITH text is
-/// carried, which is what makes the first half a rule about the text and not about the member.
+/// Every way of naming ONE version of a template that holds exactly one: its number and both
+/// documented aliases (`DescribeLaunchTemplateVersions$Versions`: "$Latest" and "$Default").
+const VERSION_SELECTORS: [&str; 3] = ["1", "$Latest", "$Default"];
+
+/// A parameter sent with no text is stored and reported AS SENT: both creates keep it, and
+/// every read of the stored version reports it carrying no text — while the same parameter
+/// sent WITH text is reported with that text, which is what makes the rows about the value the
+/// field carried and not about the member.
 #[tokio::test]
-async fn a_parameter_with_no_text_is_not_specified_by_either_create() {
+async fn a_parameter_with_no_text_is_stored_and_reported_as_sent() {
     let (router, _engine) = super::ec2_query::emulator();
 
     for parameter in &TEXT_PARAMETERS {
@@ -217,7 +230,8 @@ async fn a_parameter_with_no_text_is_not_specified_by_either_create() {
 
         // The template's FIRST version, created with the parameter carrying no text. The
         // create reports the TEMPLATE (`CreateLaunchTemplateResult$LaunchTemplate`), so the
-        // version it stored is read through the versions report.
+        // version it stored is read through the versions report — by its number and by each
+        // documented alias, since one version is the latest and the default one at once.
         let case = format!("{member} with no text on CreateLaunchTemplate");
         let name = format!("no-text.{member}");
         let body = ok(
@@ -232,12 +246,16 @@ async fn a_parameter_with_no_text_is_not_specified_by_either_create() {
         )
         .await;
         let launch_template_id = minted_id(&case, &body);
-        let actual = described(&case, &router, &launch_template_id, 1, element).await;
-        assert_eq!(
-            actual, None,
-            "case {case:?}: expected the read-back version to report no <{element}>, \
-             got {actual:?}"
-        );
+        for selector in VERSION_SELECTORS {
+            let case = format!("{case}, read back by {selector}");
+            let actual = described(&case, &router, &launch_template_id, selector, element).await;
+            assert_eq!(
+                actual.as_deref(),
+                Some(""),
+                "case {case:?}: expected the read-back version to report <{element}> carrying \
+                 no text, got {actual:?}"
+            );
+        }
 
         // The SAME parameter with no text on a new version of that template.
         let case = format!("{member} with no text on CreateLaunchTemplateVersion");
@@ -254,19 +272,20 @@ async fn a_parameter_with_no_text_is_not_specified_by_either_create() {
         .await;
         let actual = reported(&case, &body, element);
         assert_eq!(
-            actual, None,
-            "case {case:?}: expected no <{element}> on the created version, got {actual:?} \
-             in {body}"
+            actual.as_deref(),
+            Some(""),
+            "case {case:?}: expected <{element}> carrying no text on the created version, got \
+             {actual:?} in {body}"
         );
-        let actual = described(&case, &router, &launch_template_id, 2, element).await;
+        let actual = described(&case, &router, &launch_template_id, "2", element).await;
         assert_eq!(
-            actual, None,
-            "case {case:?}: expected the read-back version to report no <{element}>, \
-             got {actual:?}"
+            actual.as_deref(),
+            Some(""),
+            "case {case:?}: expected the read-back version to report <{element}> carrying no \
+             text, got {actual:?}"
         );
-
-        // The control: with TEXT the same parameter is stored and reported, so the rows above
-        // are about the text the field carried and not about the member being dropped.
+        // Version 2 is the template's LATEST, and version 1 is still its DEFAULT, so the two
+        // aliases now name versions that disagree about the parameter's text.
         let case = format!("{member} with text on CreateLaunchTemplateVersion");
         let body = ok(
             &case,
@@ -285,12 +304,16 @@ async fn a_parameter_with_no_text_is_not_specified_by_either_create() {
             Some(value),
             "case {case:?}: expected <{element}> to carry {value:?}, got {actual:?} in {body}"
         );
-        let actual = described(&case, &router, &launch_template_id, 3, element).await;
-        assert_eq!(
-            actual.as_deref(),
-            Some(value),
-            "case {case:?}: expected the read-back version to report {value:?}, got {actual:?}"
-        );
+        for (selector, expected) in [("3", value), ("$Latest", value), ("$Default", "")] {
+            let case = format!("{case}, read back by {selector}");
+            let actual = described(&case, &router, &launch_template_id, selector, element).await;
+            assert_eq!(
+                actual.as_deref(),
+                Some(expected),
+                "case {case:?}: expected the read-back version to report {expected:?}, got \
+                 {actual:?}"
+            );
+        }
     }
 }
 
@@ -365,8 +388,14 @@ async fn a_parameter_with_no_text_does_not_overwrite_the_one_it_inherits() {
                 "case {case:?}: expected <{element}> to carry {expected:?}, got {actual:?} \
                  in {body}"
             );
-            let actual =
-                described(&case, &router, &launch_template_id, version_number, element).await;
+            let actual = described(
+                &case,
+                &router,
+                &launch_template_id,
+                &version_number.to_string(),
+                element,
+            )
+            .await;
             assert_eq!(
                 actual.as_deref(),
                 Some(expected),
@@ -377,75 +406,118 @@ async fn a_parameter_with_no_text_does_not_overwrite_the_one_it_inherits() {
     }
 }
 
-/// A request whose every launch parameter carries no text has specified NONE: both creates
-/// refuse it with EC2's own code for a parameter the request left out and store nothing —
-/// while the same request against a `SourceVersion` is a version OF THAT SOURCE's parameters,
-/// which is a version that carries one.
+/// A request that NAMES a launch parameter has given launch template data, even when the
+/// field it named carries no text: both creates are served and store the version. A request
+/// that names NO launch parameter at all is refused with EC2's own code for a parameter the
+/// request left out, and stores nothing.
 #[tokio::test]
-async fn a_request_whose_every_parameter_carries_no_text_specifies_none() {
+async fn a_request_that_names_no_parameter_at_all_is_refused() {
     let (router, engine) = super::ec2_query::emulator();
 
     // A template to create the versions of, carrying a key name of its own to inherit.
-    let case = "a template to refuse versions of";
+    let case = "a template to create versions of";
     let body = ok(
         case,
         &router,
         "CreateLaunchTemplate",
         &[
-            p("LaunchTemplateName", "no-text.specifies-none"),
+            p("LaunchTemplateName", "no-text.names-one"),
             data("ImageId", "ami-00000000000000001"),
             data("KeyName", "deployment-key"),
         ],
     )
     .await;
     let launch_template_id = minted_id(case, &body);
-    let held = templates_held(&engine);
+    let mut held = templates_held(&engine);
+    let mut versions = versions_held(&engine, &launch_template_id);
 
     for parameter in &TEXT_PARAMETERS {
         let member = parameter.member;
 
-        let case = format!("CreateLaunchTemplate specifying only an empty {member}");
-        let (status, body) = api(
+        // ONE parameter, carrying no text: the request named a launch parameter, so the
+        // create is served and the template is stored.
+        let case = format!("CreateLaunchTemplate naming only an empty {member}");
+        let name = format!("names-one.{member}");
+        let body = ok(
+            &case,
             &router,
             "CreateLaunchTemplate",
-            &[
-                p("LaunchTemplateName", &format!("specifies-none.{member}")),
-                data(member, ""),
-            ],
+            &[p("LaunchTemplateName", &name), data(member, "")],
         )
         .await;
-        assert_eq!(
-            (status, error_code(&body).as_str()),
-            (400, "MissingParameter"),
-            "case {case:?}: expected a 400 MissingParameter, got {status} with body {body}"
-        );
+        let minted = minted_id(&case, &body);
+        held += 1;
         assert_eq!(
             templates_held(&engine),
             held,
-            "case {case:?}: a refused create stores no launch template"
+            "case {case:?}: the served create must store the template"
+        );
+        let actual = described(&case, &router, &minted, "$Latest", parameter.element).await;
+        assert_eq!(
+            actual.as_deref(),
+            Some(""),
+            "case {case:?}: expected the stored version to report <{}> carrying no text, got \
+             {actual:?}",
+            parameter.element
         );
 
-        let case = format!("CreateLaunchTemplateVersion specifying only an empty {member}");
-        let (status, body) = api(
+        let case = format!("CreateLaunchTemplateVersion naming only an empty {member}");
+        let _ = ok(
+            &case,
             &router,
             "CreateLaunchTemplateVersion",
             &[p("LaunchTemplateId", &launch_template_id), data(member, "")],
         )
         .await;
-        assert_eq!(
-            (status, error_code(&body).as_str()),
-            (400, "MissingParameter"),
-            "case {case:?}: expected a 400 MissingParameter, got {status} with body {body}"
-        );
+        versions += 1;
         assert_eq!(
             versions_held(&engine, &launch_template_id),
-            1,
-            "case {case:?}: a refused create stores no version"
+            versions,
+            "case {case:?}: the served create must store the version"
         );
     }
 
-    // The same request naming a SOURCE version: the parameters it specifies are the source's,
-    // so the version is created and carries them.
+    // A request whose launch template data names NO parameter at all: neither create has any
+    // launch parameter to store, and each is refused with the code EC2 reports for a
+    // parameter the request left out.
+    let case = "CreateLaunchTemplate naming no launch parameter at all";
+    let (status, body) = api(
+        &router,
+        "CreateLaunchTemplate",
+        &[p("LaunchTemplateName", "names-none")],
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (400, "MissingParameter"),
+        "case {case:?}: expected a 400 MissingParameter, got {status} with body {body}"
+    );
+    assert_eq!(
+        templates_held(&engine),
+        held,
+        "case {case:?}: a refused create stores no launch template"
+    );
+
+    let case = "CreateLaunchTemplateVersion naming no launch parameter at all";
+    let (status, body) = api(
+        &router,
+        "CreateLaunchTemplateVersion",
+        &[p("LaunchTemplateId", &launch_template_id)],
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (400, "MissingParameter"),
+        "case {case:?}: expected a 400 MissingParameter, got {status} with body {body}"
+    );
+    assert_eq!(
+        versions_held(&engine, &launch_template_id),
+        versions,
+        "case {case:?}: a refused create stores no version"
+    );
+
+    // The same request naming a SOURCE version: the parameter it sends carries no text, so
+    // the version it stores inherits the source's parameters whole.
     let case = "an empty parameter beside a source version";
     let body = ok(
         case,
@@ -473,7 +545,7 @@ async fn a_request_whose_every_parameter_carries_no_text_specifies_none() {
     );
     assert_eq!(
         versions_held(&engine, &launch_template_id),
-        2,
+        versions + 1,
         "case {case:?}: the inherited version is stored"
     );
 }

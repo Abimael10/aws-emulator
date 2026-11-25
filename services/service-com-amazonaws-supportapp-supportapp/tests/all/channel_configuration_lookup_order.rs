@@ -3,19 +3,20 @@
 //! Which refusal wins when a Slack channel configuration write names a configuration
 //! the account does not hold.
 //!
-//! The account-level precondition comes FIRST: `ConflictException`'s documentation
-//! names "Add, update, or delete a Slack channel configuration before you add a Slack
-//! workspace to your Amazon Web Services account" as its first condition, so a write
-//! whose `teamId` the account has not registered is the modelled `ConflictException`
-//! (HTTP 409) and nothing is looked up for it. Only inside a REGISTERED workspace is a
-//! pair the account holds no configuration for the modelled `ResourceNotFoundException`
-//! (HTTP 404) — "The specified resource is missing or doesn't exist, such as an account
-//! alias, Slack channel configuration, or Slack workspace configuration"
+//! The RESOURCE the request identifies comes FIRST on the two writes that act on a
+//! configuration which must already exist: a `(teamId, channelId)` pair the account holds
+//! no configuration for is the modelled `ResourceNotFoundException` (HTTP 404) — "The
+//! specified resource is missing or doesn't exist, such as an account alias, Slack channel
+//! configuration, or Slack workspace configuration"
 //! (`smithy_query(query="operation", operation="UpdateSlackChannelConfiguration,DeleteSlackChannelConfiguration",
 //! model_path="services/service-com-amazonaws-supportapp-supportapp/smithy-model/com-amazonaws-supportapp-supportapp.json")`)
-//! — with the message template every operation of this service words a miss with. The
-//! two are what a caller branches on: one tells it to add the Slack workspace first,
-//! the other that the channel was never configured.
+//! — with the message template every operation of this service words a miss with, and
+//! WHATEVER the account's workspace registry holds for that `teamId`: a workspace the
+//! account has not registered holds no configuration of its own, and deleting a workspace
+//! takes its configurations with it, so there is nothing to change or remove either way.
+//! The `ConflictException` (HTTP 409) whose documentation names "Add, update, or delete a
+//! Slack channel configuration before you add a Slack workspace to your Amazon Web
+//! Services account" is the answer of the write that ADDS a configuration to a workspace.
 //!
 //! So the tables below run the rule over what it generalises over, with the recorded
 //! "no workspace registered at all" case as a single row:
@@ -23,8 +24,8 @@
 //! * which operation is called — both that act on an existing configuration;
 //! * what the account holds ABOUT the named workspace — nothing, a registration, a
 //!   registration it then deleted (which took that workspace's configurations with it),
-//!   or one it deleted and made again, which is what decides WHICH of the two refusals
-//!   the write draws;
+//!   or one it deleted and made again: none of which changes the answer, which is what
+//!   pins that the resource lookup is what settles it;
 //! * how much the account holds BESIDES it — no other workspace, one, or a registry
 //!   filled to the documented workspace quota, each with its own configuration stored;
 //! * the form and length of the `teamId` and `channelId` the request names, at both
@@ -32,7 +33,7 @@
 //! * which optional members an update carries, since the answer is about the account's
 //!   state and not about the patch.
 //!
-//! The create path draws the same two answers in the same order, with the
+//! The create path is where the workspace precondition decides, with the
 //! already-configured conflict in place of the miss: that side of the rule is
 //! [`crate::channel_configuration_workspace_precondition`].
 //!
@@ -43,9 +44,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_supportapp_supportapp::state::MAX_SLACK_WORKSPACE_CONFIGURATIONS;
 
-use crate::channel_configuration_workspace_precondition::{
-    assert_workspace_conflict, create_body, update_body,
-};
+use crate::channel_configuration_workspace_precondition::{create_body, update_body};
 use crate::error_message_templates::{not_found, refusal};
 use crate::slack_channel_configurations::{role_arn, Emulator, Reply};
 
@@ -271,19 +270,11 @@ fn assert_miss(case: &str, team_id: &str, channel_id: &str, reply: &Reply) {
     );
 }
 
-/// Assert the refusal `case` must draw: the documented conflict while the account has
-/// not registered the workspace the request names, and the miss once it has — the whole
-/// of the order under test, read off the row's account state rather than off the
-/// request.
+/// Assert the refusal `case` must draw: the miss for the configuration the request names,
+/// whatever the row's account state holds about its workspace — the whole of the order
+/// under test, read off the resource the request identifies.
 fn assert_refusal(label: &str, case: &Case, reply: &Reply) {
-    match case.workspace {
-        Workspace::Registered | Workspace::RegisteredThenRemovedThenRegistered => {
-            assert_miss(label, &case.team_id, &case.channel_id, reply)
-        }
-        Workspace::NotRegistered | Workspace::RegisteredThenRemoved => {
-            assert_workspace_conflict(label, &case.team_id, reply)
-        }
-    }
+    assert_miss(label, &case.team_id, &case.channel_id, reply);
 }
 
 /// Assert the account still holds exactly the other workspaces' configurations and

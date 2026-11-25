@@ -13,10 +13,10 @@
 //! published catalog does not hold is kept too, and reported as one of the findings the
 //! response's `Warning` carries ([`crate::state::launch_template_warning`]): a version is a
 //! set of launch parameters rather than a launch, so the launch that tries to use such a type
-//! is what refuses it. What it keeps are the parameters the request SPECIFIED
-//! ([`crate::state::specified_launch_template_data`]): an ec2Query field with no text cannot be
-//! told from one the request never sent, so such a parameter is not stored, not reported, and
-//! does not overwrite the value a `SourceVersion` contributes for it.
+//! is what refuses it. What it keeps are the parameters the request CARRIED, each as sent — a
+//! field carrying no text included — while a `SourceVersion` is overwritten only where the
+//! request carried a VALUE: a field with no text sets nothing, so the source's parameter
+//! stands ([`crate::state::specified_launch_template_data`]).
 //!
 //! ## Shape of an operation
 //!
@@ -177,11 +177,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            held_launch_template_version, launch_template_limit_exceeded,
-            launch_template_version_payload_bytes, require_service_state,
-            resolve_launch_template_id, source_launch_template_version_not_found,
-            specified_launch_template_data, LaunchTemplateVersionSpec, MAX_CLIENT_TOKEN_CHARS,
-            MAX_LAUNCH_TEMPLATE_VERSIONS, MAX_STORED_BYTES, MAX_USER_DATA_BYTES,
+            carries_a_launch_parameter, held_launch_template_version,
+            launch_template_limit_exceeded, launch_template_version_payload_bytes,
+            require_service_state, resolve_launch_template_id,
+            source_launch_template_version_not_found, specified_launch_template_data,
+            LaunchTemplateVersionSpec, MAX_CLIENT_TOKEN_CHARS, MAX_LAUNCH_TEMPLATE_VERSIONS,
+            MAX_STORED_BYTES, MAX_USER_DATA_BYTES,
         };
 
         // Nothing here depends on the Region: a launch template carries no Region member,
@@ -212,11 +213,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // The launch parameters this request SPECIFIED, read through the one reading of them
-        // this store makes ([`specified_launch_template_data`]): an ec2Query field carrying no
-        // text is indistinguishable from one the request never sent, so a parameter with no
-        // text is not specified — it is neither stored nor reported, and it does not overwrite
-        // the value a `SourceVersion` contributes for it.
+        // The launch parameters a `SourceVersion` is OVERWRITTEN with, read through the one
+        // reading of them this store makes ([`specified_launch_template_data`]): "if you
+        // specify additional launch parameters for the new version, they overwrite any
+        // corresponding launch parameters inherited from the source version"
+        // (`SourceVersion`), and a field carrying no text carries no value to overwrite one
+        // with, so the source's parameter stands. A version that inherits nothing keeps the
+        // data the request carried, as sent.
         let specified = specified_launch_template_data(&input.launch_template_data);
 
         let state = require_service_state(&*self.engine)?;
@@ -262,7 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
         let data = match input.source_version.as_deref() {
-            None => specified.clone(),
+            None => input.launch_template_data.clone(),
             Some(source_version) => {
                 let number = held_launch_template_version(record, source_version)?
                     .ok_or_else(source_launch_template_version_not_found)?;
@@ -277,17 +280,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You must specify at least one parameter for the launch template data"
         // (`smithy_query(query="shape",shape="RequestLaunchTemplateData")`). The member is
-        // `clientOptional`, so the boundary validator lets an empty one through, and an empty
-        // version would store a version that launches nothing. It is the version as it would
-        // be STORED that must carry a parameter, so a request that specifies none but
-        // inherits from a source version is a version of that source's parameters.
-        //
-        // The shape carries dozens of members, so emptiness is decided by comparing the data
-        // with a default one rather than by naming each member — which also means a member
-        // the model gains later counts without this check being revisited. The rendering is
-        // used for this comparison only; it is never reported or logged, because `UserData`
-        // is `@sensitive`.
-        if format!("{data:?}") == format!("{:?}", RequestLaunchTemplateData::default()) {
+        // `clientOptional`, so the boundary validator lets an empty one through, and a version
+        // that names no parameter at all and inherits none would launch nothing. The
+        // requirement is about the parameters the request NAMED, which an ec2Query pair list
+        // carries whether or not they hold text ([`carries_a_launch_parameter`]) — so a
+        // request that sends a parameter with no text has named one, and a request that names
+        // none but inherits from a source version is a version of that source's parameters.
+        if !carries_a_launch_parameter(&input.launch_template_data)
+            && !carries_a_launch_parameter(&data)
+        {
             return Err(Scaffolded::missing_parameter(
                 "The request must contain at least one parameter for LaunchTemplateData",
             ));

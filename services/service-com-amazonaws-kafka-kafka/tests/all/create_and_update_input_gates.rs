@@ -63,12 +63,11 @@ const GHOST_ID: &str = "11111111-2222-4333-8444-555555555555-1";
 const NO_CLUSTER_TYPE_MESSAGE: &str =
     "You must specify a cluster type, either provisioned or serverless.";
 
-/// What MSK answers a create whose body names BOTH cluster types: the sentence stating that
-/// only one may be given, which names no member at all — the two cluster-type members are
-/// alternatives, so a body carrying both selects two clusters at once and either one would
+/// What MSK answers a create whose body names BOTH cluster types: the service's sentence for
+/// a body it cannot read, which names no member at all — the two cluster-type members are
+/// alternatives, so a body carrying both asks for two clusters at once and either one would
 /// have fixed the request.
-const ONE_CLUSTER_TYPE_MESSAGE: &str =
-    "You can specify only one cluster type, either provisioned or serverless.";
+const INVALID_REQUEST_BODY_MESSAGE: &str = "Invalid request body";
 
 /// A broker software version this service OFFERS a new cluster, so a provisioned block
 /// carrying it is one the service would build (from
@@ -276,8 +275,8 @@ async fn a_provisioned_create_refuses_a_version_the_catalog_does_not_publish() {
 /// RULE: `CreateClusterV2` names exactly ONE cluster type, and the ways of getting that wrong
 /// are DIFFERENT refusals — a missing cluster type blames the `clusterType` parameter with
 /// the sentence that says one is required, while naming both kinds with two blocks the service
-/// would each have built a cluster from is refused for the SELECTION, with the sentence that
-/// says only one may be given and no `invalidParameter` — so a client can tell the input
+/// would each have built a cluster from is refused for the SELECTION, with the service's
+/// invalid-body sentence and no `invalidParameter` — so a client can tell the input
 /// errors apart. Neither registers anything.
 #[tokio::test]
 async fn the_two_cluster_type_refusals_are_distinct() {
@@ -285,7 +284,7 @@ async fn the_two_cluster_type_refusals_are_distinct() {
 
     // The two messages are not variants of one sentence.
     assert_ne!(
-        NO_CLUSTER_TYPE_MESSAGE, ONE_CLUSTER_TYPE_MESSAGE,
+        NO_CLUSTER_TYPE_MESSAGE, INVALID_REQUEST_BODY_MESSAGE,
         "the two cluster-type refusals must carry different sentences"
     );
 
@@ -322,7 +321,7 @@ async fn the_two_cluster_type_refusals_are_distinct() {
         body["provisioned"]["numberOfBrokerNodes"] = json!(brokers);
         body["serverless"] = v2_serverless_body(&name, *configurations)["serverless"].clone();
         let reply = emulator.create_cluster_v2(body).await;
-        assert_body_refusal(&reply, case, ONE_CLUSTER_TYPE_MESSAGE);
+        assert_body_refusal(&reply, case, INVALID_REQUEST_BODY_MESSAGE);
     }
 
     let listed = listed_names(&emulator).await;
@@ -352,7 +351,7 @@ async fn the_two_cluster_type_refusals_are_distinct() {
 }
 
 /// RULE: a create naming BOTH cluster types is refused for the SELECTION it carries — the
-/// sentence stating that only one of the two may be given, and no `invalidParameter` —
+/// service's sentence for a body it cannot read, and no `invalidParameter` —
 /// whatever the two blocks say and whatever else the body carries, because the decision is
 /// taken on that selection rather than on a member a caller could repair on its own.
 ///
@@ -423,7 +422,7 @@ async fn naming_both_cluster_types_is_refused_for_the_selection_it_carries() {
             body["tags"] = row.tags;
         }
         let reply = emulator.create_cluster_v2(body).await;
-        assert_body_refusal(&reply, row.case, ONE_CLUSTER_TYPE_MESSAGE);
+        assert_body_refusal(&reply, row.case, INVALID_REQUEST_BODY_MESSAGE);
     }
 
     // A serverless block the service would not accept either — it turns no client
@@ -437,7 +436,7 @@ async fn naming_both_cluster_types_is_refused_for_the_selection_it_carries() {
     assert_body_refusal(
         &reply,
         "a serverless block that would itself have been refused",
-        ONE_CLUSTER_TYPE_MESSAGE,
+        INVALID_REQUEST_BODY_MESSAGE,
     );
 
     // The refusal registers nothing: neither block was read as a create.

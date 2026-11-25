@@ -300,11 +300,11 @@ pub struct ComAmazonawsSupportappSupportappState {
     /// `RegisterSlackWorkspaceForOrganization`, removed by
     /// `DeleteSlackWorkspaceConfiguration` and bounded by
     /// [`MAX_SLACK_WORKSPACE_CONFIGURATIONS`]. It is the account's workspace registry:
-    /// a Slack channel configuration lives INSIDE a registered workspace, so a write
-    /// whose `teamId` is absent here has no workspace to add a channel configuration to,
-    /// change one in or remove one from (see
+    /// a Slack channel configuration lives INSIDE a registered workspace, so a request to
+    /// ADD one whose `teamId` is absent here has no workspace to add it to (see
     /// [`ComAmazonawsSupportappSupportappState::unregistered_workspace_conflict`]) and
-    /// deleting a workspace takes that workspace's channel configurations with it.
+    /// deleting a workspace takes that workspace's channel configurations with it — which
+    /// is why a stored configuration is always one of a registered workspace.
     pub slack_workspace_configurations: BTreeMap<String, SlackWorkspaceConfig>,
     /// Every Slack workspace the Amazon Web Services Support Center console has
     /// authorized, keyed by `teamId` and seeded from
@@ -341,7 +341,7 @@ impl ComAmazonawsSupportappSupportappState {
     /// The registry-presence rule itself, owned where the registry is owned: a workspace
     /// is registered to this account exactly when
     /// [`Self::slack_workspace_configurations`] holds its `teamId`. Both decisions that
-    /// turn on it read it from here — the channel-configuration writes'
+    /// turn on it read it from here — the channel-configuration create's
     /// [`Self::unregistered_workspace_conflict`] and
     /// `RegisterSlackWorkspaceForOrganization`'s member-account conflict and quota
     /// accounting — so the handlers cannot come to disagree about whether a workspace
@@ -382,10 +382,12 @@ impl ComAmazonawsSupportappSupportappState {
     /// [`slack_channel_configuration_not_found`]. A caller lifts that message into its
     /// own operation's modelled error and adds nothing of its own.
     ///
-    /// A write that reaches this lookup has already satisfied the account-level
-    /// precondition [`Self::unregistered_workspace_conflict`] states, so the miss this
-    /// reports is a configuration the account does not hold IN a workspace it has
-    /// registered.
+    /// An operation that acts on an existing configuration settles its answer HERE, on the
+    /// resource the request identifies: a pair this account holds nothing for is the miss
+    /// whatever the workspace registry holds for that `teamId`, because a workspace the
+    /// account has not registered holds no configuration of its own — deleting a workspace
+    /// takes its configurations with it ([`Self::slack_channel_configurations`]), so every
+    /// stored configuration is one of a registered workspace.
     pub fn channel_configuration(
         &self,
         team_id: &str,
@@ -425,24 +427,22 @@ impl ComAmazonawsSupportappSupportappState {
         self.slack_channel_configurations.insert(key, configuration);
     }
 
-    /// Why a request that ADDS, UPDATES or DELETES a Slack channel configuration in the
+    /// Why a request that ADDS a Slack channel configuration to the
     /// workspace `team_id` names must be refused with the modelled `ConflictException`,
     /// or `None` when that workspace is registered to this account.
     ///
-    /// `ConflictException`'s documentation names this condition first, and names all
-    /// three of those writes together — "Add, update, or delete a Slack channel
-    /// configuration before you add a Slack workspace to your Amazon Web Services
-    /// account" — so each of them consults the registry before it looks a configuration
-    /// up: a `teamId` absent from [`Self::slack_workspace_configurations`] has no
-    /// workspace for a channel configuration to be added to, changed in or removed from,
-    /// and the request is that documented conflict whatever the configuration map holds
-    /// for the pair.
+    /// `ConflictException`'s documentation names this condition first — "Add, update, or
+    /// delete a Slack channel configuration before you add a Slack workspace to your
+    /// Amazon Web Services account" — and it is the answer of the write that ADDS one: a
+    /// `teamId` absent from [`Self::slack_workspace_configurations`] has no workspace for a
+    /// channel configuration to be added to, so the create consults the registry before it
+    /// stores anything.
     ///
-    /// [`slack_channel_configuration_not_found`] is therefore the answer only once this
-    /// precondition is satisfied: a miss reported to a caller is a configuration the
-    /// account does not hold in a workspace it HAS registered, which is the answer that
-    /// tells it the channel was never configured rather than that it must add the
-    /// workspace first.
+    /// The two writes that act on a configuration that must already EXIST settle their
+    /// answer on the resource the request identifies instead
+    /// ([`Self::channel_configuration`], [`Self::remove_channel_configuration`]): a pair
+    /// the account holds nothing for is the miss, and an unregistered workspace holds no
+    /// configuration of its own, so there is nothing to change or remove either way.
     pub fn unregistered_workspace_conflict(&self, team_id: &str) -> Option<String> {
         (!self.workspace_is_registered(team_id)).then(|| workspace_not_registered_message(team_id))
     }

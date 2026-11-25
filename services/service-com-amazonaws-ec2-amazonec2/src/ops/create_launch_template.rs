@@ -8,10 +8,8 @@
 //!
 //! The id, the create time, the creating principal and the default and latest version
 //! numbers are derived by the store, never taken from the request; the first version keeps
-//! the launch parameters the request SPECIFIED
-//! ([`crate::state::specified_launch_template_data`]), so nothing a caller set is dropped,
-//! while a parameter whose field carries no text — one no reader of an ec2Query pair list can
-//! tell from a field the request never sent — is not one it set. An
+//! the launch parameters the request CARRIED, each as sent — a field carrying no text
+//! included, since a launch template is the set of parameters a client gave it. An
 //! `ImageId` naming a Systems Manager parameter is kept included, stored UNRESOLVED and
 //! resolved again by each launch. Such a value is resolved here too, against the one catalog
 //! the launch reads: a parameter this account resolves no AMI for is refused as the invalid
@@ -182,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             MAX_TAGS_PER_RESOURCE, MAX_USER_DATA_BYTES, MIN_LAUNCH_TEMPLATE_NAME_CHARS,
             launch_template_limit_exceeded, launch_template_name_already_exists,
             launch_template_name_is_well_formed, launch_template_payload_bytes,
-            require_service_state, specified_launch_template_data, validate_tag_size,
+            carries_a_launch_parameter, require_service_state, validate_tag_size,
         };
 
         // Nothing here depends on the Region: a launch template carries no Region member,
@@ -243,30 +241,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 tags.len()
             )));
         }
-        // The launch parameters this request SPECIFIED, read through the one reading of them
-        // this store makes ([`specified_launch_template_data`]): an ec2Query field carrying no
-        // text is indistinguishable from one the request never sent, so a parameter with no
-        // text is not specified — the template stores nothing for it and reports nothing for
-        // it, exactly as for a request that left it out.
-        let specified = specified_launch_template_data(&input.launch_template_data);
-
         // "You must specify at least one parameter for the launch template data"
         // (`smithy_query(query="shape",shape="RequestLaunchTemplateData")`). The member is
-        // `clientOptional`, so the boundary validator lets an empty one through, and an
-        // empty version would store a template that launches nothing. It is the parameters
-        // the request SPECIFIED that must carry one, so a request whose every parameter
-        // carries no text has specified none.
-        //
-        // The shape carries dozens of members, so emptiness is decided by comparing the
-        // request's data with a default one rather than by naming each member — which also
-        // means a member the model gains later counts without this check being revisited.
-        // The rendering is used for this comparison only; it is never reported or logged,
-        // because `UserData` is `@sensitive`.
-        if format!("{specified:?}") == format!("{:?}", RequestLaunchTemplateData::default()) {
+        // `clientOptional`, so the boundary validator lets an empty one through, and data that
+        // names no parameter at all would store a template that launches nothing. The
+        // requirement is about the parameters the request NAMED, which an ec2Query pair list
+        // carries whether or not they hold text ([`carries_a_launch_parameter`]) — so a
+        // request that sends a parameter with no text has named one and is created, storing
+        // nothing for that parameter.
+        if !carries_a_launch_parameter(&input.launch_template_data) {
             return Err(Scaffolded::missing_parameter(
                 "The request must contain at least one parameter for LaunchTemplateData",
             ));
         }
+
+        // The launch parameters this version carries are the ones the request CARRIED: a
+        // launch template is the set of launch parameters a client gave it, so each one is
+        // stored and reported as sent, a field carrying no text included. Where a parameter
+        // is RESOLVED as a reference to a resource — an image, an instance type, an instance
+        // profile, a security group — a value with no text names nothing, which is that
+        // resolution's own reading ([`crate::state::launch_template_warning`],
+        // [`crate::state::specified_launch_template_data`] for the one a later version
+        // inherits).
+        let specified = input.launch_template_data.clone();
         // AWS documents a 16 KB limit on instance user data, and this is the user data
         // every instance launched from the template will get. The model declares no
         // `@length` on it, and the template retains it, so it is bounded here.
