@@ -18,7 +18,7 @@
 //!
 //! # What a request addresses, and how it is resolved
 //!
-//! Two addressings resolve, and each is checked against the records this service holds, so
+//! THREE addressings resolve, and each is checked against the records this service holds, so
 //! one request has one claimant:
 //!
 //! * HOST-STYLE, the addressing a client holding one of the service's own names uses: the
@@ -33,10 +33,23 @@
 //!   service's own ([`DATA_PLANE_SEGMENT`]), then the service's id, name or own label,
 //!   then the request path — `/_aws/vpc-lattice/{service}/{path}`. The namespace segment
 //!   begins with `_`, which no modelled path of any service does, so the prefix collides
-//!   with no control-plane route.
+//!   with no control-plane route;
+//! * THE ANNOUNCED ADDRESS, the one addressing an ORDINARY client has: a client is handed
+//!   `dnsEntry.domainName`, "the public DNS name of the service", resolves it and sends a
+//!   plain `GET /<path>` to it on the service's listener port — so that address has to
+//!   answer the service's traffic, or the only address this API publishes reaches nothing.
+//!   The announced host is this emulator's own ([`crate::state::announced_dns_hosts`]) and
+//!   names no service of its own, so WHICH service a request to it is for is read off the
+//!   records: the service whose LISTENER answers on the port the client addressed, where the
+//!   records leave no doubt which that is ([`announced_address_service`]). That host is also
+//!   where this emulator's own FRONT DOOR answers, so a request this service's MODEL binds a
+//!   route for is its CONTROL plane's and is never read here
+//!   ([`addresses_modelled_route`]) — which is why the two addressings above, which name the
+//!   service in the request, stay the unambiguous ones.
 //!
-//! Nothing host-independent is read: a request that names neither a service's own host nor
-//! the reserved prefix is left to whatever it was really addressed to.
+//! Nothing host-independent is read: a request that names no service's own host, no stored
+//! listener's own address and not the reserved prefix is left to whatever it was really
+//! addressed to.
 //!
 //! Either way, the plane answers only for a service a client is in a position to REACH: a
 //! service is reached through a service network it is associated with, and a VPC association
@@ -95,7 +108,9 @@ use ::service_common::data_plane_addressing::{
     addressed_authority, addressed_authority_of, addressed_port, first_segment, host_only,
     EMULATOR_PATH_NAMESPACE,
 };
-use ::smithy_server_runtime::{http, BoxFuture, ErasedOperation, OperationContext, Service};
+use ::smithy_server_runtime::{
+    http, BoxFuture, ErasedOperation, ErasedServiceDefinition, OperationContext, Service,
+};
 
 use crate::ops::types::{
     ForwardAction, HeaderMatch, HeaderMatchType, HttpMatch, PathMatchType, RuleAction, RuleMatch,
@@ -207,15 +222,96 @@ struct Resolved {
 /// Whether this data plane serves the request these `parts` came from — read by
 /// `Service::can_handle`, so a request addressed to a service this crate holds reaches this
 /// service instead of the front door's `UnknownService`.
-pub fn claims_parts<Eng: Send + Sync + 'static>(engine: &Eng, parts: &http::request::Parts) -> bool {
-    resolve(engine, &Addressed::of_parts(parts)).is_some()
+///
+/// `definition` is this service's own model-derived half, which decides whether THE ANNOUNCED
+/// ADDRESS is read for this request at all ([`reads_announced_address`]).
+pub fn claims_parts<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    parts: &http::request::Parts,
+    definition: &dyn ErasedServiceDefinition,
+) -> bool {
+    resolve(
+        engine,
+        &Addressed::of_parts(parts),
+        reads_announced_address(parts, definition),
+    )
+    .is_some()
+}
+
+/// Whether THE ANNOUNCED ADDRESS is read for the request these `parts` came from.
+///
+/// That addressing is the one whose host is this emulator's OWN — the address every `DnsEntry`
+/// of this service announces, which is also where this emulator's front door answers — so it
+/// is read for a request nothing else has a claim on:
+///
+/// * a request that names another service in WHAT IT CARRIES — the SigV4 credential scope it
+///   is signed with, the credential a presigned URL carries, or its RPC target, each read
+///   through the front door's own reader of it — is that service's, whatever address it was
+///   sent to. A key read off the HOST instead is not such a signal here: it is the first label
+///   of the address the client dialled, and the address this control plane announces names no
+///   service in it;
+/// * a request this service's own MODEL binds a route for is its CONTROL plane's, which
+///   answers at that very host.
+fn reads_announced_address(
+    parts: &http::request::Parts,
+    definition: &dyn ErasedServiceDefinition,
+) -> bool {
+    let signing_name = definition.identity().signing_name();
+    let named_elsewhere = carried_service_name(parts)
+        .is_some_and(|carried| !carried.eq_ignore_ascii_case(signing_name));
+    !named_elsewhere && !::service_common::addresses_modeled_route(parts, definition)
+}
+
+/// The service a request NAMES in what it carries, by the front door's own readers of those
+/// signals: the SigV4 credential scope of its `Authorization` header, the credential a
+/// presigned URL carries in its query, and its RPC target.
+///
+/// The host-style reader the front door falls back to last
+/// (`::emulator_server::service_from_host`) is deliberately not among them: see
+/// [`reads_announced_address`].
+fn carried_service_name(parts: &http::request::Parts) -> Option<String> {
+    ::emulator_server::service_from_sigv4(&parts.headers)
+        .or_else(|| ::emulator_server::service_from_sigv4_query(&parts.uri))
+        .or_else(|| ::emulator_server::service_from_target(&parts.headers))
 }
 
 /// [`claims_parts`] for the runtime-API request the serving seam is handed, resolved by the
 /// same rule.
-pub fn claims_request<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> bool {
+///
+/// Which service the request NAMES is settled before this is read — a request that reached
+/// this service was claimed by the rule above — so what is read here is the addressing alone,
+/// with THE ANNOUNCED ADDRESS withheld from a request this model binds a route for, exactly as
+/// the claim withholds it.
+pub fn claims_request<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    req: &RtRequest,
+    definition: &dyn ErasedServiceDefinition,
+) -> bool {
     let uri = parsed_uri(req.uri());
-    resolve(engine, &Addressed::of_request(req, &uri)).is_some()
+    resolve(
+        engine,
+        &Addressed::of_request(req, &uri),
+        !addresses_modelled_route(req, definition),
+    )
+    .is_some()
+}
+
+/// Whether this service's own MODEL binds a route for `req`: its wire protocol resolves a
+/// routing key and the model-derived routing table holds an operation under it.
+///
+/// The framework's own lookup, asked of the request the serving seam is handed
+/// (`MultiServiceRouter::dispatch`), so a request the CONTROL plane serves is read as the
+/// control plane's here too. `::service_common::addresses_modeled_route` is the same question
+/// asked of a request's PARTS, which is the form `Service::can_handle` is given.
+fn addresses_modelled_route(req: &RtRequest, definition: &dyn ErasedServiceDefinition) -> bool {
+    let wire = definition.wire_protocol(req);
+    if wire.is_unrecognised() {
+        return false;
+    }
+    wire.protocol()
+        .routing_key(req)
+        .ok()
+        .is_some_and(|key| definition.routing_table().get(key).is_some())
 }
 
 /// The request URI of a runtime-API request, parsed by the `http` crate: the authority — absent
@@ -230,10 +326,17 @@ fn parsed_uri(uri: &str) -> http::Uri {
 /// Which service and listener `addressed` addresses, and the path within that service's
 /// endpoint, or `None` when this data plane serves the request not at all.
 ///
-/// The two addressings are the module documentation's, in that order. Each resolves only to a
+/// The three addressings are the module documentation's, in that order. Each resolves only to a
 /// service that has a listener carrying requests of this kind ([`listener_addressed`]), so the
 /// claim and the answer cannot disagree about which requests this plane can answer.
-fn resolve<Eng: Send + Sync + 'static>(engine: &Eng, addressed: &Addressed<'_>) -> Option<Resolved> {
+///
+/// `announced` is whether THE ANNOUNCED ADDRESS is read for this request at all (see
+/// [`claims_parts`]).
+fn resolve<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    addressed: &Addressed<'_>,
+    announced: bool,
+) -> Option<Resolved> {
     let state = service_state(engine)?;
     let store = state.lock();
     let port = addressed_port(addressed.authority);
@@ -262,10 +365,18 @@ fn resolve<Eng: Send + Sync + 'static>(engine: &Eng, addressed: &Addressed<'_>) 
     // HOST-STYLE: the host the published `dnsEntry` gives a client, or the service's own
     // custom domain name.
     let authority = addressed.authority?;
-    let service = store
+    let named = store
         .services
         .values()
-        .find(|service| addresses_published_name(service, authority))?;
+        .find(|service| addresses_published_name(service, authority))
+        // THE ANNOUNCED ADDRESS: the service the records say a client handed this address was
+        // handed it FOR.
+        .or_else(|| {
+            announced
+                .then(|| announced_address_service(&store, authority, port))
+                .flatten()
+        });
+    let service = named?;
     if !reachable(&store, &service.id) {
         return None;
     }
@@ -275,6 +386,75 @@ fn resolve<Eng: Send + Sync + 'static>(engine: &Eng, addressed: &Addressed<'_>) 
         listener_id: listener.id.clone(),
         request_path: addressed.path.to_string(),
     })
+}
+
+/// The service a request to `authority` — one of the addresses the control plane ANNOUNCED —
+/// is for: the service whose LISTENER answers on the port the client addressed.
+///
+/// `None` where the records leave DOUBT: a port no listener of a reachable service answers on,
+/// and a port that listeners of SEVERAL services answer on — which is what two services
+/// announced at one host with one listener port leaves, where nothing about the request says
+/// which of them the client was handed that address for. The same reading as
+/// [`sole_service_network_arn`]: a value these records do not establish is not guessed at.
+///
+/// A client that wrote NO port dialled the default port of its scheme — "for HTTP, the default
+/// is 80. For HTTPS, the default is 443" (`Target$port`, the same two defaults a listener's own
+/// `port` member documents) — so such a request reaches a listener on a documented default
+/// port and no other, exactly as it is published ([`crate::state::data_plane_addresses`]).
+fn announced_address_service<'s>(
+    store: &'s LatticeState,
+    authority: &str,
+    port: Option<i32>,
+) -> Option<&'s LatticeService> {
+    if !addresses_announced_host(store, authority) {
+        return None;
+    }
+    let mut answering = store
+        .listeners
+        .values()
+        .filter(|listener| {
+            SERVED_PROTOCOLS
+                .iter()
+                .any(|protocol| listener.protocol.eq_ignore_ascii_case(protocol))
+        })
+        .filter(|listener| match port {
+            Some(port) => listener.port == port,
+            None => crate::state::default_port_for(&listener.protocol) == Some(listener.port),
+        })
+        .map(|listener| listener.service_id.as_str())
+        .filter(|service_id| reachable(store, service_id));
+    let first = answering.next()?;
+    if answering.any(|service_id| service_id != first) {
+        return None;
+    }
+    store.services.get(first)
+}
+
+/// Whether `authority` is one of the addresses this control plane ANNOUNCES — the host every
+/// `DnsEntry` of this service carries ([`crate::state::announced_dns_hosts`]).
+///
+/// That host is THIS EMULATOR's, read the two ways this emulator knows one:
+///
+/// * the host the request itself addressed, where that host names no service of its own — the
+///   reading `DnsEntry` announces through
+///   (`::service_common::data_plane_addressing::reached_emulator_endpoint`, "such a caller
+///   resolves nothing but the endpoint it is already talking to"), so a client dialling the
+///   value it was handed addresses this very host;
+/// * an authority a LISTENER recorded when its port was opened
+///   ([`crate::state::ListenerAddresses::answers_at`]), which is how the host this emulator is
+///   SERVED at is known — a name whose first label a host reader takes for a service's, and
+///   still an address of nothing but this process.
+fn addresses_announced_host(store: &LatticeState, authority: &str) -> bool {
+    let host = host_only(authority);
+    if ::service_common::data_plane_addressing::is_host_shaped(host)
+        && !::service_common::data_plane_addressing::names_a_service(host)
+    {
+        return true;
+    }
+    store
+        .data_plane_addresses
+        .values()
+        .any(|addresses| addresses.answers_at(authority))
 }
 
 /// The service and the path a PREFIXED PATH-STYLE request names, or `None` for a path that is
@@ -474,14 +654,18 @@ enum Chosen {
 /// before the AUTH POLICY decides, which is read under the caller's own stores' locks
 /// ([`super::data_plane_authorization`]). `admits` is which kind of caller the mounting
 /// serving this request admits, which is what says whether the emulator authenticated it.
+/// `announced` is whether THE ANNOUNCED ADDRESS is read for this request, decided by the
+/// claim's own rule ([`claims_request`]) where this service's model-derived half is at hand.
 pub async fn serve<Eng: Send + Sync + 'static>(
     engine: &Eng,
     req: &RtRequest,
     ctx: &OperationContext<'_>,
     admits: Admits,
+    announced: bool,
 ) -> RtResponse {
     let uri = parsed_uri(req.uri());
-    let Some(resolved) = resolve(engine, &Addressed::of_request(req, &uri)) else {
+    let resolved = resolve(engine, &Addressed::of_request(req, &uri), announced);
+    let Some(resolved) = resolved else {
         return rendered(&Served::status(NOT_SERVING_STATUS));
     };
     let request = DataPlaneRequest::of(req, &uri, &resolved.request_path);
@@ -869,8 +1053,8 @@ impl<Eng: Send + Sync + 'static> DataPlane<Eng> {
 
     /// Whether this plane serves `req`, by the one rule the claim uses
     /// ([`claims_request`]).
-    pub fn claims(&self, req: &RtRequest) -> bool {
-        claims_request(&*self.engine, req)
+    pub fn claims(&self, req: &RtRequest, definition: &dyn ErasedServiceDefinition) -> bool {
+        claims_request(&*self.engine, req, definition)
     }
 
     /// Whether THIS mounting is the one that serves `req`: the one whose kind of caller the
@@ -895,11 +1079,14 @@ impl<Eng: Send + Sync + 'static> DataPlane<Eng> {
 impl<Eng: Send + Sync + 'static> ErasedOperation for DataPlane<Eng> {
     fn run<'r>(
         &'r self,
-        _svc: &'r dyn Service,
+        svc: &'r dyn Service,
         req: &'r RtRequest,
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
-        Box::pin(async move { serve(&*self.engine, req, ctx, self.admits).await })
+        // Which addressings are read for this request is decided HERE, off the service this
+        // plane is mounted on, because that model-derived half is not held across an await.
+        let announced = !addresses_modelled_route(req, svc.definition());
+        Box::pin(async move { serve(&*self.engine, req, ctx, self.admits, announced).await })
     }
 
     fn auth_schemes(&self) -> Option<&'static [&'static str]> {
@@ -918,8 +1105,9 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for DataPlane<Eng> {
 mod tests {
     //! The pure rules of this module: which request a rule's match is satisfied by, how a
     //! prefixed address is read, and which target group a weighted forward sends a request to.
-    //! What the plane SERVES is pinned end to end in
-    //! `core/router/tests/all/vpc_lattice_lambda_target_data_plane.rs`.
+    //! What the plane SERVES is pinned end to end in this crate's own `tests/all/listeners.rs`
+    //! and `tests/all/announced_address_data_plane.rs`, and from a running function in the
+    //! associated VPC in `core/router/tests/all/vpc_lattice_unsigned_in_vpc_data_plane.rs`.
 
     use super::*;
 

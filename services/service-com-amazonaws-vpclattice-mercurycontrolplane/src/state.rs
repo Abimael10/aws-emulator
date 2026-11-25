@@ -33,8 +33,8 @@
 //! ComAmazonawsVpclatticeMercurycontrolplaneState::auth_policy_state)).
 //!
 //! The ADDRESSES a listener of a service answers at, published so a client of this emulator
-//! that holds one of the service's own host-style names reaches its data plane, live in the
-//! `data_plane_addresses` child module ([`published_listener_addresses`], whose record the
+//! that holds one of the addresses the control plane handed it reaches its data plane, live in
+//! the `data_plane_addresses` child module ([`published_listener_addresses`], whose record the
 //! listener's own create keeps on this store).
 //!
 //! Which resource an ARN names it for, where that resource keeps its TAGS and what a tag
@@ -58,7 +58,9 @@ pub use access_log_subscriptions::{
     AccessLogDestination, AccessLogSubscription, KIND_ACCESS_LOG_SUBSCRIPTION,
     MAX_ACCESS_LOG_SUBSCRIPTIONS, PREFIX_ACCESS_LOG_SUBSCRIPTION, UNRESOLVED_SUBSCRIBED_KIND,
 };
-pub use announced_dns::{announced_dns_entry, announced_dns_host, service_label};
+pub use announced_dns::{
+    announced_dns_entry, announced_dns_host, announced_dns_hosts, service_label,
+};
 pub use data_plane_addresses::{published_listener_addresses, ListenerAddresses};
 pub use auth_policies::{
     auth_policy_target, check_auth_policy_document, AuthPolicy, AUTH_POLICY_MEMBER,

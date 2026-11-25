@@ -85,6 +85,11 @@ const HOST_OWNED_HEADERS: &[&str] = &[
     "proxy-authorization",
 ];
 
+/// The port a URL that writes none dialled over `http`, which RFC 9110 fixes at 80 — the
+/// counterpart of [`::service_common::data_plane_addressing::IMPLICIT_HTTPS_PORT`] for the
+/// other scheme a handler may address ([`dialled_authority`]).
+const DEFAULT_HTTP_PORT: u16 = 80;
+
 /// What one request came back with: the emulated service's own answer.
 #[derive(Debug, Clone)]
 pub struct Answered {
@@ -327,13 +332,19 @@ fn authority_and_target(url: &str) -> Option<(&str, String)> {
 /// address the handler dialled, and an address this emulator published nothing at stays a
 /// request this seam does not make. The Region is the invocation's own: a listener of this
 /// emulator is not an endpoint of another Region.
+///
+/// A URL that writes NO port dialled the default port of its scheme, which is the address the
+/// register holds for a plane published on that port ([`dialled_authority`]).
 fn addressed_resource_plane(
     url: &str,
     published: Option<&::service_common::published_data_planes::PublishedPlanes>,
     default_region: &str,
 ) -> Option<Addressed> {
     let (authority, target) = authority_and_target(url)?;
-    let signing_name = published?.answering_service(authority)?;
+    let published = published?;
+    let signing_name = published.answering_service(authority).or_else(|| {
+        dialled_authority(url, authority).and_then(|dialled| published.answering_service(&dialled))
+    })?;
     Some(Addressed {
         signing_name,
         host: authority.to_string(),
@@ -341,6 +352,31 @@ fn addressed_resource_plane(
         region: default_region.to_string(),
         presigned_url: false,
     })
+}
+
+/// The `host:port` a URL that writes NO port dialled: its authority with the port its SCHEME
+/// fixes, or `None` for a URL that writes one — whose authority is that address already.
+///
+/// RFC 9110 fixes the default port of `http` at 80 and of `https` at 443, which is exactly why
+/// a URL on one of them carries no port at all, while the register above is keyed by
+/// `host:port` because one address per listener is its point
+/// ([`::service_common::published_data_planes`]). So a plane published on the default port of
+/// its protocol is dialled by a URL that writes no port, and this is the address such a URL
+/// dialled. Read off the SCHEME the handler wrote rather than assumed: a URL naming neither
+/// scheme is no request this seam makes at all ([`authority_and_target`]).
+fn dialled_authority(url: &str, authority: &str) -> Option<String> {
+    if ::service_common::data_plane_addressing::addressed_port(Some(authority)).is_some() {
+        return None;
+    }
+    let (scheme, _) = url.split_once("://")?;
+    let port = match scheme.to_ascii_lowercase().as_str() {
+        "http" => DEFAULT_HTTP_PORT,
+        "https" => ::service_common::data_plane_addressing::IMPLICIT_HTTPS_PORT,
+        _ => return None,
+    };
+    Some(::service_common::data_plane_addressing::host_port_authority(
+        authority, port,
+    ))
 }
 
 /// WHERE a PRESIGNED URL on this emulator's own endpoint goes, or `None` for a URL that
@@ -1644,7 +1680,8 @@ mod tests {
     /// a table whose rows span what the rule generalises over: every shape of address the
     /// core publishes such a listener at (a loopback literal with a port, a loopback name, a
     /// bracketed IPv6 literal, an interface address the operator bound), two services' own
-    /// listeners on one engine, and the requests that address no published listener at all
+    /// listeners on one engine, a plane published on the default port of its scheme — which a
+    /// URL writes no port for — and the requests that address no published listener at all
     /// (another port of the same host, a listener that has been withdrawn, a host that is a
     /// name, a value that is no URL).
     #[test]
@@ -1743,6 +1780,59 @@ mod tests {
             "case \"an emulator holding no published addresses\": expected no address, got \
              {unrecorded:?}"
         );
+        // A URL that writes NO port dialled the default port of its SCHEME, which is the
+        // address the register is keyed by for a plane published on that port
+        // ([`dialled_authority`]): the one address per listener the register holds.
+        published.publish("shop-0123.localhost:80", "vpc-lattice");
+        published.publish("docs.example.test:443", "vpc-lattice");
+        let default_ports: &[Row] = &[
+            Row {
+                case: "an http URL writing no port, published on 80",
+                url: "http://shop-0123.localhost/probe/1",
+                expected: Some(("vpc-lattice", "/probe/1", "us-west-2")),
+            },
+            Row {
+                case: "an https URL writing no port, published on 443",
+                url: "https://docs.example.test/index.html",
+                expected: Some(("vpc-lattice", "/index.html", "us-west-2")),
+            },
+            Row {
+                case: "the same host written with its port",
+                url: "http://shop-0123.localhost:80/probe/1",
+                expected: Some(("vpc-lattice", "/probe/1", "us-west-2")),
+            },
+            Row {
+                case: "an https URL whose host is published on 80 only",
+                url: "https://shop-0123.localhost/probe/1",
+                expected: None,
+            },
+            Row {
+                case: "an http URL whose host is published on 443 only",
+                url: "http://docs.example.test/index.html",
+                expected: None,
+            },
+            Row {
+                case: "a port neither scheme fixes",
+                url: "http://shop-0123.localhost:8080/probe/1",
+                expected: None,
+            },
+        ];
+        for row in default_ports {
+            let case = row.case;
+            let addressed = addressed_resource_plane(row.url, Some(&published), "us-west-2");
+            let actual = addressed.as_ref().map(|addressed| {
+                (
+                    addressed.signing_name.as_str(),
+                    addressed.target.as_str(),
+                    addressed.region.as_str(),
+                )
+            });
+            assert_eq!(
+                actual, row.expected,
+                "case {case:?}: expected {:?}, got {actual:?}",
+                row.expected
+            );
+        }
         // The two readings that name a service in the ADDRESS itself answer FIRST, so a plane
         // named in the path keeps its own signing name and an AWS-shaped host keeps its
         // endpoint prefix, whatever has been published.

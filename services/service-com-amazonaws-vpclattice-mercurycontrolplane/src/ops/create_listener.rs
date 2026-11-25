@@ -397,10 +397,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the request.
         store.insert_default_rule(&record, &region, now);
         // The addresses this listener answers at, published for a client of this emulator that
-        // holds one of the service's own host-style names
+        // holds one of the addresses the control plane handed it — a host-style name of the
+        // service, or the host announced in its `dnsEntry` on this listener's port
         // ([`crate::state::published_listener_addresses`]): the record is held under the
         // listener's id and withdrawn with the listener itself.
-        let addresses = crate::state::published_listener_addresses(&*self.engine, &service, &record);
+        let addresses =
+            crate::state::published_listener_addresses(&*self.engine, ctx, &service, &record);
         store.data_plane_addresses.insert(id.clone(), addresses);
         store.listeners.insert(id.clone(), record);
         let stored = store

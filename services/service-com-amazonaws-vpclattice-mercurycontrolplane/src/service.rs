@@ -156,14 +156,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             // And a SERVICE's own traffic: a request addressed to a service this crate holds
             // a record for ([`data_plane::claims_parts`]). Such a request names no modelled
             // operation and carries no credential scope naming this service — its host is one
-            // of the service's own, whose first label names no service of AWS — so
+            // of the service's own, whose first label names no service of AWS, or the host
+            // this control plane ANNOUNCED for clients to dial — so
             // the front door could resolve no target service for it and answered
             // `404 UnknownService`, for an address a client of the emulated network holds.
             //
             // The claim is narrowed to a service this crate HOLDS, read from the one shared
             // store, rather than to a host or a path shape alone, so one request keeps one
-            // claimant.
-            _ => data_plane::claims_parts(&*self.engine, parts),
+            // claimant; the announced-address reading, whose host is this emulator's own front
+            // door, is narrowed further still ([`data_plane::claims_parts`]).
+            _ => data_plane::claims_parts(&*self.engine, parts, &self.entry),
         }
     }
 
@@ -187,7 +189,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // served by the mounting that declares that scheme, so the emulator verifies it before
         // the plane runs, and one presenting none by the mounting that declares no scheme at
         // all. Naming the mounting is what keeps that verification in front of this plane.
-        if self.data_plane_unsigned.claims(req) {
+        if self.data_plane_unsigned.claims(req, &self.entry) {
             for mounting in [&self.data_plane_signed, &self.data_plane_unsigned] {
                 if mounting.serves(req) {
                     return Some(mounting as _);

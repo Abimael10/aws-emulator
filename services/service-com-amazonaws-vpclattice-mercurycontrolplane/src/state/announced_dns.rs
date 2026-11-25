@@ -30,7 +30,10 @@
 //! ([`service_label`]), the first label of the hosts this emulator's data plane claims and
 //! publishes for a client inside this process (`crate::state::data_plane_addresses`,
 //! `crate::service::data_plane`). A client that holds nothing but the announced host reaches
-//! the service through the reserved data-plane path on that host
+//! the service at that host ON THE LISTENER'S PORT, which is the address the control plane
+//! announced it: the listener records that address as one it answers at
+//! (`crate::state::data_plane_addresses`) and the plane serves the service's own traffic
+//! there, beside the reserved data-plane path on the same host
 //! (`crate::service::data_plane::data_plane_path`).
 //!
 //! The entry is built on every read as well as on the create, so nothing persists an address
@@ -63,11 +66,34 @@ const UNNAMED_SERVICE_LABEL: &str = "service";
 /// host is one nothing resolves — so even then the announced host leads no caller out of
 /// this process.
 pub fn announced_dns_host(ctx: &::smithy_server_runtime::OperationContext<'_>) -> String {
-    let authority = ::service_common::data_plane_addressing::reached_emulator_endpoint_of_parts(
-        ctx.parts(),
-    )
-    .unwrap_or_else(|| ::service_common::data_plane_addressing::emulator_endpoint_authority(ctx));
-    host_of_authority(&authority)
+    announced_dns_hosts(ctx)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| LOOPBACK_ZONE.to_string())
+}
+
+/// EVERY host this emulator announces a `DnsEntry` with: the host of the authority the
+/// request being answered addressed, when it addressed this emulator's own endpoint, and the
+/// host of the one address this process is served at — in the order
+/// [`announced_dns_host`] prefers them, with no host repeated.
+///
+/// The value one client is announced is the host THAT client reaches this emulator at, so a
+/// LISTENER — opened by one request and then answering every client's traffic — answers at
+/// every host of this list rather than only at the one its create saw
+/// (`super::data_plane_addresses`, which records the addresses a listener answers at).
+pub fn announced_dns_hosts(ctx: &::smithy_server_runtime::OperationContext<'_>) -> Vec<String> {
+    let addressed = [
+        ::service_common::data_plane_addressing::reached_emulator_endpoint_of_parts(ctx.parts()),
+        Some(::service_common::data_plane_addressing::emulator_endpoint_authority(ctx)),
+    ];
+    let mut hosts: Vec<String> = Vec::new();
+    for authority in addressed.into_iter().flatten() {
+        let host = host_of_authority(&authority);
+        if !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    hosts
 }
 
 /// The `DnsEntry` a response carries for a resource whose DNS record holds `hosted_zone_id`:
