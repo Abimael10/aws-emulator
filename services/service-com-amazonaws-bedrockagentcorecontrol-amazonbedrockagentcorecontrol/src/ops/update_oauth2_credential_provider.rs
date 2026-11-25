@@ -218,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             let store = state.lock();
             if !store.oauth2_credential_providers.contains_key(&input.name) {
-                return Err(provider_not_found().into());
+                return Err(provider_not_found(&input.name).into());
             }
         }
 
@@ -240,7 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = store
             .oauth2_credential_providers
             .get_mut(&input.name)
-            .ok_or_else(provider_not_found)?;
+            .ok_or_else(|| provider_not_found(&input.name))?;
 
         record.apply_update(
             input.credential_provider_vendor,
@@ -254,12 +254,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The refusal of an update whose `name` resolves to no provider of this
-/// account, in the OAuth2 credential-provider family's own fixed wording
-/// ([`crate::state::oauth2_credential_provider_not_found`]), which states
-/// neither the provider kind nor the name the request addressed.
-fn provider_not_found() -> UpdateOauth2CredentialProviderErrorModeled {
+/// account, in THIS route's own wording
+/// ([`crate::state::oauth2_credential_provider_not_found_on_update`]): the
+/// family's sentence plus the member and value the request addressed the
+/// provider by, which is the input the caller has to correct. The routes that
+/// only report or retire a provider word it without the name.
+fn provider_not_found(name: &str) -> UpdateOauth2CredentialProviderErrorModeled {
     UpdateOauth2CredentialProviderErrorModeled::ResourceNotFoundException(
-        crate::state::oauth2_credential_provider_not_found(),
+        crate::state::oauth2_credential_provider_not_found_on_update(name),
     )
 }
 

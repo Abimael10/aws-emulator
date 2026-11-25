@@ -563,10 +563,10 @@ async fn an_update_of_a_name_no_provider_resolves_to_is_refused() {
         );
         assert_eq!(
             refused["message"].as_str().unwrap_or_default(),
-            // The OAuth2 credential-provider family's own fixed sentence: it names
-            // neither the provider kind nor the name the request addressed
-            // (`tests/all/credential_provider_type_isolation.rs`).
-            "CredentialProvider not found",
+            // This ROUTE's own sentence: the family's words plus the member and value the
+            // request addressed the provider by, which the family's reads leave out
+            // (`tests/all/oauth2_credential_provider_not_found_wording.rs`).
+            format!("CredentialProvider not found for name: {name}"),
             "case {case:?}: unexpected refusal message, got {refused}"
         );
 

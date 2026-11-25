@@ -4,17 +4,19 @@
 //! provider of this account's token vault.
 //!
 //! The rule under test: the refusal sentence belongs to the route that answers it, not to
-//! a template shared across the credential-provider planes — the OAuth2 routes answer one
-//! ENTIRELY FIXED sentence that names neither the provider kind asked for nor the name the
-//! request carried, so no caller can read a name's existence (in this plane or in any
-//! other) off the words it gets back. The API-key read beside it does name the value its
-//! request carried, which is why the OAuth2 sentence cannot be derived from it.
+//! a template shared across the credential-provider planes — the OAuth2 routes that only
+//! report or retire a provider answer one ENTIRELY FIXED sentence that names neither the
+//! provider kind asked for nor the name the request carried, so no caller can read a
+//! name's existence (in this plane or in any other) off the words it gets back, while the
+//! OAuth2 UPDATE route appends the member and value it could not resolve. The API-key read
+//! beside it names the value its request carried in a sentence of its own, which is why
+//! none of these is derived from another.
 //!
 //! The rows span why the name resolves to nothing — never used at all, used by a provider
 //! of ANOTHER plane, a held OAuth2 provider's name in another letter case, and a name
 //! whose only create was refused — and the three OAuth2 routes that address a provider by
-//! name (`Get`, `Update` and `Delete`), so the sentence is the plane's rather than one
-//! operation's.
+//! name (`Get`, `Update` and `Delete`), so each sentence is pinned on every reason a name
+//! resolves to nothing.
 //!
 //! Secrets Manager is mounted beside this service on ONE engine, the shape
 //! `core/router/src/lib.rs` mounts them in, because a managed provider's credential is
@@ -31,10 +33,15 @@ use service_com_amazonaws_bedrockagentcorecontrol_amazonbedrockagentcorecontrol 
 /// The Region every request in this suite is signed for.
 const REGION: &str = "eu-central-1";
 
-/// The whole of the sentence every OAuth2 credential-provider route answers for a name
-/// that resolves to no provider of that plane. Written out rather than computed, so the
-/// expectation pins the words a caller reads.
+/// The whole of the sentence the OAuth2 credential-provider routes that report or retire a
+/// provider answer for a name that resolves to no provider of that plane. Written out
+/// rather than computed, so the expectation pins the words a caller reads.
 const OAUTH2_NOT_FOUND: &str = "CredentialProvider not found";
+
+/// The route whose refusal names the `name` it could not resolve, and the suffix it adds
+/// to [`OAUTH2_NOT_FOUND`] before that value.
+const OAUTH2_UPDATE_ROUTE: &str = "/identities/UpdateOauth2CredentialProvider";
+const OAUTH2_UPDATE_NOT_FOUND_SUFFIX: &str = " for name: ";
 
 /// The two documents `Oauth2Discovery$discoveryUrl` admits, which are the published
 /// locations of an authorization server's metadata (OpenID Connect Discovery 1.0 and RFC
@@ -113,6 +120,17 @@ fn custom_config(client: &str) -> Value {
     }})
 }
 
+/// The sentence the given route answers for a `name` that resolves to no OAuth2 provider:
+/// the plane's fixed one, which the update route alone extends with the value it could not
+/// resolve.
+fn expected_message(route: &str, name: &str) -> String {
+    if route == OAUTH2_UPDATE_ROUTE {
+        format!("{OAUTH2_NOT_FOUND}{OAUTH2_UPDATE_NOT_FOUND_SUFFIX}{name}")
+    } else {
+        OAUTH2_NOT_FOUND.to_string()
+    }
+}
+
 /// Every OAuth2 route that addresses a provider by `name`, as (route, the request body for
 /// `name`): the read, the update and the delete.
 fn oauth2_routes(name: &str) -> [(&'static str, Value); 3] {
@@ -122,7 +140,7 @@ fn oauth2_routes(name: &str) -> [(&'static str, Value); 3] {
             json!({"name": name}),
         ),
         (
-            "/identities/UpdateOauth2CredentialProvider",
+            OAUTH2_UPDATE_ROUTE,
             json!({
                 "name": name,
                 "credentialProviderVendor": "CustomOauth2",
@@ -136,7 +154,7 @@ fn oauth2_routes(name: &str) -> [(&'static str, Value); 3] {
     ]
 }
 
-/// Every OAuth2 route refuses a name that resolves to no OAuth2 provider with ONE fixed
+/// Every OAuth2 route refuses a name that resolves to no OAuth2 provider in its own
 /// sentence, whatever the name and whatever else holds it.
 #[tokio::test]
 async fn every_oauth2_route_refuses_an_absent_name_in_one_fixed_sentence() {
@@ -212,12 +230,14 @@ async fn every_oauth2_route_refuses_an_absent_name_in_one_fixed_sentence() {
             );
             assert_eq!(
                 message(&refused),
-                OAUTH2_NOT_FOUND,
+                expected_message(route, name),
                 "case {case:?} on {route}: unexpected refusal message, got {refused}"
             );
-            assert!(
-                !message(&refused).contains(name),
-                "case {case:?} on {route}: the refusal echoes the requested name, got {refused}"
+            assert_eq!(
+                message(&refused).contains(name),
+                route == OAUTH2_UPDATE_ROUTE,
+                "case {case:?} on {route}: the refusal names the requested name only where \
+                 this route's sentence does, got {refused}"
             );
         }
     }

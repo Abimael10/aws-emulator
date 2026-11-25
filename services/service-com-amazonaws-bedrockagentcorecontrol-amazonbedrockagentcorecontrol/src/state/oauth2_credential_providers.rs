@@ -115,12 +115,16 @@ pub fn oauth2_authorization_callback_url(endpoint_base: &str) -> String {
 /// resolves to: ENTIRELY FIXED text, naming neither the kind of credential
 /// provider asked for nor the name the request addressed it by.
 ///
-/// Each credential-provider family words its own refusal — the sentence belongs
+/// Each credential-provider ROUTE words its own refusal — the sentence belongs
 /// to the route that answers it, not to a template shared across the families —
 /// so this one is not derived from [`api_key_credential_provider_not_found`],
 /// which does state the name its request carried. Saying nothing about the name
 /// is also what keeps a read of one family from reporting whether ANOTHER
 /// family holds that name: every absent name gets one answer.
+///
+/// The routes that answer it are the ones that only report or retire a provider;
+/// the UPDATE route of this family names the `name` it could not resolve
+/// ([`oauth2_credential_provider_not_found_on_update`]).
 pub fn oauth2_credential_provider_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(OAUTH2_CREDENTIAL_PROVIDER_NOT_FOUND_MESSAGE.to_string()),
@@ -129,6 +133,27 @@ pub fn oauth2_credential_provider_not_found() -> ResourceNotFoundException {
 
 /// The whole of the sentence [`oauth2_credential_provider_not_found`] carries.
 pub const OAUTH2_CREDENTIAL_PROVIDER_NOT_FOUND_MESSAGE: &str = "CredentialProvider not found";
+
+/// How the UPDATE route of this family words the same miss: the family's own
+/// sentence, then the member the request addressed the provider by and the value
+/// it carried — the identifier the caller has to correct before the update can be
+/// served, which the routes that merely report or retire a provider leave out.
+///
+/// The fixed text is the family's sentence plus `" for name: "`; the trailing
+/// token is whatever `name` the request sent. Worded per route rather than per
+/// family: the payment plane's two sentences differ in exactly the same way
+/// ([`super::payment_credential_provider_not_found_on_update`]), so neither
+/// route's wording is derived from the other's.
+///
+/// Kept here beside the sentence the reads use rather than in one `ops/` file, so
+/// the two cannot drift apart.
+pub fn oauth2_credential_provider_not_found_on_update(name: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "{OAUTH2_CREDENTIAL_PROVIDER_NOT_FOUND_MESSAGE} for name: {name}"
+        )),
+    }
+}
 
 /// How many OAuth2 credential providers this emulator will hold.
 ///
