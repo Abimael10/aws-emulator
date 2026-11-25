@@ -93,6 +93,10 @@ pub mod scaling_policy_actions;
 /// force on that topic, and what they say about this service's publish.
 pub mod sns_topic_authorization;
 
+/// The action notifications one settle has taken out of the store and not delivered yet, held so
+/// that a pass which ends early leaves them owed rather than losing them.
+mod owed_notifications;
+
 /// The ARN namespace of Amazon SNS, whose topics are the action kind this module delivers to.
 const SNS_ARN_NAMESPACE: &str = "sns";
 
@@ -484,8 +488,11 @@ impl Transition<'_> {
 /// The one entry point every handler that touches alarms calls: it holds the store's lock
 /// only to evaluate, to take the queue and to record each execution it has made
 /// ([`record_action`]), so the deliveries themselves happen with the lock released and one
-/// request's fan-out cannot block another's read. Delivery is at-most-once: a taken
-/// notification is gone from the queue, so no later call can publish it twice.
+/// request's fan-out cannot block another's read. A record the pass has taken but not yet
+/// delivered is HELD rather than dropped ([`owed_notifications`]): a pass that ends before it
+/// has made every publish — an aborted clock task, a dropped request future, a panicking
+/// action — hands back what is left, so delivery is at-least-once and a transition's action is
+/// never silently lost.
 ///
 /// ONE request's fan-out is bounded by [`MAX_NOTIFICATIONS_PER_REQUEST`]: that many
 /// notifications are taken, each firing at most the five action ARNs a state's action list
@@ -549,6 +556,11 @@ async fn settle<Eng: Send + Sync + 'static>(
         })
     };
 
+    // What this settle has taken and not delivered: held, so that a pass which ends before its
+    // last publish hands the rest back as still owed rather than losing it
+    // ([`owed_notifications`]).
+    let mut owed = owed_notifications::Owed::new(&state, owed);
+
     // The CONFIGURATION changes the alarm writes of this store have made go out here, beside
     // the state changes below: both are events this service owes the bus about one of its
     // alarms, so one settle publishes both and neither waits for the other's work.
@@ -565,13 +577,10 @@ async fn settle<Eng: Send + Sync + 'static>(
     // settle materialised whether or not the alarm carries an action at all. A record of actions
     // nothing moved the alarm for — the ones a deleted mute rule had withheld — announces no
     // state change, because none happened.
-    let changes: Vec<state_change_events::AlarmStateChange> = owed
-        .iter()
-        .filter(|notification| notification.publishes_state_change)
-        .map(|notification| notification.state_change.clone())
-        .collect();
+    let changes = owed.state_changes();
     if !changes.is_empty() {
         state_change_events::publish(callback, &changes).await;
+        owed.state_changes_published();
     }
 
     let mut client: Option<(String, ::aws_sdk_sns::Client)> = None;
@@ -580,7 +589,9 @@ async fn settle<Eng: Send + Sync + 'static>(
     // the key: the decision is taken with the FIRING ALARM's own ARN and account in the
     // request context, which makes another alarm's publish to the same topic another question.
     let mut decided: Vec<Decided> = Vec::new();
-    for notification in owed {
+    // One record at a time, and each one stays owed until every action it carries has been
+    // executed and recorded.
+    while let Some(notification) = owed.next_to_deliver() {
         for action in &notification.actions {
             // An EC2 instance action is not a message to a target: it is an operation of EC2
             // on the instance the alarm watches, so it is executed there and recorded with
@@ -720,6 +731,9 @@ async fn settle<Eng: Send + Sync + 'static>(
             }
             record_action(&state, &notification, action, failure.as_deref(), now);
         }
+        // Every action this record carries has been executed and recorded, so nothing of it is
+        // owed any more.
+        owed.delivered();
     }
 }
 
@@ -883,13 +897,25 @@ const MAX_ALARM_WAKE_UPS: usize = 2_000;
 /// so this never doubles the running clocks for long: a take-over bumps the generation, and
 /// the losing starter's own task is aborted when it finds the generation moved on
 /// ([`set_alarm_clock`]).
+///
+/// Whether a task has ended is a statement about the clock HOLDING the claim only while the
+/// stored task is that clock's own: a starter takes the claim and installs its task a moment
+/// later ([`set_alarm_clock`]), so in between, the stored task is the PREVIOUS clock's — already
+/// finished, which is why the claim was free — while the clock that now holds the claim is alive
+/// and may be part-way through the notifications it has taken. Reading the previous task's end as
+/// this claim's would hand the claim to a second starter, whose install then ABORTS the live
+/// clock, and a delivery it had begun would be the one nothing ever makes. So the generation the
+/// stored task belongs to is compared with the current claim's
+/// ([`super::ComAmazonawsCloudwatchGraniteserviceversion20100801State::alarm_clock_handle_generation`]),
+/// and a claim whose task is not installed yet is left alone.
 fn claim_alarm_clock(
     store: &mut super::ComAmazonawsCloudwatchGraniteserviceversion20100801State,
 ) -> Option<u64> {
-    let ended = store
-        .alarm_clock
-        .as_ref()
-        .is_some_and(::tokio::task::JoinHandle::is_finished);
+    let ended = store.alarm_clock_handle_generation == store.alarm_clock_generation
+        && store
+            .alarm_clock
+            .as_ref()
+            .is_some_and(::tokio::task::JoinHandle::is_finished);
     if store.alarm_clock_running && !ended {
         return None;
     }
@@ -918,6 +944,11 @@ fn release_alarm_clock(
 /// Keep the running clock's task handle, aborting the one it replaces — and only while
 /// `generation` is still the CURRENT claim, so a starter whose own task has already stood down
 /// installs nothing and aborts nothing.
+///
+/// The claim the installed task belongs to is recorded with it, which is what makes the end of a
+/// task a statement about the clock holding the claim ([`claim_alarm_clock`]). The task this one
+/// replaces belongs to an earlier claim that was released or had ended — the only two ways a
+/// later claim is granted at all — so the abort it is given is of a task that is already over.
 fn set_alarm_clock(
     store: &mut super::ComAmazonawsCloudwatchGraniteserviceversion20100801State,
     generation: u64,
@@ -927,6 +958,7 @@ fn set_alarm_clock(
         handle.abort();
         return;
     }
+    store.alarm_clock_handle_generation = generation;
     if let Some(previous) = store.alarm_clock.replace(handle) {
         previous.abort();
     }
@@ -1459,6 +1491,27 @@ mod tests {
         assert!(
             !store.alarm_clock_running,
             "the current claim's holder must be able to release it"
+        );
+    }
+
+    /// A claim whose holder has not installed its own task yet is NOT taken over because an
+    /// EARLIER clock's task has ended: that task says nothing about the clock holding the claim,
+    /// and a take-over would abort the live one part-way through the notifications it has taken.
+    #[tokio::test]
+    async fn a_claim_whose_task_is_not_installed_yet_is_not_taken_over() {
+        let mut store = State::default();
+        let first = claim_alarm_clock(&mut store).expect("the first caller may start a clock");
+        // The first clock installs its task and that task ends without releasing the claim.
+        set_alarm_clock(&mut store, first, ended_task().await);
+        // Its end frees the claim, which a second starter takes …
+        let second = claim_alarm_clock(&mut store)
+            .expect("a claim held by a clock whose task has ended must be taken over");
+        // … and until that starter installs its OWN task, the task in the store is still the
+        // first clock's, so nothing may read its end as this claim's.
+        assert!(
+            claim_alarm_clock(&mut store).is_none(),
+            "the claim generation {second} holds must not be taken over while its own task is \
+             not installed yet"
         );
     }
 }

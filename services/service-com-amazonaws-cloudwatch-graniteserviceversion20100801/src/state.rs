@@ -2298,6 +2298,14 @@ pub struct ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     /// Which claim on the alarm clock is current, so a clock that stands down releases only
     /// its own.
     pub alarm_clock_generation: u64,
+    /// Which claim the task in [`Self::alarm_clock`] belongs to.
+    ///
+    /// A starter takes the claim and installs its task a moment later, so between those two
+    /// steps the stored task is the PREVIOUS clock's — which may already have ended — while the
+    /// clock holding the claim is alive. This is what tells the two apart, so that a task's
+    /// having ended is read as a statement about the clock that holds the claim only when the
+    /// task really is that clock's ([`alarm_actions::drive_alarm_clock`]).
+    pub alarm_clock_handle_generation: u64,
     /// The account's vended-metric enrichment configuration, once any of the enrichment
     /// operations has stored one.
     pub otel_enrichment: Option<StoredOTelEnrichment>,

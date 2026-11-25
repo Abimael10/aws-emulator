@@ -43,6 +43,54 @@ Expected (real AWS): within the 300 s barrier — during which the check re-publ
 
 Actual (emulator): zero messages on the queue for any of the three alarms over the whole 300 s window (`last observation {}`), so no notification, no OldState/NewState payload and no Action history item can be read. The concrete alarm names, namespace, queue URL and timestamps in the recording are per-run values; the requirement is that an ActionsEnabled alarm with an SNS AlarmAction and a breaching series delivers one notification to that topic's subscribers.
 
+## Resolution
+
+* Cause 1 of 1 — "the alarm->SNS->SQS leg of an evaluation-driven transition is inert" — is FIXED
+  at the one place such a transition's notification could be LOST on the way out, which is the
+  only way the path can be silent while everything the report checked before the barrier passes.
+  A transition's notification is queued ONCE, by the evaluation that moved the alarm, and nothing
+  re-queues it afterwards — the alarm now stands in the state it moved to, so every later
+  evaluation computes that same state and moves it nowhere — so the queued record is the only
+  account of the action the alarm owes. The settle that delivered it TOOK the records out of the
+  store and only then published them, so a pass that ended before its last publish lost them for
+  good: the alarm had moved, its history recorded no execution, and no later call could put it
+  right. Two things end such a pass: the alarm clock's task is ABORTED when a new clock installs
+  itself (`set_alarm_clock`), and a request's own future is dropped when the client it answers
+  goes away. The abort was reachable because the claim's take-over test read the task stored for a
+  PREVIOUS claim: a starter takes the claim and installs its task a moment later, so in between,
+  the previous clock's finished task was read as the live clock's end and a second starter was let
+  in, whose install aborted the live one — part-way through the notifications it had taken. Every
+  call this check makes starts a clock, so that window is open throughout it.
+  - `src/state/alarm_actions/owed_notifications.rs` (new) holds what a settle has taken and not
+    delivered, and hands back whatever is left when the pass ends however it ends, so delivery is
+    at-least-once; a record leaves the hold only once every action it carries has been executed and
+    recorded, and a record handed back carries only its actions where its state-change event has
+    already gone out.
+  - `src/state/alarm_actions.rs` records with each installed clock task the claim it belongs to and
+    reads a task's end as the claim holder's only when the task really is that clock's, so a live
+    clock is never aborted by a second starter.
+* The chain each part of that path implements is otherwise unchanged and now pinned end to end:
+  `core/router/tests/all/cloudwatch_client_evaluation_driven_alarm_action_on_a_started_emulator.rs`
+  starts the built binary (request authentication on, calls SigV4-signed over TLS) and writes the
+  whole estate as a client does — topic, queue, queue policy, `sqs` subscription, the published
+  series and the alarms — then waits for the delivery with the recorded drive sequence alone
+  (`PutMetricData` + `ReceiveMessage`, nothing of CloudWatch read until the envelope is in hand):
+  the control alarm's envelope arrives carrying `AlarmName`, `NewStateValue` `ALARM` and
+  `OldStateValue` `INSUFFICIENT_DATA`, its `Action` history item reports `actionState` `Succeeded`
+  and names the topic, and the gated arm beside it withholds both. A second case writes the
+  SHORTEST warm-up the model admits on both arms and reads the release: the arm that does not sit
+  its period out is delivered first, and the one that does is delivered once its window has passed.
+  The rows span the wire the client writes over (the `awsQuery` form body, where the action list
+  arrives as `AlarmActions.member.1` and a time stamp as ISO 8601 text, and the `awsJson1_0` body),
+  how the queue's grant to SNS is scoped (unscoped, or by `aws:SourceArn` to the publishing topic),
+  how an ISO time stamp is spelled (with and without the microseconds a client's clock carries) and
+  how many closed periods were already breaching when the alarm was written.
+* Unit cover for the two loss paths sits beside the code they fix: `owed_notifications`'s own tests
+  assert that a hold ending before delivery hands the record back (and hands back its actions
+  alone once the event has gone out) while a delivered one hands nothing back, and
+  `alarm_actions`'s clock tests assert that a claim whose task is not installed yet is not taken
+  over.
+
 ## Steps to Reproduce
 1. Build and boot the emulator from this checkout; point botocore cloudwatch/sns/sqs clients at it.
 2. sns CreateTopic; sqs CreateQueue; sqs GetQueueAttributes(AttributeNames=[QueueArn]); sqs SetQueueAttributes(Policy allowing Principal {"Service":"sns.amazonaws.com"} sqs:SendMessage on the queue ARN); sns Subscribe(TopicArn, Protocol="sqs", Endpoint=<queue arn>, ReturnSubscriptionArn=True).
