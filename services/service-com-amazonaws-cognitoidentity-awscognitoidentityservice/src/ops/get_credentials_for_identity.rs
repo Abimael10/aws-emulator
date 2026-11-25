@@ -13,7 +13,9 @@
 //! passed through to Security Token Service with the appropriate role for the token" (this
 //! operation's own doc) — and an assume mints a session, so a caller that asks again gets
 //! another one, which is what lets it pick up a change in what the role may do and what
-//! makes each session separately attributable where a call it signs is recorded. A session
+//! makes each session separately attributable where a call it signs is recorded. A caller
+//! whose exchange presents a token of this service's asks again with a FRESH token: the
+//! issuance is spendable once (below). A session
 //! handed out earlier is untouched by the next vend: it is the token service's, valid for
 //! its own window, so this service keeps no per-identity record of it and revokes nothing
 //! by vending again. Minting per call is bounded where the sessions live: the token
@@ -96,6 +98,16 @@
 //! that claims this service as its issuer in no way — a developer user identifier, an opaque
 //! credential of some other provider, a token of another issuer's form — is no Cognito token
 //! at all, the refusal a token another identity pool minted carries as well.
+//!
+//! Such an issuance is spendable ONCE. The exchange is the pass-through the token was minted
+//! for — "If the token is for cognito-identity.amazonaws.com, it will be passed through to
+//! Security Token Service with the appropriate role for the token" (this operation's own
+//! doc) — so a SERVED exchange redeems the issuance, and the same token presented again
+//! resolves to nothing: it is no token of this pool any more, which is the refusal a value
+//! this pool never minted carries. A caller that needs a second exchange asks its mint for a
+//! second token, which is what the issuing operations are for; an exchange that was REFUSED
+//! redeemed nothing, so the token it presented is still the unspent issuance it was
+//! ([`crate::state::ComAmazonawsCognitoidentityAwscognitoidentityserviceState::spend_presented_login_token`]).
 //!
 //! A DEVELOPER provider is no provider a login can be redeemed against here: it is "the
 //! 'domain' by which Cognito will refer to your users", this account's own back end rather
@@ -723,6 +735,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
                 duration_seconds,
             },
         );
+
+        // The exchange has been SERVED, so the token it was presented with has been redeemed:
+        // a login made under this service's own provider name is the one "passed through to
+        // Security Token Service with the appropriate role for the token" (this operation's
+        // own doc), and the pass-through has happened. The issuance is spent HERE, after the
+        // session exists and only for an exchange that was served, so a refused exchange
+        // leaves the token the unspent issuance it was and a caller that needs another
+        // exchange asks its mint for another token
+        // ([`crate::state::ComAmazonawsCognitoidentityAwscognitoidentityserviceState::spend_presented_login_token`]).
+        if let Some(logins) = input.logins.as_ref() {
+            state.lock().spend_presented_login_token(logins);
+        }
 
         Ok(GetCredentialsForIdentityOutput {
             identity_id: Some(input.identity_id.clone()),

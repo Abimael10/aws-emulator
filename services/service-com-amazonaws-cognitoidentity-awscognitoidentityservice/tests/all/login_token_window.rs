@@ -21,7 +21,10 @@
 //! Every case asserts that rule over a TABLE of windows — the modelled minimum, the window
 //! of a request that names none, and the modelled maximum among them — rather than one
 //! recorded call, and each row is read at three instants: inside its nominal window, past
-//! that window but inside the grace, and past the grace.
+//! that window but inside the grace, and past the grace. Each of those readings is made with
+//! an issuance of its own, of the row's window: what a SERVED exchange does to the issuance it
+//! was made with is `login_token_single_use`'s rule, and this suite's rule is the window
+//! alone.
 //!
 //! Those instants are reached by AGEING the issuance each row is read against — the record
 //! this service keeps of the token it minted, held in the store of this suite's own engine —
@@ -288,6 +291,8 @@ impl Emulator {
                 expiration,
                 authenticated_by: authenticated_by.to_vec(),
                 principal_tags: None,
+                // Recorded as a mint records one: no exchange has been served with it yet.
+                spent: false,
             },
         );
         token
@@ -402,17 +407,27 @@ async fn a_minted_token_is_spent_until_the_clock_skew_grace_past_its_window_has_
 
     let mut identity: Option<String> = None;
     for (case, token_duration, nominal) in rows {
-        let (identity_id, token) = emulator
-            .mint(&pool_id, developer_provider, user, token_duration)
-            .await;
-        match &identity {
-            Some(first) => assert_eq!(
-                &identity_id, first,
-                "case {case:?}: re-minting for one developer user identifier answers the same \
-                 identity, got {identity_id} after {first}"
-            ),
-            None => identity = Some(identity_id.clone()),
+        // One issuance per phase of the row, all of the same window: a SERVED exchange spends
+        // the issuance it was made with (`login_token_single_use`'s rule), so what is asked
+        // again is asked with another token of the same window rather than with a spent one.
+        let mut minted = Vec::new();
+        while minted.len() < 3 {
+            let (identity_id, token) = emulator
+                .mint(&pool_id, developer_provider, user, token_duration)
+                .await;
+            match &identity {
+                Some(first) => assert_eq!(
+                    &identity_id, first,
+                    "case {case:?}: re-minting for one developer user identifier answers the \
+                     same identity, got {identity_id} after {first}"
+                ),
+                None => identity = Some(identity_id.clone()),
+            }
+            minted.push((identity_id, token));
         }
+        let (identity_id, token) = minted[0].clone();
+        let (_, inside_the_grace) = minted[1].clone();
+        let (_, past_the_grace) = minted[2].clone();
 
         // The mint honours the duration its caller asked for EXACTLY: the grace is a
         // tolerance the reading adds, never a window the issuance hands out.
@@ -434,8 +449,12 @@ async fn a_minted_token_is_spent_until_the_clock_skew_grace_past_its_window_has_
 
         // One second PAST the nominal window, and so inside the grace: still spendable.
         let nominal_window = Duration::from_secs(u64::try_from(nominal).unwrap_or(0));
-        emulator.age_issuance(case, &token, nominal_window + Duration::from_secs(1));
-        let (status, body) = emulator.exchange(&identity_id, &token).await;
+        emulator.age_issuance(
+            case,
+            &inside_the_grace,
+            nominal_window + Duration::from_secs(1),
+        );
+        let (status, body) = emulator.exchange(&identity_id, &inside_the_grace).await;
         assert_eq!(
             status, 200,
             "case {case:?}: a token inside the clock-skew grace past its window is still \
@@ -443,10 +462,15 @@ async fn a_minted_token_is_spent_until_the_clock_skew_grace_past_its_window_has_
         );
         assert_served_credentials(case, &identity_id, &body);
 
-        // A further grace on top of that puts the token past the grace as well, and nothing
-        // but the window the record is read against has changed between the two calls.
-        emulator.age_issuance(case, &token, CLOCK_SKEW_GRACE);
-        let (status, body) = emulator.exchange(&identity_id, &token).await;
+        // A further grace on top of that puts a token of the same window past the grace as
+        // well, and nothing but the window the record is read against differs between the
+        // two calls.
+        emulator.age_issuance(
+            case,
+            &past_the_grace,
+            nominal_window + Duration::from_secs(1) + CLOCK_SKEW_GRACE,
+        );
+        let (status, body) = emulator.exchange(&identity_id, &past_the_grace).await;
         assert_refused(case, status, &body, EXPIRED_MESSAGE);
     }
 }
@@ -489,6 +513,16 @@ async fn the_sweep_gives_up_what_the_grace_no_longer_covers_and_nothing_else() {
         now - Duration::from_secs(901),
         now - Duration::from_secs(1),
     );
+    // A second issuance of that same window, for the reading made AFTER the sweep: one
+    // served exchange spends the issuance it was made with, so the two readings are made
+    // with two tokens the grace covers alike.
+    let inside_the_grace_again = emulator.record_issuance(
+        &pool_id,
+        &identity_id,
+        &authenticated_by,
+        now - Duration::from_secs(901),
+        now - Duration::from_secs(1),
+    );
     let past_the_grace = emulator.record_issuance(
         &pool_id,
         &identity_id,
@@ -522,7 +556,9 @@ async fn the_sweep_gives_up_what_the_grace_no_longer_covers_and_nothing_else() {
 
     // And the answers are the same ones, the swept record included: what decides the
     // exchange is the window, not whether the store still holds the issuance.
-    let (status, body) = emulator.exchange(&identity_id, &inside_the_grace).await;
+    let (status, body) = emulator
+        .exchange(&identity_id, &inside_the_grace_again)
+        .await;
     assert_eq!(
         status, 200,
         "a token the grace still covers is exchanged after the sweep too, got {status} with \
@@ -586,6 +622,16 @@ async fn a_token_this_service_never_issued_buys_no_credential() {
         status, 200,
         "the issued token is exchanged, got {status} with {body}"
     );
+    // A second issuance of the same identity, for the reading made after the rows: one served
+    // exchange spends the issuance it was made with.
+    let (_, issued_again) = emulator
+        .mint(
+            &pool_id,
+            developer_provider,
+            "backend-user-3",
+            Some(MAX_TOKEN_SECONDS),
+        )
+        .await;
 
     // An instant far ahead of any run of this suite, so no row below is refused for its
     // window rather than for being unknown.
@@ -632,7 +678,7 @@ async fn a_token_this_service_never_issued_buys_no_credential() {
 
     // The token that WAS issued is untouched by any of it: the refusals decided on the
     // value presented, nothing else.
-    let (status, body) = emulator.exchange(&identity_id, &issued).await;
+    let (status, body) = emulator.exchange(&identity_id, &issued_again).await;
     assert_eq!(
         status, 200,
         "the issued token is still exchanged, got {status} with {body}"

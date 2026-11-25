@@ -253,16 +253,25 @@ async fn a_value_this_pool_never_minted_is_refused_as_the_token_it_claims_to_be(
     // ...each presented alone and beside a login of the public provider, so the rule holds
     // over the SHAPE of the map as well as over the value.
     for (case, presented, owed) in &rows {
-        for (shape, logins) in [
-            ("alone", json!({COGNITO_IDENTITY_PROVIDER: presented})),
-            (
-                "beside a public-provider login",
+        for shape in ["alone", "beside a public-provider login"] {
+            // A SERVED exchange spends the issuance it was made with
+            // (`login_token_single_use`'s rule), so the row the exchange is SERVED for
+            // presents a fresh issuance of that same identity for each shape of the map,
+            // while a row that is refused presents the one value under test: a refused
+            // exchange spends nothing.
+            let presented = if owed.is_some() {
+                presented.clone()
+            } else {
+                register(&emulator, &pool_id, "backend-user-1").await.1
+            };
+            let logins = if shape == "alone" {
+                json!({COGNITO_IDENTITY_PROVIDER: &presented})
+            } else {
                 json!({
-                    COGNITO_IDENTITY_PROVIDER: presented,
+                    COGNITO_IDENTITY_PROVIDER: &presented,
                     PUBLIC_PROVIDER: "an-oauth-access-token",
-                }),
-            ),
-        ] {
+                })
+            };
             let case = format!("{case}, {shape}");
             let (status, body) = exchange(&emulator, &identity_id, &logins, None).await;
             match owed {

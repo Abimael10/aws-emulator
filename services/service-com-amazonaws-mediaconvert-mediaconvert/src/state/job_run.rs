@@ -75,10 +75,15 @@ use crate::ops::types::{Input, Output, OutputGroup, VideoDescription};
 /// How many job runs one pass makes.
 ///
 /// CHOSEN, and a bound on WORK rather than on jobs: a pass can find many jobs running at
-/// once, and each run reads and writes objects. What is left over is run by the next pass —
-/// the pump's next wake-up, or the next read that finds it due — because a claim leaves a
-/// job it did not take exactly as it found it.
-const MAX_RUNS_PER_PASS: usize = 4;
+/// once, and each run reads and writes objects. The same ceiling this crate puts on the other
+/// caller-driven work one job can ask for — the outputs one run produces, the inputs one
+/// probe reads — because it has to cover the jobs that can be due at ONE instant: a settle
+/// pass cannot await, so a job whose run has produced no record and that no driver has
+/// claimed is finished by it, and a run left for a later pass can therefore be overtaken by
+/// that job's own finish. What is left over past this ceiling is still run by the next pass —
+/// the pump's next wake-up, or the next read that finds it due — because a claim leaves a job
+/// it did not take exactly as it found it.
+const MAX_RUNS_PER_PASS: usize = 20;
 
 /// How long a CLAIMED run may be outstanding before another driver may claim it again.
 ///
@@ -111,6 +116,17 @@ const MAX_PRODUCED_OUTPUTS: usize = 20;
 /// holds is driven by the input's own sample table, which a caller writes, so the output is
 /// abandoned once it passes this rather than growing with whatever that table indexes.
 const MAX_OUTPUT_BYTES: usize = MAX_INPUT_BYTES;
+
+/// How many samples one remuxed track carries.
+///
+/// A CHOSEN ceiling, and the ITERATION-count counterpart of [`MAX_OUTPUT_BYTES`]: a sample
+/// table is written by whoever wrote the input file, and a table declares its sample count in
+/// a few bytes — so one well inside [`MAX_INPUT_BYTES`] can ask for billions of sample reads,
+/// which the byte ceiling never stops while the samples it indexes carry no bytes. More
+/// samples than this is more than a file inside this engine's own input ceiling really holds,
+/// so such a table is not carried at all and the run says what it could not produce rather
+/// than occupying a thread for it.
+const MAX_CARRIED_SAMPLES: u32 = 500_000;
 
 /// How many frames one GENERATED input's video holds.
 ///
@@ -420,17 +436,38 @@ pub async fn run_due_job_runs<Eng: Send + Sync + 'static>(
         due.truncate(MAX_RUNS_PER_PASS);
         due.into_iter().map(|(.., id)| id).collect()
     };
-    for job_id in due {
-        // The guard is taken and RELEASED around the claim, so this service's store is never
-        // locked across the object reads and writes the run makes. A job another driver
-        // claimed first costs this pass nothing.
-        let claimed = {
+    // Every run this pass makes is CLAIMED up front, under ONE guard. A claim is what tells
+    // a settle pass that the job's result is not in yet ([`super::job_settlement`]), and a
+    // produce awaits: a claim taken only when its turn came would leave every job behind the
+    // one being produced carrying neither a result nor a claim, so a settle that lands in
+    // that window — the clock pump's own, or another request's — would finish it for an
+    // engine that had not run it yet. A job another driver claimed first is left exactly as
+    // it was found and costs this pass nothing.
+    let claimed: Vec<ClaimedRun> = {
+        let mut guard = state.lock();
+        let at = Instant::now();
+        due.iter()
+            .filter_map(|job_id| claim_run(&mut guard, job_id, at, now))
+            .collect()
+    };
+    for claim in claimed {
+        // The claim is RE-STAMPED just before the produce it belongs to: a claim is a lease
+        // another driver may take over once it has been outstanding past
+        // [`RUN_RECLAIM_AFTER`], and a claim taken up front waits behind every produce this
+        // pass makes before it, so without this the later ones could expire while this pass
+        // is still going to make them and a second driver would run the same job beside it.
+        // Stamped under the guard the claim itself was taken under, and only while the job is
+        // still the one this pass claimed.
+        {
             let mut guard = state.lock();
-            claim_run(&mut guard, &job_id, Instant::now(), now)
-        };
-        let Some(claim) = claimed else {
-            continue;
-        };
+            if let Some(job) = guard.jobs.get_mut(&claim.job_id) {
+                if job.run_claimed_at.is_some() {
+                    job.run_claimed_at = Some(Instant::now());
+                }
+            }
+        }
+        // The guard is taken and RELEASED around each produce, so this service's store is
+        // never locked across the object reads and writes the run makes.
         let produced = produce(callback, region, &claim).await;
         let mut guard = state.lock();
         if let Some(job) = guard.jobs.get_mut(&claim.job_id) {
@@ -1170,6 +1207,12 @@ fn remux(media: &[u8], frame: Option<(i32, i32)>) -> Option<Vec<u8>> {
         // input track `id` are written onto the track that was added for it.
         let written = u32::try_from(position + 1).ok()?;
         let samples = reader.sample_count(*id).ok()?;
+        // What the table DECLARES is read before any of it is followed: a count past the
+        // ceiling is a table this engine does not carry ([`MAX_CARRIED_SAMPLES`]), so the
+        // loop below runs a bounded number of times whatever the samples it indexes hold.
+        if samples > MAX_CARRIED_SAMPLES {
+            return None;
+        }
         let mut carried = 0usize;
         for index in 1..=samples {
             match reader.read_sample(*id, index) {

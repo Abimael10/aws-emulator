@@ -252,11 +252,11 @@ async fn a_vend_is_decided_on_the_methods_the_redeemed_token_was_issued_with() {
     let emulator = Emulator::new();
     let pool_id = pool_with_every_provider(&emulator, "amr-redeemed").await;
 
-    // Every token first, so the pool's role can be re-scoped under all of them in turn.
+    // Every token's own claims first, so the methods each issuance recorded are pinned
+    // before any of them is redeemed.
     let rows = rows();
-    let mut minted: Vec<(&Row, String, String)> = Vec::new();
     for (index, row) in rows.iter().enumerate() {
-        let (identity_id, token) =
+        let (_, token) =
             mint(&emulator, &pool_id, row.case, row.login, &format!("user-{index}")).await;
         let carried = token_methods(row.case, &token);
         let mut expected: BTreeSet<String> = row
@@ -275,7 +275,6 @@ async fn a_vend_is_decided_on_the_methods_the_redeemed_token_was_issued_with() {
             "case {:?}: expected the token to name the methods {expected:?}, got {carried:?}",
             row.case
         );
-        minted.push((row, identity_id, token));
     }
 
     // One scoped role per `amr` value a trust policy can name: each admits the rows whose
@@ -302,8 +301,16 @@ async fn a_vend_is_decided_on_the_methods_the_redeemed_token_was_issued_with() {
             )
             .await;
 
-        for (row, identity_id, token) in &minted {
+        for (index, row) in rows.iter().enumerate() {
             let case = format!("{} against a role scoped to {scoped_to:?}", row.case);
+            // One issuance per reading: a SERVED exchange spends the issuance it was made
+            // with (`login_token_single_use`'s rule), and what is redeemed here is the
+            // methods a mint of this row's login records, which every issuance of it carries
+            // alike.
+            let (identity_id, token) =
+                mint(&emulator, &pool_id, row.case, row.login, &format!("user-{index}")).await;
+            let identity_id = &identity_id;
+            let token = &token;
             let admitted = row.published_methods.contains(&scoped_to);
             let (status, body) = emulator
                 .call(

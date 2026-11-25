@@ -15,7 +15,10 @@
 //! The rows span what the rule generalises over: which flow the request is in (no login, one
 //! public login, two of them), whether it names a `CustomRoleArn`, and whether the login it
 //! presents is a token this service minted for a developer-authenticated identity — and each
-//! row vends more than twice, because "a new one each time" is not "two in a row".
+//! row vends more than twice, because "a new one each time" is not "two in a row". The row
+//! that presents a token of THIS service presents a fresh one on each attempt: such an
+//! issuance is spendable once (`login_token_single_use`'s rule), so asking again is asking
+//! with another token, which is exactly how a caller vends again against the real service.
 //!
 //! The harness is `vended_role_session`'s: this service and the token service on ONE shared
 //! engine, with the IAM records seeded into that same engine as `iam:CreateRole` writes them,
@@ -170,31 +173,49 @@ async fn every_vend_of_one_identity_mints_its_own_session() {
     // pool carries no role mapping, which is what admits the developer exchange at all.
     let developer_pool = "per-call-developer";
     let (developer_pool_id, _) = fixture(&emulator, developer_pool, false).await;
+    let developer_mint = json!({
+        "IdentityPoolId": &developer_pool_id,
+        "Logins": {DEVELOPER_PROVIDER: "backend-user"},
+    });
     let minted = emulator
-        .ok(
-            "GetOpenIdTokenForDeveloperIdentity",
-            &json!({
-                "IdentityPoolId": &developer_pool_id,
-                "Logins": {DEVELOPER_PROVIDER: "backend-user"},
-            }),
-        )
+        .ok("GetOpenIdTokenForDeveloperIdentity", &developer_mint)
         .await;
     let developer_identity = minted["IdentityId"]
         .as_str()
         .expect("the developer exchange answers an IdentityId")
         .to_string();
-    let developer_token = minted["Token"]
-        .as_str()
-        .expect("the developer exchange answers a Token")
-        .to_string();
+    // One token per attempt: the mint answers the SAME identity for one developer user and a
+    // fresh issuance each time, and an issuance a served exchange has spent buys no second
+    // one.
+    let mut developer_requests = vec![json!({
+        "IdentityId": &developer_identity,
+        "Logins": {COGNITO_PROVIDER: minted["Token"].as_str()
+            .expect("the developer exchange answers a Token")},
+    })];
+    while developer_requests.len() < VENDS_PER_CASE {
+        let again = emulator
+            .ok("GetOpenIdTokenForDeveloperIdentity", &developer_mint)
+            .await;
+        assert_eq!(
+            again["IdentityId"].as_str(),
+            Some(developer_identity.as_str()),
+            "one developer user is one identity, got {again}"
+        );
+        developer_requests.push(json!({
+            "IdentityId": &developer_identity,
+            "Logins": {COGNITO_PROVIDER: again["Token"].as_str()
+                .expect("the developer exchange answers a Token")},
+        }));
+    }
 
-    // (case, the request to vend with, the identity it names, the role it resolves)
-    let mut rows: Vec<(&str, Value, String, String)> = Vec::new();
+    // (case, the request to vend with on each attempt, the identity it names, the role it
+    // resolves)
+    let mut rows: Vec<(&str, Vec<Value>, String, String)> = Vec::new();
     {
         let guest = emulator.identity(&pool_id, None).await;
         rows.push((
             "no Logins: the unauthenticated role",
-            json!({"IdentityId": &guest}),
+            vec![json!({"IdentityId": &guest}); VENDS_PER_CASE],
             guest,
             unauth_role(name),
         ));
@@ -204,7 +225,7 @@ async fn every_vend_of_one_identity_mints_its_own_session() {
         let federated = emulator.identity(&pool_id, Some(logins.clone())).await;
         rows.push((
             "one public login: the authenticated role",
-            json!({"IdentityId": &federated, "Logins": logins}),
+            vec![json!({"IdentityId": &federated, "Logins": logins}); VENDS_PER_CASE],
             federated,
             auth_role(name),
         ));
@@ -214,7 +235,7 @@ async fn every_vend_of_one_identity_mints_its_own_session() {
         let federated = emulator.identity(&pool_id, Some(logins.clone())).await;
         rows.push((
             "two public logins: still the authenticated role",
-            json!({"IdentityId": &federated, "Logins": logins}),
+            vec![json!({"IdentityId": &federated, "Logins": logins}); VENDS_PER_CASE],
             federated,
             auth_role(name),
         ));
@@ -224,14 +245,17 @@ async fn every_vend_of_one_identity_mints_its_own_session() {
         let federated = emulator.identity(&pool_id, Some(logins.clone())).await;
         rows.push((
             "a CustomRoleArn naming a role a mapping rule resolves to",
-            json!({"IdentityId": &federated, "Logins": logins, "CustomRoleArn": &mapped}),
+            vec![
+                json!({"IdentityId": &federated, "Logins": logins, "CustomRoleArn": &mapped});
+                VENDS_PER_CASE
+            ],
             federated,
             mapped_role(name),
         ));
     }
     rows.push((
         "a token this service minted for a developer-authenticated identity",
-        json!({"IdentityId": &developer_identity, "Logins": {COGNITO_PROVIDER: &developer_token}}),
+        developer_requests,
         developer_identity,
         auth_role(developer_pool),
     ));
@@ -242,9 +266,9 @@ async fn every_vend_of_one_identity_mints_its_own_session() {
     let mut secret_keys: BTreeSet<String> = BTreeSet::new();
     let mut session_tokens: BTreeSet<String> = BTreeSet::new();
 
-    for (case, request, identity_id, role_name) in &rows {
+    for (case, requests, identity_id, role_name) in &rows {
         let mut sessions = Vec::new();
-        for attempt in 1..=VENDS_PER_CASE {
+        for (attempt, request) in (1..=VENDS_PER_CASE).zip(requests) {
             let session = vend(&emulator, case, request, identity_id).await;
             assert!(
                 access_key_ids.insert(session.access_key_id.clone()),

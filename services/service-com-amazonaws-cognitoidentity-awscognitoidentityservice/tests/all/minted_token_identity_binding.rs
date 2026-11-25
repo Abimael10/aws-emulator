@@ -12,7 +12,9 @@
 //! token minted in one identity pool out of every other pool's identities. The refusal is
 //! answered before any role is resolved and before any session is minted, and it costs the
 //! token nothing: presented for the identity it WAS minted for, the same token is still
-//! exchanged.
+//! exchanged — which is what a refused exchange leaves of an issuance only one SERVED
+//! exchange spends (`login_token_single_use`'s rule), so each token below is exchanged once
+//! and after every refusal.
 //!
 //! WHICH refusal it is, is decided by the pool the token is read against — the pool that owns
 //! the identity the request names. A token of THAT pool, minted for another of its
@@ -238,15 +240,7 @@ async fn a_minted_token_is_a_login_of_the_identity_it_was_minted_for_and_of_no_o
         tokens.push((case, pool_id, identity_id, token));
     }
 
-    // Its OWN token is exchanged for every identity, whichever way it was minted and
-    // whichever pool it belongs to.
-    for (case, _, identity_id, token) in &tokens {
-        let logins = json!({COGNITO_IDENTITY_PROVIDER: token});
-        let (status, body) = exchange(&emulator, identity_id, &logins).await;
-        assert_served(case, identity_id, status, &body);
-    }
-
-    // And ANOTHER identity's token is refused for it — every pair of the table, which spans
+    // ANOTHER identity's token is refused for it — every pair of the table, which spans
     // two identities of one pool as well as two of different pools. Which sentence the
     // refusal carries follows the pool the token is read against: a token of the addressed
     // pool is a token of it that does not match the identity, and a token of any other pool
@@ -268,7 +262,9 @@ async fn a_minted_token_is_a_login_of_the_identity_it_was_minted_for_and_of_no_o
         }
     }
 
-    // The refusals cost the tokens nothing: each is still the login of its own identity.
+    // The refusals cost the tokens nothing: each is still the login of its own identity, so
+    // its OWN token is exchanged for every identity, whichever way it was minted and
+    // whichever pool it belongs to.
     for (case, _, identity_id, token) in &tokens {
         let logins = json!({COGNITO_IDENTITY_PROVIDER: token});
         let (status, body) = exchange(&emulator, identity_id, &logins).await;
@@ -300,6 +296,21 @@ async fn another_identitys_token_is_refused_whatever_else_the_logins_map_carries
         &Mint::Federated("map-user"),
     )
     .await;
+    // A second issuance of the SAME identity, for the second row that is served: one served
+    // exchange spends the issuance it was made with, so each served row presents its own
+    // token.
+    let (again_identity, own_token_again) = mint(
+        &emulator,
+        "the identity under test, minted again",
+        &pool_id,
+        developer_provider,
+        &Mint::Federated("map-user"),
+    )
+    .await;
+    assert_eq!(
+        again_identity, identity_id,
+        "one federated login is one identity, got {again_identity} against {identity_id}"
+    );
     let (_, sibling_token) = mint(
         &emulator,
         "another identity of the same pool",
@@ -329,7 +340,7 @@ async fn another_identitys_token_is_refused_whatever_else_the_logins_map_carries
         (
             "its own token beside a login of the public provider",
             json!({
-                COGNITO_IDENTITY_PROVIDER: &own_token,
+                COGNITO_IDENTITY_PROVIDER: &own_token_again,
                 PUBLIC_PROVIDER: "map-user",
             }),
             None,
