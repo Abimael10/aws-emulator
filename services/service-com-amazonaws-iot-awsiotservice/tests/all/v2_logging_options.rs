@@ -61,9 +61,11 @@ const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/service-role/iot-logs";
 
 /// AWS's own sentence for a read of an account whose V2 logging options were never
 /// set, written out here so the wording is pinned by the test and not only by the
-/// constant under test.
+/// constant under test. The reader of the OPTIONS document is refused with the artifact
+/// it addresses named: the per-target levels have their own wording, pinned by the
+/// `logging_levels` suite below.
 const EXPECTED_NOT_CONFIGURED_MESSAGE: &str =
-    "SetV2LoggingOptions was not previously called. No logging levels have been set.";
+    "SetV2LoggingOptions was not previously called. No logging options have been set.";
 
 /// One emulator: the shared engine plus a router with this service mounted.
 struct Emulator {

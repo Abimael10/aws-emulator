@@ -21,9 +21,11 @@
 //!   no account qualifier and no terminating period — so `DescribeScheduledAudit`
 //!   (`scheduledAuditName`) and `UpdateMitigationAction` (`findingActionName`) state one
 //!   sentence with the member each resolves by.
-//! * The V2 LOGGING family's not-configured refusal is ONE fixed sentence, naming the call
-//!   that configures logging and stating that no logging levels are set; it interpolates
-//!   nothing from the request, and it stops being answered once the options are set.
+//! * The V2 LOGGING family's not-configured refusal is a FIXED sentence: it names the call
+//!   that configures logging and then the artifact the refusing operation addresses — the
+//!   account's logging OPTIONS for the options document, its logging LEVELS for the
+//!   per-target levels. It interpolates nothing from the request, and it stops being
+//!   answered once the options are set.
 //! * A refusal's `message` is the SERVICE's own sentence. A client library's rendering of an
 //!   error (`An error occurred (<Code>) when calling the <Operation> operation: <message>`)
 //!   is built by that library around this member, so the member never carries it:
@@ -68,9 +70,15 @@ const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/service-role/iot-logs";
 /// configuration a scheduled audit can target a check of.
 const AUDIT_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/device-defender-audit";
 
-/// AWS's sentence for a request that needs V2 logging options the account never set, written
-/// out here so the wording is pinned by this suite and not only by the constant under test.
-const NOT_CONFIGURED_MESSAGE: &str =
+/// AWS's sentence for a read of the account's V2 logging OPTIONS it never set, written out
+/// here so the wording is pinned by this suite and not only by the constant under test.
+const NOT_CONFIGURED_OPTIONS_MESSAGE: &str =
+    "SetV2LoggingOptions was not previously called. No logging options have been set.";
+
+/// AWS's sentence for a request addressing the account's per-target V2 logging LEVELS while
+/// it has no logging options set: the same opening, worded after the levels the operation
+/// addresses ([`NOT_CONFIGURED_OPTIONS_MESSAGE`]).
+const NOT_CONFIGURED_LEVELS_MESSAGE: &str =
     "SetV2LoggingOptions was not previously called. No logging levels have been set.";
 
 /// How a client LIBRARY renders a refusal around the service's own `message`. The opening of
@@ -504,35 +512,53 @@ async fn a_scheduled_audit_the_account_holds_is_read_back() {
     );
 }
 
-/// RULE: the V2 logging family's not-configured refusal is ONE fixed sentence, interpolating
-/// nothing from the request, and it stops being answered once the options are set.
+/// RULE: the V2 logging family's not-configured refusal is a fixed sentence naming
+/// `SetV2LoggingOptions` and then the artifact the refusing operation addresses — the
+/// account's logging OPTIONS for the options document, its logging LEVELS for the per-target
+/// levels — interpolating nothing from the request, and it stops being answered once the
+/// options are set.
 #[tokio::test]
-async fn the_v2_logging_not_configured_refusal_is_one_fixed_sentence() {
+async fn the_v2_logging_not_configured_refusal_names_the_artifact_it_addresses() {
     let emulator = Emulator::new();
 
     // The rows are the operations of the family that need the account's options, over
     // requests that differ in their query string and body — none of which the sentence
-    // mentions.
-    let rows: Vec<(&str, &str, &str, Option<Value>)> = vec![
-        ("ListV2LoggingLevels, no filter", "GET", "/v2LoggingLevel", None),
+    // mentions — paired with the sentence each one's own artifact is worded after.
+    let rows: Vec<(&str, &str, &str, Option<Value>, &str)> = vec![
+        (
+            "ListV2LoggingLevels, no filter",
+            "GET",
+            "/v2LoggingLevel",
+            None,
+            NOT_CONFIGURED_LEVELS_MESSAGE,
+        ),
         (
             "ListV2LoggingLevels, filtered by target type",
             "GET",
             "/v2LoggingLevel?targetType=THING_GROUP",
             None,
+            NOT_CONFIGURED_LEVELS_MESSAGE,
         ),
         (
             "ListV2LoggingLevels, one row per page",
             "GET",
             "/v2LoggingLevel?maxResults=1",
             None,
+            NOT_CONFIGURED_LEVELS_MESSAGE,
         ),
-        ("GetV2LoggingOptions", "GET", "/v2LoggingOptions", None),
+        (
+            "GetV2LoggingOptions",
+            "GET",
+            "/v2LoggingOptions",
+            None,
+            NOT_CONFIGURED_OPTIONS_MESSAGE,
+        ),
         (
             "GetV2LoggingOptions, verbose",
             "GET",
             "/v2LoggingOptions?verbose=true",
             None,
+            NOT_CONFIGURED_OPTIONS_MESSAGE,
         ),
         (
             "SetV2LoggingLevel on the account default",
@@ -542,10 +568,21 @@ async fn the_v2_logging_not_configured_refusal_is_one_fixed_sentence() {
                 "logTarget": { "targetType": "DEFAULT" },
                 "logLevel": "WARN",
             })),
+            NOT_CONFIGURED_LEVELS_MESSAGE,
+        ),
+        (
+            "SetV2LoggingLevel on a thing group",
+            "POST",
+            "/v2LoggingLevel",
+            Some(json!({
+                "logTarget": { "targetType": "THING_GROUP", "targetName": "fleet-one" },
+                "logLevel": "DEBUG",
+            })),
+            NOT_CONFIGURED_LEVELS_MESSAGE,
         ),
     ];
 
-    for (case, method, path, body) in &rows {
+    for (case, method, path, body, expected) in &rows {
         let refused = emulator.call(method, path, body.as_ref()).await;
         assert_eq!(
             refused.status, 404,
@@ -558,8 +595,8 @@ async fn the_v2_logging_not_configured_refusal_is_one_fixed_sentence() {
         );
         assert_eq!(
             refused.message(),
-            Some(NOT_CONFIGURED_MESSAGE.to_string()),
-            "case {case:?}: expected {NOT_CONFIGURED_MESSAGE:?}, got {refused:?}"
+            Some((*expected).to_string()),
+            "case {case:?}: expected {expected:?}, got {refused:?}"
         );
     }
 
@@ -576,7 +613,7 @@ async fn the_v2_logging_not_configured_refusal_is_one_fixed_sentence() {
         configured.status, 200,
         "SetV2LoggingOptions must succeed, got {configured:?}"
     );
-    for (case, method, path, body) in &rows {
+    for (case, method, path, body, _) in &rows {
         let served = emulator.call(method, path, body.as_ref()).await;
         assert_eq!(
             served.status, 200,

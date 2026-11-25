@@ -180,13 +180,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The levels are overrides of the account's V2 logging options, so an account
         // that has never set them has no logging configured at all: that is the modelled
-        // `NotConfiguredException` ("The resource is not configured", HTTP 404), in the
-        // same words the reader of those options refuses it with, and never an empty
-        // page that would read as "configured, with no override".
+        // `NotConfiguredException` ("The resource is not configured", HTTP 404), worded
+        // after the LEVELS this operation addresses, and never an empty page that would
+        // read as "configured, with no override".
         if store.v2_logging_options.is_none() {
             return Err(ListV2LoggingLevelsErrorModeled::NotConfiguredException(
                 NotConfiguredException {
-                    message: Some(crate::state::missing_v2_logging_options_message()),
+                    message: Some(crate::state::missing_v2_logging_levels_message()),
                 },
             )
             .into());

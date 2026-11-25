@@ -35,16 +35,30 @@ use crate::ops::types::LogEventConfiguration;
 /// with a modelled error rather than recording options of unbounded size.
 pub const MAX_LOG_EVENT_CONFIGURATIONS: usize = 100;
 
-/// The message a reader of the account's V2 logging options refuses an account that
-/// has never set them with.
+/// The refusal sentence of a V2 logging call an account has never set its options for,
+/// for a call that addresses the logging `artifact` named here ("options", "levels").
 ///
-/// It names the call that configures them and states that no logging LEVELS are set,
-/// which is how AWS IoT words this refusal: the text is fixed — nothing about the
-/// account, the request or the region varies in it — and it is one sentence for the
-/// whole V2 logging family, so the reader of the options document and the operations
-/// that address a single logging level state the same one.
+/// The sentence has two fixed halves — nothing about the account, the request or the
+/// region varies in either — and AWS IoT words the second half after the artifact the
+/// REFUSING call addresses: a call on the account's options document says no logging
+/// options have been set, while one on the per-target logging levels says no logging
+/// levels have been. Both name `SetV2LoggingOptions` as the call that configures them,
+/// because that is the one call that takes an account out of this state whichever
+/// artifact was asked for.
+fn not_configured_message(artifact: &str) -> String {
+    format!("SetV2LoggingOptions was not previously called. No logging {artifact} have been set.")
+}
+
+/// The message a reader of the account's V2 logging OPTIONS refuses an account that
+/// has never set them with ([`not_configured_message`]).
 pub fn missing_v2_logging_options_message() -> String {
-    "SetV2LoggingOptions was not previously called. No logging levels have been set.".to_string()
+    not_configured_message("options")
+}
+
+/// The message an operation addressing the account's per-target V2 logging LEVELS
+/// refuses an account that has never set its options with ([`not_configured_message`]).
+pub fn missing_v2_logging_levels_message() -> String {
+    not_configured_message("levels")
 }
 
 /// The per-event-type part of one override: everything `LogEventConfiguration` carries

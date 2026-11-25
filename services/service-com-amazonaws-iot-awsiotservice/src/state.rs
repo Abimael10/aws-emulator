@@ -3435,8 +3435,8 @@ pub use package_configuration::PackageConfiguration;
 // here so a handler reaches them as `crate::state::<name>`.
 pub mod v2_logging;
 pub use v2_logging::{
-    missing_v2_logging_options_message, LoggedEventConfiguration, V2LoggingOptions,
-    MAX_LOG_EVENT_CONFIGURATIONS,
+    missing_v2_logging_levels_message, missing_v2_logging_options_message,
+    LoggedEventConfiguration, V2LoggingOptions, MAX_LOG_EVENT_CONFIGURATIONS,
 };
 
 // What the account's v1 LOGGING OPTIONS are — the one record `SetLoggingOptions` writes
