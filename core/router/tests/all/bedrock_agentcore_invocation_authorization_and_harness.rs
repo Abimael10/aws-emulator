@@ -51,6 +51,7 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::event_stream_frames::frames;
 use crate::query_wire::{form_encode, opt_element};
 
 /// The Region every request here is signed for.
@@ -416,85 +417,9 @@ async fn invoke_harness(
     .await
 }
 
-/// One `vnd.amazon.eventstream` frame: the member of the output union it carries and its
-/// payload as the JSON it holds.
-///
-/// A frame is its total length, its headers length, a prelude checksum, its headers, its
-/// payload and a message checksum, each length a big-endian `u32` — so the payload is the
-/// span between the headers and that trailing checksum.
-#[derive(Debug)]
-struct Frame {
-    event_type: String,
-    payload: Value,
-}
-
-/// Every frame of an event-stream body, in the order the stream carries them.
-fn frames(case: &str, body: &[u8]) -> Vec<Frame> {
-    let mut frames = Vec::new();
-    let mut rest = body;
-    while !rest.is_empty() {
-        let total: [u8; 4] = rest
-            .get(..4)
-            .and_then(|bytes| bytes.try_into().ok())
-            .unwrap_or_else(|| panic!("case {case:?}: a frame carries a prelude, got {rest:?}"));
-        let headers: [u8; 4] = rest
-            .get(4..8)
-            .and_then(|bytes| bytes.try_into().ok())
-            .unwrap_or_else(|| panic!("case {case:?}: a frame carries a headers length"));
-        let total = usize::try_from(u32::from_be_bytes(total)).expect("a frame length");
-        let headers = usize::try_from(u32::from_be_bytes(headers)).expect("a headers length");
-        assert!(
-            total >= headers + 16 && total <= rest.len(),
-            "case {case:?}: a frame of {total} bytes does not fit the {} bytes left",
-            rest.len()
-        );
-        let header_bytes = rest
-            .get(12..headers + 12)
-            .unwrap_or_else(|| panic!("case {case:?}: a frame carries {headers} header bytes"));
-        let payload = rest
-            .get(headers + 12..total - 4)
-            .unwrap_or_else(|| panic!("case {case:?}: a frame of {total} bytes carries a payload"));
-        frames.push(Frame {
-            // The `:event-type` header's value is the only ASCII name in the headers that
-            // is not one of the two header names themselves, and it is the one the union's
-            // member is reported under: it is read as the tail of the header block.
-            event_type: event_type_of(case, header_bytes),
-            payload: serde_json::from_slice(payload).unwrap_or_else(|error| {
-                panic!(
-                    "case {case:?}: an event payload must be JSON ({error}), got {:?}",
-                    String::from_utf8_lossy(payload)
-                )
-            }),
-        });
-        rest = &rest[total..];
-    }
-    frames
-}
-
-/// The `:event-type` of one frame, read out of its header block: each header is a
-/// length-prefixed name, a type byte and — for the string type the event headers use — a
-/// big-endian `u16` length and the value.
-fn event_type_of(case: &str, mut headers: &[u8]) -> String {
-    while !headers.is_empty() {
-        let name_len = usize::from(headers[0]);
-        let name = headers
-            .get(1..1 + name_len)
-            .unwrap_or_else(|| panic!("case {case:?}: a header carries its name"));
-        let value_len = headers
-            .get(2 + name_len..4 + name_len)
-            .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
-            .map(|bytes| usize::from(u16::from_be_bytes(bytes)))
-            .unwrap_or_else(|| panic!("case {case:?}: a string header carries its length"));
-        let value = headers
-            .get(4 + name_len..4 + name_len + value_len)
-            .unwrap_or_else(|| panic!("case {case:?}: a header carries its value"));
-        if name == b":event-type" {
-            return String::from_utf8_lossy(value).to_string();
-        }
-        headers = &headers[4 + name_len + value_len..];
-    }
-    panic!("case {case:?}: every event frame carries a :event-type header")
-}
+// The frames of an event-stream body are read by the ONE reader of that framing this
+// test binary shares (`crate::event_stream_frames`), so this suite states no second copy
+// of the frame layout.
 
 /// WHICH data-plane call a row makes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

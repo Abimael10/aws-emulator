@@ -25,9 +25,9 @@ use smithy_server_runtime::MultiServiceRouter;
 // The shared harness: the wire-answer reduction and the job-directory setup every suite
 // of this crate drives (`tests/all/harness.rs`).
 use crate::harness::{
-    create_job_at_arn as create_job, job_arn, mounted_service, send, served_completion, Reply,
-    COMPLETE_ROLLOUT_PATH, JOB_ARN_HEADER, SAMPLE_PATH, SAMPLE_STREAM_PATH, TRAJECTORY_ID_HEADER,
-    UPDATE_REWARD_PATH,
+    create_job_at_arn as create_job, job_arn, mounted_service, send, served_completion,
+    stream_events, Reply, COMPLETE_ROLLOUT_PATH, JOB_ARN_HEADER, SAMPLE_PATH, SAMPLE_STREAM_PATH,
+    TRAJECTORY_ID_HEADER, UPDATE_REWARD_PATH,
 };
 
 /// One `Sample` or `SampleWithResponseStream` call.
@@ -293,11 +293,37 @@ async fn every_sampling_call_captures_a_turn_and_serves_what_it_recorded() {
             // The framing each operation serves, and the id the turn reports.
             let expected_id = state::completion_id(&job_arn, &trajectory_id, index);
             if *streamed {
-                let text = reply.text();
+                let events = stream_events(&reply.body).unwrap_or_else(|error| {
+                    panic!(
+                        "case {case:?} turn {index}: expected an event-stream body, got \
+                         {error} / {:?}",
+                        reply.text()
+                    )
+                });
                 assert!(
-                    text.starts_with("data: ") && text.ends_with("data: [DONE]\n\n"),
-                    "case {case:?} turn {index}: expected server-sent-event framing, got {text:?}"
+                    events.len() > 1,
+                    "case {case:?} turn {index}: expected the completion as a series of \
+                     events, got {} event(s)",
+                    events.len()
                 );
+                for (position, event) in events.iter().enumerate() {
+                    assert_eq!(
+                        (
+                            event.message_type.as_deref(),
+                            event.event_type.as_deref(),
+                            event.payload_content_type.as_deref()
+                        ),
+                        (
+                            Some("event"),
+                            Some(state::PAYLOAD_PART_EVENT),
+                            Some(state::JSON_CONTENT_TYPE)
+                        ),
+                        "case {case:?} turn {index}: expected event {position} to be a \
+                         {:?} event carrying {:?}, got {event:?}",
+                        state::PAYLOAD_PART_EVENT,
+                        state::JSON_CONTENT_TYPE
+                    );
+                }
                 let chunk: Value = served_completion(reply);
                 assert_eq!(
                     chunk["object"], "chat.completion.chunk",
@@ -352,6 +378,196 @@ async fn every_sampling_call_captures_a_turn_and_serves_what_it_recorded() {
             "case {case:?}: expected {} distinct completion id(s), got {distinct}",
             turns.len()
         );
+    }
+}
+
+/// RULE: a streamed sampling answer delivers its completion as a SERIES of
+/// `PayloadPart` events in the `vnd.amazon.eventstream` framing an event-delivered body
+/// carries — one event per chunk, each announcing the media type of the inference result
+/// inside it — and those chunks concatenate back into exactly the completion the
+/// non-streamed framing of the same turn answers with in one document.
+///
+/// The media type and the event name are the externally stated ones, not this crate's own
+/// spelling of them: `application/vnd.amazon.eventstream` is the media type of an
+/// event-delivered body, and `PayloadPart` is the event the model's own
+/// `SampleWithResponseStreamResponse$Body` documentation names ("The streaming response
+/// body, delivered as a series of PayloadPart events").
+///
+/// The rows differ along what the rule generalises over — the form and the size of the
+/// inference payload, and the position of the turn in its trajectory — which is what the
+/// chunked text, the number of chunks and the token totals vary with.
+#[tokio::test]
+async fn the_streamed_answer_is_a_series_of_payload_part_events() {
+    /// The media type an event-delivered body carries, as the framing itself states it.
+    const EVENT_STREAM_MEDIA_TYPE: &str = "application/vnd.amazon.eventstream";
+    /// The event the model documents this member's chunks as being delivered as.
+    const PAYLOAD_PART: &str = "PayloadPart";
+
+    let (engine, router) = mounted_service();
+    let arn = job_arn(
+        "aws",
+        "us-east-1",
+        "000000000000",
+        "AgentRFT",
+        "stream-framing",
+    );
+    create_job(&engine, &arn);
+
+    for (case, trajectory_id, payload) in [
+        (
+            "a payload with no prompt-bearing field",
+            "traj-bare",
+            b"{}".to_vec(),
+        ),
+        (
+            "a chat-completions payload",
+            "traj-chat",
+            chat_payload("hello there model"),
+        ),
+        (
+            "a payload that is not JSON at all",
+            "traj-text",
+            b"not json at all".to_vec(),
+        ),
+        (
+            "a payload carrying many prompt tokens",
+            "traj-long",
+            chat_payload(&"token ".repeat(64)),
+        ),
+    ] {
+        // Two turns on the same trajectory, so the rule is asserted at more than one
+        // position of one trajectory.
+        for index in 0..2usize {
+            let reply = sample(&router, &arn, trajectory_id, &payload, true).await;
+            assert_eq!(
+                reply.status,
+                200,
+                "case {case:?} turn {index}: expected 200, got {} / {}",
+                reply.status,
+                reply.text()
+            );
+            assert_eq!(
+                reply.content_type.as_deref(),
+                Some(EVENT_STREAM_MEDIA_TYPE),
+                "case {case:?} turn {index}: expected the event-stream media type \
+                 {EVENT_STREAM_MEDIA_TYPE:?}, got {:?}",
+                reply.content_type
+            );
+
+            let events = stream_events(&reply.body).unwrap_or_else(|error| {
+                panic!(
+                    "case {case:?} turn {index}: expected a body of event-stream frames, got \
+                     {error} / {:?}",
+                    reply.text()
+                )
+            });
+            let expected_text = state::emulated_turn_text(
+                index + 1,
+                state::count_text_tokens(&state::prompt_text_of_body(&payload)),
+            );
+            // One event per chunk of the text, and one last event that ends the stream.
+            let expected_events = usize::try_from(state::count_text_tokens(&expected_text))
+                .expect("a token count that fits this host")
+                + 1;
+            assert_eq!(
+                events.len(),
+                expected_events,
+                "case {case:?} turn {index}: expected {expected_events} event(s), got {}",
+                events.len()
+            );
+
+            let expected_id = state::completion_id(&arn, trajectory_id, index);
+            for (position, event) in events.iter().enumerate() {
+                assert_eq!(
+                    (
+                        event.message_type.as_deref(),
+                        event.event_type.as_deref(),
+                        event.payload_content_type.as_deref()
+                    ),
+                    (Some("event"), Some(PAYLOAD_PART), Some("application/json")),
+                    "case {case:?} turn {index}: expected event {position} to be a \
+                     {PAYLOAD_PART} event carrying the inference result's own media type, got \
+                     {event:?}"
+                );
+                assert_eq!(
+                    (
+                        event.document["object"].as_str(),
+                        event.document["id"].as_str()
+                    ),
+                    (Some("chat.completion.chunk"), Some(expected_id.as_str())),
+                    "case {case:?} turn {index}: expected event {position} to be a chunk of \
+                     completion {expected_id:?}, got {:?}",
+                    event.document
+                );
+            }
+
+            // The deltas concatenate into exactly the text the one-document framing of the
+            // same turn reports.
+            let streamed: String = events
+                .iter()
+                .filter_map(|event| event.document["choices"][0]["delta"]["content"].as_str())
+                .collect();
+            assert_eq!(
+                streamed, expected_text,
+                "case {case:?} turn {index}: expected the chunks to concatenate into the \
+                 served text, got {streamed:?}"
+            );
+
+            // Only the last event ends the completion, and only it reports the totals.
+            let (last, earlier) = events
+                .split_last()
+                .expect("a stream that delivered at least one event");
+            for (position, event) in earlier.iter().enumerate() {
+                assert!(
+                    event.document["choices"][0]["finish_reason"].is_null()
+                        && event.document["usage"].is_null(),
+                    "case {case:?} turn {index}: expected event {position} to end nothing, got \
+                     {:?}",
+                    event.document
+                );
+            }
+            let prompt_tokens = state::count_text_tokens(&state::prompt_text_of_body(&payload));
+            let completion_tokens = state::count_text_tokens(&expected_text);
+            assert_eq!(
+                (
+                    last.document["choices"][0]["finish_reason"].clone(),
+                    last.document["usage"].clone()
+                ),
+                (
+                    json!("stop"),
+                    json!({
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": prompt_tokens + completion_tokens,
+                    })
+                ),
+                "case {case:?} turn {index}: expected the last event to end the completion and \
+                 report its totals, got {:?}",
+                last.document
+            );
+
+            // The frames are what the trajectory RETAINED for the turn, read the way the
+            // next request would read it.
+            let store = engine.state::<ServiceState>();
+            let guard = store.lock();
+            let turn = guard
+                .trajectory(&arn, trajectory_id)
+                .and_then(|trajectory| trajectory.turns.get(index))
+                .unwrap_or_else(|| {
+                    panic!("case {case:?} turn {index}: expected the turn to be captured")
+                });
+            assert_eq!(
+                (
+                    turn.response_body == reply.body,
+                    turn.response_content_type.as_deref()
+                ),
+                (true, Some(EVENT_STREAM_MEDIA_TYPE)),
+                "case {case:?} turn {index}: expected the served frames to be the recorded \
+                 ones, got {} recorded byte(s) labelled {:?}",
+                turn.response_body.len(),
+                turn.response_content_type
+            );
+        }
     }
 }
 

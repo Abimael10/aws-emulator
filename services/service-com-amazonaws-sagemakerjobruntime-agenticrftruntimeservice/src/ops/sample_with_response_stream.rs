@@ -185,9 +185,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The SAME state path as `Sample` — the crate's ONE sampling path
         // (`crate::state::serve_sampling_turn`) — so one trajectory can mix turns
         // served by either operation and the two cannot drift; only the framing of
-        // the response body differs. What the captured turn records about the
-        // REQUEST — the `Content-Type` the caller labelled its payload with — is
-        // read by that shared path out of the headers handed to it here.
+        // the response body differs: this operation's `Body` is "delivered as a
+        // series of PayloadPart events", so the completion travels as the successive
+        // event frames of an event-stream body
+        // (`crate::state::sample_stream_response_body`), under the media type such a
+        // body carries, while `Sample` answers one JSON document. What the captured
+        // turn records about the REQUEST — the `Content-Type` the caller labelled its
+        // payload with — is read by that shared path out of the headers handed to it
+        // here.
         let turn = crate::state::serve_sampling_turn(
             &*self.engine,
             &state,

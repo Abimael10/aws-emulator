@@ -328,6 +328,13 @@ quick-xml = "0.41"
 # PNGs with, so the one renderer every such service shares writes a real image rather than
 # hand-assembled bytes.
 png = "0.18"
+# `event_stream`: the `vnd.amazon.eventstream` ENCODER one frame is written with, for an
+# event whose payload is already encoded (an `@eventPayload` blob, or a stream a model
+# declares as a streaming blob rather than as a union of event structures) — the maintained
+# encoder of that framing, the same one the framework's own protocols write a
+# protocol-serialized event frame with, rather than a second laying-out of the prelude, the
+# headers and their CRCs here.
+aws-smithy-eventstream = "0.60"
 
 [dev-dependencies]
 # `acm_certificate_termination`'s own cases load REAL certificate material, minted by the

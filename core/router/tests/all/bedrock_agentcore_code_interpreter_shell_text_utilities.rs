@@ -119,45 +119,24 @@ async fn tool(router: &MultiServiceRouter, case: &str, session: &str, name: &str
 /// The payload of the FIRST event of an `application/vnd.amazon.eventstream` body, as the JSON
 /// it carries.
 ///
-/// A frame is its total length, its headers length, a prelude checksum, its headers, its
-/// payload and a message checksum, each length a big-endian `u32` — so the payload is the span
-/// between the headers and that trailing checksum.
+/// The framing is read by the ONE reader of it this test binary shares
+/// (`crate::event_stream_frames`); what this suite states about the body is that it is the
+/// single `result` event of the union.
 fn first_event(case: &str, body: &[u8]) -> Value {
-    let prelude: [u8; 4] = body
-        .get(..4)
-        .and_then(|bytes| bytes.try_into().ok())
-        .unwrap_or_else(|| panic!("case {case:?}: an event-stream body carries a frame prelude"));
-    let headers: [u8; 4] = body
-        .get(4..8)
-        .and_then(|bytes| bytes.try_into().ok())
-        .unwrap_or_else(|| panic!("case {case:?}: an event-stream frame carries a headers length"));
-    let total = usize::try_from(u32::from_be_bytes(prelude)).expect("a frame length");
-    let headers = usize::try_from(u32::from_be_bytes(headers)).expect("a headers length");
+    let mut frames = crate::event_stream_frames::frames(case, body);
     assert_eq!(
-        total,
-        body.len(),
-        "case {case:?}: expected exactly one event frame in {} bytes",
+        frames.len(),
+        1,
+        "case {case:?}: expected exactly one event frame in {} byte(s), got {frames:?}",
         body.len()
     );
-    let start = headers.saturating_add(12);
-    let end = total.saturating_sub(4);
-    let named = body
-        .get(12..start)
-        .unwrap_or_else(|| panic!("case {case:?}: a frame carries {headers} bytes of headers"));
-    assert!(
-        named.windows(6).any(|window| window == b"result"),
-        "case {case:?}: expected the `result` member of the union, got the headers {:?}",
-        String::from_utf8_lossy(named)
+    let frame = frames.remove(0);
+    assert_eq!(
+        frame.event_type, "result",
+        "case {case:?}: expected the `result` member of the union, got {:?}",
+        frame.event_type
     );
-    let payload = body
-        .get(start..end)
-        .unwrap_or_else(|| panic!("case {case:?}: a frame of {total} bytes carries a payload"));
-    serde_json::from_slice(payload).unwrap_or_else(|error| {
-        panic!(
-            "case {case:?}: the event payload must be JSON ({error}), got {:?}",
-            String::from_utf8_lossy(payload)
-        )
-    })
+    frame.payload
 }
 
 /// The text of `member` in a result's `structuredContent`.

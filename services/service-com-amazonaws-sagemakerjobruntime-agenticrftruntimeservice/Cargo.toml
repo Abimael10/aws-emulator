@@ -38,5 +38,11 @@ service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
+[dev-dependencies]
+# The `vnd.amazon.eventstream` DECODER a suite reads the frames of a streamed inference
+# body with — the same reader a client's own decoder reads that framing with — so a suite
+# asserts on the events that were delivered rather than on a byte pattern. DEV-ONLY.
+aws-smithy-eventstream = "0.60"
+
 [lints]
 workspace = true

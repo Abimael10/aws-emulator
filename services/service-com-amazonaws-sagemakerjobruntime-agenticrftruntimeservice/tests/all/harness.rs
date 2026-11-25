@@ -7,8 +7,9 @@
 //!
 //! * how a wire answer is REDUCED to what a suite asserts on — the status, the bare
 //!   error code behind `x-amzn-errortype`, the `Message` member of a restJson1 error
-//!   document, the raw body ([`Reply`]) and the completion document an inference payload
-//!   carries in either framing ([`completion_document`], [`served_completion`]) — and how a
+//!   document, the raw body ([`Reply`]), the events a streamed body delivers
+//!   ([`stream_events`]) and the completion document an inference payload carries in
+//!   either framing ([`completion_document`], [`served_completion`]) — and how a
 //!   request is DISPATCHED, including the access key id it presents ([`send`], [`send_as`]),
 //!   which is the one thing that names the principal it speaks for;
 //! * how a job comes to EXIST for a test of this crate — this service's model binds no
@@ -225,22 +226,72 @@ pub async fn send_as(
     Reply::of(router.dispatch(request).await)
 }
 
+/// One event of a streamed inference body: the frame headers a client's decoder reads it
+/// by, and the JSON document its payload carries.
+#[derive(Debug)]
+pub struct StreamEvent {
+    /// `:message-type` — `event` for a modelled event, `exception` for an in-band error.
+    pub message_type: Option<String>,
+    /// `:event-type` — which event of the stream this frame carries.
+    pub event_type: Option<String>,
+    /// `:content-type` — the media type of this frame's OWN payload.
+    pub payload_content_type: Option<String>,
+    /// The payload read as a JSON document, or [`Value::Null`] when it is not one.
+    pub document: Value,
+}
+
+/// The events a streamed inference body delivers, in order.
+///
+/// Read with the same `vnd.amazon.eventstream` reader a client's own decoder reads that
+/// framing with, so a suite asserts on the events that were delivered rather than on a
+/// byte pattern. `Err` carries what the reader said about a body that does not decode as
+/// frames at all — the harness owns no assertion, so the suite states what it expected.
+pub fn stream_events(body: &[u8]) -> Result<Vec<StreamEvent>, String> {
+    let mut buffer = bytes::Bytes::copy_from_slice(body);
+    let mut events = Vec::new();
+    while !buffer.is_empty() {
+        let message = aws_smithy_eventstream::frame::read_message_from(&mut buffer)
+            .map_err(|error| error.to_string())?;
+        let header = |name: &str| {
+            message
+                .headers()
+                .iter()
+                .find(|header| header.name().as_str() == name)
+                .map(|header| match header.value() {
+                    aws_smithy_types::event_stream::HeaderValue::String(value) => {
+                        value.as_str().to_string()
+                    }
+                    other => format!("{other:?}"),
+                })
+        };
+        events.push(StreamEvent {
+            message_type: header(":message-type"),
+            event_type: header(":event-type"),
+            payload_content_type: header(":content-type"),
+            document: serde_json::from_slice(message.payload()).unwrap_or(Value::Null),
+        });
+    }
+    Ok(events)
+}
+
 /// The completion document an inference payload carries, out of EITHER framing: a
 /// `Sample` payload IS the completion envelope, and a `SampleWithResponseStream` payload
-/// carries it in the first server-sent event of its stream. It reads the bytes alone, so a
-/// wire answer and a body RETAINED on a captured turn are reduced the same way.
+/// carries one chunk of it per event of its stream, so the FIRST event's document is what
+/// that framing opens with ([`stream_events`]). It reads the bytes alone, so a wire answer
+/// and a body RETAINED on a captured turn are reduced the same way.
 ///
-/// [`Value::Null`] when the payload carries no completion at all — a refusal envelope, or
-/// anything else that is not one — so a suite asserts on what it read instead of on a
-/// parse that panicked.
+/// [`Value::Null`] when the payload carries no document at all — neither a JSON body nor a
+/// stream of events — so a suite asserts on what it read instead of on a parse that
+/// panicked.
 #[must_use]
 pub fn completion_document(body: &[u8]) -> Value {
-    let text = String::from_utf8_lossy(body);
-    let document = text
-        .strip_prefix("data: ")
-        .and_then(|rest| rest.split("\n\n").next())
-        .unwrap_or(text.as_ref());
-    serde_json::from_str(document).unwrap_or(Value::Null)
+    if let Ok(document) = serde_json::from_slice::<Value>(body) {
+        return document;
+    }
+    stream_events(body)
+        .ok()
+        .and_then(|events| events.into_iter().next())
+        .map_or(Value::Null, |event| event.document)
 }
 
 /// The completion document one sampling ANSWER served, in whichever framing its operation

@@ -73,14 +73,30 @@ pub const MAX_TURN_BODY_BYTES: usize = 1 << 20;
 /// written.
 pub const MAX_RETAINED_BODY_BYTES: usize = 64 << 20;
 
-/// The wire value of the `Content-Type` the OpenAI-compatible, non-streaming
-/// inference response is rendered in.
+/// The wire value of the `Content-Type` the OpenAI-compatible inference response
+/// is rendered in — the non-streaming body in full, and each chunk of a streamed
+/// one — which is the MIME type of the inference result either way.
 pub const JSON_CONTENT_TYPE: &str = "application/json";
 
-/// The wire value of the `Content-Type` a streamed inference response is
-/// rendered in: OpenAI-compatible streaming is server-sent events, one
-/// `chat.completion.chunk` per `data:` line and a final `data: [DONE]`.
-pub const EVENT_STREAM_CONTENT_TYPE: &str = "text/event-stream";
+/// The `:event-type` every frame of a streamed inference response names.
+///
+/// The model documents the streamed body as "delivered as a series of PayloadPart
+/// events" (`smithy_query(query="doc",
+/// shape="SampleWithResponseStreamResponse", member="Body")`), so one chunk of the
+/// stream travels as one event of that name.
+pub const PAYLOAD_PART_EVENT: &str = "PayloadPart";
+
+/// The wire value of the `Content-Type` a streamed inference response is rendered
+/// in.
+///
+/// The body is delivered as a series of [`PAYLOAD_PART_EVENT`] events, so it carries
+/// the media type an event-delivered body has — the ONE value the shared framing seam
+/// every streaming data plane of this project writes such a body with labels it with,
+/// which is why it is that module's constant rather than a second spelling of it here.
+/// The media type of the inference result INSIDE the stream travels on each frame's own
+/// `:content-type` ([`JSON_CONTENT_TYPE`]), where the media type of an event's payload
+/// belongs.
+pub use ::service_common::event_stream::EVENT_STREAM_CONTENT_TYPE;
 
 /// Where a trajectory is in the rollout lifecycle.
 ///
@@ -954,20 +970,106 @@ pub fn emulated_turn_text(turn_number: usize, prompt_tokens: u64) -> String {
     )
 }
 
+/// The `object` an OpenAI-compatible chat-completions response names itself with,
+/// and the one a single chunk of a streamed completion names itself with.
+const COMPLETION_OBJECT: &str = "chat.completion";
+const COMPLETION_CHUNK_OBJECT: &str = "chat.completion.chunk";
+
+/// The role the assistant's own text is attributed to, and the reason a completion
+/// that ran to its end finished for — both per the OpenAI chat-completions objects
+/// this service's `Body` members are documented to carry.
+const ASSISTANT_ROLE: &str = "assistant";
+const FINISH_REASON_STOP: &str = "stop";
+
+/// What one captured turn's completion reports, derived once for EITHER framing.
+///
+/// The one document `Sample` answers with and the successive chunks
+/// `SampleWithResponseStream` delivers report the same facts about the same turn, so
+/// they are derived here once and neither framing can report a different turn from the
+/// other.
+///
+/// Both of the per-job values — the turn's `id` and the `model` that served it — are
+/// derived from the JOB the call resolves to ([`job_identity`]), never from the ARN
+/// string the request addressed that job through, so every retained turn of ONE
+/// trajectory reports one job, whichever partition, Region or account its own call
+/// spelled the ARN with. No language model runs here ([`emulated_turn_text`]), so the
+/// job the turn was routed to is what `model` reports.
+#[derive(Debug, Clone)]
+struct TurnCompletion {
+    /// The turn's opaque, stable id ([`completion_id`]).
+    id: String,
+    /// The job the turn was routed to, which is what `model` reports.
+    model: String,
+    /// `created`, in whole seconds since the epoch, as the OpenAI objects carry it.
+    created_secs: u64,
+    /// The assistant text the turn answers with ([`emulated_turn_text`]).
+    text: String,
+    /// How many tokens the prompt carried, and how many the answer does.
+    prompt_tokens: u64,
+    completion_tokens: u64,
+}
+
+/// What the turn at `index` of the trajectory `(job_arn, trajectory_id)` names reports
+/// for the prompt it was served.
+fn turn_completion(
+    job_arn: &str,
+    trajectory_id: &str,
+    index: usize,
+    prompt: &[u8],
+    created: SystemTime,
+) -> TurnCompletion {
+    let prompt_tokens = count_text_tokens(&prompt_text_of_body(prompt));
+    let text = emulated_turn_text(index + 1, prompt_tokens);
+    let completion_tokens = count_text_tokens(&text);
+    TurnCompletion {
+        id: completion_id(job_arn, trajectory_id, index),
+        model: job_identity(job_arn).to_string(),
+        created_secs: created
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs()),
+        text,
+        prompt_tokens,
+        completion_tokens,
+    }
+}
+
+impl TurnCompletion {
+    /// One document of either framing: the turn's own identity, the `object` the
+    /// framing names, the single `choices` entry this document carries and the `usage`
+    /// it reports — `null` on a chunk that reports none, which is where an
+    /// OpenAI-compatible stream carries the member before the totals are known.
+    fn document(
+        &self,
+        object: &str,
+        choice: serde_json::Value,
+        usage: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "object": object,
+            "created": self.created_secs,
+            "model": self.model,
+            "choices": [choice],
+            "usage": usage,
+        })
+    }
+
+    /// The token totals the turn reports once its whole answer is known.
+    fn usage(&self) -> serde_json::Value {
+        serde_json::json!({
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.prompt_tokens + self.completion_tokens,
+        })
+    }
+}
+
 /// The OpenAI-compatible chat-completion envelope for one captured turn.
 ///
 /// Shape per the OpenAI chat-completions response object, which is the format
 /// this service's `Body` members are documented to carry: `id`, `object`,
 /// `created`, `model`, `choices[].message`, `choices[].finish_reason` and
-/// `usage`.
-///
-/// Both of the per-job values the envelope carries — the turn's `id` and the
-/// `model` that served it — are derived from the JOB the call resolves to
-/// ([`job_identity`]), never from the ARN string the request addressed that job
-/// through, so every retained turn of ONE trajectory reports one job, whichever
-/// partition, Region or account its own call spelled the ARN with. No language
-/// model runs here ([`emulated_turn_text`]), so the job the turn was routed to is
-/// what `model` reports.
+/// `usage`. The facts it reports about the turn are [`TurnCompletion`]'s.
 #[must_use]
 pub fn completion_envelope(
     job_arn: &str,
@@ -975,31 +1077,103 @@ pub fn completion_envelope(
     index: usize,
     prompt: &[u8],
     created: SystemTime,
-    streaming: bool,
 ) -> serde_json::Value {
-    let prompt_tokens = count_text_tokens(&prompt_text_of_body(prompt));
-    let text = emulated_turn_text(index + 1, prompt_tokens);
-    let completion_tokens = count_text_tokens(&text);
-    let created_secs = created
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
-    let message_key = if streaming { "delta" } else { "message" };
-    serde_json::json!({
-        "id": completion_id(job_arn, trajectory_id, index),
-        "object": if streaming { "chat.completion.chunk" } else { "chat.completion" },
-        "created": created_secs,
-        "model": job_identity(job_arn),
-        "choices": [{
+    let completion = turn_completion(job_arn, trajectory_id, index, prompt, created);
+    completion.document(
+        COMPLETION_OBJECT,
+        serde_json::json!({
             "index": 0,
-            message_key: { "role": "assistant", "content": text },
-            "finish_reason": "stop",
-        }],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        },
-    })
+            "message": { "role": ASSISTANT_ROLE, "content": completion.text },
+            "finish_reason": FINISH_REASON_STOP,
+        }),
+        completion.usage(),
+    )
+}
+
+/// The pieces one text is DELIVERED in, one per token [`count_text_tokens`] counts.
+///
+/// Each piece carries its token and the whitespace that follows it (the first also
+/// whatever precedes it), so the pieces concatenate back into the text byte for byte and
+/// there is exactly one of them per counted token, whatever whitespace the text uses —
+/// the invariant the streamed framing's "one chunk per token" rests on.
+fn text_chunks(text: &str) -> Vec<&str> {
+    let mut starts: Vec<usize> = Vec::new();
+    let mut in_token = false;
+    for (at, character) in text.char_indices() {
+        if character.is_whitespace() {
+            in_token = false;
+        } else if !in_token {
+            in_token = true;
+            starts.push(at);
+        }
+    }
+    // The first piece reaches back to the start of the text, so nothing is dropped.
+    if let Some(first) = starts.first_mut() {
+        *first = 0;
+    }
+    let mut chunks: Vec<&str> = Vec::with_capacity(starts.len());
+    for (position, start) in starts.iter().enumerate() {
+        let end = starts.get(position + 1).copied().unwrap_or(text.len());
+        if let Some(chunk) = text.get(*start..end) {
+            chunks.push(chunk);
+        }
+    }
+    chunks
+}
+
+/// The successive chunks of ONE streamed turn's completion, in the order they are
+/// delivered.
+///
+/// The stream is "composed of successive payload chunks"
+/// (`smithy_query(query="doc", shape="ResponseStream")`), so the completion is
+/// delivered as a SERIES rather than in one piece: one chunk per token of the
+/// assistant text ([`text_chunks`], one piece per token [`count_text_tokens`] counts),
+/// each carrying its own text as the `delta` an OpenAI-compatible stream reports a
+/// chunk's increment in — and then a last chunk that carries no text, the
+/// `finish_reason` the completion ended for and the turn's `usage`. A client that
+/// concatenates the deltas reconstructs exactly the text [`completion_envelope`]
+/// reports in one document, so the two framings deliver the same answer.
+#[must_use]
+pub fn stream_chunk_documents(
+    job_arn: &str,
+    trajectory_id: &str,
+    index: usize,
+    prompt: &[u8],
+    created: SystemTime,
+) -> Vec<serde_json::Value> {
+    let completion = turn_completion(job_arn, trajectory_id, index, prompt, created);
+    let mut documents: Vec<serde_json::Value> = text_chunks(&completion.text)
+        .into_iter()
+        .enumerate()
+        .map(|(position, piece)| {
+            // The role is on the first chunk's delta alone, as an OpenAI-compatible
+            // stream reports it: every later chunk increments the same message.
+            let delta = if position == 0 {
+                serde_json::json!({ "role": ASSISTANT_ROLE, "content": piece })
+            } else {
+                serde_json::json!({ "content": piece })
+            };
+            completion.document(
+                COMPLETION_CHUNK_OBJECT,
+                serde_json::json!({
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": serde_json::Value::Null,
+                }),
+                serde_json::Value::Null,
+            )
+        })
+        .collect();
+    documents.push(completion.document(
+        COMPLETION_CHUNK_OBJECT,
+        serde_json::json!({
+            "index": 0,
+            "delta": {},
+            "finish_reason": FINISH_REASON_STOP,
+        }),
+        completion.usage(),
+    ));
+    documents
 }
 
 /// The non-streaming response body for one captured turn.
@@ -1011,13 +1185,21 @@ pub fn sample_response_body(
     prompt: &[u8],
     created: SystemTime,
 ) -> Vec<u8> {
-    let envelope = completion_envelope(job_arn, trajectory_id, index, prompt, created, false);
+    let envelope = completion_envelope(job_arn, trajectory_id, index, prompt, created);
     serde_json::to_vec(&envelope).unwrap_or_default()
 }
 
-/// The streamed response body for one captured turn: the same completion, in
-/// the server-sent-event framing an OpenAI-compatible stream uses, terminated
-/// by the `[DONE]` sentinel.
+/// The streamed response body for one captured turn: the successive chunks of the
+/// same completion ([`stream_chunk_documents`]), each delivered as ONE
+/// [`PAYLOAD_PART_EVENT`] event of an event-stream body.
+///
+/// That is the delivery the model documents for this member — "a series of PayloadPart
+/// events" — and the frames are written by the shared seam every streaming data plane
+/// of this project frames an event body with
+/// (`service_common::event_stream::frame_payload_event`), so one chunk is one frame,
+/// announcing the media type that chunk is in ([`JSON_CONTENT_TYPE`]) while the body as
+/// a whole carries the media type of an event-delivered body
+/// ([`EVENT_STREAM_CONTENT_TYPE`]).
 #[must_use]
 pub fn sample_stream_response_body(
     job_arn: &str,
@@ -1026,7 +1208,22 @@ pub fn sample_stream_response_body(
     prompt: &[u8],
     created: SystemTime,
 ) -> Vec<u8> {
-    let envelope = completion_envelope(job_arn, trajectory_id, index, prompt, created, true);
-    let chunk = serde_json::to_string(&envelope).unwrap_or_default();
-    format!("data: {chunk}\n\ndata: [DONE]\n\n").into_bytes()
+    let mut body = Vec::new();
+    for document in stream_chunk_documents(job_arn, trajectory_id, index, prompt, created) {
+        let payload = serde_json::to_vec(&document).unwrap_or_default();
+        match ::service_common::event_stream::frame_payload_event(
+            PAYLOAD_PART_EVENT,
+            JSON_CONTENT_TYPE,
+            payload,
+        ) {
+            Ok(frame) => body.extend_from_slice(&frame),
+            // Unreachable for the documents above — each a few hundred bytes, far
+            // inside the framing's own size limits — and a handler must not panic, so a
+            // frame that could not be encoded is traced rather than served half-written.
+            Err(error) => {
+                ::tracing::warn!(%error, "a streamed inference chunk could not be framed");
+            }
+        }
+    }
+    body
 }

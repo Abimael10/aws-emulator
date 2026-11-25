@@ -41,8 +41,10 @@ use crate::harness::{
 /// Small enough that a request half of this size is well inside the per-turn bound
 /// (`state::MAX_TURN_BODY_BYTES`), so a row that spends the room on the request half is
 /// answered by the store-wide ceiling and not by the per-turn one, and large enough that
-/// a small body plus the completion envelope served for it still fits.
-const ROOM: usize = 4096;
+/// a small body plus the response served for it still fits — including the streamed
+/// framing, whose event frames carry the same completion in successive chunks and so
+/// retain more than the one document the non-streamed framing serves.
+const ROOM: usize = 32768;
 
 /// The trajectory the seeding turns are retained on, which is never the trajectory a row
 /// drives.

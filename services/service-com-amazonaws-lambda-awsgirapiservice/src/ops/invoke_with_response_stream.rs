@@ -80,7 +80,7 @@ use std::sync::Arc;
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_types::body::SdkBody;
 use service_common::event_stream::{
-    error_response, event_stream_response, frame_event, EventStreamOperation,
+    error_response, event_stream_response, frame_event, frame_payload_event, EventStreamOperation,
 };
 use smithy_server_runtime::{BoxFuture, OperationContext, ServerHttpProtocol, Service};
 
@@ -695,28 +695,16 @@ fn streamed_response(
 /// bytes the handler produced ARE the frame's payload — not a member of a JSON object
 /// inside it — and the frame announces them as the opaque bytes they are. That binding is
 /// what the framework's event serializer does not express (it renders the whole event
-/// structure as JSON, which would base64-encode the blob into a member), so this frame is
-/// written here, through the same event-stream encoder.
+/// structure as JSON, which would base64-encode the blob into a member), which is why the
+/// shared event-stream seam carries its own writer for an already-encoded payload and this
+/// frame is written through that one rather than through a copy here.
 fn framed_payload_chunk(payload: &[u8]) -> Result<Vec<u8>, String> {
-    let message = ::aws_smithy_types::event_stream::Message::new(payload.to_vec())
-        .add_header(::aws_smithy_types::event_stream::Header::new(
-            ":message-type",
-            ::aws_smithy_types::event_stream::HeaderValue::String("event".into()),
-        ))
-        .add_header(::aws_smithy_types::event_stream::Header::new(
-            ":event-type",
-            ::aws_smithy_types::event_stream::HeaderValue::String(PAYLOAD_CHUNK_EVENT.into()),
-        ))
-        .add_header(::aws_smithy_types::event_stream::Header::new(
-            ":content-type",
-            ::aws_smithy_types::event_stream::HeaderValue::String(
-                PAYLOAD_CHUNK_CONTENT_TYPE.into(),
-            ),
-        ));
-    let mut framed = Vec::new();
-    ::aws_smithy_eventstream::frame::write_message_to(&message, &mut framed)
-        .map_err(|error| error.to_string())?;
-    Ok(framed)
+    frame_payload_event(
+        PAYLOAD_CHUNK_EVENT,
+        PAYLOAD_CHUNK_CONTENT_TYPE,
+        payload.to_vec(),
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// How a key that cannot decrypt a function's environment variables is answered: the

@@ -47,12 +47,14 @@
 //! unreviewed rewrite of two other services inside a Bedrock Runtime fix. Nothing new
 //! should inline the framing again — call this module.
 
+use aws_smithy_eventstream::frame::write_message_to;
 use aws_smithy_runtime_api::http::{Request, Response, StatusCode};
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
 use aws_smithy_schema_server::constraints::{envelope, validate};
 use aws_smithy_schema_server::{DeserializableStruct, ProtocolError, Violation, ViolationKind};
 use aws_smithy_types::body::SdkBody;
+use aws_smithy_types::event_stream::{Header, HeaderValue, Message};
 use smithy_server_runtime::{
     BoxFuture, ErasedOperation, OperationContext, OperationError, ServerHttpProtocol, Service,
 };
@@ -173,6 +175,45 @@ pub fn frame_event(
         .bytes()
         .map(<[u8]>::to_vec)
         .unwrap_or_default())
+}
+
+/// Frame one event whose payload is ALREADY encoded as a single
+/// `vnd.amazon.eventstream` message.
+///
+/// [`frame_event`] writes an event the model declares as a STRUCTURE, serializing its
+/// members into the frame's payload through the service's own protocol. An event whose
+/// payload is a BLOB has no member to serialize: the `@eventPayload` of an event shape,
+/// and the payload of a model that declares its stream as a streaming blob rather than
+/// as a union of event structures, ARE the frame's body, under the media type those
+/// bytes are in. That binding is the one a struct serializer cannot express — it would
+/// base64 the bytes into a JSON member — so the bytes are framed here instead, with the
+/// same three headers a protocol-serialized event frame carries, and read by a client's
+/// decoder exactly as one of those is.
+pub fn frame_payload_event(
+    event_type: &str,
+    payload_content_type: &str,
+    payload: Vec<u8>,
+) -> Result<Vec<u8>, ProtocolError> {
+    let message = Message::new(payload)
+        .add_header(Header::new(
+            ":message-type",
+            HeaderValue::String("event".into()),
+        ))
+        .add_header(Header::new(
+            ":event-type",
+            HeaderValue::String(event_type.to_string().into()),
+        ))
+        .add_header(Header::new(
+            ":content-type",
+            HeaderValue::String(payload_content_type.to_string().into()),
+        ));
+    let mut framed = Vec::new();
+    write_message_to(&message, &mut framed).map_err(|error| {
+        ProtocolError::Serde(SerdeError::custom(format!(
+            "the {event_type} frame could not be encoded: {error}"
+        )))
+    })?;
+    Ok(framed)
 }
 
 /// The `:event-type` of the frame an event-stream response OPENS with.

@@ -39,6 +39,8 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::event_stream_frames::frames;
+
 /// The host every request here is addressed to: the claim each service makes is resolved
 /// from the SigV4 credential scope and the URI path space, not from this name.
 const HOST: &str = "emulator.local";
@@ -66,9 +68,15 @@ const SAMPLE_PATH: &str = "/sample";
 const SAMPLE_STREAM_PATH: &str = "/sample-with-response-stream";
 
 /// The `Content-Type` each sampling operation renders its answer in: JSON for `Sample`,
-/// server-sent events for the streaming one.
+/// and for the streaming one the media type of an event-delivered body, whose completion
+/// arrives "as a series of PayloadPart events"
+/// (`smithy_query(query="doc",shape="SampleWithResponseStreamResponse",member="Body",
+/// model_path="services/service-com-amazonaws-sagemakerjobruntime-agenticrftruntimeservice/smithy-model/com-amazonaws-sagemakerjobruntime-agenticrftruntimeservice.json")`).
 const JSON_CONTENT_TYPE: &str = "application/json";
-const EVENT_STREAM_CONTENT_TYPE: &str = "text/event-stream";
+const EVENT_STREAM_CONTENT_TYPE: &str = "application/vnd.amazon.eventstream";
+
+/// The event each frame of that stream carries, as the member's documentation names it.
+const PAYLOAD_PART_EVENT: &str = "PayloadPart";
 
 /// A SigV4 `Authorization` header whose credential scope names the signing name the whole
 /// SageMaker family shares (`sagemaker`) and the Region the call is made in. Request
@@ -309,18 +317,18 @@ fn job_arn(partition: &str, region: &str, account: &str, category: &str, name: &
 }
 
 /// The chat-completion object one sampling answer carries: a non-streamed answer is the
-/// object itself, a streamed one is the first `data:` event of the stream.
+/// object itself, a streamed one is the document the FIRST event of its stream delivers.
+///
+/// The framing itself is read by the ONE reader of it this test binary shares
+/// (`crate::event_stream_frames`).
 fn completion_of(answer: &Answer, streamed: bool) -> Value {
     if !streamed {
         return answer.json();
     }
-    answer
-        .text()
-        .lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .find(|payload| *payload != "[DONE]")
-        .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
-        .unwrap_or(Value::Null)
+    frames("the streamed answer", &answer.body)
+        .into_iter()
+        .next()
+        .map_or(Value::Null, |frame| frame.payload)
 }
 
 /// One whole rollout a wire-only client performs against a job it had created for it.
@@ -461,11 +469,15 @@ async fn a_client_samples_the_job_the_control_plane_minted_for_it() {
                 served.content_type
             );
             if *streamed {
-                let stream = served.text();
+                let streamed_frames = frames(case, &served.body);
                 assert!(
-                    stream.trim_end().ends_with("data: [DONE]"),
-                    "case {case:?} turn {index}: expected the event stream to end with its \
-                     sentinel, got {stream:?}"
+                    streamed_frames.len() > 1
+                        && streamed_frames.iter().all(|frame| frame.message_type == "event"
+                            && frame.event_type == PAYLOAD_PART_EVENT
+                            && frame.payload_content_type == JSON_CONTENT_TYPE),
+                    "case {case:?} turn {index}: expected the completion as a series of \
+                     {PAYLOAD_PART_EVENT} events each carrying {JSON_CONTENT_TYPE:?}, got \
+                     {streamed_frames:?}"
                 );
             }
 
@@ -492,14 +504,24 @@ async fn a_client_samples_the_job_the_control_plane_minted_for_it() {
                 "case {case:?} turn {index}: expected the turn to be served for the job the \
                  request resolved to ({expected_model}), got {completion}"
             );
-            let prompt_tokens = completion
+            // The totals a completion reports: the one document of the non-streamed
+            // framing carries them, and the streamed framing reports them on the LAST
+            // event of its series, once the whole answer has been delivered.
+            let totals = if *streamed {
+                frames(case, &served.body)
+                    .pop()
+                    .map_or(Value::Null, |frame| frame.payload)
+            } else {
+                completion.clone()
+            };
+            let prompt_tokens = totals
                 .pointer("/usage/prompt_tokens")
                 .and_then(Value::as_u64)
                 .unwrap_or_default();
             assert!(
                 prompt_tokens > 0,
                 "case {case:?} turn {index}: expected the usage to count the prompt that was \
-                 sent, got {completion}"
+                 sent, got {totals}"
             );
             let id = completion
                 .get("id")
