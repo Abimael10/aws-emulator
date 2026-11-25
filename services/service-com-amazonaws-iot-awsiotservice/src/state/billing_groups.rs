@@ -281,6 +281,89 @@ impl ComAmazonawsIotAwsiotserviceState {
     }
 }
 
+/// Which `billingGroupName` a request that may name a group EITHER by name or by ARN is
+/// about, and `None` for one that named neither.
+///
+/// `AddThingToBillingGroup` and `RemoveThingFromBillingGroup` take `billingGroupName` and
+/// `billingGroupArn` and require neither
+/// (`smithy_query(query="operation",operation="AddThingToBillingGroup")`), because a group
+/// is identified by either: [`named_resource`](super::thing_group_membership::named_resource)
+/// for the billing-group family, whose ARN resource type is the one [`billing_group_arn`]
+/// mints.
+pub fn named_billing_group(name: Option<&str>, arn: Option<&str>) -> Option<String> {
+    super::thing_group_membership::named_resource(name, arn, "billinggroup")
+}
+
+/// Why a BILLING GROUP membership write is refused.
+///
+/// Both variants are the modelled `ResourceNotFoundException` of the operations that write
+/// this relation, and they are kept apart so the sentence names the end that is missing: a
+/// membership between records this account does not hold would be a relation over nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BillingGroupMembershipRefusal {
+    /// The request named a billing group this account does not hold; carries the name.
+    MissingBillingGroup(String),
+    /// The request named a thing the registry does not hold; carries the name.
+    MissingThing(String),
+}
+
+impl BillingGroupMembershipRefusal {
+    /// What the refusal reports, in the wording this service states each of these in — the
+    /// registry families' account-qualified sentence for both ends
+    /// ([`missing_billing_group_message`], [`super::missing_thing_message`]).
+    pub fn message(&self) -> String {
+        match self {
+            Self::MissingBillingGroup(billing_group_name) => {
+                missing_billing_group_message(billing_group_name)
+            }
+            Self::MissingThing(thing_name) => super::not_found::missing_thing_message(thing_name),
+        }
+    }
+}
+
+impl ComAmazonawsIotAwsiotserviceState {
+    /// Record that the thing `thing_name` is in the billing group `billing_group_name`: the
+    /// ONE billing-group membership write, so every writer of the relation agrees on what it
+    /// takes.
+    ///
+    /// The relation is SINGLE-VALUED on the thing's side — a thing names at most one
+    /// billing group, which is why it is kept as the thing record's own
+    /// [`super::ThingConfiguration::billing_group_name`] and why `CreateThing` and
+    /// `DescribeThing` each carry one `billingGroupName` rather than a list — so a thing
+    /// already in another group is MOVED into this one by the write, and a thing already in
+    /// this one is left exactly as it is: the add names no new identity, so repeating it
+    /// leaves the same one membership.
+    ///
+    /// Both ends have to EXIST, for the reason [`Self::add_thing_to_thing_group`] requires
+    /// it of a thing group's membership: a membership between records this account does not
+    /// hold would be a relation over nothing. The GROUP is resolved first — it is the end the
+    /// request addresses and the one the membership is written to — so a request naming
+    /// neither record is told about the group. The thing's own registry `version` is NOT
+    /// advanced by the write, the same reading [`Self::delete_billing_group`] makes of
+    /// clearing the relation: the write is to the membership, not to the thing's
+    /// configuration.
+    pub fn add_thing_to_billing_group(
+        &mut self,
+        billing_group_name: &str,
+        thing_name: &str,
+    ) -> Result<(), BillingGroupMembershipRefusal> {
+        if !self.billing_groups.contains_key(billing_group_name) {
+            return Err(BillingGroupMembershipRefusal::MissingBillingGroup(
+                billing_group_name.to_string(),
+            ));
+        }
+        // The group is there, so the thing record is taken mutably and a registry that holds
+        // no such thing is the other end's refusal: one lookup, and no path that can panic.
+        let Some(thing) = self.things.get_mut(thing_name) else {
+            return Err(BillingGroupMembershipRefusal::MissingThing(
+                thing_name.to_string(),
+            ));
+        };
+        thing.configuration.billing_group_name = Some(billing_group_name.to_string());
+        Ok(())
+    }
+}
+
 /// Why a billing group record cannot be REMOVED — what
 /// [`ComAmazonawsIotAwsiotserviceState::delete_billing_group`] answers instead of removing it.
 ///

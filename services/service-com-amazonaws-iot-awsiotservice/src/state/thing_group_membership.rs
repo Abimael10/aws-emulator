@@ -197,33 +197,39 @@ impl MembershipRefusal {
     }
 }
 
-/// Which `thingGroupName` a request that may name a group EITHER by name or by ARN is
-/// about, and `None` for one that named neither.
+/// Which resource of type `resource_type` a request that may name it EITHER by name or by
+/// ARN is about, and `None` for one that named neither.
 ///
-/// `AddThingToThingGroup` takes `thingGroupName` and `thingGroupArn` and requires
-/// neither, because a group is identified by either; the name inside a thing-group
-/// ARN is the group's identity, so an ARN is read down to that name and from then on
-/// the two are one request.
-pub fn named_thing_group(name: Option<&str>, arn: Option<&str>) -> Option<String> {
+/// The membership operations take a name and an ARN and require neither, because a resource
+/// is identified by either; the id inside a resource's ARN is that resource's identity, so an
+/// ARN is read down to that id and from then on the two are one request. An empty name, and
+/// an ARN that names another type or carries no id, name no resource of this type.
+///
+/// `resource_type` is the ARN resource type of the family asked about (`thinggroup`, `thing`,
+/// `billinggroup`), so every family reads an address the same way.
+pub fn named_resource(
+    name: Option<&str>,
+    arn: Option<&str>,
+    resource_type: &str,
+) -> Option<String> {
     if let Some(name) = name.filter(|name| !name.is_empty()) {
         return Some(name.to_string());
     }
-    let arn = arn?;
-    ::service_common::arn::resource_id_of_type(arn, "thinggroup")
+    ::service_common::arn::resource_id_of_type(arn?, resource_type)
         .filter(|name| !name.is_empty())
         .map(str::to_string)
+}
+
+/// Which `thingGroupName` a request that may name a group EITHER by name or by ARN is
+/// about: [`named_resource`] for the thing-group family.
+pub fn named_thing_group(name: Option<&str>, arn: Option<&str>) -> Option<String> {
+    named_resource(name, arn, "thinggroup")
 }
 
 /// Which `thingName` such a request is about, under the rule
 /// [`named_thing_group`] states for a group.
 pub fn named_thing(name: Option<&str>, arn: Option<&str>) -> Option<String> {
-    if let Some(name) = name.filter(|name| !name.is_empty()) {
-        return Some(name.to_string());
-    }
-    let arn = arn?;
-    ::service_common::arn::resource_id_of_type(arn, "thing")
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
+    named_resource(name, arn, "thing")
 }
 
 impl super::ComAmazonawsIotAwsiotserviceState {
