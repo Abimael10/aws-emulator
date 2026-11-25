@@ -5,7 +5,10 @@
 //! [`crate::state::ComAmazonawsEc2Amazonec2State::placement_groups`], so neither its name
 //! nor its id resolves for any later caller. A name the account holds no group under is
 //! refused rather than answered as a deletion that happened. The modelled output declares
-//! no members, so the answer is the ec2Query envelope's `<return>` success flag alone.
+//! no members, so the answer is the ec2Query envelope's `<return>` success flag and the
+//! receipt the live wire renders beside it — the `<groupId>` and `<groupName>` of the group
+//! that is gone, written at the seam that owns elements this model declares no member for
+//! ([`crate::service::recorded_response_members`]).
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -206,6 +209,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the placement group checked a moment ago could not be removed",
             ));
         }
+        // "The ID of the placement group" and "The name of the placement group": the live
+        // wire answers a delete with the receipt naming the group that is gone. The modelled
+        // output declares no member for either, so they are handed to the one seam that can
+        // write an element the model does not declare
+        // ([`crate::service::recorded_response_members`]) — the id this store minted for the
+        // group and the name it was held under, both read off the record this call resolved.
+        crate::service::recorded_response_members::hold_deleted_placement_group(
+            &group_id, group_name,
+        );
         Ok(DeletePlacementGroupOutput)
     }
 }

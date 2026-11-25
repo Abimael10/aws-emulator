@@ -22,8 +22,9 @@
 //!   protocol definition does not describe: the `<return>` success flag, the
 //!   `<RequestID>` element of a refusal, the media type's `charset`
 //!   parameter, the decimal form every floating-point member is written in, and
-//!   the elements the live wire renders on a reported shape that this checkout's
-//!   model declares no member for ([`recorded_response_members`]).
+//!   the elements the live wire renders on a reported shape, or on an operation's
+//!   own result, that this checkout's model declares no member for
+//!   ([`recorded_response_members`]).
 //!   It reaches every response this service renders and none of the
 //!   ones the framework renders in front of it; see `RESPONSE_CONTENT_TYPE` for
 //!   exactly where the line falls.
@@ -644,7 +645,7 @@ impl ServerProtocol for Ec2QueryEnvelope {
         // ([`recorded_response_members`]): an element the model does not carry cannot be a
         // field of a generated shape, so it is written here, where the shape is, for every
         // operation that reports it.
-        let recorded = recorded_response_members::RecordedMembersRef(body);
+        let recorded = recorded_response_members::RecordedMembersRef(body, operation_name);
         let mut response = self.inner.serialize_output(
             &DecimalFloatsRef(&recorded),
             output_schema,
@@ -896,6 +897,10 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for FinishedEnvelope<Eng> {
             // interfaces hands that renderer ([`recorded_response_members`]), cleared for the
             // same reason: one call's reported interfaces can never carry another call's.
             recorded_response_members::forget_any_held_instance_interface_hostnames();
+            // Same for the placement group a delete hands that renderer as its receipt
+            // ([`recorded_response_members`]): cleared for the same reason, so one call's
+            // receipt can never be answered on another call's response.
+            recorded_response_members::forget_any_held_deleted_placement_group();
             let mut response = self.served(svc, req, ctx).await;
             stamp_envelope(&mut response);
             // The AUDIT leg, after the response the caller gets has been finished and

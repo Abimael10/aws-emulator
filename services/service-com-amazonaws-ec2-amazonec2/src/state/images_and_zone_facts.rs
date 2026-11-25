@@ -1455,6 +1455,19 @@ impl Default for ImageSpec {
     }
 }
 
+/// The bytes one remembered root device snapshot of an AMI the account cannot see retains:
+/// the AMI id it is keyed by, plus the fixed overhead every record of this store is charged
+/// ([`STORED_RECORD_OVERHEAD_BYTES`]). The snapshot id itself is this module's own and so
+/// fixed-size.
+///
+/// The ONE definition of that charge, on the contract of [`image_payload_bytes`]:
+/// [`ComAmazonawsEc2Amazonec2State::image_root_snapshot_id_for_restore`] asks
+/// [`ComAmazonawsEc2Amazonec2State::would_exceed_stored_bytes`] with this number and charges
+/// exactly it, so the map cannot hold bytes the store's budget never saw.
+pub fn unseen_image_root_snapshot_bytes(image_id: &str) -> usize {
+    image_id.len().saturating_add(STORED_RECORD_OVERHEAD_BYTES)
+}
+
 /// The caller-chosen bytes one stored AMI holds: its tags, and every string of the record
 /// whose LENGTH a request chose — the name (which the derived `ImageLocation` holds a
 /// second copy of), the description, the architecture, the root device name (stored on the
@@ -1852,6 +1865,63 @@ impl ComAmazonawsEc2Amazonec2State {
             })
             .and_then(|mapping| mapping.ebs.as_ref())
             .and_then(|ebs| ebs.snapshot_id.clone())
+    }
+
+    /// The snapshot a root volume RESTORED from `image_id` is created from, for a writer that
+    /// has to name it: the stored image's own root device snapshot
+    /// ([`Self::image_root_snapshot_id`]) whenever the account holds that image, and otherwise
+    /// the snapshot this store mints once for that AMI and keeps
+    /// ([`Self::unseen_image_root_snapshots`]).
+    ///
+    /// An AMI the account cannot see publishes no block device mapping to read, and this
+    /// emulator serves launches from one all the same — so an instance can be running from an
+    /// image this store never held the root device of. "When you launch an instance, the root
+    /// device volume […] contains the image used to boot the instance": that volume is
+    /// restored from the image's root device snapshot, so a root volume replacement restoring
+    /// from that image creates its replacement from a snapshot too, and
+    /// `ReplaceRootVolumeTask$SnapshotId` ("the ID of the snapshot used to create the
+    /// replacement root volume") reports which. Leaving it out would say the replacement came
+    /// from nowhere.
+    ///
+    /// `None` for an image the account DOES hold that has no root device snapshot of its
+    /// own — an instance-store AMI, which restores no volume at all: nothing is minted for it,
+    /// because the store already knows what its root device is. `None` too for a value that is
+    /// not an AMI id this service could have ISSUED, and for the id that arrives once the
+    /// store is already holding as many of these as it stores or as many caller-supplied bytes
+    /// as it holds: the record is bounded and charged exactly as every other record of this
+    /// store is ([`unseen_image_root_snapshot_bytes`]), so request traffic naming fresh ids
+    /// cannot grow it without end. The caller then reports no snapshot rather than a store
+    /// that outgrew its ceiling.
+    ///
+    /// Takes `&mut self` and must only be called from a path that WRITES: the mint is a
+    /// change to the store, so no read of a resource may reach it.
+    pub fn image_root_snapshot_id_for_restore(&mut self, image_id: &str) -> Option<String> {
+        if self.images.contains_key(image_id) {
+            return self.image_root_snapshot_id(image_id);
+        }
+        if let Some(minted) = self.unseen_image_root_snapshots.get(image_id) {
+            return Some(minted.clone());
+        }
+        // Only a value of the form this service ISSUES an AMI id in names an AMI at all, so
+        // nothing else can take a place in the store ([`issued_image_id_is_well_formed`], the
+        // one reading of that form, which a launch holds its own `ImageId` to).
+        if !issued_image_id_is_well_formed(image_id) {
+            return None;
+        }
+        // A count ceiling first, then the byte budget: the two gates every writer of this
+        // store passes, in the same order.
+        if self.unseen_image_root_snapshots.len() >= MAX_STORED_RECORDS_PER_STORE {
+            return None;
+        }
+        let retained_bytes = unseen_image_root_snapshot_bytes(image_id);
+        if self.would_exceed_stored_bytes(retained_bytes) {
+            return None;
+        }
+        self.add_stored_bytes(retained_bytes);
+        let snapshot_id = self.next_id(SNAPSHOT_ID_PREFIX);
+        self.unseen_image_root_snapshots
+            .insert(image_id.to_string(), snapshot_id.clone());
+        Some(snapshot_id)
     }
 
     /// Why Amazon EC2 would not carry out a launch of `instance_type` from the AMI

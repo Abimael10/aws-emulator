@@ -341,9 +341,9 @@ async fn a_start_stores_the_analysis_and_the_describe_reports_it() {
                 started.findings_found.as_deref(),
                 started.analyzed_eni_count.as_deref(),
             ),
-            (None, None, None),
-            "case {case:?}: a running analysis has not ended, found nothing and analyzed \
-             nothing yet, got {started:?}"
+            (None, None, Some("0")),
+            "case {case:?}: a running analysis has not ended and found nothing yet, and \
+             counts the interfaces it has analyzed at none, got {started:?}"
         );
         let expected_tags: Vec<(String, String)> = tags
             .iter()
@@ -491,8 +491,10 @@ async fn the_clock_ends_the_analysis_with_the_reason_nothing_analyzed_it() {
          {FINDINGS_FOUND_VALUES:?}, got {ended:?}"
     );
     assert_eq!(
-        ended.analyzed_eni_count, None,
-        "case {case:?}: no network interface was analyzed, so none is counted, got {ended:?}"
+        ended.analyzed_eni_count.as_deref(),
+        Some("0"),
+        "case {case:?}: no network interface was analyzed, so the count stands at none, got \
+         {ended:?}"
     );
     let end_date = ended
         .end_date

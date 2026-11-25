@@ -749,12 +749,16 @@ impl ComAmazonawsEc2Amazonec2State {
             // analysis is still running.
             status_message: None,
             warning_message: None,
-            // "The analysis start date" (`StartDate`) is now; the end date, the findings and
-            // the analyzed interface count are owed by the clock, not by this call.
+            // "The analysis start date" (`StartDate`) is now; the end date and the findings
+            // are owed by the clock, not by this call.
             start_date: Some(system_time_to_date_time(SystemTime::now())),
             end_date: None,
             findings_found: None,
-            analyzed_eni_count: None,
+            // "The number of network interfaces analyzed" (`$AnalyzedEniCount`): a count of
+            // work DONE, which for an analysis that has only just started is none of it — so
+            // the analysis reports the counter at zero rather than leaving a client polling
+            // its progress with nothing to read.
+            analyzed_eni_count: Some(0),
             tags: Some(spec.tags),
         };
         self.add_stored_bytes(network_insights_access_scope_analysis_payload_bytes(

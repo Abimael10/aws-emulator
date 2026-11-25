@@ -29,30 +29,31 @@
 //! account cannot see is refused by [`crate::state::require_visible_image`], a `VolumeId`
 //! by [`crate::state::require_volume`] plus the three conditions the member
 //! documents ("must be in the same Availability Zone as the instance, must be in the
-//! `available` state, and must not be attached to an instance"), and a `SnapshotId` by
-//! [`crate::state::unresolvable_snapshot_id`] — this emulator stores no EBS snapshots at
-//! all, since `CreateSnapshot` is still a scaffold, so no snapshot id can resolve and
-//! `InvalidSnapshot.NotFound` is the faithful answer rather than a task that claims to
-//! restore from one.
+//! `available` state, and must not be attached to an instance"), and a `SnapshotId` against
+//! the account's own snapshots
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::holds_snapshot`]) — an id naming none of
+//! them is refused through [`crate::state::unresolvable_snapshot_id`], malformed before not
+//! found, rather than stored on a task that claims to restore from it.
 //!
 //! `VolumeInitializationRate` carries a published bound the model declares no `@range`
 //! for — "Valid range: 100 - 300 MiB/s" — so it is enforced here
 //! ([`crate::state::MIN_VOLUME_INITIALIZATION_RATE`]).
 //!
 //! `SnapshotId` on the task it answers is "the ID of the snapshot used to create the
-//! replacement root volume", which for a restore FROM AN AMI is the root device snapshot of
-//! the image the volume is restored from, read back off that stored image. A restore to the
-//! original root volume's launch state restores the AMI the instance was launched from, so
-//! that is the image read for it; a replacement BY a specified volume creates no volume from
-//! a snapshot and names none, and neither does a restore whose AMI this account holds no
-//! image for. A restore from a snapshot the REQUEST named never gets that far: it is refused
-//! above, so no stored task ever reports an id for a snapshot that does not exist. That id
-//! is one AWS mints per run — this store mints it the same way, in the
-//! published `snap-` plus 17 lowercase hexadecimal digit form, when the image is stored
-//! ([`crate::state::ComAmazonawsEc2Amazonec2State::insert_image`]) — so it is the snapshot
-//! of THIS run's image rather than the one some recording happened to see; it is reported
-//! identically on every read of the task and of the image it came from, which is the
-//! invariant such an id carries.
+//! replacement root volume", which every form that creates a volume from one reports: the
+//! snapshot the REQUEST named, and for a restore from an AMI the root device snapshot of the
+//! image the volume is restored from. A restore to the original root volume's launch state
+//! restores the AMI the instance was launched from, so that is the image read for it; a
+//! replacement BY a specified volume creates no volume from a snapshot and names none. The
+//! snapshot of an AMI this account holds no image for is minted by the store once and kept
+//! for that AMI
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::image_root_snapshot_id_for_restore`]):
+//! this emulator serves launches from such an AMI, so an instance can be running from an
+//! image whose root device this store never had, and a replacement restored from it is still
+//! created from a snapshot. That id is one AWS mints per run — this store mints it the same
+//! way, in the published `snap-` plus 17 lowercase hexadecimal digit form — so it is the
+//! snapshot of THIS run rather than the one some recording happened to see; it is reported
+//! identically on every read of the task, which is the invariant such an id carries.
 //!
 //! `DryRun` sits after every parameter has been validated and before the first write, so
 //! it reports whether the request WOULD have succeeded, and one `ClientToken` names the
@@ -349,10 +350,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             require_visible_image(&store, image_id)?;
         }
         if let Some(snapshot_id) = input.snapshot_id.as_deref() {
-            // This emulator stores no EBS snapshots at all (`CreateSnapshot` is still a
-            // scaffold), so no snapshot id can resolve: the request named a snapshot that
-            // does not exist, which is what it is told.
-            return Err(unresolvable_snapshot_id(snapshot_id));
+            // "The specified snapshot must be a snapshot that you previously created"
+            // (`SnapshotId`): the account's snapshots are this store's own
+            // ([`crate::state::ComAmazonawsEc2Amazonec2State::holds_snapshot`]), so an id
+            // naming none of them is refused rather than stored on a task that claims to
+            // restore from it — malformed before not found, the order EC2 asks the two
+            // questions in ([`unresolvable_snapshot_id`]).
+            if !store.holds_snapshot(snapshot_id) {
+                return Err(unresolvable_snapshot_id(snapshot_id));
+            }
         }
         if let Some(volume_id) = input.volume_id.as_deref() {
             // ONE lookup: the reader hands back the record it resolved
@@ -392,25 +398,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|token| store.replace_root_volume_task_client_tokens.get(token).cloned());
 
         let started_at = ::std::time::SystemTime::now();
-        // "The ID of the snapshot used to create the replacement root volume"
-        // (`ReplaceRootVolumeTask$SnapshotId`): a replacement volume RESTORED FROM AN AMI —
-        // the AMI the request named, or, for a restore to the original root volume's launch
-        // state, the AMI the instance was launched from — is created from that image's root
-        // device snapshot, read back off the stored image
-        // ([`crate::state::ComAmazonawsEc2Amazonec2State::image_root_snapshot_id`]). The two
-        // forms that name no snapshot are a replacement BY a specified volume (nothing is
-        // created from a snapshot) and a restore whose AMI this account holds no image for
-        // (this emulator's state then holds no snapshot the task could have used). The third
-        // form, a restore FROM a snapshot the request named, never reaches here: it is
-        // refused above, because this emulator stores no EBS snapshots for an id to resolve
-        // against.
-        let snapshot_id = if input.volume_id.is_some() {
-            None
-        } else {
-            restore_image
-                .as_deref()
-                .and_then(|image_id| store.image_root_snapshot_id(image_id))
-        };
+        // WHICH image the replacement root volume is restored from, when it is restored from
+        // one at all: the AMI the request named, or — for a restore to the original root
+        // volume's launch state — the AMI the instance was launched from. A replacement from a
+        // snapshot the request named is created from THAT snapshot, and a replacement BY a
+        // specified volume from no snapshot at all: neither reads an image.
+        let restored_from_image = (input.snapshot_id.is_none() && input.volume_id.is_none())
+            .then_some(restore_image)
+            .flatten();
         let view = ReplaceRootVolumeTask {
             // Minted by the store at the insert, so an id is never chosen twice.
             replace_root_volume_task_id: None,
@@ -420,12 +415,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             start_time: Some(iso8601_utc(started_at)),
             complete_time: None,
             tags: Some(tags),
-            // "The ID of the AMI used to create the replacement root volume" and "the ID
-            // of the snapshot used to create the replacement root volume": the AMI is the
-            // one the request named, having been resolved above, and the snapshot is the
-            // one the replacement volume was created from.
+            // "The ID of the AMI used to create the replacement root volume": the one the
+            // request named, having been resolved above. The snapshot the replacement volume
+            // is created from is settled at the insert below, where the store writes.
             image_id: input.image_id.clone(),
-            snapshot_id,
+            snapshot_id: None,
             // "Indicates whether the original root volume is to be deleted after the root
             // volume replacement task completes" — a request that asked for nothing keeps
             // the original volume, which the member reports as `false`.
@@ -460,10 +454,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let task_id = match replayed {
             Some(task_id) => task_id,
-            None => store.insert_replace_root_volume_task(
-                ReplaceRootVolumeTaskRecord::starting_now(view, started_at),
-                input.client_token.as_deref(),
-            ),
+            None => {
+                // "The ID of the snapshot used to create the replacement root volume"
+                // (`ReplaceRootVolumeTask$SnapshotId`): the snapshot the REQUEST named, which
+                // was resolved against the account's snapshots above, and otherwise — for a
+                // replacement restored from an image — that image's root device snapshot,
+                // through the one place this crate answers which snapshot that is
+                // ([`crate::state::ComAmazonawsEc2Amazonec2State::image_root_snapshot_id_for_restore`]):
+                // the stored image's own where the account holds that AMI, and otherwise the
+                // one the store mints for the AMI and keeps, so every task restoring from it
+                // names the same snapshot. Settled HERE, on the writing path, because that
+                // mint is a change to the store: a dry run and a replay settle nothing.
+                let mut view = view;
+                view.snapshot_id = match input.snapshot_id.clone() {
+                    named @ Some(_) => named,
+                    None => restored_from_image
+                        .as_deref()
+                        .and_then(|image_id| store.image_root_snapshot_id_for_restore(image_id)),
+                };
+                store.insert_replace_root_volume_task(
+                    ReplaceRootVolumeTaskRecord::starting_now(view, started_at),
+                    input.client_token.as_deref(),
+                )
+            }
         };
 
         // Read the response back OUT of the store, so the caller sees what a later

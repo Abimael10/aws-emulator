@@ -1545,7 +1545,8 @@ impl ComAmazonawsEc2Amazonec2State {
             // (`NetworkInsightsAccessScopeAnalysis$FindingsFound`): nothing analyzed this
             // scope, so whether it has findings was never determined — which is exactly
             // what the `FindingsFound` catalog's `unknown` member says. `AnalyzedEniCount`
-            // stays absent for the same reason: no network interface was analyzed.
+            // stays at the zero the start reported for the same reason: no network interface
+            // was analyzed.
             record.view.findings_found = Some(FINDINGS_FOUND_UNKNOWN.to_string());
             record.pending = None;
         }

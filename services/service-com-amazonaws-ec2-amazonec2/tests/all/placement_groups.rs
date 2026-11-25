@@ -23,8 +23,9 @@
 //! any later caller, the name is free for a new group, and a name the account holds no
 //! group under is refused with `InvalidPlacementGroup.Unknown` rather than reported as a
 //! deletion that happened. A delete that happened answers the ec2Query envelope's success
-//! flag and NOTHING about the group it removed — the operation's modelled output shape
-//! declares no members — and a group any other group still names as its parent, at whatever
+//! flag and the RECEIPT the live wire renders for the group it removed — that group's
+//! `groupId` and `groupName`, which the operation's modelled output declares no member for —
+//! and a group any other group still names as its parent, at whatever
 //! depth of a chain, stays stored.
 //!
 //! Every table row is a distinct input along what that generalises over — the strategy (one
@@ -1555,7 +1556,7 @@ async fn a_deleted_group_is_no_longer_a_group_of_the_account() {
             "case {case:?}: a successful delete answers no error envelope, got {deleted}"
         );
         // The modelled output declares no members, so the body is the envelope's success
-        // flag: the operation's whole report of what it did.
+        // flag and the receipt for the group that is gone.
         assert_eq!(
             member(&deleted, "return").as_deref(),
             Some("true"),
@@ -1771,10 +1772,10 @@ async fn a_dry_run_delete_removes_nothing() {
 /// The direct children a successful `DeletePlacementGroup` envelope carries — and the only
 /// ones it may. The operation's modelled output shape is `smithy.api#Unit`
 /// (`smithy_query(query="operation",operation="DeletePlacementGroup")`), which declares no
-/// members at all, so the whole answer is the correlation id every ec2Query response closes
-/// with and the envelope's success flag; a third element would be a member AWS publishes no
-/// rule for.
-const DELETE_ENVELOPE_CHILDREN: [&str; 2] = ["requestId", "return"];
+/// members at all, so the answer is the correlation id every ec2Query response closes with,
+/// the envelope's success flag, and the two elements the live wire renders as the receipt for
+/// the group that is gone; a further element would be a member AWS publishes no rule for.
+const DELETE_ENVELOPE_CHILDREN: [&str; 4] = ["groupId", "groupName", "requestId", "return"];
 
 /// The names of the DIRECT children of a response envelope's root, in document order — read
 /// through the XML parser, so an element nested inside a reported resource is never counted
@@ -1838,9 +1839,10 @@ async fn a_successful_create_answers_the_group_beside_the_envelopes_success_flag
 }
 
 #[tokio::test]
-async fn a_successful_delete_answers_the_envelope_s_success_flag_and_nothing_else() {
-    // The rule: a delete that happened reports the success of the call and nothing about the
-    // group it removed — the modelled output declares no members — in the media type every
+async fn a_successful_delete_answers_the_success_flag_and_the_group_it_removed() {
+    // The rule: a delete that happened reports the success of the call and the receipt for
+    // the group it removed — that group's id and name, which the modelled output declares no
+    // member for — in the media type every
     // response of this service declares, under a correlation id generated per response.
     // One row per member of the `PlacementStrategy` catalog plus the name and tag rows of
     // [`delete_cases`], so the shape of the answer is pinned across the inputs a delete
@@ -1850,7 +1852,8 @@ async fn a_successful_delete_answers_the_envelope_s_success_flag_and_nothing_els
     for (case, group_name, extra) in delete_cases() {
         let mut params = vec![param("GroupName", &group_name)];
         params.extend(extra);
-        create_ok(case, &router, &params).await;
+        let created = create_ok(case, &router, &params).await;
+        let group_id = one_group(case, &created).required(case, "groupId").to_string();
 
         let (status, content_type, body) = super::ec2_query::call_with_content_type(
             &router,
@@ -1912,6 +1915,21 @@ async fn a_successful_delete_answers_the_envelope_s_success_flag_and_nothing_els
             "case {case:?}: expected only {DELETE_ENVELOPE_CHILDREN:?} under the envelope, \
              got the extra {unexpected:?} in {body}"
         );
+
+        // The receipt: the group that is gone, by the id this account minted for it and the
+        // name the request named it by — the id read off the create rather than off this
+        // body, so the receipt has to name the group the account really held.
+        for (name, expected) in [("groupId", group_id.as_str()), ("groupName", group_name.as_str())]
+        {
+            let answered =
+                super::ec2_query::envelope_children(case, &body, "DeletePlacementGroup", name);
+            assert_eq!(
+                answered,
+                vec![expected.to_string()],
+                "case {case:?}: expected the receipt's <{name}> to be {expected:?}, got \
+                 {answered:?} in {body}"
+            );
+        }
     }
 }
 

@@ -19,7 +19,8 @@
 //!    device name, certificate and tags — under a server-minted id, in service and owed no
 //!    move, and every member of it reads back through the describe; a value outside what the
 //!    operation publishes is refused rather than defaulted or stored, and an identical request
-//!    answers the gateway it already made.
+//!    answers the gateway it already made. Every reported gateway also carries the
+//!    `certificatePinning` flag the live wire renders on one — see [`CERTIFICATE_PINNING`].
 //! 3. A DELETE TAKES THE GATEWAY AN ID NAMES OUT OF SERVICE: it keeps being reported, in the
 //!    terminal state of a gateway that is gone, whatever state it was in; an id the account
 //!    holds no gateway for is refused as the describe refuses one, and a gateway a VPN
@@ -134,6 +135,17 @@ impl Reported {
             .map_or("", String::as_str)
     }
 }
+
+/// The element the live wire renders on EVERY reported customer gateway saying whether the
+/// tunnels to it pin its certificate, and the value a gateway nothing enabled pinning for
+/// carries. This model declares no member for it, so it is written at the envelope seam
+/// (`crate::service::recorded_response_members`) and asserted here as part of what a reported
+/// gateway is.
+const CERTIFICATE_PINNING: &str = "certificatePinning";
+
+/// `certificatePinning` of a gateway certificate pinning is not enabled for — every gateway of
+/// this store, no operation of this service enabling it.
+const NOT_PINNED: &str = "false";
 
 /// The element the describe lists the gateways under
 /// (`DescribeCustomerGatewaysResult$CustomerGateways`'s `customerGatewaySet`).
@@ -267,6 +279,7 @@ async fn every_stored_gateway_is_reported_with_the_members_the_store_holds() {
                 ("ipAddress".to_string(), "203.0.113.12".to_string()),
                 ("bgpAsn".to_string(), "65000".to_string()),
                 ("deviceName".to_string(), "branch-office-router".to_string()),
+                (CERTIFICATE_PINNING.to_string(), NOT_PINNED.to_string()),
             ]),
             tags: vec![
                 ("Name".to_string(), "branch-office".to_string()),
@@ -286,6 +299,7 @@ async fn every_stored_gateway_is_reported_with_the_members_the_store_holds() {
                      12345678-1234-1234-1234-123456789012"
                         .to_string(),
                 ),
+                (CERTIFICATE_PINNING.to_string(), NOT_PINNED.to_string()),
             ]),
             tags: Vec::new(),
         },
@@ -296,6 +310,7 @@ async fn every_stored_gateway_is_reported_with_the_members_the_store_holds() {
                 ("type".to_string(), GATEWAY_TYPE_IPSEC_1.to_string()),
                 ("ipAddress".to_string(), "2001:db8::1".to_string()),
                 ("bgpAsnExtended".to_string(), "4200000000".to_string()),
+                (CERTIFICATE_PINNING.to_string(), NOT_PINNED.to_string()),
             ]),
             tags: Vec::new(),
         },
@@ -1012,13 +1027,15 @@ async fn a_create_stores_the_gateway_the_request_describes_and_reads_back() {
              {customer_gateway_id:?}"
         );
 
-        // The members the request chose, plus the two the service owns: the type it asked for
-        // and the state a create answers with.
+        // The members the request chose, plus the three the service owns: the type it asked
+        // for, the state a create answers with, and the certificate pinning flag every
+        // reported gateway carries ([`CERTIFICATE_PINNING`]).
         let mut expected = Reported {
             members: BTreeMap::from([
                 ("customerGatewayId".to_string(), customer_gateway_id.clone()),
                 ("state".to_string(), VPN_STATE_AVAILABLE.to_string()),
                 ("type".to_string(), GATEWAY_TYPE_IPSEC_1.to_string()),
+                (CERTIFICATE_PINNING.to_string(), NOT_PINNED.to_string()),
             ]),
             tags: tags.clone(),
         };

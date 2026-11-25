@@ -109,6 +109,18 @@ fn is_task_id(candidate: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+/// A `SnapshotId` is `snap-` followed by 8 or 17 lowercase hex digits, the short and the long
+/// EC2 id form.
+fn is_snapshot_id(candidate: &str) -> bool {
+    let Some(suffix) = candidate.strip_prefix("snap-") else {
+        return false;
+    };
+    matches!(suffix.len(), 8 | 17)
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// An RFC 3339 UTC timestamp, as the service renders `StartTime` and `CompleteTime`:
 /// `YYYY-MM-DDThh:mm:ssZ`.
 fn is_iso8601_utc(candidate: &str) -> bool {
@@ -533,12 +545,32 @@ async fn a_task_is_minted_from_the_request_and_reported_from_the_store() {
              got {:?}",
             case.label, created.image_id
         );
-        assert_eq!(
-            created.snapshot_id, expected_snapshot,
-            "case {:?}: the task must report the snapshot the replacement volume was \
-             created from, got {:?}",
-            case.label, created.snapshot_id
-        );
+        // A replacement restored from an AMI is created from that AMI's root device snapshot,
+        // whether or not the account holds the image: an AMI the account cannot see publishes
+        // no mapping to read, so the store mints the snapshot for it and the task reports
+        // that one — a per-run id, so the row asserts its FORM rather than a value.
+        match expected_snapshot.as_deref() {
+            Some(expected) => assert_eq!(
+                created.snapshot_id.as_deref(),
+                Some(expected),
+                "case {:?}: the task must report the snapshot the replacement volume was \
+                 created from, got {:?}",
+                case.label,
+                created.snapshot_id
+            ),
+            None if case.restore_from != RestoreFrom::AVolume => assert!(
+                created.snapshot_id.as_deref().is_some_and(is_snapshot_id),
+                "case {:?}: a replacement restored from an image must report the snapshot it \
+                 was created from, got {:?}",
+                case.label,
+                created.snapshot_id
+            ),
+            None => assert_eq!(
+                created.snapshot_id, None,
+                "case {:?}: a replacement by a volume is created from no snapshot, got {:?}",
+                case.label, created.snapshot_id
+            ),
+        }
         assert_eq!(
             created.delete_replaced_root_volume.as_deref(),
             Some(case.expected_delete_flag),
@@ -587,6 +619,101 @@ async fn a_task_is_minted_from_the_request_and_reported_from_the_store() {
             case.label
         );
     }
+}
+
+/// Rule 1, on the member the service owns the most of: WHICHEVER source creates the
+/// replacement volume from a snapshot, the task reports that snapshot — the one the request
+/// named, the root device snapshot of a stored AMI, or the snapshot the store keeps for an
+/// AMI the account holds no image for. The rows differ along which source names the snapshot
+/// and along whether two tasks name the same AMI, which is what the identity of the snapshot
+/// follows from; a replacement BY a volume is the row that names none.
+#[tokio::test]
+async fn the_snapshot_a_replacement_is_created_from_is_reported_for_every_source() {
+    let router = emulator();
+
+    // A snapshot the account really holds, taken of a volume of the account: the one source
+    // whose snapshot the REQUEST names, so the task has to echo exactly it.
+    let instance_id = launch(&router).await;
+    let zone = instance_zone(&router, &instance_id).await;
+    let volume_id = volume_in(&router, &zone).await;
+    let (status, body) = api(&router, "CreateSnapshot", &[p("VolumeId", volume_id.as_str())]).await;
+    assert_eq!(status, 200, "CreateSnapshot must succeed, got {status}: {body}");
+    let snapshot_id = element(&body, "snapshotId")
+        .unwrap_or_else(|| panic!("CreateSnapshot must report the snapshot it took: {body}"));
+
+    let (status, body) = create(
+        &router,
+        &[
+            p("InstanceId", instance_id.as_str()),
+            p("SnapshotId", snapshot_id.as_str()),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"restored from a snapshot the account holds\": the create must succeed, got \
+         {status}: {body}"
+    );
+    let from_snapshot = created_task(&body);
+    assert_eq!(
+        from_snapshot.snapshot_id.as_deref(),
+        Some(snapshot_id.as_str()),
+        "case \"restored from a snapshot the account holds\": the task must report the \
+         snapshot the request named, got {:?}",
+        from_snapshot.snapshot_id
+    );
+    // And the read path reports the same snapshot, so the id survives the create response.
+    let task_id = from_snapshot
+        .id
+        .clone()
+        .expect("the task must carry an id");
+    let (_, body) = describe(&router, &[p("ReplaceRootVolumeTaskId.1", task_id.as_str())]).await;
+    let reported = described_tasks(&body);
+    assert_eq!(
+        reported.first().and_then(|task| task.snapshot_id.clone()),
+        Some(snapshot_id.clone()),
+        "case \"restored from a snapshot the account holds\": the describe must report the \
+         same snapshot: {body}"
+    );
+
+    // An AMI the account holds no image for publishes no mapping to read, so the store keeps
+    // the root device snapshot it minted for that AMI: the snapshot is a fact of the IMAGE, so
+    // two tasks restoring from the same AMI name one snapshot and tasks restoring from
+    // different AMIs name different ones.
+    let other_ami = "ami-0fedcba987654321f";
+    let mut snapshots_by_ami: Vec<(&str, String)> = Vec::new();
+    for (case, image_id) in [
+        ("the first task of an AMI the account does not hold", UNKNOWN_AMI),
+        ("a second task of that same AMI", UNKNOWN_AMI),
+        ("a task of another AMI the account does not hold", other_ami),
+    ] {
+        let instance_id = launch_from(&router, image_id).await;
+        let (status, body) = create(&router, &[p("InstanceId", instance_id.as_str())]).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the create must succeed, got {status}: {body}"
+        );
+        let task = created_task(&body);
+        let reported = task.snapshot_id.clone().unwrap_or_default();
+        assert!(
+            is_snapshot_id(&reported),
+            "case {case:?}: a replacement restored from an image must report the snapshot it \
+             was created from, got {reported:?}"
+        );
+        snapshots_by_ami.push((image_id, reported));
+    }
+    assert_eq!(
+        snapshots_by_ami[0].1, snapshots_by_ami[1].1,
+        "case \"a second task of that same AMI\": one AMI has one root device snapshot, got \
+         {:?} and {:?}",
+        snapshots_by_ami[0].1, snapshots_by_ami[1].1
+    );
+    assert_ne!(
+        snapshots_by_ami[0].1, snapshots_by_ami[2].1,
+        "case \"a task of another AMI the account does not hold\": a different AMI has a \
+         different root device snapshot, got {:?} for both",
+        snapshots_by_ami[2].1
+    );
 }
 
 /// Rule 2: the clock walks a task through its states, `CompleteTime` appears only once it

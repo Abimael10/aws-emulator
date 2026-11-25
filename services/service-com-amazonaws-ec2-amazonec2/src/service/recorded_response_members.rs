@@ -18,8 +18,9 @@
 //! every subnet with the `<dhcpOptionsId>` it inherits from its VPC and the
 //! `<dhcpOptionsSource>` naming where that set came from, and a recorded
 //! `GetIpamPoolAllocations` answers every allocation with `<allocationId>`, `<cidrBlock>`,
-//! `<resourceProvider>` and `<status>` beside the members the shape declares. The generated
-//! serializer walks
+//! `<resourceProvider>` and `<status>` beside the members the shape declares, and a recorded
+//! `DescribeCustomerGateways` answers every customer gateway with `<certificatePinning>`. The
+//! generated serializer walks
 //! the model's members and only those, so those elements are missing from this emulator's
 //! responses: a client that reads `dhcpOptionsSource` to decide whether a VPC's DHCP
 //! options are its own or the account's reads nothing, and a strict deserializer that
@@ -55,6 +56,15 @@
 //! owns the value resolves it and hands it here ([`hold_subnet_dhcp_options`],
 //! [`hold_instance_interface_public_hostname`]), because writing an element the model does
 //! not declare is still only possible at this seam.
+//!
+//! # An element on the OPERATION rather than on a reported shape
+//!
+//! An element the live wire renders on an operation's RESULT, which the model declares no
+//! member for — a recorded `DeletePlacementGroup` answers the `<groupId>` and `<groupName>` of
+//! the group it removed, where this model's output for it is `smithy.api#Unit` — has no
+//! reported shape to key on at all. Those are written from the operation's own table
+//! ([`recorded_envelope_writer_for`]), out of what the handler resolved
+//! ([`hold_deleted_placement_group`]), beside the shape-keyed elements above.
 //!
 //! # The other difference this seam closes
 //!
@@ -92,6 +102,11 @@ const DHCP_OPTIONS_ID_MEMBER: &str = "DhcpOptionsId";
 /// structure being walked IS a reported subnet — and the key the option set in force for it
 /// was held under.
 const SUBNET_ID_MEMBER: &str = "SubnetId";
+
+/// The Smithy member name a customer gateway's own id is written under, which is what says
+/// the structure being walked IS a reported customer gateway rather than a shape whose member
+/// merely shares the name (`Explanation$CustomerGateway` targets an analysis component).
+const CUSTOMER_GATEWAY_ID_MEMBER: &str = "CustomerGatewayId";
 
 thread_local! {
     /// The DHCP option set in force for each subnet THIS response reports, keyed by
@@ -203,6 +218,52 @@ fn held_instance_interface_public_hostname(
 ) -> Option<HeldPublicHostname> {
     INSTANCE_INTERFACE_PUBLIC_HOSTNAMES
         .with(|slot| slot.borrow().get(network_interface_id).cloned())
+}
+
+thread_local! {
+    /// The placement group the `DeletePlacementGroup` being served removed, as the receipt
+    /// for that deletion names it.
+    ///
+    /// Held for the same reason as [`SUBNET_DHCP_OPTIONS`], and on the same invariant: the
+    /// operation's modelled output declares no member at all, so the two elements its
+    /// recorded receipt carries can only be written at this seam, and only the handler knows
+    /// which group was removed. Empty for every other call, in which case nothing is
+    /// written.
+    static DELETED_PLACEMENT_GROUP: RefCell<Option<DeletedPlacementGroup>> =
+        const { RefCell::new(None) };
+}
+
+/// The placement group a delete removed: the name the request named it by and the id this
+/// store minted for it, both read off the record the delete resolved.
+#[derive(Debug, Clone)]
+struct DeletedPlacementGroup {
+    group_id: String,
+    group_name: String,
+}
+
+/// Hold the placement group the delete being served removed, so the receipt it answers names
+/// the group that is gone.
+///
+/// Replaces whatever was held, so one call's receipt never leaks into another's.
+pub fn hold_deleted_placement_group(group_id: &str, group_name: &str) {
+    DELETED_PLACEMENT_GROUP.with(|slot| {
+        *slot.borrow_mut() = Some(DeletedPlacementGroup {
+            group_id: group_id.to_string(),
+            group_name: group_name.to_string(),
+        });
+    });
+}
+
+/// Drop whatever deletion receipt this thread may still hold: it belongs to no call the run
+/// about to start serves.
+pub fn forget_any_held_deleted_placement_group() {
+    DELETED_PLACEMENT_GROUP.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// The placement group the delete being served removed, or `None` when this call removed
+/// none.
+fn held_deleted_placement_group() -> Option<DeletedPlacementGroup> {
+    DELETED_PLACEMENT_GROUP.with(|slot| slot.borrow().clone())
 }
 
 /// The Smithy member name a Verified Access instance's own id is written under, which is
@@ -512,6 +573,20 @@ static INTERNET_GATEWAY_ASSOCIATION: Schema = Schema::new_member(
     0,
 );
 
+/// `<certificatePinning>` on a reported CUSTOMER GATEWAY — a member schema for the same
+/// reason as [`VPC_DHCP_OPTIONS_SOURCE`]: `com.amazonaws.ec2#CustomerGateway` declares the
+/// gateway's certificate (`certificateArn`) and no flag saying whether the tunnel pins it.
+static CUSTOMER_GATEWAY_CERTIFICATE_PINNING: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.ec2#CustomerGateway$certificatePinning",
+        EC2_NAMESPACE,
+        "certificatePinning",
+    ),
+    ShapeType::Boolean,
+    "certificatePinning",
+    0,
+);
+
 /// `<natEnabled>` on a reported network-interface association — a member schema for the same
 /// reason as [`VPC_DHCP_OPTIONS_SOURCE`]: `com.amazonaws.ec2#NetworkInterfaceAssociation`
 /// declares the addressing members of the association and no flag for the translation that
@@ -583,6 +658,35 @@ static IPAM_POOL_ALLOCATION_STATUS: Schema = Schema::new_member(
     0,
 );
 
+/// `<groupId>` on a `DeletePlacementGroup` receipt \u2014 a member schema for the same reason as
+/// [`VPC_DHCP_OPTIONS_SOURCE`], one level out: the operation's modelled output is
+/// `smithy.api#Unit`, so the envelope's result shape declares no member at all for the two
+/// elements the live wire renders on it. The shape id names the result shape the EC2 API
+/// Reference documents those elements under.
+static DELETE_PLACEMENT_GROUP_GROUP_ID: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.ec2#DeletePlacementGroupResult$groupId",
+        EC2_NAMESPACE,
+        "groupId",
+    ),
+    ShapeType::String,
+    "groupId",
+    0,
+);
+
+/// `<groupName>` on a `DeletePlacementGroup` receipt, naming the group the id above belongs
+/// to.
+static DELETE_PLACEMENT_GROUP_GROUP_NAME: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.ec2#DeletePlacementGroupResult$groupName",
+        EC2_NAMESPACE,
+        "groupName",
+    ),
+    ShapeType::String,
+    "groupName",
+    0,
+);
+
 /// The content of the `association` element of a gateway no association has been made for:
 /// no member at all, which is what makes the element present and empty.
 struct NoAssociation;
@@ -593,13 +697,17 @@ impl SerializableStruct for NoAssociation {
     }
 }
 
-/// One BORROWED structure serialized with the recorded elements of every shape under it.
+/// One BORROWED structure serialized with the recorded elements of every shape under it, and
+/// with the elements the OPERATION's own response envelope renders beside them.
 ///
 /// The entry point: a service that renders its own protocol envelope reaches its output as a
-/// `&dyn SerializableStruct` and wraps it here. Every structure NESTED under that output is
-/// re-entered, because the codec walks a nested structure with its own serializer, so the
-/// rule reaches the reported shape wherever it sits — a list item, a member of its own.
-pub struct RecordedMembersRef<'a>(pub &'a dyn SerializableStruct);
+/// `&dyn SerializableStruct` and wraps it here, with the name of the operation being
+/// answered. Every structure NESTED under that output is re-entered, because the codec walks
+/// a nested structure with its own serializer, so the rule reaches the reported shape wherever
+/// it sits — a list item, a member of its own. The operation's own elements
+/// ([`recorded_envelope_writer_for`]) are written last, after the output's members, for the
+/// same reason a shape's are: the order the model gave the body is untouched.
+pub struct RecordedMembersRef<'a>(pub &'a dyn SerializableStruct, pub &'a str);
 
 impl SerializableStruct for RecordedMembersRef<'_> {
     fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
@@ -607,8 +715,49 @@ impl SerializableStruct for RecordedMembersRef<'_> {
             inner: s,
             written: None,
             zone: EnclosingRecord::default(),
-        })
+        })?;
+        match recorded_envelope_writer_for(self.1) {
+            Some(writer) => writer(s),
+            None => Ok(()),
+        }
     }
+}
+
+/// How one OPERATION's response envelope renders the elements its modelled output declares no
+/// member for, written once the output's own members have been.
+type RecordedEnvelopeWriter = fn(&mut dyn ShapeSerializer) -> Result<(), SerdeError>;
+
+/// How one OPERATION's response envelope renders the elements its modelled output declares no
+/// member for, or `None` for an operation the live wire answers exactly as the model declares
+/// it.
+///
+/// The shape-keyed table above cannot answer for these: the elements sit on the operation's
+/// RESULT shape rather than on a shape reported inside it, and an output modelled as
+/// `smithy.api#Unit` carries no shape of its own to key on at all.
+fn recorded_envelope_writer_for(operation_name: &str) -> Option<RecordedEnvelopeWriter> {
+    match operation_name {
+        "DeletePlacementGroup" => Some(write_delete_placement_group_recorded_members),
+        _ => None,
+    }
+}
+
+/// A `DeletePlacementGroup` receipt's recorded elements: the id and the name of the group the
+/// call removed.
+///
+/// Both are read off the record the delete resolved and handed here by the handler
+/// ([`hold_deleted_placement_group`]) — the name the request named the group by and the id
+/// this store minted for it when the group was created — so the receipt reports the group
+/// that is gone rather than an echo of the request alone. Written only for a call that
+/// removed one: a refused delete renders through the error envelope and never through here,
+/// and a call that held nothing reports nothing.
+fn write_delete_placement_group_recorded_members(
+    s: &mut dyn ShapeSerializer,
+) -> Result<(), SerdeError> {
+    let Some(deleted) = held_deleted_placement_group() else {
+        return Ok(());
+    };
+    s.write_string(&DELETE_PLACEMENT_GROUP_GROUP_ID, &deleted.group_id)?;
+    s.write_string(&DELETE_PLACEMENT_GROUP_GROUP_NAME, &deleted.group_name)
 }
 
 /// One nested structure of no recorded elements of its own, serialized with the zone of the
@@ -690,6 +839,9 @@ struct WrittenMembers {
     /// Whether the structure wrote a Verified Access instance id of its own, which is the
     /// id the attachment set below belongs to.
     verified_access_instance_id: bool,
+    /// Whether the structure wrote a customer gateway id of its own, which is what makes a
+    /// structure named after a customer gateway one.
+    customer_gateway_id: bool,
     /// Whether the structure wrote an internet gateway id of its own, which is what makes a
     /// structure named after an internet gateway one.
     internet_gateway_id: bool,
@@ -756,6 +908,7 @@ fn recorded_writer_for(schema: &Schema) -> Option<RecordedWriter> {
     match schema.shape_id().shape_name() {
         "Vpc" => Some(write_vpc_recorded_members),
         "Subnet" => Some(write_subnet_recorded_members),
+        "CustomerGateway" => Some(write_customer_gateway_recorded_members),
         "IpamPoolAllocation" => Some(write_ipam_pool_allocation_recorded_members),
         "VerifiedAccessInstance" => Some(write_verified_access_instance_recorded_members),
         "InternetGateway" => Some(write_internet_gateway_recorded_members),
@@ -1100,6 +1253,30 @@ fn write_subnet_recorded_members(
     s.write_string(&SUBNET_DHCP_OPTIONS_SOURCE, DHCP_OPTIONS_SOURCE_VPC)
 }
 
+/// A reported CUSTOMER GATEWAY's recorded elements: whether the tunnels to it pin the
+/// gateway's certificate.
+///
+/// NOT enabled for any gateway of this store: certificate pinning is turned on where the
+/// gateway's certificate is configured, and no operation of this service turns it on — the
+/// create takes a certificate ARN and nothing about pinning it — so every gateway reports the
+/// flag off. That is the whole difference the element closes for a client that reads it:
+/// absent reads as "this answer does not say", present and `false` as "not enabled".
+///
+/// Written only for a structure that reported a customer gateway id of its own, which is what
+/// makes it one of these gateways rather than a shape whose member merely shares the name — so
+/// it reaches the create's `customerGateway`, every item of a describe's `customerGatewaySet`
+/// and the delete's echo alike, the rule being the shape's rather than one handler's.
+fn write_customer_gateway_recorded_members(
+    s: &mut dyn ShapeSerializer,
+    written: &WrittenMembers,
+    _zone: &EnclosingRecord,
+) -> Result<(), SerdeError> {
+    if !written.customer_gateway_id {
+        return Ok(());
+    }
+    s.write_boolean(&CUSTOMER_GATEWAY_CERTIFICATE_PINNING, false)
+}
+
 /// A reported Verified Access instance's recorded elements: the transit-gateway attachments
 /// it holds.
 ///
@@ -1335,6 +1512,7 @@ impl ShapeSerializer for RecordedMemberSerializer<'_> {
                     VERIFIED_ACCESS_INSTANCE_ID_MEMBER => {
                         written.verified_access_instance_id = true;
                     }
+                    CUSTOMER_GATEWAY_ID_MEMBER => written.customer_gateway_id = true,
                     INTERNET_GATEWAY_ID_MEMBER => written.internet_gateway_id = true,
                     VOLUME_ID_MEMBER => written.volume_id = true,
                     HTTP_TOKENS_MEMBER => written.http_tokens = true,

@@ -104,5 +104,40 @@ Traces: ec2-t12-post-delete-not-found-probes#task#18.
 All ten causes are HTTP 200 responses whose bodies lack members the recording always carries:
 $.CreateFlowLogsResponse.clientToken missing; $.DescribeCustomerGatewaysResponse.customerGatewaySet.item.certificatePinning missing (expected 'false'); $.DescribeInstanceEventWindowsResponse.instanceEventWindowSet.item.associationTarget missing (expected {dedicatedHostIdSet, instanceIdSet, tagSet}); $.CreateIpamPoolResponse.ipamPool.locale missing (expected 'None'); $.ModifyVerifiedAccessInstanceResponse.verifiedAccessInstance.verifiedAccessInstanceTransitGatewayAttachmentSet missing (expected empty); $.StartNetworkInsightsAccessScopeAnalysisResponse.networkInsightsAccessScopeAnalysis.analyzedEniCount missing (expected '0'); $.CreateReplaceRootVolumeTaskResponse.replaceRootVolumeTask.snapshotId missing; $.DescribeReplaceRootVolumeTasksResponse.replaceRootVolumeTaskSet.item.snapshotId missing; $.DescribeSubnetsResponse.subnetSet.item.dhcpOptionsId and .dhcpOptionsSource missing (expected the dopt-* id and 'vpc'); $.DeletePlacementGroupResponse.groupId and .groupName missing.
 
+## Resolution
+
+The rule applied: a member of a reported shape whose value the service always knows is
+present in EVERY response that reports that shape, carrying the value in force — never left
+out for a client to tell "nothing" from "this answer does not say". Four of the ten causes
+needed work; the other six were already served by mainline (see below).
+
+* Cause 2 (`certificatePinning`) and Cause 10 (`DeletePlacementGroup`'s `groupId`/`groupName`)
+  are elements this checkout's model declares no member for, so they are written at the one
+  seam that can write one (`src/service/recorded_response_members.rs`): the gateway's flag is
+  keyed on the SHAPE, so it reaches the create, every describe item and the post-delete read
+  alike, and the delete's receipt is keyed on the OPERATION, the modelled output being
+  `smithy.api#Unit` — the id read off the record the delete resolved and the name the request
+  named it by.
+* Cause 6 (`analyzedEniCount`): a counter of work done starts at zero, so the start reports 0
+  and the end the clock owes the analysis leaves it there, nothing having analyzed the scope.
+* Causes 7 and 8 (`snapshotId` on the create and the describe of a root volume replacement
+  task): the snapshot is now resolved for every form that creates the replacement volume from
+  one — the snapshot the request named (resolved against the account's own snapshots, which
+  this store now holds, instead of the stale blanket refusal), and otherwise the root device
+  snapshot of the image restored, which the store mints once per AMI and keeps for an AMI the
+  account holds no image for. Both paths read one record, so the create and the describe
+  cannot disagree.
+* Already correct, unchanged: Cause 1 (`CreateFlowLogs` echoes the recorded token),
+  Cause 3 (a fresh event window holds an empty association target),
+  Cause 4 (`state::reported_ipam_pool` reports the `None` locale),
+  Cause 5 (the Verified Access attachment set is written at the same seam),
+  Cause 9 (the subnet's DHCP option set and its source are resolved by the projection and
+  written at that seam).
+
+Covered by `tests/all/response_members_every_read_reports.rs` and by new rows and a new test
+in `tests/all/customer_gateways.rs`, `tests/all/placement_groups.rs`,
+`tests/all/network_insights_access_scope_analyses.rs` and
+`tests/all/replace_root_volume_tasks.rs`.
+
 ## Steps to Reproduce
 Replay simparity-wire-aws-v1 and inspect ec2-conflict-flow-log-duplicate#task#3, ec2-customer-gateway-crud-lifecycle#task#2, ec2-instance-event-window-and-application-status-check-lifecycle#task#2, ec2-ipam-consolidated-delete-and-deprovision-lifecycle#task#11, ec2-modify-verified-access-instance-contract#task#2, ec2-network-insights-access-scope-analysis-lifecycle#task#3, ec2-replace-root-volume-task#task#6 and #task#7, ec2-subnet-route-table-lifecycle#task#5, ec2-t12-post-delete-not-found-probes#task#18.

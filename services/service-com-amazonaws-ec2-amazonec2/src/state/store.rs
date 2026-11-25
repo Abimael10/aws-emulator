@@ -2373,6 +2373,27 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// [`Self::images`] under the same id, written by the one writer of an image
     /// ([`Self::insert_image`]) and reported by `DescribeImageAttribute`'s `uefiData`.
     pub image_uefi_data: BTreeMap<String, String>,
+    /// The ROOT DEVICE SNAPSHOT this store reports for an AMI the account cannot see, by the
+    /// `ImageId` named: minted once, on the first write that has to name it, and kept, so
+    /// every later answer about that AMI's root device names the same snapshot.
+    ///
+    /// Why it exists: this emulator serves a launch from an AMI it holds no image for (see
+    /// the module docs of `super::launched_root_volumes`), so an instance can be running from
+    /// an image whose own block device mapping this store never had. A root volume restored
+    /// from such an image is still restored FROM A SNAPSHOT — which is what
+    /// `ReplaceRootVolumeTask$SnapshotId` reports of the replacement it creates — and the id
+    /// of that snapshot is a fact of the IMAGE rather than of one task, so it is held here
+    /// under the image id rather than on each record that reports it. There is no snapshot
+    /// RECORD to go with it: the account cannot see the image, so it cannot see the image
+    /// owner's snapshot either, and `DescribeSnapshots` resolves no more for this id than it
+    /// does for any snapshot of another account.
+    ///
+    /// Written by [`Self::image_root_snapshot_id_for_restore`], the one place that mint
+    /// happens, bounded by [`MAX_STORED_RECORDS_PER_STORE`] entries and charged against the
+    /// store's byte budget ([`unseen_image_root_snapshot_bytes`]) exactly as every other
+    /// record of this store is, so request traffic naming fresh ids cannot grow it without
+    /// end.
+    pub unseen_image_root_snapshots: BTreeMap<String, String>,
     /// When the `pending` -> `available` move an AMI COPY left owing falls due, by the
     /// `ImageId` of the image that owes it, on the same monotonic clock and for the same
     /// reason [`Self::vpc_available_at`] holds a `pending` VPC's: the modelled [`Image`]
@@ -4120,6 +4141,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             network_insights_analysis_client_tokens: HashMap::new(),
             images: BTreeMap::new(),
             image_uefi_data: BTreeMap::new(),
+            // Nothing has had to name the root snapshot of an AMI this store holds no image
+            // for yet.
+            unseen_image_root_snapshots: BTreeMap::new(),
             // A fresh account has copied no AMI, so no image owes a move and no token names
             // one.
             image_available_at: BTreeMap::new(),
