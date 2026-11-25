@@ -1008,9 +1008,11 @@ pub const PROFILE_RESOURCE_TYPE: &str = "PROFILE";
 /// The `ResourceType` a Profile-association error reports.
 pub const PROFILE_ASSOCIATION_RESOURCE_TYPE: &str = "PROFILE_ASSOCIATION";
 
-/// The message every "this id names nothing" refusal of this service carries: one
-/// template shared by every resource kind of the Resolver family this service
-/// belongs to, whose only variable part is the id, taken verbatim from the request.
+/// The message a "this id names nothing" refusal carries for the resource kinds of
+/// the Resolver family this service belongs to that share one template — a Profile,
+/// a Profile association, a tagged resource — whose only variable part is the id,
+/// taken verbatim from the request. A Profile RESOURCE association is reported with
+/// its own template instead ([`profile_resource_association_not_found`]).
 ///
 /// The family reports its sub-error code inside the message rather than in
 /// `Error.Code`, which stays `ResourceNotFoundException`.
@@ -1096,14 +1098,22 @@ pub fn vpc_association_limit_exceeded(
 pub const PROFILE_RESOURCE_ASSOCIATION_RESOURCE_TYPE: &str = "PROFILE_RESOURCE_ASSOCIATION";
 
 /// `ResourceNotFoundException` for a resource-association id that names no stored
-/// resource association.
+/// resource association — the refusal of every operation addressed by a
+/// `ProfileResourceAssociationId`.
 ///
-/// The Resolver family answers a lookup of an id it holds nothing for with one
-/// template, naming only the id from the request.
+/// This plane does NOT share the service's resource-kind-agnostic template
+/// ([`resource_not_found_message`]): an id that resolves to no Profile resource
+/// association is reported with the association's own sub-error code and sentence,
+/// whose single variable part is the id taken verbatim from the request.
 pub fn profile_resource_association_not_found(
     association_id: &str,
 ) -> crate::ops::types::ResourceNotFoundException {
-    resource_not_found(association_id, PROFILE_RESOURCE_ASSOCIATION_RESOURCE_TYPE)
+    crate::ops::types::ResourceNotFoundException {
+        message: Some(format!(
+            "[RSLVR-05200] Can't locate the Profile association with ID: \"{association_id}\"."
+        )),
+        resource_type: Some(PROFILE_RESOURCE_ASSOCIATION_RESOURCE_TYPE.to_string()),
+    }
 }
 
 /// `ValidationException` for a `ResourceArn` this service cannot read as naming a

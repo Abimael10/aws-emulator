@@ -28,6 +28,11 @@
 //!   the stored association left exactly as it was;
 //! * `DisassociateResourceFromProfile` removes the association, reports it in the
 //!   phase of being removed, and leaves its id naming nothing;
+//! * an id that resolves to no stored resource association — one that was removed, and
+//!   one that was never minted — is refused by EVERY operation addressed by a
+//!   `ProfileResourceAssociationId` with the Profile-association not-found template,
+//!   while an operation addressed by the (Profile, resource) pair keeps naming both
+//!   values it was given;
 //! * a DNS Firewall rule group's `priority` is accepted inside the documented
 //!   range and refused outside it, with nothing persisted for a refused request;
 //! * an ARN naming any other kind of resource is refused;
@@ -352,6 +357,15 @@ fn being_removed_message(kind: &str) -> String {
     format!("Deleting the Profile to {kind} association")
 }
 
+/// The whole message an operation addressed by a `ProfileResourceAssociationId`
+/// refuses an id that resolves to no stored resource association with: the
+/// Profile-association sub-error code, the fixed sentence, and the id from the
+/// request in double quotes. TRANSCRIBED here, so the suite states the template
+/// independently of the code that renders it.
+fn association_not_found_message(id: &str) -> String {
+    format!("[RSLVR-05200] Can't locate the Profile association with ID: \"{id}\".")
+}
+
 /// Whether `id` is `rpr-` followed by 16 lowercase hex digits — the id shape this
 /// emulator mints for a resource association, inside `ResourceId`'s modelled 1..64
 /// length.
@@ -600,7 +614,7 @@ async fn a_disassociated_resource_association_is_reported_removed_and_then_names
             );
             assert_eq!(
                 gone.message(),
-                format!("[RSLVR-05007] Can't find the resource with ID \"{id}\"."),
+                association_not_found_message(&id),
                 "case {case}: read {attempt} reported an unexpected refusal message"
             );
         }
@@ -632,6 +646,122 @@ async fn a_disassociated_resource_association_is_reported_removed_and_then_names
             ids,
             vec![kept_id.clone()],
             "case {case}: the Profile must list only the association that was not removed"
+        );
+    }
+}
+
+/// The message an operation addressed by a (ProfileId, ResourceArn) PAIR reports an
+/// unresolvable pair with, naming both values from the request. Transcribed, so this
+/// suite can show the id-addressed template and the pair-addressed one stay apart.
+fn pair_not_found_message(profile_id: &str, resource_arn: &str) -> String {
+    format!(
+        "[RSLVR-05300] Can't locate the Profile ID: \"{profile_id}\" or resource ID \
+         \"{resource_arn}\"."
+    )
+}
+
+#[tokio::test]
+async fn an_id_that_resolves_to_no_resource_association_is_refused_with_the_association_template() {
+    let em = Emulator::new();
+    let profile_id = em.profile("association-not-found").await;
+
+    // Rows spanning both ways an id comes to resolve to nothing — one minted and then
+    // removed per kind of resource a Profile can hold, and ids that were never minted
+    // — over ids differing in shape: the minted `rpr-` + 16 hex form at both ends of
+    // its range, a non-hex tail, a bare word, a single character, and exactly the
+    // modelled 64-character maximum of `ResourceId`
+    // (`smithy_query(query="shape",shape="ResourceId")`: @length 1..64).
+    let mut cases: Vec<(String, String)> = Vec::new();
+    for (index, (resource_arn, _resource_type, _kind)) in
+        associable_resources().into_iter().enumerate()
+    {
+        let created = em
+            .associate(&profile_id, &resource_arn, &format!("gone{index}"), None)
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case arn={resource_arn}: associate expected 200, got {} / {:?}",
+            created.status, created.body
+        );
+        let id = created.field("Id");
+        let removed = em.disassociate(&profile_id, &resource_arn).await;
+        assert_eq!(
+            removed.status, 200,
+            "case arn={resource_arn}: disassociate expected 200, got {} / {:?}",
+            removed.status, removed.body
+        );
+        cases.push((format!("removed arn={resource_arn}"), id));
+    }
+    for unminted in [
+        "rpr-0000000000000000",
+        "rpr-ffffffffffffffff",
+        "rpr-notevenhexdigit",
+        "nosuchassociation",
+        "z",
+    ] {
+        cases.push((format!("unminted {unminted}"), unminted.to_string()));
+    }
+    cases.push(("unminted 64-character id".to_string(), "q".repeat(64)));
+
+    for (origin, id) in cases {
+        // Both operations addressed by a `ProfileResourceAssociationId`: the read and
+        // the update. Each reports the same refusal, because the id is what neither
+        // can resolve.
+        for (operation, reply) in [
+            ("GetProfileResourceAssociation", em.get_association(&id).await),
+            (
+                "UpdateProfileResourceAssociation",
+                em.update(&id, Some("renamed"), None).await,
+            ),
+        ] {
+            let case = format!("{operation} {origin} id={id}");
+            assert_eq!(
+                reply.status, 400,
+                "case {case}: expected HTTP 400, got {} / {:?}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                reply.error.as_deref(),
+                Some("ResourceNotFoundException"),
+                "case {case}: expected ResourceNotFoundException, got {:?}",
+                reply.body
+            );
+            assert_eq!(
+                reply.message(),
+                association_not_found_message(&id),
+                "case {case}: expected {:?}, got {:?}",
+                association_not_found_message(&id),
+                reply.message()
+            );
+        }
+    }
+
+    // The template belongs to the operations addressed by the association's own id: an
+    // operation addressed by the (Profile, resource) PAIR still names both values it
+    // was given instead, since either half can be why the pair resolves to nothing.
+    for (profile, arn) in [
+        (profile_id.as_str(), "arn:aws:route53:::hostedzone/Z0000000000000000001"),
+        ("rp-0000000000000000", "arn:aws:route53:::hostedzone/Z0000000000000000002"),
+    ] {
+        let reply = em.disassociate(profile, arn).await;
+        let case = format!("DisassociateResourceFromProfile {profile}/{arn}");
+        assert_eq!(
+            reply.status, 400,
+            "case {case}: expected HTTP 400, got {} / {:?}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error.as_deref(),
+            Some("ResourceNotFoundException"),
+            "case {case}: expected ResourceNotFoundException, got {:?}",
+            reply.body
+        );
+        assert_eq!(
+            reply.message(),
+            pair_not_found_message(profile, arn),
+            "case {case}: expected {:?}, got {:?}",
+            pair_not_found_message(profile, arn),
+            reply.message()
         );
     }
 }
@@ -847,7 +977,7 @@ async fn an_unknown_profile_a_repeated_pair_and_an_unminted_id_are_refused() {
         );
         assert_eq!(
             refusal.message(),
-            format!("[RSLVR-05007] Can't find the resource with ID \"{unminted}\"."),
+            association_not_found_message(unminted),
             "case id={unminted}: unexpected refusal message"
         );
     }
@@ -1064,7 +1194,7 @@ async fn a_refused_update_leaves_the_stored_association_exactly_as_it_was() {
         );
         assert_eq!(
             refusal.message(),
-            format!("[RSLVR-05007] Can't find the resource with ID \"{unminted}\"."),
+            association_not_found_message(unminted),
             "case {case}: unexpected refusal message"
         );
     }

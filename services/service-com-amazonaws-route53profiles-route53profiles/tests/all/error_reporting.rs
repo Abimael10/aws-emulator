@@ -8,11 +8,13 @@
 //!
 //! The rules under test:
 //!
-//! * an id that names no resource of this service is `ResourceNotFoundException`
-//!   carrying ONE message template, the same for every resource kind and every
-//!   operation addressed by an id, whose only variable part is the id the request
-//!   named; an operation addressed by a (ProfileId, ResourceId) PAIR names both ids
-//!   instead, since either half can be why the pair resolves to nothing;
+//! * an id that names no Profile, Profile association or tagged resource of this
+//!   service is `ResourceNotFoundException` carrying ONE message template, the same
+//!   for each of those kinds and every operation addressed by such an id, whose only
+//!   variable part is the id the request named; an operation addressed by a
+//!   (ProfileId, ResourceId) PAIR names both ids instead, since either half can be why
+//!   the pair resolves to nothing. (The Profile RESOURCE association plane has its own
+//!   template, held to in `resource_association_lifecycle.rs`.)
 //! * `DeleteProfile` refuses a Profile an association still names with
 //!   `ConflictException`, and the message names the blocking ASSOCIATION, read off
 //!   the service's own state, so the caller is told what to delete first;
