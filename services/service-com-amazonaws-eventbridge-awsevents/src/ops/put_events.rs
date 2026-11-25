@@ -2707,12 +2707,13 @@ fn event_bus_target(arn: &str) -> Option<BusTarget> {
 /// The rule AWS follows: a rule whose target is an event bus publishes the event
 /// onto that bus, where it is matched by THAT bus's rules and delivered to their
 /// targets — the bus is reached by publishing, not by an API call to another
-/// service. The copy is the SAME event, PRESERVED: every member of the envelope
-/// is carried over, its `id` and the `region` it was published in included, so a
-/// consumer reading both buses sees one event rather than two and a rule of the
-/// other Region sees where the event came from. The forward happens at most once
-/// per event: a copy that reached its bus BY a forward is not forwarded on
-/// ([`MAX_BUS_HOPS`]).
+/// service. The copy is a fresh INGESTION on the destination bus: every member of
+/// the envelope is carried over, the `region` the event was published in
+/// included, while the `id` is a NEW one the destination bus mints — so a rule of
+/// another Region sees where the event came from, and a consumer tells the
+/// forwarded delivery from the original rather than de-duplicating one of them
+/// away. The forward happens at most once per event: a copy that reached its bus
+/// BY a forward is not forwarded on ([`MAX_BUS_HOPS`]).
 ///
 /// The handover spends the request's own delivery budget — charged BEFORE
 /// anything about it is decided, so every outcome it can have, a refusal and the
@@ -2828,16 +2829,19 @@ async fn republish(
     ) {
         return crate::state::InvocationOutcome::Failed { code, message };
     }
-    // The copy carries the event's OWN id: a forward hands the destination bus
-    // the event that was published, so every member of the envelope is preserved
-    // and a consumer reading both buses sees ONE event rather than two. Nothing
-    // is minted for it — the id is the ingestion receipt of the publication the
-    // forward is carrying.
-    let event_id = envelope
-        .get(EVENT_ID_FIELD)
-        .and_then(::serde_json::Value::as_str)
-        .unwrap_or(dispatch.event_id.as_str())
-        .to_string();
+    // The copy is a fresh INGESTION on the destination bus, so that bus mints the
+    // id it carries: an event forwarded onto another bus is a new event there,
+    // distinct from the publication the forward is carrying and from every other
+    // copy of it, which is what lets a consumer reading both buses tell the two
+    // deliveries apart and de-duplicate by id within one bus. Every other member
+    // of the envelope is PRESERVED, the origin `region` included, so a rule of the
+    // receiving bus still sees where the event came from.
+    let event_id = state.lock().next_event_id(now);
+    let mut envelope = envelope;
+    envelope.insert(
+        EVENT_ID_FIELD.to_string(),
+        ::serde_json::Value::String(event_id.clone()),
+    );
     let envelope = ::serde_json::Value::Object(envelope);
     // Matching the copy against the other bus's rules is CPU-bound and runs with
     // no lock held: yielding first gives a cancellation or a shutdown signal

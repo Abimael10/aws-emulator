@@ -75,8 +75,8 @@ fn names_a_cross_account_class(arn: &str) -> bool {
 /// class is held in one place.
 ///
 /// Asked by the role requirement of a bus target
-/// ([`super::request_validation`]), which is about WHICH bus a target names
-/// rather than about whether the class may be named across accounts at all.
+/// ([`super::request_validation`]), which is about the CLASS a target names
+/// rather than about whether that class may be named across accounts at all.
 #[must_use]
 pub fn names_an_event_bus(arn: &str) -> bool {
     names_a_cross_account_class(arn)

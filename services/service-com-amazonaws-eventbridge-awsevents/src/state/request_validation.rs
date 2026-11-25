@@ -231,12 +231,8 @@ pub fn reserved_tag_key_removal_violation(keys: &[String]) -> Option<String> {
 /// This is the per-target counterpart of [`super::target_arn_violation`], which
 /// checks the FORM of each ARN-valued member and runs first: a value that is no
 /// ARN is reported as such rather than as a resource of the wrong service.
-///
-/// `region` is the Region the request was signed for: whether EventBridge invokes
-/// a target as a role the target names can depend on the Region the target's own
-/// resource lives in ([`invoked_under_a_named_role`]).
-pub fn target_violation(region: &str, target: &Target) -> Option<String> {
-    target_role_violation(region, target)
+pub fn target_violation(target: &Target) -> Option<String> {
+    target_role_violation(target)
         .or_else(|| target_parameters_violation(target))
         .or_else(|| ecs_parameters_violation(target))
         .or_else(|| {
@@ -751,22 +747,23 @@ fn missing_parameter_block(target: &Target) -> Option<&'static str> {
 /// resources, EventBridge relies on resource-based policies; for EC2 instances,
 /// Kinesis Data Streams, Step Functions state machines and API Gateway APIs,
 /// EventBridge relies on IAM roles that you specify in the `RoleARN` argument in
-/// `PutTargets`" (this operation's own documentation) — and an event bus of
-/// another account or Region is in that second class too ("you must specify a
-/// `RoleArn` with proper permissions in the `Target` structure"). A target of that
-/// class carrying no `RoleArn` names nothing for EventBridge to assume, so the
-/// delivery it asks for could never be made.
+/// `PutTargets`" (this operation's own documentation) — and the EVENT BUS target is
+/// in that second class too: reaching one is an `events:PutEvents` on the bus the
+/// target names, made as "the IAM role to be used for this target when the rule is
+/// triggered" (`Target$RoleArn`). A target of that class carrying no `RoleArn`
+/// names nothing for EventBridge to assume, so the delivery it asks for could
+/// never be made.
 ///
-/// The classes are the ones EventBridge delivers to BY MAKING that API call on a
-/// resource of the account — the ones the sentence above enumerates, plus the
-/// Amazon ECS task target, whose delivery is an `ecs:RunTask` on the cluster the
-/// target names — read off the service and the resource type of the target's ARN
-/// ([`ROLE_INVOKED_TARGETS`]). A target of any other service is one this
-/// operation accepts without a role, whether it is invoked under a
-/// resource-based policy or under a role the delivery assumes when one is given
-/// ([`crate::ops::put_events`]'s own reading of the same sentence).
-fn target_role_violation(region: &str, target: &Target) -> Option<String> {
-    if target.role_arn.is_some() || !invoked_under_a_named_role(region, &target.arn) {
+/// The classes are the ones EventBridge delivers to BY MAKING that API call — the
+/// ones the sentence above enumerates, the Amazon ECS task target, whose delivery
+/// is an `ecs:RunTask` on the cluster the target names, and the event bus, whose
+/// delivery is a publication onto it — read off the service and the resource type
+/// of the target's ARN ([`invoked_under_a_named_role`]). A target of any other
+/// service is one this operation accepts without a role, whether it is invoked
+/// under a resource-based policy or under a role the delivery assumes when one is
+/// given ([`crate::ops::put_events`]'s own reading of the same sentence).
+fn target_role_violation(target: &Target) -> Option<String> {
+    if target.role_arn.is_some() || !invoked_under_a_named_role(&target.arn) {
         return None;
     }
     Some(format!("RoleArn is required for target {}.", target.arn))
@@ -778,13 +775,13 @@ fn target_role_violation(region: &str, target: &Target) -> Option<String> {
 ///
 /// An ARN of the same service naming another kind of resource is NOT one of them:
 /// an `arn:aws:events:…:api-destination/…` is an HTTP endpoint this service
-/// invokes through a connection's own credentials, not the event bus of another
-/// account the documentation is about.
+/// invokes through a connection's own credentials, not the event bus the
+/// documentation is about.
 ///
-/// The event bus is NOT in this table: whether EventBridge invokes one as a role
-/// the target names depends on the ACCOUNT and the REGION it belongs to rather
-/// than on its class alone, which is read where the class is
-/// ([`invoked_under_a_named_role`]).
+/// The event bus IS one of them, whichever account and Region it belongs to:
+/// reaching a bus target is a `events:PutEvents` on that bus, which EventBridge
+/// makes as the role the target hands it ([`invoked_under_a_named_role`] reads the
+/// class through the one place that holds it).
 const ROLE_INVOKED_TARGETS: [(&str, Option<&str>); 5] = [
     // "Step Functions state machines"
     ("states", Some("stateMachine")),
@@ -804,29 +801,27 @@ const ROLE_INVOKED_TARGETS: [(&str, Option<&str>); 5] = [
 ];
 
 /// Whether the target `arn` names a resource of one of [`ROLE_INVOKED_TARGETS`],
-/// or an event bus EventBridge publishes onto as a role the target names.
+/// or an event bus — the class EventBridge reaches by PUBLISHING onto it.
 ///
-/// The role requirement the documentation states for a bus is conditioned on
-/// WHICH bus it is: "if you are setting the event bus of ANOTHER Amazon Web
-/// Services account as the target … you must specify a `RoleArn` with proper
-/// permissions in the `Target` structure" (`PutTargets`), and a bus of another
-/// REGION is reached the same way — by a publication made outside the Region the
-/// rule lives in, which is not one EventBridge makes as itself. A bus of the
-/// account AND the Region the rule itself lives in is published onto by
-/// EventBridge as itself — "set that account's event bus as a target of the rules
-/// in your account" is what the sentence is about — so such a target names no role
-/// and needs none, and a rule forwarding onto a bus beside it is accepted as
-/// written.
+/// A bus target is delivered to by an `events:PutEvents` on the bus the target
+/// names, and EventBridge makes that call as the role the target hands it: "the
+/// Amazon Resource Name (ARN) of the IAM role to be used for this target when the
+/// rule is triggered" (`Target$RoleArn`), the role whose permissions that
+/// publication is made under. So a bus target carrying no `RoleArn` names nothing
+/// for EventBridge to publish as, whichever account and Region the bus belongs to:
+/// the requirement is a property of the CLASS rather than of where the bus lives,
+/// and a rule forwarding onto a bus beside it needs a role exactly as one
+/// forwarding across an account or a Region boundary does.
 ///
-/// `region` is the Region the request was signed for, which is the Region its
-/// rules and their ARNs live in. WHICH class an ARN names is read through the one
-/// place that holds it ([`super::target_account::names_an_event_bus`]).
-fn invoked_under_a_named_role(region: &str, arn: &str) -> bool {
+/// WHICH class an ARN names is read through the one place that holds it
+/// ([`super::target_account::names_an_event_bus`]), so an api destination of this
+/// same service is not taken for a bus.
+fn invoked_under_a_named_role(arn: &str) -> bool {
     let Some(parsed) = ::service_common::arn::parse(arn) else {
         return false;
     };
     if super::target_account::names_an_event_bus(arn) {
-        return parsed.account != super::account_id() || parsed.region != region;
+        return true;
     }
     ROLE_INVOKED_TARGETS
         .iter()

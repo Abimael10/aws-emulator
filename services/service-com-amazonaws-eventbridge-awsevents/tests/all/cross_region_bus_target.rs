@@ -9,11 +9,12 @@
 //! PUBLISHING the event onto that bus ("set that account's event bus as a target
 //! of the rules in your account … specify that account's event bus as the `Arn`
 //! value when you run `PutTargets`", `PutTargets`), where it is matched by THAT
-//! bus's own rules and delivered to their targets. The copy is the same event,
-//! PRESERVED: every member of the envelope is carried over, its `id` and the
-//! `region` it was published in included, so a rule of the receiving Region sees
-//! the Region the event came from and a consumer reading both buses sees one
-//! event rather than two.
+//! bus's own rules and delivered to their targets. The copy is a fresh INGESTION
+//! on the receiving bus: every member of the envelope is carried over, the
+//! `region` the event was published in included, while the `id` is a NEW one that
+//! bus minted — so a rule of the receiving Region sees the Region the event came
+//! from, and a consumer tells the forwarded delivery from the original rather
+//! than de-duplicating one of them away.
 //!
 //! The rows differ along where the target bus lives (the publisher's Region,
 //! another Region), along what the receiving bus's rules do with the copy (match
@@ -339,17 +340,17 @@ async fn a_bus_target_publishes_the_event_onto_the_bus_it_names() {
         );
         let copy: Value = serde_json::from_str(&bodies[0])
             .unwrap_or_else(|error| panic!("case {case:?}: the copy is not JSON ({error})"));
-        // The copy carries the SOURCE Region and the event's OWN id: a forward
-        // hands the destination bus the event that was published, so everything
-        // the publication fixed is carried over.
+        // The copy carries the SOURCE Region, and an id of its OWN: the forward is
+        // an ingestion on the receiving bus, so that bus mints the id its copy
+        // carries rather than repeating the publication's.
         assert_eq!(
             copy["region"], json!(SOURCE_REGION),
             "case {case:?}: expected the copy to name the source Region, got {copy}"
         );
         let delivered_id = copy["id"].as_str().unwrap_or_default();
-        assert_eq!(
-            delivered_id, published,
-            "case {case:?}: expected the published event's own id on the copy, got \
+        assert!(
+            !delivered_id.is_empty() && delivered_id != published,
+            "case {case:?}: expected the copy to carry an id of its own, got \
              {delivered_id:?} for a publication of {published:?}"
         );
         for member in ["source", "detail-type", "account", "time", "version"] {

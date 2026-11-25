@@ -203,22 +203,26 @@ pub fn by_input_path(path: &str, event: &Value) -> Result<String, String> {
 /// delivered as written. Where a placeholder stands decides which characters
 /// those are, because the documented templates are of two kinds:
 ///
-/// * one that opens a JSON OBJECT or ARRAY carries its placeholders "in quotes
-///   or out" (`InputTransformer$InputTemplate`), so a placeholder standing as a
-///   JSON value carries the selected value's JSON text — `{"n": <n>}` renders a
-///   number — and one standing inside one of the template's own strings carries
-///   that value's reading AS A STRING ([`text`]): a string's own characters, as
-///   that string carries them, and any other value's JSON text;
-/// * a template that is a quoted STRING (`"<instance> is in state <status>"`) is
-///   that one string, so every placeholder in it stands inside it and carries the
-///   same reading.
+/// * a STRUCTURED one, opening a JSON OBJECT or ARRAY, carries its placeholders
+///   "in quotes or out" (`InputTransformer$InputTemplate`), so a placeholder
+///   standing as a JSON value carries the selected value's JSON text —
+///   `{"n": <n>}` renders a number — and one standing inside one of the
+///   template's own string literals carries that value's reading as TEXT
+///   ([`text`]), written as that literal carries those characters
+///   ([`escaped_for_a_string`]): a quote, a newline or a backslash in a selected
+///   string reaches the target as the character it is and the template stays the
+///   JSON it was written as;
+/// * a PLAIN-TEXT one — a sentence, and the quoted string a sentence is written
+///   as (`"<instance> is in state <status>"`) — is text, so every placeholder in
+///   it carries that same reading as TEXT and NOTHING is escaped for the text
+///   around it.
 ///
-/// So a value that has no reading as a string — an object, an array — written
-/// inside a string leaves a rendering that is not a JSON document: nothing
-/// re-quotes a document to keep the template's JSON whole, because what the target
-/// would then receive is not what the template says. Such an input is never handed
-/// to a target: the invocation fails and the event is dead-lettered
-/// ([`crate::ops::put_events`] decides that).
+/// So a plain-text template splicing a value that carries a quote or a newline
+/// renders exactly those characters, which leaves a rendering that is not a JSON
+/// document: nothing re-quotes a value to keep a template's text parseable,
+/// because what the target would then receive is not what the template says. Such
+/// an input is never handed to a target: the invocation fails and the event is
+/// dead-lettered ([`crate::ops::put_events`] decides that).
 ///
 /// A placeholder standing for an EVENT carries that event's JSON document
 /// ([`Fill::Document`]) wherever it stands, for the reason [`reserved`] gives.
@@ -263,19 +267,21 @@ pub fn render(
                 match fill {
                     // A JSON document stands as it is wherever the placeholder is.
                     Fill::Document(document) => rendered.push_str(&document),
-                    // A value standing where the template takes a VALUE is
-                    // written as its JSON text.
+                    // A value standing where a STRUCTURED template takes a VALUE
+                    // is written as its JSON text.
                     Fill::Selected(value) if scan.structured() && !scan.in_string() => {
                         rendered.push_str(&value.to_string());
                     }
-                    // A STRING standing inside one of the template's own strings
-                    // is written as that string carries those characters.
+                    // A STRING standing inside one of a structured template's own
+                    // string literals is written as that literal carries those
+                    // characters, so the template stays the JSON it was written as.
                     Fill::Selected(Value::String(characters)) if scan.in_string() => {
                         rendered.push_str(&escaped_for_a_string(&characters));
                     }
-                    // Everything else is written as its reading as a string
-                    // ([`text`]), which for a value that has none is the JSON
-                    // document it is.
+                    // Everywhere else — a plain-text template, and a container
+                    // inside a structured template's own string, which no quoting
+                    // of a JSON string would make a value of — the placeholder
+                    // carries the value's reading as TEXT, as it reads ([`text`]).
                     Fill::Selected(value) => rendered.push_str(&text(&value)),
                 }
                 if rendered.len() > MAX_RENDERED_BYTES {
@@ -313,15 +319,21 @@ struct Scan {
 
 impl Scan {
     /// The state a walk of `template` starts in. A template that opens a JSON
-    /// object, array or STRING is one whose own JSON the rendering keeps — those
-    /// are the forms `PutTargets` accepts
-    /// ([`crate::state::request_validation`]) — so a placeholder in it stands
-    /// either where a JSON value does or inside one of the template's own
-    /// strings. Anything else is plain text, which escapes nothing and has no
-    /// JSON structure to stand inside.
+    /// OBJECT or ARRAY is the structured kind, whose own JSON the rendering keeps:
+    /// a placeholder in it stands either where a JSON value does or inside one of
+    /// the template's own string literals, and what lands inside such a literal is
+    /// written as that literal carries it ([`escaped_for_a_string`]).
+    ///
+    /// Every other template is PLAIN TEXT — a sentence, and the quoted string a
+    /// sentence is written as to make its rendering a JSON document — so the
+    /// template's own characters are delivered as written, a placeholder in it
+    /// stands for the characters its value reads as ([`text`]) and NOTHING is
+    /// escaped for the text around it: a value carrying a quote or a newline
+    /// renders exactly those characters, which is what can leave such a rendering
+    /// no JSON document at all ([`render`] states what becomes of one).
     fn of(template: &str) -> Self {
         Self {
-            structured: template.trim_start().starts_with(['{', '[', '"']),
+            structured: template.trim_start().starts_with(['{', '[']),
             in_string: false,
             escaped: false,
         }
@@ -459,13 +471,14 @@ const A_PLACEHOLDERS_VALUE: &str = "null";
 ///
 /// What an `InputTransformer` delivers is the JSON text a target is handed, and a
 /// template is that document with holes in it: a placeholder standing where a
-/// value does will be filled with a value, and one standing inside a string with
-/// characters of that string. So the template is read with each placeholder
-/// replaced by what it stands for — a JSON value out of a string, nothing inside
-/// one — and what is left must parse. A template that is nothing but one
-/// placeholder states a document (`<aws.events.event.json>` is the event), an
-/// object or array with placeholders in it states one, a quoted string states the
-/// string it is, and a bare unquoted sentence states none.
+/// value does will be filled with a value, and one standing inside a string
+/// literal with characters of that string. So the template is read with each
+/// placeholder replaced by what it stands for — a JSON value where a value
+/// stands, nothing inside a structured template's own string literal — and what
+/// is left must parse. A template that is nothing but one placeholder states a
+/// document (`<aws.events.event.json>` is the event), an object or array with
+/// placeholders in it states one, a quoted string states the string it is, and a
+/// bare unquoted sentence states none.
 ///
 /// The walk stands where [`render`]'s does ([`Scan`]), so this reads the same
 /// placeholders a rendering fills and judges the same template the delivery will
@@ -495,26 +508,43 @@ pub fn states_a_json_document(template: &str) -> bool {
 }
 
 /// The characters a selected value contributes where a placeholder stands for it
-/// AS A STRING: inside one of a JSON template's own string literals, or in a
-/// template that is no JSON document at all.
+/// AS TEXT: inside one of a structured template's own string literals, or
+/// anywhere in a plain-text template.
 ///
 /// A STRING contributes its own characters, with none of JSON's quoting of a
 /// string: `{"o": "<order>"}` renders the order id and not a second pair of
-/// quotes around it — and where it lands inside such a string those characters are
-/// written as that string carries them ([`escaped_for_a_string`]), because that is
-/// what a JSON string holding them reads as.
+/// quotes around it. A scalar contributes its literal — a number its digits,
+/// `null` the four characters `null`.
 ///
-/// Every other value has NO reading as a string, so it contributes the JSON
-/// document it is: a number its digits, `null` the four characters `null`, and a
-/// container `["a","b"]` rather than `[a,b]` — stripping the quoting of the
-/// strings INSIDE a container would hand the target text that is no reading of the
-/// value at all. A container written inside one of the template's own strings
-/// therefore carries JSON's own punctuation into it, which is what leaves such a
-/// rendering no JSON document ([`render`] states what becomes of one).
+/// A CONTAINER contributes its elements' and members' own readings as text,
+/// inside its own brackets and separated by commas, with JSON's quoting of the
+/// strings in it dropped and a member written `name:value`: an array of two ids
+/// reads `[o1,o2]` and a list of objects `[{id:o1,v:1},{id:o2}]`. The reading is
+/// the value as TEXT at every depth, which is what a template splicing a
+/// container into a sentence delivers — JSON's own punctuation belongs to the
+/// JSON TEXT of the value, which is what a placeholder standing where a JSON
+/// value does carries instead ([`render`]).
+///
+/// The walk is as deep as the SELECTED value nests, which is as deep as the
+/// event it was selected out of parsed ([`crate::state::parse_delivered_event`]
+/// reads it with `serde_json`, whose own nesting bound the document had to pass),
+/// and it reads one value of one event, whose size [`super::MAX_ENTRY_SIZE_BYTES`]
+/// bounds.
 fn text(value: &Value) -> String {
     match value {
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
+        Value::String(characters) => characters.clone(),
+        Value::Array(elements) => {
+            let read: Vec<String> = elements.iter().map(text).collect();
+            format!("[{}]", read.join(","))
+        }
+        Value::Object(members) => {
+            let read: Vec<String> = members
+                .iter()
+                .map(|(name, value)| format!("{name}:{}", text(value)))
+                .collect();
+            format!("{{{}}}", read.join(","))
+        }
+        scalar => scalar.to_string(),
     }
 }
 
@@ -696,22 +726,37 @@ mod tests {
                 "\"A-1\"",
             ),
             (
-                // A selected list has no reading as a string, so it is written
-                // as the JSON document it is — inside the template's own string
-                // too, where that is what leaves the rendering no JSON at all.
+                // A selected list has no reading as a JSON value inside one of
+                // the template's own strings, so it reads as TEXT there: its
+                // elements' own readings, inside its brackets, unquoted.
                 "a list inside the template's own string",
-                "\"<items>\"",
-                "\"[\"a\",\"b\"]\"",
+                "{\"i\": \"<items>\"}",
+                "{\"i\": \"[a,b]\"}",
             ),
             (
                 "a list in a sentence",
                 "items: <items>",
-                "items: [\"a\",\"b\"]",
+                "items: [a,b]",
             ),
             (
                 "a list of objects in a sentence",
                 "lines: <lines>",
-                "lines: [{\"sku\":\"s1\"},{\"sku\":\"s2\"}]",
+                "lines: [{sku:s1},{sku:s2}]",
+            ),
+            (
+                // A quoted-string template is PLAIN TEXT: its own quoting is
+                // delivered as written and the list reads as text inside it.
+                "a list inside a quoted-string template",
+                "\"<items>\"",
+                "\"[a,b]\"",
+            ),
+            (
+                // Nothing is escaped for a plain-text template, so a value
+                // carrying a quote renders that quote — which is what leaves such
+                // a rendering no JSON document.
+                "a value carrying quotes in a quoted-string template",
+                "\"he said <quoted>\"",
+                "\"he said he said \"hi\"\"",
             ),
             (
                 "a sentence template",

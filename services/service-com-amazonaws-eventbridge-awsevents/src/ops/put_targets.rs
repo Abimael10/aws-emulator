@@ -316,7 +316,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(violation) = input
             .targets
             .iter()
-            .find_map(|target| crate::state::request_validation::target_violation(&region, target))
+            .find_map(crate::state::request_validation::target_violation)
         {
             return Err(crate::scaffolded::Scaffolded::validation(violation));
         }
