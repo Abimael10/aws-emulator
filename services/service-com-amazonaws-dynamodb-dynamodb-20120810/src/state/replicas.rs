@@ -1106,8 +1106,17 @@ impl Table {
             items: self.items.clone(),
             reported_counters: MeteredCounters::new(now),
             stored_bytes: self.stored_bytes,
-            write_budget: CapacityBudget::new(now),
-            read_budget: CapacityBudget::new(now),
+            // A new table has banked no credit: what stands behind its first request is the
+            // capacity that went unused since its creation began
+            // ([`unused_capacity_since`]).
+            write_budget: CapacityBudget::new(crate::state::unused_capacity_since(
+                now,
+                now + STATUS_TRANSITION,
+            )),
+            read_budget: CapacityBudget::new(crate::state::unused_capacity_since(
+                now,
+                now + STATUS_TRANSITION,
+            )),
             key_write_budgets: KeyWriteBudgets::default(),
             contributor_insights: ContributorInsights::default(),
             time_to_live: TimeToLive::default(),

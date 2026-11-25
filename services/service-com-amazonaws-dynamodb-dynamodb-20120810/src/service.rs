@@ -178,6 +178,10 @@ mod request_signature;
 /// reported on.
 mod request_latency_metrics;
 
+/// The `AWS/DynamoDB` `ThrottledRequests` series this service publishes for each request a
+/// provisioned-throughput ceiling turned down, under the same `{TableName, Operation}` pair.
+mod throttled_request_metrics;
+
 /// The input constraints this service checks ITSELF — the ones the model declares no trait
 /// for — read off the request body so their clauses join the walk's in one refusal.
 mod request_constraints;
@@ -1083,6 +1087,17 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for OperationScopedClauseForm<E
                 ctx.parts(),
                 &answered,
                 took,
+            );
+            // And where a request a provisioned-throughput ceiling turned down — refused
+            // outright, or served with part of its work handed back — is counted into the
+            // table's `ThrottledRequests` series
+            // ([`throttled_request_metrics`]).
+            throttled_request_metrics::publish_throttled_request(
+                &*self.engine,
+                operation,
+                req,
+                ctx.parts(),
+                &answered,
             );
             // And where what the request's outcome WAS is counted: the items a read returned
             // and the writes a condition turned down, settled under the store's lock and

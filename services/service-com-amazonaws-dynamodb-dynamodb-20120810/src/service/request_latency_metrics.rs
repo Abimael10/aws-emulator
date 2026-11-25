@@ -83,7 +83,7 @@ const ONE_REQUEST: f64 = 1.0;
 /// and is no part of this family.
 ///
 /// Sorted, so membership is a binary search over a constant.
-const METERED_OPERATIONS: &[&str] = &[
+pub(super) const METERED_OPERATIONS: &[&str] = &[
     "BatchExecuteStatement",
     "BatchGetItem",
     "BatchWriteItem",
@@ -181,7 +181,7 @@ pub fn publish_served_request<Eng: Send + Sync + 'static>(
 /// transactional surfaces' per-element member, and the statement surfaces' statement text. A
 /// name spelled as the table's ARN resolves to the table's own name, because the series is
 /// the TABLE's and a table is one resource however a request addressed it.
-fn addressed_tables(document: &Value, region: &str) -> Vec<String> {
+pub(super) fn addressed_tables(document: &Value, region: &str) -> Vec<String> {
     let mut tables: Vec<String> = Vec::new();
     let mut addressed = |name: &str| {
         // A 2xx answer means the name was one this service resolved, so a name this

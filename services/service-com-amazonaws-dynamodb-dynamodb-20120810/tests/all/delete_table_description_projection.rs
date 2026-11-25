@@ -38,6 +38,11 @@ use crate::emulator::{
 /// streams crate derives from that model, so these rows cannot drift from the enum.
 const VIEW_TYPES: &[&str] = STREAM_VIEW_TYPE_VALUES;
 
+/// The write capacity a PROVISIONED row is created with: ample for the items the row seeds,
+/// since a table admits the capacity that went unused behind it and the writes here are
+/// setup rather than the subject.
+const SEED_WRITE_UNITS: u32 = 400;
+
 /// One row of the table: a table to create, and what the create configured.
 struct Row {
     case: &'static str,
@@ -135,7 +140,11 @@ fn create_body(row: &Row, name: &str) -> Value {
         "BillingMode": row.billing,
     });
     if row.billing == "PROVISIONED" {
-        body["ProvisionedThroughput"] = json!({"ReadCapacityUnits": 4, "WriteCapacityUnits": 2});
+        // Ample for the handful of items each row seeds — a provisioned table admits the
+        // capacity that went unused behind it, and what this suite is about is the
+        // DESCRIPTION a teardown reports rather than the rate those writes are held to.
+        body["ProvisionedThroughput"] =
+            json!({"ReadCapacityUnits": 4, "WriteCapacityUnits": SEED_WRITE_UNITS});
     }
     if row.with_indexes {
         definitions.push(json!({"AttributeName": "Gsi", "AttributeType": "S"}));
@@ -321,7 +330,7 @@ async fn the_reported_description_carries_every_member_the_table_was_created_wit
         );
         let throughput = &description["ProvisionedThroughput"];
         let (read, write) = if row.billing == "PROVISIONED" {
-            (4, 2)
+            (4, SEED_WRITE_UNITS)
         } else {
             // On-demand mode provisions nothing, so the reported pair is zeroes.
             (0, 0)

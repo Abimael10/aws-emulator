@@ -1202,23 +1202,30 @@ async fn a_batch_hands_back_the_writes_the_ceilings_did_not_admit() {
         "case the table ceiling on UpdateItem: a throttled update stores nothing"
     );
 
-    // A DELETE is a write too, and is admitted from the same budget: this table is
-    // provisioned for just enough burst to store one item of this size, so removing it
-    // again — which costs what storing it did — is past what is left, and the item is
-    // still there afterwards.
+    // A DELETE is a write too, and is admitted from the same budget: the item is stored
+    // against capacity that covers it, the table is then held to one write unit — whose
+    // whole burst is less than removing an item of this size costs — and the delete is
+    // refused with the item still there afterwards.
     table_with(
         &router,
         "Snug",
         &[("pk", "HASH", "S"), ("sk", "RANGE", "N")],
         json!({"BillingMode": "PROVISIONED",
-               "ProvisionedThroughput": {"ReadCapacityUnits": 1,
-                                         "WriteCapacityUnits": 2}}),
+               "ProvisionedThroughput": {"ReadCapacityUnits": 4000,
+                                         "WriteCapacityUnits": 4000}}),
     )
     .await;
     ok(
         &router,
         "PutItem",
         json!({"TableName": "Snug", "Item": heavy_item("one", 0, &payload)}),
+    )
+    .await;
+    ok(
+        &router,
+        "UpdateTable",
+        json!({"TableName": "Snug", "BillingMode": "PROVISIONED",
+               "ProvisionedThroughput": {"ReadCapacityUnits": 4000, "WriteCapacityUnits": 1}}),
     )
     .await;
     let (status, deleted) = call(

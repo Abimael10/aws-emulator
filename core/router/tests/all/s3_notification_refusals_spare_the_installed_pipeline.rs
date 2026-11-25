@@ -111,8 +111,11 @@ const UNABLE_TO_VALIDATE: &str = "Unable to validate the following destination c
 const AMBIGUOUS: &str = "Configuration is ambiguously defined. Cannot have overlapping suffixes \
                          in two rules if the prefixes are overlapping for the same event type.";
 
-/// The provisioned capacity the declared table carries.
-const READ_CAPACITY: u64 = 5;
+/// The provisioned capacity the declared table carries. The read side is ample because this
+/// suite POLLS the table for what a delivery left, several times a second: a provisioned table
+/// admits its rate plus the capacity that went unused behind it, so a poll loop faster than the
+/// rate would be throttled — which is a property of the loop and not of what it waits for.
+const READ_CAPACITY: u64 = 400;
 const WRITE_CAPACITY: u64 = 5;
 
 /// How long one invocation of the handler is given, as the function's own `Timeout`.

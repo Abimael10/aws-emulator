@@ -218,7 +218,10 @@ fn sources() -> Vec<Source> {
                     {"AttributeName": "Size", "AttributeType": "N"},
                 ],
                 "BillingMode": "PROVISIONED",
-                "ProvisionedThroughput": {"ReadCapacityUnits": 2, "WriteCapacityUnits": 2},
+                // Write capacity ample for the items seeded below: a write fans out to both
+                // indexes, and a provisioned table admits only the capacity that went unused
+                // behind it, which seeding a fresh table has little of.
+                "ProvisionedThroughput": {"ReadCapacityUnits": 2, "WriteCapacityUnits": 400},
                 "GlobalSecondaryIndexes": [
                     {
                         "IndexName": "ByColour",

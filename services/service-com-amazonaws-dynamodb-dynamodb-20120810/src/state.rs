@@ -579,8 +579,10 @@ pub const DEFAULT_TABLE_MAX_WRITE_CAPACITY_UNITS: i64 = 40_000;
 /// How much unused capacity a provisioned table keeps for a burst: "DynamoDB currently
 /// retains up to 300 seconds (5 minutes) of unused read and write capacity" (DynamoDB
 /// Developer Guide, "Using burst capacity effectively"). It is the CEILING on what the
-/// budget in [`CapacityBudget`] can hold, so a table that has been idle admits a burst
-/// of this many seconds' worth of writes at once and no more.
+/// budget in [`CapacityBudget`] can hold, so a table that has been idle this long admits
+/// a burst of this many seconds' worth of writes at once and no more — while a table that
+/// has been idle for less holds only what went unused over the time it has existed
+/// ([`CapacityBudget::new`]).
 pub const BURST_CAPACITY_WINDOW: Duration = Duration::from_secs(300);
 
 /// The write capacity ONE partition key value can consume per second: "a single
@@ -2113,8 +2115,8 @@ impl MeteredCounters {
 /// refilled is derived from the clock when the next write asks for it.
 #[derive(Debug, Clone)]
 pub struct CapacityBudget {
-    /// What was left at [`Self::measured_at`], or `None` while nothing has been spent:
-    /// an untouched budget holds the whole ceiling, whatever rate is in force by the
+    /// What was left at [`Self::measured_at`], or `None` for a budget that has been idle
+    /// for its whole window and so holds the ceiling, whatever rate is in force by the
     /// time it is first spent from.
     remaining: Option<f64>,
     /// When `remaining` was measured.
@@ -2122,10 +2124,27 @@ pub struct CapacityBudget {
 }
 
 impl CapacityBudget {
-    /// The budget a resource created at `now` starts life with: it has consumed
-    /// nothing, so the first write it is asked to admit has the whole burst ceiling
-    /// behind it.
+    /// The budget a resource created at `now` starts life with: NOTHING banked, filling
+    /// from that instant at the rate in force.
+    ///
+    /// What a burst draws on is capacity that WENT UNUSED — "DynamoDB currently retains up
+    /// to 300 seconds (5 minutes) of unused read and write capacity" (DynamoDB Developer
+    /// Guide, "Using burst capacity effectively") — and a resource that has only just been
+    /// created has had no capacity to leave unused yet. So the credit behind the first
+    /// request is the rate over the time the resource has existed, which reaches the whole
+    /// [`BURST_CAPACITY_WINDOW`] ceiling only after a resource has sat unused that long.
     pub fn new(now: SystemTime) -> Self {
+        Self {
+            remaining: Some(0.0),
+            measured_at: now,
+        }
+    }
+
+    /// The budget of something that has been IDLE for at least a whole burst window, so it
+    /// holds the ceiling: what a per-key budget minted on the first request that addresses
+    /// that key starts from, since the key consumed nothing over the window behind it
+    /// ([`KeyWriteBudgets`]).
+    pub fn idle(now: SystemTime) -> Self {
         Self {
             remaining: None,
             measured_at: now,
@@ -2280,7 +2299,7 @@ impl KeyWriteBudgets {
         self.make_room_for(partition, now);
         self.budgets
             .entry(partition.clone())
-            .or_insert_with(|| CapacityBudget::new(now))
+            .or_insert_with(|| CapacityBudget::idle(now))
             .take_within(
                 PARTITION_WRITE_UNITS_PER_SECOND,
                 PARTITION_BURST_WINDOW,
@@ -2315,7 +2334,7 @@ impl KeyWriteBudgets {
         self.make_room_for(partition, now);
         self.budgets
             .entry(partition.clone())
-            .or_insert_with(|| CapacityBudget::new(now))
+            .or_insert_with(|| CapacityBudget::idle(now))
             .take_borrowing(
                 PARTITION_WRITE_UNITS_PER_SECOND,
                 PARTITION_BURST_WINDOW,
@@ -4005,7 +4024,9 @@ pub mod streams_seam;
 /// creates a table. Re-exported below, so every caller still names it `crate::state::…`.
 pub mod table_minting;
 
-pub use table_minting::{mint_table, MintedTable, BILLING_MODE_PAY_PER_REQUEST};
+pub use table_minting::{
+    mint_table, unused_capacity_since, MintedTable, BILLING_MODE_PAY_PER_REQUEST,
+};
 
 pub use streams_seam::{
     disable_stream_in, disable_table_stream, hand_back_table_stream, publish_item_changes,

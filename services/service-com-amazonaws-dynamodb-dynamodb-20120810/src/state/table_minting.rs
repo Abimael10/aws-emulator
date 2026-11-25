@@ -74,6 +74,7 @@ pub struct MintedTable {
 /// and the name, and the id is "a unique identifier for the table, in UUID format, generated
 /// by DynamoDB when the table is created" (`TableDescription$TableId`).
 pub fn mint_table(minted: MintedTable) -> Table {
+    let budgets_from = unused_capacity_since(minted.creation_date_time, minted.active_at);
     let MintedTable {
         region,
         name,
@@ -139,10 +140,11 @@ pub fn mint_table(minted: MintedTable) -> Table {
         stream,
         items: BTreeMap::new(),
         stored_bytes: 0,
-        // A new table has consumed none of the capacity it is provisioned for, so its first
-        // write has the whole documented burst behind it, and the same for its reads.
-        write_budget: CapacityBudget::new(creation_date_time),
-        read_budget: CapacityBudget::new(creation_date_time),
+        // A new table has consumed none of the capacity it is provisioned for, so what its
+        // first write has behind it is the capacity that went unused since its creation began
+        // ([`unused_capacity_since`]), and the same for its reads.
+        write_budget: CapacityBudget::new(budgets_from),
+        read_budget: CapacityBudget::new(budgets_from),
         key_write_budgets: KeyWriteBudgets::default(),
         // A new table has been metered once, at zero: `ItemCount`/`TableSizeBytes` are
         // refreshed "approximately every six hours", not by the writes that follow.
@@ -161,6 +163,31 @@ pub fn mint_table(minted: MintedTable) -> Table {
         // Nothing scales a new table's capacities.
         auto_scaling: TableAutoScaling::default(),
     }
+}
+
+/// From when the capacity that went UNUSED behind a fresh table is counted
+/// ([`CapacityBudget::new`]): the instant its creation BEGAN.
+///
+/// A table's own create answers it `CREATING` and the clock owes it [`STATUS_TRANSITION`]
+/// before it serves anything, so a caller's first request can only arrive once that span has
+/// passed and the credit behind it is that span's worth. A plane that mints a table already
+/// `ACTIVE` — one that reports a create complete only once the resource has stabilised — has
+/// waited the same span out BEFORE it minted the table, so the table's creation began that
+/// much earlier and the same credit stands behind its first request. Counting it from
+/// `creation_date_time` alone would hand that plane's caller a table that cannot serve one
+/// write.
+///
+/// Stated once, and taken by every path that builds a table's budgets — the creates here, and
+/// the restores and the replica that assemble a [`Table`] of their own — so a path that mints
+/// a table already `ACTIVE` cannot silently get one that serves nothing.
+pub fn unused_capacity_since(
+    creation_date_time: SystemTime,
+    active_at: SystemTime,
+) -> SystemTime {
+    active_at
+        .checked_sub(STATUS_TRANSITION)
+        .unwrap_or(creation_date_time)
+        .min(creation_date_time)
 }
 
 /// The `BillingMode` value that puts a table in the on-demand capacity mode, as the model's

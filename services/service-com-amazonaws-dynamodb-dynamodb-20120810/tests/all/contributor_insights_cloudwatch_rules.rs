@@ -880,16 +880,19 @@ async fn every_access_that_names_a_key_contributes_to_the_table_s_accessed_keys_
 }
 
 /// The read capacity the throttled row's table is provisioned for: the smallest a table can
-/// carry, so its documented burst is spent in a handful of reads.
+/// carry, so the credit that accumulated behind it is spent in a bounded run of reads.
 const PROVISIONED_READ_UNITS: i64 = 1;
 
 /// The bytes of the item that row reads: "one read request unit represents one strongly
 /// consistent read request ... for an item up to 4 KB in size" (the Developer Guide), so a read
-/// of this item costs about a hundred units and a 1-RCU table's whole burst is a few of them.
-const ITEM_BYTES: usize = 399 * 1024;
+/// of this item costs ONE unit and a 1-RCU table serves as many of them as it has banked
+/// seconds of its rate, which is never more than the documented 300.
+const ITEM_BYTES: usize = 1024;
 
-/// How many reads that row drives before it gives up on ever being throttled.
-const MOST_READS: usize = 24;
+/// How many reads that row drives before it gives up on ever being throttled: past the most
+/// one-unit reads a 1-RCU table could ever have credit for, so a table that throttles
+/// nothing is reported as such rather than looping.
+const MOST_READS: usize = 600;
 
 #[tokio::test]
 async fn a_throttled_access_contributes_to_the_table_s_throttled_keys_rule() {
@@ -939,6 +942,9 @@ async fn a_throttled_access_contributes_to_the_table_s_throttled_keys_rule() {
         "case {case:?}: that rule is the throttled-keys one, got {throttled_rule:?}"
     );
 
+    // The reads run until the first one the table has no credit for: what it had banked is
+    // the capacity that went unused since it was created, so how many are served is not a
+    // fixed number — but the run always serves some and ends in a refusal.
     let mut throttled = 0.0_f64;
     let mut served = 0usize;
     for _ in 0..MOST_READS {
@@ -956,12 +962,13 @@ async fn a_throttled_access_contributes_to_the_table_s_throttled_keys_rule() {
             served += 1;
         } else {
             throttled += 1.0;
+            break;
         }
     }
     assert!(
         throttled > 0.0 && served > 0,
-        "case {case:?}: the burst must serve some reads and refuse the rest, got {served} served \
-         and {throttled} refused"
+        "case {case:?}: the credit behind the table must serve some reads and run out, got \
+         {served} served and {throttled} refused"
     );
 
     let answered = report(&router, &throttled_rule).await;

@@ -559,8 +559,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stream: None,
             items: ::std::collections::BTreeMap::new(),
             stored_bytes: 0,
-            write_budget: crate::state::CapacityBudget::new(now),
-            read_budget: crate::state::CapacityBudget::new(now),
+            // A new table has banked no credit: what stands behind its first request is the
+            // capacity that went unused since its creation began
+            // ([`crate::state::unused_capacity_since`]).
+            write_budget: crate::state::CapacityBudget::new(
+                crate::state::unused_capacity_since(now, now + crate::state::STATUS_TRANSITION),
+            ),
+            read_budget: crate::state::CapacityBudget::new(crate::state::unused_capacity_since(
+                now,
+                now + crate::state::STATUS_TRANSITION,
+            )),
             key_write_budgets: crate::state::KeyWriteBudgets::default(),
             reported_counters: crate::state::MeteredCounters::new(now),
             contributor_insights: crate::state::ContributorInsights::default(),

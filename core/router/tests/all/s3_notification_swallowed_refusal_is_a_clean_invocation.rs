@@ -173,8 +173,11 @@ const PERIOD_SECS: i64 = 60;
 /// because nothing here asserts how long a run took — only what it left.
 const FUNCTION_TIMEOUT: u64 = 120;
 
-/// The provisioned capacity the table is created with.
-const READ_CAPACITY: u64 = 5;
+/// The provisioned capacity the table is created with. The read side is ample because this
+/// suite POLLS the table for what a delivery left, several times a second: a provisioned table
+/// admits its rate plus the capacity that went unused behind it, so a poll loop faster than the
+/// rate would be throttled — which is a property of the loop and not of what it waits for.
+const READ_CAPACITY: u64 = 400;
 const WRITE_CAPACITY: u64 = 5;
 
 /// How long this suite looks for work another service's clock owes — a stack settling, a

@@ -56,6 +56,18 @@ const DRAIN_WRITE_UNITS: i64 = 4000;
 /// compares the table against and asks for, so the two cannot drift apart.
 const DRAIN_READ_UNITS: i64 = 2000;
 
+/// How many requests one `BatchWriteItem` carries at most
+/// (`BatchWriteItem$RequestItems` is `@length(1..25)`), which is what the loops here send
+/// per call.
+const MAX_BATCH_REQUESTS: usize = 25;
+
+/// How many calls [`spend_write_budget`] makes before it reports a table that never runs
+/// short: a provisioned budget holds at most 300 seconds of its rate (Developer Guide,
+/// "Using burst capacity effectively"), so a loop of one-unit writes empties the budget of
+/// the one- and two-unit tables below inside a fraction of this many calls, whatever credit
+/// had accumulated behind them.
+const SPEND_CALLS: usize = 200;
+
 /// The fixed sentence a refused write carries, as the Developer Guide states it for a
 /// table that has spent the throughput it is provisioned for.
 const THROUGHPUT_EXCEEDED: &str = "The level of configured provisioned throughput for the \
@@ -188,6 +200,40 @@ async fn drain(
     residue
 }
 
+/// Spend `table`'s write budget down to nothing, so the batch under test meets the capacity
+/// the table is PROVISIONED for rather than the credit that had accumulated behind it.
+///
+/// What a table has banked at any instant is how much of its provisioning went unused —
+/// "DynamoDB currently retains up to 300 seconds (5 minutes) of unused read and write
+/// capacity" (Developer Guide, "Using burst capacity effectively") — a figure no caller can
+/// read. So it is EMPTIED rather than computed: batches of one-unit writes are sent until
+/// one of them is handed part of its work back, which is the answer of a table with nothing
+/// left to admit them from.
+async fn spend_write_budget(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    case: &str,
+    table: &str,
+) {
+    for round in 0..SPEND_CALLS {
+        let requests: Vec<Value> = (0..MAX_BATCH_REQUESTS)
+            .map(|slot| put_of(&(format!("spend{round}-{slot}"), slot as i64), 0))
+            .collect();
+        let (status, body, _) = batch_write(router, table, requests).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a batch of one-unit writes is served while the budget is spent \
+             down, got {status} with {body}"
+        );
+        if !handed_back(&body, table).is_empty() {
+            return;
+        }
+    }
+    panic!(
+        "case {case:?}: a provisioned table holds at most 300 seconds of its rate, so \
+         {SPEND_CALLS} batches of one-unit writes must run its budget out"
+    )
+}
+
 /// Every key the table holds, read back through a paginated strongly consistent `Scan`.
 async fn stored_keys(router: &smithy_server_runtime::MultiServiceRouter, table: &str) -> Vec<Key> {
     let mut keys: Vec<Key> = Vec::new();
@@ -257,17 +303,16 @@ enum Answer {
     Refused,
 }
 
-/// One row: a table, a priming stream that spends some of its budget, and the batch whose
+/// One row: a table, whether its budget is spent before the call, and the batch whose
 /// answer the rule decides.
 struct Row {
     case: &'static str,
     /// The billing members `CreateTable` is given.
     billing: Value,
-    /// Batches of `prime_per_batch` writes of `prime_payload` bytes, sent at keys of their
-    /// own before the measured batch, to spend the table's budget down.
-    prime_batches: usize,
-    prime_per_batch: usize,
-    prime_payload: usize,
+    /// Whether the table's write budget is emptied before the measured batch
+    /// ([`spend_write_budget`]), so the batch meets the rate the table is provisioned for
+    /// rather than the credit that accumulated behind it.
+    spend_budget: bool,
     /// The payload bytes of each request of the measured batch, one entry per request.
     batch: Vec<usize>,
     /// Whether the measured batch aims every one of its requests at ONE partition key
@@ -276,9 +321,9 @@ struct Row {
     answer: Answer,
 }
 
-/// The rows: the capacity mode, the provisioned units, the item size, how much of the
-/// budget was already spent, the number of requests, which ceiling binds, and a batch
-/// that mixes a request waiting for capacity with one that can never be admitted.
+/// The rows: the capacity mode, the provisioned units, the item size, whether the budget was
+/// already spent, the number of requests, which ceiling binds, and a batch that mixes a
+/// request waiting for capacity with one that can never be admitted.
 ///
 /// A write costs one unit per 1 KB of the item, and a budget never holds more than 300
 /// seconds of its rate (Developer Guide, "Using burst capacity effectively"), so a table
@@ -296,42 +341,31 @@ fn rows() -> Vec<Row> {
         Row {
             case: "on-demand, a full batch of small writes",
             billing: on_demand.clone(),
-            prime_batches: 0,
-            prime_per_batch: 0,
-            prime_payload: 0,
+            spend_budget: false,
             batch: vec![900; 25],
             one_key: false,
             answer: Answer::ServedWhole,
         },
         Row {
-            case: "one write unit, burst spent, a full batch of 8 KB writes",
+            case: "one write unit, budget spent, a full batch of 8 KB writes",
             billing: provisioned(1),
-            // 300 writes of one unit each is the whole burst a one-unit table can hold.
-            prime_batches: 12,
-            prime_per_batch: 25,
-            prime_payload: 900,
+            spend_budget: true,
             batch: vec![8 * 1024; 25],
             one_key: false,
             answer: Answer::ServedOne,
         },
         Row {
-            case: "one write unit, burst spent, a single 8 KB write",
+            case: "one write unit, budget spent, a single 8 KB write",
             billing: provisioned(1),
-            prime_batches: 12,
-            prime_per_batch: 25,
-            prime_payload: 900,
+            spend_budget: true,
             batch: vec![8 * 1024],
             one_key: false,
             answer: Answer::ServedWhole,
         },
         Row {
-            case: "two write units, most of the burst spent, two 100 KB writes",
+            case: "two write units, budget spent, two 100 KB writes",
             billing: provisioned(2),
-            // Four ~101-unit writes leave under 200 of the 600 units this table can hold,
-            // which covers one more of them and not two.
-            prime_batches: 1,
-            prime_per_batch: 4,
-            prime_payload: 100 * 1024,
+            spend_budget: true,
             batch: vec![100 * 1024; 2],
             one_key: false,
             answer: Answer::ServedPartly,
@@ -339,9 +373,7 @@ fn rows() -> Vec<Row> {
         Row {
             case: "fifty write units, nothing spent, a full batch of small writes",
             billing: provisioned(50),
-            prime_batches: 0,
-            prime_per_batch: 0,
-            prime_payload: 0,
+            spend_budget: false,
             batch: vec![900; 25],
             one_key: false,
             answer: Answer::ServedWhole,
@@ -349,9 +381,7 @@ fn rows() -> Vec<Row> {
         Row {
             case: "one write unit, a single write past the whole burst",
             billing: provisioned(1),
-            prime_batches: 0,
-            prime_per_batch: 0,
-            prime_payload: 0,
+            spend_budget: false,
             batch: vec![399 * 1024],
             one_key: false,
             answer: Answer::Refused,
@@ -359,9 +389,7 @@ fn rows() -> Vec<Row> {
         Row {
             case: "one write unit, two writes past the whole burst",
             billing: provisioned(1),
-            prime_batches: 0,
-            prime_per_batch: 0,
-            prime_payload: 0,
+            spend_budget: false,
             batch: vec![399 * 1024; 2],
             one_key: false,
             answer: Answer::Refused,
@@ -369,9 +397,7 @@ fn rows() -> Vec<Row> {
         Row {
             case: "one write unit, one write past the burst beside one inside it",
             billing: provisioned(1),
-            prime_batches: 0,
-            prime_per_batch: 0,
-            prime_payload: 0,
+            spend_budget: false,
             batch: vec![399 * 1024, 900],
             one_key: false,
             answer: Answer::ServedPartly,
@@ -383,9 +409,7 @@ fn rows() -> Vec<Row> {
             // ceiling bounds is the SUSTAINED rate, which the drain suite below walks.
             case: "capacity to spare, eight 400 KB writes at one partition key",
             billing: provisioned(DRAIN_WRITE_UNITS),
-            prime_batches: 0,
-            prime_per_batch: 0,
-            prime_payload: 0,
+            spend_budget: false,
             batch: vec![399 * 1024; 8],
             one_key: true,
             answer: Answer::ServedWhole,
@@ -401,22 +425,10 @@ async fn a_batch_hands_back_what_capacity_does_not_cover_and_refuses_only_the_im
         let table = format!("Row{index}");
         table_with(&router, &table, row.billing.clone()).await;
 
-        // The priming stream spends the table's budget down, at keys of its own so the
+        // The budget is emptied first where the row asks for it, at keys of its own so the
         // measured batch meets a fresh per-key ceiling.
-        for batch in 0..row.prime_batches {
-            let requests: Vec<Value> = (0..row.prime_per_batch)
-                .map(|slot| {
-                    let ordinal = (batch * row.prime_per_batch + slot) as i64;
-                    put_of(&(format!("prime{ordinal}"), ordinal), row.prime_payload)
-                })
-                .collect();
-            let (status, body, _) = batch_write(&router, &table, requests).await;
-            assert_eq!(
-                (status, handed_back(&body, &table).len()),
-                (200, 0),
-                "case {case:?}: the priming batch {batch} must be served whole, got {status} \
-                 with {body}"
-            );
+        if row.spend_budget {
+            spend_write_budget(&router, case, &table).await;
         }
         let primed: BTreeSet<Key> = stored_keys(&router, &table).await.into_iter().collect();
 
@@ -695,13 +707,15 @@ async fn one_request_batches_run_the_progress_allowance_out_and_are_then_refused
 async fn a_batch_of_deletes_hands_back_what_capacity_does_not_cover_as_delete_requests() {
     let router = crate::emulator::emulator();
     let case = "a batch of deletes against a spent budget";
-    // A one-unit table can hold 300 units of credit; each ~8 KB item below costs nine units
-    // to store and the same to remove, and the filler writes below cost one each.
+    // The items to be removed are seeded against capacity that covers them — each ~8 KB item
+    // costs nine units to store and the same to remove — and the table is then held to one
+    // write unit, with the credit behind it spent, so the deletes meet an empty budget.
     table_with(
         &router,
         "Deletes",
         json!({"BillingMode": "PROVISIONED",
-               "ProvisionedThroughput": {"ReadCapacityUnits": 2000, "WriteCapacityUnits": 1}}),
+               "ProvisionedThroughput": {"ReadCapacityUnits": DRAIN_READ_UNITS,
+                                         "WriteCapacityUnits": DRAIN_WRITE_UNITS}}),
     )
     .await;
     let doomed: Vec<Key> = (0..25).map(|slot| (format!("d{slot}"), slot)).collect();
@@ -718,20 +732,19 @@ async fn a_batch_of_deletes_hands_back_what_capacity_does_not_cover_as_delete_re
          {status} with {} handed back",
         handed_back(&body, "Deletes").len()
     );
-    // Spend what is left on writes of one unit each, so the deletes meet an empty budget.
-    for batch in 0..3 {
-        let requests: Vec<Value> = (0..25)
-            .map(|slot| put_of(&(format!("filler{batch}-{slot}"), slot), 900))
-            .collect();
-        let (status, body, _) = batch_write(&router, "Deletes", requests).await;
-        assert_eq!(
-            (status, handed_back(&body, "Deletes").len()),
-            (200, 0),
-            "case {case:?}: the filler batch {batch} spends the rest of the budget, got \
-             {status} with {} handed back",
-            handed_back(&body, "Deletes").len()
-        );
-    }
+    ok(
+        &router,
+        "UpdateTable",
+        json!({"TableName": "Deletes", "BillingMode": "PROVISIONED",
+               "ProvisionedThroughput": {"ReadCapacityUnits": DRAIN_READ_UNITS,
+                                         "WriteCapacityUnits": 1}}),
+    )
+    .await;
+    // The lowered capacity is in force once the table is ACTIVE again: "while it's UPDATING,
+    // you can't issue another UpdateTable request", and this suite raises the capacity again
+    // when it drains the residue.
+    describe_when_active(&router, case, "Deletes").await;
+    spend_write_budget(&router, case, "Deletes").await;
 
     let requests: Vec<Value> = doomed
         .iter()

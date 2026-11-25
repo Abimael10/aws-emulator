@@ -492,9 +492,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // data from its first instant.
             reported_counters: crate::state::MeteredCounters::new(now),
             stored_bytes: item_bytes,
-            // A new table has consumed none of the capacity it is provisioned for.
-            write_budget: crate::state::CapacityBudget::new(now),
-            read_budget: crate::state::CapacityBudget::new(now),
+            // A new table has banked no credit: what stands behind its first request is the
+            // capacity that went unused since its creation began
+            // ([`crate::state::unused_capacity_since`]).
+            write_budget: crate::state::CapacityBudget::new(
+                crate::state::unused_capacity_since(now, active_at),
+            ),
+            read_budget: crate::state::CapacityBudget::new(crate::state::unused_capacity_since(
+                now, active_at,
+            )),
             key_write_budgets: crate::state::KeyWriteBudgets::default(),
             contributor_insights: crate::state::ContributorInsights::default(),
             // TTL is one of the settings the doc above has a caller set up again on the

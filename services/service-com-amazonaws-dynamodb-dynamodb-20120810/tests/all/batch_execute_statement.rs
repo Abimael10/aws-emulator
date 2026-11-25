@@ -31,6 +31,11 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::emulator::{call, emulator, error_code, ok};
 use crate::table_items::create_active_table;
 
+/// Seconds of refill credited to a table beyond the measured wall clock of a load, so a slow
+/// machine cannot fail the ceiling below: a provisioned budget also fills while the table is
+/// being created and while the answers are being read back.
+const REFILL_SLACK_SECONDS: usize = 5;
+
 /// Run one batch that must answer HTTP 200 and return its parsed body.
 async fn batch(router: &MultiServiceRouter, body: Value) -> Value {
     ok(router, "BatchExecuteStatement", body).await
@@ -678,13 +683,14 @@ async fn a_write_past_the_capacity_its_table_is_provisioned_for_is_throttled() {
             false,
         ),
     ];
-    // One write unit covers a one-item write of up to 1 KB, so a table provisioned for
-    // one unit per second covers about this many of these inserts before its budget is
-    // spent.
+    // One write unit covers a one-item write of up to 1 KB, and a provisioned budget holds
+    // at most this many seconds of its rate as credit ("DynamoDB currently retains up to 300
+    // seconds (5 minutes) of unused read and write capacity" — Developer Guide, "Using burst
+    // capacity effectively"), so a one-unit table can never have more than this many of
+    // these inserts funded whatever a caller does.
     let burst_units = usize::try_from(BURST_CAPACITY_WINDOW.as_secs()).unwrap_or(usize::MAX);
     let per_batch = 25usize;
     let batches = 20usize;
-
     for (case, billing, throttles) in rows {
         let router = emulator();
         create_billed_table(&router, "metered", &billing).await;
@@ -692,6 +698,7 @@ async fn a_write_past_the_capacity_its_table_is_provisioned_for_is_throttled() {
         let mut served = 0usize;
         let mut codes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         let mut refused_key: Option<String> = None;
+        let started = std::time::Instant::now();
         for batch_at in 0..batches {
             let statements: Vec<Value> = (0..per_batch)
                 .map(|slot_at| {
@@ -712,6 +719,7 @@ async fn a_write_past_the_capacity_its_table_is_provisioned_for_is_throttled() {
                 }
             }
         }
+        let elapsed = started.elapsed();
 
         if throttles {
             assert_eq!(
@@ -720,12 +728,21 @@ async fn a_write_past_the_capacity_its_table_is_provisioned_for_is_throttled() {
                 "case {case}: a write past the provisioned capacity is throttled in its own \
                  slot and nothing else fails, got {codes:?} over {served} served writes"
             );
-            // The burst is what the table had not consumed, so the load is served up to
-            // it and refused past it.
+            // The credit behind a table is the capacity that went unused before the load
+            // arrived, which is some of it and never more than the documented window's
+            // worth: so part of the load is served and the rest refused. The ceiling is
+            // that window of the table's rate, plus the rate over the time the load itself
+            // took (the budget goes on filling while it runs) and a few seconds of slack, so
+            // a loaded machine cannot fail it — a table that absorbed more than that
+            // absorbed writes nothing paid for.
+            let funded = burst_units
+                + usize::try_from(elapsed.as_secs()).unwrap_or(usize::MAX)
+                + REFILL_SLACK_SECONDS;
             assert!(
-                served >= burst_units && served < batches * per_batch,
-                "case {case}: expected the burst ({burst_units} units) to be served and the \
-                 rest refused, got {served} of {} served",
+                served > 0 && served <= funded,
+                "case {case}: expected part of the load served from the credit the table had \
+                 banked (at most {funded} one-unit writes, from a {burst_units}-unit window \
+                 and {elapsed:?} of refill) and the rest refused, got {served} of {} served",
                 batches * per_batch
             );
             let refused_key = refused_key.expect("a throttled slot was observed");

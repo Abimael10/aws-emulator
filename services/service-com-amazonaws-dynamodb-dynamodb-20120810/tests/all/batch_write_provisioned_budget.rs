@@ -17,8 +17,8 @@
 //! The rows differ along what the rule generalises over: the capacity mode, the write
 //! units the table is provisioned for, the bytes of each item (and so the units one write
 //! costs), the requests per batch, and the number of batches in the stream — from a single
-//! batch a fresh burst covers whole, through streams of ten to 320 batches, to a batch
-//! whose every request asks for more than its table's credit could ever hold.
+//! batch the table's provisioning covers whole, through streams of ten to 320 batches, to a
+//! batch whose every request asks for more than its table's credit could ever hold.
 //!
 //! The table here is keyed by a partition key alone and every write is aimed at a key of
 //! its own, so the ceiling under test is the table's own provisioning rather than the
@@ -190,10 +190,11 @@ struct Row {
 /// batch and the length of the stream.
 ///
 /// A write costs one unit per 1 KB of the item and a budget holds at most
-/// [`BURST_SECONDS`] of its rate, so a table provisioned for one write unit holds at most
-/// 300 units — which is why 320 batches of 25 ~1 KB writes are far past what it can
-/// absorb, while ONE such batch against a fresh budget is well inside it, and a 399 KB
-/// item is a write that budget could never admit however long a caller waits.
+/// [`BURST_SECONDS`] of its rate — credit that is capacity which WENT UNUSED, so a table
+/// just created holds only what went unused since — which is why 320 batches of 25 ~1 KB
+/// writes are far past what a one-unit table can absorb, while one such batch against a
+/// table provisioned for fifty units is well inside it, and a 399 KB item is a write a
+/// one-unit table's credit could never admit however long a caller waits.
 fn rows() -> Vec<Row> {
     vec![
         Row {
@@ -213,8 +214,8 @@ fn rows() -> Vec<Row> {
             absorption: Absorption::Whole,
         },
         Row {
-            case: "one write unit, a fresh burst and one full batch of ~1 KB writes",
-            write_units: Some(1),
+            case: "fifty write units, one full batch of ~1 KB writes",
+            write_units: Some(50),
             batches: 1,
             per_batch: 25,
             payload: 900,

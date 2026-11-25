@@ -115,8 +115,11 @@ const REPORTED_SUFFIX_RULE: &str = "Suffix";
 const S3_PRINCIPAL: &str = "s3.amazonaws.com";
 const INVOKE_ACTION: &str = "lambda:InvokeFunction";
 
-/// The provisioned capacity the declared table carries, as the reference estate declares it.
-const READ_CAPACITY: u64 = 5;
+/// The provisioned capacity the declared table carries. The read side is ample because this
+/// suite POLLS the table for what a delivery left, several times a second: a provisioned table
+/// admits its rate plus the capacity that went unused behind it, so a poll loop faster than the
+/// rate would be throttled — which is a property of the loop and not of what it waits for.
+const READ_CAPACITY: u64 = 400;
 const WRITE_CAPACITY: u64 = 5;
 
 /// How long one invocation of the handler is given, as the function's own `Timeout`. Nothing here
