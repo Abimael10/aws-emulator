@@ -3,14 +3,16 @@
 //! What a frame INSIDE the runtime's own standard library is rendered as, in the stack a
 //! failed Python invocation answers with.
 //!
-//! The rule under test: every frame of a Python run's `stackTrace` that names a source file of
-//! the execution environment is a `traceback`-formatted frame — its location line AND the
-//! source line at that location — and a module of the standard library the runtime ships is
-//! such a file, under the runtime's own library directory, exactly as a module of the
-//! deployment package under the task root is ([`crate::python_frame_source_lines`], which pins
-//! the same rule over the package's own modules). A frame of a library module reduced to its
-//! location alone drops the statement that raised, so a client parsing the stack cannot say
-//! what the error was taken on.
+//! The rule under test: a module of the standard library this runtime serves is compiled INTO
+//! the interpreter, under its own module name and with no file behind it, so a traceback frame
+//! standing in one of them is ONE line naming the FROZEN module —
+//! `  File "<frozen <module>>", line <n>, in <name>` — and carries no source text at all,
+//! while a frame of a module a FILE of the execution environment holds (the deployment
+//! package's own, under the task root) is its location and the source line at it
+//! ([`crate::python_frame_source_lines`], which pins that half of the rule). No frame of such
+//! a module names a path inside the runtime's library directory: no file of the environment
+//! holds it, so a path there would name a file nothing could be read from, and the statement
+//! the error was taken on would be read off text no running code was compiled from.
 //!
 //! The rows differ along what the rule generalises over: WHICH module of the library the
 //! failure is taken in (a module at the top of the library, a module inside a package, a
@@ -18,10 +20,11 @@
 //! the failure is reported as, and HOW DEEP the stack is when it is taken.
 //!
 //! Every row drives real HTTP requests through the router, and nothing about a frame is
-//! written out here: the frames the error document carries are compared against the ones the
-//! STANDARD LIBRARY's own formatter renders for the very same failure, which the function
-//! itself is asked for on a second invocation. So the assertion is the rule — a frame is what
-//! `traceback` makes of it — rather than one recorded traceback.
+//! written out here: the frozen modules the error document names are compared against the
+//! units the STANDARD LIBRARY's own formatter names for the very same failure, which the
+//! function itself is asked for on a second invocation. So the assertion is the rule — a
+//! frozen module's frame names that module and stands on nothing — rather than one recorded
+//! traceback.
 
 use std::sync::Arc;
 
@@ -32,11 +35,17 @@ use crate::python_frame_source_lines::{
     create_function, frame_lines, invoke, located, poll_until_active, router_on, PYTHON,
 };
 
-/// The directory the runtime's own standard library is mounted at, which is the prefix of the
-/// file a frame inside one of its modules names: `/var/lang/lib/<runtime>`, as the execution
-/// environment states it (`AWS_EXECUTION_ENV`).
+/// The directory a managed runtime keeps the standard library it ships under, named for the
+/// runtime the function is configured with (`AWS_EXECUTION_ENV`). This runtime holds no FILE
+/// of a frozen module there, so no frame of one may name a path under it.
 fn library_root() -> String {
     format!("/var/lang/lib/{PYTHON}")
+}
+
+/// What a frame names when it stands in a module compiled into the interpreter: the module's
+/// own name, written as the frozen module it is.
+fn frozen(module: &str) -> String {
+    format!("<frozen {module}>")
 }
 
 /// One row: the statement the function fails on, and how many frames inside the library the
@@ -45,7 +54,7 @@ struct LibraryFrameCase {
     case: &'static str,
     /// The body of the function the handler calls, which is where the failure is taken.
     statement: &'static str,
-    /// The least number of frames naming a file under the library root.
+    /// The least number of frames standing in a frozen module of the library.
     least_library_frames: usize,
 }
 
@@ -53,8 +62,8 @@ struct LibraryFrameCase {
 ///
 /// Every statement fails INSIDE a module of the standard library rather than in the package's
 /// own code, so the deepest frames of each stack are library frames. The modules the
-/// statements reach are the runtime's own (`os`, `json`, `random`, `shlex`, `re`), each of
-/// which this runtime offers.
+/// statements reach are the ones this runtime serves frozen (`os`, `json`, `random`, `shlex`,
+/// `re`), none of which is a file of the execution environment.
 fn library_frame_cases() -> Vec<LibraryFrameCase> {
     vec![
         LibraryFrameCase {
@@ -117,68 +126,57 @@ fn module(statement: &str) -> String {
     .join("\n")
 }
 
-/// What one rendered frame STATES: the file it names, the line number in it, the symbol the
+/// What one rendered frame STATES: the unit it names, the line number in it, the symbol the
 /// frame is in, and the source line it carries (empty for a frame carrying none).
 fn stated(frame: &str) -> Option<(String, usize, String, String)> {
     let lines = frame_lines(frame);
-    let (file, number) = located(lines.first()?)?;
+    let (unit, number) = located(lines.first()?)?;
     let symbol = lines
         .first()?
         .rsplit_once(", in ")
         .map(|(_located, symbol)| symbol.to_string())?;
     let source = lines.get(1).copied().unwrap_or_default().to_string();
-    Some((file, number, symbol, source))
+    Some((unit, number, symbol, source))
 }
 
-/// The frames of `frames` that name a file under the runtime's own library directory.
-fn library_frames(frames: &[String], root: &str) -> Vec<String> {
+/// The frames of `frames` that stand in a module no file holds: the ones whose unit is written
+/// as a pseudo-file rather than as a path.
+fn frozen_frames(frames: &[String]) -> Vec<String> {
     frames
         .iter()
         .filter(|frame| {
-            frame_lines(frame)
-                .first()
-                .and_then(|line| located(line))
-                .is_some_and(|(file, _line)| file.starts_with(root))
+            stated(frame)
+                .is_some_and(|(unit, _, _, _)| unit.starts_with('<') && unit.ends_with('>'))
         })
         .cloned()
         .collect()
 }
 
-/// The POSITION and the source line of each of `frames`: the line number, the symbol and the
-/// source line, with the file left out.
-///
-/// The file is left out because the two renderings compared here name it differently by
-/// design: the runtime renders a library module's frame as that module's file under the
-/// runtime's own library directory, while a rendering made INSIDE the run names the unit the
-/// module was compiled under — which is the naming rule
-/// [`crate::invoke_function_error_document`] pins. What this suite is about is the other half
-/// of the frame: the position, and the source line at it.
-fn positions(frames: &[String]) -> Vec<(usize, String, String)> {
-    frames
-        .iter()
-        .filter_map(|frame| stated(frame))
-        .map(|(_file, number, symbol, source)| (number, symbol, source))
-        .collect()
-}
-
-/// The frames of a rendering made INSIDE the run that are the library's own: a module of the
-/// library is named by the unit it was compiled under rather than by a path, so its frames are
-/// the ones naming no absolute file.
+/// The frames of a rendering made INSIDE the run that are the library's own: the interpreter
+/// names a frozen module by the unit it was compiled under, which is its module NAME, so those
+/// are the frames naming no absolute path.
 fn compiled_unit_frames(frames: &[String]) -> Vec<String> {
     frames
         .iter()
-        .filter(|frame| {
-            frame_lines(frame)
-                .first()
-                .and_then(|line| located(line))
-                .is_some_and(|(file, _line)| !file.starts_with('/'))
-        })
+        .filter(|frame| stated(frame).is_some_and(|(unit, _, _, _)| !unit.starts_with('/')))
         .cloned()
         .collect()
 }
 
+/// What the error document must carry for a frame the run's own rendering states as `frame`:
+/// the same position and symbol, with the unit written as the frozen module it is and no
+/// source text under it.
+///
+/// A trailing `.py` on the compiled unit is dropped, because the unit a frozen module is
+/// compiled under is its module NAME and that is what the frozen origin states.
+fn expected_frozen(frame: &str) -> Option<(String, usize, String, String)> {
+    let (unit, number, symbol, _source) = stated(frame)?;
+    let module = unit.strip_suffix(".py").unwrap_or(&unit).to_string();
+    Some((frozen(&module), number, symbol, String::new()))
+}
+
 #[tokio::test]
-async fn a_library_frame_carries_the_source_line_it_stands_on() {
+async fn a_library_frame_names_the_frozen_module_it_stands_in() {
     let _stream = one_invocation_stream_at_a_time().await;
     let root = library_root();
     // One engine for the whole table: every row is its own function on it, so the
@@ -225,45 +223,76 @@ async fn a_library_frame_carries_the_source_line_it_stands_on() {
             raised.text()
         );
 
-        // Every frame naming a source FILE of the environment — the package's own modules
-        // under the task root and the library's under its own directory — is its location and
-        // the source line at it.
         for (position, frame) in frames.iter().enumerate() {
             let lines = frame_lines(frame);
-            let Some((file, number)) = lines.first().and_then(|line| located(line)) else {
+            let Some((unit, number, _symbol, source)) = stated(frame) else {
                 panic!(
                     "case {:?}: frame {position} must open with its location, got {frame:?}",
                     case.case
                 );
             };
-            assert_eq!(
-                lines.len(),
-                2,
-                "case {:?}: frame {position} of {file:?} line {number} must be its location \
-                 and the source line at it, got {frame:?}",
+            if unit.starts_with('/') {
+                // A module a FILE of the environment holds: its location and the source line
+                // at it, which is the deployment package's own modules here.
+                assert_eq!(
+                    lines.len(),
+                    2,
+                    "case {:?}: frame {position} of {unit:?} line {number} must be its \
+                     location and the source line at it, got {frame:?}",
+                    case.case
+                );
+                assert!(
+                    source.starts_with("    ") && !source.trim().is_empty(),
+                    "case {:?}: frame {position} of {unit:?} must carry its source line \
+                     indented under the location, got {source:?}",
+                    case.case
+                );
+                continue;
+            }
+            // A module compiled into the interpreter: the frozen module it is, and nothing
+            // under it.
+            assert!(
+                unit.starts_with("<frozen ") && unit.ends_with('>'),
+                "case {:?}: frame {position} stands in no file of the environment, so it must \
+                 name the frozen module it is in, got {unit:?}",
                 case.case
             );
-            let statement = lines[1];
-            assert!(
-                statement.starts_with("    ") && !statement.trim().is_empty(),
-                "case {:?}: frame {position} of {file:?} must carry its source line indented \
-                 under the location, got {statement:?}",
+            assert_eq!(
+                lines.len(),
+                1,
+                "case {:?}: frame {position} stands in {unit:?}, which no file holds, so it \
+                 carries no source text, got {frame:?}",
                 case.case
             );
         }
 
+        // Said the other way round, over the value a client must never be shown: the library
+        // directory of a managed runtime holds no file of a frozen module, so no frame names a
+        // path under it.
+        let leaked: Vec<&String> = frames
+            .iter()
+            .filter(|frame| stated(frame).is_some_and(|(unit, _, _, _)| unit.starts_with(&root)))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "case {:?}: no frame of a frozen module may name a path under {root:?}, got \
+             {leaked:?}",
+            case.case
+        );
+
         // The library's own frames, and as many of them as the row reaches.
-        let inside = library_frames(&frames, &root);
+        let inside = frozen_frames(&frames);
         assert!(
             inside.len() >= case.least_library_frames,
-            "case {:?}: expected at least {} frames inside {root:?}, got {frames:?}",
+            "case {:?}: expected at least {} frames standing in a frozen module, got \
+             {frames:?}",
             case.case,
             case.least_library_frames
         );
 
         // The same failure, rendered by the STANDARD LIBRARY's own formatter inside the
-        // function: the frames the error document carries for the library are exactly the
-        // ones `traceback` makes of them.
+        // function: the library frames the error document carries are exactly those frames,
+        // each naming the frozen module the interpreter compiled that unit under.
         let rendered = invoke(&router, &name, br#"{"render": true}"#).await;
         assert_eq!(
             rendered.status,
@@ -290,14 +319,17 @@ async fn a_library_frame_carries_the_source_line_it_stands_on() {
             case.case,
             rendered.text()
         );
-        let formatted_inside = positions(&compiled_unit_frames(&formatted));
-        let inside_positions = positions(&inside);
+        let expected: Vec<(String, usize, String, String)> = compiled_unit_frames(&formatted)
+            .iter()
+            .filter_map(|frame| expected_frozen(frame))
+            .collect();
+        let reported: Vec<(String, usize, String, String)> =
+            inside.iter().filter_map(|frame| stated(frame)).collect();
         assert_eq!(
-            inside_positions,
-            formatted_inside,
-            "case {:?}: the library's frames must read as `traceback` renders them \
-             (line, symbol, source line), expected {formatted_inside:?}, got \
-             {inside_positions:?}",
+            reported, expected,
+            "case {:?}: every library frame must name the frozen module the interpreter \
+             compiled it under, at the position `traceback` states, with no source text, \
+             expected {expected:?}, got {reported:?}",
             case.case
         );
     }

@@ -90,7 +90,7 @@ import traceback
 _host = __import__("_lambda_host")
 
 # What the INIT phase resolved, for the INVOKE phase the host calls next: the request
-# document, this runtime's own library directory and the handler's entry point.
+# document and the handler's entry point.
 _PREPARED = {}
 
 
@@ -1110,12 +1110,13 @@ def _raised(error_type, error_message, stack_trace):
 
 
 def _runtime_library(environment):
-    """The directory the modules of the RUNTIME ITSELF are reported under.
+    """The directory the modules the RUNTIME ITSELF supplies as FILES are mounted at.
 
     A managed runtime keeps the standard library it ships under the library directory of
     its own language installation, named for the runtime the function is configured with
     — which the invocation's environment states, as ``AWS_EXECUTION_ENV`` is
-    ``AWS_Lambda_<runtime>``.
+    ``AWS_Lambda_<runtime>``. The modules this runtime serves FROZEN have no directory of
+    their own there ([_frame_origin]).
     """
 
     marker = "AWS_Lambda_"
@@ -1125,102 +1126,48 @@ def _runtime_library(environment):
     return "/var/lang/lib/" + execution_env[len(marker):]
 
 
-def _frame_file(filename, library):
-    """The FILE a traceback frame names.
+def _frame_origin(filename):
+    """What a traceback frame names, and whether a SOURCE LINE may stand under it.
 
-    A frame of the deployment package's own module already names its path under the task
-    root, and a frame the interpreter renders as a pseudo-file (``<string>``) has no path
-    to name. Everything else is a module of the runtime's own standard library, whose
-    frame names that module's source file under the runtime's library directory rather
-    than the bare module name it was compiled under.
+    A module the execution environment holds as a FILE names that file by path — the
+    deployment package's own modules under the task root, a layer's content, the modules the
+    runtime supplies under its own directories — and the line the frame stands on is read out
+    of it, so such a frame is its location and that line.
+
+    A module of the standard library this runtime serves is compiled INTO the interpreter
+    instead, under its own module name rather than a path: no file holds it, so the frame
+    names the FROZEN module it is standing in and carries no source text at all. That is how
+    a managed runtime serving its standard library frozen renders such a frame.
+
+    A pseudo-file the interpreter renders for code it was handed as text (``<string>``) is
+    already written as one and is left as it is.
     """
 
-    if not library or filename.startswith("/") or filename.startswith("<"):
-        return filename
-    path = filename[:-3] if filename.endswith(".py") else filename
-    return "%s/%s.py" % (library, path.replace(".", "/"))
+    if filename.startswith("/") or filename.startswith("<"):
+        return filename, True
+    module = filename[:-3] if filename.endswith(".py") else filename
+    return "<frozen %s>" % module, False
 
 
-def _library_source(filename):
-    """The SOURCE of the standard-library module compiled under ``filename``, or ``None``
-    when the library this runtime ships holds no module under that name.
-
-    The modules of that library are compiled INTO this runtime rather than read off a path,
-    so a source lookup for one of them — a traceback rendering a frame, `inspect` reading a
-    definition — finds no file and comes back empty. The environment holds the library's own
-    text and answers for one module of it at a time, which is the same text those compiled
-    modules were built from.
-    """
-
-    # A module resolved from one of the MOUNTS names its own path, and its lines are cached
-    # when it is imported ([_PackageLoader.exec_module]); a pseudo-file is no module of the
-    # library at all.
-    if not filename or filename.startswith("/") or filename.startswith("<"):
-        return None
-    source = _host.library_source(filename)
-    if not source:
-        return None
-    return source
-
-
-def _install_library_lines():
-    """Make the modules of the runtime's own standard library READABLE to every source
-    lookup, the way a managed runtime's library directory is.
-
-    `linecache` is what the standard library looks a source line up through — a traceback
-    frame's own line, a definition `inspect` is asked for — so the library's text is given
-    to it rather than to one renderer: a frame inside the library then carries its source
-    line wherever a traceback is rendered, in the error document a failed invocation answers
-    with and in the records the invocation logs alike.
-
-    The cache is seeded as a module held in memory is, with no modification time, so the
-    entry is kept rather than dropped by a cache check that finds no file
-    ([_PackageLoader.exec_module]).
-    """
-
-    held = linecache.getlines
-
-    def getlines(filename, module_globals=None):
-        lines = held(filename, module_globals)
-        if lines:
-            return lines
-        source = _library_source(filename)
-        if source is None:
-            return lines
-        linecache.cache[filename] = (
-            len(source),
-            None,
-            source.splitlines(True),
-            _frame_file(filename, _PREPARED.get("library") or ""),
-        )
-        return linecache.cache[filename][2]
-
-    linecache.getlines = getlines
-
-
-# Installed with this runtime, before anything it could be asked for has run: the library's
-# own modules are readable from the first source lookup of the first invocation on.
-_install_library_lines()
-
-
-def _frames(trace, library):
+def _frames(trace):
     """One rendered frame per entry of ``trace``, as the error document carries them.
 
-    A frame is its location line and the source line at that location, and nothing else:
-    the fine-grained error-location anchors (the ``~`` and ``^`` run under the source
-    line) this interpreter can render are not part of the frame the runtime reports. That
-    holds for every frame of the stack, the ones inside the runtime's own standard library
-    included ([_install_library_lines]).
+    A frame is its location line and, for a module a file holds, the source line at that
+    location — and nothing else: the fine-grained error-location anchors (the ``~`` and ``^``
+    run under the source line) this interpreter can render are not part of the frame the
+    runtime reports, and a frozen module's frame is its location alone
+    ([_frame_origin]).
     """
 
     rendered = []
     for frame in traceback.extract_tb(trace):
+        origin, carries_source = _frame_origin(frame.filename)
         text = '  File "%s", line %s, in %s\n' % (
-            _frame_file(frame.filename, library),
+            origin,
             frame.lineno,
             frame.name,
         )
-        if frame.line:
+        if carries_source and frame.line:
             text += "    %s\n" % frame.line.strip()
         rendered.append(text)
     return rendered
@@ -1401,7 +1348,6 @@ def _prepare(request, library):
         )
 
     _PREPARED["request"] = request
-    _PREPARED["library"] = library
     _PREPARED["entry"] = entry
     return None
 
@@ -1415,7 +1361,6 @@ def _invoke(deadline_epoch_ms):
     context — is already done ([_bind]), so what this phase holds is the handler's own work
     and the handler is entered with its whole timeout left.
     """
-    library = _PREPARED["library"]
     entry = _PREPARED["entry"]
     if "context" not in _PREPARED:
         return _raised(
@@ -1438,7 +1383,7 @@ def _invoke(deadline_epoch_ms):
         return _raised(
             type(error).__name__,
             str(error),
-            _frames(trace, library) if trace is not None else [],
+            _frames(trace) if trace is not None else [],
         )
 
     try:
@@ -1457,9 +1402,11 @@ def _main_prepare(payload):
         request = json.loads(payload)
     except BaseException as error:
         return json.dumps(_raised("Runtime.InternalError", str(error), []))
-    # Where this runtime's OWN modules are, which a frame of one of them names.
+    # The DIRECTORY this runtime's own modules are mounted at, which is where the standard
+    # library it supplies as files is imported from ([_prepare]). A module it serves FROZEN has
+    # no directory at all, and a frame of one names the frozen module rather than a path
+    # ([_frame_origin]), so nothing past this phase needs it.
     library = _runtime_library(request.get("environment") or {})
-    _PREPARED["library"] = library
     try:
         outcome = _prepare(request, library)
     except BaseException as error:
@@ -1467,7 +1414,7 @@ def _main_prepare(payload):
             _raised(
                 type(error).__name__,
                 str(error),
-                _frames(error.__traceback__, library),
+                _frames(error.__traceback__),
             )
         )
     if outcome is not None:
@@ -1530,7 +1477,6 @@ def _bind(request):
 
 
 def _main_bind(payload):
-    library = _PREPARED.get("library") or ""
     try:
         request = json.loads(payload)
     except BaseException as error:
@@ -1542,7 +1488,7 @@ def _main_bind(payload):
             _raised(
                 type(error).__name__,
                 str(error),
-                _frames(error.__traceback__, library),
+                _frames(error.__traceback__),
             )
         )
     if outcome is not None:
@@ -1552,7 +1498,6 @@ def _main_bind(payload):
 
 
 def _main_invoke(deadline_epoch_ms):
-    library = _PREPARED.get("library") or ""
     try:
         return json.dumps(_invoke(deadline_epoch_ms))
     except BaseException as error:
@@ -1560,7 +1505,7 @@ def _main_invoke(deadline_epoch_ms):
             _raised(
                 type(error).__name__,
                 str(error),
-                _frames(error.__traceback__, library),
+                _frames(error.__traceback__),
             )
         )
 

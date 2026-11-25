@@ -281,8 +281,9 @@ fn is_anchor(line: &str) -> bool {
 }
 
 /// Assert that every frame of `frames` is one frame as a runtime renders it: a location
-/// line naming a source FILE by path, at the line of a real source line and in a named
-/// function, at most one source line under it, and no anchors.
+/// line naming the source FILE it stands in by path, or the FROZEN module it stands in for a
+/// module no file holds, at the line of a real source line and in a named function, at most
+/// one source line under it — and none at all for a frozen module — and no anchors.
 fn assert_frames_are_locations_and_source(case: &str, frames: &[String]) {
     for (index, frame) in frames.iter().enumerate() {
         assert!(
@@ -298,9 +299,16 @@ fn assert_frames_are_locations_and_source(case: &str, frames: &[String]) {
         let Some((file, number, name)) = located(lines[0]) else {
             panic!("case {case}: frame {index} must open with its location, got {frame:?}");
         };
+        let names_a_file = file.starts_with('/') && file.ends_with(".py");
         assert!(
-            file.starts_with('/') && file.ends_with(".py"),
-            "case {case}: frame {index} must name a source file by path, got {file:?}"
+            names_a_file || (file.starts_with('<') && file.ends_with('>')),
+            "case {case}: frame {index} must name a source file by path or the frozen module \
+             it stands in, got {file:?}"
+        );
+        assert!(
+            names_a_file || lines.len() == 1,
+            "case {case}: frame {index} stands in {file:?}, which no file of the environment \
+             holds, so it carries no source text, got {frame:?}"
         );
         assert!(
             number > 0 && !name.is_empty(),
@@ -438,14 +446,14 @@ async fn a_timed_out_run_reports_the_sandbox_timeout_class() {
 
 /// Every frame of the stack a failed run reports is ONE frame as the runtime renders it:
 /// its location and the source line at it, with the file named by path — one row per shape
-/// of stack, including one that reaches the runtime's own modules, whose frame names the
-/// module's source file under the runtime's library directory.
+/// of stack, including one that reaches a module of the standard library this runtime serves
+/// FROZEN, whose frame names that frozen module and carries no source text.
 #[tokio::test]
 async fn a_reported_frame_is_a_location_and_its_source_line() {
     let _stream = one_invocation_stream_at_a_time().await;
-    // The library directory of the runtime the function is configured for, where a managed
-    // runtime keeps the standard library it ships.
-    let library: &str = &format!("/var/lang/lib/{PYTHON}/");
+    // The module of the standard library the third row's failure is taken inside, as the
+    // frame of a frozen module names it.
+    let library: &str = "<frozen os>";
     // The case, the module source, the event, how many frames the stack holds at least,
     // and the directory a frame of the stack must name a file in beside the task root.
     let cases: &[(&str, &str, &str, usize, Option<&str>)] = &[
@@ -518,9 +526,9 @@ async fn a_reported_frame_is_a_location_and_its_source_line() {
             assert!(
                 frames.iter().any(|frame| {
                     located(frame_lines(frame)[0])
-                        .is_some_and(|(file, _, _)| file.starts_with(within))
+                        .is_some_and(|(file, _, _)| file == *within)
                 }),
-                "case {case}: expected a frame naming a source file in {within:?}, got \
+                "case {case}: expected a frame standing in {within:?}, got \
                  {frames:?}"
             );
         }

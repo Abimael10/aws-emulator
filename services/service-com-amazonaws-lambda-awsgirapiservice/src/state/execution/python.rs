@@ -2394,13 +2394,17 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<PyRef<Py
                 .into())
         },
     );
-    // The SOURCE of one module of the standard library this RUNTIME ships, which the runtime
-    // reads a traceback frame's own line out of ([`super::python_library`]). A managed runtime
-    // keeps that library as readable files of its own library directory, and the interpreter
-    // embedded here imports it from a frozen copy instead — compiled code with no text — so
-    // the text is held by the host and answered for the module a frame states it is in.
-    // Nothing is dispatched, no host path is opened and no bound is spent: it is the
-    // environment's own library, the same text the frozen code was compiled from.
+    // The SOURCE of one module of the standard library this RUNTIME ships
+    // ([`super::python_library`]). The interpreter embedded here imports that library from a
+    // frozen copy — compiled code with no text behind it — so the text is held by the host and
+    // answered for the module a guest names. Nothing is dispatched, no host path is opened and
+    // no bound is spent: it is the environment's own library, the same text the frozen code was
+    // compiled from.
+    //
+    // The RUNTIME does not read it: a frame standing in a frozen module names that module and
+    // carries no source text, exactly as a managed runtime serving its library frozen renders
+    // one ([`super::bootstrap`]'s `_frame_origin`). This seam is what the environment answers a
+    // GUEST that asks for a library module's own text with.
     set_function(
         vm,
         &module,
@@ -2408,7 +2412,7 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<PyRef<Py
         move |args: FuncArgs, vm: &VirtualMachine| {
             let named: String = args.bind(vm)?;
             // The seam is string-in, string-out: a name this library holds no module under
-            // answers the empty text, which is the frame having no line to show.
+            // answers the empty text, which is the library holding no such module.
             Ok(vm
                 .ctx
                 .new_str(super::python_library::library_source(&named).unwrap_or_default())

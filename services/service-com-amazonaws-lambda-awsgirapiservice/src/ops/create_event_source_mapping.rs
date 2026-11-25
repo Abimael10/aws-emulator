@@ -62,7 +62,9 @@
 //! [`absent_required_member`]). A position STATED is held to the source too: one the source
 //! cannot be read from is refused with that same modelled 400, keyed on the kind of
 //! resource the ARN names (see [`crate::state::supports_starting_position`] and
-//! [`crate::state::unsupported_starting_position_message`]).
+//! [`crate::state::unsupported_starting_position_message`]); `StartingPosition` is a setting
+//! of the mapping's CREATION alone — `UpdateEventSourceMapping` takes no such member — so
+//! this is the one operation that decides it.
 //!
 //! What the mapping may be asked to MEASURE is held to that same source:
 //! `EventSourceMappingMetricsConfig$Metrics` is "the metrics you want your event source

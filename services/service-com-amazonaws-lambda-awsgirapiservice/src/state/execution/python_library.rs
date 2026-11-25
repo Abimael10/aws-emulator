@@ -2,21 +2,20 @@
 
 //! The SOURCE of the standard library a `python3.x` execution environment's runtime ships.
 //!
-//! A managed runtime keeps its standard library as FILES under its own library directory, so a
-//! traceback frame standing inside one of those modules is rendered the same way a frame of
-//! the deployment package is: the location line and the source line at that location. The
-//! interpreter this crate embeds imports that same library from a frozen copy — compiled code
-//! objects carrying no text — so a frame inside it would have no line to show.
+//! The interpreter this crate embeds imports that library from a FROZEN copy — compiled code
+//! objects carrying no text, held under the module's own name rather than under a path — so a
+//! guest asking what a module of it is written as finds no file to read.
 //!
 //! This module is the text those code objects were compiled from, taken into the binary when
-//! this crate is built (`build.rs`) out of the very library the frozen copy is built from: the
-//! line reported at a position is the line the running code really was compiled from, no host
-//! path is opened while a function runs, and nothing about a frame is written out by hand.
+//! this crate is built (`build.rs`) out of the very library the frozen copy is built from, and
+//! answered to the guest for one module at a time (`super::python::library_source`): the text
+//! a guest reads is the text the running code really was compiled from, no host path is opened
+//! while a function runs, and nothing about a module is written out by hand.
 //!
-//! It is keyed the way a frame names its module — [`library_source`] — because the unit a
-//! frozen module is compiled under is its module name rather than a path
-//! ([`super::bootstrap`]'s `_frame_file`, which renders that name as the module's file under
-//! the library directory).
+//! It is keyed the way the interpreter names a frozen module — [`library_source`] — because
+//! the unit such a module is compiled under is its module NAME and not a path, which is also
+//! what a traceback frame inside it states ([`super::bootstrap`]'s `_frame_origin`, which
+//! renders that name as the frozen module the frame stands in).
 
 include!(concat!(env!("OUT_DIR"), "/python_library_sources.rs"));
 

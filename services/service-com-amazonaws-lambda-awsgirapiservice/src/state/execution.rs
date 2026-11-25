@@ -3068,16 +3068,16 @@ mod tests {
     }
 
     /// Every frame of the stack a Python run's error document carries is ONE frame as the
-    /// runtime renders it: its location line, which names the source FILE by path, and the
-    /// source line at that location — with no fine-grained error-location anchors under it.
-    /// One row per shape of stack, including one that reaches a module the RUNTIME itself
-    /// supplies, whose frame names that module's file under the runtime's own library
-    /// directory rather than the bare module name it was compiled under.
+    /// runtime renders it: its location line, and — for a module a FILE of the execution
+    /// environment holds — the source line at that location, with no fine-grained
+    /// error-location anchors under it. One row per shape of stack, including one that reaches
+    /// a module of the standard library this runtime serves FROZEN, whose frame names that
+    /// frozen module and stands on no source text at all.
     #[test]
     fn a_reported_frame_is_a_location_and_its_source_line() {
-        // The library directory of the runtime the probe function is configured with, where
-        // a managed runtime keeps the standard library it ships.
-        let library = "/var/lang/lib/python3.12/";
+        // The module of the standard library the third row's failure is taken inside, as the
+        // frame of a frozen module names it.
+        let frozen = "<frozen os>";
         let cases: &[(&str, &str, usize, Option<&str>)] = &[
             (
                 "a subscript of a key the event does not hold",
@@ -3097,7 +3097,7 @@ mod tests {
                 "import os\n\n\
                  def handler(event, context):\n    return os.environ[\"ABSENT\"]\n",
                 2,
-                Some(library),
+                Some(frozen),
             ),
         ];
         for (case, source, least, within) in cases {
@@ -3124,9 +3124,17 @@ mod tests {
                              {frame:?}"
                         )
                     });
+                let names_a_file = file.starts_with('/') && file.ends_with(".py");
+                let names_a_frozen_module = file.starts_with('<') && file.ends_with('>');
                 assert!(
-                    file.starts_with('/') && file.ends_with(".py"),
-                    "case {case}: frame {index} must name a source file by path, got {file:?}"
+                    names_a_file || names_a_frozen_module,
+                    "case {case}: frame {index} must name a source file by path or the frozen \
+                     module it stands in, got {file:?}"
+                );
+                assert!(
+                    names_a_file || lines.len() == 1,
+                    "case {case}: frame {index} stands in {file:?}, which no file holds, so it \
+                     carries no source text, got {frame:?}"
                 );
                 for line in lines.iter().skip(1) {
                     let marks = line.trim();
@@ -3139,10 +3147,10 @@ mod tests {
                 }
             }
             if let Some(within) = within {
-                let expected = format!("  File \"{within}");
+                let expected = format!("  File \"{within}\", line ");
                 assert!(
                     frames.iter().any(|frame| frame.starts_with(&expected)),
-                    "case {case}: expected a frame naming a source file in {within:?}, got \
+                    "case {case}: expected a frame standing in {within:?}, got \
                      {frames:?}"
                 );
             }
