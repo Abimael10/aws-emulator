@@ -100,3 +100,53 @@ Cause 3 (rule-priority-collision UPDATE never terminal):
 3. update_stack with rule A moved to Priority 20 and body 'a2'. On AWS ELBv2 refuses with PriorityInUse (400), the stack settles UPDATE_ROLLBACK_COMPLETE with an UPDATE_FAILED event for rule A, and rule A keeps its ARN, Priority 10 and body 'a1'.
 4. update_stack again with rule A at free Priority 15 and body 'a2': UPDATE_COMPLETE, same rule ARN, ALB serves 'a2'.
 5. Re-replay elbv2.deploy-elbv2-2-rule-priority-collision-update-rejected.
+
+## Resolution
+
+Causes 1 and 2 were already in force in the tree this was picked up from, and the replay now
+reports both of their keys `fixed`:
+
+* Cause 1 — `src/ops/set_rule_priorities.rs` constructs its `PriorityInUseException` from
+  `crate::state::rule_priorities_refusal_message()` ("One or more priorities not found"), the
+  collection wording every list-addressing refusal of this service answers, while the operation
+  that places ONE rule at ONE priority (`CreateRule`) states that priority
+  (`crate::state::priority_in_use_message`). Pinned by the elbv2 crate's own suites and by
+  `services/service-com-amazonaws-cloudformation-cloudformation/tests/all/elbv2_rule_priority_collision_update.rs`,
+  which asserts the wording a refused stack update carries.
+* Cause 2 — `src/state/rule_actions.rs`'s `check_forward_weights` refuses a forward action whose
+  named target groups' weights total zero with the generic validation code and stores nothing; it
+  is applied by `CreateListener`, `ModifyListener`, `CreateRule` and `ModifyRule`. Pinned by
+  `tests/all/weighted_forward_and_target_group_stickiness.rs` and
+  `tests/all/zero_weight_forward_lambda_selection.rs`, over both published bounds of
+  `TargetGroupTuple$Weight` and every operation that sets such an action.
+
+Cause 3 states that the CloudFormation-driven flow reaches no terminal state. The root cause it
+names — CloudFormation SYNTHESISING the Elastic Load Balancing identifiers instead of creating the
+resources — is gone: `src/state/provisioning/elastic_load_balancing.rs` creates each of the four
+declared types through that service's own `CreateLoadBalancer`, `CreateTargetGroup`,
+`CreateListener` and `CreateRule`, and the deployment is held open until the service reports the
+load balancer active. No non-terminal state and no non-serving address could be reproduced:
+
+* in process (`core/router/tests/all/elbv2_stack_update_drives_its_declared_estate.rs`,
+  `services/service-com-amazonaws-cloudformation-cloudformation/tests/all/elbv2_rule_priority_collision_update.rs`,
+  which spans the collision at a middle priority and at both published bounds of `RulePriority`);
+* on the started binary over a real socket (`core/router/tests/all/zz_elbv2_stack_probe.rs`);
+* and now, declared the way an SDK client declares it — a JSON template with the long-form
+  references over a public-subnet network — through all four operations including the TEARDOWN:
+  `core/router/tests/all/elbv2_stack_estate_from_a_json_template.rs`. That suite also holds the
+  address the stack published to answering on the FIRST exchange after `CREATE_COMPLETE`, and to
+  answering nothing at all once the stack is torn down.
+
+What is NOT closed here, and is left to the issue that owns it: the replayed unit still reports
+`Check timed out after 60.0s`, a harness wall-clock cut-off carrying no emulator response to
+compare, while the whole recorded sequence (create, the refused move, the move onto a free
+priority) settles and serves in about 3 s in every drive above. The one mechanism left that fits a
+client burning its budget in a data-plane poll is the form of the address itself:
+`LoadBalancer$DNSName` is published as a `host:port` AUTHORITY, so a client that composes the
+documented `http://{DNSName}:{listener port}` builds a URL carrying two ports and reaches nothing
+at all. That is cause 2 of
+`issues/things-that-do-not-work/20261123T141857Z-elbv2-4-net-new-causes-an-alb-answers.md`, filed
+with its own replay keys, whose evidence is exactly that refusal (`http://127.0.0.1:37113:80`) on
+sibling elbv2 data-plane checks — so this check's remaining divergence is BLOCKED on that issue's
+fix rather than on anything cause 3 names. The suites above dial the published authority directly,
+which is why none of them can fail on it.

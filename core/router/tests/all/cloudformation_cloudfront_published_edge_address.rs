@@ -250,11 +250,16 @@ async fn wait_until_deployed(router: &MultiServiceRouter, case: &str, id: &str) 
 }
 
 /// What a viewer's own connection answered: the status line's code, the headers and the body.
-struct Served {
-    status: u16,
-    headers: BTreeMap<String, String>,
-    body: String,
-    raw: String,
+///
+/// `pub(crate)` with [`parsed`]: this is the ONE reading this test crate keeps of an HTTP/1.1
+/// answer that arrived on a published address's own socket, so a suite that dials another
+/// published address — `elbv2_stack_estate_from_a_json_template`, over a load balancer's — takes
+/// the same framing rather than a second copy of it.
+pub(crate) struct Served {
+    pub(crate) status: u16,
+    pub(crate) headers: BTreeMap<String, String>,
+    pub(crate) body: String,
+    pub(crate) raw: String,
 }
 
 impl Served {
@@ -319,7 +324,7 @@ async fn dial(case: &str, authority: &str, path: &str) -> Served {
 /// entity the edge framed rather than everything that happened to arrive on the connection;
 /// an answer that states no length is read to the end of the stream, which is what the
 /// `Connection: close` of the dial asks for.
-fn parsed(case: &str, raw: &str) -> Served {
+pub(crate) fn parsed(case: &str, raw: &str) -> Served {
     let (head, body) = raw.split_once("\r\n\r\n").unwrap_or_else(|| {
         panic!("case {case:?}: the answer carries no end of headers: {raw:?}")
     });
