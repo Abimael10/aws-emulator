@@ -34,7 +34,10 @@ use crate::table_metadata::{athena, athena_ok, emulator, glue_ok, GLUE_CATALOG};
 const CATALOG_DEFAULT_DATABASE: &str = "default";
 
 /// The `Name`s of a `DatabaseList`, in the order the service returned them.
-fn reported_names(page: &Value) -> Vec<String> {
+///
+/// `pub(crate)` because `tests/all` is ONE crate: a sibling suite over this same listing
+/// reads a page's names through this one function rather than copying it.
+pub(crate) fn reported_names(page: &Value) -> Vec<String> {
     page["DatabaseList"]
         .as_array()
         .unwrap_or_else(|| panic!("expected a DatabaseList, got {page}"))

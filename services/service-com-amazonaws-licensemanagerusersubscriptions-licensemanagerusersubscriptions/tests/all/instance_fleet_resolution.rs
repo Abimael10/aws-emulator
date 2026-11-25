@@ -417,6 +417,18 @@ async fn every_instance_the_account_has_carries_the_user_association_plane() {
     }
 }
 
+/// The id `launched` with its LAST character replaced by a DIFFERENT one: an id of EC2's
+/// own form, one character from an instance the account has, that no launch minted.
+///
+/// The replacement is chosen against the character that is there, so the result differs
+/// from `launched` whatever hex digit the launch minted last — a fixed digit would, for one
+/// id in sixteen, name the launched instance itself.
+fn near_miss(launched: &str) -> String {
+    let (head, last) = launched.split_at(launched.len() - 1);
+    let replacement = if last == "0" { '1' } else { '0' };
+    format!("{head}{replacement}")
+}
+
 /// RULE, the other side: an id no instance of the account has is refused, with the same
 /// code, status and sentence on every operation that acts on a caller-named instance — and
 /// an instance EC2 has TERMINATED is no longer one the account has.
@@ -448,7 +460,7 @@ async fn an_id_no_instance_of_the_account_has_is_refused_on_every_gated_operatio
         },
         Row {
             case: "a near miss on a launched instance".to_string(),
-            instance_id: format!("{}0", &launched[..launched.len() - 1]),
+            instance_id: near_miss(&launched),
         },
         Row {
             case: "an upper-case spelling of a launched instance".to_string(),
