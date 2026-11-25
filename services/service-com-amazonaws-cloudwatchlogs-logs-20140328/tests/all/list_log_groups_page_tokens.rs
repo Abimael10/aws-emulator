@@ -7,10 +7,13 @@
 //! shared store cannot pass. WHICH log groups the filters select is the subject of
 //! `tests/all/log_group_name_pattern_lists.rs`; this suite is about the walk.
 //!
-//! The rule: `nextToken` is "the token for the next set of items to return", so it comes back
-//! exactly while log groups remain beyond the page just reported, and carrying it back resumes
-//! the SAME enumeration where that page ended — which is what lets a client enumerating the
-//! account's log groups see every one of them exactly once.
+//! The rule: `nextToken` is "the token for the next set of items to return", and this
+//! operation "is paginated" — "your first use of this operation returns 50 results, and includes
+//! a token to use in a subsequent operation to return more results": a page that REPORTED log
+//! groups hands back the token that continues the SAME enumeration where it ended, and only a
+//! page that reported none ends the walk. Carrying a token back resumes that enumeration after
+//! the last group the page named — which is what lets a client enumerating the account's log
+//! groups see every one of them exactly once, and makes the walk terminate.
 //!
 //! The table spans what the rule generalises over: the page size, from one group per page up
 //! to more than the account holds, and whether the enumeration is the whole account's or the
@@ -66,10 +69,10 @@ async fn page(logs: &Logs, case: &str, request: &Value) -> (Vec<String>, Option<
     (names, token)
 }
 
-/// A page carries a `nextToken` exactly while log groups remain beyond it, and walking the
-/// token reports every selected group exactly once.
+/// A page carries a `nextToken` exactly while it reported log groups, and walking the token
+/// reports every selected group exactly once before an empty page ends the walk.
 #[tokio::test]
-async fn a_page_carries_a_token_exactly_while_log_groups_remain() {
+async fn a_page_carries_a_token_exactly_while_it_reports_log_groups() {
     let logs = Logs::new();
     account_with_groups(&logs).await;
 
@@ -113,6 +116,7 @@ async fn a_page_carries_a_token_exactly_while_log_groups_remain() {
                     names.len() <= page_size,
                     "case {case:?}: a page holds at most limit groups, got {names:?}"
                 );
+                let reported_any = !names.is_empty();
                 walked.extend(names);
                 pages += 1;
                 assert!(
@@ -121,9 +125,9 @@ async fn a_page_carries_a_token_exactly_while_log_groups_remain() {
                 );
                 assert_eq!(
                     next.is_some(),
-                    walked.len() < selected.len(),
-                    "case {case:?}: expected a token exactly while groups remain, after \
-                     {walked:?} of {selected:?}"
+                    reported_any,
+                    "case {case:?}: expected a token exactly while a page reports groups, \
+                     after {walked:?} of {selected:?}"
                 );
                 match next {
                     Some(next) => token = Some(next),
@@ -135,5 +139,102 @@ async fn a_page_carries_a_token_exactly_while_log_groups_remain() {
                 "case {case:?}: expected every selected group exactly once, got {walked:?}"
             );
         }
+    }
+}
+
+/// A page that reported the LAST of the matching log groups still carries a token — the
+/// service hands one back with the results it reported rather than looking past them — and
+/// continuing from that token answers the groups left, which is none, and ends the walk.
+///
+/// The rows span what the rule generalises over: a page bounded by no `limit` at all, one
+/// bounded at exactly the number matching, one bounded above it, and a page of one group out of
+/// one matching.
+#[tokio::test]
+async fn a_complete_page_still_carries_a_token_and_the_next_page_ends_the_walk() {
+    let logs = Logs::new();
+    account_with_groups(&logs).await;
+
+    // (case, the request, the groups it reports)
+    let rows: Vec<(&str, Value, usize)> = vec![
+        ("no limit at all", json!({}), GROUPS.len()),
+        (
+            "a limit at exactly the number matching",
+            json!({"limit": GROUPS.len()}),
+            GROUPS.len(),
+        ),
+        (
+            "a limit above the number matching",
+            json!({"limit": GROUPS.len() + 5}),
+            GROUPS.len(),
+        ),
+        (
+            // One group matches the pattern and the page takes it, so the page is both the
+            // first and the last of that enumeration.
+            "one group out of one matching",
+            json!({"logGroupNamePattern": "^/payments/api", "limit": 1}),
+            1,
+        ),
+    ];
+
+    for (case, request, reported) in rows {
+        let (names, token) = page(&logs, case, &request).await;
+        assert_eq!(
+            names.len(),
+            reported,
+            "case {case:?}: expected {reported} group(s), got {names:?}"
+        );
+        let token = token.unwrap_or_else(|| {
+            panic!("case {case:?}: expected a token with the groups reported, got none")
+        });
+
+        let mut next_request = request.clone();
+        next_request["nextToken"] = json!(token);
+        let (left, next_token) = page(&logs, case, &next_request).await;
+        assert!(
+            left.is_empty(),
+            "case {case:?}: expected nothing left past the last group, got {left:?}"
+        );
+        assert_eq!(
+            next_token, None,
+            "case {case:?}: expected the empty page to end the walk, got {next_token:?}"
+        );
+    }
+}
+
+/// A page that reported NO log group carries no token: there is nothing to continue from, so
+/// the enumeration ends there.
+#[tokio::test]
+async fn a_page_reporting_no_log_group_carries_no_token() {
+    let logs = Logs::new();
+    account_with_groups(&logs).await;
+
+    // (case, a request matching none of the account's log groups)
+    let rows: Vec<(&str, Value)> = vec![
+        (
+            "a name pattern no group matches",
+            json!({"logGroupNamePattern": "^/absent"}),
+        ),
+        (
+            "a name pattern no group matches, with a page bound",
+            json!({"logGroupNamePattern": "^/absent", "limit": 1}),
+        ),
+        (
+            // "An array of tag filters to return only log groups that have specific tags":
+            // none of these groups is tagged at all.
+            "a tag filter no group matches",
+            json!({"logGroupTags": [{"key": "stage", "values": ["prod"]}]}),
+        ),
+    ];
+
+    for (case, request) in rows {
+        let (names, token) = page(&logs, case, &request).await;
+        assert!(
+            names.is_empty(),
+            "case {case:?}: expected no group reported, got {names:?}"
+        );
+        assert_eq!(
+            token, None,
+            "case {case:?}: expected no token with an empty page, got {token:?}"
+        );
     }
 }

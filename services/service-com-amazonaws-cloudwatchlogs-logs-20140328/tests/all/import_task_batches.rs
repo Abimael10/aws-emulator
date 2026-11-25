@@ -366,7 +366,7 @@ async fn a_created_import_reports_the_batches_its_window_implies() {
 #[tokio::test]
 async fn the_completions_the_clock_owes_are_reported_and_reading_changes_nothing() {
     let logs = Logs::new();
-    let id = "import-clock";
+    let id = "c1000000-0000-4000-8000-00000000000c";
     // Four batches: a window of four days.
     let count = seed_task(
         &logs,
@@ -429,7 +429,7 @@ async fn a_stopped_import_reports_the_status_each_batch_ended_in() {
 
     for (case, status, failure) in rows {
         let logs = Logs::new();
-        let id = "import-stopped";
+        let id = "50000000-0000-4000-8000-000000000005";
         let count = seed_task(
             &logs,
             id,
@@ -481,7 +481,7 @@ async fn a_stopped_import_reports_the_status_each_batch_ended_in() {
 #[tokio::test]
 async fn the_status_filter_selects_exactly_the_batches_in_those_statuses() {
     let logs = Logs::new();
-    let id = "import-filtered";
+    let id = "f1000000-0000-4000-8000-00000000000f";
     let count = seed_task(
         &logs,
         id,
@@ -573,7 +573,7 @@ async fn the_status_filter_selects_exactly_the_batches_in_those_statuses() {
 #[tokio::test]
 async fn paging_walks_the_batches_once_at_every_page_size() {
     let logs = Logs::new();
-    let id = "import-paged";
+    let id = "a0000000-0000-4000-8000-00000000000a";
     let count = seed_task(
         &logs,
         id,
@@ -666,11 +666,16 @@ async fn paging_walks_the_batches_once_at_every_page_size() {
 #[tokio::test]
 async fn an_import_id_no_task_carries_is_a_missing_resource() {
     let logs = Logs::new();
-    seed_task(&logs, "import-present", None);
+    seed_task(&logs, "91000000-0000-4000-8000-000000000009", None);
 
-    // Ids no stored task carries: one of the same shape as the stored id, one that is the stored
-    // id with a suffix, and one bearing no resemblance.
-    for id in ["import-absent", "import-present-gone", "NOTHING"] {
+    // Ids in the form an import id is written in that no stored task carries: one differing
+    // from the stored id in its last character, one differing in its first, and one bearing no
+    // resemblance to it.
+    for id in [
+        "91000000-0000-4000-8000-000000000008",
+        "11000000-0000-4000-8000-000000000009",
+        "77777777-7777-4777-8777-777777777777",
+    ] {
         let (code, message) = logs.refusal(OP, &json!({"importId": id})).await;
         assert_eq!(
             code, "ResourceNotFoundException",
@@ -690,8 +695,8 @@ async fn an_import_id_no_task_carries_is_a_missing_resource() {
 #[tokio::test]
 async fn a_token_from_another_enumeration_is_refused() {
     let logs = Logs::new();
-    let id = "import-tokens";
-    let other = "import-other";
+    let id = "70000000-0000-4000-8000-000000000007";
+    let other = "80000000-0000-4000-8000-000000000008";
     seed_task(
         &logs,
         id,
@@ -765,7 +770,7 @@ async fn a_token_from_another_enumeration_is_refused() {
 #[tokio::test]
 async fn the_published_limit_bounds_are_accepted_and_one_past_each_is_refused() {
     let logs = Logs::new();
-    let id = "import-limits";
+    let id = "60000000-0000-4000-8000-000000000006";
     seed_task(
         &logs,
         id,

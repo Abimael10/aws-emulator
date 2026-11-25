@@ -1496,6 +1496,10 @@ impl QueryRecord {
     ///
     /// The OpenSearch languages have source and limit syntax of their own, so a query written
     /// in one of them reports the text that was submitted.
+    ///
+    /// The `SOURCE` command states the range in the epoch MILLISECONDS its arguments are
+    /// written in, which is not the unit `StartQuery` takes the range in
+    /// ([`source_range_start_ms`], [`source_range_end_ms`]).
     pub fn set_effective_query_string(&mut self, selects_own_sources: bool) {
         if self.query_language != DEFAULT_QUERY_LANGUAGE {
             self.effective_query_string = self.query_string.clone();
@@ -1511,8 +1515,8 @@ impl QueryRecord {
             effective.push_str(&format!(
                 "{EFFECTIVE_SOURCE_COMMAND} {} {EFFECTIVE_SOURCE_START}{} {EFFECTIVE_SOURCE_END}{} {STAGE_SEPARATOR} ",
                 sources.join(", "),
-                self.start_time_secs,
-                self.end_time_secs,
+                source_range_start_ms(self.start_time_secs),
+                source_range_end_ms(self.end_time_secs),
             ));
         }
         effective.push_str(&self.query_string);
@@ -1600,11 +1604,32 @@ const EFFECTIVE_SOURCE_COMMAND: &str = "SOURCE";
 const QUOTED_SOURCE_NAME: &str = "\"";
 
 /// The `SOURCE` argument stating the beginning of the range the query reads, followed by the
-/// instant itself: the `startTime` the start named, as it named it.
+/// instant itself ([`source_range_start_ms`]).
 const EFFECTIVE_SOURCE_START: &str = "START=";
 
-/// The `SOURCE` argument stating the end of that range. See [`EFFECTIVE_SOURCE_START`].
+/// The `SOURCE` argument stating the end of that range. See [`EFFECTIVE_SOURCE_START`] and
+/// [`source_range_end_ms`].
 const EFFECTIVE_SOURCE_END: &str = "END=";
+
+/// The instant the `SOURCE` command of an effective query string states as the BEGINNING of
+/// the range, in the epoch MILLISECONDS that command's arguments are written in — a
+/// pipelined query bounds its sources in the same unit a log event carries its timestamp in,
+/// while `StartQuery$startTime` is "epoch time, the number of seconds since January 1, 1970".
+/// A bound stated in seconds names a whole second, so the range opens at the FIRST
+/// millisecond of the second the start named.
+fn source_range_start_ms(start_time_secs: i64) -> i64 {
+    start_time_secs.saturating_mul(MILLIS_PER_SECOND)
+}
+
+/// The instant that command states as the END of the range, in the same unit
+/// ([`source_range_start_ms`]). "The range is inclusive, so the specified end time is included
+/// in the query" (`StartQuery$endTime`), so a range ending at a stated second covers every
+/// millisecond of that second and closes at its LAST one.
+fn source_range_end_ms(end_time_secs: i64) -> i64 {
+    end_time_secs
+        .saturating_mul(MILLIS_PER_SECOND)
+        .saturating_add(MILLIS_PER_SECOND - 1)
+}
 
 /// What separates two commands of a Logs Insights QL query: "The processors work one after
 /// another, in the order that you list them, like a pipeline" — the pipe every stage of a
@@ -1879,6 +1904,20 @@ impl ExportTaskRecord {
 /// [`mint_uuid_from_seq`] every UUID-shaped id of this service comes from.
 pub fn mint_import_task_id(seq: u64) -> String {
     mint_uuid_from_seq(seq)
+}
+
+/// Whether `value` is written in the UUID form every id this service mints one as carries
+/// ([`mint_uuid_from_seq`]): the five hyphen-separated hexadecimal groups of 8-4-4-4-12
+/// characters a UUID is rendered in.
+///
+/// The maintained UUID parser decides what parses, and the parsed value is compared back
+/// against the text it was read from — folded to lower case, because the form is the groups
+/// and the hyphens rather than the case the hexadecimal is written in — so the simple
+/// (unhyphenated), braced and URN spellings it also accepts are not read as this form: an id
+/// written in one of those is not one this service ever handed out.
+pub fn is_uuid_form(value: &str) -> bool {
+    ::uuid::Uuid::parse_str(value)
+        .is_ok_and(|parsed| parsed.hyphenated().to_string() == value.to_lowercase())
 }
 
 /// The id `CreateExportTask` gives the task it creates — "The ID of the export task" —

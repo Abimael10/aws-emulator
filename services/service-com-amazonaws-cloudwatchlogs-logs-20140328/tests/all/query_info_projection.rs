@@ -110,13 +110,19 @@ async fn completed(logs: &Logs, case: &str, id: &str) -> Value {
 
 /// The `SOURCE`-prefixed query a start that named its log groups and window as PARAMETERS
 /// stores: the command those parameters stand for, then the submitted pipeline.
+///
+/// The command states the range in the epoch MILLISECONDS its arguments are written in, which
+/// is not the unit `StartQuery` takes the range in ("epoch time, the number of seconds since
+/// January 1, 1970"): the range opens at the first millisecond of the second the start named
+/// and — "the range is inclusive, so the specified end time is included in the query" — closes
+/// at the LAST millisecond of the second it ended at.
 fn source_prefixed(groups: &[&str], window: (i64, i64), submitted: &str) -> String {
     let sources: Vec<String> = groups.iter().map(|name| format!("\"{name}\"")).collect();
     format!(
         "SOURCE {} START={} END={} | {submitted}",
         sources.join(", "),
-        window.0,
-        window.1
+        window.0 * 1_000,
+        window.1 * 1_000 + 999
     )
 }
 

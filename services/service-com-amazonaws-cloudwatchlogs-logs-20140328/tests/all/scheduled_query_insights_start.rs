@@ -229,8 +229,14 @@ async fn a_query_of_a_group_holding_events_is_served_for_every_window_in_the_cla
         assert_eq!(
             reported["queryString"].as_str(),
             Some(
-                format!("SOURCE \"{GROUP}\" START={start_time} END={end_time} | {query_string}")
-                    .as_str()
+                // The command states the range in epoch MILLISECONDS, closing at the last
+                // millisecond of the inclusive end second.
+                format!(
+                    "SOURCE \"{GROUP}\" START={} END={} | {query_string}",
+                    start_time * 1_000,
+                    end_time * 1_000 + 999
+                )
+                .as_str()
             ),
             "case {case:?}: the reported query string is the effective one the start stored, got \
              {reported}"
@@ -495,10 +501,13 @@ async fn a_scheduled_querys_own_configuration_starts_an_interactive_query() {
         assert_eq!(
             reported["queryString"].as_str(),
             Some(
+                // The command states the range in epoch MILLISECONDS, closing at the last
+                // millisecond of the inclusive end second.
                 format!(
-                    "SOURCE {} START={} END={end_time} | {query_string}",
+                    "SOURCE {} START={} END={} | {query_string}",
                     sources.join(", "),
-                    first - 60
+                    (first - 60) * 1_000,
+                    end_time * 1_000 + 999
                 )
                 .as_str()
             ),

@@ -719,6 +719,17 @@ pub fn active_import_tasks_limit_message() -> String {
 /// the condition — it carries not even the id it was handed.
 pub const NO_MATCHING_IMPORT_MESSAGE: &str = "No matching import found.";
 
+/// The refusal an operation answers when the `importId` it is given is not written in the
+/// form an import id has at all.
+///
+/// An import id is a UUID ([`super::mint_import_task_id`]), and the modelled `ImportId`
+/// pattern (`^[\-a-zA-Z0-9]+$`) admits far more than that: a value inside the pattern but
+/// outside the form names no import that could ever exist, which is the incorrectly specified
+/// parameter `InvalidParameterException` reports rather than the absent resource
+/// [`NO_MATCHING_IMPORT_MESSAGE`] reports. Fixed text for the condition, naming the member at
+/// fault and quoting nothing of the value it rejected.
+pub const IMPORT_ID_FORM_MESSAGE: &str = "ImportId must be a valid UUID format";
+
 /// The name prefix of the managed log group an import task delivers into, which is also the
 /// one `CreateImportTask`'s own IAM example documents for an import destination
 /// ("arn:aws:logs:us-east-1:123456789012:log-group:/aws/cloudtrail/*").

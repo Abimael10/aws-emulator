@@ -65,11 +65,13 @@ async fn account_with_tables(logs: &Logs) -> (i64, i64) {
 /// The query string the service STORES for a start of `query_string` over the standing group
 /// and window: CloudWatch Logs Insights names the log groups and the range inside the query,
 /// so the `logGroupName` and the window this start names as parameters are reported as the
-/// `SOURCE` command they stand for.
+/// `SOURCE` command they stand for — whose range is stated in epoch MILLISECONDS, closing at
+/// the last millisecond of the inclusive end second.
 fn effective_query_string(window: (i64, i64), query_string: &str) -> String {
     format!(
         "SOURCE \"{GROUP}\" START={} END={} | {query_string}",
-        window.0, window.1
+        window.0 * 1_000,
+        window.1 * 1_000 + 999
     )
 }
 

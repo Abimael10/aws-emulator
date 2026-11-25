@@ -244,15 +244,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // "Optional filter to describe a specific import task by its ID": the FORM of that
+        // id is a precondition on the request — an id outside the form an import id is
+        // written in ([`crate::state::is_uuid_form`]) names no import that could exist, so it
+        // is the incorrectly specified parameter it is rather than an import this account
+        // happens not to hold.
+        if let Some(import_id) = input.import_id.as_deref() {
+            if !crate::state::is_uuid_form(import_id) {
+                return Err(invalid(crate::state::IMPORT_ID_FORM_MESSAGE));
+            }
+        }
+
         // An import runs asynchronously, so the status this call reports is the one the
         // clock has already made due — materialised before the read, never moved on
         // because of it.
         store.materialize_due_import_transitions(crate::state::now_ms());
 
-        // "Optional filter to describe a specific import task by its ID": the one input
-        // that names a resource of this service rather than describing a subset, so an id
-        // no task carries is a missing resource rather than an empty page — stated in the
-        // sentence CloudWatch Logs words that condition in.
+        // The one input that names a resource of this service rather than describing a
+        // subset, so an id in that form that no task carries is a missing resource rather
+        // than an empty page — stated in the sentence CloudWatch Logs words that condition
+        // in.
         if let Some(import_id) = input.import_id.as_deref() {
             if !store.import_tasks.contains_key(import_id) {
                 return Err(DescribeImportTasksErrorModeled::ResourceNotFoundException(

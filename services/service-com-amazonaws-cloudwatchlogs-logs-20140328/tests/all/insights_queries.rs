@@ -302,8 +302,12 @@ async fn a_query_string_that_compiles_is_accepted_and_stored() {
         assert_eq!(
             reported["queryString"].as_str(),
             Some(
+                // The command states the range in epoch MILLISECONDS, closing at the last
+                // millisecond of the inclusive end second.
                 format!(
-                    "SOURCE \"{GROUP}\" START={start_time} END={end_time} | {query_string}"
+                    "SOURCE \"{GROUP}\" START={} END={} | {query_string}",
+                    start_time * 1_000,
+                    end_time * 1_000 + 999
                 )
                 .as_str()
             ),

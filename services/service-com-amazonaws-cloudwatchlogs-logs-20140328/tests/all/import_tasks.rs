@@ -87,10 +87,14 @@ fn destination_arn(id: &str) -> String {
 
 /// The corpus every filtering, paging and reporting case below reads: six tasks spanning
 /// all four `ImportStatus` values, three sources, and each form an `ImportFilter` takes.
+///
+/// Each one is held under an id in the form CloudWatch Logs gives an import task — a UUID,
+/// which is the form `importId` is required to be written in — so the store holds what a
+/// create of this service could have put there.
 fn seeds() -> Vec<Seed> {
     vec![
         Seed {
-            id: "import-a1",
+            id: "a1111111-1111-4111-8111-111111111111",
             source: SOURCE_ONE,
             status: IMPORT_STATUS_IN_PROGRESS,
             filter: None,
@@ -98,7 +102,7 @@ fn seeds() -> Vec<Seed> {
             created_ago_ms: 6_000,
         },
         Seed {
-            id: "import-b2",
+            id: "b2222222-2222-4222-8222-222222222222",
             source: SOURCE_ONE,
             status: IMPORT_STATUS_COMPLETED,
             filter: Some(ImportFilter {
@@ -109,7 +113,7 @@ fn seeds() -> Vec<Seed> {
             created_ago_ms: 5_000,
         },
         Seed {
-            id: "import-c3",
+            id: "c3333333-3333-4333-8333-333333333333",
             source: SOURCE_TWO,
             status: IMPORT_STATUS_COMPLETED,
             filter: Some(ImportFilter {
@@ -120,7 +124,7 @@ fn seeds() -> Vec<Seed> {
             created_ago_ms: 4_000,
         },
         Seed {
-            id: "import-d4",
+            id: "d4444444-4444-4444-8444-444444444444",
             source: SOURCE_TWO,
             status: IMPORT_STATUS_CANCELLED,
             filter: Some(ImportFilter {
@@ -131,7 +135,7 @@ fn seeds() -> Vec<Seed> {
             created_ago_ms: 3_000,
         },
         Seed {
-            id: "import-e5",
+            id: "e5555555-5555-4555-8555-555555555555",
             source: SOURCE_THREE,
             status: IMPORT_STATUS_FAILED,
             filter: Some(ImportFilter {
@@ -142,7 +146,7 @@ fn seeds() -> Vec<Seed> {
             created_ago_ms: 2_000,
         },
         Seed {
-            id: "import-f6",
+            id: "f6666666-6666-4666-8666-666666666666",
             source: SOURCE_THREE,
             status: IMPORT_STATUS_IN_PROGRESS,
             filter: None,
@@ -235,12 +239,12 @@ async fn every_filter_selects_exactly_the_tasks_that_match_it() {
             "no filter at all",
             json!({}),
             vec![
-                "import-a1",
-                "import-b2",
-                "import-c3",
-                "import-d4",
-                "import-e5",
-                "import-f6",
+                "a1111111-1111-4111-8111-111111111111",
+                "b2222222-2222-4222-8222-222222222222",
+                "c3333333-3333-4333-8333-333333333333",
+                "d4444444-4444-4444-8444-444444444444",
+                "e5555555-5555-4555-8555-555555555555",
+                "f6666666-6666-4666-8666-666666666666",
             ],
         ),
         // The four values of the model's `ImportStatus` enum: IN_PROGRESS, CANCELLED,
@@ -248,37 +252,37 @@ async fn every_filter_selects_exactly_the_tasks_that_match_it() {
         (
             "importStatus IN_PROGRESS",
             json!({"importStatus": IMPORT_STATUS_IN_PROGRESS}),
-            vec!["import-a1", "import-f6"],
+            vec!["a1111111-1111-4111-8111-111111111111", "f6666666-6666-4666-8666-666666666666"],
         ),
         (
             "importStatus COMPLETED",
             json!({"importStatus": IMPORT_STATUS_COMPLETED}),
-            vec!["import-b2", "import-c3"],
+            vec!["b2222222-2222-4222-8222-222222222222", "c3333333-3333-4333-8333-333333333333"],
         ),
         (
             "importStatus CANCELLED",
             json!({"importStatus": IMPORT_STATUS_CANCELLED}),
-            vec!["import-d4"],
+            vec!["d4444444-4444-4444-8444-444444444444"],
         ),
         (
             "importStatus FAILED",
             json!({"importStatus": IMPORT_STATUS_FAILED}),
-            vec!["import-e5"],
+            vec!["e5555555-5555-4555-8555-555555555555"],
         ),
         (
             "importSourceArn of the first source",
             json!({"importSourceArn": SOURCE_ONE}),
-            vec!["import-a1", "import-b2"],
+            vec!["a1111111-1111-4111-8111-111111111111", "b2222222-2222-4222-8222-222222222222"],
         ),
         (
             "importSourceArn of the second source",
             json!({"importSourceArn": SOURCE_TWO}),
-            vec!["import-c3", "import-d4"],
+            vec!["c3333333-3333-4333-8333-333333333333", "d4444444-4444-4444-8444-444444444444"],
         ),
         (
             "importSourceArn of the third source",
             json!({"importSourceArn": SOURCE_THREE}),
-            vec!["import-e5", "import-f6"],
+            vec!["e5555555-5555-4555-8555-555555555555", "f6666666-6666-4666-8666-666666666666"],
         ),
         (
             "importSourceArn no stored task imports from",
@@ -287,23 +291,23 @@ async fn every_filter_selects_exactly_the_tasks_that_match_it() {
         ),
         (
             "importId of one stored task",
-            json!({"importId": "import-c3"}),
-            vec!["import-c3"],
+            json!({"importId": "c3333333-3333-4333-8333-333333333333"}),
+            vec!["c3333333-3333-4333-8333-333333333333"],
         ),
         (
             "importId and the status that task is in",
-            json!({"importId": "import-e5", "importStatus": IMPORT_STATUS_FAILED}),
-            vec!["import-e5"],
+            json!({"importId": "e5555555-5555-4555-8555-555555555555", "importStatus": IMPORT_STATUS_FAILED}),
+            vec!["e5555555-5555-4555-8555-555555555555"],
         ),
         (
             "importId and a status that task is not in",
-            json!({"importId": "import-e5", "importStatus": IMPORT_STATUS_COMPLETED}),
+            json!({"importId": "e5555555-5555-4555-8555-555555555555", "importStatus": IMPORT_STATUS_COMPLETED}),
             vec![],
         ),
         (
             "importStatus and importSourceArn that one task satisfies together",
             json!({"importStatus": IMPORT_STATUS_COMPLETED, "importSourceArn": SOURCE_ONE}),
-            vec!["import-b2"],
+            vec!["b2222222-2222-4222-8222-222222222222"],
         ),
         (
             "importStatus and importSourceArn no task satisfies together",
@@ -545,7 +549,7 @@ async fn a_token_from_another_enumeration_is_refused() {
     let continued = reported_ids(&logs, &json!({"limit": 1, "nextToken": token})).await;
     assert_eq!(
         continued,
-        vec!["import-b2".to_string()],
+        vec!["b2222222-2222-4222-8222-222222222222".to_string()],
         "case \"the token's own enumeration\": expected the second task, got {continued:?}"
     );
 }
@@ -558,9 +562,14 @@ async fn an_import_id_no_task_carries_is_a_missing_resource() {
     let logs = Logs::new();
     seed_store(&logs);
 
-    // Ids no stored task carries: one of the same shape as a stored id, one that is a
-    // stored id with a suffix, and one bearing no resemblance.
-    for id in ["import-z9", "import-a1-gone", "NOTHING"] {
+    // Ids in the form an import id is written in that no stored task carries: one differing
+    // from a stored id in its last character, one differing in its first, and one bearing no
+    // resemblance to any of them.
+    for id in [
+        "a1111111-1111-4111-8111-111111111112",
+        "01111111-1111-4111-8111-111111111111",
+        "99999999-9999-4999-8999-999999999999",
+    ] {
         let (code, message) = logs.refusal(OP, &json!({"importId": id})).await;
         assert_eq!(
             code, "ResourceNotFoundException",
@@ -654,7 +663,7 @@ async fn the_completion_the_clock_owes_is_reported_and_reading_changes_nothing()
             .engine()
             .state::<ComAmazonawsCloudwatchlogsLogs20140328State>();
         let mut store = state.lock();
-        for (id, created) in [("import-due", due), ("import-running", now)] {
+        for (id, created) in [("d0000000-0000-4000-8000-00000000000d", due), ("f0000000-0000-4000-8000-00000000000f", now)] {
             let record = ImportTaskRecord::new(
                 id,
                 SOURCE_ONE,
@@ -671,13 +680,13 @@ async fn the_completion_the_clock_owes_is_reported_and_reading_changes_nothing()
     let rows: [(&str, &str, &str, i64); 2] = [
         (
             "a completion the clock already made due",
-            "import-due",
+            "d0000000-0000-4000-8000-00000000000d",
             IMPORT_STATUS_COMPLETED,
             due + IMPORT_COMPLETION_DELAY_MS,
         ),
         (
             "a completion still ahead of the clock",
-            "import-running",
+            "f0000000-0000-4000-8000-00000000000f",
             IMPORT_STATUS_IN_PROGRESS,
             now,
         ),
@@ -711,7 +720,7 @@ async fn the_completion_the_clock_owes_is_reported_and_reading_changes_nothing()
     let completed = reported_ids(&logs, &json!({"importStatus": IMPORT_STATUS_COMPLETED})).await;
     assert_eq!(
         completed,
-        vec!["import-due".to_string()],
+        vec!["d0000000-0000-4000-8000-00000000000d".to_string()],
         "case \"filtering on the materialised status\": expected the completed task, \
          got {completed:?}"
     );

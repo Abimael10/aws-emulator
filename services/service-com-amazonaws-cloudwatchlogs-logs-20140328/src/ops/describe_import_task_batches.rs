@@ -215,6 +215,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // batches and needs none of it.
         let _ = ctx;
 
+        let invalid = |message: &str| {
+            DescribeImportTaskBatchesError::from(
+                DescribeImportTaskBatchesErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
+                    },
+                ),
+            )
+        };
+
+        // "The ID of the import task to get batch information for": the one required input,
+        // and it names a resource of this service. The FORM of that id is a precondition on
+        // the request, decided before any state is read: an id outside the form an import id
+        // is written in ([`crate::state::is_uuid_form`]) names no import that could exist, so
+        // it is the incorrectly specified parameter it is rather than an import this account
+        // happens not to hold.
+        if !crate::state::is_uuid_form(&input.import_id) {
+            return Err(invalid(crate::state::IMPORT_ID_FORM_MESSAGE));
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeImportTaskBatchesError::from(
                 DescribeImportTaskBatchesErrorModeled::ServiceUnavailableException(
@@ -226,23 +246,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
-        let invalid = |message: &str| {
-            DescribeImportTaskBatchesError::from(
-                DescribeImportTaskBatchesErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(message.to_string()),
-                    },
-                ),
-            )
-        };
-
         // An import runs asynchronously, so the statuses this call reports — the task's and
         // those of the batches it is grouped into — are the ones the clock has already made
         // due: materialised before the read, never moved on because of it.
         store.materialize_due_import_transitions(crate::state::now_ms());
 
-        // "The ID of the import task to get batch information for": the one required input,
-        // and it names a resource of this service, so an id no task carries is a missing
+        // An id in the form an import id is written in that no task carries IS a missing
         // resource rather than an empty page — stated in the sentence CloudWatch Logs words
         // that condition in for an import it holds none under.
         let Some(task) = store.import_tasks.get(&input.import_id) else {

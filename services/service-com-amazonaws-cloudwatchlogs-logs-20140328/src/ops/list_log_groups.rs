@@ -423,9 +423,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let last = first.saturating_add(limit).min(matching.len());
         let page = &matching[first..last];
 
-        // A token only where a page follows this one: "The token for the next set of
-        // items to return."
-        let next_token = page.last().filter(|_| last < matching.len()).map(|group| {
+        // A token wherever the page REPORTED log groups: "This operation is paginated. By
+        // default, your first use of this operation returns 50 results, and includes a token
+        // to use in a subsequent operation to return more results" — the token accompanies
+        // the results the page carries, and the enumeration is continued from the last group
+        // this page named rather than from a look past it. Only a page that reported NO log
+        // group has nothing to continue from, so that is the page that ends the walk: a
+        // continuation standing at the end of the enumeration answers the groups left, which
+        // may be none, and ends it there.
+        let next_token = page.last().map(|group| {
             Cursor {
                 filters: filters_of(&input),
                 after: group.name.clone(),
