@@ -51,7 +51,7 @@ const ASSOCIATION_COLLECTION_PATH: &str = "/custom-detection-rule/association";
 /// followed by `association/<AssociationId>`. A request that carries no association id is
 /// judged against every association of the rule, which is this path with the wildcard in
 /// the id's place; the assertion below holds the two spellings to one another.
-fn associations_of(rule_id: &str, association_id: &str) -> String {
+pub(crate) fn associations_of(rule_id: &str, association_id: &str) -> String {
     arn_of(
         REGION,
         &format!("detection-rule/custom/{rule_id}/association/{association_id}"),
@@ -108,7 +108,7 @@ fn assert_refused(case: &str, reply: &Reply, expected: &str) {
 }
 
 /// The id of a rule the catalogue publishes, read through this service's own listing.
-async fn published_rule_id(emulator: &Emulator) -> String {
+pub(crate) async fn published_rule_id(emulator: &Emulator) -> String {
     let rules = emulator
         .call(
             ACCOUNT_KEY,
