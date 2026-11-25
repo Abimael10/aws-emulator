@@ -10,10 +10,13 @@
 //! occurred"). Four conditions of the catalog DDL show it, and the name the statement wrote
 //! is the only part either text takes from the request:
 //!
-//! * a `CREATE DATABASE`/`CREATE SCHEMA` naming a database the catalog already holds, and a
-//!   `CREATE EXTERNAL TABLE` naming a table it already holds, report the metastore's
-//!   sentence closed with a full stop as the error message, and the DDL task's line followed
-//!   by that sentence without the stop as the reason;
+//! * a `CREATE DATABASE`/`CREATE SCHEMA` naming a database the catalog already holds
+//!   reports the metastore's sentence closed with a full stop as the error message, and the
+//!   DDL task's line followed by that sentence bare as the reason; a `CREATE EXTERNAL TABLE`
+//!   naming a table it already holds reports the same sentence for a table as the error
+//!   message, and the task's line followed by the metastore EXCEPTION that task wrapped as
+//!   the reason — each field carrying what the service and the task really wrote for that
+//!   condition;
 //! * a `DROP DATABASE`/`DROP SCHEMA` naming a database the catalog does not hold reports the
 //!   drop's own sentence as the error message, and the Hive compiler's semantic exception for
 //!   the name it could not resolve as the reason;
@@ -250,10 +253,10 @@ async fn a_drop_of_an_absent_database_reports_each_field_in_its_own_words() {
     assert_rows(&router, &rows).await;
 }
 
-/// A definition of a TABLE the catalog already holds reports the same pair in the
-/// metastore's own words for that object: the rule is the condition's sentence as the error
-/// message and the DDL task's line in front of it as the reason, whatever object the
-/// statement defines.
+/// A definition of a TABLE the catalog already holds reports the condition's own sentence as
+/// the error message and the DDL task's line in front of what the task wrote as the reason:
+/// the rule is that each field carries what its own writer wrote for the condition, which for
+/// a table collision is the metastore's already-exists EXCEPTION rendering.
 #[tokio::test]
 async fn an_already_held_table_reports_the_metastores_sentence_in_both_fields() {
     let (engine, router) = engine_and_router();
@@ -293,7 +296,10 @@ async fn an_already_held_table_reports_the_metastores_sentence_in_both_fields() 
             ),
             error_type: ERROR_TYPE_DDL_TASK,
             message: format!("Table {table} already exists."),
-            reason: format!("{DDL_TASK_FAILED} Table {table} already exists"),
+            reason: format!(
+                "{DDL_TASK_FAILED} AlreadyExistsException(message:Table {table} already \
+                 exist)"
+            ),
         })
         .collect();
 

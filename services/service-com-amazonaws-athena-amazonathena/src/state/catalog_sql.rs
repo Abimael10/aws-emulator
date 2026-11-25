@@ -450,13 +450,18 @@ impl Failure {
     ///
     /// The statement is one the HIVE DDL engine performs, so what it reports is that
     /// engine's own, in the two texts that engine writes (see [`Self::ddl_task`]): the
-    /// metastore's sentence for the condition closed with a full stop as the error message,
-    /// and the task line followed by that sentence bare as the state change reason — the
-    /// same pair the already-held DATABASE reports ([`Self::database_already_exists`]), of
-    /// which the error message is RECORDED behaviour.
+    /// service's sentence for the condition closed with a full stop as the error message,
+    /// and the task line followed by the metastore EXCEPTION the task wrapped as the state
+    /// change reason ([`table_already_exists_exception`]). RECORDED behaviour, and the half
+    /// of it that differs from the already-held DATABASE: that condition's task wrote the
+    /// bare sentence and this one's wrote the exception rendering
+    /// ([`Self::database_already_exists`]), so each field carries what the task really wrote
+    /// for its own condition.
     pub fn table_already_exists(target: &Relation) -> Self {
-        let stated = format!("Table {} already exists", target.table);
-        Self::ddl_task(format!("{stated}."), stated)
+        Self::ddl_task(
+            format!("Table {} already exists.", target.table),
+            table_already_exists_exception(&target.table),
+        )
     }
 
     /// A statement the HIVE DDL engine performs names a database the catalog does not
@@ -804,6 +809,15 @@ fn hive_database_absent_diagnostic(database: &str) -> String {
 /// the statement named as its only variable part.
 fn database_already_exists_sentence(database: &str) -> String {
     format!("Database {database} already exists")
+}
+
+/// What a failed DDL task WROTE about a table that is ALREADY THERE: the metastore raises
+/// its already-exists exception for a table, and what the task reports is that exception's
+/// own rendering — the exception class, the `message:` label and the metastore's sentence
+/// for the condition, worded as that exception words it rather than as the service's own
+/// sentence for the same condition. The table the statement named is its only variable part.
+fn table_already_exists_exception(table: &str) -> String {
+    format!("AlreadyExistsException(message:Table {table} already exist)")
 }
 
 /// Everything one run of a statement needs beside the statement itself.
