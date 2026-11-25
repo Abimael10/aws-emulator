@@ -428,13 +428,49 @@ fn arn_resource_id(arn: &str) -> &str {
 /// How this service states that the `resourceArn` a tagging call addresses a resource by
 /// resolves to no resource of this account in this Region.
 ///
-/// The call named the resource ONLY by that ARN, and no resource exists to take a name
-/// from, so the ARN is what the sentence carries — the same "<the resource> not found."
-/// form this service words a namespace miss with ([`namespace_not_found`]). It is the
-/// modelled `ResourceNotFoundException` at its own `@httpError` 404: what the request got
-/// wrong is the resource it addressed, not the shape of its input.
+/// The sentence is entirely FIXED text, worded from the resource TYPE the ARN addresses
+/// and nothing else: the call carries the resource only as an ARN, so the refusal states
+/// which KIND of resource was looked for and carries no part of the request — not the
+/// ARN, not the id in it, not the account or the Region. The ARN the call submitted
+/// travels in the modelled `ResourceNotFoundException$resourceName` member instead, the
+/// same way [`NAMESPACE_HAS_NO_WORKGROUP`] keeps its resource out of its own sentence. It
+/// is the modelled `ResourceNotFoundException` at its own `@httpError` 404: what the
+/// request got wrong is the resource it addressed, not the shape of its input.
 pub fn tagged_resource_not_found(arn: &str) -> String {
-    format!("Resource {arn} not found.")
+    format!("{} not found", tagged_resource_kind(arn))
+}
+
+/// The resource KIND a tagging refusal is worded from, read off `arn`'s resource-type
+/// segment.
+///
+/// The catalog is this service's own taggable resources — the ARN forms it mints
+/// ([`namespace_arn`], [`workgroup_arn`], [`snapshot_arn`]) and the ones
+/// [`ComAmazonawsRedshiftserverlessRedshiftserverlessState::tags_for_resource_arn`]
+/// resolves — each named as the service words it,
+/// the resource-type segment capitalized. An ARN whose type segment names no taggable
+/// resource of this service (another service's resource, another type of this service's,
+/// or a value that carries no resource-type segment at all) has no kind to word the
+/// refusal from, so the refusal states only that the resource was not found: a caller
+/// telling "this kind of resource does not exist" from "this ARN is not a resource of
+/// this service" reads exactly that difference off the sentence.
+fn tagged_resource_kind(arn: &str) -> &'static str {
+    match arn_resource_type(arn).to_ascii_lowercase().as_str() {
+        "namespace" => "Namespace",
+        "workgroup" => "Workgroup",
+        "snapshot" => "Snapshot",
+        _ => "Resource",
+    }
+}
+
+/// The resource-type segment of `arn`: in
+/// `arn:<partition>:<service>:<region>:<account>:<type>/<id>` the sixth colon-separated
+/// field, up to the `/` or `:` that separates it from the resource id. A value with fewer
+/// than six fields, or whose sixth field starts with its separator, carries no
+/// resource-type segment and yields the empty string.
+fn arn_resource_type(arn: &str) -> &str {
+    let resource = arn.splitn(6, ':').nth(5).unwrap_or_default();
+    let end = resource.find(['/', ':']).unwrap_or(resource.len());
+    &resource[..end]
 }
 
 /// How this service states that a snapshot name resolves to nothing.

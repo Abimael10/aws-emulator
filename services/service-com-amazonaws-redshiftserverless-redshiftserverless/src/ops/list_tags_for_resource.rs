@@ -156,8 +156,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(tags) = state.tags_for_resource_arn(&input.resource_arn) else {
             // The ARN resolves to no resource of this account in this Region, so what the
             // call got wrong is the resource it addressed: the modelled
-            // `ResourceNotFoundException`, worded from the ARN the request carried and
-            // carrying it in the member modelled for the resource not found.
+            // `ResourceNotFoundException`, worded from the resource KIND the ARN names and
+            // carrying the ARN itself in the member modelled for the resource not found.
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::tagged_resource_not_found(&input.resource_arn),

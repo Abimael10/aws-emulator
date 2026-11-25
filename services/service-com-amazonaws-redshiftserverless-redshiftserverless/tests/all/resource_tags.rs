@@ -20,6 +20,10 @@
 //! what is left — a key the resource does not carry is nothing to remove, and an ARN
 //! that resolves to nothing is the same modelled refusal, having removed nothing.
 //!
+//! That refusal's message is FIXED text worded from the resource KIND the ARN names and
+//! carries no part of the request, so each unresolvable-ARN row below states the sentence
+//! it expects outright rather than deriving it from the ARN it submitted.
+//!
 //! Every rule is asserted over a TABLE rather than one request: the rows differ along the
 //! resource kind (namespace, workgroup, snapshot), the number and shape of the tags
 //! (absent, the empty list, one, several, an empty value, the published length bounds of
@@ -480,30 +484,36 @@ async fn an_arn_that_resolves_to_no_resource_is_refused_as_not_found() {
 
     // A UUID the emulator minted for nothing.
     let absent_id = "3f8c1a7e-5b2d-4c6e-9a10-7d4e2f6b8c90";
-    let cases: Vec<(&str, String)> = vec![
+    let cases: Vec<(&str, String, &str)> = vec![
         (
             "a namespace id that names nothing",
             format!("arn:aws:redshift-serverless:us-east-1:{ACCOUNT}:namespace/{absent_id}"),
+            "Namespace not found",
         ),
         (
             "a workgroup id that names nothing",
             format!("arn:aws:redshift-serverless:us-east-1:{ACCOUNT}:workgroup/{absent_id}"),
+            "Workgroup not found",
         ),
         (
             "a snapshot id that names nothing",
             format!("arn:aws:redshift-serverless:us-east-1:{ACCOUNT}:snapshot/{absent_id}"),
+            "Snapshot not found",
         ),
         (
             "a real namespace id under the wrong resource kind",
             format!("arn:aws:redshift-serverless:us-east-1:{ACCOUNT}:workgroup/{real_namespace_id}"),
+            "Workgroup not found",
         ),
         (
             "a real workgroup id in another account",
             format!("arn:aws:redshift-serverless:us-east-1:999999999999:workgroup/{real_workgroup_id}"),
+            "Workgroup not found",
         ),
         (
             "a real workgroup id in another Region",
             format!("arn:aws:redshift-serverless:eu-central-1:{ACCOUNT}:workgroup/{real_workgroup_id}"),
+            "Workgroup not found",
         ),
         (
             "a real workgroup id in another partition",
@@ -511,12 +521,21 @@ async fn an_arn_that_resolves_to_no_resource_is_refused_as_not_found() {
                 "arn:aws-us-gov:redshift-serverless:us-gov-west-1:{ACCOUNT}:workgroup/\
                  {real_workgroup_id}"
             ),
+            "Workgroup not found",
         ),
-        ("a value that is no ARN at all", "not-an-arn".to_string()),
-        ("the ARN of a deleted namespace", doomed_arn),
+        (
+            "a value that is no ARN at all",
+            "not-an-arn".to_string(),
+            "Resource not found",
+        ),
+        (
+            "the ARN of a deleted namespace",
+            doomed_arn,
+            "Namespace not found",
+        ),
     ];
 
-    for (label, resource_arn) in &cases {
+    for (label, resource_arn, expected_message) in &cases {
         let case = format!("{label} ({resource_arn})");
         let (status, body) = call(
             &router,
@@ -531,8 +550,8 @@ async fn an_arn_that_resolves_to_no_resource_is_refused_as_not_found() {
         );
         assert_eq!(
             body["message"],
-            json!(format!("Resource {resource_arn} not found.")),
-            "case {case}: got {:?}",
+            json!(expected_message),
+            "case {case}: expected {expected_message:?}, got {:?}",
             body["message"]
         );
         assert_eq!(
@@ -878,26 +897,31 @@ async fn tag_resource_refuses_an_arn_that_resolves_to_no_resource() {
 
     // A UUID the emulator minted for nothing.
     let absent_id = "9c21f0ab-6d4e-4a1b-8f33-05e7b6c2d914";
-    let cases: Vec<(&str, String)> = vec![
+    let cases: Vec<(&str, String, &str)> = vec![
         (
             "a namespace id that names nothing",
             format!("arn:aws:redshift-serverless:us-east-1:{ACCOUNT}:namespace/{absent_id}"),
+            "Namespace not found",
         ),
         (
             "a workgroup id that names nothing",
             format!("arn:aws:redshift-serverless:us-east-1:{ACCOUNT}:workgroup/{absent_id}"),
+            "Workgroup not found",
         ),
         (
             "a real namespace id under the wrong resource kind",
             format!("arn:aws:redshift-serverless:us-east-1:{ACCOUNT}:snapshot/{real_namespace_id}"),
+            "Snapshot not found",
         ),
         (
             "a real namespace id in another account",
             format!("arn:aws:redshift-serverless:us-east-1:999999999999:namespace/{real_namespace_id}"),
+            "Namespace not found",
         ),
         (
             "a real namespace id in another Region",
             format!("arn:aws:redshift-serverless:eu-central-1:{ACCOUNT}:namespace/{real_namespace_id}"),
+            "Namespace not found",
         ),
         (
             "a real namespace id in another partition",
@@ -905,13 +929,22 @@ async fn tag_resource_refuses_an_arn_that_resolves_to_no_resource() {
                 "arn:aws-us-gov:redshift-serverless:us-gov-west-1:{ACCOUNT}:namespace/\
                  {real_namespace_id}"
             ),
+            "Namespace not found",
         ),
-        ("a value that is no ARN at all", "not-an-arn".to_string()),
-        ("the ARN of a deleted namespace", doomed_arn),
+        (
+            "a value that is no ARN at all",
+            "not-an-arn".to_string(),
+            "Resource not found",
+        ),
+        (
+            "the ARN of a deleted namespace",
+            doomed_arn,
+            "Namespace not found",
+        ),
     ];
 
     let submitted = vec![("env".to_string(), "prod".to_string())];
-    for (label, resource_arn) in &cases {
+    for (label, resource_arn, expected_message) in &cases {
         let case = format!("{label} ({resource_arn})");
         let (status, body) = tag_resource_call(&router, "us-east-1", resource_arn, &submitted).await;
         assert_eq!(
@@ -921,8 +954,8 @@ async fn tag_resource_refuses_an_arn_that_resolves_to_no_resource() {
         );
         assert_eq!(
             body["message"],
-            json!(format!("Resource {resource_arn} not found.")),
-            "case {case}: got {:?}",
+            json!(expected_message),
+            "case {case}: expected {expected_message:?}, got {:?}",
             body["message"]
         );
         assert_eq!(
@@ -1413,30 +1446,35 @@ async fn untag_resource_refuses_an_arn_that_resolves_to_no_resource() {
 
     // A UUID the emulator minted for nothing.
     let absent_id = "1b7d4e52-0a93-4f61-9c28-6e5a3d1f7b40";
-    let cases: Vec<(&str, String)> = vec![
+    let cases: Vec<(&str, String, &str)> = vec![
         (
             "a namespace id that names nothing",
             format!("arn:aws:redshift-serverless:us-east-1:{ACCOUNT}:namespace/{absent_id}"),
+            "Namespace not found",
         ),
         (
             "a snapshot id that names nothing",
             format!("arn:aws:redshift-serverless:us-east-1:{ACCOUNT}:snapshot/{absent_id}"),
+            "Snapshot not found",
         ),
         (
             "a real namespace id under the wrong resource kind",
             format!("arn:aws:redshift-serverless:us-east-1:{ACCOUNT}:workgroup/{real_namespace_id}"),
+            "Workgroup not found",
         ),
         (
             "a real namespace id in another account",
             format!(
                 "arn:aws:redshift-serverless:us-east-1:999999999999:namespace/{real_namespace_id}"
             ),
+            "Namespace not found",
         ),
         (
             "a real namespace id in another Region",
             format!(
                 "arn:aws:redshift-serverless:eu-central-1:{ACCOUNT}:namespace/{real_namespace_id}"
             ),
+            "Namespace not found",
         ),
         (
             "a real namespace id in another partition",
@@ -1444,12 +1482,21 @@ async fn untag_resource_refuses_an_arn_that_resolves_to_no_resource() {
                 "arn:aws-us-gov:redshift-serverless:us-gov-west-1:{ACCOUNT}:namespace/\
                  {real_namespace_id}"
             ),
+            "Namespace not found",
         ),
-        ("a value that is no ARN at all", "not-an-arn".to_string()),
-        ("the ARN of a deleted namespace", doomed_arn),
+        (
+            "a value that is no ARN at all",
+            "not-an-arn".to_string(),
+            "Resource not found",
+        ),
+        (
+            "the ARN of a deleted namespace",
+            doomed_arn,
+            "Namespace not found",
+        ),
     ];
 
-    for (label, resource_arn) in &cases {
+    for (label, resource_arn, expected_message) in &cases {
         let case = format!("{label} ({resource_arn})");
         let (status, body) =
             untag_resource_call(&router, "us-east-1", resource_arn, &["env".to_string()]).await;
@@ -1460,8 +1507,8 @@ async fn untag_resource_refuses_an_arn_that_resolves_to_no_resource() {
         );
         assert_eq!(
             body["message"],
-            json!(format!("Resource {resource_arn} not found.")),
-            "case {case}: got {:?}",
+            json!(expected_message),
+            "case {case}: expected {expected_message:?}, got {:?}",
             body["message"]
         );
         assert_eq!(
