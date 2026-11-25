@@ -12,28 +12,29 @@
 //! reached at all, so a route whose settings throttle it and its twin on the same stage
 //! answer differently for the same api.
 //!
-//! The ARITHMETIC of the bucket is not written here: it is the tree's one token bucket
-//! ([`::service_common::token_bucket`]), so this service and every other that meters a
-//! published rate-and-burst pair cannot disagree about whether a request is admitted. What
-//! this module owns is what the MODEL says — which members declare the pair, what an absent
-//! one means, that the thing metered is one route of one stage, and WHICH requests of it may
-//! draw on the capacity the rate has not refilled yet.
+//! The ARITHMETIC of the bucket is not written here, and neither is the accounting of the
+//! submissions in flight together: both are the tree's one token bucket
+//! ([`::service_common::token_bucket`], whose [`Submissions`] this module meters a route
+//! with), so this service and every other that meters a published rate-and-burst pair cannot
+//! disagree about whether a request is admitted. What this module owns is what the MODEL says
+//! — which members declare the pair, what an absent one means, and that the thing metered is
+//! one route of one stage.
 //!
-//! That last reading is what the burst limit states. The burst a published pair names is how
-//! many requests the gateway serves AT ONCE, so the requests in flight TOGETHER at a route may
-//! draw ahead of the rate ([`::service_common::token_bucket::Bucket::admits_ahead`]), and the
-//! burst is BOTH how many of them are served at once and how far they may draw: what they take
-//! is charged to the same bucket, so the rate repays it and the route is served at its rate
-//! over time. Both budgets come back — the burst's room as each request is answered, the
-//! bucket's capacity as the rate refills it — so a route under load that never lets up keeps
-//! being served. A request that arrives while the route has nothing in flight arrived ALONE —
-//! at the instant it is metered the gateway has nothing else of the route to serve it beside,
-//! and cannot know what has not arrived yet — so the bucket answers it, which is what meters a
-//! caller that waits for each answer before asking again. So at one instant a throttled route
-//! serves its burst and sheds the excess rather than all of it, and over time it serves its
-//! rate — a route whose bucket was full may serve the burst it held and then a burst drawn
-//! ahead of the rate before the rate has refilled either, which is the draw being repaid
-//! rather than a second burst being granted.
+//! What that shared reading gives a route is what the burst limit states. The burst a
+//! published pair names is how many requests the gateway serves AT ONCE, so the requests in
+//! flight TOGETHER at a route may draw ahead of the rate, and the burst is BOTH how many of
+//! them are served at once and how far they may draw: what they take is charged to the same
+//! bucket, so the rate repays it and the route is served at its rate over time. Both budgets
+//! come back — the burst's room as each request is answered, the bucket's capacity as the rate
+//! refills it — so a route under load that never lets up keeps being served. A request that
+//! arrives while the route has nothing in flight arrived ALONE — at the instant it is metered
+//! the gateway has nothing else of the route to serve it beside, and cannot know what has not
+//! arrived yet — so the bucket answers it, which is what meters a caller that waits for each
+//! answer before asking again. So at one instant a throttled route serves its burst and sheds
+//! the excess rather than all of it, and over time it serves its rate — a route whose bucket
+//! was full may serve the burst it held and then a burst drawn ahead of the rate before the
+//! rate has refilled either, which is the draw being repaid rather than a second burst being
+//! granted.
 //!
 //! The buckets are DATA-PLANE state: how much of each route's capacity the requests already
 //! served have taken, and which submissions of it the gateway is still answering. A
@@ -44,7 +45,7 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-use ::service_common::token_bucket::{Bucket, Limits as BucketLimits};
+use ::service_common::token_bucket::{Limits as BucketLimits, Submissions};
 
 /// The requests per second a route is metered at when its settings name a burst limit but no
 /// rate: the account-level rate quota API Gateway publishes for a Region, which is the
@@ -83,43 +84,7 @@ type MeteredRoute = (String, String, String);
 /// The throttles of every metered route of this account.
 #[derive(Debug, Default)]
 pub struct RouteThrottles {
-    routes: BTreeMap<MeteredRoute, Metered>,
-}
-
-/// What one metered route's throttle holds.
-#[derive(Debug)]
-struct Metered {
-    /// The capacity the steady-state rate refills — the bucket the pair declares, which every
-    /// request this route is served takes one of.
-    bucket: Bucket,
-    /// How many submissions of this route the gateway is answering right now: arrived and
-    /// not answered yet. A submission the throttle SHEDS counts too while it is being
-    /// answered, because it arrived alongside the others — it is one of the requests that
-    /// arrived together, whatever it is answered with.
-    in_flight: usize,
-    /// How many requests the route is BEING SERVED right now: admitted and not answered yet.
-    /// This is what the burst limit bounds — the requests in flight together — so it is
-    /// released as each of them is answered rather than accumulated.
-    served_in_flight: usize,
-}
-
-impl Metered {
-    /// A route nothing has been metered against yet: a full bucket, nothing in flight.
-    fn new(limits: Limits, now: Instant) -> Self {
-        Self {
-            bucket: Bucket::full(limits, now),
-            in_flight: 0,
-            served_in_flight: 0,
-        }
-    }
-
-    /// Whether the burst leaves room for one more request to be served at once: what the
-    /// route is being served TOGETHER is the burst, however many requests arrive and however
-    /// much capacity the bucket holds when they do.
-    fn below_the_burst(&self, limits: Limits) -> bool {
-        let serving = u32::try_from(self.served_in_flight).unwrap_or(u32::MAX);
-        f64::from(serving) < limits.burst
-    }
+    routes: BTreeMap<MeteredRoute, Submissions>,
 }
 
 impl RouteThrottles {
@@ -128,13 +93,12 @@ impl RouteThrottles {
     ///
     /// One budget answers — the bucket the rate refills, which every admitted request is
     /// charged one of. What the arrival decides is how far the bucket may be drawn for it, and
-    /// the burst decides how many requests the route is served AT ONCE. A request that arrives
-    /// while the route has others still unanswered is one of the requests in flight TOGETHER:
-    /// it may draw on capacity the rate has not refilled yet ([`Bucket::admits_ahead`]) while
-    /// fewer than burst-many requests are being served ([`Metered::below_the_burst`]), so a
-    /// route whose bucket is full and one whose bucket is spent both serve the burst and no
-    /// more at once. A request that arrives while the route has nothing in flight arrived
-    /// alone, so it takes only what the bucket holds ([`Bucket::admits`]).
+    /// the burst decides how many requests the route is served AT ONCE, which is the shared
+    /// reading of a pair whose burst is the number served together
+    /// ([`Submissions::arrived`]): a request that arrives while the route has others still
+    /// unanswered may draw on capacity the rate has not refilled yet while fewer than
+    /// burst-many requests are being served, and one that arrives while the route has nothing
+    /// in flight takes only what the bucket holds.
     ///
     /// Neither budget is spent for good: the burst's room comes back as each request is
     /// answered ([`Self::answered`]) and the bucket's capacity as the rate refills it, which is
@@ -151,24 +115,10 @@ impl RouteThrottles {
         limits: Limits,
         now: Instant,
     ) -> bool {
-        let metered = self
-            .routes
+        self.routes
             .entry(route_of(api_id, stage_name, route_key))
-            .or_insert_with(|| Metered::new(limits, now));
-        let arrived_together = metered.in_flight > 0;
-        metered.in_flight += 1;
-        if !metered.below_the_burst(limits) {
-            return false;
-        }
-        let admitted = if arrived_together {
-            metered.bucket.admits_ahead(limits, now)
-        } else {
-            metered.bucket.admits(limits, now)
-        };
-        if admitted {
-            metered.served_in_flight += 1;
-        }
-        admitted
+            .or_insert_with(|| Submissions::new(limits, now))
+            .arrived(limits, now)
     }
 
     /// The gateway has ANSWERED one submission of this route: it is no longer one of the
@@ -189,10 +139,7 @@ impl RouteThrottles {
             );
             return;
         };
-        metered.in_flight = metered.in_flight.saturating_sub(1);
-        if served {
-            metered.served_in_flight = metered.served_in_flight.saturating_sub(1);
-        }
+        metered.answered(served);
     }
 
     /// Forget every bucket of one api, for an api that is no longer there.

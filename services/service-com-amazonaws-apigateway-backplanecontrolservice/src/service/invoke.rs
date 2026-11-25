@@ -1856,7 +1856,7 @@ async fn serving<Eng: Send + Sync + 'static>(
             // Read here, under the lock that read the stage, and ACCOUNTED below with the
             // metering, because recording a request needs an exclusive lock.
             let stage_throttle = response_cache::method_settings_in_force(stage, matched_path, verb)
-                .and_then(crate::state::ThrottleLimits::of_method_setting)
+                .and_then(crate::state::method_setting_limits)
                 .map(|limits| StageThrottle {
                     key: crate::state::stage_method_throttle_key(
                         &api.id,
@@ -1911,23 +1911,31 @@ async fn serving<Eng: Send + Sync + 'static>(
     // after them. A request this throttle sheds is answered 429 through the api's own
     // `THROTTLED` gateway response, with the payload unchecked and the integration never
     // performed — the same shape as a shed metered request.
-    if let Some(throttle) = stage_throttle {
-        let mut store = state.lock();
-        if !store.stage_method_throttle_admits(
-            &throttle.key,
-            throttle.limits,
-            ::std::time::Instant::now(),
-        ) {
-            tracing::debug!(
-                api_id = %integration.api_id,
-                stage = %integration.stage,
-                path = %integration.path,
-                verb = %integration.verb,
-                "this stage's throttle for the method admits no further request"
-            );
-            return throttle.throttled;
+    //
+    // The submission is metered AROUND the answer rather than at a point in it
+    // ([`stage_throttle`]): the burst a `methodSettings` entry states is how many requests the
+    // stage serves AT ONCE, so a submission is one the next arrival arrives TOGETHER with for
+    // as long as this call is unanswered — which is why the guard is held to the end of this
+    // function and released by its drop, on every path out of it.
+    let _metered = match stage_throttle {
+        Some(throttle) => {
+            let submission = stage_throttle::metered(&state, throttle.key, throttle.limits);
+            if !submission.admitted() {
+                tracing::debug!(
+                    api_id = %integration.api_id,
+                    stage = %integration.stage,
+                    path = %integration.path,
+                    verb = %integration.verb,
+                    rate = throttle.limits.rate,
+                    burst = throttle.limits.burst,
+                    "this stage's throttle for the method admits no further request"
+                );
+                return throttle.throttled;
+            }
+            Some(submission)
         }
-    }
+        None => None,
+    };
 
     // OFF the lock: the payload against the model's JSON Schema. A refused payload is
     // answered through the api's own gateway response for `BAD_REQUEST_BODY`, so the
@@ -3101,7 +3109,7 @@ fn plans_associating(
         .map(|plan| {
             (
                 plan.id.clone(),
-                crate::state::ThrottleLimits::declared(plan.throttle.as_ref()),
+                crate::state::declared_throttle_limits(plan.throttle.as_ref()),
             )
         })
         .collect()
@@ -4522,6 +4530,11 @@ pub use browser_invoke::*;
 /// concern that is about the TRANSPORT an invoke is performed over rather than about which
 /// answer is served.
 mod reached_emulator;
+
+/// The serving stage's own THROTTLE of the method, metered around the answer, in a file of
+/// its own: the one concern that spans the whole of serving one call rather than one step of
+/// it.
+mod stage_throttle;
 
 /// Where the stage holds the result an authorizer returned for ONE identity, in a file of its
 /// own with the tests of that key's own property.

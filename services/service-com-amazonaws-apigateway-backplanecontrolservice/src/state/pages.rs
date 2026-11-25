@@ -119,26 +119,12 @@ impl Page {
     /// that holds no element at all, one a caller emptied, a filter that selects none, and the
     /// window a caller that walked to the end asks for.
     ///
-    /// One copy for every `position`/`limit` collection of this service, so no listing of this
-    /// service reports an empty page a second way. The base path mappings of one domain name
-    /// are the one collection this service answers otherwise
-    /// ([`Page::items_reported_only_when_held`]).
+    /// One copy for EVERY `position`/`limit` collection of this service, so no listing of this
+    /// service reports an empty page a second way — the base path mappings of one domain name
+    /// included, which a client confirms a delete with by reading the list the emptied domain
+    /// name answers.
     pub fn reported_items<Element>(&self, items: Vec<Element>) -> Option<Vec<Element>> {
         Some(items)
-    }
-
-    /// The page as the ONE collection of this service that leaves its member OUT of an empty
-    /// answer reports it: present where the page holds an element, absent altogether where it
-    /// holds none, so the whole answer is the empty object.
-    ///
-    /// The base path mappings of a domain name are answered this way — a domain name that
-    /// carries no mapping is answered no `item` member at all — against
-    /// [`Page::reported_items`] for every other listing of this service.
-    pub fn items_reported_only_when_held<Element>(
-        &self,
-        items: Vec<Element>,
-    ) -> Option<Vec<Element>> {
-        (!items.is_empty()).then_some(items)
     }
 }
 

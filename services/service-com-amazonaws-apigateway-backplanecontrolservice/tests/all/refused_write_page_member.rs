@@ -14,9 +14,7 @@
 //! The rule, asserted over a TABLE of collections rather than one listing: a refused write
 //! stores nothing, so the listing of the collection it would have joined is a 200 reporting
 //! that collection exactly as that listing reports a page holding no element — the page
-//! member (`item` on the wire) PRESENT and empty for every collection of this service, and
-//! the bare empty object for the base path mappings of one domain name, the one collection
-//! of this service answered that way
+//! member (`item` on the wire) PRESENT and empty, for every collection of this service
 //! ([`crate::emptied_collection_page_member::empty_page_body`], this crate's one reading of
 //! an empty page). A client therefore reads "the refusal created nothing" off the listing
 //! itself rather than off an absent member.

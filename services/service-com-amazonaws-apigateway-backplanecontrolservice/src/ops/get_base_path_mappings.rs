@@ -5,12 +5,12 @@
 //! The base path mappings of one domain name, oldest first, one `position`/`limit` page at a
 //! time. Reads only.
 //!
-//! A page that holds no element is answered with the member LEFT OUT: a domain name that
-//! carries no mapping — one that never carried one, and one whose last mapping was deleted —
-//! is answered the empty object, with no page member, no cursor and no page-size echo
-//! ([`crate::state::Page::items_reported_only_when_held`]). This collection is the one of
-//! this service answered that way; every other reports its page member present and empty
-//! ([`crate::state::Page::reported_items`]).
+//! A page that holds no element is answered with the member PRESENT and empty: a domain name
+//! that carries no mapping — one that never carried one, and one whose last mapping was
+//! deleted — is answered the empty list, with no cursor and no page-size echo beside it
+//! ([`crate::state::Page::reported_items`], the one reading every listing of this service
+//! reports an empty page by), so a client confirms its deletes by counting a list rather than
+//! by asking whether the member is there at all.
 //!
 //! ## Shape of an operation
 //!
@@ -196,13 +196,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         Ok(Paged::new(
             GetBasePathMappingsOutput {
-                // The page's elements, reported only where the page HOLDS one
-                // (`crate::state::Page::items_reported_only_when_held`): the mappings of a
-                // domain name are the one collection of this service whose empty answer
-                // leaves the member out, so a domain name that carries no mapping — however
-                // it came to carry none — is answered the empty object rather than an empty
-                // list.
-                items: page.items_reported_only_when_held(items),
+                // The page's elements, PRESENT whatever the page holds
+                // (`crate::state::Page::reported_items`): "the current page of elements from
+                // this collection" is a list a client counts, so a domain name that carries
+                // no mapping — however it came to carry none — is answered the empty list
+                // rather than an answer that withholds the member.
+                items: page.reported_items(items),
                 position: page.next_position.clone(),
             },
             page.echoed_limit(),

@@ -14,8 +14,8 @@
 //! * a collection that holds no element reports its page member as the EMPTY list — with
 //!   no cursor and no echoed page size beside it — across every listing of this service,
 //!   the deployments collection included (asserted by `crate::deployment_collection`,
-//!   which owns that collection's own answer), the base path mappings of a domain name
-//!   excepted: that one listing answers an empty page with no page member at all
+//!   which owns that collection's own answer) and the base path mappings of a domain name
+//!   included too
 //!   (`crate::emptied_collection_page_member::empty_page_body`, the one reading of an empty
 //!   page);
 //! * a limited page of an API's documentation parts holds the parts at the first

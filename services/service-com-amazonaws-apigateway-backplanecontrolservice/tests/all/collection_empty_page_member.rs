@@ -12,8 +12,7 @@
 //! current page of elements from this collection" whatever that page holds — for every
 //! collection of this service, a page that holds nothing is a success carrying the page
 //! member as the EMPTY list, so a client reads "nothing is listed" off a list it can count
-//! rather than off an absent member. The base path mappings of a domain name are the one
-//! collection of this service answered the other way, with no page member at all
+//! rather than off an absent member
 //! (`crate::emptied_collection_page_member::empty_page_body`, the one reading of an empty
 //! page).
 //!

@@ -14,9 +14,9 @@
 //!
 //! The rule, asserted over a TABLE of collections rather than one listing: a collection
 //! emptied of its last element answers with its page member (`item` on the wire) PRESENT and
-//! empty, and with neither a cursor nor a page-size echo beside it — except the base path
-//! mappings of a domain name, the one collection of this service whose empty answer carries no
-//! page member at all ([`empty_page_body`], the one reading of an empty page).
+//! empty, and with neither a cursor nor a page-size echo beside it ([`empty_page_body`], the
+//! one reading of an empty page, which every listing of this service answers — the base path
+//! mappings of a domain name included).
 //! The DEPLOYMENTS collection is asserted the same way by
 //! `crate::deployment_collection`, which owns it.
 //!
@@ -178,24 +178,20 @@ async fn emptied(gateway: &Gateway, collection: &str) -> String {
     }
 }
 
-/// The one collection of this service whose empty answer carries NO page member: the base
-/// path mappings of one domain name, which API Gateway answers with the bare empty object.
-pub(crate) const MEMBERLESS_EMPTY_PAGE: &str = "GetBasePathMappings";
-
 /// The whole body the listing named `collection` answers once its page holds no element: the
 /// page member PRESENT and empty — "the current page of elements from this collection" is a
 /// list a client counts, and a page of nothing is a list of nothing — and nothing beside it,
 /// no cursor and no page-size echo, because a page of nothing carries on nowhere.
 ///
-/// [`MEMBERLESS_EMPTY_PAGE`] is answered the other way, with no page member at all.
+/// EVERY `position`/`limit` listing of this service answers that way, the base path mappings
+/// of one domain name included: the body does not change shape with which collection, or with
+/// how the page came to hold nothing.
 ///
 /// `pub(crate)` so every suite of this crate that reads an empty page reads the same spelling.
-pub(crate) fn empty_page_body(collection: &str) -> Value {
-    if collection == MEMBERLESS_EMPTY_PAGE {
-        json!({})
-    } else {
-        json!({ "item": [] })
-    }
+/// The collection is still named by each caller — it is what a failing case is read against —
+/// and no longer decides the answer.
+pub(crate) fn empty_page_body(_collection: &str) -> Value {
+    json!({ "item": [] })
 }
 
 #[tokio::test]

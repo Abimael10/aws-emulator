@@ -96,16 +96,15 @@ async fn get_base_path_mappings_pages_through_creation_order_on_position_and_lim
     let domain_name = "collection.example.com";
     created_domain(&gateway, domain_name, json!({})).await;
 
-    // A domain name that carries no mapping is answered the empty object: the base path
-    // mappings of a domain name are the one collection of this service whose empty page
-    // carries no page member at all, and nothing beside it either, because nothing follows a
-    // page that ended the collection
+    // A domain name that carries no mapping is answered the page member PRESENT and empty —
+    // every listing of this service answers an empty page that way — and nothing beside it
+    // either, because nothing follows a page that ended the collection
     // (`crate::emptied_collection_page_member::empty_page_body`).
     let empty = page_of(&gateway, domain_name, "", "the empty collection").await;
     assert_eq!(
         empty,
         crate::emptied_collection_page_member::empty_page_body("GetBasePathMappings"),
-        "case the empty collection: expected no page member, got {empty:?}"
+        "case the empty collection: expected the page member present and empty, got {empty:?}"
     );
 
     // The creates differ along what the rule generalises over: the SPELLING of the base
@@ -553,14 +552,14 @@ async fn an_empty_page_of_this_collection_is_answered_with_the_empty_page_member
             let body = page_of(&gateway, &domain_name, query, &case).await;
             assert_eq!(
                 body,
-                json!({}),
-                "case {case}: expected no page member and nothing beside it, got \
-                 {body:?}"
+                crate::emptied_collection_page_member::empty_page_body("GetBasePathMappings"),
+                "case {case}: expected the page member present and empty with nothing beside \
+                 it, got {body:?}"
             );
         }
 
-        // The contrast: one mapping created again, and the page carries it — so the absent
-        // member is a page of nothing rather than this listing never filling it.
+        // The contrast: one mapping created again, and the page carries it — so the empty
+        // list is a page of nothing rather than this listing never filling it.
         created_mapping(
             &gateway,
             &domain_name,

@@ -95,7 +95,7 @@ pub struct ComAmazonawsApigatewayBackplanecontrolserviceState {
     /// ([`ComAmazonawsApigatewayBackplanecontrolserviceState::forget_api_key`]), so it
     /// never grows with the request count.
     pub throttle_buckets: BTreeMap<String, ThrottleBucket>,
-    /// The token bucket each throttled method of each stage is metered against, keyed by
+    /// The accounting each throttled method of each stage is metered against, keyed by
     /// [`StageMethodThrottleKey`]: one bucket per `(API, stage, method path)`, because a
     /// `methodSettings` entry's `throttlingRateLimit`/`throttlingBurstLimit` is the rate the
     /// STAGE admits requests for the METHOD the entry applies to — whoever is calling, and
@@ -108,7 +108,7 @@ pub struct ComAmazonawsApigatewayBackplanecontrolserviceState {
     /// a method's requests are admitted at cannot be computed without recording the ones
     /// already admitted. Bounded by the records the control plane holds and reclaimed with
     /// the stage it meters
-    /// ([`ComAmazonawsApigatewayBackplanecontrolserviceState::stage_method_throttle_admits`]),
+    /// ([`ComAmazonawsApigatewayBackplanecontrolserviceState::stage_method_throttle_arrived`]),
     /// so it never grows with the request count.
     pub stage_method_throttle_buckets: StageMethodThrottleBuckets,
     /// The requests each API key that has invoked a stage has sent, counted by the day
@@ -1411,73 +1411,37 @@ pub fn metering_key(usage_plan_id: &str, key_id: &str) -> String {
     format!("{usage_plan_id}/{key_id}")
 }
 
-/// The request rate a usage plan's `throttle` admits, as the token bucket that meters it
-/// reads the pair: the bucket's capacity and the rate it refills at.
+/// The request rate a published rate-and-burst pair admits, as the token bucket that meters
+/// it reads the pair: the bucket's capacity and the rate it refills at.
 ///
 /// `ThrottleSettings` documents the pair as "the API request rate limits" —
 /// `rateLimit` "the API request steady-state rate limit" and `burstLimit` "the API request
 /// burst limit", which is the capacity "provided by the token bucket algorithm" the
-/// account-level limits ([`DEFAULT_ACCOUNT_THROTTLE`]) are published as. A limit that is
-/// not POSITIVE is no limit: both "must be numeric and greater than zero"
+/// account-level limits ([`DEFAULT_ACCOUNT_THROTTLE`]) are published as. The ARITHMETIC of
+/// that bucket is the workspace's one reading of it ([`::service_common::token_bucket`]), so
+/// this service and every other that meters such a pair cannot answer differently about
+/// whether a request is admitted; what stays here is what THIS model says the pair means.
+pub type ThrottleLimits = ::service_common::token_bucket::Limits;
+
+/// The token bucket one metered thing's requests are admitted through: a usage plan's
+/// `(plan, API key)` pair, and one method of one stage ([`stage_method_throttle`]).
+///
+/// A bucket starts FULL — a caller that has sent nothing may burst up to the burst limit —
+/// and refills at the rate, so the limits a resource is updated to take effect on the next
+/// request rather than on a bucket frozen at the old ones.
+pub type ThrottleBucket = ::service_common::token_bucket::Bucket;
+
+/// The limits a usage plan's `throttle` declares, or `None` when it declares none that
+/// limits anything.
+///
+/// A limit that is not POSITIVE is no limit: both "must be numeric and greater than zero"
 /// ([`INVALID_THROTTLE_SETTINGS`]), so a plan whose throttle sets neither (the structure's
 /// own zeroes) throttles nothing rather than refusing everything.
-#[derive(Debug, Clone, Copy)]
-pub struct ThrottleLimits {
-    /// The most requests admissible at once — the bucket's capacity.
-    pub burst: f64,
-    /// The requests per second the bucket refills at.
-    pub rate: f64,
-}
-
-impl ThrottleLimits {
-    /// The limits `throttle` declares, or `None` when it declares none that limits
-    /// anything.
-    pub fn declared(throttle: Option<&ThrottleSettings>) -> Option<Self> {
-        let throttle = throttle?;
-        let burst = f64::from(throttle.burst_limit);
-        let rate = throttle.rate_limit;
-        (burst > 0.0 && rate.is_finite() && rate > 0.0).then_some(Self { burst, rate })
-    }
-}
-
-/// The token bucket one metered `(usage plan, API key)` pair's requests are admitted
-/// through.
-///
-/// A bucket starts FULL — a key that has sent nothing may burst up to the plan's burst
-/// limit — and refills at the plan's rate, so the limits a plan is updated to take effect
-/// on the next request rather than on a bucket frozen at the old ones.
-#[derive(Debug, Clone)]
-pub struct ThrottleBucket {
-    /// The requests still admissible as of [`Self::refilled_at`].
-    tokens: f64,
-    /// The instant `tokens` was last computed at.
-    refilled_at: ::std::time::Instant,
-}
-
-impl ThrottleBucket {
-    /// A bucket holding `limits.burst` requests as of `now`.
-    fn full(limits: ThrottleLimits, now: ::std::time::Instant) -> Self {
-        Self {
-            tokens: limits.burst,
-            refilled_at: now,
-        }
-    }
-
-    /// Admit one request and record it, or report that `limits` admit none at `now`.
-    ///
-    /// The refill is the time since the last request times the rate, capped at the burst
-    /// limit: the bucket cannot hold more than the capacity however long a key has been
-    /// idle, which is what makes the steady-state rate the rate.
-    fn admits(&mut self, limits: ThrottleLimits, now: ::std::time::Instant) -> bool {
-        let elapsed = now.saturating_duration_since(self.refilled_at).as_secs_f64();
-        self.tokens = (self.tokens + elapsed * limits.rate).min(limits.burst);
-        self.refilled_at = now;
-        if self.tokens < 1.0 {
-            return false;
-        }
-        self.tokens -= 1.0;
-        true
-    }
+pub fn declared_throttle_limits(throttle: Option<&ThrottleSettings>) -> Option<ThrottleLimits> {
+    let throttle = throttle?;
+    let burst = f64::from(throttle.burst_limit);
+    let rate = throttle.rate_limit;
+    (burst > 0.0 && rate.is_finite() && rate > 0.0).then_some(ThrottleLimits { burst, rate })
 }
 
 /// The `BadRequestException` message for a `keyType` that is not [`USAGE_PLAN_KEY_TYPE`].
@@ -3114,7 +3078,7 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
     ///
     /// This is the one place a usage plan's throttle is accounted, so the data plane and
     /// anything else that meters a request share one bucket per pair; a plan whose
-    /// `throttle` declares no positive limit ([`ThrottleLimits::declared`]) is not metered
+    /// `throttle` declares no positive limit ([`declared_throttle_limits`]) is not metered
     /// at all and admits every request.
     pub fn throttle_admits(
         &mut self,

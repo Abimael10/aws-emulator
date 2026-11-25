@@ -12,21 +12,18 @@
 //! chance to get the refill or the cap wrong, so the bucket lives here once.
 //!
 //! What stays with the service is everything ABOUT ITS OWN MODEL: which members declare the
-//! pair, what an absent or non-positive member means for that resource, what the thing
-//! being metered is keyed by, and which of its requests may draw on the rate before the bucket
-//! has refilled ([`Bucket::admits_ahead`], the reading a pair gets whose burst is the number
-//! of requests served AT ONCE). This module owns only the bucket: how much capacity is left,
-//! how it refills, how far it may be drawn, and whether one request may be admitted.
+//! pair, what an absent or non-positive member means for that resource, and what the thing
+//! being metered is keyed by. This module owns the bucket — how much capacity is left, how it
+//! refills, how far it may be drawn, and whether one request may be admitted — and, for a pair
+//! whose burst is the number of requests served AT ONCE, the accounting of the submissions in
+//! flight together that may draw ahead of the rate ([`Submissions`]).
 //!
 //! Nothing here sleeps or waits: the capacity is computed from how much time has passed
 //! since the last admitted request, so a caller that was idle finds its whole burst again
 //! and a caller that was not finds what the rate refilled.
 //!
-//! Two services still carry their own copy of this arithmetic, each pinned by its own
-//! suites and each to be MIGRATED onto this module in the change that owns that service
-//! rather than copied again:
-//! `service-com-amazonaws-apigateway-backplanecontrolservice/src/state.rs` (`ThrottleLimits`
-//! + `ThrottleBucket`, metering a usage plan's `ThrottleSettings`) and
+//! One service still carries its own copy of this arithmetic, pinned by its own suites and to
+//! be MIGRATED onto this module in the change that owns that service rather than copied again:
 //! `service-com-amazonaws-xray-awsxray/src/state.rs` (`RateLimiter`, whose `burst` /
 //! `per_second` / `last_refill` are the same bucket over a per-account request budget).
 
@@ -130,6 +127,100 @@ impl Bucket {
     /// first can take the bucket below zero.
     pub fn charge(&mut self, cost: f64) {
         self.tokens -= cost;
+    }
+}
+
+/// One metered thing's capacity BESIDE the submissions of it the service is still answering,
+/// for a published pair whose burst is the number of requests served AT ONCE.
+///
+/// Several AWS services publish such a pair — API Gateway's per-method `MethodSetting`
+/// throttle and API Gateway v2's per-route `RouteSettings` are the same reading — and what
+/// that reading needs is the request metered AROUND the answer rather than at a point in it: a
+/// submission is one the next arrival arrives TOGETHER with from the moment it arrives until
+/// the service has answered it. The requests in flight together may draw ahead of the rate
+/// ([`Bucket::admits_ahead`]) while fewer than burst-many are being served, so at one instant
+/// a metered thing serves its burst and sheds the excess rather than all of it; what they take
+/// is charged to the same bucket, so the rate repays it and what is served over time is still
+/// the steady-state rate. A submission that arrives while nothing of it is in flight arrived
+/// ALONE — at the instant it is metered the service has nothing else of it to serve it beside,
+/// and cannot know what has not arrived yet — so the bucket alone answers it, which is what
+/// meters a caller that waits for each answer before asking again.
+///
+/// Both budgets come back: the burst's room as each request is answered, the bucket's capacity
+/// as the rate refills it, so a metered thing under load that never lets up keeps being served
+/// rather than closing. What stays with the SERVICE is what its own model says — which members
+/// declare the pair, what an absent one means, and what the thing being metered is keyed by.
+#[derive(Debug)]
+pub struct Submissions {
+    /// The capacity the steady-state rate refills, which every admitted request takes one of.
+    bucket: Bucket,
+    /// How many submissions the service is answering right now: arrived and not answered yet.
+    /// One the throttle SHEDS counts too while it is being answered, because it arrived
+    /// alongside the others — it is one of the requests that arrived together, whatever it is
+    /// answered with.
+    in_flight: usize,
+    /// How many requests are BEING SERVED right now: admitted and not answered yet. This is
+    /// what the burst bounds — the requests in flight together — so it is released as each of
+    /// them is answered rather than accumulated.
+    served_in_flight: usize,
+}
+
+impl Submissions {
+    /// A metered thing nothing has been metered against yet: a full bucket, nothing in flight.
+    #[must_use]
+    pub fn new(limits: Limits, now: ::std::time::Instant) -> Self {
+        Self {
+            bucket: Bucket::full(limits, now),
+            in_flight: 0,
+            served_in_flight: 0,
+        }
+    }
+
+    /// One submission ARRIVES: whether `limits` admit it at `now`, taking its capacity for it
+    /// when they do.
+    ///
+    /// Every submission this answers for must be released with [`Self::answered`] once the
+    /// service has answered it, or it is held to be serving it for ever.
+    pub fn arrived(&mut self, limits: Limits, now: ::std::time::Instant) -> bool {
+        let arrived_together = self.answering();
+        self.in_flight += 1;
+        if !self.below_the_burst(limits) {
+            return false;
+        }
+        let admitted = if arrived_together {
+            self.bucket.admits_ahead(limits, now)
+        } else {
+            self.bucket.admits(limits, now)
+        };
+        if admitted {
+            self.served_in_flight += 1;
+        }
+        admitted
+    }
+
+    /// One submission has been ANSWERED: it is no longer one of the requests a later arrival
+    /// arrives together with, and one that was SERVED leaves the burst's room for the next.
+    pub fn answered(&mut self, served: bool) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        if served {
+            self.served_in_flight = self.served_in_flight.saturating_sub(1);
+        }
+    }
+
+    /// Whether the service is still answering a submission of this metered thing — which is
+    /// what a later arrival arrives TOGETHER with, and what keeps the accounting alive while
+    /// the records it belongs to are reclaimed.
+    #[must_use]
+    pub fn answering(&self) -> bool {
+        self.in_flight > 0
+    }
+
+    /// Whether the burst leaves room for one more request to be served at once: what is being
+    /// served TOGETHER is the burst, however many requests arrive and however much capacity
+    /// the bucket holds when they do.
+    fn below_the_burst(&self, limits: Limits) -> bool {
+        let serving = u32::try_from(self.served_in_flight).unwrap_or(u32::MAX);
+        f64::from(serving) < limits.burst
     }
 }
 
@@ -385,6 +476,127 @@ mod tests {
                 row.rate > 0.0,
                 "case {case:?}: expected the repaid bucket to admit a request again only \
                  where the rate refills it at all, got {after}"
+            );
+        }
+    }
+
+    /// One row of the submissions table: the pair, how much of the bucket a caller that waits
+    /// for each answer spent first, how many submissions then arrive before any is answered,
+    /// and how many of those are served.
+    struct Together {
+        case: &'static str,
+        rate: f64,
+        burst: f64,
+        spent_alone: usize,
+        at_once: usize,
+        served: usize,
+    }
+
+    /// The submissions in flight TOGETHER are served the burst and no more, so a burst larger
+    /// than the allowance is partially shed rather than shed whole — whether the bucket was
+    /// full or spent when they arrived — and a caller that waits for each answer is metered by
+    /// the bucket alone.
+    #[test]
+    fn submissions_that_arrive_together_are_served_the_burst_and_no_more() {
+        let start = Instant::now();
+        // Rows differ along the pair, along how much of the bucket was spent before the
+        // submissions arrive (nothing, and all of it), and along how many arrive: fewer than
+        // the burst, and far more.
+        let rows = [
+            Together {
+                case: "a burst of one met by forty at once, its bucket spent",
+                rate: 1.0,
+                burst: 1.0,
+                spent_alone: 1,
+                at_once: 40,
+                served: 1,
+            },
+            Together {
+                case: "a burst of one met by forty at once, its bucket full",
+                rate: 1.0,
+                burst: 1.0,
+                spent_alone: 0,
+                at_once: 40,
+                served: 1,
+            },
+            Together {
+                case: "a burst of five met by forty at once, its bucket spent",
+                rate: 10.0,
+                burst: 5.0,
+                spent_alone: 5,
+                at_once: 40,
+                served: 5,
+            },
+            Together {
+                // The first of them arrives with nothing in flight, so a SPENT bucket sheds
+                // it and only the rest may draw ahead.
+                case: "fewer submissions than the burst, its bucket spent",
+                rate: 10.0,
+                burst: 5.0,
+                spent_alone: 5,
+                at_once: 3,
+                served: 2,
+            },
+            Together {
+                case: "fewer submissions than the burst, its bucket full",
+                rate: 10.0,
+                burst: 5.0,
+                spent_alone: 0,
+                at_once: 3,
+                served: 3,
+            },
+            Together {
+                case: "a burst no rate ever repays",
+                rate: 0.0,
+                burst: 1.0,
+                spent_alone: 1,
+                at_once: 20,
+                served: 1,
+            },
+        ];
+        for row in rows {
+            let case = row.case;
+            let limits = Limits {
+                rate: row.rate,
+                burst: row.burst,
+            };
+            let mut metered = Submissions::new(limits, start);
+            // The caller that waits for every answer: each request arrives with nothing in
+            // flight, so the bucket's own capacity is what answers it.
+            for index in 0..row.spent_alone {
+                let served = metered.arrived(limits, start);
+                assert!(
+                    served,
+                    "case {case:?}: expected request {index} of the capacity served"
+                );
+                assert!(
+                    metered.answering(),
+                    "case {case:?}: a submission is in flight until it is answered"
+                );
+                metered.answered(served);
+            }
+            assert!(
+                !metered.answering(),
+                "case {case:?}: every answered submission is released"
+            );
+            // Then the submissions that arrive together: none is answered until all have
+            // arrived.
+            let decided: Vec<bool> = (0..row.at_once)
+                .map(|_| metered.arrived(limits, start))
+                .collect();
+            let served = decided.iter().filter(|served| **served).count();
+            assert_eq!(
+                served, row.served,
+                "case {case:?}: expected {} of {} submissions served at once, got {served} \
+                 ({decided:?})",
+                row.served, row.at_once
+            );
+            for served in &decided {
+                metered.answered(*served);
+            }
+            assert!(
+                !metered.answering(),
+                "case {case:?}: the whole burst is released once it is answered"
             );
         }
     }
