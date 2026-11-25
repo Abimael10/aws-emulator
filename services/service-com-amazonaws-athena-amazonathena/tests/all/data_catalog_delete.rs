@@ -5,9 +5,8 @@
 //! so every assertion is about what an SDK client observes.
 //!
 //! The rule under test: a delete removes the ONE data catalog its `Name` addresses from
-//! the account's registry and answers with the record it removed, so the name no longer
-//! resolves for any later call, and a `Name` the registry does not hold removes nothing
-//! and is refused.
+//! the account's registry and reports no member for it, so the name no longer resolves for
+//! any later call, and a `Name` the registry does not hold removes nothing and is refused.
 //!
 //! Each test asserts that rule over a TABLE of inputs rather than one request: the rows
 //! differ along the catalog type, the parameters that type requires, the name's length and
@@ -18,9 +17,8 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::state::{
-    self, DATA_CATALOG_STATUS_DELETE_COMPLETE, DATA_CATALOG_TYPE_FEDERATED,
-    DATA_CATALOG_TYPE_GLUE, DATA_CATALOG_TYPE_HIVE, DATA_CATALOG_TYPE_LAMBDA,
-    ERROR_CODE_INVALID_INPUT, MAX_DATA_CATALOG_NAME_CHARS,
+    self, DATA_CATALOG_TYPE_FEDERATED, DATA_CATALOG_TYPE_GLUE, DATA_CATALOG_TYPE_HIVE,
+    DATA_CATALOG_TYPE_LAMBDA, ERROR_CODE_DATA_CATALOG_NOT_FOUND, MAX_DATA_CATALOG_NAME_CHARS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -55,14 +53,29 @@ fn name_of_length(length: usize) -> String {
     "aA0_@-".chars().cycle().take(length).collect()
 }
 
-/// Create one catalog and return the `DataCatalog` the create answered with.
+/// Create one catalog and return the `DataCatalog` a read of it reports.
+///
+/// The create itself reports nothing, so the registered record is read back through
+/// `GetDataCatalog` — the one account of a catalog there is.
 async fn create(router: &MultiServiceRouter, case: &str, request: &Value) -> Value {
     let (status, body) = call(router, "CreateDataCatalog", request).await;
     assert_eq!(
         status, 200,
         "case {case:?}: expected CreateDataCatalog to answer 200, got {status} with {body:?}"
     );
-    data_catalog(&body)
+    assert_eq!(
+        body,
+        json!({}),
+        "case {case:?}: expected CreateDataCatalog to report no member, got {body:?}"
+    );
+    let name = &request["Name"];
+    let (read_status, read_body) = call(router, "GetDataCatalog", &json!({ "Name": name })).await;
+    assert_eq!(
+        read_status, 200,
+        "case {case:?}: expected GetDataCatalog to read the created catalog back, got \
+         {read_status} with {read_body:?}"
+    );
+    data_catalog(&read_body)
 }
 
 /// One row of the delete table: a catalog that differs from the next along its type, the
@@ -158,11 +171,11 @@ fn delete_cases() -> Vec<DeleteCase> {
     ]
 }
 
-/// A delete removes the catalog it names and nothing else: the response is the record the
-/// registry held, the name no longer reads back, a second delete of it finds nothing, and
-/// every other catalog in the registry is untouched.
+/// A delete removes the catalog it names and nothing else: the response carries no member,
+/// the name no longer reads back, a second delete of it finds nothing, and every other
+/// catalog in the registry is untouched.
 #[tokio::test]
-async fn a_delete_removes_the_named_catalog_and_reports_the_record_it_removed() {
+async fn a_delete_removes_the_named_catalog_and_reports_no_member() {
     let router = router();
     let cases = delete_cases();
 
@@ -180,41 +193,30 @@ async fn a_delete_removes_the_named_catalog_and_reports_the_record_it_removed() 
             "case {:?}: expected DeleteDataCatalog to answer 200, got {status} with {body:?}",
             case.case
         );
-        let removed = data_catalog(&body);
-
-        // The response is the record the registry held, member for member, as the create
-        // reported it.
-        for member in ["Name", "Type", "Description", "Parameters", "ConnectionType"] {
-            assert_eq!(
-                removed[member], created[position][member],
-                "case {:?}: expected the deleted catalog's {member} to be the registered \
-                 {:?}, got {:?}",
-                case.case, created[position][member], removed[member]
-            );
-        }
+        // The delete says nothing about the resource it removed: no `DataCatalog`, and no
+        // other member either.
         assert_eq!(
-            removed["ConnectionType"].as_str(),
-            case.connection_type,
-            "case {:?}: expected ConnectionType {:?}, got {:?}",
-            case.case,
-            case.connection_type,
-            removed["ConnectionType"]
-        );
-        // `DataCatalog$Status` is "the status of the creation or deletion of the data
-        // catalog", and this call's deletion is done when it returns.
-        assert_eq!(
-            removed["Status"].as_str(),
-            Some(DATA_CATALOG_STATUS_DELETE_COMPLETE),
-            "case {:?}: expected the deleted catalog's Status to be \
-             {DATA_CATALOG_STATUS_DELETE_COMPLETE}, got {removed:?}",
+            body,
+            json!({}),
+            "case {:?}: expected DeleteDataCatalog to report no member, got {body:?}",
             case.case
         );
         assert_eq!(
-            removed["Error"],
+            data_catalog(&body),
             Value::Null,
-            "case {:?}: expected no Error on a catalog that was deleted, got {:?}",
+            "case {:?}: expected no DataCatalog on the delete response, got {:?}",
             case.case,
-            removed["Error"]
+            data_catalog(&body)
+        );
+        // What the registry did hold is what the read taken while it held it reported,
+        // which is the only place a caller ever sees the catalog.
+        assert_eq!(
+            created[position]["ConnectionType"].as_str(),
+            case.connection_type,
+            "case {:?}: expected the registered catalog's ConnectionType {:?}, got {:?}",
+            case.case,
+            case.connection_type,
+            created[position]["ConnectionType"]
         );
 
         // The name resolves for nothing afterwards: neither a read nor a second delete.
@@ -264,8 +266,8 @@ async fn a_delete_removes_the_named_catalog_and_reports_the_record_it_removed() 
     }
 }
 
-/// A `Name` the registry does not hold deletes nothing and is refused as a bad request,
-/// whatever else the registry holds.
+/// A `Name` the registry does not hold deletes nothing and is refused under the class of
+/// a catalog this account does not hold, whatever else the registry holds.
 #[tokio::test]
 async fn a_name_the_registry_does_not_hold_is_refused() {
     let router = router();
@@ -306,11 +308,12 @@ async fn a_name_the_registry_does_not_hold_is_refused() {
         assert_eq!(
             refusal_codes(&body),
             (
-                ERROR_CODE_INVALID_INPUT.to_string(),
-                ERROR_CODE_INVALID_INPUT.to_string()
+                ERROR_CODE_DATA_CATALOG_NOT_FOUND.to_string(),
+                ERROR_CODE_DATA_CATALOG_NOT_FOUND.to_string()
             ),
-            "case {case:?}: expected the refusal to carry {ERROR_CODE_INVALID_INPUT} under \
-             both AthenaErrorCode and ErrorCode, got {body:?}"
+            "case {case:?}: expected the refusal to carry \
+             {ERROR_CODE_DATA_CATALOG_NOT_FOUND} under both AthenaErrorCode and ErrorCode, \
+             got {body:?}"
         );
         assert_eq!(
             message(&body),
@@ -500,10 +503,9 @@ async fn concurrent_deletes_of_one_catalog_leave_exactly_one_succeeding() {
              {answers:?}"
         );
         assert_eq!(
-            data_catalog(&succeeded[0].1)["Name"].as_str(),
-            Some(name.as_str()),
-            "case {callers} callers: expected the one success to report the catalog it \
-             removed, got {:?}",
+            succeeded[0].1,
+            json!({}),
+            "case {callers} callers: expected the one success to report no member, got {:?}",
             succeeded[0].1
         );
         for (status, body) in answers.iter().filter(|(status, _)| *status != 200) {

@@ -186,8 +186,7 @@ async fn read_catalog(router: &MultiServiceRouter, name: &str) -> (u16, Value) {
 
 /// RULE: a catalog holds the connector wiring its parameters resolve to — one composite
 /// LAMBDA function under both role keys beside the name of the catalog it is asked about,
-/// every other map as it was given — and that is what the create answers with and what
-/// every later read reports.
+/// every other map as it was given — and that is what every read of it reports.
 #[tokio::test]
 async fn a_created_catalog_holds_the_wiring_its_parameters_resolve_to() {
     let router = build_router();
@@ -212,9 +211,10 @@ async fn a_created_catalog_holds_the_wiring_its_parameters_resolve_to() {
             case.case
         );
         assert_eq!(
-            created["DataCatalog"]["Parameters"], held,
-            "case {:?}: expected the create response to report {held:?}, got {:?}",
-            case.case, created["DataCatalog"]["Parameters"]
+            created,
+            json!({}),
+            "case {:?}: expected the create to report no member, got {created:?}",
+            case.case
         );
 
         let (status, read) = read_catalog(&router, &name).await;

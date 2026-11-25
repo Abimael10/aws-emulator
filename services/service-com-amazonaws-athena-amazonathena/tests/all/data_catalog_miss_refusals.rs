@@ -4,15 +4,17 @@
 //! names no catalog this account holds.
 //!
 //! The rule: such a request is refused with the operation's own MODELLED client error —
-//! `InvalidRequestException`, HTTP 400, under this service's `INVALID_INPUT` refusal class
-//! — carrying that path's own sentence with the catalog name taken from the request, never
-//! with an error shape the operation does not model. Each path words the miss as Athena
-//! words it, and the wordings are not interchangeable: a read of the registry states the
-//! name "was not found.", a delete the same sentence without the closing period, an update
-//! that the catalog "does not exist.", and a METADATA read — which resolves the catalog it
-//! would read through rather than the registry record — that it "cannot find" the catalog
+//! `InvalidRequestException`, HTTP 400 — carrying that path's own refusal class and that
+//! path's own sentence with the catalog name taken from the request, never with an error
+//! shape the operation does not model. Each path words the miss as Athena words it, and
+//! the wordings are not interchangeable: a read of the registry states the name "was not
+//! found.", a delete the same sentence without the closing period, an update that the
+//! catalog "does not exist.", and a METADATA read — which resolves the catalog it would
+//! read through rather than the registry record — that it "cannot find" the catalog
 //! (`tests/all/metadata_catalog_lookup_refusal.rs` owns that sentence over every metadata
-//! read).
+//! read). The classes are not interchangeable either: the delete path reports a catalog it
+//! does not hold under the class of an absent catalog, every other path under the class of
+//! a request the caller must correct.
 //!
 //! Asserted over a TABLE: the rows span the paths that address a catalog by name and the
 //! forms a catalog name takes (one character, the documented punctuation — underscore, at
@@ -24,7 +26,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::state::{
     self, DATA_CATALOG_TYPE_GLUE, DATA_CATALOG_TYPE_HIVE, DATA_CATALOG_TYPE_LAMBDA,
-    ERROR_CODE_INVALID_INPUT, MAX_DATA_CATALOG_NAME_CHARS,
+    ERROR_CODE_DATA_CATALOG_NOT_FOUND, ERROR_CODE_INVALID_INPUT, MAX_DATA_CATALOG_NAME_CHARS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -38,11 +40,16 @@ fn lambda_arn(role: &str) -> String {
 }
 
 /// One path that addresses a data catalog by name: the operation, the body it is handed
-/// for a catalog name, and the sentence a miss must be refused with.
+/// for a catalog name, the refusal CLASS a miss on that path carries, and the sentence a
+/// miss must be refused with.
 struct MissPath {
     case: &'static str,
     operation: &'static str,
     body: fn(&str) -> Value,
+    /// The `AthenaErrorCode`/`ErrorCode` the path's miss is classified under: the class of
+    /// a resource that is not held where the path has one of its own, and the class of a
+    /// request the caller must correct everywhere else.
+    code: &'static str,
     expected: fn(&str) -> String,
 }
 
@@ -54,12 +61,14 @@ fn miss_paths() -> Vec<MissPath> {
             case: "GetDataCatalog, which reads",
             operation: "GetDataCatalog",
             body: |name| json!({ "Name": name }),
+            code: ERROR_CODE_INVALID_INPUT,
             expected: |name| format!("DataCatalog {name} was not found."),
         },
         MissPath {
             case: "DeleteDataCatalog, which removes",
             operation: "DeleteDataCatalog",
             body: |name| json!({ "Name": name }),
+            code: ERROR_CODE_DATA_CATALOG_NOT_FOUND,
             expected: |name| format!("DataCatalog {name} was not found"),
         },
         MissPath {
@@ -76,6 +85,7 @@ fn miss_paths() -> Vec<MissPath> {
                 })
             },
             expected: |name| format!("DataCatalog {name} does not exist."),
+            code: ERROR_CODE_INVALID_INPUT,
         },
         MissPath {
             case: "GetTableMetadata, which reads through the catalog",
@@ -88,6 +98,7 @@ fn miss_paths() -> Vec<MissPath> {
                 })
             },
             expected: |name| state::metadata_catalog_not_found(name),
+            code: ERROR_CODE_INVALID_INPUT,
         },
     ]
 }
@@ -117,13 +128,7 @@ async fn every_data_catalog_path_refuses_an_unheld_name_with_its_own_modelled_wo
             let body = (path.body)(&name);
             let (status, answer) = call(&router, path.operation, &body).await;
             let case = format!("{} on {name:?}", path.case);
-            assert_refusal(
-                &case,
-                status,
-                &answer,
-                ERROR_CODE_INVALID_INPUT,
-                &(path.expected)(&name),
-            );
+            assert_refusal(&case, status, &answer, path.code, &(path.expected)(&name));
         }
     }
 }

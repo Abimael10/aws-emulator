@@ -23,7 +23,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::state::{
     DATA_CATALOG_TYPE_GLUE, DATA_CATALOG_TYPE_HIVE, DATA_CATALOG_TYPE_LAMBDA,
-    ERROR_CODE_INVALID_INPUT, GLUE_DATA_CATALOG_NAME,
+    ERROR_CODE_DATA_CATALOG_NOT_FOUND, ERROR_CODE_INVALID_INPUT, GLUE_DATA_CATALOG_NAME,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -238,7 +238,7 @@ async fn the_implicit_catalog_is_refused_as_undeletable() {
             &format!("a second DeleteDataCatalog of {case}"),
             status,
             &again,
-            ERROR_CODE_INVALID_INPUT,
+            ERROR_CODE_DATA_CATALOG_NOT_FOUND,
             &format!("DataCatalog {name} was not found"),
         );
     }

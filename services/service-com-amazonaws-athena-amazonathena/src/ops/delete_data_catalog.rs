@@ -2,8 +2,9 @@
 
 //! @op DeleteDataCatalog
 //! IMPLEMENTED: removes the named data catalog from this service's registry and answers
-//! with the record it removed, so a later `GetDataCatalog` of that name is refused and a
-//! second delete of the same name finds nothing left to remove. The account's implicit Glue
+//! with no member at all, so a later `GetDataCatalog` of that name is refused and a
+//! second delete of the same name finds nothing left to remove, under the refusal class of
+//! a catalog this account does not hold. The account's implicit Glue
 //! Data Catalog is not a registered catalog and no delete removes it, so a delete that
 //! addresses it is refused as a protected resource before the registry is read at all.
 //!
@@ -179,13 +180,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let ::std::collections::btree_map::Entry::Occupied(entry) =
             store.data_catalogs.entry(input.name.clone())
         else {
-            // Athena models no not-found error for this operation; naming a catalog this
-            // account does not hold is "something wrong with the input to the request",
-            // which is what `InvalidRequestException` (HTTP 400) reports, under the code
-            // for a refusal the request itself caused. The sentence comes from
-            // `crate::state`, where the delete path's wording of a catalog miss lives
-            // beside every other operation's.
-            return Err(invalid_request(
+            // Athena models no not-found error for this operation, so the miss is reported
+            // inside `InvalidRequestException` (HTTP 400) like every other refusal of it —
+            // but under the class of a resource that is not held
+            // (`crate::state::ERROR_CODE_DATA_CATALOG_NOT_FOUND`) rather than the class of
+            // a request the caller must correct, which is what lets a teardown loop tell
+            // "already gone" from "bad request". The sentence comes from `crate::state`,
+            // where the delete path's wording of a catalog miss lives beside every other
+            // operation's.
+            return Err(DeleteDataCatalogError::invalid_request(
+                crate::state::ERROR_CODE_DATA_CATALOG_NOT_FOUND,
                 crate::state::data_catalog_not_found_on_delete(&input.name),
             ));
         };
@@ -207,23 +211,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // nothing about that: what it leaves behind is the Glue connection and the Lambda
         // function a FEDERATED catalog is created alongside, neither of which this
         // emulator creates, so there is nothing else for either form of the call to drop.
-        let removed = entry.remove();
+        entry.remove();
 
-        // The response is the record the registry no longer holds, through the same
-        // projection `GetDataCatalog` reads a live one through.
-        Ok(DeleteDataCatalogOutput {
-            data_catalog: Some(removed.to_deleted_data_catalog()),
-        })
+        // `DeleteDataCatalogOutput$DataCatalog` is optional and this operation reports no
+        // member: the delete commits the removal and says nothing about the resource it
+        // removed, so a caller learns the catalog is gone from the registry no longer
+        // resolving its name, not from a status echoed back here.
+        Ok(DeleteDataCatalogOutput { data_catalog: None })
     }
 }
 
 /// The operation's own client error: HTTP 400 `InvalidRequestException` of the class a
 /// refusal the caller's own input caused belongs to.
 ///
-/// Every refusal above is a bad request rather than an unwritten operation, and
-/// `InvalidRequestException` is the client error this operation models: "Indicates that
-/// something is wrong with the input to the request." Raised through the service's own
-/// refusal channel, which is what carries the code under both names the wire gives it.
+/// Every refusal raised through this helper is a bad request rather than an unwritten
+/// operation, and `InvalidRequestException` is the client error this operation models:
+/// "Indicates that something is wrong with the input to the request." The ONE refusal of
+/// this operation that is not of that class — a `Name` the registry holds no catalog
+/// under — carries [`crate::state::ERROR_CODE_DATA_CATALOG_NOT_FOUND`] instead, and names
+/// it at the site. Raised through the service's own refusal channel, which is what carries
+/// the code under both names the wire gives it.
 fn invalid_request(message: impl Into<String>) -> DeleteDataCatalogError {
     DeleteDataCatalogError::invalid_request(crate::state::ERROR_CODE_INVALID_INPUT, message)
 }

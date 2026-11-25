@@ -1023,12 +1023,6 @@ pub const DATA_CATALOG_STATUS_CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
 /// "`CREATE_COMPLETE`: Data catalog creation complete."
 pub const DATA_CATALOG_STATUS_CREATE_COMPLETE: &str = "CREATE_COMPLETE";
 
-/// The `DataCatalogStatus` of a catalog whose deletion is done: `DataCatalog$Status`
-/// documents "`DELETE_COMPLETE`: Federated data catalog deleted." and is "the status of
-/// the creation or deletion of the data catalog", so it is the status a delete reports for
-/// the catalog it removed.
-pub const DATA_CATALOG_STATUS_DELETE_COMPLETE: &str = "DELETE_COMPLETE";
-
 /// How long a federated catalog stays [`DATA_CATALOG_STATUS_CREATE_IN_PROGRESS`] before
 /// it is [`DATA_CATALOG_STATUS_CREATE_COMPLETE`].
 ///
@@ -1163,24 +1157,12 @@ impl DataCatalogRecord {
     }
 
     /// The record as the modelled `DataCatalog` shape a read answers with, as of `now`.
-    pub fn to_data_catalog(&self, now: SystemTime) -> DataCatalog {
-        self.to_data_catalog_in_status(self.status_at(now))
-    }
-
-    /// The record as the `DataCatalog` a DELETE answers with: the same projection a read
-    /// answers with, in the deletion status the removal reached.
     ///
-    /// `DataCatalog$Status` is "the status of the creation or deletion of the data
-    /// catalog", and what this projection reports is the deletion — complete, because the
-    /// registry no longer holds the record when the delete returns, so no part of the
-    /// removal is still owed and no later read of it is possible.
-    pub fn to_deleted_data_catalog(&self) -> DataCatalog {
-        self.to_data_catalog_in_status(DATA_CATALOG_STATUS_DELETE_COMPLETE)
-    }
-
-    /// The record as the modelled `DataCatalog` shape, reporting `status`. Every other
-    /// member is the record's own, so a read and a delete differ in the status alone.
-    fn to_data_catalog_in_status(&self, status: &str) -> DataCatalog {
+    /// The only projection of a stored catalog there is: the catalog is reported by the
+    /// read operations alone, so every member here is the record's own and the status is
+    /// the one the clock puts it in at `now`.
+    pub fn to_data_catalog(&self, now: SystemTime) -> DataCatalog {
+        let status = self.status_at(now);
         DataCatalog {
             name: self.name.clone(),
             description: self.description.clone(),
@@ -2659,6 +2641,16 @@ pub const ERROR_CODE_QUERY_EXECUTION_NOT_FOUND: &str = "QUERY_EXECUTION_NOT_FOUN
 /// did not finish successfully. Its own class, so a client can tell "poll again" from a
 /// request it must not repeat.
 pub const ERROR_CODE_INVALID_QUERY_EXECUTION_STATE: &str = "INVALID_QUERY_EXECUTION_STATE";
+
+/// The error code a DELETE refuses a `Name` this account holds no data catalog under with.
+///
+/// RECORDED BEHAVIOUR, per path: Athena classifies the delete path's catalog miss as a
+/// class of its own, so a teardown loop can tell "the catalog is already gone" from
+/// [`ERROR_CODE_INVALID_INPUT`], which says the request itself must be corrected. The
+/// registry READ of an absent catalog is recorded as `INVALID_INPUT` instead, which is why
+/// this code belongs to the delete path's miss rather than to every mention of a catalog
+/// that is not held.
+pub const ERROR_CODE_DATA_CATALOG_NOT_FOUND: &str = "DATACATALOG_NOT_FOUND";
 
 /// The message `GetQueryResults` refuses a query that has not finished with.
 pub fn query_not_yet_finished(state: &str) -> String {

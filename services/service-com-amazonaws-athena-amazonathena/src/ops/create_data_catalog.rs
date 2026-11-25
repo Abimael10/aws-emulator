@@ -3,7 +3,9 @@
 //! @op CreateDataCatalog
 //! IMPLEMENTED: registers a data catalog under its name in this service's state, with the
 //! parameters the catalog's type requires checked, and refuses a name the registry
-//! already holds. `GetDataCatalog` answers out of the same record.
+//! already holds. The success response carries no member: the registered catalog is
+//! reported by `GetDataCatalog` and `ListDataCatalogs`, which answer out of the same
+//! record.
 //!
 //! ## Shape of an operation
 //!
@@ -242,6 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
+
         // The wiring the request's parameters resolve to, which is what the catalog holds
         // and every read of it reports.
         let held_parameters =
@@ -258,14 +261,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             connection_type,
             tags,
         };
-        // The response is the record the registry now holds, read through the same
-        // projection `GetDataCatalog` reads it through.
-        let data_catalog = record.to_data_catalog(now);
         store.data_catalogs.insert(input.name, record);
 
-        Ok(CreateDataCatalogOutput {
-            data_catalog: Some(data_catalog),
-        })
+        // `CreateDataCatalogOutput$DataCatalog` is optional and this operation reports no
+        // member: the create commits the catalog and says nothing about it, so the only
+        // account of the registered resource — including the status its provisioning is in
+        // — is the one a read (`GetDataCatalog`, `ListDataCatalogs`) gives afterwards.
+        Ok(CreateDataCatalogOutput { data_catalog: None })
     }
 }
 

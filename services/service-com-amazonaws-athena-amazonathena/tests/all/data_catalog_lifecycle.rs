@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::state::{
     self, DATA_CATALOG_STATUS_CREATE_COMPLETE, DATA_CATALOG_STATUS_CREATE_IN_PROGRESS,
     DATA_CATALOG_TYPE_FEDERATED, DATA_CATALOG_TYPE_GLUE, DATA_CATALOG_TYPE_HIVE,
-    DATA_CATALOG_TYPE_LAMBDA, FEDERATED_DATA_CATALOG_CREATION, MAX_DATA_CATALOG_NAME_CHARS,
+    DATA_CATALOG_TYPE_LAMBDA, MAX_DATA_CATALOG_NAME_CHARS,
     MAX_FEDERATED_DATA_CATALOG_NAME_CHARS, MAX_TAGS_PER_RESOURCE,
 };
 use service_com_amazonaws_athena_amazonathena::EmulatedService;
@@ -111,9 +111,6 @@ struct CreateCase {
     case: &'static str,
     name: String,
     request: Value,
-    /// The `Status` the CREATE response must report, which depends only on whether this
-    /// catalog type is created synchronously.
-    created_status: &'static str,
     /// The `ConnectionType` the catalog must report, if any.
     connection_type: Option<&'static str>,
     /// The `Parameters` a read of the catalog must report, where they are not the map the
@@ -135,7 +132,6 @@ fn create_cases() -> Vec<CreateCase> {
                 "Type": DATA_CATALOG_TYPE_GLUE,
                 "Parameters": { "catalog-id": "111122223333" }
             }),
-            created_status: DATA_CATALOG_STATUS_CREATE_COMPLETE,
             connection_type: None,
             read_back_parameters: None,
         },
@@ -151,7 +147,6 @@ fn create_cases() -> Vec<CreateCase> {
                     "sdk-version": "1.0"
                 }
             }),
-            created_status: DATA_CATALOG_STATUS_CREATE_COMPLETE,
             connection_type: None,
             read_back_parameters: None,
         },
@@ -163,7 +158,6 @@ fn create_cases() -> Vec<CreateCase> {
                 "Type": DATA_CATALOG_TYPE_LAMBDA,
                 "Parameters": { "function": "arn:aws:lambda:us-east-1:111122223333:function:both" }
             }),
-            created_status: DATA_CATALOG_STATUS_CREATE_COMPLETE,
             connection_type: None,
             // The composite function is the wiring of both roles, and the catalog it is
             // asked about is the one it was registered under.
@@ -187,7 +181,6 @@ fn create_cases() -> Vec<CreateCase> {
                 },
                 "Tags": [{ "Key": "env", "Value": "prod" }]
             }),
-            created_status: DATA_CATALOG_STATUS_CREATE_COMPLETE,
             connection_type: None,
             read_back_parameters: None,
         },
@@ -202,7 +195,6 @@ fn create_cases() -> Vec<CreateCase> {
                         "arn:aws:glue:us-east-1:111122223333:connection/snowflake"
                 }
             }),
-            created_status: DATA_CATALOG_STATUS_CREATE_IN_PROGRESS,
             connection_type: None,
             read_back_parameters: None,
         },
@@ -217,7 +209,6 @@ fn create_cases() -> Vec<CreateCase> {
                     "connection-properties": "{\"spill_bucket\":\"my_spill\"}"
                 }
             }),
-            created_status: DATA_CATALOG_STATUS_CREATE_IN_PROGRESS,
             // `DataCatalog$ConnectionType` is "the type of connection for a FEDERATED
             // data catalog", which the create call states in `connection-type`.
             connection_type: Some("MYSQL"),
@@ -227,7 +218,8 @@ fn create_cases() -> Vec<CreateCase> {
 }
 
 /// A created catalog is the one a later read reports: every member the create call
-/// carried comes back from `GetDataCatalog` unchanged, under the name it registered.
+/// carried comes back from `GetDataCatalog` unchanged, under the name it registered, and
+/// the create itself reports no member.
 #[tokio::test]
 async fn a_created_data_catalog_is_read_back_by_get_data_catalog() {
     let router = router();
@@ -239,13 +231,13 @@ async fn a_created_data_catalog_is_read_back_by_get_data_catalog() {
             "case {:?}: expected CreateDataCatalog to answer 200, got {status} with {created:?}",
             case.case
         );
-        let created = data_catalog(&created);
+        // The create commits the catalog and says nothing about it: the registered
+        // resource, its status included, is the read's to report.
         assert_eq!(
-            created["Status"].as_str(),
-            Some(case.created_status),
-            "case {:?}: expected the created catalog's Status to be {:?}, got {created:?}",
-            case.case,
-            case.created_status
+            created,
+            json!({}),
+            "case {:?}: expected CreateDataCatalog to report no member, got {created:?}",
+            case.case
         );
 
         let (status, read) = read_catalog(&router, &case.name).await;
@@ -266,12 +258,6 @@ async fn a_created_data_catalog_is_read_back_by_get_data_catalog() {
                 read[member], expected,
                 "case {:?}: expected {member} to read back as {expected:?}, got {:?}",
                 case.case, read[member]
-            );
-            assert_eq!(
-                created[member], expected,
-                "case {:?}: expected the create response's {member} to be {expected:?}, \
-                 got {:?}",
-                case.case, created[member]
             );
         }
         assert_eq!(
@@ -328,10 +314,17 @@ async fn a_catalog_is_complete_when_its_creation_is_due() {
              with {created:?}"
         );
         assert_eq!(
-            data_catalog(&created)["Status"].as_str(),
+            created,
+            json!({}),
+            "case {catalog_type:?}: expected CreateDataCatalog to report no member, got \
+             {created:?}"
+        );
+        let (_, read) = read_catalog(&router, &name).await;
+        assert_eq!(
+            read["Status"].as_str(),
             Some(DATA_CATALOG_STATUS_CREATE_COMPLETE),
-            "case {catalog_type:?}: expected a synchronously created catalog to be \
-             {DATA_CATALOG_STATUS_CREATE_COMPLETE}, got {created:?}"
+            "case {catalog_type:?}: expected a synchronously created catalog to read back \
+             as {DATA_CATALOG_STATUS_CREATE_COMPLETE}, got {read:?}"
         );
         let (_, read) = read_catalog(&router, &name).await;
         assert_eq!(
@@ -360,10 +353,9 @@ async fn a_catalog_is_complete_when_its_creation_is_due() {
          {created:?}"
     );
     assert_eq!(
-        data_catalog(&created)["Status"].as_str(),
-        Some(DATA_CATALOG_STATUS_CREATE_IN_PROGRESS),
-        "case {name:?}: expected an asynchronously created catalog to be \
-         {DATA_CATALOG_STATUS_CREATE_IN_PROGRESS}, got {created:?}"
+        created,
+        json!({}),
+        "case {name:?}: expected CreateDataCatalog to report no member, got {created:?}"
     );
     let (_, read) = read_catalog(&router, name).await;
     assert_eq!(
@@ -373,9 +365,23 @@ async fn a_catalog_is_complete_when_its_creation_is_due() {
          {DATA_CATALOG_STATUS_CREATE_IN_PROGRESS}, got {read:?}"
     );
 
-    // Past the instant the completion is due, every later read reports it — and reading
-    // is what materialises nothing: the status follows from the clock alone.
-    std::thread::sleep(FEDERATED_DATA_CATALOG_CREATION + Duration::from_millis(100));
+    // Once the completion is due every later read reports it — and reading is what
+    // materialises nothing: the status follows from the clock alone. The CONDITION is what
+    // is waited on, under a deadline far above the span the transition is due after, so a
+    // loaded host cannot turn a slow run into a failure.
+    let deadline = tokio::time::Instant::now() + COMPLETION_DEADLINE;
+    loop {
+        let (_, read) = read_catalog(&router, name).await;
+        if read["Status"].as_str() == Some(DATA_CATALOG_STATUS_CREATE_COMPLETE) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "case {name:?}: the catalog must reach {DATA_CATALOG_STATUS_CREATE_COMPLETE}, \
+             last read {read:?}"
+        );
+        tokio::time::sleep(COMPLETION_POLL).await;
+    }
     for attempt in 0..2 {
         let (_, read) = read_catalog(&router, name).await;
         assert_eq!(
@@ -386,6 +392,15 @@ async fn a_catalog_is_complete_when_its_creation_is_due() {
         );
     }
 }
+
+/// How long a wait for the completion a federated catalog's clock owes may take.
+///
+/// Generous: what the test asserts is the status the transition reaches, never how fast the
+/// host reaches it, so the deadline is only there to fail a wait that will never end.
+const COMPLETION_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How often that wait looks again.
+const COMPLETION_POLL: Duration = Duration::from_millis(25);
 
 /// The parameters each catalog type documents as required are required, and the sets it
 /// documents as mutually exclusive are exclusive.
@@ -653,7 +668,9 @@ async fn a_name_the_registry_already_holds_is_refused() {
             "case {case:?}: expected the first CreateDataCatalog to answer 200, got \
              {status} with {body:?}"
         );
-        let registered = data_catalog(&body);
+        // The create reports nothing, so the registered record is the read's answer.
+        let name = first["Name"].as_str().expect("the case names its catalog");
+        let (_, registered) = read_catalog(&router, name).await;
 
         let (status, body) = call(&router, "CreateDataCatalog", &second).await;
         assert_eq!(
@@ -668,7 +685,6 @@ async fn a_name_the_registry_already_holds_is_refused() {
         );
 
         // The refused create overwrote nothing: the registry still holds the first one.
-        let name = first["Name"].as_str().expect("the case names its catalog");
         let (_, read) = read_catalog(&router, name).await;
         for member in ["Name", "Type", "Description", "Parameters"] {
             assert_eq!(
