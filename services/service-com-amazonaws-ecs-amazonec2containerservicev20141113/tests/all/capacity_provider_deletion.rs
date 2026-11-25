@@ -41,8 +41,9 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::capacity_providers::{group_arn, managed_instances};
 use crate::ecs_wire::{
-    create_auto_scaling_group, create_cluster, list, ok, refusal, register_definition, service,
-    string, ACCOUNT, SIGNED_REGION,
+    associate_capacity_providers, create_auto_scaling_group, create_cluster,
+    describe_cluster_attachments, list, ok, refusal, register_definition, service, string, ACCOUNT,
+    SIGNED_REGION,
 };
 
 /// How often the polls below look again.
@@ -107,25 +108,6 @@ async fn describe_provider(router: &MultiServiceRouter, name: &str, case: &str) 
     providers[0].clone()
 }
 
-/// Describe one cluster by name and return it, with the attachments the association left
-/// on it (`DescribeClusters$include`: the `ATTACHMENTS` field).
-async fn describe_cluster(router: &MultiServiceRouter, cluster: &str, case: &str) -> Value {
-    let body = ok(
-        router,
-        "DescribeClusters",
-        json!({ "clusters": [cluster], "include": ["ATTACHMENTS"] }),
-        case,
-    )
-    .await;
-    let clusters = list(&body, "clusters", case);
-    assert_eq!(
-        clusters.len(),
-        1,
-        "case {case:?}: expected exactly one described cluster, got {body}"
-    );
-    clusters[0].clone()
-}
-
 /// Create one capacity provider over the Auto Scaling group `group`, with managed scaling
 /// when `managed_scaling` asks for it.
 async fn create_provider(
@@ -147,42 +129,6 @@ async fn create_provider(
         case,
     )
     .await;
-}
-
-/// Associate exactly `providers` with `cluster`, then wait for the attachments update the
-/// association owes to land — a cluster mid-update refuses the next cluster mutation, so a
-/// suite that associates and then disassociates waits for the condition rather than for a
-/// fixed time.
-async fn associate(
-    router: &MultiServiceRouter,
-    cluster: &str,
-    providers: &[&str],
-    case: &str,
-) {
-    ok(
-        router,
-        "PutClusterCapacityProviders",
-        json!({
-            "cluster": cluster,
-            "capacityProviders": providers,
-            "defaultCapacityProviderStrategy": [],
-        }),
-        case,
-    )
-    .await;
-    let deadline = Instant::now() + POLL_BUDGET;
-    loop {
-        let read = describe_cluster(router, cluster, case).await;
-        if read["attachmentsStatus"].as_str() == Some("UPDATE_COMPLETE") {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "case {case:?}: expected the capacity-provider attachments update to land, got \
-             {read}"
-        );
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
 }
 
 /// Wait until the delete of `name` reports `DELETE_COMPLETE`, and answer the provider as it
@@ -256,7 +202,7 @@ async fn a_delete_no_cluster_association_holds_retires_the_provider() {
     // The association a DELETED cluster leaves behind holds nothing open: "To remove a
     // capacity provider from a cluster, you can either use PutClusterCapacityProviders or
     // delete the cluster."
-    associate(&router, "shortlived", &["retiretombstone"], "setup").await;
+    associate_capacity_providers(&router, "shortlived", &["retiretombstone"], "setup").await;
     ok(
         &router,
         "DeleteCluster",
@@ -402,9 +348,9 @@ async fn a_delete_a_cluster_association_holds_is_reported_on_the_provider() {
     ] {
         create_provider(&router, provider, group, false, "setup").await;
     }
-    associate(&router, "holder", &["heldshort"], "setup").await;
-    associate(&router, "holderarn", &["heldarn"], "setup").await;
-    associate(&router, "elsewhere", &["heldelsewhere"], "setup").await;
+    associate_capacity_providers(&router, "holder", &["heldshort"], "setup").await;
+    associate_capacity_providers(&router, "holderarn", &["heldarn"], "setup").await;
+    associate_capacity_providers(&router, "elsewhere", &["heldelsewhere"], "setup").await;
 
     // The rows differ along how the delete names the provider and whether the `cluster` the
     // request carries is the one holding the association — the hold is the ASSOCIATION,
@@ -459,7 +405,7 @@ async fn a_delete_a_cluster_association_holds_is_reported_on_the_provider() {
                 "case {case:?}: after {attempt} the describe reports the same pair, got {read}"
             );
             // And the cluster keeps the provider it was not deleted out of.
-            let cluster = describe_cluster(&router, holder, case).await;
+            let cluster = describe_cluster_attachments(&router, holder, case).await;
             assert!(
                 list(&cluster, "capacityProviders", case).contains(&json!(provider)),
                 "case {case:?}: after {attempt} the cluster still lists the provider, got \
@@ -470,7 +416,7 @@ async fn a_delete_a_cluster_association_holds_is_reported_on_the_provider() {
         // "To remove a capacity provider from a cluster, you can either use
         // PutClusterCapacityProviders or delete the cluster": once the association is gone
         // the identical delete goes through.
-        associate(&router, holder, &[], case).await;
+        associate_capacity_providers(&router, holder, &[], case).await;
         let answer = ok(&router, "DeleteCapacityProvider", request, case).await;
         let deleted = answer["capacityProvider"].clone();
         assert_eq!(
@@ -646,7 +592,7 @@ async fn a_provider_a_services_strategy_names_cannot_be_freed_for_deletion() {
     let router = service();
     create_cluster(&router, "withservice", "setup").await;
     create_provider(&router, "heldbyservice", "asg-heldbyservice", false, "setup").await;
-    associate(&router, "withservice", &["heldbyservice"], "setup").await;
+    associate_capacity_providers(&router, "withservice", &["heldbyservice"], "setup").await;
     register_definition(&router, "strategyapp", "setup").await;
     ok(
         &router,
@@ -708,7 +654,7 @@ async fn a_provider_a_services_strategy_names_cannot_be_freed_for_deletion() {
         ("ACTIVE".to_string(), Some("DELETE_FAILED".to_string())),
         "case {case:?}: the describe reports the same pair, got {read}"
     );
-    let cluster = describe_cluster(&router, "withservice", case).await;
+    let cluster = describe_cluster_attachments(&router, "withservice", case).await;
     assert!(
         list(&cluster, "capacityProviders", case).contains(&json!("heldbyservice")),
         "case {case:?}: the cluster still lists the provider, got {cluster}"

@@ -622,6 +622,56 @@ pub(crate) async fn create_cluster(
     string(&body["cluster"], "clusterArn", case)
 }
 
+/// One cluster as `DescribeClusters` reports it, with the attachments a capacity-provider
+/// association leaves on it (`DescribeClusters$include`: the `ATTACHMENTS` field).
+pub(crate) async fn describe_cluster_attachments(
+    router: &MultiServiceRouter,
+    cluster: &str,
+    case: &str,
+) -> Value {
+    let body = ok(
+        router,
+        "DescribeClusters",
+        json!({ "clusters": [cluster], "include": ["ATTACHMENTS"] }),
+        case,
+    )
+    .await;
+    list(&body, "clusters", case)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("case {case:?}: expected the cluster {cluster} back, got {body}"))
+}
+
+/// Associate exactly `providers` with `cluster`, and wait for the attachments update the
+/// association owes to land. A cluster whose attachments are mid-update refuses the next
+/// cluster mutation, so a suite that associates and then associates again waits for the
+/// CONDITION rather than for a span ([`poll_until`]).
+pub(crate) async fn associate_capacity_providers(
+    router: &MultiServiceRouter,
+    cluster: &str,
+    providers: &[&str],
+    case: &str,
+) {
+    ok(
+        router,
+        "PutClusterCapacityProviders",
+        json!({
+            "cluster": cluster,
+            "capacityProviders": providers,
+            "defaultCapacityProviderStrategy": [],
+        }),
+        case,
+    )
+    .await;
+    poll_until(
+        case,
+        "the capacity-provider attachments update to land",
+        || describe_cluster_attachments(router, cluster, case),
+        |reported| reported["attachmentsStatus"] == json!("UPDATE_COMPLETE"),
+    )
+    .await;
+}
+
 /// The EC2 instance id the shared capacity helper registers. One per cluster is enough:
 /// a container instance is registered INTO a cluster, so the same instance id in another
 /// cluster is another registration.
