@@ -149,6 +149,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // An update sets the policy's availability SLO to the block it carries, so the
+        // same rule a create is held to applies: the target has to name one of the
+        // service levels this service offers, and one that does not is refused before the
+        // record is touched, leaving the stored policy exactly as it was.
+        if let Some(rejection) =
+            crate::state::availability_slo_rejection(input.availability_slo.as_ref())
+        {
+            return Err(UpdatePolicyErrorModeled::ValidationException(rejection).into());
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdatePolicyErrorModeled::InternalServerException(
                 InternalServerException {

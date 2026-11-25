@@ -163,6 +163,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // The availability SLO a policy is created with has to name one of the service
+        // levels this service offers: the model bounds `availabilitySlo.target` to a
+        // percentage and no further, so a value inside that range naming no offered level
+        // is refused here — before the store is read or written, so a refused create
+        // leaves no policy and no consumed token behind.
+        if let Some(rejection) =
+            crate::state::availability_slo_rejection(input.availability_slo.as_ref())
+        {
+            return Err(CreatePolicyErrorModeled::ValidationException(rejection).into());
+        }
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         // The creation parameters of THIS request, which are what a `clientToken` compares

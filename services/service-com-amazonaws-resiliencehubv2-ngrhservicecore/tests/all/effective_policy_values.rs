@@ -93,13 +93,6 @@ pub(crate) const DISASTER_RECOVERY_APPROACHES: [&str; 5] = [
     "BACKUP_AND_RESTORE",
 ];
 
-/// `AvailabilitySlo$target`'s modelled range.
-///
-/// SOURCE: `smithy_query(query="shape", shape="AvailabilitySlo")` — `range {min: 0,
-/// max: 100}`.
-pub(crate) const AVAILABILITY_SLO_MIN: f64 = 0.0;
-pub(crate) const AVAILABILITY_SLO_MAX: f64 = 100.0;
-
 /// An emulator holding only this service, over one shared engine.
 pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -300,18 +293,18 @@ fn derivation_rows() -> Vec<Row> {
             targets: json!({}),
         },
         Row {
-            label: "availability SLO at the modelled minimum",
-            name: "SloAtMinimum",
-            targets: json!({"availabilitySlo": {"target": AVAILABILITY_SLO_MIN}}),
+            label: "the lowest offered availability SLO",
+            name: "SloLowest",
+            targets: json!({"availabilitySlo": {"target": 99.9}}),
         },
         Row {
-            label: "availability SLO at the modelled maximum",
-            name: "SloAtMaximum",
-            targets: json!({"availabilitySlo": {"target": AVAILABILITY_SLO_MAX}}),
+            label: "the highest offered availability SLO",
+            name: "SloHighest",
+            targets: json!({"availabilitySlo": {"target": 99.99}}),
         },
         Row {
-            label: "a fractional availability SLO",
-            name: "SloFractional",
+            label: "the middle offered availability SLO",
+            name: "SloMiddle",
             targets: json!({"availabilitySlo": {"target": 99.95}}),
         },
         Row {
@@ -471,7 +464,7 @@ async fn reattaching_a_policy_rederives_the_values_the_service_reports() {
     let case = "a service whose attached policy is swapped for another";
     let first_body = json!({
         "name": "FirstAttached",
-        "availabilitySlo": {"target": 95.5},
+        "availabilitySlo": {"target": 99.95},
         "multiAz": {"rtoInMinutes": 10},
     });
     let second_body = json!({
@@ -613,7 +606,7 @@ async fn deleting_the_referenced_policy_clears_the_values_and_keeps_the_pointer(
     let control_case = "a service attached to a policy that is never deleted";
     let control_body = json!({
         "name": "SurvivingPolicy",
-        "availabilitySlo": {"target": 92.5},
+        "availabilitySlo": {"target": 99.9},
         "multiAz": {"rtoInMinutes": 20, "disasterRecoveryApproach": "HOT_STANDBY"},
     });
     let control_policy = create_policy(&router, control_case, control_body.clone()).await;

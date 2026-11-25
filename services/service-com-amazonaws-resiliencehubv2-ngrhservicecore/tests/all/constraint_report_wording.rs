@@ -631,20 +631,23 @@ async fn a_number_outside_its_modelled_range_is_reported_as_the_schema_finding()
     assert_reports(&router, cases).await;
 
     // Each published bound is INSIDE the range, so a value AT it is served rather than
-    // reported: `AvailabilitySlo$target` is `@range` 0..100, the minute targets are
-    // `@range` 0.., and `MaxResults` is 1..100.
+    // reported: the minute targets are `@range` 0.., and `MaxResults` is 1..100.
+    // `AvailabilitySlo$target` is `@range` 0..100 as well, but the service offers only
+    // discrete availability levels inside that range, so the values served at that member
+    // are those levels (the lowest and the highest of them here; the whole set, and the
+    // refusal of a value outside it, is pinned in `availability_slo_allowed_targets.rs`).
     for (case, method, uri, body) in [
         (
-            "the availability SLO target at its minimum",
+            "the lowest availability SLO target the service offers",
             "POST",
             "/v2/create-policy",
-            Some(json!({"name": "slo-at-minimum", "availabilitySlo": {"target": 0}})),
+            Some(json!({"name": "slo-lowest-offered", "availabilitySlo": {"target": 99.9}})),
         ),
         (
-            "the availability SLO target at its maximum",
+            "the highest availability SLO target the service offers",
             "POST",
             "/v2/create-policy",
-            Some(json!({"name": "slo-at-maximum", "availabilitySlo": {"target": 100}})),
+            Some(json!({"name": "slo-highest-offered", "availabilitySlo": {"target": 99.99}})),
         ),
         (
             "the minute targets at their minimum",

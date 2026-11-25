@@ -44,11 +44,14 @@
 //!
 //! [`not_found`] holds the refusal every operation that resolves an ARN answers with when
 //! the ARN names nothing stored, so the whole crate words it once, [`conflicts`] holds the
-//! `ConflictException` wordings a create answers with, and [`tagging`] holds
+//! `ConflictException` wordings a create answers with, [`availability_slo`] holds the
+//! availability targets a policy may be written with and the refusal of one it may not,
+//! and [`tagging`] holds
 //! the one tag map projection and the write path `TagResource` reaches a tagged resource
 //! through, whichever of this store's resources an ARN names.
 
 mod assertions;
+mod availability_slo;
 mod conflicts;
 pub mod discovered_resources;
 mod input_sources;
@@ -62,6 +65,10 @@ mod user_journeys;
 pub use assertions::{
     assertion_not_found, mint_assertion_id, AssertionIdempotencyRecord, AssertionRecord,
     ASSERTION_RESOURCE_TYPE, ASSERTION_SOURCE_USER, MAX_ASSERTIONS_PER_SERVICE,
+};
+pub use availability_slo::{
+    availability_slo_rejection, unsupported_availability_slo_target_message,
+    ALLOWED_AVAILABILITY_SLO_TARGETS, AVAILABILITY_SLO_TARGET_FIELD,
 };
 pub use conflicts::{name_already_exists_message, two_requests_one_token_message};
 pub use discovered_resources::{

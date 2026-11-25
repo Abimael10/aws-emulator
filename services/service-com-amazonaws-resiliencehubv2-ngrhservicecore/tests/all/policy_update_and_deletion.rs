@@ -363,7 +363,7 @@ fn update_rows() -> Vec<UpdateRow> {
             created: json!({"name": "All-Blocks", "description": "before"}),
             patch: json!({
                 "description": "",
-                "availabilitySlo": {"target": 100.0},
+                "availabilitySlo": {"target": 99.99},
                 "multiAz": {
                     "rtoInMinutes": 0,
                     "rpoInMinutes": 0,
@@ -378,7 +378,7 @@ fn update_rows() -> Vec<UpdateRow> {
             }),
             expected: json!({
                 "description": "",
-                "availabilitySlo": {"target": 100.0},
+                "availabilitySlo": {"target": 99.99},
                 "multiAz": {
                     "rtoInMinutes": 0,
                     "rpoInMinutes": 0,
@@ -393,16 +393,16 @@ fn update_rows() -> Vec<UpdateRow> {
             }),
         },
         UpdateRow {
-            case: "the availability SLO at its lower bound, on a policy that had targets",
+            case: "the lowest offered availability SLO, on a policy that had targets",
             created: json!({
                 "name": "Slo-Floor",
-                "availabilitySlo": {"target": 99.9},
+                "availabilitySlo": {"target": 99.95},
                 "dataRecovery": {"timeBetweenBackupsInMinutes": 60},
             }),
-            patch: json!({"availabilitySlo": {"target": 0.0}}),
+            patch: json!({"availabilitySlo": {"target": 99.9}}),
             expected: json!({
                 "description": null,
-                "availabilitySlo": {"target": 0.0},
+                "availabilitySlo": {"target": 99.9},
                 "multiAz": null,
                 "multiRegion": null,
                 "dataRecovery": {"timeBetweenBackupsInMinutes": 60},
@@ -547,7 +547,7 @@ async fn a_deleted_policy_is_no_longer_readable() {
             json!({
                 "name": "Doomed-Full",
                 "description": "to be deleted",
-                "availabilitySlo": {"target": 99.0},
+                "availabilitySlo": {"target": 99.9},
                 "multiAz": {"rtoInMinutes": 10, "rpoInMinutes": 5},
                 "multiRegion": {"rtoInMinutes": 100, "rpoInMinutes": 50},
                 "dataRecovery": {"timeBetweenBackupsInMinutes": 30},

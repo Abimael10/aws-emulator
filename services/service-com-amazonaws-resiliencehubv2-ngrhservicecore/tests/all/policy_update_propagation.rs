@@ -36,8 +36,7 @@ use serde_json::{json, Map, Value};
 
 use crate::effective_policy_values::{
     assert_effective, call, create_policy, create_service, derived_from, emulator, get_policy,
-    get_service, same_json, service_arn_of, service_of, AVAILABILITY_SLO_MAX,
-    AVAILABILITY_SLO_MIN, DISASTER_RECOVERY_APPROACHES, SOURCE_SELF,
+    get_service, same_json, service_arn_of, service_of, DISASTER_RECOVERY_APPROACHES, SOURCE_SELF,
 };
 // The `UpdatePolicy` route is spelled once for this test binary, beside the suite that
 // first drove it.
@@ -223,9 +222,9 @@ fn rows() -> Vec<Row> {
         Row {
             case: "every block at once, each at a modelled bound",
             name: "PropEveryBlock",
-            created: json!({"availabilitySlo": {"target": 50.0}}),
+            created: json!({"availabilitySlo": {"target": 99.9}}),
             patch: json!({
-                "availabilitySlo": {"target": AVAILABILITY_SLO_MAX},
+                "availabilitySlo": {"target": 99.99},
                 "multiAz": {
                     "rtoInMinutes": 0,
                     "rpoInMinutes": 0,
@@ -240,16 +239,16 @@ fn rows() -> Vec<Row> {
             }),
         },
         Row {
-            case: "the availability SLO taken to its modelled minimum",
+            case: "the availability SLO taken to the lowest the service offers",
             name: "PropSloFloor",
             created: json!({"availabilitySlo": {"target": 99.95}}),
-            patch: json!({"availabilitySlo": {"target": AVAILABILITY_SLO_MIN}}),
+            patch: json!({"availabilitySlo": {"target": 99.9}}),
         },
         Row {
             case: "an update that touches no target block changes nothing derived",
             name: "PropNoTargets",
             created: json!({
-                "availabilitySlo": {"target": 95.0},
+                "availabilitySlo": {"target": 99.95},
                 "multiAz": {"disasterRecoveryApproach": "ACTIVE_ACTIVE"},
             }),
             patch: json!({"description": "edited, targets untouched", "sharingEnabled": true}),
@@ -267,7 +266,7 @@ async fn an_update_to_a_policy_rederives_what_every_referencing_service_reports(
     let control_case = "a service attached to a policy no update touches";
     let control_name = "PropControlPolicy";
     let control_blocks = json!({
-        "availabilitySlo": {"target": 92.5},
+        "availabilitySlo": {"target": 99.9},
         "multiAz": {"rtoInMinutes": 20, "disasterRecoveryApproach": "HOT_STANDBY"},
     });
     let control_policy = given_policy(&router, control_case, control_name, &control_blocks).await;

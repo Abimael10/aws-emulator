@@ -241,7 +241,7 @@ struct Row {
 /// The create table.
 ///
 /// Rows differ along which optional blocks are present (none, one, all four), the target
-/// values (both ends of `AvailabilitySlo$target`'s range, zero and large RTO/RPO minutes,
+/// values (each availability SLO the service offers, zero and large RTO/RPO minutes,
 /// a backup interval), each modelled disaster recovery approach, `sharingEnabled`
 /// (absent, `false`, `true`), tag count (none, one, five) and the length of `name` and
 /// `description` (both modelled extremes).
@@ -259,18 +259,18 @@ fn create_rows() -> Vec<Row> {
             }),
         },
         Row {
-            case: "empty description and the availability SLO at its upper bound".to_string(),
+            case: "empty description and the highest offered availability SLO".to_string(),
             body: json!({
-                "name": "slo-upper-bound",
+                "name": "slo-highest",
                 "description": "",
-                "availabilitySlo": {"target": AVAILABILITY_SLO_MAX},
+                "availabilitySlo": {"target": 99.99},
             }),
         },
         Row {
-            case: "availability SLO at its lower bound".to_string(),
+            case: "the lowest offered availability SLO".to_string(),
             body: json!({
-                "name": "slo_lower_bound",
-                "availabilitySlo": {"target": AVAILABILITY_SLO_MIN},
+                "name": "slo_lowest",
+                "availabilitySlo": {"target": 99.9},
             }),
         },
         Row {
