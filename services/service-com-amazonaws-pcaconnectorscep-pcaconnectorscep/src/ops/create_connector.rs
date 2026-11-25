@@ -518,9 +518,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// resource this call creates is the connector, so the thing that was not found is not the
 /// resource it acts on but the parameter that named it, and that is what the error
 /// discriminates on. `ResourceType`'s own doc sentence ("can be either `Connector` or
-/// `Challenge`") names the two resource KINDS this service owns — the discriminator of a
-/// call addressed AT one of them — and a create is not such a call; its sibling
-/// `CreateChallenge` reports its own unresolvable reference the same way.
+/// `Challenge`") spells the two resource KINDS THIS service owns, and the certificate
+/// authority this member references is neither: it is a resource Amazon Web Services Private
+/// CA owns, which that two-word domain cannot name. Every reference this service CAN spell
+/// that way is reported with the kind word instead ([`crate::state::resource_type_of`]),
+/// `CreateChallenge`'s unresolvable connector included.
 const MISSING_MEMBER_CERTIFICATE_AUTHORITY_ARN: &str = "CertificateAuthorityArn";
 
 /// Amazon Web Services Private CA holds no certificate authority under the ARN the request

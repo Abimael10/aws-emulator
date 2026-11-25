@@ -65,9 +65,10 @@ pub const TYPE_INTUNE: &str = "INTUNE";
 
 /// `ResourceId`/`ResourceType` vocabulary of this service's errors: the `ResourceType`
 /// member's doc says it "can be either `Connector` or `Challenge`", which are the two kinds
-/// of resource this service owns — the discriminator of a call addressed AT one of them. A
-/// create, whose own resource does not exist yet, reports the reference it could not resolve
-/// by the input member that carried it instead (see [`resource_not_found`]).
+/// of resource this service owns. Those two words are the WHOLE domain of that member, so
+/// every `ResourceNotFoundException` this service answers about one of its own resources
+/// carries one of them — whichever operation answers it, and whether the ARN was the resource
+/// the call is addressed at or a resource it only references (see [`resource_not_found`]).
 pub const RESOURCE_TYPE_CONNECTOR: &str = "Connector";
 /// The other value `ResourceType` carries.
 pub const RESOURCE_TYPE_CHALLENGE: &str = "Challenge";
@@ -865,18 +866,18 @@ pub fn resource_type_of(resource_arn: &str) -> &'static str {
 /// two variable parts are the error's other two members, so a caller reads the same two
 /// facts out of the sentence and out of the fields.
 ///
-/// `resource_type` is what the request named and this service could not find: the kind of
-/// resource (`Connector` or `Challenge`, as [`resource_type_of`] decides it) for a call
-/// addressed AT that resource, and the name of the input member that referenced it for a
-/// call that creates a different resource, since there the missing thing is the caller's
-/// parameter rather than the resource this call acts on.
+/// `resource_type` is the KIND of the resource `resource_id` names and this service could not
+/// find, in the two words the member's own doc states its domain as — "either `Connector` or
+/// `Challenge`" — as [`resource_type_of`] reads them off the ARN. That holds for every
+/// operation that answers this error about one of this service's resources, a create that
+/// only REFERENCES one included (`CreateChallenge`'s `ConnectorArn`): the member is the
+/// machine-readable discriminator a client branches on, so a value outside that domain
+/// matches neither documented case.
 ///
-/// Both halves of that are AWS's own answers, read off the wire: the member's doc sentence
-/// ("can be either `Connector` or `Challenge`") names the two resource KINDS this service
-/// owns, which is the discriminator of a call addressed at one of them, while the creates —
-/// whose own resource does not exist yet — report the unresolvable reference by the input
-/// member that carried it (`CertificateAuthorityArn` on `CreateConnector`, `ConnectorArn` on
-/// `CreateChallenge`), and word the sentence from the same string.
+/// The one reference this service cannot spell that way is a resource it does not own:
+/// `CreateConnector`'s `CertificateAuthorityArn` names a private CA that Amazon Web Services
+/// Private CA owns, a kind the two-word domain has no word for, so that call reports the
+/// input member that carried the reference (see its own handler).
 pub fn resource_not_found(resource_type: &str, resource_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: format!("{resource_type} was not found: {resource_id}."),

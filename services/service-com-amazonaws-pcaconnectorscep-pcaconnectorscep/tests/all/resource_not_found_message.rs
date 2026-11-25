@@ -7,10 +7,11 @@
 //! and a terminating `.` (smithy_query: shape ResourceNotFoundException, whose three members
 //! are all required). The two variable parts come from the request and from state, and they
 //! are exactly the error's other two members, so the sentence and the fields report the same
-//! two facts. `ResourceType` is what the request named and this service could not find: the
-//! kind of resource (`Connector` or `Challenge`) for a call addressed AT that resource, and
-//! the name of the input member that referenced it on `CreateChallenge`, whose own resource
-//! is the challenge it creates rather than the connector it was handed.
+//! two facts. `ResourceType` is the KIND of the resource `ResourceId` names and this service
+//! could not find, in the two words that member's own doc states its domain as ("can be
+//! either `Connector` or `Challenge`") — whichever operation answers the error, and whether
+//! the ARN named the resource the call is addressed AT or one it only references, as
+//! `CreateChallenge`'s `ConnectorArn` does.
 //!
 //! Every case drives the service the way a client does, one HTTP request per call through the
 //! same `MultiServiceRouter` the emulator boots. The rows differ along what the rule
@@ -37,10 +38,11 @@ const ACCOUNT: &str = "000000000000";
 const RESOURCE_TYPE_CONNECTOR: &str = state::RESOURCE_TYPE_CONNECTOR;
 const RESOURCE_TYPE_CHALLENGE: &str = state::RESOURCE_TYPE_CHALLENGE;
 
-/// What `CreateChallenge`'s 404 names instead: the input member that referenced the connector
-/// (smithy_query: operation CreateChallenge), because the resource that call acts on is the
-/// challenge it creates.
-const MISSING_MEMBER_CONNECTOR_ARN: &str = "ConnectorArn";
+/// The WHOLE domain of `ResourceType`, as its own doc states it (smithy_query: doc shape
+/// ResourceNotFoundException member ResourceType — "can be either `Connector` or
+/// `Challenge`"). No 404 this service answers about one of its own resources may carry
+/// anything else.
+const RESOURCE_TYPE_DOMAIN: &[&str] = &[RESOURCE_TYPE_CONNECTOR, RESOURCE_TYPE_CHALLENGE];
 
 /// Private-CA ARNs matching `CertificateAuthorityArn`'s own pattern. Rows name different CAs,
 /// so no assertion can pass by echoing one recorded value.
@@ -165,8 +167,9 @@ impl Op {
 const CONNECTOR_OPS: &[(Op, &str)] = &[
     (Op::GetConnector, RESOURCE_TYPE_CONNECTOR),
     (Op::ListChallengeMetadata, RESOURCE_TYPE_CONNECTOR),
-    // The create names the input member it was handed, not the resource kind.
-    (Op::CreateChallenge, MISSING_MEMBER_CONNECTOR_ARN),
+    // The create reports the KIND of the resource it could not resolve too: the connector it
+    // was handed, not the name of the member that carried the ARN.
+    (Op::CreateChallenge, RESOURCE_TYPE_CONNECTOR),
 ];
 
 /// Every operation a challenge ARN can be handed to that answers this error, likewise.
@@ -535,3 +538,147 @@ async fn a_challenge_whose_connector_is_not_serving_gets_the_same_sentence() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The `ResourceType` member's domain, over both kinds and every operation.
+// ---------------------------------------------------------------------------
+
+/// One hand-built ARN that names nothing, with the kind the ARN's own FORM makes it.
+///
+/// The segments vary along everything the ARN patterns let a caller vary (smithy_query:
+/// shapes ConnectorArn and ChallengeArn): the partition, the Region, the twelve-digit
+/// account, the connector uuid and — for a challenge ARN — the challenge uuid. None of them
+/// may change the word the 404 carries.
+#[derive(Debug, Clone, Copy)]
+struct ArnRow {
+    name: &'static str,
+    partition: &'static str,
+    region: &'static str,
+    account: &'static str,
+    connector_id: &'static str,
+    /// Empty makes the row a connector ARN; a uuid appends the challenge segment.
+    challenge_id: &'static str,
+}
+
+impl ArnRow {
+    fn arn(&self) -> String {
+        let connector = format!(
+            "arn:{}:pca-connector-scep:{}:{}:connector/{}",
+            self.partition, self.region, self.account, self.connector_id
+        );
+        if self.challenge_id.is_empty() {
+            connector
+        } else {
+            format!("{connector}/challenge/{}", self.challenge_id)
+        }
+    }
+
+    /// The kind the ARN names, decided from its form alone: the challenge segment makes it a
+    /// challenge, anything else a connector.
+    fn expected_resource_type(&self) -> &'static str {
+        if self.challenge_id.is_empty() {
+            RESOURCE_TYPE_CONNECTOR
+        } else {
+            RESOURCE_TYPE_CHALLENGE
+        }
+    }
+
+    /// The operations such an ARN can be handed to, with the kind word each must answer.
+    fn operations(&self) -> &'static [(Op, &'static str)] {
+        if self.challenge_id.is_empty() {
+            CONNECTOR_OPS
+        } else {
+            CHALLENGE_OPS
+        }
+    }
+}
+
+/// ARNs no record was ever created under, spanning both resource kinds and every segment the
+/// patterns allow to vary.
+const DOMAIN_ROWS: &[ArnRow] = &[
+    ArnRow {
+        name: "connector ARN of this partition and the request's own Region",
+        partition: "aws",
+        region: REGION,
+        account: ACCOUNT,
+        connector_id: "7d1f3b52-9a0c-4e6d-8f21-0b4c5d6e7f80",
+        challenge_id: "",
+    },
+    ArnRow {
+        name: "connector ARN of the GovCloud partition",
+        partition: "aws-us-gov",
+        region: "us-gov-east-1",
+        account: ACCOUNT,
+        connector_id: "0123456f-89ab-cdef-0123-456789abcdef",
+        challenge_id: "",
+    },
+    ArnRow {
+        name: "connector ARN of the China partition and another account",
+        partition: "aws-cn",
+        region: "cn-north-1",
+        account: "123456789012",
+        connector_id: "deadbeef-0000-1111-2222-333344445555",
+        challenge_id: "",
+    },
+    ArnRow {
+        name: "challenge ARN of this partition and the request's own Region",
+        partition: "aws",
+        region: REGION,
+        account: ACCOUNT,
+        connector_id: "7d1f3b52-9a0c-4e6d-8f21-0b4c5d6e7f80",
+        challenge_id: "1b7f2991-f611-452a-9050-38557f08ec1d",
+    },
+    ArnRow {
+        name: "challenge ARN of the GovCloud partition and another account",
+        partition: "aws-us-gov",
+        region: "us-gov-west-1",
+        account: "210987654321",
+        connector_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        challenge_id: "99999999-8888-7777-6666-555555555555",
+    },
+    ArnRow {
+        name: "challenge ARN of the China partition",
+        partition: "aws-cn",
+        region: "cn-northwest-1",
+        account: ACCOUNT,
+        connector_id: "11111111-2222-3333-4444-555555555555",
+        challenge_id: "22222222-3333-4444-5555-666666666666",
+    },
+];
+
+/// Whichever operation answers this error, the `ResourceType` it carries is one of the two
+/// words the member's documented domain holds, and it is the kind the `ResourceId` ARN names
+/// — never the name of the input member that carried the ARN, which is in that domain for no
+/// request.
+#[tokio::test]
+async fn resource_type_stays_inside_its_documented_domain() {
+    for row in DOMAIN_ROWS {
+        let case = row.name;
+        let arn = row.arn();
+        let expected = row.expected_resource_type();
+
+        for (op, resource_type) in row.operations() {
+            let (router, engine) = new_router();
+            // A live connector with a live challenge is stored when the call arrives, so no
+            // refusal below can come from an empty store.
+            let live = active_connector(&router, &engine, case, CA_ARNS[0]).await;
+            new_challenge(&router, case, &live).await;
+
+            let answer = op.call(&router, &arn).await;
+            let operation = format!("{op:?}");
+            assert_not_found(&answer, case, &operation, &arn, resource_type);
+
+            let answered = answer.body["ResourceType"].as_str().unwrap_or_default();
+            assert!(
+                RESOURCE_TYPE_DOMAIN.contains(&answered),
+                "case {case:?} on {operation}: ResourceType must be one of \
+                 {RESOURCE_TYPE_DOMAIN:?}, got {answered:?}"
+            );
+            assert_eq!(
+                answered, expected,
+                "case {case:?} on {operation}: expected the kind the ARN names, got {answered:?}"
+            );
+        }
+    }
+}
+
