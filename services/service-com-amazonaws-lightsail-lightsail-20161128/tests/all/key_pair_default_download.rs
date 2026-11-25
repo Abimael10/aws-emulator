@@ -203,8 +203,7 @@ fn assert_real_key_pair(case: &str, body: &Value) -> String {
         .unwrap_or_else(|| panic!("case {case}: expected privateKeyBase64, got {body:?}"));
 
     // The public half: the `ssh-rsa` public key the model documents — the
-    // algorithm name and the key's base64 encoding, checked where that rule
-    // lives.
+    // base64 of the key's own encoding, checked where that rule lives.
     let public =
         crate::key_pair_public_key_encoding::assert_reported_ssh_public_key(case, public_key);
 

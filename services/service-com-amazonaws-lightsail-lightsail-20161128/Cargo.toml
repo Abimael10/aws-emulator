@@ -32,7 +32,8 @@ service-com-amazonaws-s3-amazons3 = { workspace = true }
 # The OpenSSH key, certificate and fingerprint formats: the temporary key pair
 # `GetInstanceAccessDetails` grants, and the SSH host key it records for an
 # instance, are real Ed25519 key material described by this crate, and the
-# `ssh-rsa` public key line `CreateKeyPair` answers is written with it too.
+# base64-encoded `ssh-rsa` public key `CreateKeyPair` answers is written with it
+# too.
 ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ed25519", "getrandom"] }
 # The RSA key pair `CreateKeyPair` mints; already in this workspace's lock file,
 # where another service generates its RSA key pairs with it.

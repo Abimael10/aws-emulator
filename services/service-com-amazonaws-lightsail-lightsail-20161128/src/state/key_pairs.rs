@@ -70,27 +70,20 @@ impl StoredKeyPair {
 /// it, so a second copy of it has no reason to exist.
 pub struct MintedKeyPairMaterial {
     /// The public half as "a base64-encoded public key of the ssh-rsa type"
-    /// (`CreateKeyPairResult$publicKeyBase64`): the public key as an SSH public
-    /// key of that type is published — its algorithm name, a space, and the
-    /// base64 of the key's own `ssh-rsa` encoding — which is the
-    /// `authorized_keys` line a caller saves, hands to a provisioner, or
-    /// submits again to `ImportKeyPair`.
+    /// (`CreateKeyPairResult$publicKeyBase64`): the base64 of the key's own
+    /// `ssh-rsa` encoding and nothing else — one base64 token, with no algorithm
+    /// label, no separating space and no surrounding whitespace.
     ///
-    /// The member names the TYPE of the key it carries, and that type is named
-    /// by the value: an SSH public key with no algorithm label is not a public
-    /// key anything that reads SSH keys accepts, so the label is part of the
-    /// value and not something the caller is left to prepend. "Base64-encoded"
-    /// is how this service's model words every half it publishes as text — the
-    /// sibling `privateKeyBase64` is documented the same way and carries a whole
-    /// PEM, dashes, labels and line breaks included — so the wording fixes that
-    /// the half is published as text in its own encoding, not that the text is
-    /// the base64 alphabet alone. No comment is attached, because the service
-    /// publishes none for the pair.
+    /// A member documented as base64-encoded carries base64, so what a caller
+    /// decodes is the key blob itself: the RFC 4253 `ssh-rsa` public key, which
+    /// names its own algorithm inside itself, so nothing of the key is lost by
+    /// leaving the OpenSSH line's text prefix off. The label and the space
+    /// belong to the `authorized_keys` LINE a caller composes from this value,
+    /// not to the value.
     ///
-    /// This is NOT the rendering an instance's SSH host key is reported with
-    /// ([`witness_ssh_host_key`]): there the algorithm is a member of its own
-    /// (`HostKeyAttributes$algorithm`) beside the key blob, exactly as a
-    /// `known_hosts` entry carries the two apart.
+    /// It is the same rendering an instance's SSH host key is reported with
+    /// ([`witness_ssh_host_key`]): the key blob's base64, with the algorithm
+    /// named apart from it.
     pub public_key: String,
     /// The private half as an `RSA PRIVATE KEY` PEM — the PKCS#1 encoding
     /// `privateKeyBase64` documents ("A base64-encoded RSA private key"), which
@@ -174,12 +167,12 @@ impl MintedKeyPairMaterial {
 /// `submitted` is a `publicKeyBase64` member — "a base64-encoded public key of
 /// the ssh-rsa type" — so what is read is the key's own SSH encoding,
 /// base64-encoded. BOTH renderings that encoding is published in are read: the
-/// whole OpenSSH public key line `<algorithm> <body>[ <comment>]` a caller reads
-/// out of a `.pub` file — which is also what the two results that report a
-/// public half carry ([`MintedKeyPairMaterial::public_key`]), so a pair this
-/// service minted imports again as it was reported — and the base64 body alone,
-/// which is that same key without the label. Whitespace around the value is not
-/// part of either, so it is not read as key material.
+/// base64 body alone — which is what the two results that report a public half
+/// carry ([`MintedKeyPairMaterial::public_key`]), so a pair this service minted
+/// imports again exactly as it was reported — and the whole OpenSSH public key
+/// line `<algorithm> <body>[ <comment>]` a caller reads out of a `.pub` file,
+/// which is that same key with a text label before it. Whitespace around the
+/// value is not part of either, so it is not read as key material.
 ///
 /// The line form is read because the modelled `Base64` shape is a plain string
 /// carrying no pattern (`smithy_query(query="shape",shape="Base64")`), so the
@@ -333,28 +326,25 @@ const KEY_PAIR_MODULUS_BITS: ::aws_lc_rs::rsa::KeySize = ::aws_lc_rs::rsa::KeySi
 /// "A base64-encoded public key of the ssh-rsa type"
 /// (`CreateKeyPairResult$publicKeyBase64`, and the same wording on
 /// `DownloadDefaultKeyPairResult$publicKeyBase64`) for the RSA key `private`'s
-/// public half: that key published as an SSH public key of its type — the
-/// algorithm name, a space, and the base64 of the key's own `ssh-rsa` encoding
-/// — built from the key's modulus and public exponent by the crate that
-/// implements the SSH key formats.
+/// public half: the base64 of the key's own `ssh-rsa` encoding, built from the
+/// key's modulus and public exponent by the crate that implements the SSH key
+/// formats.
 ///
-/// The whole value is what a caller USES: it is the `authorized_keys` line an
-/// SSH tool reads, the value an instance's provisioner is handed, and one of
-/// the two renderings `ImportKeyPair` reads a key back out of
-/// ([`imported_public_key_fingerprint`]) — so a pair this service minted can be
-/// imported again as it was reported.
+/// The value is base64 text ALONE, as the member it fills is documented to be:
+/// decoding it gives the RFC 4253 `ssh-rsa` key blob, which names its algorithm
+/// inside itself. The algorithm label, the space after it and the comment field
+/// an OpenSSH line may carry are the LINE's, not the key's, so none of them is
+/// published here and no whitespace surrounds the value — a caller composing an
+/// `authorized_keys` entry writes the algorithm name before this body.
 ///
-/// Only the algorithm label and the body are published: the comment field an
-/// OpenSSH line may carry is dropped, because the service publishes no comment
-/// for the pair, and no whitespace surrounds the value.
+/// It is also one of the two renderings `ImportKeyPair` reads a key back out of
+/// ([`imported_public_key_fingerprint`]), so a pair this service minted can be
+/// imported again exactly as it was reported.
 fn ssh_rsa_public_key(private: &::pkcs1::RsaPrivateKey<'_>) -> Option<String> {
     let key = ::ssh_key::public::KeyData::Rsa(::ssh_key::public::RsaPublicKey {
         e: ::ssh_key::Mpint::from_positive_bytes(private.public_exponent.as_bytes()).ok()?,
         n: ::ssh_key::Mpint::from_positive_bytes(private.modulus.as_bytes()).ok()?,
     });
     let openssh = ::ssh_key::PublicKey::new(key, "").to_openssh().ok()?;
-    Some(format!(
-        "{SSH_RSA_ALGORITHM} {}",
-        openssh_key_body(&openssh)?
-    ))
+    Some(openssh_key_body(&openssh)?.to_string())
 }
