@@ -1,0 +1,52 @@
+Issue-Source: trace-sweep-divergence
+Issue-Trace: cloudwatchomni-deep-link-and-identity-center-refusals
+Issue-Step: task#7
+Issue-Severity: MEDIUM
+Issue-Corpus: simparity-wire-aws-v1
+Issue-Corpus-Kind: wire
+Issue-Trace-Ids: cloudwatchomni-deep-link-and-identity-center-refusals cloudwatchomni-domain-and-space-singleton-lifecycle
+Issue-Shape-Id: com.amazonaws.cloudwatchomni#CloudWatchOmniFrontend
+Issue-Key: cloudwatchomni|GetDomain|2xx->2xx|$.domain.customEndpointUrls[*]
+Issue-Key: cloudwatchomni|GetDomain|2xx->2xx|$.domain.domainEndpointUrl
+Issue-Commit: 6651c87027da78b467298e3a28f696cadd44fc38
+
+# cloudwatchomni GetDomain announces domain endpoint URLs on a host the emulator does not answer on
+
+> _Note: this issue was identified against the code base at commit `6651c87027da78b467298e3a28f696cadd44fc38`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+GetDomain
+
+## Description
+Cause 1 of 1: the Domain envelope GetDomain returns advertises `domainEndpointUrl` and every `customEndpointUrls` entry on an authority that is NOT one this emulator answers on, so both URLs — the only two addresses the response hands a client for reaching the domain — lead nowhere. The read path is the one still diverging: the same fault on the create and update paths is owned by open issue 20261120T040030Z-cloudwatchomni-createdomain-and-updatedomain-publish-domain-endpoint-urls.md, and the earlier read-path issue 20261112T102024Z-cloudwatchomni-publishes-domain-endpoint-urls-on-a-cloudwatch.md is RESOLVED and therefore covers nothing here; the fixed issue 20261122T221118Z-cloudwatchomni-domain-endpoint-urls-carry-the-domain-identity.md moved the identity out of the path and back into the leftmost host label, which is now correct — what is still wrong is the SUFFIX/authority the label is attached to.
+
+  AWS: Smithy com.amazonaws.cloudwatchomni#GetDomain is @readonly, takes domainId (DomainId, required, @pattern ^d-[0-9a-z]{1,25}$) and returns the required `domain` member (Domain). com.amazonaws.cloudwatchomni#Domain.domainEndpointUrl is a REQUIRED String documented "The HTTPS endpoint URL for accessing the domain"; Domain.customEndpointUrls is a StringList documented "Additional endpoint URLs derived from the domain name"; Domain.domainId is required @pattern ^d-[0-9a-z]{1,25}$ and Domain.name is @length 3..63 @pattern ^[a-z0-9]+(-[a-z0-9]+)*$. The model fixes no hostname, so the host is recorded behavior only: in the recording GetDomain answers 200 with two https URLs whose LEFTMOST host label is the resource identity (the domain id for domainEndpointUrl, the domain name for each custom endpoint) and whose shared host suffix is a zone that actually serves that domain — i.e. a URL the caller can open and reach the domain it just read. The requirement is that pairing: AWS's URL shape (identity as leftmost label, one suffix shared by both members) rooted on an authority that resolves back to whatever is serving the response. The concrete suffix, the generated domain id, the generated domain name and the port in any one recording are per-run values and are not part of the requirement.
+
+  Emulator: GetDomain answers 200 (expected status 200 — the divergence is purely in the two endpoint members) with $.domain.domainEndpointUrl = 'https://d-<domainId>.localhost:<port>' and $.domain.customEndpointUrls[0] = 'https://<domain-name>.localhost:<port>'. The replay comparator returns host_not_own on BOTH members: the announced authority is not an address this emulator is reached on. The identity label is correctly leftmost, but it is prefixed onto the reserved loopback name, so the announced host is a name beneath `localhost` that this emulator neither serves nor is reachable at (the request itself arrived on the data listener's own authority, and a plain resolver answers only `localhost` itself, not labels under it). Hypothesis: `announced_endpoint_authority` composes `<identity>.<announced_zone_of_authority(reached_authority)>`, and for a request reached at an IP literal that zone collapses to the bare loopback name, producing a sub-label nothing answers for.
+
+  Why: a client treats these two members as the DNS-addressed per-domain endpoints they are documented to be — it opens domainEndpointUrl to reach the domain, derives/opens a custom endpoint from the domain name, pins or virtual-host-matches a TLS name on the leftmost label, or hands the URL to a browser or deep-link flow. Against this emulator every one of those fails: the name does not resolve, so the request never reaches the process that minted the URL (and may egress toward a resolver outside the emulated environment). GetDomain is the read any client re-reads endpoints from, so the two endpoint members of the authoritative domain view cannot be trusted at all, and flows that chain off a read domain (deep-link issuance, custom-endpoint probes, identity-center redirects) are unreachable.
+
+  Fix: the shared Domain endpoint projection in the cloudwatchomni service crate that the GetDomain read path returns through — compose the announced authority from an address this emulator actually answers on (the host:port the request arrived on, or a configured public base URL it serves), while keeping AWS's URL shape with the identity as the leftmost host label and one suffix shared by domainEndpointUrl and every customEndpointUrls entry; the inverse address reader and whatever serves those addresses must move with it so that what is advertised is what the emulator answers. Apply it in the single projection so the read path agrees with the create/update paths once those are fixed too.
+
+  Traces: cloudwatchomni-deep-link-and-identity-center-refusals#task#7 (GetDomain, 200, $.domain.domainEndpointUrl and $.domain.customEndpointUrls[0] both host_not_own) and cloudwatchomni-domain-and-space-singleton-lifecycle#task#8 (same cluster, same two members).
+
+## Evidence
+Wire corpus simparity-wire-aws-v1, divergence key `service=cloudwatchomni|GetDomain|status=200->200|keys=$.domain.customEndpointUrls[0],$.domain.domainEndpointUrl`, verdict `mismatch`, expected status 200, actual status 200. Cluster of 2 steps: cloudwatchomni-deep-link-and-identity-center-refusals#task#7 (representative) and cloudwatchomni-domain-and-space-singleton-lifecycle#task#8. Not blocked by a stub and owned by no open issue.
+
+Replay detail (representative step):
+  $.domain.domainEndpointUrl: host_not_own (expected 'https://d-cxyxlau21tjoyl4p5d9aytusu.cloudwatch-omni.global.app.aws', got 'https://d-cxyxlau21tjoyl4p5d9aytusu.localhost:38975')
+  $.domain.customEndpointUrls[0]: host_not_own (expected 'https://sim2real-probe-cwo-dom-6575bfbb.cloudwatch-omni.global.app.aws', got 'https://sim2real-probe-cwo-dom-6575bfbb.localhost:38975')
+
+The domain id 'd-cxyxlau21tjoyl4p5d9aytusu', the generated name 'sim2real-probe-cwo-dom-6575bfbb', the recorded public suffix and the port 38975 are all per-run/per-environment values and are NOT the requirement. The verdict is host_not_own rather than value_mismatch precisely because the comparator judges the announced authority, not the literal string: the emulator announced an address other than the one it is reached on. The structural part that IS required and is already satisfied: the leftmost host label equals the domain id for domainEndpointUrl and the domain name for the custom endpoint. The part that diverges: the suffix those labels sit on ('localhost', with the identity as a sub-label of the reserved loopback name) is not an authority this emulator answers on, so neither URL reaches the emulator that produced it.
+
+Smithy cited (services/service-com-amazonaws-cloudwatchomni-cloudwatchomnifrontend/smithy-model/com-amazonaws-cloudwatchomni-cloudwatchomnifrontend.json): GetDomain @readonly, input domainId (DomainId required, @pattern ^d-[0-9a-z]{1,25}$), output domain (Domain, required), errors AccessDeniedException 403 / InternalServerException 500 / ResourceNotFoundException 404 / ThrottlingException 429 / ValidationException 400; Domain.domainEndpointUrl (String, required, "The HTTPS endpoint URL for accessing the domain"), Domain.customEndpointUrls (StringList, "Additional endpoint URLs derived from the domain name"), Domain.domainId (required, ^d-[0-9a-z]{1,25}$), Domain.name (@length 3..63, @pattern ^[a-z0-9]+(-[a-z0-9]+)*$). The hostname is not modeled — recorded behavior only.
+
+Emulator source (file/line citations only): services/service-com-amazonaws-cloudwatchomni-cloudwatchomnifrontend/src/state/domain_endpoint.rs:117-128 `announced_authority`, :159-172 `announced_endpoint_authority` (builds `<dns_label(identity)>.<announced_zone_of_authority(reached_authority)>[:port]`), :178-186 `announced_endpoint_url`, :191-196 `domain_endpoint_url`, :206-213 `custom_endpoint_urls`, :223-232 `announced_domain` — the one projection the GetDomain read path returns a Domain through.
+
+## Steps to Reproduce
+1. Boot the emulator from this checkout and replay the wire corpus (replay_wire_corpus).
+2. Fixture 'cloudwatchomni-deep-link-and-identity-center-refusals', step task#7: create a domain with a name matching ^[a-z0-9]+(-[a-z0-9]+)*$, then call GetDomain(domainId) and read the 200 body's $.domain.domainEndpointUrl and $.domain.customEndpointUrls[0].
+3. Observe both are https URLs of the form 'https://<identity>.localhost:<port>' — the identity label is correct, but the host suffix is the reserved loopback name, so the announced authority is not one the emulator is reached on; the replay comparator reports host_not_own on both members.
+4. Resolve / open either URL from the client side: the name does not resolve to this emulator, so the request never reaches the process that minted it.
+5. Expected: both members are rooted on an authority this emulator actually answers on (the host:port the request arrived on, or its configured served base), with AWS's shape preserved — domain id as the leftmost label of domainEndpointUrl, domain name as the leftmost label of each customEndpointUrls entry, and one suffix shared by both.
+6. Re-replay BOTH steps of the cluster after the fix: cloudwatchomni-deep-link-and-identity-center-refusals#task#7 and cloudwatchomni-domain-and-space-singleton-lifecycle#task#8. A fix applied only to the create/update write paths (open issue 20261120T040030Z) leaves this read path diverging.
