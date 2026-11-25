@@ -157,7 +157,7 @@ async fn put_composite_alarm_configuration(
     name: &str,
     properties: &Value,
 ) -> Result<Created, Refusal> {
-    call_json_rpc(
+    call_query_compatible_json_rpc(
         ctx,
         CLOUDWATCH_SIGNING_NAME,
         region,
@@ -223,7 +223,7 @@ pub(super) async fn delete_composite_alarm(
     physical_resource_id: &str,
 ) -> Result<(), Refusal> {
     let request = serde_json::json!({ ALARM_NAMES_MEMBER: [physical_resource_id] });
-    match call_json_rpc(
+    match call_query_compatible_json_rpc(
         ctx,
         CLOUDWATCH_SIGNING_NAME,
         region,
@@ -249,7 +249,7 @@ pub(super) async fn describe_composite_alarm(
     physical_resource_id: &str,
 ) -> Result<Option<Value>, Refusal> {
     let request = serde_json::json!({ ALARM_NAMES_MEMBER: [physical_resource_id] });
-    let answered = call_json_rpc(
+    let answered = call_query_compatible_json_rpc(
         ctx,
         CLOUDWATCH_SIGNING_NAME,
         region,

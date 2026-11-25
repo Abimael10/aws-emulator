@@ -363,6 +363,26 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     // three TRANSCODING types are provisioned by a provider that words another shape, which is
     // recorded per provider ([`SDK_PROVIDER_SHAPES`]).
     ("mediaconvert", "MediaConvert", SdkDiagnostic::Operation),
+    // Amazon CloudWatch's SDK names it `AmazonCloudWatch` — the name the SDK client of that
+    // service's own query-era surface carries, which is neither its signing name
+    // (`monitoring`) nor its `sdkId` (`CloudWatch`,
+    // `smithy_query(query="service_info")` on that service's model). The shape is the PROXIED
+    // one, naming the error code the call was refused with and closing with the proxy the
+    // request was made through, as the recorded `ResourceStatusReason` of an
+    // `AWS::CloudWatch::CompositeAlarm` whose `AlarmRule` references an alarm that does not
+    // exist carries it (in the behavioral corpus `simparity-behavioral-aws-v1`, check
+    // `cloudwatch.deploy-cloudwatch-1-alarm-rename-replaces-and-dangling-composite-rejected`,
+    // whose reason carries `Error Code: ValidationError` beside the ARN of the missing alarm).
+    // The error code in it is the LEGACY query code that `awsQueryCompatible` service reports
+    // for the class, which is what a client of it branches on
+    // ([`in_process_calls::call_query_compatible_json_rpc`]). Every type this emulator
+    // provisions over this signing name is that service's (the two alarm types, the dashboard
+    // and the metric stream).
+    (
+        crate::state::provisioner::CLOUDWATCH_SIGNING_NAME,
+        "AmazonCloudWatch",
+        SdkDiagnostic::Proxied,
+    ),
     // Neptune Analytics' SDK names it `NeptuneGraph` — that model's own `sdkId`
     // (`Neptune Graph`) written as one word, exactly as Application Auto Scaling's above is —
     // and words the ATTEMPT-counting shape, as the recorded `ResourceStatusReason` of an

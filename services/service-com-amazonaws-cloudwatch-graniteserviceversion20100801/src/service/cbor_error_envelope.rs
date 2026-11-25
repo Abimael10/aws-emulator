@@ -49,6 +49,17 @@
 //! routing table names for the request, so the framework still owns the whole deserialize ->
 //! validate -> handle -> serialize sequence.
 //!
+//! A FOURTH layer answers on this route without any operation of this service being named: the
+//! PROTOCOL in front of the service, which refuses a request naming an operation this service
+//! does not have — or, since this route names the service in its path, naming another service —
+//! and a request it cannot FRAME at all. Such a refusal belongs to no shape of the API model,
+//! so the class a client resolves it to is that framework's own
+//! ([`PROTOCOL_LEVEL_CLASSES`], named in full by [`naming_the_protocol_level_class`]), and the
+//! one this layer makes itself is the request this route cannot read
+//! ([`unframable_request_refusal`], taken on the way IN because the bytes a client sent are
+//! what decides it). The status of such a refusal is the protocol's own and is left as the
+//! layer that built it wrote it.
+//!
 //! What is deliberately LEFT ALONE: every success, every answer in another protocol's
 //! envelope, and the emulator's own synthetic signals — the scaffold's 501 and the
 //! authorization layer's 403 belong to no class of this service's API, so they are answered
@@ -324,6 +335,11 @@ pub fn completing_the_cbor_envelope(mut resp: RtResponse) -> RtResponse {
 /// this service would have served anyway, and only the rendered answer is completed on the way
 /// out. Every operation of this service is served through one of these, so a failure raised by
 /// ANY layer passes through the one place that names its class the way this route names one.
+///
+/// The ONE thing it answers itself is a request this route cannot FRAME: a body that is not a
+/// CBOR map encodes no operation input at all, so there is nothing to deserialize, validate or
+/// handle, and it is refused as the serialization failure it is
+/// ([`unframable_request_refusal`]) rather than as a value the model does not admit.
 #[derive(Debug)]
 pub struct TheCborErrorEnvelope<O> {
     operation: O,
@@ -347,6 +363,9 @@ where
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
+            if let Some(refused) = unframable_request_refusal(req) {
+                return refused;
+            }
             let answered = self.operation.run(svc, req, ctx).await;
             completing_the_cbor_envelope(answered)
         })
@@ -357,6 +376,164 @@ where
     fn auth_schemes(&self) -> Option<&'static [&'static str]> {
         self.operation.auth_schemes()
     }
+}
+
+/// The PROTOCOL-level classes of this route: a refusal made by the protocol in front of the
+/// service rather than by its API, named as that framework names one.
+///
+/// A refusal of this kind belongs to no shape of the API model — it is answered before any
+/// operation of this service is named, let alone served — so the class a client resolves it to
+/// is the framework's own, in the package the framework's request-handling classes are named in
+/// ([`super::query_compatible_errors`]'s, which the two text wires state too) and under that
+/// class's EXCEPTION name. An SDK maps a CBOR error to an exception class by matching this
+/// value, so a bare local name resolves to nothing and a client cannot classify the refusal at
+/// all.
+///
+/// Two such classes are reachable on this route, each keyed by the LOCAL NAME the layer that
+/// built the refusal wrote:
+///
+/// * a request naming an operation this service does not have — or, since this route addresses
+///   the service in the path as well, naming another service
+///   ([`super::request_protocol::names_another_service`]): the unknown-operation class, which
+///   keeps the 404 this protocol's own routing rules answer it with;
+/// * a request this route cannot FRAME ([`unframable_request_refusal`]): the serialization
+///   class.
+const PROTOCOL_LEVEL_CLASSES: &[(&str, &str)] = &[
+    (
+        "UnknownOperationError",
+        "com.amazon.coral.service#UnknownOperationException",
+    ),
+    (
+        "BadRequestException",
+        SERIALIZATION_EXCEPTION,
+    ),
+];
+
+/// The class a request this route cannot read at all is refused under.
+const SERIALIZATION_EXCEPTION: &str = "com.amazon.coral.service#SerializationException";
+
+/// `resp` — a refusal the PROTOCOL in front of this service made — with its class named as
+/// this route names a protocol-level class ([`PROTOCOL_LEVEL_CLASSES`]), or `resp` itself when
+/// it is no such refusal.
+///
+/// The status and the message are left exactly as the layer that built them wrote them: the
+/// status of such a refusal is this protocol's own (the 404 its routing rules answer an unknown
+/// operation with), and the sentence belongs to whoever worded it. Only the discriminator is
+/// restated, so this and [`completing_the_cbor_envelope`] — which names the classes of the
+/// service's own API — cannot disagree about any answer either of them touches.
+pub fn naming_the_protocol_level_class(mut resp: RtResponse) -> RtResponse {
+    if resp.status().as_u16() < FIRST_FAILURE_STATUS || !is_a_cbor_answer(&resp) {
+        return resp;
+    }
+    let Some(entries) = resp.body().bytes().and_then(error_entries) else {
+        return resp;
+    };
+    let Some(named) = entries
+        .iter()
+        .find(|(key, _)| key == TYPE_MEMBER)
+        .map(|(_, value)| local_name(value).to_string())
+    else {
+        return resp;
+    };
+    let Some((_, shape_id)) = PROTOCOL_LEVEL_CLASSES
+        .iter()
+        .find(|(class, _)| *class == named)
+    else {
+        return resp;
+    };
+    let message = entries
+        .iter()
+        .find_map(|(key, value)| message_member(key).map(|member| (member, value.as_str())));
+    if let Some(body) = envelope_body(shape_id, message) {
+        restated_body(&mut resp, body);
+    }
+    resp
+}
+
+/// The refusal of a request on this route whose body is not a CBOR map, or `None` for a body
+/// this route can frame.
+///
+/// Every operation's input is a STRUCTURE, which this protocol encodes as a map, so a body that
+/// is not one encodes no input of any operation: there is nothing for the framework's
+/// deserialize -> validate -> handle sequence to read, and the refusal is a SERIALIZATION
+/// failure rather than a statement about any member's value. It is decided on the way IN, where
+/// the body is still the bytes the client sent, because by the time the sequence has refused
+/// such a request the two are indistinguishable: a value the model does not admit is answered
+/// in the same request-validation class.
+///
+/// A body carrying NO BYTES AT ALL is one of those: it holds no CBOR item, so it is no map —
+/// not the empty map, which is the one item every operation whose members are all optional is
+/// called with and which this protocol's own encoder writes for it. A caller that means the
+/// empty request sends that map.
+fn unframable_request_refusal(req: &RtRequest) -> Option<RtResponse> {
+    if !super::request_protocol::is_a_cbor_call(req) {
+        return None;
+    }
+    let body = req.body().bytes()?;
+    if is_a_cbor_map(body) {
+        return None;
+    }
+    // The sentence is the CONDITION's, and only the empty body has one: a request carrying no
+    // bytes at all supplied no value where an item was expected, which is what
+    // [`UNEXPECTED_EMPTY_VALUE`] states. Any other unframable body is answered by the class
+    // alone — this layer invents no sentence for a shape of bytes the service does not word one
+    // for. The member it is stated under is the CAPITALISED one this class words, where the
+    // request-validation class states its own clause under the lower-case spelling.
+    let message = body
+        .is_empty()
+        .then_some((&UPPER_MESSAGE_MEMBER, UNEXPECTED_EMPTY_VALUE));
+    let mut resp = RtResponse::new(
+        StatusCode::try_from(CLIENT_FAULT_STATUS).ok()?,
+        aws_smithy_types::body::SdkBody::from(envelope_body(SERIALIZATION_EXCEPTION, message)?),
+    );
+    resp.headers_mut().insert("content-type", CBOR_CONTENT_TYPE);
+    resp.headers_mut()
+        .insert(super::request_protocol::SMITHY_PROTOCOL_HEADER, super::request_protocol::RPC_V2_CBOR);
+    Some(resp)
+}
+
+/// What the serialization class states for a request that carried NO BYTES at all: the whole
+/// fixed text of that refusal, with no part of the request in it — the condition is that there
+/// was no value to read.
+const UNEXPECTED_EMPTY_VALUE: &str = "Got an unexpected empty value.";
+
+/// Whether `body` is a CBOR map whose keys are text — the encoding this protocol writes a
+/// structure in — and nothing else.
+///
+/// Read with the same maintained codec [`error_entries`] reads an answer with, and for the same
+/// reason: what has to be judged is the FRAMING of the bytes, which no schema-driven reader can
+/// answer for a body it cannot read against a shape. Each entry's value is read PAST rather
+/// than inspected — a member may hold any CBOR item — so this decides the framing and nothing
+/// about any value.
+fn is_a_cbor_map(body: &[u8]) -> bool {
+    let mut decoder = minicbor::Decoder::new(body);
+    // A map of a declared length, or an indefinite one closed by a break item: an encoder is
+    // free to write either.
+    let Ok(declared) = decoder.map() else {
+        return false;
+    };
+    let mut read = 0_u64;
+    loop {
+        match declared {
+            Some(count) if read == count => break,
+            None => match decoder.datatype() {
+                Ok(minicbor::data::Type::Break) => {
+                    if decoder.skip().is_err() {
+                        return false;
+                    }
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => return false,
+            },
+            _ => {}
+        }
+        if decoder.str().is_err() || decoder.skip().is_err() {
+            return false;
+        }
+        read = read.saturating_add(1);
+    }
+    decoder.position() == body.len()
 }
 
 #[cfg(test)]

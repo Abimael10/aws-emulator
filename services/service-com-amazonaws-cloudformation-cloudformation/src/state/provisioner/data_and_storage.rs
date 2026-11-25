@@ -846,7 +846,7 @@ pub(super) async fn put_metric_stream_configuration(
         _ => Map::new(),
     };
     request.insert("Name".to_string(), Value::String(name.to_string()));
-    let reported = call_json_rpc(
+    let reported = call_query_compatible_json_rpc(
         ctx,
         CLOUDWATCH_SIGNING_NAME,
         region,
@@ -875,7 +875,7 @@ pub(super) async fn delete_metric_stream(
     physical_resource_id: &str,
 ) -> Result<(), Refusal> {
     let request = serde_json::json!({ "Name": physical_resource_id });
-    call_json_rpc(
+    call_query_compatible_json_rpc(
         ctx,
         CLOUDWATCH_SIGNING_NAME,
         region,
@@ -896,7 +896,7 @@ pub(super) async fn describe_metric_stream(
     physical_resource_id: &str,
 ) -> Result<Option<Value>, Refusal> {
     let request = serde_json::json!({ "Name": physical_resource_id });
-    match call_json_rpc(
+    match call_query_compatible_json_rpc(
         ctx,
         CLOUDWATCH_SIGNING_NAME,
         region,
@@ -987,7 +987,7 @@ pub(super) async fn put_dashboard_body(
     if let Some(tags) = properties.get("Tags") {
         request.insert("Tags".to_string(), tags.clone());
     }
-    call_json_rpc(
+    call_query_compatible_json_rpc(
         ctx,
         CLOUDWATCH_SIGNING_NAME,
         region,
@@ -1032,7 +1032,7 @@ pub(super) async fn retag_dashboard(
     let held = declared_tags(
         // CloudWatch answers its tag read as the same `[{Key, Value}]` list a declaration's
         // `Tags` property is written as, so one reader serves both sides.
-        &call_json_rpc(
+        &call_query_compatible_json_rpc(
             ctx,
             CLOUDWATCH_SIGNING_NAME,
             region,
@@ -1044,7 +1044,7 @@ pub(super) async fn retag_dashboard(
     );
     let (added, removed) = tag_delta(&held, &desired);
     if !added.is_empty() {
-        call_json_rpc(
+        call_query_compatible_json_rpc(
             ctx,
             CLOUDWATCH_SIGNING_NAME,
             region,
@@ -1058,7 +1058,7 @@ pub(super) async fn retag_dashboard(
         .await?;
     }
     if !removed.is_empty() {
-        call_json_rpc(
+        call_query_compatible_json_rpc(
             ctx,
             CLOUDWATCH_SIGNING_NAME,
             region,
@@ -1086,7 +1086,7 @@ pub(super) async fn delete_dashboard(
     physical_resource_id: &str,
 ) -> Result<(), Refusal> {
     let request = serde_json::json!({ "DashboardNames": [physical_resource_id] });
-    call_json_rpc(
+    call_query_compatible_json_rpc(
         ctx,
         CLOUDWATCH_SIGNING_NAME,
         region,
@@ -1108,7 +1108,7 @@ pub(super) async fn describe_dashboard(
     physical_resource_id: &str,
 ) -> Result<Option<Value>, Refusal> {
     let request = serde_json::json!({ "DashboardName": physical_resource_id });
-    match call_json_rpc(
+    match call_query_compatible_json_rpc(
         ctx,
         CLOUDWATCH_SIGNING_NAME,
         region,

@@ -313,7 +313,12 @@ async fn the_scalar_lists_of_a_metric_result_carry_only_their_modelled_items() {
     ];
 
     for case in cases {
-        publish(&router, case.metric, base, case.published).await;
+        // A publish states the datums it publishes, so a call carrying none is refused rather
+        // than accepted as a publish of nothing: the row that reads a series with no datapoint
+        // in the range therefore publishes nothing at all.
+        if !case.published.is_empty() {
+            publish(&router, case.metric, base, case.published).await;
+        }
         let (output, body): (GetMetricDataOutput, _) = served(
             case.label,
             &router,

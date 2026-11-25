@@ -172,9 +172,17 @@ enum Fault {
     /// control characters are not supported as part of dimension values.", `Dimension$Value`.)
     CharacterSet,
     /// The text is made of characters the member accepts but is still no dimension text: all
-    /// whitespace, or a name opening with the colon the member forbids.
+    /// whitespace.
     Unusable,
+    /// The text opens with the one prefix the member FORBIDS: "Dimension names […] cannot
+    /// start with a colon (:)" (`Dimension$Name`). The refusal quotes the offending PREFIX
+    /// rather than the whole text: what is invalid about such a name is the character it opens
+    /// with, which is what tells the caller what to drop.
+    ForbiddenPrefix,
 }
+
+/// The prefix `Dimension$Name` forbids, which is also the value its refusal reports.
+const FORBIDDEN_NAME_PREFIX: &str = ":";
 
 /// The refusal message a dimension of `text` at member path `parameter` is answered with when
 /// it broke `fault` — the character-set class names only the member path, while the
@@ -185,6 +193,9 @@ fn dimension_refusal(fault: Fault, text: &str, parameter: &str) -> String {
             format!("The value for parameter {parameter} contains non-ASCII characters.")
         }
         Fault::Unusable => format!("The value {text} for parameter {parameter} is invalid."),
+        Fault::ForbiddenPrefix => {
+            format!("The value {FORBIDDEN_NAME_PREFIX} for parameter {parameter} is invalid.")
+        }
     }
 }
 
@@ -257,6 +268,23 @@ const fn unusable(
     }
 }
 
+/// A row whose NAME opens with the prefix the member forbids.
+const fn forbidden_prefix(
+    case: &'static str,
+    name: &'static str,
+    value: &'static str,
+) -> DimensionRow {
+    DimensionRow {
+        case,
+        name,
+        value,
+        refused: Some(Refused {
+            member: "Name",
+            fault: Fault::ForbiddenPrefix,
+        }),
+    }
+}
+
 #[tokio::test]
 async fn only_a_dimension_cloudwatch_can_hold_is_stored() {
     // The rows differ along what the dimension carries: printable ASCII in a name and a
@@ -264,8 +292,10 @@ async fn only_a_dimension_cloudwatch_can_hold_is_stored() {
     // character, text outside ASCII altogether (accented, ideographic, emoji), whitespace
     // only, and a name opening with the colon the member forbids. Which refusal class a
     // refused row is answered in is the rule it broke: text outside the member's character set
-    // is reported as that, naming the member path alone, and text the member cannot use for
-    // another reason is reported in the unusable-value family, which quotes it.
+    // is reported as that, naming the member path alone; text the member cannot use for
+    // another reason is reported in the unusable-value family, which quotes it; and a name
+    // opening with the forbidden prefix is reported in that same family quoting the PREFIX,
+    // which is the part of the value that is invalid.
     let rows: &[DimensionRow] = &[
         held("plain ASCII", "InstanceId", "i-0123456789abcdef"),
         held("ASCII punctuation and spacing", "Path group", "/api/v1 (read)"),
@@ -285,7 +315,12 @@ async fn only_a_dimension_cloudwatch_can_hold_is_stored() {
         character_set("a non-ASCII name", "Sérvice", "api", "Name"),
         unusable("a value of only spaces", "Host", "   ", "Value"),
         unusable("a name of only spaces", "   ", "api", "Name"),
-        unusable("a name opening with a colon", ":reserved", "api", "Name"),
+        // The forbidden prefix, with the text after it varying: the reported value is the
+        // prefix whatever follows it, including nothing at all.
+        forbidden_prefix("a name opening with a colon", ":reserved", "api"),
+        forbidden_prefix("a name of the colon alone", ":", "api"),
+        forbidden_prefix("a name opening with two colons", "::aws", "api"),
+        forbidden_prefix("a colon before a space", ": name", "api"),
     ];
 
     for DimensionRow {

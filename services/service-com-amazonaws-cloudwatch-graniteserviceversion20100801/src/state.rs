@@ -1685,6 +1685,16 @@ pub const O_TEL_ENRICHMENT_RUNNING: &str = "Running";
 /// (`GetOTelEnrichmentOutput$Status`).
 pub const O_TEL_ENRICHMENT_STOPPED: &str = "Stopped";
 
+/// The sentence a refusal of an operation that needs the account's enrichment ENABLED carries
+/// — the whole fixed text of that refusal, with no variable part: the account is the one the
+/// call was signed for, so nothing of the request is stated.
+///
+/// One sentence for the one condition, which is what the state it reports is: an account whose
+/// enrichment was never started and one whose enrichment has been stopped are both accounts
+/// with enrichment not enabled, so the guard that refuses a call needing it answers alike
+/// either way (`crate::ops::update_o_tel_enrichment`).
+pub const O_TEL_ENRICHMENT_NOT_ENABLED: &str = "OTel enrichment is not enabled for this account";
+
 /// The most metric selectors one account's enrichment configuration holds: "A maximum of 100
 /// filters is allowed across `IncludeFilters` and `ExcludeFilters` combined."
 /// (`OTelEnrichmentMetricSelector`)
@@ -3463,13 +3473,15 @@ pub fn parse_taggable_arn(arn: &str) -> Option<TaggableResource<'_>> {
 /// The CloudWatch resource `arn` names, or the sentence saying why it names none. Every
 /// operation that takes a `ResourceARN` resolves it through this one rule and renders the
 /// sentence through whichever parameter fault its own model declares.
+///
+/// The sentence states the REQUIREMENT the member carries — that its value be an ARN of a
+/// resource of this service — and quotes the value the request supplied, which is its only
+/// variable part. It enumerates no resource KIND: which kinds are taggable is the member's
+/// own documentation (`TagResourceInput$ResourceARN`), and a refusal that lists them states
+/// more than the requirement a caller has to satisfy.
 pub fn taggable_resource(arn: &str) -> Result<TaggableResource<'_>, String> {
-    parse_taggable_arn(arn).ok_or_else(|| {
-        format!(
-            "The value {arn} for parameter ResourceARN is not valid: it is not the ARN of a \
-             CloudWatch alarm, dashboard, metric stream or Contributor Insights rule"
-        )
-    })
+    parse_taggable_arn(arn)
+        .ok_or_else(|| format!("ResourceARN must be valid and belong to a CloudWatch resource: {arn}"))
 }
 
 /// The `ResourceNotFoundException` body ("The named resource does not exist") an operation

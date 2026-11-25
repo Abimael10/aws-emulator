@@ -70,6 +70,84 @@ pub(crate) async fn call_json_rpc(
     Err(refusal_of(signing_name, None, status, &document))
 }
 
+/// The header an SDK of an `awsQueryCompatible` service opts into the legacy error report
+/// with, the value it carries, and the header that report travels back in.
+const QUERY_MODE_HEADER: &str = "x-amzn-query-mode";
+const QUERY_MODE_ON: &str = "true";
+const QUERY_ERROR_HEADER: &str = "x-amzn-query-error";
+
+/// [`call_json_rpc`] as an SDK of an `awsQueryCompatible` service makes it: asking for the
+/// LEGACY error code of whatever class the answer names, and reporting a refusal under that
+/// code.
+///
+/// Such a service migrated off the query protocol and still states the class of a failure
+/// twice — the error SHAPE in the awsJson body, and the `awsQueryError` code of that class in
+/// a header, for a client that asked for it. The second is the code a client of that service
+/// branches on, so it is the code the exception its SDK raises carries and the one a resource
+/// provider quoting that refusal reports ([`sdk_diagnostics::sdk_diagnostic`]). A service that
+/// is not query-compatible reports no such header, and its refusal is read exactly as
+/// [`call_json_rpc`] reads one; everything else is that function's — the same signing, the
+/// same routing, the same answer document.
+pub(crate) async fn call_query_compatible_json_rpc(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    signing_name: &str,
+    region: &str,
+    content_type: &str,
+    target: &str,
+    request: &Value,
+) -> Result<Value, Refusal> {
+    // Under the stack's service role, exactly as [`call_json_rpc`] is.
+    if let Some(denied) = denied_by_the_service_role(signing_name, target.rsplit('.').next()) {
+        return Err(denied);
+    }
+    let body = serde_json::to_vec(request).map_err(|error| Refusal {
+        code: "SerializationException".to_string(),
+        message: error.to_string(),
+    })?;
+    let headers = vec![
+        ("content-type", content_type.to_string()),
+        ("x-amz-target", target.to_string()),
+        (QUERY_MODE_HEADER, QUERY_MODE_ON.to_string()),
+    ];
+    let (status, answered, payload) = dispatch(
+        ctx,
+        signing_name,
+        region,
+        "POST",
+        "/",
+        headers,
+        body,
+        &[QUERY_ERROR_HEADER],
+    )
+    .await
+    .map_err(|message| Refusal {
+        code: "InternalFailure".to_string(),
+        message,
+    })?;
+    let document: Value = serde_json::from_slice(&payload).unwrap_or(Value::Null);
+    if (200..300).contains(&status) {
+        return Ok(document);
+    }
+    let reported = answered
+        .get(QUERY_ERROR_HEADER)
+        .and_then(|report| reported_query_code(report));
+    Err(refusal_naming(
+        signing_name,
+        None,
+        None,
+        status,
+        &document,
+        reported,
+    ))
+}
+
+/// The legacy error code an `awsQueryCompatible` answer REPORTS: the class named before the
+/// fault side in the report (`ValidationError;Sender`), or `None` when the report names none.
+fn reported_query_code(report: &str) -> Option<&str> {
+    let code = report.split(';').next().unwrap_or_default().trim();
+    (!code.is_empty()).then_some(code)
+}
+
 /// The media type an awsQuery request carries: its parameters are a form body, not a
 /// document ("the request is sent as `application/x-www-form-urlencoded`"). Read only by
 /// [`call_query`], which is the one place this module writes such a body.
@@ -1053,19 +1131,39 @@ pub(super) fn refusal_of_call(
     status: u16,
     document: &Value,
 ) -> Refusal {
-    let code = document
-        .get("__type")
-        .or_else(|| document.get("code"))
-        .or_else(|| document.get("Code"))
-        // A service whose error shapes MODEL the code as a member of their own carries it
-        // there rather than under one of the wire's conventional keys: every error of Amazon
-        // EFS declares a required `ErrorCode` beside its `Message`
-        // (`smithy_query(query="shape",shape="MountTargetConflict")`), and that member is the
-        // value a client of that service branches on.
-        .or_else(|| document.get("ErrorCode"))
-        .and_then(Value::as_str)
-        .map(|code| code.rsplit('#').next().unwrap_or(code).to_string())
-        .unwrap_or_else(|| format!("{UNNAMED_CODE_PREFIX}{status}"));
+    refusal_naming(signing_name, operation, uri, status, document, None)
+}
+
+/// [`refusal_of_call`] with the error CODE stated by the caller, where the answer REPORTED one
+/// of its own beside the shape its body names
+/// ([`call_query_compatible_json_rpc`]): `None` reads the code off the document, which is what
+/// every other wire's answer says.
+///
+/// The ONE body behind both, so the code a refusal carries and the message built from it cannot
+/// be derived from different values.
+fn refusal_naming(
+    signing_name: &str,
+    operation: Option<&str>,
+    uri: Option<&str>,
+    status: u16,
+    document: &Value,
+    reported: Option<&str>,
+) -> Refusal {
+    let code = reported.map(ToString::to_string).unwrap_or_else(|| {
+        document
+            .get("__type")
+            .or_else(|| document.get("code"))
+            .or_else(|| document.get("Code"))
+            // A service whose error shapes MODEL the code as a member of their own carries it
+            // there rather than under one of the wire's conventional keys: every error of Amazon
+            // EFS declares a required `ErrorCode` beside its `Message`
+            // (`smithy_query(query="shape",shape="MountTargetConflict")`), and that member is the
+            // value a client of that service branches on.
+            .or_else(|| document.get("ErrorCode"))
+            .and_then(Value::as_str)
+            .map(|code| code.rsplit('#').next().unwrap_or(code).to_string())
+            .unwrap_or_else(|| format!("{UNNAMED_CODE_PREFIX}{status}"))
+    });
     let message = document
         .get("message")
         .or_else(|| document.get("Message"))

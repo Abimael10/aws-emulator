@@ -191,6 +191,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Enrichment must already be running for the account. If it is not, this operation
         // returns a ResourceNotFoundException. To start enrichment, use StartOTelEnrichment."
+        //
+        // The documentation says what the condition is; the SENTENCE the refusal carries is
+        // the fixed text of the class, and it states the account's enrichment as NOT ENABLED
+        // — one condition, whether enrichment was never started or has been stopped, which is
+        // why this one guard answers both ([`crate::state::O_TEL_ENRICHMENT_NOT_ENABLED`]).
         let Some(stored) = store
             .otel_enrichment
             .as_mut()
@@ -200,11 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ResourceNotFoundException {
                     resource_type: None,
                     resource_id: None,
-                    message: Some(
-                        "OTel enrichment is not running for this account. To start enrichment, \
-                         use StartOTelEnrichment."
-                            .into(),
-                    ),
+                    message: Some(crate::state::O_TEL_ENRICHMENT_NOT_ENABLED.into()),
                 },
             )
             .into());

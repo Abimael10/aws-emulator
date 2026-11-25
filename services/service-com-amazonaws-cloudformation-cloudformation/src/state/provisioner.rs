@@ -467,7 +467,8 @@ pub(super) use super::{
 };
 
 use super::provisioning::{
-    call_json_rpc, call_query, call_query_as, call_rest_json, call_rest_json_named, call_rest_xml,
+    call_json_rpc, call_query, call_query_as, call_query_compatible_json_rpc, call_rest_json,
+    call_rest_json_named, call_rest_xml,
     modelled_declaration, percent_encoded, published_instant, xml_element, xml_elements,
     xml_entry_map, xml_entry_structures, xml_leaf, xml_member_structures, xml_scalar_children,
     Created, ModelledScalar, Readiness,

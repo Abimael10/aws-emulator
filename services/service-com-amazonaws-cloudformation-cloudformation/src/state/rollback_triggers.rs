@@ -71,7 +71,9 @@ use std::time::SystemTime;
 use serde_json::{json, Value};
 
 use super::provisioner::{CLOUDWATCH_SIGNING_NAME, CLOUDWATCH_TARGET_PREFIX};
-use super::provisioning::{call_json_rpc, unwind, OnRefusal, Teardown, AWS_JSON_1_0};
+use super::provisioning::{
+    call_query_compatible_json_rpc, unwind, OnRefusal, Teardown, AWS_JSON_1_0,
+};
 use super::StoredRollbackTrigger;
 
 /// What the failure a trigger forces OWES the services that own the stack's resources.
@@ -314,7 +316,7 @@ async fn alarm_state(
     region: &str,
     name: &str,
 ) -> Option<String> {
-    let answer = call_json_rpc(
+    let answer = call_query_compatible_json_rpc(
         ctx,
         CLOUDWATCH_SIGNING_NAME,
         region,

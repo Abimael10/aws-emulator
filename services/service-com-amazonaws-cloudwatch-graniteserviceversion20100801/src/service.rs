@@ -51,10 +51,14 @@
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
-//! - `override_routing_error` — how this service words a request that reached it
-//!   but named no modeled operation. The default returns `None`, so the entry
-//!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
-//!   404, …). Return `Some(resp)` to answer in your own envelope if desired.
+//! - `override_routing_error` — EDITED HERE: how this service words a request that reached it
+//!   but named no modeled operation. The envelope, the status and the sentence stay the
+//!   protocol-correct default's; what this service states is the CLASS such a refusal names,
+//!   which on the `rpcv2Cbor` route is a protocol-level class of the framework in front of the
+//!   service and is named in full there ([`cbor_error_envelope`]). The same answer serves a
+//!   request this file DECLINES to route — a CBOR-route call addressed to another Smithy
+//!   service ([`request_protocol`]), which the generated table's own key would otherwise
+//!   resolve.
 //! - `override_framework_error` — how this service words a transport-level
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
 //!   body). The default returns `None`, keeping the entry's protocol-correct
@@ -146,6 +150,11 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// inside [`QueryCompatibleErrors`], for the same reason: naming the class of a failure is
     /// owed by every answer, whichever layer built it.
     metered: TheWayEveryOperationIsServed<Eng, TheModelledOperation>,
+    /// The answer to a request this service DECLINES to serve: one the generated table's own
+    /// key would have resolved, addressed to another Smithy service on the CBOR route
+    /// ([`TheUnroutedRequest`]). Unmetered and unauthorized, because a request that named no
+    /// operation of this service is not a call it served.
+    unrouted: TheUnroutedRequest,
 }
 
 /// Wire one `crate::ops::<module>::<Operation>` per line into `$table`, each served the way
@@ -413,17 +422,20 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             ),
         );
         // Every operation whose model declares NONE of this service's parameter faults and
-        // whose input carries a collection with a modelled maximum: such an operation refuses a
-        // collection over that maximum in the request-validation class, quoting the collection
-        // the request carried ([`submitted_collection_refusal`], which holds that rule). The
-        // operations left out of this list are the ones it cannot reach — either their model
-        // declares a parameter fault, so a collection over its cap is one of THOSE
+        // whose input carries a collection the model bounds or whose ELEMENTS it constrains:
+        // such an operation refuses a collection over that maximum, and a constraint one of a
+        // collection's elements broke, in the request-validation class — quoting the collection
+        // the request carried and stating the element shape's whole set at the collection
+        // member ([`submitted_collection_refusal`], which holds that rule). The operations left
+        // out of this list are the ones it cannot reach — either their model declares a
+        // parameter fault, so a collection over its cap is one of THOSE
         // ([`collection_cap_refusal`], which the seam behind this list words), or their input
-        // declares no bounded collection at all, so there is no collection to refuse.
+        // declares no such collection at all, so there is no collection to refuse.
         stating_the_submitted_collection!(
             overridden,
             engine,
             delete_alarms::DeleteAlarms,
+            describe_alarm_history::DescribeAlarmHistory,
             disable_alarm_actions::DisableAlarmActions,
             enable_alarm_actions::EnableAlarmActions,
             put_alarm_mute_rule::PutAlarmMuteRule,
@@ -452,7 +464,17 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                 request_protocol::naming_the_request,
             ),
             overridden,
+            unrouted: TheUnroutedRequest,
         }
+    }
+
+    /// The NAME of this service's own Smithy service shape, as the CBOR route's path addresses
+    /// a service by: the local part of the shape id the generated entry carries
+    /// (`com.amazonaws.cloudwatch#GraniteServiceVersion20100801` ->
+    /// `GraniteServiceVersion20100801`), read off the model rather than restated here.
+    fn service_shape_name(&self) -> &str {
+        let shape_id = self.entry.identity().shape_id();
+        shape_id.rsplit('#').next().unwrap_or(shape_id)
     }
 }
 
@@ -831,18 +853,26 @@ fn missing_required_member_refusal(
 /// The refusal of a value against a modelled `@pattern`, quoting the expression the way AWS
 /// quotes it — or `None` when nothing in `refusal` broke a pattern.
 ///
-/// A `@pattern` is written in the model as a WHOLE-VALUE match: the `^` and the `$` are how
-/// Smithy turns a find into a total match, not part of the expression the service advertises.
-/// AWS states the requirement as that expression alone, so a client that lifts it out of the
-/// message and re-validates locally gets the one the service publishes
-/// ([`service_common::validation::unanchored`], the shared rendering). Everything else about
-/// the refusal — the envelope, the clause, the member path, the class — is the framework's and
-/// the shared renderer's, so this and the walk behind it cannot drift.
+/// A Smithy `@pattern` is a FIND, so the expression a member DECLARES and the expression its
+/// whole value has to satisfy are two different things, and the requirement this service
+/// states is the second — decided END BY END
+/// ([`service_common::validation::whole_value_expression`], the shared rendering of that
+/// dialect): an end the model ANCHORS carries its `^` / `$` away with it, because the anchor is
+/// how the model makes the match total there rather than part of the character grammar, while
+/// an end the model leaves OPEN admits any run of characters and is spelled with one. So a
+/// client that lifts the expression out of the message and re-validates locally gets the one
+/// the service publishes, for a member anchored at both ends and for one anchored at a single
+/// end alike. Everything else about the refusal — the envelope, the clause, the member path,
+/// the class — is the framework's and the shared renderer's, so this and the walk behind it
+/// cannot drift.
 ///
 /// It holds for every member of this service whose model declares a `@pattern`, whatever the
-/// operation: the dataset identifier and the KMS key ARN the dataset operations take are the
+/// operation: the dataset identifier and the KMS key ARN the dataset operations take
+/// (`^…$`, quoted as the expression between the anchors) and the metric NAMESPACE a filter
+/// selects by (`^[^:]`, open at its close and so quoted with the run that end admits) are the
 /// recorded cases, and a member modelled with a pattern later is stated the same way without
-/// another line here.
+/// another line here. The CHECK always runs the model's pattern as written; only this
+/// rendering decides the ends.
 fn unanchored_pattern_refusal(refusal: &Refusal) -> Option<Refused> {
     let Refusal::Invalid(violations) = refusal else {
         return None;
@@ -857,7 +887,7 @@ fn unanchored_pattern_refusal(refusal: &Refusal) -> Option<Refused> {
     }
     service_common::validation_message::aws_validation_refusal_with(
         refusal,
-        service_common::validation::unanchored,
+        service_common::validation::whole_value_expression,
     )
 }
 
@@ -873,10 +903,10 @@ fn unanchored_pattern_refusal(refusal: &Refusal) -> Option<Refused> {
 /// Only the code and two RENDERINGS are this service's; the envelope, the clauses and the
 /// member paths are the shared ones, so this and the walk behind it cannot drift:
 ///
-/// * the value set is stated in the order the SET ITSELF is walked
-///   ([`service_common::validation_message::in_hashed_enum_order`]), which is the order this
-///   service is recorded listing an enumerated type's values in — neither the model's
-///   declaration order nor a sorted one;
+/// * the value set is the one this service PUBLISHES for the type, in the order the SET ITSELF
+///   is walked ([`in_the_published_value_set`]), which is the order this service is recorded
+///   listing an enumerated type's values in — neither the model's declaration order nor a
+///   sorted one;
 /// * the clause quotes the SUBMITTED value, which is what tells a client which of the values it
 ///   sent was rejected — a near miss of a declared value (a mis-cased one, say) cannot be told
 ///   from an unsupported one without it. WHETHER a clause carries that half is a property of the
@@ -886,19 +916,75 @@ fn scalar_enum_refusal(violations: &[aws_smithy_schema_server::Violation]) -> Op
     if !violations.iter().any(is_scalar_enum_violation) {
         return None;
     }
-    let stated = Refusal::Invalid(
-        violations
-            .iter()
-            .map(service_common::validation_message::in_hashed_enum_order)
-            .collect(),
-    );
-    // The whole envelope is the shared renderer's; only the CODE and the order a value set is
-    // listed in are this service's.
+    let stated = Refusal::Invalid(violations.iter().map(in_the_published_value_set).collect());
+    // The whole envelope is the shared renderer's; only the CODE and the value set a clause
+    // enumerates are this service's.
     let message = service_common::validation_message::aws_validation_refusal(&stated)?.message;
     Some(Refused {
         code: VALIDATION.shape_name.to_string(),
         message,
     })
+}
+
+/// The value sets this service PUBLISHES for its own enumerated types, where what it
+/// publishes is not the whole set its on-disk model declares: the values the model declares,
+/// matched as a set, against the values a refusal of this service enumerates.
+///
+/// A refusal states the set a caller has to choose from, and that set is the one the service
+/// ADVERTISES for the type — which a model revision may run ahead of, since a value the model
+/// gains is in the shape before the published enumeration names it. The alarm TYPE is such a
+/// type: the on-disk model declares a third kind of alarm beside the metric and composite ones
+/// (`smithy_query(query="shape",shape="AlarmType")`), and this service's constraint refusals
+/// enumerate the two the published enumeration carries. Which values a member ADMITS is not
+/// decided here — that is the enum the member targets, so a filter naming the third kind is
+/// still served ([`service_common::validation_message::stated_enum_value_set`], the shared
+/// reading of such a row).
+const PUBLISHED_ENUM_VALUE_SETS: &service_common::validation_message::StatedEnumValueSets<'static> = &[(
+    &["CompositeAlarm", "MetricAlarm", "LogAlarm"],
+    &["MetricAlarm", "CompositeAlarm"],
+)];
+
+/// `declared` as a refusal of this service enumerates it: the values it PUBLISHES for that
+/// type ([`PUBLISHED_ENUM_VALUE_SETS`]), in the order the set's own hash table is walked
+/// ([`service_common::validation_message::hashed_enum_order`], which is the order this service
+/// is recorded listing an enumerated type's values in).
+///
+/// Both halves belong to the TYPE rather than to a member, an operation or a depth, so one
+/// type is enumerated alike wherever a clause states it: a value set the table names no row
+/// for is the model's own, in that same walked order.
+fn published_enum_values(declared: &[String]) -> Vec<String> {
+    let published: Vec<String> =
+        match service_common::validation_message::stated_enum_value_set(
+            declared,
+            PUBLISHED_ENUM_VALUE_SETS,
+        ) {
+            Some(published) => published.iter().map(|value| (*value).to_string()).collect(),
+            None => declared.to_vec(),
+        };
+    service_common::validation_message::hashed_enum_order(&published)
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+/// `violation` with an enumerated type's value set stated as this service enumerates one
+/// ([`published_enum_values`]), and any other violation returned unchanged.
+///
+/// The CLAUSE stays the framework's: only the set that goes into it moves, so the member path,
+/// the echoed value and the requirement's wording keep coming from the one place that writes
+/// them.
+fn in_the_published_value_set(
+    violation: &aws_smithy_schema_server::Violation,
+) -> aws_smithy_schema_server::Violation {
+    let aws_smithy_schema_server::ViolationKind::EnumValue(ref declared) = violation.kind else {
+        return violation.clone();
+    };
+    aws_smithy_schema_server::Violation {
+        path: violation.path.clone(),
+        kind: aws_smithy_schema_server::ViolationKind::EnumValue(published_enum_values(declared)),
+        value: violation.value.clone(),
+        sensitive: violation.sensitive,
+    }
 }
 
 /// Whether `violation` is a SCALAR member outside the enumerated type it is modelled as — the
@@ -1391,7 +1477,7 @@ fn judgement(
 /// How this service words a boundary refusal when no OPERATION states one of its own: the two
 /// classes it restates, in order — the ones CloudWatch answers as one of its own PARAMETER
 /// faults ([`parameter_fault`]), then a value that broke a modelled `@pattern`, whose
-/// requirement AWS quotes without the anchors the model wraps it in
+/// requirement AWS quotes as the expression the WHOLE value must satisfy
 /// ([`unanchored_pattern_refusal`], which keeps the framework's own class). Everything else
 /// keeps the framework's code and wording.
 ///
@@ -1853,6 +1939,43 @@ impl ErasedOperation for TheModelledOperation {
     }
 }
 
+/// A request this service does not SERVE, answered as the framework answers a request that
+/// named no operation of it: the routing failure this service's entry renders, with the class
+/// of a protocol-level refusal named in full where the route states one
+/// ([`cbor_error_envelope::naming_the_protocol_level_class`]).
+///
+/// It re-implements nothing and reads nothing of the request: the answer is the one the router
+/// itself would have given had `override_operation` claimed nothing, which is the point —
+/// `override_operation` is the only seam that can decline a request the generated table's own
+/// key WOULD have resolved (a CBOR-route call addressed to another Smithy service,
+/// [`request_protocol::names_another_service`]), and a declined request has to be answered
+/// there rather than served.
+struct TheUnroutedRequest;
+
+impl ErasedOperation for TheUnroutedRequest {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r aws_smithy_runtime_api::http::Request,
+        _ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+        Box::pin(async move { the_routing_failure(svc.definition(), req) })
+    }
+}
+
+/// How this service answers a request that named no operation of it: its entry's own
+/// protocol-correct routing failure, with the class named as a protocol-level refusal of the
+/// route it travels on is named ([`cbor_error_envelope::naming_the_protocol_level_class`]).
+///
+/// ONE answer, so the seam the router asks ([`Service::override_routing_error`]) and the one a
+/// declined request reaches ([`TheUnroutedRequest`]) cannot word the same failure differently.
+fn the_routing_failure(
+    definition: &dyn ErasedServiceDefinition,
+    req: &aws_smithy_runtime_api::http::Request,
+) -> aws_smithy_runtime_api::http::Response {
+    cbor_error_envelope::naming_the_protocol_level_class(definition.routing_error_response(req))
+}
+
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn definition(&self) -> &dyn smithy_server_runtime::ErasedServiceDefinition {
         // The model-derived half of this service — identity, protocol, routing
@@ -1899,6 +2022,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // which for a query-protocol call is the `Action` field of its form body: a request in
         // one of this service's protocols is served by the same wrappers as one in another.
         let key = self.entry.wire_protocol(req).protocol().routing_key(req).ok()?;
+        // The CBOR route addresses the SERVICE in the path beside the operation, and the
+        // framework's routing key is the operation step alone: a call addressed to another
+        // Smithy service names no operation of THIS one, so it is declined here — the only
+        // seam that can decline a key the generated table would otherwise resolve — and
+        // answered as the unrouted request it is ([`TheUnroutedRequest`]).
+        if request_protocol::names_another_service(req, self.service_shape_name()) {
+            return Some(&self.unrouted as &dyn ErasedOperation);
+        }
         if let Some(operation) = self.overridden.get(key) {
             return Some(operation);
         }
@@ -1924,12 +2055,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
         // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // routing table resolved it. The envelope, the status and the sentence stay the
+        // protocol-correct default's (query -> 400 InvalidAction text/xml, awsJson -> 404,
+        // rpcv2Cbor -> 404); what this service states is the CLASS such a refusal names, which
+        // on the CBOR route is a protocol-level class of the framework in front of the service
+        // and is named in full there ([`the_routing_failure`]).
+        Some(the_routing_failure(self.definition(), req))
     }
 
     fn override_framework_error(

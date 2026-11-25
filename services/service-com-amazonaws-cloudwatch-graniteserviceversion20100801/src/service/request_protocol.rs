@@ -105,8 +105,51 @@ fn names_the_query_protocol() -> RtRequest {
 
 /// The header that names the Smithy RPC v2 CBOR protocol, and the value it carries: "the
 /// `smithy-protocol` header… MUST be set to `rpc-v2-cbor`" (that protocol's specification).
-const SMITHY_PROTOCOL_HEADER: &str = "smithy-protocol";
-const RPC_V2_CBOR: &str = "rpc-v2-cbor";
+///
+/// `pub(super)` because the ERROR ENVELOPE of that route answers a refusal of its own — a
+/// request it cannot frame — and such an answer names the route it travels on exactly as every
+/// other answer of it does (`super::cbor_error_envelope`).
+pub(super) const SMITHY_PROTOCOL_HEADER: &str = "smithy-protocol";
+pub(super) const RPC_V2_CBOR: &str = "rpc-v2-cbor";
+
+/// Whether `req` is a call on the Smithy RPC v2 CBOR route: the one marker that protocol's
+/// specification names it by, read as the ONE reading of that header in this service
+/// ([`names_a_protocol`], which asks the same question of the same header).
+pub(super) fn is_a_cbor_call(req: &RtRequest) -> bool {
+    req.headers()
+        .get(SMITHY_PROTOCOL_HEADER)
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case(RPC_V2_CBOR))
+}
+
+/// The two path steps the CBOR route addresses a call with: "every request is
+/// `POST /service/{ServiceName}/operation/{OperationName}`" (that protocol's specification).
+const CBOR_ROUTE_SERVICE_STEP: &str = "/service/";
+const CBOR_ROUTE_OPERATION_STEP: &str = "/operation/";
+
+/// Whether `req` is a CBOR-route call addressed to a Smithy service OTHER than `shape_name`.
+///
+/// This route names the SERVICE in the path beside the operation, so the path addresses one
+/// service's surface: a request naming another service's shape names no operation of THIS
+/// service, whatever operation the rest of the path spells, and is as unrouted here as a
+/// request naming an operation this service does not have. The framework's own routing key is
+/// the operation step alone (`aws_smithy_schema_server::rpc::routing_key_from_path`), which is
+/// why the service step is read here.
+///
+/// `false` for a call in either of this service's other protocols, whose requests carry no such
+/// path, and for a path that does not spell the two steps at all — the framework's own key
+/// resolution already refuses that, and this answers only the question it does not ask.
+pub(super) fn names_another_service(req: &RtRequest, shape_name: &str) -> bool {
+    if !is_a_cbor_call(req) {
+        return false;
+    }
+    let path = req.uri().split('?').next().unwrap_or_default();
+    let Some(addressed) = path.strip_prefix(CBOR_ROUTE_SERVICE_STEP) else {
+        return false;
+    };
+    addressed
+        .split_once(CBOR_ROUTE_OPERATION_STEP)
+        .is_some_and(|(named, _)| named != shape_name)
+}
 
 /// The header an `awsJson` client names the operation in, which is what names that protocol on
 /// a request to this service, and the media-type prefix its body carries.

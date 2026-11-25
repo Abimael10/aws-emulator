@@ -303,6 +303,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })
             }))
             .collect();
+        // A publish states the datums it publishes, so a call that carries none publishes
+        // nothing: there is no series to create, no datapoint to append and nothing for a
+        // later read to find. CloudWatch refuses it as the required parameter it was not
+        // given ([`at_least_one_datum`]) rather than answering a success that did nothing,
+        // which is the only signal a caller whose batching loop produced no datum ever gets.
+        //
+        // Counted over BOTH lists a datum may arrive on, for the reason the cap below is: the
+        // metric data an `EntityMetricData` entry carries is a `MetricData` list too, so a
+        // call that publishes its datums through an entity has stated datums.
+        if data.is_empty() {
+            return Err(at_least_one_datum());
+        }
         if data.len() > MAX_METRICS_PER_REQUEST {
             return Err(collection_too_large("MetricData", MAX_METRICS_PER_REQUEST));
         }
@@ -392,8 +404,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let dimension_path = member_path(&format!("{path}.Dimensions"), index);
                 let name_path = format!("{dimension_path}.Name");
                 checked_character_set(&dimension.name, &name_path)?;
-                // "Dimension names […] cannot start with a colon (:)." (`Dimension$Name`)
-                if !has_non_whitespace(&dimension.name) || dimension.name.starts_with(':') {
+                // "Dimension names […] cannot start with a colon (:)." (`Dimension$Name`) —
+                // the value the refusal reports is the FORBIDDEN PREFIX itself, not the whole
+                // name the request carried: what is invalid about such a name is the character
+                // it opens with, and reporting that is what tells the caller which character
+                // the service objected to. The same rule as for a publish into the namespace
+                // space AWS reserves, which reports the reserved prefix alone
+                // ([`RESERVED_NAMESPACE_PREFIX`]).
+                if dimension.name.starts_with(FORBIDDEN_DIMENSION_NAME_PREFIX) {
+                    return Err(value_is_invalid(
+                        FORBIDDEN_DIMENSION_NAME_PREFIX,
+                        &name_path,
+                    ));
+                }
+                if !has_non_whitespace(&dimension.name) {
                     return Err(value_is_invalid(&dimension.name, &name_path));
                 }
                 let value_path = format!("{dimension_path}.Value");
@@ -654,6 +678,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// supposed to own.
 const RESERVED_NAMESPACE_PREFIX: &str = "AWS/";
 
+/// The prefix a dimension NAME may not open with: "Dimension names must contain only ASCII
+/// characters, must include at least one non-whitespace character, and cannot start with a
+/// colon (:)" (`Dimension$Name`).
+///
+/// It is both what the check looks for and what the refusal REPORTS, exactly as
+/// [`RESERVED_NAMESPACE_PREFIX`] is for a namespace: the offending part of the value is the
+/// character the name opens with.
+const FORBIDDEN_DIMENSION_NAME_PREFIX: &str = ":";
+
 /// How far BEHIND the current instant a datum's time stamp may be: "You can specify time
 /// stamps that are as much as two weeks before the current date" (`PutMetricData`).
 const INGEST_WINDOW_BEHIND_SECS: f64 = 14.0 * 24.0 * 60.0 * 60.0;
@@ -742,6 +775,20 @@ fn value_is_invalid(value: &str, parameter: &str) -> PutMetricDataError {
 /// Refuse a list that carries more entries than its documented cap.
 fn collection_too_large(collection: &str, cap: usize) -> PutMetricDataError {
     invalid_parameter_value(crate::state::collection_too_large_message(collection, cap))
+}
+
+/// Refuse a publish that carries no metric datum at all, through the missing-parameter fault
+/// this operation's model declares (`MissingRequiredParameterException`, "An input parameter
+/// that is required is missing", HTTP 400, `awsQueryError` code `MissingParameter`).
+///
+/// The whole sentence is fixed text of that refusal: a call carrying no datum states no value
+/// for the data it publishes, and there is nothing of the request to name — the member it was
+/// looked for on is the same member for every such call.
+fn at_least_one_datum() -> PutMetricDataError {
+    PutMetricDataErrorModeled::MissingRequiredParameterException(MissingRequiredParameterException {
+        message: Some("At least one MetricDatum object must be present in the request.".to_string()),
+    })
+    .into()
 }
 
 /// Refuse a request that carries two members which state the same thing two ways.
