@@ -5,9 +5,10 @@
 //! Every assertion here is about a RULE, asserted over a set of inputs rather than
 //! over one request:
 //!
-//! 1. a requested window the addressed stream's archive holds no fragment in is
+//! 1. a requested window the addressed stream's archive holds no media PLAYING in is
 //!    refused WHOLESALE — HTTP 404, `ResourceNotFoundException`, one fixed sentence
-//!    — and because that refusal is a function of the archive and the window alone,
+//!    — while a window an earlier-starting fragment still plays over is served, and
+//!    because that refusal is a function of the archive and the window alone,
 //!    identical calls in flight together are answered identically;
 //! 2. the images are the window's sampled instants: its start, then one per
 //!    `SamplingInterval`, at most 25 to a page, with a `NextToken` while more remain;
@@ -339,6 +340,289 @@ async fn a_window_with_no_fragments_is_refused_wholesale() {
             message, NO_FRAGMENTS,
             "case {case:?}: expected {NO_FRAGMENTS:?}, got {message:?}"
         );
+    }
+}
+
+/// How long the one fragment of [`LONG_FRAGMENT_STREAM`] plays, in milliseconds: a
+/// whole minute of media from ONE producer timestamp, so a sampled window fits
+/// strictly inside it and holds no fragment START at all.
+const LONG_FRAGMENT_MILLIS: u64 = 60_000;
+
+/// A stream holding exactly one minute-long fragment.
+const LONG_FRAGMENT_STREAM: &str = "get-images-long-fragment-stream";
+
+/// A stream holding exactly one fragment of no duration, which therefore plays at the
+/// single instant it is stamped at and nowhere else.
+const INSTANT_FRAGMENT_STREAM: &str = "get-images-instant-fragment-stream";
+
+/// [`harness`] with two more streams, each holding ONE fragment stamped at the same
+/// producer and server timestamps as the first seeded fragment but playing for a
+/// different length of time: a whole minute, and no time at all.
+fn harness_with_one_fragment_each() -> Harness {
+    let harness = harness();
+    {
+        let state = service_state(&*harness.engine).expect("the service store");
+        let mut state = state.lock();
+        let created_at = from_epoch_millis(T0_SECS * 1000);
+        for (name, duration_millis) in [
+            (LONG_FRAGMENT_STREAM, LONG_FRAGMENT_MILLIS),
+            (INSTANT_FRAGMENT_STREAM, 0),
+        ] {
+            let archived = ArchivedStream::new(name, REGION, created_at, 24);
+            register_stream(&harness.engine, &archived);
+            state.put_stream(archived);
+            assert!(
+                state.append_fragment(
+                    name,
+                    StoredFragment::new(
+                        FRAGMENT_BASE.to_string(),
+                        from_epoch_millis(producer_secs(0) * 1000),
+                        from_epoch_millis(server_secs(0) * 1000),
+                        duration_millis,
+                        frame_png(FRAME_WIDTH, FRAME_HEIGHT),
+                    ),
+                ),
+                "case seed {name}: the stream must exist"
+            );
+        }
+    }
+    harness
+}
+
+/// One row of the coverage table: a window over an archive holding ONE fragment, and
+/// what the archive holds for it.
+struct CoverageCase {
+    /// What this row is about.
+    case: &'static str,
+    /// The stream the request addresses.
+    stream: &'static str,
+    /// The `ImageSelectorType` the request names.
+    selector: &'static str,
+    /// The window, in epoch seconds.
+    start_secs: i64,
+    end_secs: i64,
+    /// The `SamplingInterval` the request names, if any.
+    interval_millis: Option<i64>,
+    /// `None` when the window holds no archived media at all, so the whole call is
+    /// refused; otherwise one entry per sampled instant: whether media covers it (an
+    /// image is generated) or not (`NO_MEDIA` is reported for that instant alone).
+    covered: Option<Vec<bool>>,
+}
+
+/// RULE: whether the archive holds media "in" a requested window is decided by what was
+/// PLAYING over it — a fragment whose own timestamp starts at or before an instant of
+/// the window and whose playback duration still covers that instant holds media for it,
+/// whether or not the fragment started inside the window — so a window every instant of
+/// which is backed by an earlier-starting fragment is served, and only a window no
+/// archived fragment plays anywhere in is refused wholesale.
+///
+/// The rows differ along what the rule generalises over: where the window sits relative
+/// to the one fragment's playback (strictly inside it, straddling its start, straddling
+/// its end, entirely past it), how long that fragment plays (a whole minute, no time at
+/// all), which timestamp field is selected, and whether the request samples the window
+/// at all.
+#[tokio::test]
+async fn a_window_the_archive_plays_over_is_served_wherever_its_fragment_started() {
+    let harness = harness_with_one_fragment_each();
+    let from = producer_secs(0);
+    let from_server = server_secs(0);
+    let rows = vec![
+        CoverageCase {
+            case: "a window strictly inside the minute-long fragment, which starts \
+                   before it and plays past it",
+            stream: LONG_FRAGMENT_STREAM,
+            selector: "PRODUCER_TIMESTAMP",
+            start_secs: from + 10,
+            end_secs: from + 20,
+            interval_millis: Some(1_000),
+            covered: Some(vec![true; 11]),
+        },
+        CoverageCase {
+            case: "that same window on the server timestamp field",
+            stream: LONG_FRAGMENT_STREAM,
+            selector: "SERVER_TIMESTAMP",
+            start_secs: from_server + 10,
+            end_secs: from_server + 20,
+            interval_millis: Some(1_000),
+            covered: Some(vec![true; 11]),
+        },
+        CoverageCase {
+            case: "a window inside the fragment, sampled at no interval at all",
+            stream: LONG_FRAGMENT_STREAM,
+            selector: "PRODUCER_TIMESTAMP",
+            start_secs: from + 30,
+            end_secs: from + 31,
+            interval_millis: None,
+            covered: Some(vec![true]),
+        },
+        CoverageCase {
+            case: "a window straddling the fragment's start: the instants before it \
+                   report NO_MEDIA",
+            stream: LONG_FRAGMENT_STREAM,
+            selector: "PRODUCER_TIMESTAMP",
+            start_secs: from - 5,
+            end_secs: from + 5,
+            interval_millis: Some(1_000),
+            covered: Some(vec![
+                false, false, false, false, false, true, true, true, true, true, true,
+            ]),
+        },
+        CoverageCase {
+            case: "a window straddling the instant the fragment finishes playing",
+            stream: LONG_FRAGMENT_STREAM,
+            selector: "PRODUCER_TIMESTAMP",
+            start_secs: from + 59,
+            end_secs: from + 61,
+            interval_millis: Some(1_000),
+            covered: Some(vec![true, false, false]),
+        },
+        CoverageCase {
+            case: "a window that opens the instant the fragment has finished playing",
+            stream: LONG_FRAGMENT_STREAM,
+            selector: "PRODUCER_TIMESTAMP",
+            start_secs: from + 60,
+            end_secs: from + 70,
+            interval_millis: Some(1_000),
+            covered: None,
+        },
+        CoverageCase {
+            case: "the minute-long fragment read on the field it plays nowhere near",
+            stream: LONG_FRAGMENT_STREAM,
+            selector: "SERVER_TIMESTAMP",
+            start_secs: from + 10,
+            end_secs: from + 20,
+            interval_millis: Some(1_000),
+            covered: None,
+        },
+        CoverageCase {
+            case: "a window opening on a fragment of no duration: its one instant is \
+                   covered and nothing after it is",
+            stream: INSTANT_FRAGMENT_STREAM,
+            selector: "PRODUCER_TIMESTAMP",
+            start_secs: from,
+            end_secs: from + 5,
+            interval_millis: Some(1_000),
+            covered: Some(vec![true, false, false, false, false, false]),
+        },
+        CoverageCase {
+            case: "a window after a fragment of no duration, which starts before the \
+                   window but plays nowhere in it",
+            stream: INSTANT_FRAGMENT_STREAM,
+            selector: "PRODUCER_TIMESTAMP",
+            start_secs: from + 1,
+            end_secs: from + 5,
+            interval_millis: Some(1_000),
+            covered: None,
+        },
+    ];
+
+    for row in rows {
+        let CoverageCase {
+            case,
+            stream,
+            selector,
+            start_secs,
+            end_secs,
+            interval_millis,
+            covered,
+        } = row;
+        let mut body = request(stream, selector, start_secs, end_secs, "JPEG");
+        if let Some(interval) = interval_millis {
+            body = with(&body, serde_json::json!({ "SamplingInterval": interval }));
+        }
+        let response = harness.post("/getImages", &body).await;
+        let status = response.status().as_u16();
+        let Some(covered) = covered else {
+            assert_eq!(
+                status, 404,
+                "case {case:?}: expected HTTP 404, got {status} with body {:?}",
+                String::from_utf8_lossy(response.body())
+            );
+            let (code, message) = reported(&response);
+            assert_eq!(
+                (code.as_str(), message.as_str()),
+                ("ResourceNotFoundException", NO_FRAGMENTS),
+                "case {case:?}: expected (\"ResourceNotFoundException\", {NO_FRAGMENTS:?}), \
+                 got ({code:?}, {message:?})"
+            );
+            continue;
+        };
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with body {:?}",
+            String::from_utf8_lossy(response.body())
+        );
+        let page = images(&response);
+        assert_eq!(
+            page.len(),
+            covered.len(),
+            "case {case:?}: expected {} images, got {}",
+            covered.len(),
+            page.len()
+        );
+        for (index, (image, has_media)) in page.iter().zip(covered).enumerate() {
+            if has_media {
+                assert_eq!(
+                    image["Error"],
+                    serde_json::Value::Null,
+                    "case {case:?}: instant {index} expected an image, got {image:?}"
+                );
+                assert!(
+                    !image_bytes(image).is_empty(),
+                    "case {case:?}: instant {index} expected image content, got {image:?}"
+                );
+            } else {
+                assert_eq!(
+                    image["Error"].as_str(),
+                    Some("NO_MEDIA"),
+                    "case {case:?}: instant {index} expected NO_MEDIA, got {image:?}"
+                );
+            }
+        }
+    }
+}
+
+/// RULE: the wholesale refusal is a function of the archive and the requested window
+/// ALONE, so no member that only shapes how the window is sampled or how many images
+/// one page carries can turn a served window into a refusal or back.
+///
+/// The rows cross a window the archive plays over with one it does not, over every
+/// sampling interval and page size the walk could be cut at.
+#[tokio::test]
+async fn how_a_window_is_sampled_does_not_decide_whether_the_archive_answers_it() {
+    let harness = harness_with_one_fragment_each();
+    let from = producer_secs(0);
+    // (case, start secs, end secs, the status every sampling of that window expects)
+    let windows: Vec<(&str, i64, i64, u16)> = vec![
+        ("inside the minute-long fragment", from + 10, from + 20, 200),
+        ("past the minute-long fragment", from + 60, from + 70, 404),
+    ];
+    for (case, start_secs, end_secs, expected) in windows {
+        for interval in [None, Some(200), Some(1_000), Some(7_000)] {
+            for max_results in [None, Some(1), Some(25)] {
+                let mut body = request(
+                    LONG_FRAGMENT_STREAM,
+                    "PRODUCER_TIMESTAMP",
+                    start_secs,
+                    end_secs,
+                    "JPEG",
+                );
+                if let Some(interval) = interval {
+                    body = with(&body, serde_json::json!({ "SamplingInterval": interval }));
+                }
+                if let Some(max_results) = max_results {
+                    body = with(&body, serde_json::json!({ "MaxResults": max_results }));
+                }
+                let response = harness.post("/getImages", &body).await;
+                let status = response.status().as_u16();
+                assert_eq!(
+                    status, expected,
+                    "case {case:?} sampled every {interval:?} ms into pages of \
+                     {max_results:?}: expected HTTP {expected}, got {status} with body {:?}",
+                    String::from_utf8_lossy(response.body())
+                );
+            }
+        }
     }
 }
 

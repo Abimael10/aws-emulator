@@ -16,18 +16,19 @@
 //!   range for `StartTimestamp`'s documented "inclusive range of timestamps for an
 //!   image to be returned" either — and when it spans more than the documented 300
 //!   seconds.
-//! * A window the stream's archive holds NO fragment in is refused WHOLESALE with
+//! * A window the stream's archive holds NO media in is refused WHOLESALE with
 //!   `ResourceNotFoundException` (404), not answered 200 with per-image markers: the
 //!   refusal is a pure function of the archive and the requested window, so repeating
 //!   the identical call — concurrently or not — answers identically.
-//!   "In" the window is the archive's one range rule, the same one `ListFragments`,
-//!   `GetClip` and the streaming sessions select with: a fragment is in a window when
-//!   its own selected timestamp — "the (starting) timestamp of the fragment" — falls
-//!   inside it. That is deliberately NOT the per-instant covering relation used below:
-//!   this refusal answers the error's documented condition, "a stream that has no
-//!   fragments within the requested time range", whereas an individual image is
-//!   generated from whichever fragment was being recorded at its instant, which may
-//!   have started before the window.
+//!   "In" the window is the PLAYBACK relation the images themselves are read on: the
+//!   archive holds media in a window when some fragment was being recorded at an
+//!   instant of it, a fragment that started before `StartTimestamp` and plays past it
+//!   included — `StartTimestamp` "must be within an inclusive range of timestamps for
+//!   an image to be returned", and that range is the one the archived media spans, not
+//!   the set of instants a fragment happens to start at. It is deliberately NOT the
+//!   start-only range rule `ListFragments`, `GetClip` and the streaming sessions
+//!   select with, whose own timestamp ranges document that a fragment starting before
+//!   the range is left out.
 //! * Otherwise one image is generated per sampled instant: the window's start, then one
 //!   every `SamplingInterval` milliseconds while the window lasts. Each image is either
 //!   the frame the covering fragment's archived bytes carry, re-encoded in the requested
@@ -164,7 +165,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    date_time_millis, epoch_millis, service_state, FragmentCursor, StoredFragment,
+    date_time_millis, fragment_covers_instant, service_state, FragmentCursor, StoredFragment,
     StreamLookupError, TimestampOrigin, NO_DATA_RETENTION_MESSAGE, TIMESTAMP_RANGE_ORDER_MESSAGE,
 };
 use std::io::Cursor;
@@ -213,7 +214,7 @@ const NO_MEDIA: &str = "NO_MEDIA";
 /// of the missing image."
 const MEDIA_ERROR: &str = "MEDIA_ERROR";
 
-/// The refusal a request over a window the archive holds no fragment in carries.
+/// The refusal a request over a window the archive holds no media in carries.
 /// `ResourceNotFoundException` (404) is what Kinesis Video Streams raises when it
 /// "can't find the stream that you specified" AND when the request names no archived
 /// media; this message is the second case, entirely fixed text naming neither the
@@ -536,12 +537,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             };
 
-            // The archive holds nothing in the requested window: the WHOLE call is
-            // refused, rather than answered with a list of absence markers.
-            if stream
-                .fragments_in_range(origin, start_millis, end_millis)
-                .is_empty()
-            {
+            // The archive holds no media anywhere in the requested window: the WHOLE
+            // call is refused, rather than answered with a list of absence markers.
+            //
+            // "In the window" is the same playback relation the bytes of an individual
+            // image are read on, so a window whose instants are backed by a fragment
+            // that started before it is served rather than reported empty; it is a
+            // function of the archive and the window alone — not of the sampling
+            // interval, nor of which page is being served — so identical calls and
+            // every continuation of one query decide it identically.
+            if !stream.holds_media_in_range(origin, start_millis, end_millis) {
                 return Err(GetImagesErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(NO_FRAGMENTS_MESSAGE.to_string()),
@@ -719,12 +724,7 @@ fn covering_media(
     fragments
         .iter()
         .rev()
-        .find(|fragment| {
-            let from = epoch_millis(origin.of(fragment));
-            let duration = i64::try_from(fragment.duration_millis).unwrap_or(i64::MAX);
-            let until = from.saturating_add(duration);
-            from <= at_millis && (at_millis < until || at_millis == from)
-        })
+        .find(|fragment| fragment_covers_instant(fragment, origin, at_millis))
         .map(|fragment| fragment.media.clone())
 }
 

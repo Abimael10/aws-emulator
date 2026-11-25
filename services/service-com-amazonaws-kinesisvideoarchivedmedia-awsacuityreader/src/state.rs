@@ -341,7 +341,14 @@ pub fn fragment_in<'a>(
 /// The fragments of `fragments` whose `origin` timestamp falls in the inclusive
 /// range `[start_millis, end_millis]`, in ingestion order.
 ///
-/// The one range rule every selector-driven operation uses.
+/// The one range rule every selector-driven operation uses, and deliberately a
+/// rule about a fragment's own START: the timestamp ranges of the streaming
+/// sessions and of the clip select a fragment that way — "Only fragments that
+/// start exactly at or after StartTimestamp are included in the session.
+/// Fragments that start before StartTimestamp and continue past it aren't
+/// included in the session." An operation that asks instead which media was
+/// PLAYING over a range reads [`range_holds_media`] /
+/// [`fragment_covers_instant`].
 #[must_use]
 pub fn fragments_in_range(
     fragments: &[StoredFragment],
@@ -356,6 +363,61 @@ pub fn fragments_in_range(
             at >= start_millis && at <= end_millis
         })
         .collect()
+}
+
+/// Whether the media `fragment` archives was being recorded AT `at_millis`, read
+/// on the `origin` timestamp field: its own selected timestamp starts at or
+/// before that instant and its playback duration still covers it.
+///
+/// A fragment of no duration covers the single instant it is stamped at, so
+/// every archived fragment holds media for at least its own start.
+#[must_use]
+pub fn fragment_covers_instant(
+    fragment: &StoredFragment,
+    origin: TimestampOrigin,
+    at_millis: i64,
+) -> bool {
+    let from = epoch_millis(origin.of(fragment));
+    let duration = i64::try_from(fragment.duration_millis).unwrap_or(i64::MAX);
+    let until = from.saturating_add(duration);
+    from <= at_millis && (at_millis < until || at_millis == from)
+}
+
+/// Whether the media `fragment` archives plays anywhere inside the inclusive
+/// range `[start_millis, end_millis]`, read on `origin`.
+///
+/// That is the PLAYBACK relation, not the start relation
+/// [`fragments_in_range`] selects on: a fragment that started before the range
+/// and is still playing inside it holds media for that range exactly as one that
+/// starts inside it does.
+#[must_use]
+pub fn fragment_covers_range(
+    fragment: &StoredFragment,
+    origin: TimestampOrigin,
+    start_millis: i64,
+    end_millis: i64,
+) -> bool {
+    let from = epoch_millis(origin.of(fragment));
+    (from >= start_millis && from <= end_millis)
+        || fragment_covers_instant(fragment, origin, start_millis)
+}
+
+/// Whether `fragments` holds any media playing inside the inclusive range
+/// `[start_millis, end_millis]`, read on `origin`.
+///
+/// The one "this range has media" rule, so an operation that reads an image from
+/// whichever fragment was recording at an instant decides absence on the same
+/// relation it reads those bytes on.
+#[must_use]
+pub fn range_holds_media(
+    fragments: &[StoredFragment],
+    origin: TimestampOrigin,
+    start_millis: i64,
+    end_millis: i64,
+) -> bool {
+    fragments
+        .iter()
+        .any(|f| fragment_covers_range(f, origin, start_millis, end_millis))
 }
 
 /// The one stream an archived-media read addresses.
@@ -409,6 +471,20 @@ impl ResolvedStream<'_> {
         end_millis: i64,
     ) -> Vec<&StoredFragment> {
         fragments_in_range(self.fragments, origin, start_millis, end_millis)
+    }
+
+    /// Whether this stream's archive holds media playing anywhere inside the
+    /// inclusive range `[start_millis, end_millis]`, read on `origin` — the
+    /// fragment that started before the range and is still playing inside it
+    /// included.
+    #[must_use]
+    pub fn holds_media_in_range(
+        &self,
+        origin: TimestampOrigin,
+        start_millis: i64,
+        end_millis: i64,
+    ) -> bool {
+        range_holds_media(self.fragments, origin, start_millis, end_millis)
     }
 
     /// The manifest/playlist snapshot a streaming session over this stream
