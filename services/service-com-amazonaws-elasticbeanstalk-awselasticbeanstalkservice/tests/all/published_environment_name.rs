@@ -120,7 +120,10 @@ async fn ok(emulator: &Emulator, case: &str, action: &str, params: &[(&str, &str
 }
 
 /// The same, signed for `region`.
-async fn ok_in(
+///
+/// `pub(crate)` for the sibling suite that drives the same launches in the same
+/// binary (`published_address_hosts.rs`), so one call-and-assert serves both.
+pub(crate) async fn ok_in(
     emulator: &Emulator,
     case: &str,
     region: &str,
@@ -358,7 +361,12 @@ async fn served(emulator: &Emulator, case: &str, cname: &str) -> String {
 /// LOOPBACK literal, the interface the core binds its listeners on and the one a
 /// resolver answers a name under the loopback zone with (RFC 6761), so what is
 /// under test is the addressing and not the host's own resolver.
-async fn dialled(case: &str, cname: &str) -> String {
+///
+/// `pub(crate)` because a sibling suite in this same binary asks the same
+/// question of the same published addresses (`published_address_hosts.rs`): one
+/// copy of the dial, so the two cannot drift about how a published address is
+/// reached.
+pub(crate) async fn dialled(case: &str, cname: &str) -> String {
     let (authority, path) = cname
         .split_once('/')
         .unwrap_or_else(|| panic!("case {case:?}: expected an address with a path, got {cname:?}"));
