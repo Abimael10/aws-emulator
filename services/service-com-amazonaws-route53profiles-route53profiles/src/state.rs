@@ -1008,14 +1008,17 @@ pub const PROFILE_RESOURCE_TYPE: &str = "PROFILE";
 /// The `ResourceType` a Profile-association error reports.
 pub const PROFILE_ASSOCIATION_RESOURCE_TYPE: &str = "PROFILE_ASSOCIATION";
 
-/// The message a "this id names nothing" refusal carries for the resource kinds of
-/// the Resolver family this service belongs to that share one template — a Profile,
-/// a Profile association, a tagged resource — whose only variable part is the id,
-/// taken verbatim from the request. A Profile RESOURCE association is reported with
-/// its own template instead ([`profile_resource_association_not_found`]).
+/// The message a "this id names no resource" refusal of this service carries: one
+/// template shared by the resource kinds whose readers report an unresolvable id as
+/// a missing resource — a Profile, a Profile association, a tagged resource — whose
+/// only variable part is the id, taken verbatim from the request.
 ///
 /// The family reports its sub-error code inside the message rather than in
 /// `Error.Code`, which stays `ResourceNotFoundException`.
+///
+/// A Profile RESOURCE association id is not one of those: see
+/// [`profile_resource_association_not_found`] for the template that plane carries, and
+/// [`invalid_profile_resource_association_id`] for a value that is no such id at all.
 fn resource_not_found_message(id: &str) -> String {
     format!("[RSLVR-05007] Can't find the resource with ID \"{id}\".")
 }
@@ -1097,9 +1100,47 @@ pub fn vpc_association_limit_exceeded(
 /// The `ResourceType` a Profile-resource-association error reports.
 pub const PROFILE_RESOURCE_ASSOCIATION_RESOURCE_TYPE: &str = "PROFILE_RESOURCE_ASSOCIATION";
 
-/// `ResourceNotFoundException` for a resource-association id that names no stored
-/// resource association — the refusal of every operation addressed by a
-/// `ProfileResourceAssociationId`.
+/// `ValidationException` for a `ProfileResourceAssociationId` whose FORM this service
+/// cannot read as one of its Profile resource association ids
+/// ([`is_profile_resource_association_id`]).
+///
+/// Such a value is settled as a PARAMETER before any lookup, so it is refused as an id
+/// the service will not accept rather than reported as an absent resource — the same
+/// refusal, and the same error shape, this family gives every other
+/// "<thing> in your request isn't valid" value ([`invalid_resource_arn`]). An id of the
+/// right form that resolves to nothing is the other refusal
+/// ([`profile_resource_association_not_found`]).
+///
+/// The one variable part is the id, taken verbatim from the request.
+pub fn invalid_profile_resource_association_id(
+    association_id: &str,
+) -> crate::ops::types::ValidationException {
+    crate::ops::types::ValidationException {
+        message: Some(format!(
+            "[RSLVR-05200] The Profile resource association ID in your request isn't valid: \
+             \"{association_id}\". Check the ID and try again."
+        )),
+    }
+}
+
+/// Whether `association_id` has the form of a Profile resource association id of this
+/// service: the prefix such an id is minted under followed by hex digits.
+///
+/// What the FORM decides is which refusal an id the store holds nothing for gets: an id
+/// this service could have minted names a resource that is absent, while anything else is
+/// a value it does not accept as such an id at all.
+pub fn is_profile_resource_association_id(association_id: &str) -> bool {
+    association_id
+        .strip_prefix(PROFILE_RESOURCE_ASSOCIATION_ID_PREFIX)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .is_some_and(|digits| {
+            !digits.is_empty() && digits.chars().all(|digit| digit.is_ascii_hexdigit())
+        })
+}
+
+/// `ResourceNotFoundException` for a resource-association id of the right form
+/// ([`is_profile_resource_association_id`]) that names no stored resource association —
+/// one whose association has been removed, and one that was never minted.
 ///
 /// This plane does NOT share the service's resource-kind-agnostic template
 /// ([`resource_not_found_message`]): an id that resolves to no Profile resource

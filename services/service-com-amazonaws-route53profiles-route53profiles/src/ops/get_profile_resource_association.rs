@@ -161,6 +161,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+        // The association is addressed by its own id, whose FORM this service settles as
+        // a PARAMETER before any lookup: a value it cannot read as one of its resource
+        // association ids is refused as a value it will not accept, while an id it could
+        // have minted that the store holds nothing for names an absent association.
+        if !crate::state::is_profile_resource_association_id(&input.profile_resource_association_id)
+        {
+            return Err(
+                GetProfileResourceAssociationErrorModeled::ValidationException(
+                    crate::state::invalid_profile_resource_association_id(
+                        &input.profile_resource_association_id,
+                    ),
+                )
+                .into(),
+            );
+        }
         let mut store = state.lock();
         store.settle_due_associations(::std::time::Instant::now());
         let association = store

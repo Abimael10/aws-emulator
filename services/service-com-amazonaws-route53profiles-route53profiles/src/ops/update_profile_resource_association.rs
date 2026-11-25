@@ -182,10 +182,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UpdateProfileResourceAssociationError::validation(message));
         }
 
+        // The update addresses the association by its own id, whose FORM this service
+        // settles as a PARAMETER before any lookup, exactly as the reader addressed by
+        // that id does: a value it cannot read as one of its resource association ids is
+        // refused as a value it will not accept.
+        if !crate::state::is_profile_resource_association_id(&input.profile_resource_association_id)
+        {
+            return Err(
+                UpdateProfileResourceAssociationErrorModeled::ValidationException(
+                    crate::state::invalid_profile_resource_association_id(
+                        &input.profile_resource_association_id,
+                    ),
+                )
+                .into(),
+            );
+        }
+
         let mut store = state.lock();
 
-        // The update addresses the association by its own id, so an id the store holds
-        // nothing for names nothing to update.
+        // An id of that form the store holds nothing for names no association to update.
         let Some(association) = store
             .profile_resource_associations
             .get_mut(&input.profile_resource_association_id)

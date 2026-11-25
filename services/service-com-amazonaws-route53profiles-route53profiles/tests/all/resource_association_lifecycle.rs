@@ -27,18 +27,19 @@
 //!   pattern, or a DNS Firewall priority outside the documented range is refused with
 //!   the stored association left exactly as it was;
 //! * `DisassociateResourceFromProfile` removes the association, reports it in the
-//!   phase of being removed, and leaves its id naming nothing;
-//! * an id that resolves to no stored resource association — one that was removed, and
-//!   one that was never minted — is refused by EVERY operation addressed by a
-//!   `ProfileResourceAssociationId` with the Profile-association not-found template,
-//!   while an operation addressed by the (Profile, resource) pair keeps naming both
-//!   values it was given;
+//!   phase of being removed, and leaves its id resolving to nothing;
+//! * an id no stored resource association answers to — one that was removed, and one
+//!   that was never minted — is refused by EVERY operation addressed by a
+//!   `ProfileResourceAssociationId`, on the id's FORM where this service cannot read it
+//!   as one of its own and on the store otherwise, while an operation addressed by the
+//!   (Profile, resource) pair keeps naming both values it was given;
 //! * a DNS Firewall rule group's `priority` is accepted inside the documented
 //!   range and refused outside it, with nothing persisted for a refused request;
 //! * an ARN naming any other kind of resource is refused;
 //! * a `ProfileId` that names nothing is `ResourceNotFoundException`, a repeat of a
-//!   (Profile, resource) pair already associated is `ConflictException`, and an
-//!   association id that was never minted is `ResourceNotFoundException`.
+//!   (Profile, resource) pair already associated is `ConflictException`, and a
+//!   resource-association id of a form this service does not mint is refused as a value
+//!   it will not accept (`ValidationException`).
 //!
 //! This suite keeps its own harness rather than the Profile suite's, because it
 //! also reaches the store directly to bring the clock-owed transition forward
@@ -58,7 +59,10 @@ use service_com_amazonaws_route53profiles_route53profiles::state::{
 };
 use service_com_amazonaws_route53profiles_route53profiles::EmulatedService;
 
-use super::harness::{assert_timestamp_form, path_label};
+use super::harness::{
+    assert_timestamp_form, association_not_found_message, invalid_association_id_message,
+    path_label,
+};
 
 /// This service's sigv4 signing name, from the model (`OPERATIONS.md`, "Wire protocol").
 const SIGNING_NAME: &str = "route53profiles";
@@ -357,15 +361,6 @@ fn being_removed_message(kind: &str) -> String {
     format!("Deleting the Profile to {kind} association")
 }
 
-/// The whole message an operation addressed by a `ProfileResourceAssociationId`
-/// refuses an id that resolves to no stored resource association with: the
-/// Profile-association sub-error code, the fixed sentence, and the id from the
-/// request in double quotes. TRANSCRIBED here, so the suite states the template
-/// independently of the code that renders it.
-fn association_not_found_message(id: &str) -> String {
-    format!("[RSLVR-05200] Can't locate the Profile association with ID: \"{id}\".")
-}
-
 /// Whether `id` is `rpr-` followed by 16 lowercase hex digits — the id shape this
 /// emulator mints for a resource association, inside `ResourceId`'s modelled 1..64
 /// length.
@@ -598,7 +593,9 @@ async fn a_disassociated_resource_association_is_reported_removed_and_then_names
             assert_timestamp_form(&case, member, &removed.association()[member]);
         }
 
-        // The id now names nothing, on every read and however often it is polled.
+        // The id now resolves to nothing, on every read and however often it is
+        // polled, and a removed association's id — an id of the form this service mints
+        // — names an absent association.
         for attempt in 0..3 {
             let gone = em.get_association(&id).await;
             assert_eq!(
@@ -661,17 +658,19 @@ fn pair_not_found_message(profile_id: &str, resource_arn: &str) -> String {
 }
 
 #[tokio::test]
-async fn an_id_that_resolves_to_no_resource_association_is_refused_with_the_association_template() {
+async fn an_id_no_resource_association_answers_to_is_refused_on_its_form_then_on_the_store() {
     let em = Emulator::new();
     let profile_id = em.profile("association-not-found").await;
 
-    // Rows spanning both ways an id comes to resolve to nothing — one minted and then
-    // removed per kind of resource a Profile can hold, and ids that were never minted
-    // — over ids differing in shape: the minted `rpr-` + 16 hex form at both ends of
-    // its range, a non-hex tail, a bare word, a single character, and exactly the
-    // modelled 64-character maximum of `ResourceId`
-    // (`smithy_query(query="shape",shape="ResourceId")`: @length 1..64).
-    let mut cases: Vec<(String, String)> = Vec::new();
+    // Rows spanning both ways an id comes to answer for no association — one minted and
+    // then removed per kind of resource a Profile can hold, and ids that were never
+    // minted — over ids differing in shape: the minted `rpr-` + hex form at both ends of
+    // its range, that prefix with a non-hex tail, a bare word, a single character, and
+    // exactly the modelled 64-character maximum of `ResourceId`
+    // (`smithy_query(query="shape",shape="ResourceId")`: @length 1..64). The third column
+    // is whether the value has the FORM this service mints such an id in, which is what
+    // decides which of the two refusals it earns.
+    let mut cases: Vec<(String, String, bool)> = Vec::new();
     for (index, (resource_arn, _resource_type, _kind)) in
         associable_resources().into_iter().enumerate()
     {
@@ -690,20 +689,39 @@ async fn an_id_that_resolves_to_no_resource_association_is_refused_with_the_asso
             "case arn={resource_arn}: disassociate expected 200, got {} / {:?}",
             removed.status, removed.body
         );
-        cases.push((format!("removed arn={resource_arn}"), id));
+        cases.push((format!("removed arn={resource_arn}"), id, true));
     }
-    for unminted in [
-        "rpr-0000000000000000",
-        "rpr-ffffffffffffffff",
-        "rpr-notevenhexdigit",
-        "nosuchassociation",
-        "z",
+    for (unminted, well_formed) in [
+        ("rpr-0000000000000000", true),
+        ("rpr-ffffffffffffffff", true),
+        ("rpr-notevenhexdigit", false),
+        ("nosuchassociation", false),
+        ("z", false),
     ] {
-        cases.push((format!("unminted {unminted}"), unminted.to_string()));
+        cases.push((
+            format!("unminted {unminted}"),
+            unminted.to_string(),
+            well_formed,
+        ));
     }
-    cases.push(("unminted 64-character id".to_string(), "q".repeat(64)));
+    cases.push((
+        "unminted 64-character id".to_string(),
+        "q".repeat(64),
+        false,
+    ));
 
-    for (origin, id) in cases {
+    for (origin, id, well_formed) in cases {
+        // What the row's form earns it: an id this service could have minted names an
+        // association that is absent, and a value it cannot read as such an id is one it
+        // will not accept at all.
+        let (expected_error, expected_message) = if well_formed {
+            (
+                "ResourceNotFoundException",
+                association_not_found_message(&id),
+            )
+        } else {
+            ("ValidationException", invalid_association_id_message(&id))
+        };
         // Both operations addressed by a `ProfileResourceAssociationId`: the read and
         // the update. Each reports the same refusal, because the id is what neither
         // can resolve.
@@ -722,21 +740,20 @@ async fn an_id_that_resolves_to_no_resource_association_is_refused_with_the_asso
             );
             assert_eq!(
                 reply.error.as_deref(),
-                Some("ResourceNotFoundException"),
-                "case {case}: expected ResourceNotFoundException, got {:?}",
+                Some(expected_error),
+                "case {case}: expected {expected_error}, got {:?}",
                 reply.body
             );
             assert_eq!(
                 reply.message(),
-                association_not_found_message(&id),
-                "case {case}: expected {:?}, got {:?}",
-                association_not_found_message(&id),
+                expected_message,
+                "case {case}: expected {expected_message:?}, got {:?}",
                 reply.message()
             );
         }
     }
 
-    // The template belongs to the operations addressed by the association's own id: an
+    // The refusal belongs to the operations addressed by the association's own id: an
     // operation addressed by the (Profile, resource) PAIR still names both values it
     // was given instead, since either half can be why the pair resolves to nothing.
     for (profile, arn) in [
@@ -966,18 +983,31 @@ async fn an_unknown_profile_a_repeated_pair_and_an_unminted_id_are_refused() {
         second.association()
     );
 
-    // An id that was never minted names nothing.
-    for unminted in ["rpr-0000000000000000", "rpr-doesnotexist"] {
+    // An id no association answers to, in each of the two forms: one this service could
+    // have minted names an absent association, and one it cannot read as such an id at
+    // all is a value it will not accept.
+    for (unminted, well_formed) in [("rpr-0000000000000000", true), ("rpr-doesnotexist", false)] {
+        let (expected_error, expected_message) = if well_formed {
+            (
+                "ResourceNotFoundException",
+                association_not_found_message(unminted),
+            )
+        } else {
+            (
+                "ValidationException",
+                invalid_association_id_message(unminted),
+            )
+        };
         let refusal = em.get_association(unminted).await;
         assert_eq!(
             refusal.error.as_deref(),
-            Some("ResourceNotFoundException"),
-            "case id={unminted}: expected ResourceNotFoundException, got {:?}",
+            Some(expected_error),
+            "case id={unminted}: expected {expected_error}, got {:?}",
             refusal.body
         );
         assert_eq!(
             refusal.message(),
-            association_not_found_message(unminted),
+            expected_message,
             "case id={unminted}: unexpected refusal message"
         );
     }
@@ -1176,10 +1206,22 @@ async fn a_refused_update_leaves_the_stored_association_exactly_as_it_was() {
     );
     let group_id = created.field("Id");
 
-    // An id the store holds nothing for names nothing to update. The members it does
-    // carry are valid, so the refusal can only be the id's.
-    for unminted in ["rpr-0000000000000000", "rpr-doesnotexist"] {
+    // An id no association answers to names nothing to update. The members the request
+    // does carry are valid, so the refusal can only be the id's — and it is the same
+    // refusal the reader addressed by that id gives, each form its own.
+    for (unminted, well_formed) in [("rpr-0000000000000000", true), ("rpr-doesnotexist", false)] {
         let case = format!("id={unminted}");
+        let (expected_error, expected_message) = if well_formed {
+            (
+                "ResourceNotFoundException",
+                association_not_found_message(unminted),
+            )
+        } else {
+            (
+                "ValidationException",
+                invalid_association_id_message(unminted),
+            )
+        };
         let refusal = em.update(unminted, Some("renamed"), None).await;
         assert_eq!(
             refusal.status, 400,
@@ -1188,13 +1230,13 @@ async fn a_refused_update_leaves_the_stored_association_exactly_as_it_was() {
         );
         assert_eq!(
             refusal.error.as_deref(),
-            Some("ResourceNotFoundException"),
+            Some(expected_error),
             "case {case}: unexpected error code, got {:?}",
             refusal.body
         );
         assert_eq!(
             refusal.message(),
-            association_not_found_message(unminted),
+            expected_message,
             "case {case}: unexpected refusal message"
         );
     }

@@ -13,8 +13,13 @@
 //!   for each of those kinds and every operation addressed by such an id, whose only
 //!   variable part is the id the request named; an operation addressed by a
 //!   (ProfileId, ResourceId) PAIR names both ids instead, since either half can be why
-//!   the pair resolves to nothing. (The Profile RESOURCE association plane has its own
-//!   template, held to in `resource_association_lifecycle.rs`.)
+//!   the pair resolves to nothing;
+//! * a Profile RESOURCE association is the exception: an operation addressed by a
+//!   `ProfileResourceAssociationId` settles the FORM of that id as a PARAMETER before
+//!   any lookup, so a value it cannot read as one of its own ids is refused as a value
+//!   the service will not accept (`ValidationException`, the shape every other "isn't
+//!   valid" refusal of this family uses), while an id of that form the store holds
+//!   nothing for is the association plane's own not-found template;
 //! * `DeleteProfile` refuses a Profile an association still names with
 //!   `ConflictException`, and the message names the blocking ASSOCIATION, read off
 //!   the service's own state, so the caller is told what to delete first;
@@ -23,7 +28,9 @@
 //!   while re-associating the SAME pair reports the association as already existing;
 //! * every one of these refusals is HTTP 400.
 
-use super::harness::Emulator;
+use serde_json::json;
+
+use super::harness::{association_not_found_message, invalid_association_id_message, Emulator};
 
 /// The single message a missing resource of this service is reported with: the
 /// Resolver-family sub-error code, a fixed sentence, and the id from the request.
@@ -357,4 +364,134 @@ async fn a_vpc_that_already_has_a_profile_is_refused_as_a_spent_quota() {
         );
         em.disassociate(&rival, resource_id).await;
     }
+}
+
+/// `ProfileResourceAssociationId` values no stored resource association answers to,
+/// each with the refusal its FORM earns it: `true` where the value has the form this
+/// service mints such an id in (so it names an association that is absent), `false`
+/// where it does not (so it is no such id at all).
+///
+/// The rows differ in form — the minted prefix with hex digits at both ends of its
+/// range, that prefix with a non-hex tail, a neighbouring resource kind's prefix, a
+/// bare word, a single character, and exactly the 64-character maximum of `ResourceId`
+/// (`smithy_query(query="shape",shape="ResourceId")`: `length 1..64`), so every row
+/// passes the modelled constraint and reaches the handler.
+fn ids_no_association_answers_to() -> Vec<(String, bool)> {
+    vec![
+        ("rpr-0123456789abcdef".to_string(), true),
+        ("rpr-0000000000000000".to_string(), true),
+        ("rpr-ffffffffffffffff".to_string(), true),
+        ("rpr-notevenhexdigits".to_string(), false),
+        ("rpra-neverminted".to_string(), false),
+        ("rp-0123456789abcdef".to_string(), false),
+        ("rpassoc-fedcba9876543210".to_string(), false),
+        ("nosuchassociation".to_string(), false),
+        ("z".to_string(), false),
+        ("q".repeat(64), false),
+    ]
+}
+
+#[tokio::test]
+async fn an_id_no_resource_association_answers_to_is_refused_on_its_form_then_on_the_store() {
+    let em = Emulator::new();
+    let profile_id = em
+        .create_named("bad-id-host")
+        .await
+        .nested_string("Profile", "Id");
+    // A live association, so the suite also shows the id that DOES resolve is served.
+    // A private hosted zone's ARN carries neither region nor account, which is what
+    // `AssociateResourceToProfile` documents first among the resources a Profile holds.
+    let hosted_zone = "arn:aws:route53:::hostedzone/Z11111111111AAAAAAAAA";
+    let live = em
+        .associate_resource(&profile_id, hosted_zone, "live-resource", None)
+        .await;
+    assert_eq!(
+        live.status, 200,
+        "setup: AssociateResourceToProfile expected 200, got {} / {:?}",
+        live.status, live.body
+    );
+    let live_id = live.nested_string("ProfileResourceAssociation", "Id");
+
+    for (id, well_formed) in ids_no_association_answers_to() {
+        // The shape and the message the row's FORM earns it: an id this service could
+        // have minted names an absent association, anything else is no such id at all.
+        let (expected_error, expected_message) = if well_formed {
+            ("ResourceNotFoundException", association_not_found_message(&id))
+        } else {
+            ("ValidationException", invalid_association_id_message(&id))
+        };
+        // Every operation addressed by a resource-association id, with the update
+        // asked for both a member it could apply and nothing at all, so the refusal
+        // can only be the id's.
+        let cases = vec![
+            (
+                "GetProfileResourceAssociation",
+                em.get_resource_association(&id).await,
+            ),
+            (
+                "UpdateProfileResourceAssociation Name",
+                em.update_resource_association(&id, json!({ "Name": "renamed" }))
+                    .await,
+            ),
+            (
+                "UpdateProfileResourceAssociation no member",
+                em.update_resource_association(&id, json!({})).await,
+            ),
+        ];
+        for (operation, reply) in cases {
+            let case = format!("{operation} id={id:?} well_formed={well_formed}");
+            assert_eq!(
+                reply.status, 400,
+                "case {case}: expected HTTP 400, got {} / {:?}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                reply.error.as_deref(),
+                Some(expected_error),
+                "case {case}: expected {expected_error}, got {:?}",
+                reply.body
+            );
+            let header = reply.error_type_header.clone().unwrap_or_default();
+            assert!(
+                header.contains(expected_error),
+                "case {case}: x-amzn-errortype must name {expected_error}, got {header:?}"
+            );
+            assert_eq!(
+                reply.message(),
+                expected_message,
+                "case {case}: expected {expected_message:?}, got {:?}",
+                reply.message()
+            );
+        }
+    }
+
+    // Positive control: the id the associate call minted still reads back, and the
+    // update addressed by it still applies, so the refusal above is about the id
+    // resolving to nothing and nothing else.
+    let fetched = em.get_resource_association(&live_id).await;
+    assert_eq!(
+        fetched.status, 200,
+        "case id={live_id:?}: a minted id expected 200, got {} / {:?}",
+        fetched.status, fetched.body
+    );
+    assert_eq!(
+        fetched.nested_string("ProfileResourceAssociation", "Id"),
+        live_id,
+        "case id={live_id:?}: the read-back must report the association asked for, got {:?}",
+        fetched.body
+    );
+    let updated = em
+        .update_resource_association(&live_id, json!({ "Name": "renamed" }))
+        .await;
+    assert_eq!(
+        updated.status, 200,
+        "case id={live_id:?}: an update of a minted id expected 200, got {} / {:?}",
+        updated.status, updated.body
+    );
+    assert_eq!(
+        updated.nested_string("ProfileResourceAssociation", "Name"),
+        "renamed",
+        "case id={live_id:?}: the update must apply the Name it named, got {:?}",
+        updated.body
+    );
 }

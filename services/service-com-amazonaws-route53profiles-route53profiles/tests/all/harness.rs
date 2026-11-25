@@ -247,6 +247,17 @@ impl Emulator {
             .await
     }
 
+    /// `UpdateProfileResourceAssociation`: the association id is a path label and the
+    /// body carries only the members this update names.
+    pub(crate) async fn update_resource_association(&self, id: &str, body: Value) -> Reply {
+        self.call(
+            "PATCH",
+            &format!("/profileresourceassociation/{id}"),
+            Some(body),
+        )
+        .await
+    }
+
     /// `ListProfileResourceAssociations`: the Profile is a path label and
     /// `ResourceType`, `MaxResults` and `NextToken` are query parameters, so
     /// `query` is appended as given (`""` for none).
@@ -313,6 +324,27 @@ pub(crate) fn timestamp_fraction_digits(value: &Value) -> Option<usize> {
         return None;
     }
     Some(text.split_once('.').map_or(0, |(_, fraction)| fraction.len()))
+}
+
+/// The message this service refuses a `ProfileResourceAssociationId` it can resolve
+/// to no stored resource association with, when the id has the FORM of one of its own
+/// (the prefix such an id is minted under followed by hex digits): the
+/// Profile-association sub-error code, the fixed sentence, and the id taken verbatim
+/// from the request. Transcribed here, so every suite states the template
+/// independently of the code that renders it.
+pub(crate) fn association_not_found_message(id: &str) -> String {
+    format!("[RSLVR-05200] Can't locate the Profile association with ID: \"{id}\".")
+}
+
+/// The message this service refuses a `ProfileResourceAssociationId` whose FORM it
+/// cannot read as one of its own with: the same sub-error code, the sentence for a
+/// value it will not accept as such an id, and the id taken verbatim from the request.
+/// Transcribed here for the same reason.
+pub(crate) fn invalid_association_id_message(id: &str) -> String {
+    format!(
+        "[RSLVR-05200] The Profile resource association ID in your request isn't valid: \
+         \"{id}\". Check the ID and try again."
+    )
 }
 
 /// Asserts that `value` is carried the way this service carries a lifecycle

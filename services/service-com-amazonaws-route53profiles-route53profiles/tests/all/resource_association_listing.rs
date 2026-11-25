@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::harness::{path_label, Emulator, Reply, ACCOUNT_ID};
+use super::harness::{association_not_found_message, path_label, Emulator, Reply, ACCOUNT_ID};
 
 /// The region the shared harness signs for, used to build the ARNs below.
 const REGION: &str = "us-east-1";
@@ -625,15 +625,10 @@ async fn associate(
         .to_string()
 }
 
-/// `UpdateProfileResourceAssociation`: the association's own id is a path label and
-/// the members to change travel in the body.
+/// `UpdateProfileResourceAssociation`, through the shared harness method so this
+/// suite builds no second copy of that request.
 async fn update_association(em: &Emulator, id: &str, body: Value) -> Reply {
-    em.call(
-        "PATCH",
-        &format!("/profileresourceassociation/{id}"),
-        Some(body),
-    )
-    .await
+    em.update_resource_association(id, body).await
 }
 
 /// `DisassociateResourceFromProfile`: the (Profile, resource ARN) pair are both
@@ -989,6 +984,13 @@ async fn the_listing_follows_the_store_through_an_update_and_a_disassociate() {
         Some("ResourceNotFoundException"),
         "case id={rule_group}: a disassociated association's id must name nothing, got {:?}",
         gone.body
+    );
+    assert_eq!(
+        gone.message(),
+        association_not_found_message(&rule_group),
+        "case id={rule_group}: expected {:?}, got {:?}",
+        association_not_found_message(&rule_group),
+        gone.message()
     );
 
     // `MaxResults` is modelled `range 1..100`, so a page size outside it is refused
