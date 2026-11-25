@@ -216,7 +216,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The function has to exist before any of its capacity can be reserved, and
-        // resolution is what brings the record up to whatever the clock already made due.
+        // resolution is what brings the record up to whatever the clock already made due. The
+        // resource the refusal names is the one this call addressed: the function at the
+        // version its capacity is reserved for
+        // (`crate::state::reserved_concurrency_not_found_message`).
         crate::state::resolve_function(&mut store, &input.function_name, None, &region, now)
             .map_err(|failure| match failure {
                 crate::state::ResolveFailure::Malformed(message) => invalid_parameter(message),
@@ -224,7 +227,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     PutFunctionConcurrencyErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
                             r#type: None,
-                            message: Some(message),
+                            message: Some(
+                                crate::state::reserved_concurrency_not_found_message(
+                                    &region, &reference, message,
+                                ),
+                            ),
                         },
                     )
                     .into()

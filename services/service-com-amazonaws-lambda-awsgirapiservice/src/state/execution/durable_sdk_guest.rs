@@ -47,6 +47,18 @@
 //!   execution's history comes to carry what the handler really did. A step that has already
 //!   SUCCEEDED is never run a second time: a checkpointed step is complete, which is the
 //!   at-most-once guarantee the programming model gives a unit of work.
+//! * `context.invoke(function, payload)` invokes ANOTHER function as one CHAINED INVOCATION of
+//!   this execution and answers what that function returned. The invocation is the same
+//!   `Invoke` call a client makes, dispatched through the one seam a run reaches another service
+//!   by ([`super::aws_api`]), so the invoked function RUNS, is handed the caller's payload,
+//!   writes its own log and answers its own result — and an invocation the service refuses is
+//!   refused exactly as a client's is. Like every other operation of the model it is
+//!   CHECKPOINTED: the chained invocation that began, carrying the function it invokes and the
+//!   input it carries, and then the one that answered or the one that failed, through the one
+//!   host function that records a checkpoint ([`super::super::durable_steps`]), so the
+//!   execution's history carries the chain the handler really took. A chained invocation that
+//!   did not answer raises `CallableRuntimeError` carrying the error the service or the invoked
+//!   function reported, so an uncaught one fails the execution with that error.
 //! * `Duration` is the span type the model's own operations take, with the constructors a
 //!   handler writes (`from_millis`, `from_seconds`, `from_minutes`, `from_hours`,
 //!   `from_days`) and the readings it gives back.
@@ -58,10 +70,6 @@
 //!   ([`super::super::durable_callbacks`]), which is where the `CallbackStarted` history event
 //!   carrying the id is appended; `WaitForCallbackConfig` is the configuration a handler names
 //!   the timeouts in.
-//!
-//! What it does NOT do: the CHAINED INVOCATION operations of the model, which start another
-//! execution. A handler reaching for one is answered the attribute error of a name this runtime
-//! does not supply, rather than a handle to an execution nothing started.
 
 use super::package::PackageModule;
 
@@ -139,6 +147,7 @@ __all__ = [
 /// `aws_durable_execution_sdk_python`: the names a durable handler imports.
 const DURABLE_SDK_SOURCE: &str = r#""""The durable-execution programming model for Python handlers."""
 
+import base64 as _base64
 import json as _json
 import time
 
@@ -160,11 +169,13 @@ __all__ = [
 
 
 class CallableRuntimeError(Exception):
-    """What a STEP whose work kept raising fails the execution with.
+    """What an operation of this model whose work did not answer fails the execution with.
 
-    A step is attempted again for as long as its retry strategy allows; once those attempts
+    A STEP is attempted again for as long as its retry strategy allows; once those attempts
     are spent, the execution fails with this error carrying the message the work's own
-    exception carried.
+    exception carried. A CHAINED INVOCATION that did not answer -- one the service refused, one
+    whose invoked function failed -- raises it carrying the message that service or that
+    function reported.
     """
 
 
@@ -400,6 +411,143 @@ def _result_payload(value):
         return None
 
 
+# What ONE chained invocation is: the same `Invoke` call a client makes, made through the one
+# seam a run reaches another service by, and made SYNCHRONOUSLY because the answer is what the
+# handler that took the invocation reads back.
+_INVOKE_SERVICE = "lambda"
+_INVOKE_OPERATION = "Invoke"
+_INVOKE_TYPE = "RequestResponse"
+
+# The `OperationType` of a chained invocation and the `OperationAction`s taken on it, as the
+# model names them (`OperationUpdate$Type`, `OperationUpdate$Action`).
+_CHAINED_INVOKE = "CHAINED_INVOKE"
+
+
+def _first_named(options, *names):
+    """The first of `names` that `options` carries a value under."""
+    for name in names:
+        held = options.get(name)
+        if held is not None:
+            return held
+    return None
+
+
+def _invoke_payload_text(payload):
+    """The event a chained invocation carries, as the JSON text `Invoke$Payload` takes.
+
+    Text and bytes are the document the caller rendered itself, which is the form that member
+    carries one in; any other value IS the document, so it is rendered here.
+    """
+    if payload is None:
+        return None
+    if isinstance(payload, (bytes, bytearray)):
+        return bytes(payload).decode("utf-8", "replace")
+    if isinstance(payload, str):
+        return payload
+    return _json.dumps(payload)
+
+
+def _invoke_call(target, input_text, tenant_id):
+    """Invoke `target` and answer what the service said.
+
+    The invocation is dispatched through the host's own call seam, so it is the very `Invoke`
+    request a client makes: the invoked function RUNS, writes its own log and answers its own
+    payload, and an invocation the service refuses is refused exactly as a client's is.
+
+    `tenant_id` is the RUN's own tenant, never a value the handler named, so a chained
+    invocation addresses the tenant of the execution that took it ([`DurableContext.invoke`]).
+
+    The REGION is the invocation's own: the seam replaces a value that is no Region name with
+    it, so a chained invocation names none and reaches the endpoint this run was addressed at.
+    """
+    request = {"FunctionName": target, "InvocationType": _INVOKE_TYPE}
+    if input_text is not None:
+        request["Payload"] = _base64.b64encode(input_text.encode("utf-8")).decode("ascii")
+    if tenant_id is not None:
+        request["TenantId"] = str(tenant_id)
+    answered = _host.aws(_INVOKE_SERVICE, _INVOKE_OPERATION, "", _json.dumps(request))
+    try:
+        answered = _json.loads(answered)
+    except ValueError:
+        return {"refused": "not_made", "detail": "the chained invocation was not answered"}
+    return answered if isinstance(answered, dict) else {}
+
+
+def _answered_document(answered):
+    """The output document a call answered, keyed by the operation's own output members."""
+    text = answered.get("body") or ""
+    try:
+        document = _json.loads(text) if text else {}
+    except ValueError:
+        return {}
+    return document if isinstance(document, dict) else {}
+
+
+def _answered_text(answered, document, member):
+    """The text one member of the answer carries, decoded from the base64 a blob travelled as.
+
+    WHICH of the answer's members carry bytes is the called operation's own model's to say, and
+    the host names them beside the answer, so a member it named is decoded and any other is
+    read as the text it already is.
+    """
+    held = document.get(member)
+    if not isinstance(held, str):
+        return ""
+    carried = list(answered.get("payloadBlobs") or []) + list(answered.get("streams") or [])
+    if member not in carried:
+        return held
+    try:
+        return _base64.b64decode(held).decode("utf-8", "replace")
+    except (TypeError, ValueError):
+        return ""
+
+
+def _refused_sentence(document):
+    """The message a refusal carried, under either spelling this wire uses for it."""
+    for member in ("message", "Message", "errorMessage"):
+        held = document.get(member)
+        if isinstance(held, str):
+            return held
+    return ""
+
+
+# The separator a shape id carries between its namespace and the shape's own name, which is
+# what an error class arrives named by.
+_SHAPE_ID_SEPARATOR = chr(35)
+
+
+def _refused_class(answered, document):
+    """The error class a refusal named, as the service answered it, and none for one that
+    named none."""
+    for named in (answered.get("errorType"), document.get("__type"), document.get("Code")):
+        if not isinstance(named, str):
+            continue
+        shape = named.rpartition(_SHAPE_ID_SEPARATOR)[2].split(":")[0].strip()
+        if shape:
+            return shape
+    return None
+
+
+def _error_document(text):
+    """The error document a FAILED invocation answered, as a runtime writes one."""
+    try:
+        document = _json.loads(text)
+    except ValueError:
+        return {}
+    return document if isinstance(document, dict) else {}
+
+
+def _invoked_result(text):
+    """What the invoked function returned, as the handler reads it: the JSON it answered, the
+    text itself for an answer that is not JSON, and nothing for one that answered nothing."""
+    if not text:
+        return None
+    try:
+        return _json.loads(text)
+    except ValueError:
+        return text
+
+
 # How long this model waits between two readings of a callback it is waiting on, in seconds.
 #
 # The window a callback is open for is the HOST's, and so is the instant it closes, so a reading
@@ -551,6 +699,7 @@ class DurableContext:
         self._steps = 0
         self._waits = 0
         self._callbacks = 0
+        self._invokes = 0
 
     def __getattr__(self, name):
         return getattr(self._context, name)
@@ -664,6 +813,127 @@ class DurableContext:
             # clamps to what is left of the invocation.
             time.sleep(_CALLBACK_POLL_SECONDS)
 
+    def invoke(self, function_name=None, payload=None, config=None, name=None, **options):
+        """Invoke ANOTHER function as one CHAINED INVOCATION of this execution, and answer
+        what it returned.
+
+        `function_name` is the name or ARN of the function to invoke
+        (`ChainedInvokeOptions$FunctionName`) and `payload` is the event it is handed; either
+        may be named on a configuration passed beside them instead. The invocation is one
+        OPERATION of this execution, so it is CHECKPOINTED like every other one: the chained
+        invocation that STARTED, carrying the function it invokes and the input it carries, and
+        then the one that ANSWERED, carrying the answer -- or the one that FAILED, carrying the
+        error it failed with.
+
+        What comes back is what the invoked function returned. An invocation the service
+        REFUSED -- a function that does not exist among them -- and one whose function FAILED
+        both raise `CallableRuntimeError` carrying that error's own message, so a handler that
+        does not catch it fails this execution with the error the chain failed on.
+
+        The TENANT the invocation is made under is the RUN's own, read off the invocation
+        context this durable context was built from: a chained invocation stays inside the
+        tenant of the execution that took it, so no call of this operation can name another
+        one.
+        """
+        target = function_name
+        if target is None:
+            target = _first_named(
+                options, "function_name", "functionName", "FunctionName", "target"
+            )
+        if target is None:
+            target = _member(config, "function_name", "functionName", "FunctionName")
+        if not isinstance(target, str) or not target:
+            raise TypeError(
+                "a chained invocation names the function to invoke, not %r" % (target,)
+            )
+        held = payload
+        if held is None:
+            held = _first_named(options, "payload", "Payload", "input", "event")
+        if held is None:
+            held = _member(config, "payload", "input")
+        tenant = getattr(self._context, "tenant_id", None)
+        if name is None:
+            name = _member(config, "name")
+        input_text = _invoke_payload_text(held)
+        self._invokes += 1
+        identifier = "invoke-%d" % self._invokes
+        self._checkpoint(
+            "START",
+            identifier,
+            name,
+            1,
+            operation=_CHAINED_INVOKE,
+            payload=input_text,
+            function_name=target,
+            tenant_id=tenant,
+        )
+        answered = _invoke_call(target, input_text, tenant)
+        refused = answered.get("refused")
+        if refused:
+            # The call was not MADE at all, so nothing invoked the function: the operation
+            # failed for the reason the host gives rather than for anything a service said.
+            raise self._chain_failed(
+                identifier, name, target, answered.get("detail") or refused, None
+            )
+        status = answered.get("status") or 0
+        document = _answered_document(answered)
+        if not 200 <= status < 300:
+            # The SERVICE refused the invocation, and its own refusal is what this operation
+            # failed with: a function that does not exist fails the execution with the
+            # service's own function-not-found sentence.
+            raise self._chain_failed(
+                identifier,
+                name,
+                target,
+                _refused_sentence(document),
+                _refused_class(answered, document),
+            )
+        carried = _answered_text(answered, document, "Payload")
+        if document.get("FunctionError"):
+            # The function RAN and failed. What such an invocation answers is that run's own
+            # error document, which is the error this operation failed with.
+            failed = _error_document(carried)
+            raise self._chain_failed(
+                identifier,
+                name,
+                target,
+                failed.get("errorMessage") or carried,
+                failed.get("errorType") or document.get("FunctionError"),
+            )
+        self._checkpoint(
+            "SUCCEED",
+            identifier,
+            name,
+            1,
+            operation=_CHAINED_INVOKE,
+            payload=carried or None,
+            function_name=target,
+            tenant_id=tenant,
+        )
+        return _invoked_result(carried)
+
+    def _chain_failed(self, identifier, name, target, message, code):
+        """Checkpoint the chained invocation `identifier` as FAILED, and answer the error to
+        raise for it.
+
+        The CHECKPOINT carries the error class the service or the invoked function named, which
+        is what the operation's own history event reports; what the handler is RAISED is the
+        model's own error for an operation whose work did not answer.
+        """
+        self._checkpoint(
+            "FAIL",
+            identifier,
+            name,
+            1,
+            operation=_CHAINED_INVOKE,
+            function_name=target,
+            error={
+                "errorType": code or "CallableRuntimeError",
+                "errorMessage": message,
+            },
+        )
+        return CallableRuntimeError(message)
+
     def step(self, work, *args, **kwargs):
         """Run one STEP of this execution and answer what its work returned.
 
@@ -768,6 +1038,8 @@ class DurableContext:
         next_attempt_delay=None,
         operation="STEP",
         wait_seconds=None,
+        function_name=None,
+        tenant_id=None,
     ):
         """Record one thing that happened to an operation of the execution this run belongs
         to."""
@@ -781,6 +1053,12 @@ class DurableContext:
             # `WaitOptions$WaitSeconds` and `WaitStartedDetails$Duration` are whole numbers
             # of seconds, so a span named finer than that is reported as the nearest second.
             record["waitSeconds"] = int(wait_seconds + 0.5)
+        if function_name is not None:
+            # `ChainedInvokeOptions$FunctionName`: the function a chained invocation invokes,
+            # as the operation NAMED it.
+            record["functionName"] = str(function_name)
+        if tenant_id is not None:
+            record["tenantId"] = str(tenant_id)
         if name is not None:
             record["name"] = str(name)
         if payload is not None:

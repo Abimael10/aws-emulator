@@ -46,7 +46,8 @@ use super::*;
 // uses, and these are reached through the operations' own types.
 use crate::ops::{
     CallbackFailedDetails, CallbackStartedDetails, CallbackSucceededDetails,
-    CallbackTimedOutDetails,
+    CallbackTimedOutDetails, ChainedInvokeFailedDetails, ChainedInvokeStartedDetails,
+    ChainedInvokeStoppedDetails, ChainedInvokeSucceededDetails,
 };
 
 /// The member names of the document the runtime's durable SDK reports one checkpoint as.
@@ -81,6 +82,13 @@ const CALLBACK_TIMEOUT_MEMBER: &str = "timeoutSeconds";
 /// See [`TYPE_MEMBER`]: the `CallbackOptions$HeartbeatTimeoutSeconds` it was configured with.
 const CALLBACK_HEARTBEAT_MEMBER: &str = "heartbeatTimeoutSeconds";
 
+/// See [`TYPE_MEMBER`]: the function a CHAINED INVOCATION invoked, which
+/// `ChainedInvokeOptions$FunctionName` names and `ChainedInvokeStartedDetails$FunctionName`
+/// reports.
+const FUNCTION_NAME_MEMBER: &str = "functionName";
+/// See [`TYPE_MEMBER`]: the `ChainedInvokeOptions$TenantId` that invocation carried.
+const TENANT_ID_MEMBER: &str = "tenantId";
+
 /// The `OperationType` of the unit of work a durable handler runs through `context.step(…)`
 /// (`smithy_query(query="shape", shape="OperationType")`: `EXECUTION`, `CONTEXT`, `STEP`,
 /// `WAIT`, `CALLBACK`, `CHAINED_INVOKE`).
@@ -98,6 +106,10 @@ pub const CONTEXT_TYPE: &str = "CONTEXT";
 /// the execution rather than one its history takes a step-shaped event for; see
 /// [`STEP_TYPE`].
 pub const EXECUTION_TYPE: &str = "EXECUTION";
+
+/// The `OperationType` of the invocation of ANOTHER function a durable handler runs through
+/// `context.invoke(…)` ([`super::execution::durable_sdk_guest`]); see [`STEP_TYPE`].
+pub const CHAINED_INVOKE_TYPE: &str = "CHAINED_INVOKE";
 
 /// The `OperationAction` values a checkpoint carries (`smithy_query(query="shape",
 /// shape="OperationAction")`: `START`, `SUCCEED`, `FAIL`, `RETRY`, `CANCEL`).
@@ -140,6 +152,22 @@ pub const EVENT_TYPE_CONTEXT_SUCCEEDED: &str = "ContextSucceeded";
 
 /// The model's `EventType` for a child CONTEXT that raised; see [`EVENT_TYPE_STEP_STARTED`].
 pub const EVENT_TYPE_CONTEXT_FAILED: &str = "ContextFailed";
+
+/// The model's `EventType` for a CHAINED INVOCATION that began; see
+/// [`EVENT_TYPE_STEP_STARTED`].
+pub const EVENT_TYPE_CHAINED_INVOKE_STARTED: &str = "ChainedInvokeStarted";
+
+/// The model's `EventType` for a CHAINED INVOCATION that answered; see
+/// [`EVENT_TYPE_STEP_STARTED`].
+pub const EVENT_TYPE_CHAINED_INVOKE_SUCCEEDED: &str = "ChainedInvokeSucceeded";
+
+/// The model's `EventType` for a CHAINED INVOCATION that did not answer — the service
+/// refused it, or the function it invoked failed; see [`EVENT_TYPE_STEP_STARTED`].
+pub const EVENT_TYPE_CHAINED_INVOKE_FAILED: &str = "ChainedInvokeFailed";
+
+/// The model's `EventType` for a CHAINED INVOCATION something cut off before it answered,
+/// which is the operation being CANCELLED; see [`EVENT_TYPE_STEP_STARTED`].
+pub const EVENT_TYPE_CHAINED_INVOKE_STOPPED: &str = "ChainedInvokeStopped";
 
 /// The member names the runtime's error document carries inside a failed operation's `error`.
 const ERROR_TYPE_MEMBER: &str = "errorType";
@@ -248,6 +276,13 @@ pub struct Checkpoint {
     /// The `CallbackOptions$HeartbeatTimeoutSeconds` it was configured with, which
     /// `CallbackStartedDetails$HeartbeatTimeout` reports.
     pub callback_heartbeat_timeout_seconds: Option<i32>,
+    /// The function a CHAINED INVOCATION invoked, which
+    /// `ChainedInvokeStartedDetails$FunctionName` reports — as the operation NAMED it, which is
+    /// one of the documented `FunctionName` forms.
+    pub function_name: Option<String>,
+    /// The `ChainedInvokeOptions$TenantId` that invocation carried, which
+    /// `ChainedInvokeStartedDetails$TenantId` reports.
+    pub tenant_id: Option<String>,
 }
 
 impl Checkpoint {
@@ -267,6 +302,14 @@ impl Checkpoint {
             (CONTEXT_TYPE, START_ACTION) => Some(EVENT_TYPE_CONTEXT_STARTED),
             (CONTEXT_TYPE, SUCCEED_ACTION) => Some(EVENT_TYPE_CONTEXT_SUCCEEDED),
             (CONTEXT_TYPE, FAIL_ACTION) => Some(EVENT_TYPE_CONTEXT_FAILED),
+            // A CHAINED INVOCATION: the one a durable handler started, the one the invoked
+            // function answered, the one that did not answer — because the service refused the
+            // invocation or the function it reached failed — and the one something cut off
+            // before it answered, which is the operation being CANCELLED.
+            (CHAINED_INVOKE_TYPE, START_ACTION) => Some(EVENT_TYPE_CHAINED_INVOKE_STARTED),
+            (CHAINED_INVOKE_TYPE, SUCCEED_ACTION) => Some(EVENT_TYPE_CHAINED_INVOKE_SUCCEEDED),
+            (CHAINED_INVOKE_TYPE, FAIL_ACTION) => Some(EVENT_TYPE_CHAINED_INVOKE_FAILED),
+            (CHAINED_INVOKE_TYPE, CANCEL_ACTION) => Some(EVENT_TYPE_CHAINED_INVOKE_STOPPED),
             // A CALLBACK: the one the handler minted and is waiting on, the one a client
             // completed or failed, and the one whose window the clock closed — which is the
             // operation being CANCELLED, the action the model has for an operation nothing
@@ -314,6 +357,8 @@ impl Checkpoint {
                 .filter(|seconds| *seconds >= 0),
             callback_heartbeat_timeout_seconds: whole(CALLBACK_HEARTBEAT_MEMBER)
                 .filter(|seconds| *seconds >= 0),
+            function_name: text(FUNCTION_NAME_MEMBER),
+            tenant_id: text(TENANT_ID_MEMBER),
         })
     }
 }
@@ -436,6 +481,44 @@ pub fn append_checkpoint(
         }
         EVENT_TYPE_CONTEXT_FAILED => {
             event.context_failed_details = Some(ContextFailedDetails { error: failure() });
+        }
+        // The CHAINED INVOCATION events, each carrying the one details member of its own type:
+        // the function the operation invoked and the input it was handed, the answer it came
+        // back with, and the error of one that did not answer or was cut off.
+        EVENT_TYPE_CHAINED_INVOKE_STARTED => {
+            // `ChainedInvokeStartedDetails$FunctionName` is REQUIRED: a checkpoint of a chained
+            // invocation starting that names no function is not an event this history can take.
+            let Some(function_name) = checkpoint.function_name.clone() else {
+                return false;
+            };
+            // "The JSON input payload provided to the chained invocation": the payload of the
+            // operation that STARTED, which is what the invocation carried, and none reported
+            // for one that carried none.
+            event.chained_invoke_started_details = Some(ChainedInvokeStartedDetails {
+                function_name,
+                tenant_id: checkpoint.tenant_id.clone(),
+                input: checkpoint.payload.is_some().then(|| {
+                    let held = result();
+                    EventInput {
+                        payload: held.payload,
+                        truncated: held.truncated,
+                    }
+                }),
+                executed_version: None,
+                durable_execution_arn: None,
+            });
+        }
+        EVENT_TYPE_CHAINED_INVOKE_SUCCEEDED => {
+            event.chained_invoke_succeeded_details =
+                Some(ChainedInvokeSucceededDetails { result: result() });
+        }
+        EVENT_TYPE_CHAINED_INVOKE_FAILED => {
+            event.chained_invoke_failed_details =
+                Some(ChainedInvokeFailedDetails { error: failure() });
+        }
+        EVENT_TYPE_CHAINED_INVOKE_STOPPED => {
+            event.chained_invoke_stopped_details =
+                Some(ChainedInvokeStoppedDetails { error: failure() });
         }
         // The CALLBACK events, each carrying the one details member of its own type: the id the
         // handler's durable context minted and the timeouts it was configured with, the result

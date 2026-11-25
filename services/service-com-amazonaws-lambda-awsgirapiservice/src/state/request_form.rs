@@ -8,7 +8,10 @@
 //! judged against what the operation admits, and only a request that passes reaches the
 //! store. So the answer to a malformed identifier is the same whether or not the resource
 //! exists — which is the whole difference a caller acts on, because a 404 says "create it
-//! first" while this 400 says "stop sending this value".
+//! first" while this 400 says "stop sending this value". A request that DOES pass and finds
+//! nothing is answered for the resource it resolved, which is what
+//! [`reserved_concurrency_not_found_message`] words for the operations whose subject is a
+//! function's reserved concurrency.
 //!
 //! Two clauses live here rather than once per handler, because each is the SERVICE's and not
 //! one operation's:
@@ -93,6 +96,35 @@ pub const FUNCTION_ONLY_OPERATION_MESSAGE: &str =
     "This operation is permitted on Lambda functions only. Aliases and versions do not \
      support this operation. Please specify either a function name or an unqualified \
      function ARN.";
+
+/// What an operation on the function's RESERVED CONCURRENCY says it could not FIND: the fixed
+/// `Function not found: ` followed by the ARN the request RESOLVED.
+///
+/// The capacity a reservation sets aside is the capacity an INVOCATION of the function holds,
+/// so the resource one of these operations addresses is the function AT the version such an
+/// invocation runs: the identifier they take carries no qualifier of its own
+/// ([`FUNCTION_ONLY_OPERATION_MESSAGE`]), so it resolves to the unpublished version, and the
+/// refusal names that fully qualified ARN — the same resource a synchronous invocation of the
+/// same name says it could not find ([`super::resolved_invocation_arn`]).
+///
+/// `resolution_stated` is what the resolution itself worded, which stands wherever this
+/// endpoint resolves no ARN for the reference at all: an ARN of ANOTHER Region names no
+/// function here and is refused on the Region rather than on a version
+/// ([`super::foreign_region_function_message`]).
+///
+/// Recorded behaviour: corpus `simparity-behavioral-aws-v1`, trace
+/// `iam__lambda__logs.put-concurrency-refused-on-unknown-function-preserves-real-reservation`,
+/// where `PutFunctionConcurrency` on an unqualified name no function is held under is answered
+/// `404 ResourceNotFoundException` with the `:$LATEST`-qualified ARN after the fixed prefix.
+#[must_use]
+pub fn reserved_concurrency_not_found_message(
+    region: &str,
+    reference: &super::FunctionReference,
+    resolution_stated: String,
+) -> String {
+    super::resolved_invocation_arn(region, reference, None)
+        .map_or(resolution_stated, |arn| format!("Function not found: {arn}"))
+}
 
 /// What a paginated listing refuses a `Marker` it did not issue with.
 ///
