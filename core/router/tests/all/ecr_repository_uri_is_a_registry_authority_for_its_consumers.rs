@@ -17,7 +17,7 @@
 //! holds the repository is reported BESIDE the address instead, by `registryId` and the ARN,
 //! read off the stored record. That is the rule the owning crate states and its own suites pin
 //! (`services/service-com-amazonaws-ecr-amazonec2containerregistry-v20150921`:
-//! `src/state/registry_address.rs`, `tests/all/repository_registry_uri.rs`,
+//! `src/state/registry_address.rs`, `tests/all/repository_uri_is_dialable_wherever_served.rs`,
 //! `tests/all/published_registry_address.rs`), and this suite reads it where three crates
 //! have to agree on it.
 //!
@@ -286,11 +286,8 @@ struct Row {
 /// The authority a row's served address carries, host and port: what a caller reaches this
 /// process at, and therefore the address Amazon ECR publishes a repository of this deployment
 /// at — a call made to one of AWS's own endpoint hosts is answered the address this process is
-/// served at. What a client dials therefore leads back to this process, and no label is
-/// composed on top of it: a name in the zone AWS serves its own registries in resolves at
-/// genuine AWS infrastructure, and one this emulator invents in a zone of its own resolves only
-/// where a resolver implements that zone. Read off the row's own served address rather than
-/// imported, so a published authority built on anything else fails these rows.
+/// served at. Read off the row's own served address rather than imported, so a published
+/// authority built on anything else fails these rows.
 fn served_authority(served_base: &str) -> &str {
     served_base
         .split_once("://")

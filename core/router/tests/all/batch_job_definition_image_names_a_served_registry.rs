@@ -12,9 +12,11 @@
 //! value on the first `/`, dials the authority and asks for the path reaches the very
 //! repository in this emulator.** `Repository$repositoryUri` is "The URI for the repository.
 //! You can use this URI for container image `push` and `pull` operations", so the authority
-//! has to resolve to this process: it is the address this emulator is served at, host and
-//! port whole, never a name in a zone AWS publishes its own endpoints in,
-//! which resolves at genuine AWS infrastructure or nowhere near here. A consumer of
+//! has to resolve to this process: it is the address this emulator answers registry requests
+//! at, host and port whole, never a name in a zone AWS publishes its own endpoints in, which
+//! resolves at genuine AWS infrastructure or nowhere near here, and never a name composed on
+//! top of this process's own, which resolves only where a resolver implements that zone. A
+//! consumer of
 //! `ContainerProperties$image` ("The image used to start a container") PULLS what it reads, so
 //! an address published there that nothing here answers on takes the pull out of the emulated
 //! environment while every other member of the definition looks healthy. The image itself is a
@@ -33,15 +35,16 @@
 //! repository another crate assigned the address of.
 //!
 //! The rows differ along what the rule generalises over: the address this emulator is SERVED
-//! at (an IPv4 socket, a loopback name with a port, a host an operator chose, a host carrying
-//! no port), the endpoint the Amazon ECR call ARRIVED on
+//! at (an IPv4 socket, the loopback name with a port, and a host an operator chose with and
+//! without a port), the endpoint the Amazon ECR call ARRIVED on
 //! (this service's own endpoint host, and the registry
 //! host AWS publishes — neither of them a name this emulator answers on), the Region the calls
 //! are made in, the repository name (plain, namespaced, and the punctuation
 //! `RepositoryName`'s pattern allows), how the registration ADDRESSES the image (the bare URI,
 //! which is the untagged form, a tag, a digest) and the `assignPublicIp` the Fargate
-//! registration names. The last test follows the described image the way a container runtime
-//! does — it pulls the manifest at the address the read handed it.
+//! registration names. Every row DIALS the published authority, and the last test follows the
+//! described image the way a container runtime does — it pulls the manifest at the address the
+//! read handed it.
 
 use std::sync::Arc;
 
@@ -111,8 +114,8 @@ impl Addressed {
 /// addresses it, and the public-IP assignment the Fargate registration states.
 struct Row {
     case: &'static str,
-    /// The address this emulator is SERVED at, which is the address every address these
-    /// services announce for a caller to dial is built on.
+    /// The address this emulator is SERVED at, which is where every address these services
+    /// announce for a caller to dial comes from.
     served_base: &'static str,
     /// The `Host` the Amazon ECR calls of this row are addressed to — an endpoint this
     /// emulator does not answer on, so the address it publishes cannot be the one the call
@@ -177,7 +180,7 @@ const ROWS: &[Row] = &[
     },
     Row {
         case: "an image of a repository whose name carries the punctuation the pattern \
-               allows, served at a host carrying no port",
+               allows, served at a host an operator chose carrying no port",
         served_base: "https://registry.emulator.test",
         ecr_host: EcrHost::AwsRegistryHost,
         region: "cn-north-1",
@@ -343,9 +346,9 @@ fn authority_and_path<'value>(case: &str, value: &'value str) -> (&'value str, &
 /// be one this process is reached at; whether anything is composed on top of that address is
 /// Amazon ECR's own rule and its own suites' subject (`src/state/registry_address.rs`,
 /// `tests/all/published_registry_address.rs`). What is read here is the half a consumer of the
-/// address depends on, which is that dialling it arrives at this emulator. Taken off the row's
-/// own served address rather than imported, so an address built on anything else fails these
-/// rows.
+/// address depends on, which is that dialling it arrives at this emulator — which every row
+/// then does. Taken off the row's own served address rather than imported, so an address built
+/// on anything else fails these rows.
 fn assert_dialable_authority(case: &str, served_base: &str, address: &str) -> String {
     let (authority, _path) = authority_and_path(case, address);
     let lowered = authority.to_ascii_lowercase();

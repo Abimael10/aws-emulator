@@ -790,14 +790,13 @@ fn host_of(authority: &str) -> &str {
 
 #[tokio::test]
 async fn each_registrys_published_address_is_dialled_with_that_registrys_credential() {
-    // The rule the chain from a create to a push depends on: a repository is published in the
-    // zone and on the port the URL a `docker login` of that caller is pointed at carries — so
-    // a client that logs in where the token says and pushes where the repository URI says
-    // dials the same interface — with the holding registry's own labels in front, which is
-    // what makes the ADDRESS say which registry a request addresses beside the credential it
-    // presents. One repository name, taken in several Regions, is published at that Region's
-    // own address, and a pull there with that Region's token answers the image THAT Region's
-    // registry holds.
+    // The rule the chain from a create to a push depends on: a repository is published on the
+    // very endpoint the URL a `docker login` of that caller is pointed at carries — so a
+    // client that logs in where the token says and pushes where the repository URI says dials
+    // the one interface this process is reached on, and the credential it presents is what
+    // says which registry the request addresses. One repository name, taken in several
+    // Regions, is published at that one address, and a pull there with that Region's token
+    // answers the image THAT Region's registry holds.
     let name = "shared/by-every-registry";
     for endpoint in endpoints() {
         let router = emulator();

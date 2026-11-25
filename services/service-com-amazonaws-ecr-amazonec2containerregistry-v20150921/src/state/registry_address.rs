@@ -95,7 +95,9 @@
 ///   publishes its OWN endpoints in (`addresses_an_aws_endpoint`), which resolves nowhere
 ///   near this process; and so would a caller that came in on a host naming ONE registry,
 ///   which answers for that Region alone. Taking the served address WHOLE, host and port
-///   together, is what keeps the reported address dialable.
+///   together, is what keeps the reported address dialable — a `/v2` request presenting a
+///   `docker login` credential is this registry's whatever host it arrived on
+///   (`crate::service`'s registry claim).
 pub fn announced_registry_endpoint(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
 ) -> String {
@@ -240,7 +242,7 @@ pub struct RegistryHostParts<'host> {
     /// The Region that registry serves.
     pub region: &'host str,
     /// The zone the registry is served in: AWS's own partition suffix for the host AWS
-    /// publishes, and a zone of its own for a host this emulator is reached at.
+    /// publishes, and a zone of its own for a host an operator points a client at.
     pub zone: &'host str,
 }
 

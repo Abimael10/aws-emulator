@@ -124,14 +124,12 @@ fn assert_published_uri(case: &str, repository: &Value, name: &str) {
     // `arn:<partition>:ecr:<region>:<account>:repository/<name>` — the identity the stored
     // record carries, which is what the response reports beside the address.
     let arn_fields: Vec<&str> = arn.split(':').collect();
-    let (arn_region, arn_account) = (
-        *arn_fields
-            .get(3)
-            .unwrap_or_else(|| panic!("case {case:?}: {arn:?} names no Region")),
-        *arn_fields
-            .get(4)
-            .unwrap_or_else(|| panic!("case {case:?}: {arn:?} names no account")),
-    );
+    let arn_region = *arn_fields
+        .get(3)
+        .unwrap_or_else(|| panic!("case {case:?}: {arn:?} names no Region"));
+    let arn_account = *arn_fields
+        .get(4)
+        .unwrap_or_else(|| panic!("case {case:?}: {arn:?} names no account"));
     assert_eq!(
         registry_id, arn_account,
         "case {case:?}: expected the reported registry to own the repository its ARN names, \
@@ -168,6 +166,8 @@ fn assert_published_uri(case: &str, repository: &Value, name: &str) {
         }
         None => authority,
     };
+    // No registry host composed on top of that address, and nothing in a zone AWS publishes
+    // its own endpoints in: neither resolves to this process.
     let labels: Vec<&str> = host.split('.').collect();
     assert!(
         !labels
