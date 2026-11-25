@@ -913,6 +913,7 @@ pub fn identity_provider_test_message(server: &Server) -> &'static str {
 /// built from anything the caller sent.
 pub const ACCESS_ACTION_CREATE: &str = "create";
 pub const ACCESS_ACTION_DESCRIBE: &str = "describe";
+pub const ACCESS_ACTION_LIST: &str = "list";
 pub const ACCESS_ACTION_UPDATE: &str = "update";
 pub const ACCESS_ACTION_DELETE: &str = "delete";
 

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAccesses
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAccesses`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAccesses::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the directory access grants stored for one server in `BTreeMap`
+//! (`ExternalId`) order, exactly as `ListUsers` pages that server's users. An access
+//! grant is a group in the server's directory, so the listing is served only on a
+//! server whose `IdentityProviderType` is the directory-backed one and refused on
+//! every other one with the same `InvalidRequestException` (400) `CreateAccess`,
+//! `DescribeAccess`, `UpdateAccess` and `DeleteAccess` share. `MaxResults` is a real
+//! page bound and `NextToken` is the opaque token this service's listings hand out, so
+//! a token it did not mint is an `InvalidNextTokenException` (400). Each entry is
+//! projected from the SAME stored record `DescribeAccess` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +159,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAccesses` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAccessesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAccesses"))
+        use crate::state as st;
+
+        // A `@readonly` report: it reads request metadata nowhere and writes nothing.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            ListAccessesErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let guard = state.lock();
+
+        // The named resource is resolved FIRST — as every listing of this service does
+        // for its parent server — so a listing for a server that does not exist is a
+        // not-found, whatever else the request carries.
+        let Some(server) = guard.servers.get(&input.server_id) else {
+            return Err(st::not_found(
+                ListAccessesErrorModeled::ResourceNotFoundException(st::unknown_server(
+                    &input.server_id,
+                )),
+            ));
+        };
+
+        // The server-type gate, the one rule every access operation shares: an access
+        // grant IS a group in the server's directory, so on a server that authenticates
+        // against no directory the request names something that cannot exist — a
+        // malformed request rather than an empty set of grants.
+        if server.identity_provider_type != st::IDENTITY_PROVIDER_AWS_DIRECTORY_SERVICE {
+            return Err(ListAccessesErrorModeled::InvalidRequestException(
+                st::accesses_require_directory_provider(
+                    st::ACCESS_ACTION_LIST,
+                    &server.identity_provider_type,
+                ),
+            )
+            .into());
+        }
+
+        // A token this service did not hand out resumes nothing, so it is refused
+        // rather than silently restarting the listing.
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(st::decode_page_token(token).ok_or_else(|| {
+                ListAccessesErrorModeled::InvalidNextTokenException(st::invalid_next_token())
+            })?),
+            None => None,
+        };
+
+        // ONE range scan over this server's run of the access map: the records to
+        // render come straight out of it, so no row is looked up a second time.
+        let stored: Vec<&st::Access> = guard.accesses_of(&input.server_id).collect();
+        let ids: Vec<&str> = stored
+            .iter()
+            .map(|access| access.external_id.as_str())
+            .collect();
+        let (page, next_key) =
+            st::page_bounds(&ids, after.as_deref(), st::page_limit(input.max_results));
+
+        let accesses = stored
+            .get(page)
+            .unwrap_or_default()
+            .iter()
+            .map(|stored| ListedAccess {
+                external_id: Some(stored.external_id.clone()),
+                home_directory: stored.home_directory.clone(),
+                home_directory_type: stored.home_directory_type.clone(),
+                role: stored.role.clone(),
+            })
+            .collect();
+
+        Ok(ListAccessesOutput {
+            // A token only when a further page remains.
+            next_token: next_key.as_deref().map(st::encode_page_token),
+            server_id: input.server_id,
+            accesses,
+        })
     }
 }
