@@ -535,7 +535,7 @@ impl ComAmazonawsInterconnectInterconnectState {
     }
 
     /// The stored connection an `AmazonResourceName` ADDRESSES in `region`, for the
-    /// operations whose `arn` member IS the resource they act on (the tag operations).
+    /// operations that REPORT what the record it names holds (the tag listing).
     ///
     /// What identifies the resource is the `ConnectionId` the ARN's resource segment
     /// carries, resolved among the connections the called endpoint holds by the same
@@ -544,17 +544,27 @@ impl ComAmazonawsInterconnectInterconnectState {
     /// (`[^:]+`), so it is a value the caller may spell any way and it addresses no
     /// scope of its own — the scope an ARN-addressed request is judged against is its
     /// partition and account ([`arn_scope_violation`]), and the Region it reaches is
-    /// the one the request itself is signed for. A connection that has reached the
-    /// terminal `deleted` state is gone: the record stays readable by its identifier
-    /// so a caller polling a delete sees the terminal state, but a deleted resource is
-    /// no longer one this account holds.
+    /// the one the request itself is signed for.
+    ///
+    /// The state the record is in is not part of the key either, so a REPORTING
+    /// operation answers from exactly the record [`Self::connection_in`] hands its
+    /// sibling readers — `GetConnection` and `ListConnections` — including one a
+    /// `DeleteConnection` has settled into the terminal state, which stays readable
+    /// until its retention elapses. Two readers of one stored record therefore never
+    /// disagree about what it holds. Requiring the resource to still EXIST is the
+    /// writers' rule instead ([`Self::connection_in_for_arn_mut`]): a tag set that is
+    /// no longer a resource of this account takes no write.
     pub fn connection_in_for_arn(&self, region: &str, arn: &str) -> Option<&StoredConnection> {
         let id = connection_id_from_arn(arn)?;
-        self.connection_in(region, id).filter(|stored| exists_as_resource(stored))
+        self.connection_in(region, id)
     }
 
     /// [`Self::connection_in_for_arn`] for the operations that MUTATE the tag set they
-    /// resolve, resolving the same resource under the same rule.
+    /// resolve, which resolve the same resource by the same key and then require it to
+    /// still exist: a connection that has reached the terminal `deleted` state is gone,
+    /// so there is no resource of this account left to write a tag onto, while the
+    /// record itself stays readable so a caller polling a delete — and the listing that
+    /// reports what that record holds — still sees it.
     pub fn connection_in_for_arn_mut(
         &mut self,
         region: &str,
@@ -1507,8 +1517,10 @@ pub fn judge_connection_arn<E: ArnRefusal>(arn: &str, request_shape: &str) -> Re
 /// ([`ComAmazonawsInterconnectInterconnectState::connection_in_for_arn_mut`]), and its
 /// absent case is this service's own client fault — so both writers of a tag set report
 /// a missing resource with one code and one sentence. A REPORTING operation resolves the
-/// same resource and refuses nothing for it: a read asks what is on the resource rather
-/// than whether it is there, so an ARN of this scope that resolves to nothing is answered
+/// record the store still holds
+/// ([`ComAmazonawsInterconnectInterconnectState::connection_in_for_arn`]) and refuses
+/// nothing for it: a read asks what is on the record rather than whether the resource is
+/// still there, so an ARN of this scope that resolves to no record at all is answered
 /// with the empty tag set instead.
 pub fn connection_for_arn_mut<'store, E: ArnResourceRefusal>(
     store: &'store mut ComAmazonawsInterconnectInterconnectState,
@@ -1730,9 +1742,10 @@ pub fn is_deleted_or_deleting(state: &str) -> bool {
     state == DELETING_CONNECTION_STATE || state == DELETED_CONNECTION_STATE
 }
 
-/// Whether `stored` is still a resource of this account: a connection that has reached
-/// the terminal `deleted` state is gone, while the record itself stays readable by its
-/// identifier so a caller polling a delete sees that terminal state.
+/// Whether `stored` is still a resource of this account WRITES can be made on: a
+/// connection that has reached the terminal `deleted` state is gone, while the record
+/// itself stays readable by its identifier so a caller polling a delete sees that
+/// terminal state — and so every READER of that record reports what it holds.
 fn exists_as_resource(stored: &StoredConnection) -> bool {
     stored.connection.state != DELETED_CONNECTION_STATE
 }

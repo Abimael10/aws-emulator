@@ -28,7 +28,6 @@
 //! whose Region segment is `[^:]+`).
 
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use serde_json::json;
 
@@ -66,9 +65,10 @@ const CALLER_REGIONS: [&str; 2] = [DEFAULT_SIGNING_REGION, "ap-southeast-2"];
 /// (`^(mcc|lmcc)-[a-z0-9]{8}$`).
 const NEVER_ALLOCATED_IDS: [&str; 2] = ["mcc-00000000", "lmcc-zzzzzzzz"];
 
-/// Long enough to cover the provisioning span `state.rs` documents (400 ms) with
-/// margin; the transition is due at a stored instant, so any wait past it settles.
-const SETTLE_WAIT: Duration = Duration::from_millis(700);
+/// The terminal `ConnectionState` a completed `DeleteConnection` settles into
+/// (`smithy_query(query="shape",shape="ConnectionState")` -> values include
+/// "deleted"), which a row waits for by POLLING the record's state.
+const SETTLED_DELETE_STATE: &str = "deleted";
 
 /// A connection ARN with the fields a row wants, built the way the member's pattern
 /// writes them: `arn:<partition>:interconnect:<region>:<account>:connection/<id>`.
@@ -330,11 +330,13 @@ async fn an_arn_of_another_account_or_partition_is_a_request_fault() {
     }
 }
 
-/// RULE: the answer follows the resource — a connection whose delete the clock has
-/// settled into the terminal `deleted` state resolves to nothing, through every Region
-/// spelling of its ARN, while one still being torn down is still served.
+/// RULE: the answer follows the resource for the two WRITES — a connection whose
+/// delete the clock has settled into the terminal `deleted` state takes no tag write,
+/// through every Region spelling of its ARN — while the READ follows the stored
+/// RECORD: it reports the tag set that record still holds, through every spelling, for
+/// as long as the store keeps it readable.
 #[tokio::test]
-async fn a_settled_delete_resolves_to_nothing_whatever_region_its_arn_spells() {
+async fn a_settled_delete_takes_no_write_whatever_region_its_arn_spells() {
     let emulator = Emulator::new();
     let caller = CALLER_REGIONS[1];
     let places = placements_in(&emulator, caller).await;
@@ -367,27 +369,44 @@ async fn a_settled_delete_resolves_to_nothing_whatever_region_its_arn_spells() {
         listed["tags"]
     );
 
-    tokio::time::sleep(SETTLE_WAIT).await;
+    // The terminal state is waited for by POLLING the record, never by sleeping a span.
     let settled = emulator
-        .ic_ok_in(caller, "GetConnection", json!({ "identifier": id }))
+        .connection_in_state(caller, &id, SETTLED_DELETE_STATE)
         .await;
     assert_eq!(
-        text(&settled["connection"], "state"),
-        "deleted",
+        text(&settled, "state"),
+        SETTLED_DELETE_STATE,
         "case \"after the delete settles\": expected the terminal state, got {:?}",
-        settled["connection"]["state"]
+        settled["state"]
     );
 
     for (name, arn) in [
         ("its own ARN", stored_arn.clone()),
         ("another Region's spelling", respelled.clone()),
     ] {
-        assert_resolves_to_nothing(
-            &emulator,
-            caller,
-            &arn,
-            &format!("after the delete settles / {name}"),
-        )
-        .await;
+        let case = format!("after the delete settles / {name}");
+        for (operation, body) in arn_operations() {
+            let (status, answer) = emulator.ic_in(caller, operation, body(&arn)).await;
+            if operation == TAG_READER {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?} on {operation}: expected the record to stay readable, got {status} with {answer:?}"
+                );
+                assert_eq!(
+                    tags_of(&answer),
+                    tags_of(&settled),
+                    "case {case:?} on {operation}: expected the record's own tag set {:?}, got {:?}",
+                    settled["tags"],
+                    answer["tags"]
+                );
+                continue;
+            }
+            assert_answers_fault(&case, operation, Fault::NoSuchConnection, &arn, status, &answer);
+            let reported = message(&answer);
+            assert_eq!(
+                reported, RESOURCE_ABSENT_MESSAGE,
+                "case {case:?} on {operation}: expected the fixed not-found sentence, got {reported:?}"
+            );
+        }
     }
 }

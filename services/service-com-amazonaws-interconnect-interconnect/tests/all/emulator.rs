@@ -481,6 +481,24 @@ impl Emulator {
     /// it is fully provisioned itself, exactly as a gateway is an attach point only once
     /// it is ready for use ([`Self::ready_gateways`]).
     pub(crate) async fn provisioned_connection(&self, region: &str, identifier: &str) -> Value {
+        self.connection_in_state(region, identifier, CONNECTION_READY_STATE)
+            .await
+    }
+
+    /// The record `region`'s endpoint reports for `identifier` once the clock has
+    /// carried it into `state`, POLLED rather than slept for.
+    ///
+    /// What a suite waits for is the state, never a fixed span, so a loaded or a fast
+    /// host is not what decides a case: the deadline is far past every span this
+    /// service's clock owes a connection. The record stays readable throughout, which
+    /// is true of every state a stored connection reaches — including the terminal one
+    /// a settled delete leaves, for as long as the store retains the record.
+    pub(crate) async fn connection_in_state(
+        &self,
+        region: &str,
+        identifier: &str,
+        state: &str,
+    ) -> Value {
         let started = Instant::now();
         loop {
             let (status, body) = self
@@ -488,18 +506,18 @@ impl Emulator {
                 .await;
             assert_eq!(
                 status, 200,
-                "setup {identifier:?}: expected the connection to stay readable while it \
-                 provisions, got {status} with {body:?}"
+                "setup {identifier:?}: expected the connection to stay readable while the clock \
+                 carries it to {state:?}, got {status} with {body:?}"
             );
             let connection = body["connection"].clone();
-            let state = text(&connection, "state");
-            if state == CONNECTION_READY_STATE {
+            let reported = text(&connection, "state");
+            if reported == state {
                 return connection;
             }
             assert!(
                 started.elapsed() < CONNECTION_READY_BUDGET,
-                "setup {identifier:?}: expected the connection to be fully provisioned within \
-                 {CONNECTION_READY_BUDGET:?}, it is still {state:?}"
+                "setup {identifier:?}: expected the connection to reach {state:?} within \
+                 {CONNECTION_READY_BUDGET:?}, it is still {reported:?}"
             );
             tokio::time::sleep(CONNECTION_READY_INTERVAL).await;
         }

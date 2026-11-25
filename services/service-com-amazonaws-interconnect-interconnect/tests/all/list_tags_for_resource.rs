@@ -3,31 +3,36 @@
 //! End-to-end suite for `ListTagsForResource`, driven over the wire through the
 //! shared [`crate::emulator`] harness.
 //!
-//! RULE under test: `ListTagsForResource` reports the tag set the resource its
-//! `arn` names CURRENTLY holds — every key the store holds for it with its value,
-//! and no other key — without changing it, so a repeated call with no tag write in
-//! between answers the same and the resource reads back unchanged. A resource that
-//! carries no tags lists the empty set, and so does an `arn` of the request's scope
-//! that resolves to no resource at all: the read answers what is on the resource
-//! rather than whether it is there, and nothing was ever tagged. What IS refused is
-//! an `arn` the request may not address: one whose account or partition is not the
+//! RULE under test: `ListTagsForResource` reports the tag set the record its `arn`
+//! names CURRENTLY holds — every key the store holds for it with its value, and no
+//! other key — without changing it, so a repeated call with no tag write in between
+//! answers the same and the resource reads back unchanged. Being a read, it answers
+//! from the SAME stored record `GetConnection` reads, whatever state the clock has
+//! left that record in, so the two readers never disagree. A record that carries no
+//! tags lists the empty set, and so does an `arn` of the request's scope that
+//! resolves to no record at all: the read answers what is on the record rather than
+//! whether the resource is still there, and nothing was ever tagged. What IS refused
+//! is an `arn` the request may not address: one whose account or partition is not the
 //! scope the request addresses (HTTP 400), and one that is not a connection ARN at all
 //! (HTTP 400), never with a 501.
 //!
 //! Every assertion is about that rule over a TABLE of inputs whose rows differ in
 //! the number of tags (0, 1, 3, 20), the length of the keys and values (each
-//! modelled bound), the form of the keys, and the environment and bandwidth the
-//! tagged connection sits on. The lengths come from the model:
+//! modelled bound), the form of the keys, the `ConnectionState` the record is in when
+//! it is read, and the environment and bandwidth the tagged connection sits on. The
+//! lengths come from the model:
 //! `smithy_query(query="shape",shape="TagKey,TagValue")` gives `TagKey`
-//! `@length(min: 1, max: 128)` and `TagValue` `@length(min: 0, max: 256)`.
+//! `@length(min: 1, max: 128)` and `TagValue` `@length(min: 0, max: 256)`, and the
+//! states from `smithy_query(query="shape",shape="ConnectionState")`.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use crate::arn_scope_refusals::{assert_answers_fault, Fault};
-use crate::emulator::{code, create_with_tags, message, placements, tags_of, text, Emulator};
+use crate::emulator::{
+    available_bandwidths, code, create_with_tags, message, placements, tags_of, text, Emulator,
+};
 
 /// The account id every emulator ARN carries.
 const ACCOUNT_ID: &str = engine::EMULATOR_ACCOUNT_ID;
@@ -36,14 +41,50 @@ const ACCOUNT_ID: &str = engine::EMULATOR_ACCOUNT_ID;
 /// it mints carries.
 const REGION: &str = "us-east-1";
 
-/// Long enough to cover the provisioning span `state.rs` documents (400 ms) with
-/// margin; the transition is due at a stored instant, so any wait past it settles.
-const SETTLE_WAIT: Duration = Duration::from_millis(700);
-
 /// `TagKey` is modelled `@length(min: 1, max: 128)`.
 const TAG_KEY_MAX: usize = 128;
 /// `TagValue` is modelled `@length(min: 0, max: 256)`.
 const TAG_VALUE_MAX: usize = 256;
+
+// The `ConnectionState` values the state-spanning rows drive a record into, spelled as
+// the model spells them (`smithy_query(query="shape",shape="ConnectionState")` ->
+// values: available | requested | pending | down | deleting | deleted | failed |
+// updating).
+/// The state an in-flight bandwidth change hands a record.
+const UPDATING_STATE: &str = "updating";
+/// The transient state a `DeleteConnection` hands a record.
+const DELETING_STATE: &str = "deleting";
+/// The terminal state a settled delete leaves a record in, which the store keeps
+/// readable until its retention elapses.
+const DELETED_STATE: &str = "deleted";
+
+/// Where in a connection's lifecycle a row reads the record it created.
+#[derive(Debug, Clone, Copy)]
+enum Reach {
+    /// Straight after the create, with the clock wherever it has got to on its own.
+    AsCreated,
+    /// Carried to the state the model documents as fully provisioned.
+    Provisioned,
+    /// With a bandwidth change in flight.
+    Updating,
+    /// Being torn down.
+    Deleting,
+    /// Torn down: the terminal state, with the record still readable.
+    Deleted,
+}
+
+/// A bandwidth the environment offers OTHER than `current`, or `None` when it offers
+/// only the one size — what a row that needs an in-flight change asks `UpdateConnection`
+/// for.
+async fn other_bandwidth(
+    emulator: &Emulator,
+    environment_id: &str,
+    current: &str,
+) -> Option<String> {
+    available_bandwidths(&emulator.environment(environment_id).await)
+        .into_iter()
+        .find(|bandwidth| bandwidth != current)
+}
 
 // ---------------------------------------------------------------------------
 // Calls under test
@@ -469,59 +510,238 @@ async fn list_tags_for_resource_answers_the_empty_set_for_an_arn_that_names_no_c
     );
 }
 
-/// RULE: a resource has a tag set for as long as it exists — a connection that is
-/// still `deleting` lists its tags, and once the clock has settled it into the
-/// terminal `deleted` state the resource is gone, so the listing answers the empty
-/// tag set: nothing is on a resource that is not there.
+/// RULE: the listing and `GetConnection` are two readers of ONE stored record, so
+/// whatever `ConnectionState` the clock has left that record in — including the
+/// terminal state a settled `DeleteConnection` leaves, which stays readable for its
+/// retention — the listing reports exactly the tag set the record holds, which is the
+/// set `GetConnection` reports for it.
 #[tokio::test]
-async fn list_tags_for_resource_follows_the_resource_out_of_existence() {
+async fn list_tags_for_resource_reports_the_record_in_every_state_it_is_readable_in() {
     let emulator = Emulator::new();
     let placements = placements(&emulator).await;
-    let tags: BTreeMap<String, String> = [
-        ("env".to_string(), "test".to_string()),
-        ("team".to_string(), "network".to_string()),
-    ]
-    .into_iter()
-    .collect();
-    let connection = create_with_tags(&emulator, &placements[0], 900, &tags).await;
-    let id = text(&connection, "id");
-    let arn = text(&connection, "arn");
 
-    let deleted = emulator
-        .ic_ok("DeleteConnection", json!({ "identifier": id }))
-        .await;
-    assert_eq!(
-        text(&deleted["connection"], "state"),
-        "deleting",
-        "case \"straight after the delete\": expected the transient state, got {:?}",
-        deleted["connection"]["state"]
-    );
+    // The rows span the lifecycle: the state a create leaves the record in, the state
+    // the clock carries it to, the one an in-flight bandwidth change hands it to, the
+    // transient teardown state, and the terminal state a settled delete leaves.
+    let reaches = [
+        Reach::AsCreated,
+        Reach::Provisioned,
+        Reach::Updating,
+        Reach::Deleting,
+        Reach::Deleted,
+    ];
+    // Crossed with tag sets that differ in count and in key form, so no row's answer
+    // can come from a set shaped like another's.
+    let tag_sets: Vec<(&str, Vec<(&str, &str)>)> = vec![
+        ("no tags", vec![]),
+        ("one key", vec![("owner", "me")]),
+        (
+            "three keys",
+            vec![("env", "test"), ("team", "network"), ("key.with.dots", "")],
+        ),
+    ];
 
-    // Still `deleting`: the resource is there, so its tags are still listable.
-    assert_eq!(
-        listed_tags(&emulator, &arn, "while deleting").await,
-        tags,
-        "case \"while deleting\": expected the tags of a resource that still exists"
-    );
+    let mut rows_in_the_terminal_state = 0usize;
+    let mut rows_in_flight = 0usize;
+    for (seed, reach) in reaches.into_iter().enumerate() {
+        for (offset, (label, tags)) in tag_sets.iter().enumerate() {
+            let placement = &placements[(seed * tag_sets.len() + offset) % placements.len()];
+            let case = format!("{reach:?} / {label} / {} / {}", placement.0, placement.1);
+            let expected: BTreeMap<String, String> = tags
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+            let connection = create_with_tags(
+                &emulator,
+                placement,
+                1_000 + seed * tag_sets.len() + offset,
+                &expected,
+            )
+            .await;
+            let id = text(&connection, "id");
+            let arn = text(&connection, "arn");
 
-    tokio::time::sleep(SETTLE_WAIT).await;
-    let settled = emulator.get_connection(&id).await.1["connection"].clone();
-    assert_eq!(
-        text(&settled, "state"),
-        "deleted",
-        "case \"after the delete settles\": expected the terminal state, got {:?}",
-        settled["state"]
-    );
+            match reach {
+                // Read with the clock wherever it has got to on its own.
+                Reach::AsCreated => {}
+                Reach::Provisioned => {
+                    emulator.provisioned_connection(REGION, &id).await;
+                }
+                Reach::Updating => {
+                    // A bandwidth change is what hands a record the transient
+                    // `updating` state; an environment offering a single size has no
+                    // such change to make, so those rows are covered by the others.
+                    let Some(other) = other_bandwidth(&emulator, &placement.0, &placement.1).await
+                    else {
+                        continue;
+                    };
+                    emulator.provisioned_connection(REGION, &id).await;
+                    let changed = emulator
+                        .ic_ok(
+                            "UpdateConnection",
+                            json!({ "identifier": id, "bandwidth": other }),
+                        )
+                        .await;
+                    assert_eq!(
+                        text(&changed["connection"], "state"),
+                        UPDATING_STATE,
+                        "case {case:?}: expected a bandwidth change to report the in-flight state, got {:?}",
+                        changed["connection"]["state"]
+                    );
+                    rows_in_flight += 1;
+                }
+                Reach::Deleting => {
+                    let deleted = emulator
+                        .ic_ok("DeleteConnection", json!({ "identifier": id }))
+                        .await;
+                    assert_eq!(
+                        text(&deleted["connection"], "state"),
+                        DELETING_STATE,
+                        "case {case:?}: expected the delete to report the teardown state, got {:?}",
+                        deleted["connection"]["state"]
+                    );
+                    rows_in_flight += 1;
+                }
+                Reach::Deleted => {
+                    emulator
+                        .ic_ok("DeleteConnection", json!({ "identifier": id }))
+                        .await;
+                    let settled = emulator.connection_in_state(REGION, &id, DELETED_STATE).await;
+                    assert_eq!(
+                        text(&settled, "state"),
+                        DELETED_STATE,
+                        "case {case:?}: expected the terminal state before the read, got {:?}",
+                        settled["state"]
+                    );
+                    rows_in_the_terminal_state += 1;
+                }
+            }
 
-    let (status, body) = list_tags(&emulator, &arn).await;
-    assert_eq!(
-        status, 200,
-        "case \"after the delete settles\": expected HTTP 200 for a deleted resource, got {status} with {body:?}"
+            let (status, body) = list_tags(&emulator, &arn).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200 from ListTagsForResource, got {status} with {body:?}"
+            );
+            let (get_status, fetched) = emulator.get_connection(&id).await;
+            assert_eq!(
+                get_status, 200,
+                "case {case:?}: expected the record to stay readable, got {get_status} with {fetched:?}"
+            );
+            let record = fetched["connection"].clone();
+            let state = text(&record, "state");
+            assert_eq!(
+                tags_of(&body),
+                tags_of(&record),
+                "case {case:?} (state {state:?}): expected the listing to report the same tag set as GetConnection {:?}, got {:?}",
+                record["tags"],
+                body["tags"]
+            );
+            assert_eq!(
+                tags_of(&body),
+                expected,
+                "case {case:?} (state {state:?}): expected the stored tag set {expected:?}, got {:?}",
+                body["tags"]
+            );
+        }
+    }
+
+    assert!(
+        rows_in_the_terminal_state >= tag_sets.len(),
+        "the table must read a record in the terminal state for every tag set, got {rows_in_the_terminal_state} rows"
     );
-    assert_eq!(
-        tags_of(&body),
-        BTreeMap::new(),
-        "case \"after the delete settles\": expected the empty tag set, got {:?}",
-        body["tags"]
+    assert!(
+        rows_in_flight > 0,
+        "the table must read a record the clock still owes a transition, got {rows_in_flight} rows"
     );
+}
+
+/// RULE: nothing but a tag WRITE changes a tag set, so a `DeleteConnection` leaves the
+/// keys the record holds exactly where they were and the listing keeps reporting them
+/// for as long as the record is readable — while the two WRITERS of that set refuse
+/// the ARN of a resource that no longer exists, and their refusals change nothing the
+/// listing reports.
+#[tokio::test]
+async fn a_settled_delete_removes_no_tag_from_the_record_it_leaves() {
+    let emulator = Emulator::new();
+    let placements = placements(&emulator).await;
+
+    // Rows differ in the size and the form of the set the delete leaves behind.
+    let sets: Vec<(&str, Vec<(&str, &str)>)> = vec![
+        ("a single key", vec![("owner", "me")]),
+        (
+            "two keys",
+            vec![("env", "test"), ("team", "network")],
+        ),
+        (
+            "keys differing in form",
+            vec![("Key With Spaces", "1"), ("ключ-日本語", "")],
+        ),
+        ("no key at all", vec![]),
+    ];
+
+    for (seed, (label, tags)) in sets.into_iter().enumerate() {
+        let placement = &placements[seed % placements.len()];
+        let case = format!("{label} / {} / {}", placement.0, placement.1);
+        let expected: BTreeMap<String, String> = tags
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        let connection = create_with_tags(&emulator, placement, 900 + seed, &expected).await;
+        let id = text(&connection, "id");
+        let arn = text(&connection, "arn");
+
+        // Still being torn down: the record is there, so its tags are listed.
+        let deleted = emulator
+            .ic_ok("DeleteConnection", json!({ "identifier": id }))
+            .await;
+        assert_eq!(
+            text(&deleted["connection"], "state"),
+            DELETING_STATE,
+            "case {case:?}: expected the transient state, got {:?}",
+            deleted["connection"]["state"]
+        );
+        assert_eq!(
+            listed_tags(&emulator, &arn, &case).await,
+            expected,
+            "case {case:?}: expected the tags of a record that is still being torn down"
+        );
+
+        // And once the clock has settled it into the terminal state, which the record
+        // stays readable in: the same set, and the same one GetConnection reports.
+        let settled = emulator.connection_in_state(REGION, &id, DELETED_STATE).await;
+        assert_eq!(
+            tags_of(&settled),
+            expected,
+            "case {case:?}: expected the settled record to still hold its tags, got {:?}",
+            settled["tags"]
+        );
+        assert_eq!(
+            listed_tags(&emulator, &arn, &case).await,
+            expected,
+            "case {case:?}: expected the listing to report the settled record's tags"
+        );
+
+        // The two writers of that set are the operations the resource's absence does
+        // refuse: a tag set that is no longer a resource of the account takes no write.
+        for (operation, body) in [
+            ("TagResource", json!({ "arn": arn, "tags": { "written": "no" } })),
+            ("UntagResource", json!({ "arn": arn, "tagKeys": ["owner"] })),
+        ] {
+            let (status, answered) = emulator.ic(operation, body).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?} on {operation}: expected HTTP 400 for a resource that no longer exists, got {status} with {answered:?}"
+            );
+            assert!(
+                code(&answered).contains("InterconnectClientException"),
+                "case {case:?} on {operation}: expected InterconnectClientException, got {:?}",
+                code(&answered)
+            );
+        }
+        assert_eq!(
+            listed_tags(&emulator, &arn, &case).await,
+            expected,
+            "case {case:?}: expected the refused writes to leave the listing exactly as it was"
+        );
+    }
 }

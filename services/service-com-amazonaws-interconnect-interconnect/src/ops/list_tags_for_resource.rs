@@ -152,15 +152,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// "List all current tags on the specified resource. Currently this supports
     /// Connection resources."
     ///
-    /// `@readonly`: the answer is the tag set the resource the `arn` names CURRENTLY
+    /// `@readonly`: the answer is the tag set the record the `arn` names CURRENTLY
     /// holds — exactly what `CreateConnection$tags`, `TagResource` and
     /// `UntagResource` last left in the store, with no key the store does not hold
     /// and none of the ones it does left out. Listing tags never changes a tag set,
-    /// so two calls with no tag write in between answer the same. The listing does
-    /// not validate that the resource exists: an `arn` of the scope the request
-    /// addresses that resolves to no resource carries no tags, and the EMPTY tag set
-    /// is that answer rather than a refusal — nothing was ever tagged, which is what
-    /// a read asked. What is refused is an `arn` the caller is not talking to at all:
+    /// so two calls with no tag write in between answer the same. Being a read, it
+    /// reports from the SAME stored record `GetConnection` reads — the state that
+    /// record is in decides nothing here, so a connection whose delete has settled
+    /// into the terminal state still lists every key the store holds for it for as
+    /// long as that record is readable, and the two readers never disagree. The
+    /// listing does not validate that the resource exists either: an `arn` of the
+    /// scope the request addresses that resolves to no record carries no tags, and
+    /// the EMPTY tag set is that answer rather than a refusal — nothing was ever
+    /// tagged, which is what a read asked. What is refused is an `arn` the caller is
+    /// not talking to at all:
     /// one whose partition or account is not the scope the request addresses is a
     /// fault in the request. The ARN's Region segment is unconstrained in the model,
     /// so it is a value the caller may spell any way rather than a scope of its own:
@@ -199,9 +204,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already made due (`deleting` -> `deleted`, `updating` -> the state the
         // connection came from), which were owed at this instant whether or not
         // anybody asked. No tag is added, removed or rewritten on a read, so a later
-        // caller sees exactly what this one saw. The resource is the one the ARN's id
+        // caller sees exactly what this one saw. The record is the one the ARN's id
         // names among those the Region the request addressed holds, resolved the way
-        // every ARN-addressed operation here resolves it.
+        // every ARN-addressed operation here resolves it — and, being a read, from the
+        // same record this store hands `GetConnection`, whatever state it is in.
         let found = {
             let mut store = state.lock();
             store.materialise_due_transitions(::std::time::Instant::now());
@@ -211,12 +217,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A tag set with nothing in it is the answer to BOTH ways an `arn` can carry
-        // no tags, because a read asks what is on the resource and not whether it is
-        // there: a resource that exists carrying no tags (stored as `None`, how a
+        // no tags, because a read asks what is on the record and not whether the
+        // resource is still there: a record carrying no tags (stored as `None`, how a
         // connection created without tags is held and what `UntagResource` leaves once
-        // the last key goes), and an `arn` of this scope resolving to no resource at
-        // all, which nothing has ever tagged. Either way the answer is the EMPTY tag
-        // set rather than an absent member.
+        // the last key goes), and an `arn` of this scope resolving to no record at all
+        // — an id that was never allocated, or one whose retention has elapsed — which
+        // nothing has ever tagged. Either way the answer is the EMPTY tag set rather
+        // than an absent member.
         Ok(ListTagsForResourceOutput {
             tags: Some(found.flatten().unwrap_or_default()),
         })

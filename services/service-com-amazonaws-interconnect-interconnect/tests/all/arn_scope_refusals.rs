@@ -14,7 +14,9 @@
 //! resource is not a malformed request at all: the two tag WRITES refuse it as this
 //! service's own client fault (HTTP 400 `InterconnectClientException`, worded with a
 //! fixed sentence carrying nothing of the ARN), and the `@readonly` LISTING answers
-//! HTTP 200 with the empty tag set. Neither class is ever the connection-scoped 404.
+//! HTTP 200 with the empty tag set — it reports what the record the ARN names holds,
+//! and an ARN naming no record at all has nothing on it. Neither class is ever the
+//! connection-scoped 404.
 //!
 //! The operations covered are every one whose input addresses its resource by
 //! `AmazonResourceName`: `ListTagsForResource`, `TagResource` and `UntagResource`
@@ -32,7 +34,6 @@
 //! 59..150 bound) — crossed with all three operations.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -60,9 +61,10 @@ const PARTITION: &str = "aws";
 /// end of that span is still an ARN the boundary validator passes to the handler.
 const ARN_LENGTH: (usize, usize) = (59, 150);
 
-/// Long enough to cover the provisioning span `state.rs` documents (400 ms) with
-/// margin; the transition is due at a stored instant, so any wait past it settles.
-const SETTLE_WAIT: Duration = Duration::from_millis(700);
+/// The terminal `ConnectionState` a completed `DeleteConnection` settles into
+/// (`smithy_query(query="shape",shape="ConnectionState")` -> values include
+/// "deleted"), which a row waits for by POLLING the record's state.
+const SETTLED_DELETE_STATE: &str = "deleted";
 
 // ---------------------------------------------------------------------------
 // The operations under test
@@ -482,12 +484,14 @@ async fn the_same_operations_serve_an_in_scope_arn() {
     }
 }
 
-/// RULE: the class an ARN falls into follows the resource — a connection still
-/// `deleting` is served, and once the clock has settled it into the terminal
-/// `deleted` state its ARN resolves to nothing, which is the client fault for the two
-/// writes and the empty tag set for the read, and never a 404.
+/// RULE: the class an ARN falls into follows the resource for the two WRITES — a
+/// connection still `deleting` takes a tag write, and once the clock has settled it
+/// into the terminal `deleted` state the resource is gone, so a write on its ARN is
+/// the client fault and never a 404. The READ is not a question about the resource's
+/// existence at all: it reports the record the store still holds, so the tags stay
+/// listed for as long as that record is readable.
 #[tokio::test]
-async fn a_settled_delete_moves_its_arn_into_the_client_fault_class() {
+async fn a_settled_delete_moves_its_arn_into_the_client_fault_class_for_the_writes() {
     let emulator = Emulator::new();
     let places = placements(&emulator).await;
     let tags: BTreeMap<String, String> = [("env".to_string(), "test".to_string())]
@@ -518,17 +522,35 @@ async fn a_settled_delete_moves_its_arn_into_the_client_fault_class() {
         answer["tags"]
     );
 
-    tokio::time::sleep(SETTLE_WAIT).await;
-    let settled = emulator.get_connection(&id).await.1["connection"].clone();
+    // Waited for by polling the state, never by sleeping a span.
+    let settled = emulator
+        .connection_in_state(REGION, &id, SETTLED_DELETE_STATE)
+        .await;
     assert_eq!(
         text(&settled, "state"),
-        "deleted",
+        SETTLED_DELETE_STATE,
         "case \"after the delete settles\": expected the terminal state, got {:?}",
         settled["state"]
     );
 
     for (operation, body) in arn_operations() {
         let (status, answer) = emulator.ic(operation, body(&arn)).await;
+        if operation == TAG_READER {
+            // The record is still readable, so the read still reports what it holds —
+            // the same set `GetConnection` reports on the same instant.
+            assert_eq!(
+                status, 200,
+                "case \"after the delete settles\" on {operation}: expected the record to stay readable, got {status} with {answer:?}"
+            );
+            assert_eq!(
+                tags_of(&answer),
+                tags_of(&settled),
+                "case \"after the delete settles\" on {operation}: expected the record's own tag set {:?}, got {:?}",
+                settled["tags"],
+                answer["tags"]
+            );
+            continue;
+        }
         assert_answers_fault(
             "after the delete settles",
             operation,
