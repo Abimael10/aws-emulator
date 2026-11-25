@@ -213,7 +213,10 @@ impl ManagedRuleGroupDescriptor {
     /// the scope nor the caller's region: see
     /// [`AWS_MANAGED_RULE_NOTIFICATION_TOPIC`]. One topic per VENDOR is the same
     /// reading a Marketplace seller's listing is reported under
-    /// ([`managed_product_topic_arn`], which mints both).
+    /// ([`MarketplaceSeller::notification_topic_arn`]); this vendor's own account is
+    /// not something any source available here states, so its topic is reported in
+    /// this emulator's account ([`managed_product_topic_arn`]) rather than under an
+    /// account number nobody published.
     pub fn sns_topic_arn(&self) -> String {
         managed_product_topic_arn(AWS_MANAGED_RULE_NOTIFICATION_TOPIC)
     }

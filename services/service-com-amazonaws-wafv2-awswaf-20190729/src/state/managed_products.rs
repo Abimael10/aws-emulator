@@ -21,8 +21,8 @@
 //!   carries one.
 //! * `SnsTopicArn` is the topic "used to provide notification of changes to the
 //!   managed rule group", and the vendor that publishes the group owns that topic —
-//!   one per VENDOR, so each seller has its own and not the Amazon Web Services
-//!   Managed Rules one.
+//!   one per VENDOR, in that vendor's own account, so each seller has its own and
+//!   not the Amazon Web Services Managed Rules one.
 //! * A seller's listing is not something this account may RUN:
 //!   `ListAvailableManagedRuleGroups` lists "all Amazon Web Services Managed Rules
 //!   rule groups and all of the Amazon Web Services Marketplace managed rule groups
@@ -40,7 +40,12 @@ use super::*;
 /// page" of a Marketplace managed rule group, and a Marketplace listing's product
 /// page lives under this address followed by the identifier the listing is
 /// published as (see [`MarketplaceManagedProduct::product_link`]).
-pub const MARKETPLACE_PRODUCT_PAGE_ADDRESS: &str = "https://aws.amazon.com/marketplace/pp";
+///
+/// The address AS PUBLISHED, down to its scheme: a product page is the
+/// Marketplace's own page and the link is catalogue reference data, so nothing here
+/// normalises it. The URLs this service rewrites are the ones a CALLER fetches from
+/// this emulator; a vendor's product page is neither of those.
+pub const MARKETPLACE_PRODUCT_PAGE_ADDRESS: &str = "http://aws.amazon.com/marketplace/pp";
 
 /// An Amazon Web Services Marketplace SELLER of managed rule groups: the name its
 /// groups are published under and the topic it announces changes to them on.
@@ -58,12 +63,28 @@ pub struct MarketplaceSeller {
     pub vendor_name: &'static str,
     /// The name of the topic this seller announces changes to its managed rule
     /// groups on, which `SnsTopicArn` reports the ARN of.
-    ///
-    /// A seller's topic lives in the seller's OWN account, which is not something
-    /// this emulator holds: every ARN this service answers is minted through the
-    /// emulator's own ARN builder, so what distinguishes one vendor's topic from
-    /// another's here is the topic name, published per seller.
     pub notification_topic: &'static str,
+    /// The account [`Self::notification_topic`] lives in, where this catalogue can
+    /// cite the one the published catalogue states, and `None` where it cannot.
+    ///
+    /// A vendor's notification topic is the VENDOR's resource, published by the
+    /// service rather than created by this account, so its ARN names the publishing
+    /// vendor's account and not the caller's — citing it is what lets a subscriber
+    /// follow that vendor's changes. Cited, never composed, like the rest of a
+    /// listing: a seller whose account no source available here states reports its
+    /// topic in this emulator's own account instead (see
+    /// [`Self::notification_topic_arn`]) rather than under an account number nobody
+    /// published.
+    pub notification_topic_account: Option<&'static str>,
+}
+
+impl MarketplaceSeller {
+    /// The ARN of the topic this seller announces changes to its managed rule
+    /// groups on: the seller's own topic, in the seller's own account where this
+    /// catalogue cites it.
+    pub fn notification_topic_arn(&self) -> String {
+        vendor_notification_topic_arn(self.notification_topic_account, self.notification_topic)
+    }
 }
 
 /// One Amazon Web Services Marketplace managed rule group, as its seller lists it.
@@ -79,20 +100,28 @@ pub struct MarketplaceManagedProduct {
     /// (`ManagedProductDescriptor$ManagedRuleSetName`, an `EntityName`:
     /// `length 1..128`, pattern `^[\w\-]+$`), in the seller's own naming form.
     pub managed_rule_set_name: &'static str,
-    /// The listing's display name (`ProductTitle` is "the display name for the
-    /// managed rule group"), where this catalogue can cite the seller's published
-    /// title; `None` where it cannot.
+    /// The identifier the seller publishes this listing's product under
+    /// (`ProductId`: `length 1..128`, pattern `\S`), where this catalogue can cite
+    /// it; `None` where it cannot, and then the identifier this catalogue publishes
+    /// for the identifying pair stands in ([`managed_product_id`]).
     ///
-    /// Cited or omitted, never composed: a seller's listing text is the seller's, so
-    /// a listing whose title this catalogue cannot cite reports none rather than a
-    /// text nobody published — the same reading
+    /// A product's identifier is assigned by the vendor that publishes it, so it is
+    /// cited beside the rest of the listing rather than computed from the listing's
+    /// name.
+    pub product_id: Option<&'static str>,
+    /// The listing's display name (`ProductTitle` is "the display name for the
+    /// managed rule group"), in the seller's published words.
+    ///
+    /// Cited, never composed: a seller's listing text is the seller's. Every
+    /// descriptor the service publishes carries a title and a summary, so a listing
+    /// whose own text no source available here states is absent from this catalogue
+    /// rather than reported with a text nobody published — the same reading
     /// [`PublishedManagedRule::published_label`] takes of a label.
-    pub product_title: Option<&'static str>,
+    pub product_title: &'static str,
     /// The listing's one-line summary (`ProductDescription` is "a short description
-    /// of the managed rule group"), in the seller's published words where this
-    /// catalogue can cite them, and `None` where it cannot (see
+    /// of the managed rule group"), in the seller's published words (see
     /// [`Self::product_title`]).
-    pub product_description: Option<&'static str>,
+    pub product_description: &'static str,
     /// The segment the seller's product page is published under on Amazon Web
     /// Services Marketplace: the listing code the page is addressed by, which
     /// [`MARKETPLACE_PRODUCT_PAGE_ADDRESS`] is followed by to form `ProductLink`.
@@ -120,14 +149,16 @@ impl MarketplaceManagedProduct {
         ManagedProductDescriptor {
             vendor_name: Some(self.seller.vendor_name.to_string()),
             managed_rule_set_name: Some(self.managed_rule_set_name.to_string()),
-            product_id: Some(managed_product_id(
-                self.seller.vendor_name,
-                self.managed_rule_set_name,
-            )),
+            // The identifier its publisher states for it, and otherwise the one this
+            // catalogue publishes for the pair — what [`managed_product_id`] answers
+            // for this product, read off the entry rather than looked up again.
+            product_id: Some(self.product_id.map(str::to_string).unwrap_or_else(|| {
+                product_id_of_pair(self.seller.vendor_name, self.managed_rule_set_name)
+            })),
             product_link: Some(self.product_link()),
-            product_title: self.product_title.map(str::to_string),
-            product_description: self.product_description.map(str::to_string),
-            sns_topic_arn: Some(managed_product_topic_arn(self.seller.notification_topic)),
+            product_title: Some(self.product_title.to_string()),
+            product_description: Some(self.product_description.to_string()),
+            sns_topic_arn: Some(self.seller.notification_topic_arn()),
             is_versioning_supported: self.is_versioning_supported,
             is_advanced_managed_rule_set: false,
         }
@@ -154,10 +185,11 @@ impl MarketplaceManagedProduct {
 // ---------------------------------------------------------------------------
 
 /// The seller of the `CyberSecurityCloud-` managed rule groups, with the topic it
-/// announces changes to them on.
+/// announces changes to them on and the account that topic lives in.
 const CYBER_SECURITY_CLOUD: MarketplaceSeller = MarketplaceSeller {
     vendor_name: "Cyber Security Cloud Inc.",
     notification_topic: "CyberSecurityCloud-ManagedRule",
+    notification_topic_account: Some("343255486711"),
 };
 
 /// The Amazon Web Services Marketplace managed rule groups this catalogue
@@ -169,33 +201,32 @@ const CYBER_SECURITY_CLOUD: MarketplaceSeller = MarketplaceSeller {
 /// `(VendorName, Name)` pair.
 ///
 /// A seller's inventory is the SELLER's publication, so every entry here is CITED
-/// rather than composed: the vendor name, the group name, the listing code its
-/// product page is addressed by, the seller's notification topic and whatever of the
-/// listing's own text is citable. A listing this catalogue cannot cite is absent
-/// rather than invented, and a text it cannot cite is omitted rather than worded here
-/// ([`MarketplaceManagedProduct::product_title`]) — adding a seller's listing is a
-/// data change in this one list. What the catalogue publishes per entry is the
-/// product's identifier and the ARN of its seller's topic ([`managed_product_id`],
-/// [`managed_product_topic_arn`]), because a seller's own identifiers and account are
-/// not observable here.
+/// rather than composed: the vendor name, the group name, the identifier and the
+/// listing text the seller publishes the product under, the listing code its product
+/// page is addressed by and the seller's notification topic. A listing this
+/// catalogue cannot cite is absent rather than invented — adding a seller's listing
+/// is a data change in this one list. Listed in the order the service's catalogue
+/// publishes them.
 pub const MARKETPLACE_MANAGED_PRODUCT_CATALOGUE: &[MarketplaceManagedProduct] = &[
     listing(
         &CYBER_SECURITY_CLOUD,
-        "CyberSecurityCloud-HighSecurityOWASPSet-",
-        None,
-        None,
-        "B081TD6XL1",
+        "CyberSecurityCloud-APIGatewayServerless-",
+        Some("8bbf295b-34b3-40c0-bee7-5ba8f602705f"),
+        "Cyber Security Cloud Managed Rules for AWS WAF -API Gateway/Serverless-",
+        "The Cyber Security Cloud OWASP ruleset is designed to mitigate and \
+         minimize vulnerabilities, including all those on OWASP API \
+         Security/Serverless Top 10 Threats.",
+        "B081TKTBQ8",
     ),
     listing(
         &CYBER_SECURITY_CLOUD,
-        "CyberSecurityCloud-APIGatewayServerless-",
-        Some("Cyber Security Cloud Managed Rules for AWS WAF -API Gateway/Serverless-"),
-        Some(
-            "The Cyber Security Cloud OWASP ruleset is designed to mitigate and \
-             minimize vulnerabilities, including all those on OWASP API \
-             Security/Serverless Top 10 Threats.",
-        ),
-        "B081TKTBQ8",
+        "CyberSecurityCloud-HighSecurityOWASPSet-",
+        Some("fa8c6ca7-12c3-4e3f-8524-782177f2f2bd"),
+        "Cyber Security Cloud Managed Rules for AWS WAF -HighSecurity OWASP Set-",
+        "The Cyber Security Cloud OWASP ruleset is designed to mitigate and \
+         minimize vulnerabilities, including all those on OWASP Top 10 Web \
+         Application Threats list.",
+        "B081TD6XL1",
     ),
 ];
 
@@ -212,13 +243,15 @@ pub const MARKETPLACE_MANAGED_PRODUCT_CATALOGUE: &[MarketplaceManagedProduct] = 
 const fn listing(
     seller: &'static MarketplaceSeller,
     managed_rule_set_name: &'static str,
-    product_title: Option<&'static str>,
-    product_description: Option<&'static str>,
+    product_id: Option<&'static str>,
+    product_title: &'static str,
+    product_description: &'static str,
     product_page: &'static str,
 ) -> MarketplaceManagedProduct {
     MarketplaceManagedProduct {
         seller,
         managed_rule_set_name,
+        product_id,
         product_title,
         product_description,
         product_page,
@@ -278,20 +311,44 @@ pub fn managed_products_of_vendor(vendor_name: &str) -> Vec<ManagedProductDescri
 /// `ManagedRuleGroupStatement`, and a caller that round-trips one into another call
 /// keys on this.
 ///
-/// A vendor assigns that identifier when it publishes the set, which is not something
-/// this emulator observes, so the catalogue publishes one: the UUID the identifying
+/// A vendor assigns that identifier when it publishes the set, so the identifier a
+/// product is reported under is the one its PUBLISHER states where this catalogue
+/// cites it ([`MarketplaceManagedProduct::product_id`]). Where no source available
+/// here states one, the catalogue publishes one instead: the UUID the identifying
 /// pair spells, shaped like every other id this service mints ([`new_uuid`]) but
 /// DERIVED from the pair rather than from fresh entropy — so the same product is
 /// reported under the same identifier on every call and by every operation that
 /// reports it, and no two products share one.
 pub fn managed_product_id(vendor_name: &str, managed_rule_set_name: &str) -> String {
+    if let Some(published) = published_product_id(vendor_name, managed_rule_set_name) {
+        return published.to_string();
+    }
+    product_id_of_pair(vendor_name, managed_rule_set_name)
+}
+
+/// The identifier the vendor that publishes the product of this pair states for it,
+/// where this catalogue cites it.
+///
+/// Only a Marketplace seller's listing carries one today: the Amazon Web Services
+/// Managed Rules family's catalogue entries state no published identifier, so their
+/// products are reported under [`product_id_of_pair`].
+fn published_product_id(vendor_name: &str, managed_rule_set_name: &str) -> Option<&'static str> {
+    marketplace_managed_product(vendor_name, managed_rule_set_name)
+        .and_then(|listing| listing.product_id)
+}
+
+/// The identifier this catalogue publishes for a product whose own is not cited: the
+/// UUID the identifying pair spells (see [`managed_product_id`]).
+fn product_id_of_pair(vendor_name: &str, managed_rule_set_name: &str) -> String {
     use ::sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
     // The pair, each part length-prefixed, so no two different pairs hash the same
     // bytes.
     for part in [vendor_name, managed_rule_set_name] {
-        hasher.update(part.len().to_le_bytes());
+        // A fixed-width prefix, so the identifier a product is reported under is the
+        // same whatever target the emulator was built for.
+        hasher.update((part.len() as u64).to_le_bytes());
         hasher.update(part.as_bytes());
     }
     let digest: [u8; 32] = hasher.finalize().into();
@@ -313,6 +370,29 @@ pub fn managed_product_id(vendor_name: &str, managed_rule_set_name: &str) -> Str
 /// ([`AWS_MANAGED_RULE_NOTIFICATION_REGION`]).
 pub fn managed_product_topic_arn(topic: &str) -> String {
     ::engine::emulator_arn("sns", AWS_MANAGED_RULE_NOTIFICATION_REGION, topic)
+}
+
+/// The ARN of the topic a vendor announces changes on, in the vendor's OWN account
+/// where this catalogue cites it (`account`), and in this emulator's account where
+/// it cannot ([`managed_product_topic_arn`]).
+///
+/// A notification topic is not a resource of the calling account: the vendor that
+/// publishes the managed rule group owns it, and a caller subscribes to it to learn
+/// of that vendor's changes. So where the published catalogue states the account the
+/// topic lives in, the ARN reported for it carries THAT account, as catalogue
+/// reference data rather than as an ARN this emulator minted for a resource of its
+/// own. Same region either way: one topic per vendor, in the region that vendor
+/// publishes it in ([`AWS_MANAGED_RULE_NOTIFICATION_REGION`]).
+fn vendor_notification_topic_arn(account: Option<&str>, topic: &str) -> String {
+    match account {
+        // The partition is written out here, rather than taken from the emulator's
+        // own ARN builder, because this is a published catalogue constant rather
+        // than an ARN this emulator mints for a resource of its own.
+        Some(account) => {
+            format!("arn:aws:sns:{AWS_MANAGED_RULE_NOTIFICATION_REGION}:{account}:{topic}")
+        }
+        None => managed_product_topic_arn(topic),
+    }
 }
 
 /// The Marketplace listing the pair `(vendor_name, name)` names, if a seller in

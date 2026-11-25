@@ -44,3 +44,35 @@ All 46 recorded descriptors ($.ManagedProducts[0]..[45]) are reported 'missing',
 2. Equivalently, call wafv2 DescribeAllManagedProducts with Scope=REGIONAL (then Scope=CLOUDFRONT).
 3. Observe 200 with a ManagedProducts list in which no element carries a ProductTitle or ProductDescription member, the ProductId values are emulator-minted UUIDs, every ProductLink uses the https:// scheme, and every SnsTopicArn names account 000000000000.
 4. Compare each element against the recorded AWS catalog: none of the 46 recorded descriptors is present, e.g. no element has ManagedRuleSetName 'CyberSecurityCloud-HighSecurityOWASPSet-' together with ProductId 'fa8c6ca7-12c3-4e3f-8524-782177f2f2bd', its published ProductTitle/ProductDescription and its vendor-account SnsTopicArn.
+
+## Resolution
+
+FIXED as to the rule, for every product the catalogue publishes; the catalogue's MEMBERSHIP stays
+limited to the listings a source available here states.
+
+The rule: a managed product is a vendor's publication read out of the service's own fixed catalogue,
+so every descriptor a describe reports is fully populated — a `ProductTitle` and a
+`ProductDescription` for every product — and each member naming something the publishing VENDOR owns
+(the product's identifier, the link to its product page, the ARN of the topic it announces its
+changes on) is reported exactly as the catalogue publishes it, never rewritten through the
+local-account/URL normalisation this emulator applies to resources a CALLER owns.
+
+`src/state/managed_products.rs` now carries, per Marketplace listing, the identifier its seller
+publishes the product under, the seller's own display title and summary (both required of an entry
+rather than optional, so a listing whose text no source states is absent rather than reported
+blank), and, per seller, the account its notification topic lives in; the Marketplace product-page
+address is the published `http://aws.amazon.com/marketplace/pp` form rather than a normalised one.
+`managed_product_id` reports the identifier the publishing vendor states where the catalogue cites
+one and otherwise the identifier the catalogue publishes for the identifying pair, so one function
+answers for every operation that reports a product. Both describes
+(`DescribeAllManagedProducts`, `DescribeManagedProductsByVendor`) project that one catalogue, and
+`DescribeManagedRuleGroup`'s topic is unchanged: the Amazon Web Services Managed Rules vendor's own
+account is stated nowhere available here, so its topic stays in this emulator's account rather than
+under an account number nobody published.
+
+Both recorded Marketplace descriptors now replay identical to AWS's, and the
+`$.ManagedProducts[*].ProductLink` key passes. The rest of AWS's 46-entry membership is NOT served:
+it is a snapshot of third-party seller inventory (vendor names, rule-set names, listing codes and
+published identifiers) that no rule of the service produces and no source available here states, so
+`$.ManagedProducts[*]` stays red rather than being closed with an invented inventory. Adding a
+seller's listing remains a data change in that one list.

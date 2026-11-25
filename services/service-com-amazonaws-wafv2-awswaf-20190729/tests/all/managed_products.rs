@@ -36,7 +36,10 @@ use crate::managed_rule_groups::managed_statement;
 use crate::web_acl_lifecycle::{create_web_acl, is_model_uuid, visibility, Waf};
 
 /// The products a response reports, in the order it reported them.
-fn reported(response: &Value) -> Vec<Value> {
+///
+/// Shared with the sibling suite in `crate::managed_product_catalog_data`, so both
+/// read a report the same way.
+pub(crate) fn reported(response: &Value) -> Vec<Value> {
     response["ManagedProducts"]
         .as_array()
         .cloned()
@@ -53,7 +56,13 @@ fn of_aws_managed_rules(products: &[Value]) -> Vec<Value> {
 }
 
 /// The reported product the `(VendorName, ManagedRuleSetName)` pair names.
-fn product_of<'a>(products: &'a [Value], vendor: &str, name: &str) -> Option<&'a Value> {
+///
+/// Shared with the sibling suite in `crate::managed_product_catalog_data`.
+pub(crate) fn product_of<'a>(
+    products: &'a [Value],
+    vendor: &str,
+    name: &str,
+) -> Option<&'a Value> {
     products.iter().find(|product| {
         product["VendorName"] == json!(vendor) && product["ManagedRuleSetName"] == json!(name)
     })
@@ -290,28 +299,17 @@ async fn reporting_the_managed_products_changes_nothing() {
 ///
 /// The rows are the WHOLE product catalogue — one per Marketplace listing and one
 /// per published rule set — crossed with both declared scopes. They span what a
-/// listing's seller publishes about it too: an entry whose own text this catalogue
-/// cites and one it cannot, which reports no title or summary rather than a text
-/// nobody published.
+/// listing's seller publishes about it too: its own title and summary, the link to
+/// its product page, and the topic it announces its changes on.
 #[tokio::test]
 async fn both_vendor_families_are_reported_as_managed_products() {
     // The rows below are only worth crossing if the catalogue really spans both
-    // families, and the Marketplace family both forms of cited listing text.
+    // families.
     assert!(
         !MARKETPLACE_MANAGED_PRODUCT_CATALOGUE.is_empty()
             && !MANAGED_RULE_GROUP_CATALOGUE.is_empty(),
         "the catalogue must publish products of both vendor families for this table \
          to span the class"
-    );
-    assert!(
-        MARKETPLACE_MANAGED_PRODUCT_CATALOGUE
-            .iter()
-            .any(|listing| listing.product_title.is_some())
-            && MARKETPLACE_MANAGED_PRODUCT_CATALOGUE
-                .iter()
-                .any(|listing| listing.product_title.is_none()),
-        "the Marketplace family must publish a listing whose title this catalogue \
-         cites and one it cannot, for this table to span both"
     );
 
     let waf = Waf::new();
@@ -334,6 +332,7 @@ async fn both_vendor_families_are_reported_as_managed_products() {
             let MarketplaceManagedProduct {
                 seller,
                 managed_rule_set_name,
+                product_id: _,
                 product_title,
                 product_description,
                 product_page,
@@ -344,8 +343,8 @@ async fn both_vendor_families_are_reported_as_managed_products() {
             else {
                 panic!("case {case:?}: the seller's listing must be reported, got {response}");
             };
-            // The listing's own text where this catalogue cites the seller's, and no
-            // member at all where it cannot: a text nobody published is not reported.
+            // The listing's own text, in the seller's published words: every
+            // descriptor carries a title and a summary.
             assert_eq!(
                 product["ProductTitle"],
                 json!(product_title),
@@ -386,7 +385,7 @@ async fn both_vendor_families_are_reported_as_managed_products() {
             );
             // The topic its SELLER announces changes on, not the Amazon Web Services
             // Managed Rules one.
-            let expected_topic = managed_product_topic_arn(seller.notification_topic);
+            let expected_topic = seller.notification_topic_arn();
             assert_eq!(
                 product["SnsTopicArn"],
                 json!(expected_topic),
