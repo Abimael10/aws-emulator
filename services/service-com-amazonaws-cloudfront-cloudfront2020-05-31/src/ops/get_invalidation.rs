@@ -151,7 +151,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(stored) = store.distribution(&input.distribution_id) else {
             return Err(GetInvalidationErrorModeled::NoSuchDistribution(
-                crate::state::no_such_distribution(),
+                crate::state::unresolved_distribution_id(
+                    crate::state::ADDRESSED_BY_DISTRIBUTION_ID,
+                    &input.distribution_id,
+                ),
             )
             .into());
         };

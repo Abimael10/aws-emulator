@@ -2284,6 +2284,33 @@ pub fn no_such_distribution() -> NoSuchDistribution {
     }
 }
 
+/// The modelled `NoSuchDistribution` an operation ADDRESSED by a distribution identifier
+/// answers an identifier it could not resolve — the split
+/// [`ComAmazonawsCloudfrontCloudfront20200531State::unresolved_origin_access_control`]
+/// makes, under the one error class this family's models bind for both conditions.
+///
+/// A value written in the alphabet CloudFront writes an entity identifier in
+/// ([`is_entity_id_form`]) is an identifier of that mint, and WHICH one was ever issued is a
+/// property of the STORE: such a value the account holds no distribution under is the
+/// distribution reported ABSENT ([`no_such_distribution`]). A value written OUTSIDE it — in
+/// lower case, around a separator, as a UUID, as a word or as a domain name — was never an
+/// identifier at all, so it is the identifier the route reports it cannot READ
+/// ([`id_format_invalid_message`]).
+///
+/// `member` is the MODEL's name for the member that carried the value, the one variable part
+/// of that sentence: [`ADDRESSED_BY_ID`] for the distribution's own routes, and
+/// [`ADDRESSED_BY_DISTRIBUTION_ID`] for the routes addressed by the distribution a resource
+/// is held under. Nothing the request supplied reaches the wire — both sentences are fixed
+/// text.
+pub fn unresolved_distribution_id(member: &str, id: &str) -> NoSuchDistribution {
+    if is_entity_id_form(id) {
+        return no_such_distribution();
+    }
+    NoSuchDistribution {
+        message: Some(id_format_invalid_message(member)),
+    }
+}
+
 /// The modelled `NoSuchInvalidation` for an invalidation id a distribution does not
 /// hold. Fixed service text, for the same reason [`no_such_distribution`] is.
 pub fn no_such_invalidation() -> NoSuchInvalidation {

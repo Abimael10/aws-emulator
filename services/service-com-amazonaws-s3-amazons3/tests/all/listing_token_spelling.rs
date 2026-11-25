@@ -82,9 +82,12 @@ fn assert_written_in(case: &str, token: &str, alphabet: Alphabet, position: &str
     }
 }
 
-/// `token` with its last character replaced by another of the same alphabet — a value one
-/// character away from the one a listing issued, which only the authenticator inside it can
-/// refuse.
+/// `token` with its last NON-PADDING character replaced by another of the same alphabet — a
+/// value one character away from the one a listing issued, which only the authenticator inside
+/// it can refuse.
+///
+/// Not the padding a base64 value ends in: a change there would be refused for the spelling
+/// rather than for the authenticator.
 fn one_character_away(token: &str, alphabet: Alphabet) -> String {
     let mut characters: Vec<char> = token.chars().collect();
     // The padding a base64 token ends in is not a character the value is free in, so the

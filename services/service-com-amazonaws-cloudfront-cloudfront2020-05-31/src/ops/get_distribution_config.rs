@@ -16,10 +16,13 @@
 //! returned" — is unreachable over the wire: `Id` is a required `@httpLabel` of
 //! `/2020-05-31/distribution/{Id}/config`, so an empty label matches no route and never
 //! arrives here. Every id that does arrive either names a stored distribution or is answered
-//! with `NoSuchDistribution` and its fixed sentence: `Id` carries no `@pattern` and no
-//! `@length`, so this route reads no form of the value and resolves every one of them against
-//! the store, exactly as `GetDistribution` and every other operation addressed by a
-//! distribution identifier does (`crate::state::no_such_distribution`).
+//! with `NoSuchDistribution`, under one of the two sentences that error class carries: `Id`
+//! carries no `@pattern` and no `@length`, so this route reads of the value only the ALPHABET
+//! CloudFront writes an entity identifier in — a value of that alphabet the account holds no
+//! distribution under is the distribution reported absent, and a value written outside it is
+//! the identifier the route reports it cannot read — exactly as `GetDistribution` and every
+//! other operation addressed by a distribution identifier does
+//! (`crate::state::unresolved_distribution_id`).
 //!
 //! ## Shape of an operation
 //!
@@ -156,11 +159,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(stored) = store.distribution(&input.id) else {
             return Err(GetDistributionConfigErrorModeled::NoSuchDistribution(
-                // The STORE is what says whether an identifier was ever issued, so nothing of
-                // the value's form is read in front of it: every `Id` this account holds no
-                // distribution under is the distribution reported ABSENT, under the fixed
-                // sentence this one error class carries.
-                crate::state::no_such_distribution(),
+                // One error class covers both conditions, so the SENTENCE tells them apart:
+                // WHICH identifier of the alphabet an entity identifier is written in was
+                // ever issued is the STORE's own record, so such an `Id` the account holds no
+                // distribution under is the distribution reported ABSENT, while a value
+                // written outside that alphabet is the identifier this route cannot READ.
+                crate::state::unresolved_distribution_id(
+                    crate::state::ADDRESSED_BY_ID,
+                    &input.id,
+                ),
             )
             .into());
         };

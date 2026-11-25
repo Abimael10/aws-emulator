@@ -44,7 +44,7 @@
 //! the caller hands back unread — "NextContinuationToken is obfuscated and is not a real
 //! key" (`ListObjectsV2Output$NextContinuationToken`), "ContinuationToken is obfuscated and
 //! is not a real bucket" (`ListBucketsOutput$ContinuationToken`). So it is written in the
-//! alphabet AWS writes that listing's own tokens in — url-safe base64 for the object
+//! alphabet AWS writes that listing's own tokens in — standard base64 for the object
 //! listings, lowercase hex for the account's bucket listing — it is no rendering of the
 //! position it resumes at in any spelling a
 //! caller could compute, and only a value this service minted for THIS LISTING names a
@@ -684,12 +684,16 @@ fn computable_spellings(position: &str) -> Vec<(String, String)> {
     spellings
 }
 
-/// `token` with its last character changed — a value one character away from the token a
+/// `token` with its FIRST character changed — a value one character away from the token a
 /// listing really issued, which only the authenticator inside it can refuse.
-fn flip_last(token: &str) -> String {
+///
+/// The first character rather than the last, because a padded base64 value ends in the
+/// padding character: a change there would be refused for the spelling rather than for the
+/// authenticator, which is not what the rows using this read.
+fn flip_first(token: &str) -> String {
     let mut characters: Vec<char> = token.chars().collect();
-    if let Some(last) = characters.last_mut() {
-        *last = match *last {
+    if let Some(first) = characters.first_mut() {
+        *first = match *first {
             'A' => 'B',
             _ => 'A',
         };
@@ -926,7 +930,7 @@ async fn the_object_listing_hands_back_an_opaque_token_whatever_key_it_resumes_a
         let mut forged = computable_spellings(&resumed_at);
         forged.push((
             "a token with its last character changed".to_string(),
-            flip_last(&token),
+            flip_first(&token),
         ));
         forged.push((
             "not an encoding at all".to_string(),
@@ -1203,7 +1207,7 @@ async fn the_annotation_listing_token_is_a_cursor_only_into_the_object_it_was_is
     let mut forged = computable_spellings(&resumed_at);
     forged.push((
         "a token with its last character changed".to_string(),
-        flip_last(&token),
+        flip_first(&token),
     ));
     forged.push((
         "not an encoding at all".to_string(),
@@ -1382,7 +1386,7 @@ async fn an_object_listing_token_names_a_position_and_resumes_whichever_bucket_i
     let mut forged = computable_spellings(&position);
     forged.push((
         "a token with its last character changed".to_string(),
-        flip_last(&token),
+        flip_first(&token),
     ));
     forged.push((
         "not an encoding at all".to_string(),

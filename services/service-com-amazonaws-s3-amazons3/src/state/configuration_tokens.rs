@@ -103,8 +103,8 @@ impl PagedListing {
     /// The alphabet THIS listing's token is written in, which is the alphabet the recorded
     /// answers of that listing write it in: a lowercase-hex value for the account's own
     /// bucket listing and for the four listings of a bucket's id-addressed configurations, a
-    /// base64 one for the listings of what a bucket or an object version holds and for the
-    /// directory-bucket listing.
+    /// base64 one — the standard alphabet, padded — for the listings of what a bucket or an
+    /// object version holds and for the directory-bucket listing.
     ///
     /// The token is round-tripped unread either way — "an opaque value that Amazon S3
     /// understands" — so which of the two it is changes nothing a client can do with the

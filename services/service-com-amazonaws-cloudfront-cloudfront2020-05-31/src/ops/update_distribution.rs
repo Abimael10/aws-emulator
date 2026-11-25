@@ -347,8 +347,10 @@ fn current_record(
             )
         })
         .ok_or_else(|| {
-            UpdateDistributionErrorModeled::NoSuchDistribution(crate::state::no_such_distribution())
-                .into()
+            UpdateDistributionErrorModeled::NoSuchDistribution(
+                crate::state::unresolved_distribution_id(crate::state::ADDRESSED_BY_ID, id),
+            )
+            .into()
         })
 }
 

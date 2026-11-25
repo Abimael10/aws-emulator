@@ -11,13 +11,16 @@
 //! contract, and the members that carry one are plain `string` `@httpLabel`s in the model (no
 //! `@pattern`, no `@length`), so no route may invent a format constraint of its own:
 //!
-//! * the DISTRIBUTION reads NOTHING of the value. Every operation addressed by a distribution
+//! * the DISTRIBUTION reads the ALPHABET and nothing more
+//!   ([`super::unresolved_distribution_id`]). Every operation addressed by a distribution
 //!   identifier — the distribution's own reads and mutations, the invalidations held under one,
-//!   the monitoring subscription — carries the value straight through to the store and reports
-//!   the distribution ABSENT ([`super::no_such_distribution`]) for every one it holds no
-//!   distribution under, because the width and alphabet this emulator MINTS a distribution
-//!   identifier at are one form CloudFront writes one in, never the only form, and WHICH
-//!   identifier was ever issued is a property of the STORE alone;
+//!   the monitoring subscription — carries a value written in the alphabet an entity
+//!   identifier is written in ([`super::is_entity_id_form`]) straight through to the store and
+//!   reports the distribution ABSENT ([`super::no_such_distribution`]) for every one it holds
+//!   no distribution under, because the width this emulator MINTS a distribution identifier at
+//!   is one width CloudFront writes one in, never the only width, and WHICH identifier of that
+//!   alphabet was ever issued is a property of the STORE alone — while a value written outside
+//!   that alphabet is the identifier the route reports it cannot READ;
 //! * the field-level encryption CONFIGURATION DOCUMENT routes read the WHOLE form their
 //!   record's ids are ISSUED in — the kind's namespace letter over an identifier body of the
 //!   issued width — of a value that is written as an identifier of this mint at all, and read
@@ -30,12 +33,13 @@
 //!
 //! The same split, for the kinds whose identifier form IS decided by the value alone, is made
 //! by the free functions beside the refusals they answer with:
-//! [`super::unresolved_key_group_id`] and the two field-level encryption records'. Those need
+//! [`super::unresolved_distribution_id`], [`super::unresolved_key_group_id`] and the two
+//! field-level encryption records'. Those need
 //! no store, which is the one reason the one below is a method. A kind whose recorded contract
 //! makes NO such split reads nothing of the value at all and reports the absent resource for
-//! every identifier it cannot resolve, which is what the distribution, the public key and the
-//! field-level encryption configuration's RESOURCE read do ([`super::no_such_distribution`],
-//! [`super::no_such_public_key`], [`super::no_such_field_level_encryption_config`]).
+//! every identifier it cannot resolve, which is what the public key and the
+//! field-level encryption configuration's RESOURCE read do
+//! ([`super::no_such_public_key`], [`super::no_such_field_level_encryption_config`]).
 //!
 //! Nothing here echoes the submitted value: both sentences are fixed text.
 
@@ -75,3 +79,10 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
 /// resource by, except the ones that address a resource held UNDER a distribution
 /// (`CreateInvalidation$DistributionId`).
 pub const ADDRESSED_BY_ID: &str = "Id";
+
+/// The model's name for the member the operations addressed by the distribution a resource is
+/// held under carry that distribution's identifier in — the invalidations of a distribution
+/// and its monitoring subscription (`CreateInvalidation$DistributionId`,
+/// `GetMonitoringSubscription$DistributionId`), which is the member such a route names when
+/// it reports an identifier it cannot read ([`super::unresolved_distribution_id`]).
+pub const ADDRESSED_BY_DISTRIBUTION_ID: &str = "DistributionId";

@@ -17,7 +17,8 @@
 //!
 //! What an identifier a MATCHED route cannot resolve earns is each resource kind's own
 //! contract, asserted in the suites that own it
-//! (`distribution_identifier_reads_no_form`, `origin_access_control_identifier_readability`,
+//! (`distribution_identifier_reads_no_form`, `distribution_identifier_reads_its_alphabet`,
+//! `origin_access_control_identifier_readability`,
 //! `crossed_resource_identifiers`).
 //!
 //! Every assertion travels the router, so each case exercises routing, the restXml reader, the

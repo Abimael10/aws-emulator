@@ -61,6 +61,7 @@ fn is_lowercase_hex(token: &str) -> bool {
 /// Whether `token` is written in base64's STANDARD alphabet, padded (RFC 4648 §4).
 fn is_standard_base64(token: &str) -> bool {
     !token.is_empty()
+        && token.len().is_multiple_of(4)
         && token
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '+' | '/' | '='))

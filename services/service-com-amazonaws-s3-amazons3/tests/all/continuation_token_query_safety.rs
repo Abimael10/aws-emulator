@@ -219,7 +219,8 @@ async fn the_object_listing_token_travels_unchanged_and_resumes_the_listing() {
 }
 
 /// RULE on the listing whose token is written in the OTHER alphabet: the account's own bucket
-/// listing hands back a hex token, which travels unchanged the same way.
+/// listing hands back a hex token, which is inside RFC 3986's unreserved set — so the encoded
+/// hand-back and the verbatim one are the same bytes, and both resume the listing.
 #[tokio::test]
 async fn the_bucket_listing_token_travels_unchanged_and_resumes_the_account() {
     let router = router();

@@ -182,7 +182,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|stored| (stored.etag.clone(), stored.deletable()))
         else {
             return Err(DeleteDistributionErrorModeled::NoSuchDistribution(
-                crate::state::no_such_distribution(),
+                crate::state::unresolved_distribution_id(
+                    crate::state::ADDRESSED_BY_ID,
+                    &input.id,
+                ),
             )
             .into());
         };

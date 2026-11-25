@@ -281,8 +281,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The REQUEST/CONTENT validation stage Amazon SES runs before it weighs the send
         // against anything the account holds: the addresses the request names, the headers,
         // the tags and the attachments the one template states for every message of this
-        // call ([`crate::state::send_validation`]). What ONE destination states for itself
-        // is that destination's own business and is reported in its own result below.
+        // call ([`crate::state::send_validation`]). What ONE ENTRY states for itself — the
+        // headers and the tags of its own message — is read AFTER the gates on sending below
+        // ([`entry_members_defect`]), because the identity a call sends from is weighed before
+        // anything an individual entry carries.
         validate_request(&input, template)?;
 
         if template
@@ -365,91 +367,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // template is work the CALLER sizes, so it is not done while the store every other
         // request shares is locked.
         //
-        // Every gate here is a gate on SENDING A MESSAGE — the account's sending switch, the
-        // configuration set's own, and the sending identity each message is sent from — so a
-        // call that has no message to send reaches none of them: its entries are reported as
-        // what is wrong with them, which is the whole of what such a call does.
-        let content = match renders_a_message {
-            false => None,
-            true => {
-                let mut store = state.lock();
-                store.settle(now);
+        // Every gate here is a gate on the REQUEST — the account's sending switch, the
+        // configuration set it names, and the identity every message of this call is sent
+        // from — so every call passes them, whatever its entries carry: a request this account
+        // has no ability to send, or has no identity to send as, is refused whole rather than
+        // reported entry by entry. Only the TEMPLATE is resolved for the messages there ARE to
+        // render, because that is what a message is rendered FROM: a call whose every entry is
+        // reported `INVALID_PARAMETER` renders nothing, and so looks up nothing.
+        let content = {
+            let mut store = state.lock();
+            store.settle(now);
 
-                // The account-level sending switch (`GetAccount`'s `SendingEnabled`, which
-                // `PutAccountSendingAttributes` sets) gates every message this account
-                // sends, so it is read before anything about these particular messages.
-                if !store.account.sending_enabled {
+            // The account-level sending switch (`GetAccount`'s `SendingEnabled`, which
+            // `PutAccountSendingAttributes` sets) gates every message this account
+            // sends, so it is read before anything about these particular messages.
+            if !store.account.sending_enabled {
+                return Err(SendBulkEmailErrorModeled::SendingPausedException(
+                    SendingPausedException {
+                        message: Some(
+                            "The message can't be sent because the account's ability to \
+                             send email is currently paused."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+
+            // The configuration set the request names is a resource of this account,
+            // and the set's own sending switch gates every message sent with it: while
+            // it is off, a send naming the set has no ability to send, whatever the
+            // account-wide switch says.
+            if let Some(set_name) = input.configuration_set_name.as_deref() {
+                let Some(configuration_set) = store.configuration_sets.get(set_name) else {
+                    return Err(SendBulkEmailErrorModeled::NotFoundException(
+                        NotFoundException {
+                            message: Some(crate::state::configuration_set_not_found(set_name)),
+                        },
+                    )
+                    .into());
+                };
+                if !configuration_set.sending_enabled {
                     return Err(SendBulkEmailErrorModeled::SendingPausedException(
                         SendingPausedException {
-                            message: Some(
-                                "The message can't be sent because the account's ability to \
-                                 send email is currently paused."
-                                    .to_string(),
-                            ),
+                            message: Some(crate::state::configuration_set_sending_paused(
+                                set_name,
+                            )),
                         },
                     )
                     .into());
                 }
+            }
 
-                // The configuration set the request names is a resource of this account,
-                // and the set's own sending switch gates every message sent with it: while
-                // it is off, a send naming the set has no ability to send, whatever the
-                // account-wide switch says.
-                if let Some(set_name) = input.configuration_set_name.as_deref() {
-                    let Some(configuration_set) = store.configuration_sets.get(set_name) else {
-                        return Err(SendBulkEmailErrorModeled::NotFoundException(
-                            NotFoundException {
-                                message: Some(crate::state::configuration_set_not_found(
-                                    set_name,
-                                )),
-                            },
-                        )
-                        .into());
-                    };
-                    if !configuration_set.sending_enabled {
-                        return Err(SendBulkEmailErrorModeled::SendingPausedException(
-                            SendingPausedException {
-                                message: Some(crate::state::configuration_set_sending_paused(
-                                    set_name,
-                                )),
-                            },
-                        )
-                        .into());
-                    }
-                }
+            // "The address that you specify has to be verified." An address identity
+            // authorises itself; a domain identity authorises every address in that
+            // domain and its subdomains. The check covers every identity the messages
+            // of this call involve, exactly as a single send weighs them
+            // (`crate::ops::send_email`): the one sending identity, the recipients the
+            // entries address, and the address bounce and complaint notifications are
+            // forwarded to. The set it reads is the bounded one built above.
+            let failed = store.unverified_send_identities(
+                &region,
+                &from,
+                &recipients,
+                input.feedback_forwarding_email_address.as_deref(),
+            );
+            // What the failed check REFUSES is the sending identity every message of
+            // this call is sent from.
+            if failed
+                .iter()
+                .any(|identity| identity == crate::state::addr_spec(&from))
+            {
+                let named: Vec<&str> = failed.iter().map(String::as_str).collect();
+                return Err(SendBulkEmailErrorModeled::MessageRejected(MessageRejected {
+                    message: Some(crate::state::unverified_identities_message(
+                        &region, &named,
+                    )),
+                })
+                .into());
+            }
 
-                // "The address that you specify has to be verified." An address identity
-                // authorises itself; a domain identity authorises every address in that
-                // domain and its subdomains. The check covers every identity the messages
-                // of this call involve, exactly as a single send weighs them
-                // (`crate::ops::send_email`): the one sending identity, the recipients the
-                // entries address, and the address bounce and complaint notifications are
-                // forwarded to. The set it reads is the bounded one built above.
-                let failed = store.unverified_send_identities(
-                    &region,
-                    &from,
-                    &recipients,
-                    input.feedback_forwarding_email_address.as_deref(),
-                );
-                // What the failed check REFUSES is the sending identity every message of
-                // this call is sent from.
-                if failed
-                    .iter()
-                    .any(|identity| identity == crate::state::addr_spec(&from))
-                {
-                    let named: Vec<&str> = failed.iter().map(String::as_str).collect();
-                    return Err(SendBulkEmailErrorModeled::MessageRejected(MessageRejected {
-                        message: Some(crate::state::unverified_identities_message(
-                            &region, &named,
-                        )),
-                    })
-                    .into());
-                }
+            // The headers and the tags ONE entry states for its own message: part of the
+            // request's own form, refused whole rather than reported as that entry's result
+            // ([`entry_members_defect`]), and read once the call has an identity to send as.
+            validate_entry_members(&input)?;
 
-                // The template every message of this call is rendered from, read back out of
-                // the account's template store: a resource of the account, resolved for the
-                // messages this call has to render.
-                Some(template_content(&store, template)?)
+            // The template every message of this call is rendered from, read back out of
+            // the account's template store: a resource of the account, resolved for the
+            // messages this call has to render.
+            match renders_a_message {
+                false => None,
+                true => Some(template_content(&store, template)?),
             }
         };
 
@@ -983,9 +991,10 @@ fn entry_tags(entry: &BulkEmailEntry, default_tags: &[MessageTag]) -> Vec<(Strin
 ///
 /// The same stage a single send runs ([`crate::state::send_validation`]), over what this
 /// request states for EVERY message it sends: the addresses it names, and the headers, the
-/// tags and the attachments its one template carries. What a single destination states for
-/// itself is read per entry instead ([`entry_defect`]), because a defect there is reported in
-/// that destination's own result rather than failing the call.
+/// tags and the attachments its one template carries. What ONE ENTRY states for its own
+/// message is read after the gates on sending ([`validate_entry_members`]), and the
+/// DESTINATION one addresses is read per entry instead ([`entry_defect`]), because a defect
+/// there is reported in that destination's own result rather than failing the call.
 fn validate_request(
     input: &SendBulkEmailInput,
     template: &Template,
@@ -1018,10 +1027,31 @@ fn validate_request(
     ) {
         return Err(bad_request(defect));
     }
-    // The headers and the tags ONE entry states for its own message are part of the
-    // request's own form too: SES is recorded refusing the whole call for a header it writes
-    // itself wherever the request states it, rather than reporting it as that entry's
-    // result. What is read per entry is the DESTINATION it addresses ([`entry_defect`]).
+    if let Some(defect) = crate::state::send_validation::attachments_defect(
+        template.attachments.as_deref().unwrap_or_default(),
+    ) {
+        return Err(bad_request(defect));
+    }
+    if let Some(defect) = crate::state::send_validation::tags_defect(
+        input.default_email_tags.as_deref().unwrap_or_default(),
+    ) {
+        return Err(bad_request(defect));
+    }
+    Ok(())
+}
+
+/// What the HEADERS and the TAGS one entry states for its own message have to be, over every
+/// entry of the request, in the order the request lists them.
+///
+/// Part of the request's own FORM, not of that destination's result: SES is recorded refusing
+/// the whole call for a header it writes itself wherever the request states it, rather than
+/// reporting it as that entry's result. What is read per entry is the DESTINATION it addresses
+/// ([`entry_defect`]).
+///
+/// Read AFTER the gates on sending (the handler): a call is weighed against the account's
+/// ability to send and against the identity it sends from before anything one of its entries
+/// carries is read, which is the order Amazon SES is recorded answering in.
+fn validate_entry_members(input: &SendBulkEmailInput) -> Result<(), SendBulkEmailError> {
     for entry in &input.bulk_email_entries {
         if let Some(defect) = crate::state::send_validation::headers_defect(
             entry.replacement_headers.as_deref().unwrap_or_default(),
@@ -1033,16 +1063,6 @@ fn validate_request(
         ) {
             return Err(bad_request(defect));
         }
-    }
-    if let Some(defect) = crate::state::send_validation::attachments_defect(
-        template.attachments.as_deref().unwrap_or_default(),
-    ) {
-        return Err(bad_request(defect));
-    }
-    if let Some(defect) = crate::state::send_validation::tags_defect(
-        input.default_email_tags.as_deref().unwrap_or_default(),
-    ) {
-        return Err(bad_request(defect));
     }
     Ok(())
 }

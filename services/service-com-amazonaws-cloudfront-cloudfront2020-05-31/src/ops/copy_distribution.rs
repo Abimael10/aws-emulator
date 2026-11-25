@@ -310,6 +310,12 @@ impl From<CopyDistributionErrorModeled> for CopyDistributionError {
 /// omit this field, the default value is `True`" (`CopyDistributionRequest$Enabled`).
 const DEFAULT_ENABLED: bool = true;
 
+/// The model's name for the member this operation carries the copied distribution's
+/// identifier in (`CopyDistributionRequest$PrimaryDistributionId`), which is the member the
+/// refusal of an identifier this route cannot read names
+/// (`crate::state::unresolved_distribution_id`).
+const PRIMARY_DISTRIBUTION_ID_MEMBER: &str = "PrimaryDistributionId";
+
 /// Why a `Staging` value other than `true` is refused: `CopyDistributionRequest$Staging`
 /// is "the type of distribution that your primary distribution will be copied to. The
 /// only valid value is `True`, indicating that you are copying to a staging
@@ -476,7 +482,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|stored| (stored.etag.clone(), stored.config.clone()))
             else {
                 return Err(CopyDistributionErrorModeled::NoSuchDistribution(
-                    crate::state::no_such_distribution(),
+                    crate::state::unresolved_distribution_id(
+                        PRIMARY_DISTRIBUTION_ID_MEMBER,
+                        &input.primary_distribution_id,
+                    ),
                 )
                 .into());
             };

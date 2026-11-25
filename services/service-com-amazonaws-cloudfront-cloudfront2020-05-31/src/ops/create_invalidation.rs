@@ -198,12 +198,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(stored) = store.distribution(&input.distribution_id) else {
             return Err(CreateInvalidationErrorModeled::NoSuchDistribution(
-                // `DistributionId` carries no `@pattern` and no `@length`, so no form of the
-                // value is read in front of the store: WHICH identifier was ever issued is the
-                // store's own record, and every value it holds no distribution under is the
-                // distribution reported ABSENT, under the fixed sentence this error class
-                // carries wherever it is answered.
-                crate::state::no_such_distribution(),
+                // `DistributionId` carries no `@pattern` and no `@length`, so the only form of
+                // the value this route reads is the ALPHABET CloudFront writes an entity
+                // identifier in: WHICH identifier of it was ever issued is the store's own
+                // record, so such a value it holds no distribution under is the distribution
+                // reported ABSENT, while a value written outside that alphabet is the
+                // identifier this route reports it cannot READ.
+                crate::state::unresolved_distribution_id(
+                    crate::state::ADDRESSED_BY_DISTRIBUTION_ID,
+                    &input.distribution_id,
+                ),
             )
             .into());
         };

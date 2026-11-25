@@ -150,7 +150,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // distribution for is the modelled not-found.
         let Some((distribution, etag)) = store.distribution_payload(&input.id) else {
             return Err(GetDistributionErrorModeled::NoSuchDistribution(
-                crate::state::no_such_distribution(),
+                // One error class covers both conditions, so the SENTENCE tells them apart:
+                // an `Id` written in the alphabet an entity identifier is written in that the
+                // account holds no distribution under is the distribution reported absent,
+                // and a value written outside it is the identifier this route cannot read.
+                crate::state::unresolved_distribution_id(
+                    crate::state::ADDRESSED_BY_ID,
+                    &input.id,
+                ),
             )
             .into());
         };
