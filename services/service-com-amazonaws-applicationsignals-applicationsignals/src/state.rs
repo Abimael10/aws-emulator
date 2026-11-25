@@ -22,7 +22,7 @@ use ::chrono::Datelike;
 use crate::ops::types::{
     ConflictException, DependencyConfig, ExclusionWindow, Goal, GroupingAttributeDefinition,
     GroupingConfiguration, Interval, Metric, MetricDataQuery, MetricSource, MetricStat,
-    MonitoredRequestCountMetricDataQueries,
+    MonitoredRequestCountMetricDataQueries, RecurrenceRule,
     RequestBasedServiceLevelIndicator, RequestBasedServiceLevelIndicatorConfig,
     RequestBasedServiceLevelIndicatorMetric, ResourceNotFoundException, RollingInterval,
     ServiceLevelIndicator, ServiceLevelIndicatorConfig, ServiceLevelIndicatorMetric,
@@ -2888,11 +2888,35 @@ fn next_exclusion_window_ordinal(windows: &BTreeMap<u64, ExclusionWindow>) -> u6
 ///
 /// A STATED `StartTime` is stored exactly as sent — the default settles an omission, it never
 /// re-times an instant the caller chose.
+///
+/// The `RecurrenceRule` is stored as the STRUCTURE every read of the window reports, built
+/// from the recurrence the addition stated: a window added with a cron or rate expression
+/// keeps that expression, and one added without a recurrence keeps the structure with no
+/// expression in it. That is the member set the recorded listing of a one-shot window carries,
+/// and it is what makes "this window recurs on no schedule" an answer the read states rather
+/// than one the caller has to infer from an absent member.
 pub fn stored_exclusion_window(window: &ExclusionWindow, served_at: DateTime) -> ExclusionWindow {
     ExclusionWindow {
         start_time: Some(window.start_time.unwrap_or(wire_instant(served_at))),
+        recurrence_rule: Some(RecurrenceRule {
+            expression: recurrence_expression(window).map(str::to_string),
+        }),
         ..window.clone()
     }
+}
+
+/// The recurrence expression `window` recurs on, or `None` for a window that recurs on no
+/// schedule — which a caller states either by naming no `RecurrenceRule` at all or by naming
+/// one with no `Expression` in it, the form every read of a stored window reports
+/// ([`stored_exclusion_window`]).
+///
+/// The one reading of a window's recurrence, so what a read reports is what a removal names
+/// the same window by ([`same_exclusion_window`]).
+pub fn recurrence_expression(window: &ExclusionWindow) -> Option<&str> {
+    window
+        .recurrence_rule
+        .as_ref()
+        .and_then(|rule| rule.expression.as_deref())
 }
 
 /// Nanoseconds in one millisecond, which is the resolution an instant this service settles
@@ -2947,7 +2971,11 @@ pub fn wire_instant(at: DateTime) -> DateTime {
 /// is the set a `RemoveExclusionWindows` can address — and since every stored window carries
 /// the `StartTime` it was added at ([`stored_exclusion_window`]), a removal names the window
 /// it means by the start time the read reported for it. `Window` and `RecurrenceRule` carry no
-/// `PartialEq`, so those members are compared out, as [`same_dependency`] is; `StartTime` is
+/// `PartialEq`, so those members are compared out, as [`same_dependency`] is. The recurrence
+/// is compared by the EXPRESSION a window recurs on ([`recurrence_expression`]), so naming no
+/// recurrence rule and naming one with no expression in it name the same one-shot window —
+/// which is what lets a removal name back the window set a read reported, where every window
+/// carries the structure. `StartTime` is
 /// compared at the resolution the wire carries it at ([`instant_millis`]), because that is the
 /// resolution a caller can name an instant AT: the value a read reports is a JSON number, and
 /// the instant it re-parses to on the way back in is the same instant only to the millisecond,
@@ -2958,14 +2986,7 @@ pub fn same_exclusion_window(left: &ExclusionWindow, right: &ExclusionWindow) ->
         && left.window.duration == right.window.duration
         && left.start_time.as_ref().map(instant_millis)
             == right.start_time.as_ref().map(instant_millis)
-        && left
-            .recurrence_rule
-            .as_ref()
-            .map(|rule| rule.expression.as_str())
-            == right
-                .recurrence_rule
-                .as_ref()
-                .map(|rule| rule.expression.as_str())
+        && recurrence_expression(left) == recurrence_expression(right)
         && left.reason == right.reason
 }
 
@@ -3478,19 +3499,23 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
 
     /// The entity `key_attributes` identifies, as `GetService` reports it over the window.
     ///
-    /// The reported key attributes are the identity this emulator holds for the entity
-    /// ([`Self::observed_identity`]) — the request's own when no stored SLO holds a fuller
-    /// one, since the attributes ARE the entity's identity and the caller named it. So an
-    /// entity no stored SLO monitors is reported by its identity alone rather than refused:
-    /// Application Signals identifies an entity by its key attributes rather than by a
-    /// stored resource id, and this read reports what it observed for that identity.
+    /// Application Signals DISCOVERS a service from the telemetry an instrumented
+    /// application sends rather than creating one, so every member of the reported entity
+    /// is a member it observed, and an identity nothing was observed for over the window is
+    /// reported as the entity it is — one nothing is known about. The answer then carries no
+    /// `KeyAttributes` and no `MetricReferences`: not the identity the request named back (an
+    /// echo of the request is no evidence that anything discovered it), and not an empty
+    /// metric list (which would state that the service was discovered and collects no
+    /// metrics).
+    ///
+    /// For an entity the store IS evidence of over the window, the reported key attributes
+    /// are the identity this emulator holds for it ([`Self::observed_identity`]) — the
+    /// fullest attribute set a stored SLO monitors it under, which is a superset of the one
+    /// the request named.
     ///
     /// `MetricReferences` reports the standard metrics Application Signals collects for the
     /// entity ([`standard_metric_references`]), dimensioned by the identity this read
-    /// reports for it — but only for an entity the store is evidence of over the window: an
-    /// identity nothing monitored was not DISCOVERED, so there is nothing collecting metrics
-    /// for it and the list is empty, exactly as it is for a window in which nothing was
-    /// observed.
+    /// reports for it.
     ///
     /// `ServiceGroups` reports the groups the configured grouping attributes put this entity
     /// in ([`Self::service_groups`]) — again only for an entity the store is evidence of,
@@ -3506,20 +3531,22 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         window_end: &DateTime,
         now: &DateTime,
     ) -> Service {
-        let (reported, metric_references, service_groups) =
-            match self.observed_identity(key_attributes, window_start, window_end, now) {
-                Some(reported) => (
-                    reported.clone(),
-                    standard_metric_references(metric_dimensions(&reported, None, None)),
-                    self.service_groups(&reported),
-                ),
-                None => (key_attributes.clone(), Vec::new(), None),
-            };
+        let Some(reported) = self.observed_identity(key_attributes, window_start, window_end, now)
+        else {
+            // Nothing observed for this identity over this window: every member of the
+            // entity is one this read would have observed, so the answer carries none.
+            return Service::default();
+        };
+        let metric_references =
+            standard_metric_references(metric_dimensions(&reported, None, None));
         Service {
-            key_attributes: reported,
+            service_groups: self.service_groups(&reported),
+            key_attributes: Some(reported),
             attribute_maps: None,
-            service_groups,
-            metric_references,
+            // Every discovered entity collects the standard metric set, so this is never
+            // empty — and a member with no values is left absent rather than serialized as
+            // an empty list.
+            metric_references: (!metric_references.is_empty()).then_some(metric_references),
             log_group_references: None,
         }
     }

@@ -250,19 +250,15 @@ async fn query_timestamps_bind_in_every_documented_form() {
                     "case {case:?}: expected an empty {member}, got {:?}",
                     answer[member]
                 ),
-                // `GetService` reports the entity the request identified, with no metric
-                // reference for an entity nothing monitors.
+                // `GetService` reports what it OBSERVED for the identity: nothing is
+                // stored, so nothing discovered it and the `Service` object carries no
+                // member at all (`undiscovered_service_members`).
                 None => {
                     assert_eq!(
-                        answer["Service"]["KeyAttributes"], entity,
-                        "case {case:?}: expected the requested KeyAttributes back, got {:?}",
-                        answer["Service"]["KeyAttributes"]
-                    );
-                    assert_eq!(
-                        answer["Service"]["MetricReferences"].as_array().map(Vec::len),
+                        answer["Service"].as_object().map(serde_json::Map::len),
                         Some(0),
-                        "case {case:?}: expected no metric reference, got {:?}",
-                        answer["Service"]["MetricReferences"]
+                        "case {case:?}: expected a Service carrying no observed member, got {:?}",
+                        answer["Service"]
                     );
                 }
             }
@@ -546,8 +542,8 @@ async fn topology_reads_report_what_the_stored_slos_monitor() {
         partial["Service"]["KeyAttributes"]
     );
 
-    // Over a window in which nothing was observed, the same partial identity is reported
-    // back as it was named — there is no stored observation to widen it with.
+    // Over a window in which nothing was observed, the same partial identity is reported by
+    // no key attributes at all — there is no observation to report it from.
     let (_, partial_earlier) = call(
         &router,
         "POST",
@@ -556,13 +552,14 @@ async fn topology_reads_report_what_the_stored_slos_monitor() {
     )
     .await;
     assert_eq!(
-        partial_earlier["Service"]["KeyAttributes"],
-        partial_resource,
-        "case \"GetService orders-table by a partial identity, earlier window\": expected the requested attributes, got {:?}",
-        partial_earlier["Service"]["KeyAttributes"]
+        partial_earlier["Service"].get("KeyAttributes"),
+        None,
+        "case \"GetService orders-table by a partial identity, earlier window\": expected no key attributes, got {:?}",
+        partial_earlier["Service"]
     );
 
-    // An entity no stored SLO monitors is reported by its identity alone.
+    // An entity no stored SLO monitors is reported as the entity nothing discovered: the
+    // `Service` object carries neither its identity nor any metric reference.
     let (status, ghost) = call(
         &router,
         "POST",
@@ -575,16 +572,10 @@ async fn topology_reads_report_what_the_stored_slos_monitor() {
         "case \"GetService ghost\": expected HTTP 200, got {status} with {ghost:?}"
     );
     assert_eq!(
-        ghost["Service"]["KeyAttributes"],
-        service_entity("ghost"),
-        "case \"GetService ghost\": expected the requested identity, got {:?}",
+        ghost["Service"].as_object().map(serde_json::Map::len),
+        Some(0),
+        "case \"GetService ghost\": expected a Service carrying no observed member, got {:?}",
         ghost["Service"]
-    );
-    assert_eq!(
-        metric_set(&ghost["Service"]["MetricReferences"]),
-        BTreeSet::new(),
-        "case \"GetService ghost\": expected no metric reference, got {:?}",
-        ghost["Service"]["MetricReferences"]
     );
 
     // The operations of the entity, in name order, one entry per distinct operation the

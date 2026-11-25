@@ -1,0 +1,75 @@
+{
+  "smithy": "2.0",
+  "shapes": {
+    "com.amazonaws.applicationsignals#Service": {
+      "type": "structure",
+      "members": {
+        "KeyAttributes": { "target": "com.amazonaws.applicationsignals#Attributes" },
+        "AttributeMaps": { "target": "com.amazonaws.applicationsignals#AttributeMaps" },
+        "ServiceGroups": { "target": "com.amazonaws.applicationsignals#ServiceGroups" },
+        "MetricReferences": { "target": "com.amazonaws.applicationsignals#MetricReferences" },
+        "LogGroupReferences": { "target": "com.amazonaws.applicationsignals#LogGroupReferences" }
+      }
+    },
+    "com.amazonaws.applicationsignals#RecurrenceRule": {
+      "type": "structure",
+      "members": {
+        "Expression": { "target": "com.amazonaws.applicationsignals#Expression" }
+      }
+    },
+    "com.amazonaws.applicationsignals#Attributes": {
+      "type": "map",
+      "key": { "target": "com.amazonaws.applicationsignals#KeyAttributeName" },
+      "value": { "target": "com.amazonaws.applicationsignals#KeyAttributeValue" },
+      "traits": {
+        "smithy.api#length": { "min": 1, "max": 4 }
+      }
+    },
+    "com.amazonaws.applicationsignals#KeyAttributeName": {
+      "type": "string",
+      "traits": {
+        "smithy.api#pattern": "^[a-zA-Z]{1,50}$"
+      }
+    },
+    "com.amazonaws.applicationsignals#KeyAttributeValue": {
+      "type": "string",
+      "traits": {
+        "smithy.api#length": { "min": 1, "max": 1024 },
+        "smithy.api#pattern": "^[ -~]*[!-~]+[ -~]*$"
+      }
+    },
+    "com.amazonaws.applicationsignals#AttributeMaps": {
+      "type": "list",
+      "member": { "target": "com.amazonaws.applicationsignals#AttributeMap" }
+    },
+    "com.amazonaws.applicationsignals#AttributeMap": {
+      "type": "map",
+      "key": { "target": "smithy.api#String" },
+      "value": { "target": "smithy.api#String" }
+    },
+    "com.amazonaws.applicationsignals#ServiceGroups": {
+      "type": "list",
+      "member": { "target": "com.amazonaws.applicationsignals#ServiceGroup" }
+    },
+    "com.amazonaws.applicationsignals#MetricReferences": {
+      "type": "list",
+      "member": { "target": "com.amazonaws.applicationsignals#MetricReference" }
+    },
+    "com.amazonaws.applicationsignals#LogGroupReferences": {
+      "type": "list",
+      "member": { "target": "com.amazonaws.applicationsignals#Attributes" }
+    },
+    "com.amazonaws.applicationsignals#Expression": {
+      "type": "string",
+      "traits": {
+        "smithy.api#length": { "min": 1, "max": 1024 }
+      }
+    },
+    "com.amazonaws.applicationsignals#ServiceGroup": {
+      "type": "structure"
+    },
+    "com.amazonaws.applicationsignals#MetricReference": {
+      "type": "structure"
+    }
+  }
+}

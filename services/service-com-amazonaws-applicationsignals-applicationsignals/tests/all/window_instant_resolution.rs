@@ -307,12 +307,12 @@ async fn reports_the_entity(
             !entries.is_empty()
         }
         Observation::ServiceMetrics => {
-            let references = answer["Service"]["MetricReferences"]
+            // An entity the store observed nothing for over the window carries no
+            // `MetricReferences` member at all (`undiscovered_service_members`), so the
+            // absence and the empty list are one answer here: nothing was observed.
+            !answer["Service"]["MetricReferences"]
                 .as_array()
-                .unwrap_or_else(|| {
-                    panic!("case {case:?}: expected a MetricReferences list, got {answer:?}")
-                });
-            !references.is_empty()
+                .is_none_or(Vec::is_empty)
         }
     }
 }

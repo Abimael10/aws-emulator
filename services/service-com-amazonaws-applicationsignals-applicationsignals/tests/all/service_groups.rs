@@ -788,11 +788,11 @@ async fn an_identity_nothing_was_observed_for_carries_no_groups() {
             body["Service"].get("ServiceGroups")
         );
         assert_eq!(
-            body["Service"]["MetricReferences"].as_array().map(Vec::len),
-            Some(0),
+            body["Service"].get("MetricReferences"),
+            None,
             "case {:?}: expected no metric references either, got {:?}",
             case.label,
-            body["Service"]["MetricReferences"]
+            body["Service"]
         );
     }
 }

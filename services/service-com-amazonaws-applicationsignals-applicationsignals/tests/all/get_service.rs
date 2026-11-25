@@ -316,8 +316,9 @@ async fn get_service_refuses_a_body_the_model_rejects() {
 }
 
 /// A well-formed `GetService` reports the entity its key attributes identify: the fullest
-/// attribute set this emulator holds for it, and the request's own identity when it holds
-/// none.
+/// attribute set this emulator holds for it, and NO key attributes at all when it holds none
+/// — Application Signals discovers a service from telemetry, so a read of an identity nothing
+/// was observed for reports no discovered service (`undiscovered_service_members`).
 ///
 /// The rows differ along how much of the entity the request names (all of it, a subset of a
 /// four-attribute entity, an identity no record monitors) and along the entity's own size
@@ -339,8 +340,9 @@ async fn get_service_reports_the_entity_its_key_attributes_identify() {
         monitored: Option<Value>,
         /// The `KeyAttributes` the read sends.
         request: Value,
-        /// The `Service.KeyAttributes` the response must carry.
-        reported: Value,
+        /// The `Service.KeyAttributes` the response must carry, or `None` when it must
+        /// carry none.
+        reported: Option<Value>,
     }
 
     let cases = vec![
@@ -348,7 +350,7 @@ async fn get_service_reports_the_entity_its_key_attributes_identify() {
             label: "the request names the whole monitored identity",
             monitored: Some(service.clone()),
             request: service.clone(),
-            reported: service.clone(),
+            reported: Some(service.clone()),
         },
         Case {
             label: "the request names a subset of a four-attribute entity",
@@ -358,19 +360,19 @@ async fn get_service_reports_the_entity_its_key_attributes_identify() {
                 "ResourceType": "AWS::DynamoDB::Table",
                 "Identifier": "orders-table"
             }),
-            reported: resource.clone(),
+            reported: Some(resource.clone()),
         },
         Case {
-            label: "no record monitors the identity: it is reported as asked",
+            label: "no record monitors the identity: nothing discovered it",
             monitored: None,
             request: service.clone(),
-            reported: service.clone(),
+            reported: None,
         },
         Case {
             label: "a record monitors another entity entirely",
             monitored: Some(resource),
-            request: service.clone(),
-            reported: service,
+            request: service,
+            reported: None,
         },
     ];
 
@@ -389,11 +391,20 @@ async fn get_service_reports_the_entity_its_key_attributes_identify() {
             "case {:?}: expected 200, got {status} with {body}",
             case.label
         );
-        assert_eq!(
-            body["Service"]["KeyAttributes"], case.reported,
-            "case {:?}: expected KeyAttributes {}, got {}",
-            case.label, case.reported, body["Service"]["KeyAttributes"]
-        );
+        match case.reported.as_ref() {
+            Some(reported) => assert_eq!(
+                &body["Service"]["KeyAttributes"], reported,
+                "case {:?}: expected KeyAttributes {reported}, got {}",
+                case.label, body["Service"]["KeyAttributes"]
+            ),
+            None => assert_eq!(
+                body["Service"].get("KeyAttributes"),
+                None,
+                "case {:?}: expected no KeyAttributes member at all, got {}",
+                case.label,
+                body["Service"]
+            ),
+        }
         assert_eq!(
             body["StartTime"].as_f64(),
             start.parse::<f64>().ok(),

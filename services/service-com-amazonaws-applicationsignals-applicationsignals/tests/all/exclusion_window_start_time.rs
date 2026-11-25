@@ -121,14 +121,22 @@ async fn an_omitted_start_time_defaults_to_the_instant_the_add_was_served() {
             "case {label:?}: expected the repeated read to report the same StartTime, got {again}"
         );
 
-        // And the rest of the configuration is the one sent.
-        for member in ["Window", "RecurrenceRule", "Reason"] {
+        // And the rest of the configuration is the one sent. The recurrence is compared by
+        // the EXPRESSION the window recurs on: every reported window carries the
+        // `RecurrenceRule` structure, which is what the `exclusion_window_recurrence_rule`
+        // suite pins.
+        for member in ["Window", "Reason"] {
             assert_eq!(
                 page["ExclusionWindows"][0][member],
                 sent[member],
                 "case {label:?}: expected {member} as sent, got {page}"
             );
         }
+        assert_eq!(
+            page["ExclusionWindows"][0]["RecurrenceRule"]["Expression"],
+            sent["RecurrenceRule"]["Expression"],
+            "case {label:?}: expected the recurrence expression as sent, got {page}"
+        );
     }
 }
 

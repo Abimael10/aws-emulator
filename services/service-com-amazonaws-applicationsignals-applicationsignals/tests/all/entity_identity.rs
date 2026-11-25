@@ -350,12 +350,10 @@ async fn an_identity_that_names_the_documented_minimum_is_served() {
     ];
 
     let router = router();
-    create_slo(
-        &router,
-        "checkout-latency",
-        &json!({ "Type": "Service", "Name": "checkout", "Environment": "eks:prod/default" }),
-    )
-    .await;
+    // The ONE identity this store is evidence of: a stored SLO monitors it.
+    let monitored =
+        json!({ "Type": "Service", "Name": "checkout", "Environment": "eks:prod/default" });
+    create_slo(&router, "checkout-latency", &monitored).await;
 
     for (label, key_attributes) in cases {
         for (operation, path, member) in ENTITY_READS {
@@ -372,11 +370,21 @@ async fn an_identity_that_names_the_documented_minimum_is_served() {
                 "case {case:?}: expected 200, got {status} with {body}"
             );
             match member {
-                // The entity is reported by the identity the request named, at least.
-                None => assert_eq!(
+                // The read is SERVED, which is what this row is about. `GetService` reports
+                // the entity by the identity the store holds for it, so the identity comes
+                // back for the one a record monitors; an identity nothing was observed for is
+                // answered with the `Service` object carrying no member at all
+                // (`undiscovered_service_members`).
+                None if key_attributes == monitored => assert_eq!(
                     body["Service"]["KeyAttributes"]["Type"], key_attributes["Type"],
                     "case {case:?}: expected the entity's Type back, got {}",
                     body["Service"]["KeyAttributes"]
+                ),
+                None => assert_eq!(
+                    body["Service"].as_object().map(serde_json::Map::len),
+                    Some(0),
+                    "case {case:?}: expected a Service carrying no observed member, got {}",
+                    body["Service"]
                 ),
                 // The list is present, whether or not the store holds an entry for the
                 // identity: each is a `@required` output member.

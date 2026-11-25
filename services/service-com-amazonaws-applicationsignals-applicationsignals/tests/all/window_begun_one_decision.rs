@@ -213,8 +213,7 @@ async fn discovered(
     );
     !answer["Service"]["MetricReferences"]
         .as_array()
-        .unwrap_or_else(|| panic!("case {case:?}: expected a MetricReferences list, got {answer:?}"))
-        .is_empty()
+        .is_none_or(Vec::is_empty)
 }
 
 /// What the rule settles for a row's window, given where its `StartTime` sits relative to the
@@ -503,7 +502,7 @@ async fn every_projection_decides_the_period_on_the_instant_it_was_given() {
                 store
                     .observed_service(&monitored, &window_start, &window_end, &now)
                     .metric_references
-                    .len(),
+                    .map_or(0, |references| references.len()),
             ),
             (
                 "ListServiceOperations",

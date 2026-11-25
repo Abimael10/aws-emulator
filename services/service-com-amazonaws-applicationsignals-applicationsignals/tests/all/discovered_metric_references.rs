@@ -506,8 +506,10 @@ async fn both_ends_of_an_edge_report_the_same_references() {
 }
 
 /// An identity the store is no evidence of over the window was not DISCOVERED, so
-/// `GetService` reports it with a present, EMPTY `MetricReferences` — and the lists report
-/// no entry at all, so there is nothing to carry references.
+/// `GetService` reports no `MetricReferences` member at all — an absent member, not a present
+/// and empty list, since "nothing observed" and "observed, and there are no metrics" are
+/// different answers (`undiscovered_service_members`) — and the lists report no entry at all,
+/// so there is nothing to carry references.
 ///
 /// The rows differ along why there is no evidence: an identity no SLO names, a window that
 /// ends before the SLOs existed, and a window that has not begun.
@@ -548,10 +550,10 @@ async fn an_entity_with_no_evidence_carries_no_reference() {
             "case {case:?}: expected HTTP 200, got {status} with {answer:?}"
         );
         assert_eq!(
-            answer["Service"]["MetricReferences"].as_array().map(Vec::len),
-            Some(0),
-            "case {case:?}: expected a present, empty MetricReferences, got {:?}",
-            answer["Service"]["MetricReferences"]
+            answer["Service"].get("MetricReferences"),
+            None,
+            "case {case:?}: expected no MetricReferences member at all, got {:?}",
+            answer["Service"]
         );
 
         for (member, path) in [

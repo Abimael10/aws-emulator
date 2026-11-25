@@ -29,6 +29,7 @@ pub mod create_service_level_objective_types;
 pub mod delete_grouping_configuration_types;
 pub mod delete_instrumentation_configuration_types;
 pub mod delete_service_level_objective_types;
+pub mod discovered_service_types;
 pub mod get_instrumentation_configuration_status_types;
 pub mod get_instrumentation_configuration_types;
 pub mod get_service_level_objective_types;
@@ -47,6 +48,7 @@ pub mod list_service_states_types;
 pub mod list_services_types;
 pub mod list_tags_for_resource_types;
 pub mod put_grouping_configuration_types;
+pub mod recurrence_rule_types;
 pub mod report_instrumentation_configuration_status_types;
 pub mod shared_types;
 pub mod start_discovery_types;
@@ -70,6 +72,8 @@ pub use delete_grouping_configuration_types::*;
 pub use delete_instrumentation_configuration_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use delete_service_level_objective_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use discovered_service_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_instrumentation_configuration_status_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
@@ -104,6 +108,8 @@ pub use list_services_types::*;
 pub use list_tags_for_resource_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use put_grouping_configuration_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use recurrence_rule_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use report_instrumentation_configuration_status_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
