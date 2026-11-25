@@ -12,7 +12,10 @@
 //!   INPUT — HTTP 400, `ValidationException`, the fixed sentence `Invalid StreamArn`
 //!   — when the value is not written as a stream's ARN, while a value that IS so
 //!   written is resolved and may legitimately be absent
-//!   (`ResourceNotFoundException`) or present (200);
+//!   (`ResourceNotFoundException`) or present (200); a request that omits the
+//!   identifier it addresses — a stream ARN, a shard iterator — names no position
+//!   either, so it draws that same sentence rather than the shared constraint
+//!   envelope for a null member;
 //! * a `ListStreams$TableName` the model's own constraints do not admit is refused
 //!   with one sentence stating the member's modelled length window, with no
 //!   constraint envelope around it and nothing of the request inside it, while a name
@@ -53,6 +56,10 @@ const REGION: &str = "us-east-1";
 /// The whole sentence a member carrying a stream ARN is refused with when the value
 /// is not written as one.
 const INVALID_STREAM_ARN: &str = "Invalid StreamArn";
+
+/// The whole sentence the member carrying a shard iterator is refused with when the
+/// value names no position this service can read from.
+const INVALID_SHARD_ITERATOR: &str = "Invalid ShardIterator";
 
 /// The whole sentence a `TableName` the model's constraints do not admit is refused
 /// with. The two figures are the member's own modelled bounds — `TableName` is
@@ -606,5 +613,132 @@ async fn list_streams_refuses_an_inadmissible_table_name_with_the_length_sentenc
         body["Streams"].as_array().map(Vec::len),
         Some(1),
         "case the registered table: expected its one stream, got {body}"
+    );
+}
+
+/// A request that OMITS the identifier it addresses names no position either, so it
+/// draws that identifier's OWN fixed sentence — the same one a value of the wrong form
+/// draws — and never the shared constraint envelope for a null member.
+///
+/// The rows span what the rule generalises over: which identifier the request left out
+/// (a stream ARN, a shard iterator), which operation carried it, and what else the
+/// request carried — nothing, the operation's other members, and a second member that
+/// is ITSELF outside its bounds, which the identifier is still judged before.
+#[tokio::test]
+async fn an_omitted_addressing_identifier_draws_the_identifiers_own_sentence() {
+    let (engine, router) = build();
+    let registered = register(&engine, "ledger", seconds_ago(3_600));
+    let shard_id = only_shard_id(&router, &registered).await;
+
+    // (case, operation, the request, the sentence the rule requires)
+    let rows: Vec<(String, &str, serde_json::Value, &str)> = vec![
+        (
+            "DescribeStream with no member at all".to_string(),
+            "DescribeStream",
+            serde_json::json!({}),
+            INVALID_STREAM_ARN,
+        ),
+        (
+            "DescribeStream with only a page width".to_string(),
+            "DescribeStream",
+            serde_json::json!({ "Limit": 1 }),
+            INVALID_STREAM_ARN,
+        ),
+        (
+            "DescribeStream with a page width below its own floor".to_string(),
+            "DescribeStream",
+            serde_json::json!({ "Limit": 0 }),
+            INVALID_STREAM_ARN,
+        ),
+        (
+            "DescribeStream with a resume point but no stream".to_string(),
+            "DescribeStream",
+            serde_json::json!({ "ExclusiveStartShardId": shard_id }),
+            INVALID_STREAM_ARN,
+        ),
+        (
+            "GetShardIterator with every other member but no stream".to_string(),
+            "GetShardIterator",
+            serde_json::json!({ "ShardId": shard_id, "ShardIteratorType": "LATEST" }),
+            INVALID_STREAM_ARN,
+        ),
+        (
+            "GetShardIterator with no member at all".to_string(),
+            "GetShardIterator",
+            serde_json::json!({}),
+            INVALID_STREAM_ARN,
+        ),
+        (
+            "GetRecords with no member at all".to_string(),
+            "GetRecords",
+            serde_json::json!({}),
+            INVALID_SHARD_ITERATOR,
+        ),
+        (
+            "GetRecords with only a page width".to_string(),
+            "GetRecords",
+            serde_json::json!({ "Limit": 10 }),
+            INVALID_SHARD_ITERATOR,
+        ),
+        (
+            "GetRecords with a page width above its own ceiling".to_string(),
+            "GetRecords",
+            serde_json::json!({ "Limit": 100_000 }),
+            INVALID_SHARD_ITERATOR,
+        ),
+    ];
+
+    for (case, operation, body, expected) in rows {
+        let (status, answered) = call(&router, operation, body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a request naming no position must be refused with 400, got \
+             {status} and {answered}"
+        );
+        assert_eq!(
+            error_code(&answered),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {answered}"
+        );
+        let message = error_message(&answered);
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
+        );
+        assert!(
+            !message.contains("validation error"),
+            "case {case:?}: this refusal is the identifier's own sentence, not the shared \
+             constraint envelope, got {message:?}"
+        );
+    }
+
+    // The neighbouring classes the rule must not swallow. A required member this
+    // service states no sentence of its own for keeps the shared envelope: nothing
+    // about the identifiers above generalises to every absent member.
+    let (status, answered) = call(
+        &router,
+        "GetShardIterator",
+        serde_json::json!({ "StreamArn": registered, "ShardId": shard_id }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case an absent iterator type: expected 400, got {status} and {answered}"
+    );
+    let message = error_message(&answered);
+    assert_eq!(
+        message,
+        "1 validation error detected: Value null at 'shardIteratorType' failed to satisfy \
+         constraint: Member must not be null",
+        "case an absent iterator type: expected the shared constraint envelope, got {message:?}"
+    );
+
+    // And an OPTIONAL member carrying one of those identifiers may legitimately be
+    // absent: `ListStreams` with no page boundary enumerates from the start.
+    let (status, answered) = call(&router, "ListStreams", serde_json::json!({})).await;
+    assert_eq!(
+        status, 200,
+        "case no page boundary at all: an optional identifier may be absent, got {status} \
+         and {answered}"
     );
 }

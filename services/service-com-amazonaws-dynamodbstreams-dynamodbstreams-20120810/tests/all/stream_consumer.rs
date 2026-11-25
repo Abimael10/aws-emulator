@@ -834,9 +834,32 @@ async fn describe_stream_agrees_with_list_streams_and_reports_the_shard_topology
     );
     assert_eq!(
         second_page["StreamDescription"]["LastEvaluatedShardId"].as_str(),
+        Some(child_id.as_str()),
+        "a shard page reports the shard it stopped at, whether or not another follows \
+         it, got {second_page}"
+    );
+    // The page AFTER the last shard is the one that evaluated nothing, and that is the
+    // page without a cursor — which is what ends a consumer's walk.
+    let (status, past_end) = call(
+        &router,
+        "DescribeStream",
+        serde_json::json!({
+            "StreamArn": stream_arn,
+            "Limit": 1,
+            "ExclusiveStartShardId": child_id,
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "the page past the last shard answered {status}: {past_end}");
+    assert_eq!(
+        past_end["StreamDescription"]["Shards"].as_array().map(Vec::len),
+        Some(0),
+        "resuming after the last shard evaluates nothing, got {past_end}"
+    );
+    assert_eq!(
+        past_end["StreamDescription"]["LastEvaluatedShardId"].as_str(),
         None,
-        "the last shard page offers no cursor, because nothing follows it, got \
-         {second_page}"
+        "a page that evaluated no shard offers no cursor, got {past_end}"
     );
 
     // Draining a CLOSED shard retires the iterator: NextShardIterator goes null.

@@ -1177,6 +1177,15 @@ pub fn is_stream_arn(value: &str) -> bool {
 /// arrived in.
 pub const INVALID_STREAM_ARN: &str = "Invalid StreamArn";
 
+/// What a request is refused with when the member that carries a shard iterator does
+/// not name a position this service can read from — a token it never minted, or no
+/// token at all.
+///
+/// The same wholly fixed form as [`INVALID_STREAM_ARN`], naming the SHAPE the member
+/// targets (`ShardIterator`): an iterator is opaque, so there is nothing of the value
+/// to report and nothing about the position it would have named to disclose.
+pub const INVALID_SHARD_ITERATOR: &str = "Invalid ShardIterator";
+
 /// The ARN a stream of this table registered at `at` carries.
 fn stream_arn_at(registration: &StreamRegistration, at: SystemTime) -> String {
     format!(

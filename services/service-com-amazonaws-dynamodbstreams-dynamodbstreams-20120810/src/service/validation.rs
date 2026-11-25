@@ -32,9 +32,11 @@
 //! the enumerated TYPE rather than to a member, an operation or a depth: one type is listed
 //! alike wherever it is carried, and a type this model gains needs nothing added here.
 //!
-//! One refusal is worded earlier still and never reaches here: a `ListStreams` table
-//! name the model's own constraints do not admit draws one sentence stating the length
-//! window a name has to fit ([`super::table_name_refusal`]), with no envelope around it.
+//! Two refusals are worded earlier still and never reach here: a request that OMITS the
+//! identifier it addresses — a stream ARN, a shard iterator — draws that identifier's
+//! own sentence ([`super::absent_identifier_refusal`]), and a `ListStreams` table name
+//! the model's own constraints do not admit draws one sentence stating the length window
+//! a name has to fit ([`super::table_name_refusal`]), with no envelope around either.
 
 use smithy_server_runtime::{Refusal, Refused, Violation};
 
@@ -137,9 +139,17 @@ mod tests {
                  satisfy enum value set: [LATEST, TRIM_HORIZON]",
             ),
             (
+                // The member paths an absent-member clause is still stated at are the
+                // ones this service does not address a position by: a request that
+                // omitted a stream ARN or a shard iterator is worded before this module
+                // is reached (`super::absent_identifier_refusal`).
                 "a member absent from the request, which carried no value to withhold",
-                violation("shardIterator", ViolationKind::MissingRequiredMember, None),
-                "Value null at 'shardIterator' failed to satisfy constraint: Member must \
+                violation(
+                    "shardIteratorType",
+                    ViolationKind::MissingRequiredMember,
+                    None,
+                ),
+                "Value null at 'shardIteratorType' failed to satisfy constraint: Member must \
                  not be null",
             ),
         ];

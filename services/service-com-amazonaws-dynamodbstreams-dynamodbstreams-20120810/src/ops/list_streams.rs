@@ -4,7 +4,8 @@
 //! IMPLEMENTED: enumerates the streams registered in [`crate::state`] in stream-ARN
 //! order, filtered by `TableName` when one is given and paged by `Limit` /
 //! `ExclusiveStartStreamArn`. An account (or table) with no stream gets an empty
-//! `Streams` list, not an error.
+//! `Streams` list, not an error. A page the requested width closed reports the stream
+//! it stopped at in `LastEvaluatedStreamArn`, which is where the next call resumes.
 //!
 //! `ExclusiveStartStreamArn` carries the same `StreamArn` shape the stream-addressing
 //! operations take, so a value that is not written as a stream's ARN is refused as
@@ -223,9 +224,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(start) => std::ops::Bound::Excluded(start.as_str()),
             None => std::ops::Bound::Unbounded,
         };
-        // Lazily: one more entry than the page needs, which is exactly the evidence
-        // `LastEvaluatedStreamArn` requires — whether a further stream matched.
-        let mut matching = guard
+        // Lazily, and only as far as the page is wide: the enumeration is NOT read one
+        // entry past the page to find out whether another stream matched, because that
+        // is not what the cursor reports (see below).
+        let streams: Vec<Stream> = guard
             .streams()
             .range::<str, _>((start, std::ops::Bound::Unbounded))
             .map(|(_, stream)| stream)
@@ -235,29 +237,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .as_ref()
                     .is_none_or(|table_name| &stream.table_name == table_name)
             })
-            .take(limit + 1);
-
-        let mut streams: Vec<Stream> = Vec::new();
-        let mut truncated = false;
-        for stream in &mut matching {
-            if streams.len() == limit {
-                truncated = true;
-                break;
-            }
-            streams.push(Stream {
+            .take(limit)
+            .map(|stream| Stream {
                 stream_arn: Some(stream.stream_arn.clone()),
                 table_name: Some(stream.table_name.clone()),
                 stream_label: Some(stream.stream_label.clone()),
-            });
-        }
-        // `LastEvaluatedStreamArn` is set only when `Limit` truncated the page.
-        let last_evaluated_stream_arn = truncated
-            .then(|| {
-                streams
-                    .last()
-                    .and_then(|stream| stream.stream_arn.clone())
             })
-            .flatten();
+            .collect();
+
+        // The RESUME POINT: "the stream ARN of the item where the operation stopped,
+        // inclusive of the previous result set. Use this value to start a new
+        // operation, excluding this value in the new request"
+        // (`ListStreamsOutput$LastEvaluatedStreamArn`). The page STOPPED at an item
+        // exactly when the width it was allowed ran out, so that — and not whether a
+        // further stream happens to match — is what the cursor turns on: "If
+        // LastEvaluatedStreamArn is not empty, it does not necessarily mean that there
+        // is more data in the result set." A page the width did not close carried the
+        // enumeration to its end, so it reports none, which is the signal that ends a
+        // client's walk; a full page that happened to be the last one hands back a
+        // cursor whose next call is an empty page without one.
+        let last_evaluated_stream_arn = streams
+            .last()
+            .filter(|_| streams.len() == limit)
+            .and_then(|stream| stream.stream_arn.clone());
 
         Ok(ListStreamsOutput {
             streams: Some(streams),

@@ -10,7 +10,9 @@
 //!
 //! `Limit`'s documented ceiling of 1000 records is a bound the service ENFORCES: a
 //! larger page request is refused (`ValidationException`), not quietly served a
-//! smaller page.
+//! smaller page — but only after the `ShardIterator` has been resolved, because the
+//! iterator is the position this call addresses: a request that is wrong in both ways
+//! is refused over the iterator, which is the fault a caller has to fix first.
 //!
 //! ## Shape of an operation
 //!
@@ -207,17 +209,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // call mints is the NEXT position's token, which the spec says it returns.
         let _ = ctx;
         let now = std::time::SystemTime::now();
-        // The bound the service enforces on this request's parameters, which the model
-        // does not express (`Limit` is declared 1.. with no maximum): a page larger
-        // than the service serves is refused rather than silently narrowed. Decided
-        // before the iterator is resolved — a request whose parameters cannot be served
-        // is refused whatever the store holds.
-        if input
-            .limit
-            .is_some_and(|limit| limit > crate::state::MAX_GET_RECORDS_LIMIT)
-        {
-            return Err(limit_above_ceiling());
-        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetRecordsErrorModeled::InternalServerError(InternalServerError {
                 message: Some("the DynamoDB Streams store is unavailable".to_string()),
@@ -250,10 +241,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             crate::state::IteratorLookup::Unknown => {
                 return Err(crate::scaffolded::Scaffolded::validation(
-                    "Invalid ShardIterator",
+                    crate::state::INVALID_SHARD_ITERATOR,
                 ))
             }
         };
+
+        // The bound the service enforces on this request's parameters, which the model
+        // does not express (`Limit` is declared 1.. with no maximum): a page larger
+        // than the service serves is refused rather than silently narrowed. Decided
+        // AFTER the iterator, because the iterator is what this request addresses: a
+        // request that names no readable position is refused over that position
+        // whatever else it asks for, so a consumer whose stored token has gone bad is
+        // told to re-acquire one rather than to narrow its page.
+        if input
+            .limit
+            .is_some_and(|limit| limit > crate::state::MAX_GET_RECORDS_LIMIT)
+        {
+            return Err(limit_above_ceiling());
+        }
 
         // `Limit`'s declared range (1..) is enforced at the boundary and its upper
         // bound above, so what is left here is the page size an absent member means:

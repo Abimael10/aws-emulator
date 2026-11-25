@@ -6,7 +6,9 @@
 //! `StreamLabel` populated, and a `Limit` up to the documented upper limit of 100
 //! is honoured exactly. (A `Limit` ABOVE that ceiling is refused, which is pinned
 //! with this service's other parameter bounds in
-//! `service_enforced_parameter_bounds.rs`.)
+//! `service_enforced_parameter_bounds.rs`.) The page the width closed reports the
+//! stream it stopped at in `LastEvaluatedStreamArn`, which is what a client resumes
+//! the enumeration from.
 //!
 //! The rows span the class rather than one table: every `StreamViewType` the model
 //! declares, table names at both ends of the documented `TableName` bound and over
@@ -450,4 +452,198 @@ async fn one_page_never_exceeds_the_documented_hundred_streams() {
         status, 400,
         "Limit 0 is outside the declared range and must be refused, got {status} with {body}"
     );
+}
+
+/// One row of the cursor table: the case, the `Limit` it sends (`None` for an absent
+/// member), the table the page is scoped to (`None` for the whole registry), and the
+/// index in the matching list the page resumes AFTER (`None` for the start of it).
+type CursorCase = (
+    &'static str,
+    Option<i64>,
+    Option<&'static str>,
+    Option<usize>,
+);
+
+/// The resume point a page reports: "the stream ARN of the item where the operation
+/// stopped, inclusive of the previous result set. Use this value to start a new
+/// operation, excluding this value in the new request"
+/// (`ListStreamsOutput$LastEvaluatedStreamArn`).
+///
+/// The rule pinned here: the page STOPPED at an item exactly when the width it was
+/// allowed ran out, so the cursor is reported whenever the page was filled to that
+/// width — including a full page with nothing after it, which is why "If
+/// LastEvaluatedStreamArn is not empty, it does not necessarily mean that there is more
+/// data in the result set" — and is absent only for a page the width did not close,
+/// which is the signal that the last page has been processed.
+///
+/// The rows span what the rule generalises over: how wide the page asked for is (absent,
+/// the narrowest, inside the registry, exactly as wide as what matched, wider, and the
+/// published ceiling), how many streams match (the whole registry or one table's
+/// streams), and where the page resumes from (the start, after an entry, and past the
+/// last one).
+#[tokio::test]
+async fn the_cursor_is_reported_whenever_the_requested_width_closed_the_page() {
+    let (engine, router) = build();
+    let base = seconds_ago(7_200);
+    // Five streams over two tables, so a page can be narrowed by `TableName` as well
+    // as by `Limit`, and the two tables hold different numbers of them.
+    let mut by_table: HashMap<String, Vec<String>> = HashMap::new();
+    let mut offset = 0_u64;
+    for (table_name, count) in [("ledger-a", 3_usize), ("ledger-b", 2_usize)] {
+        for _ in 0..count {
+            // One second apart, so every stream gets its own millisecond label.
+            let at = base + Duration::from_secs(offset);
+            let stream_arn = register(&engine, table_name, StreamViewType::KeysOnly, at);
+            by_table
+                .entry(table_name.to_string())
+                .or_default()
+                .push(stream_arn);
+            offset += 1;
+        }
+    }
+    for arns in by_table.values_mut() {
+        arns.sort();
+    }
+    let mut all: Vec<String> = by_table.values().flatten().cloned().collect();
+    all.sort();
+    assert_eq!(all.len(), 5, "the fixture must hold five streams, got {all:?}");
+
+    // Each row: the `Limit` sent (None for an absent member), the table the page is
+    // scoped to (None for the whole registry), and the index in the matching list the
+    // page resumes AFTER (None for the start of it).
+    let rows: [CursorCase; 12] = [
+        ("no Limit at all", None, None, None),
+        ("Limit 1, the narrowest page", Some(1), None, None),
+        ("Limit 1 resuming after the first stream", Some(1), None, Some(0)),
+        ("Limit 2, inside the registry", Some(2), None, None),
+        ("Limit 4, one short of the registry", Some(4), None, None),
+        ("Limit 5, exactly the registry", Some(5), None, None),
+        ("Limit 6, wider than the registry", Some(6), None, None),
+        (
+            "Limit 100, the published ceiling",
+            Some(i64::from(MAX_PAGE_LIMIT)),
+            None,
+            None,
+        ),
+        (
+            "Limit 2 scoped to the table with three streams",
+            Some(2),
+            Some("ledger-a"),
+            None,
+        ),
+        (
+            "Limit 2 scoped to the table with two streams",
+            Some(2),
+            Some("ledger-b"),
+            None,
+        ),
+        (
+            "Limit 3 scoped to the table with two streams",
+            Some(3),
+            Some("ledger-b"),
+            None,
+        ),
+        ("Limit 1 resuming after the last stream", Some(1), None, Some(4)),
+    ];
+
+    for (case, limit, table_name, resume_after) in rows {
+        let matching = match table_name {
+            Some(table_name) => by_table
+                .get(table_name)
+                .cloned()
+                .unwrap_or_else(|| panic!("case {case}: {table_name} registered nothing")),
+            None => all.clone(),
+        };
+        let width = usize::try_from(limit.unwrap_or(i64::from(MAX_PAGE_LIMIT)))
+            .expect("every row asks for a positive width");
+        let start = resume_after.map_or(0, |index| index + 1);
+        let expected_page: Vec<String> = matching
+            .iter()
+            .skip(start.min(matching.len()))
+            .take(width)
+            .cloned()
+            .collect();
+        // The cursor is the item the width stopped the page at, so it is there exactly
+        // when the page was filled to the width asked for.
+        let expected_cursor = (expected_page.len() == width)
+            .then(|| expected_page.last().cloned())
+            .flatten();
+
+        let mut body = serde_json::json!({});
+        if let Some(target) = body.as_object_mut() {
+            if let Some(limit) = limit {
+                target.insert("Limit".to_string(), serde_json::json!(limit));
+            }
+            if let Some(table_name) = table_name {
+                target.insert("TableName".to_string(), serde_json::json!(table_name));
+            }
+            if let Some(index) = resume_after {
+                target.insert(
+                    "ExclusiveStartStreamArn".to_string(),
+                    serde_json::json!(matching[index]),
+                );
+            }
+        }
+        let page = list_streams(&router, case, body).await;
+        let arns = page_arns(case, &page);
+        assert_eq!(
+            arns, expected_page,
+            "case {case}: expected the page {expected_page:?}, got {arns:?}"
+        );
+        let cursor = page["LastEvaluatedStreamArn"].as_str().map(str::to_string);
+        assert_eq!(
+            cursor, expected_cursor,
+            "case {case}: expected the cursor {expected_cursor:?}, got {cursor:?}"
+        );
+    }
+}
+
+/// The cursor is what a client's enumeration is driven by, so following it must visit
+/// every stream exactly once and terminate — whatever width the pages are asked for,
+/// including one that divides the registry exactly (where the last full page hands back
+/// a cursor whose next call is the empty page that ends the walk).
+#[tokio::test]
+async fn following_the_cursor_visits_every_stream_once_and_terminates() {
+    let (engine, router) = build();
+    let base = seconds_ago(7_200);
+    let mut all: Vec<String> = (0..6_u64)
+        .map(|index| {
+            register(
+                &engine,
+                &format!("ledger-{index}"),
+                StreamViewType::NewImage,
+                base + Duration::from_secs(index),
+            )
+        })
+        .collect();
+    all.sort();
+
+    // The widths differ in how they fall against the registry: narrower than it, a
+    // divisor of it, one short of it, exactly it, and wider than it.
+    for width in [1_i64, 2, 5, 6, 7] {
+        let case = format!("walking with Limit {width}");
+        let mut seen: Vec<String> = Vec::new();
+        let mut start: Option<String> = None;
+        // Generous: one call per stream plus the terminating one and a few spare, so a
+        // walk that fails to terminate is caught instead of looping for ever.
+        for _ in 0..all.len() + 4 {
+            let mut body = serde_json::json!({ "Limit": width });
+            if let (Some(target), Some(start)) = (body.as_object_mut(), start.as_ref()) {
+                target.insert(
+                    "ExclusiveStartStreamArn".to_string(),
+                    serde_json::Value::String(start.clone()),
+                );
+            }
+            let page = list_streams(&router, &case, body).await;
+            seen.extend(page_arns(&case, &page));
+            match page["LastEvaluatedStreamArn"].as_str() {
+                Some(cursor) => start = Some(cursor.to_string()),
+                None => break,
+            }
+        }
+        assert_eq!(
+            seen, all,
+            "case {case}: the walk must visit every stream once, in ARN order"
+        );
+    }
 }

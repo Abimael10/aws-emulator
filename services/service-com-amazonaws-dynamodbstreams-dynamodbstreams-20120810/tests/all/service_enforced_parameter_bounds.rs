@@ -69,6 +69,16 @@ const LIST_STREAMS_LIMIT_REFUSAL: &str = "One or more parameter values were inva
 const TIMESTAMP_REFUSAL: &str = "One or more parameter values were invalid: \
      Timestamp parameter cannot be greater than the current timestamp";
 
+/// The whole sentence a request that names no readable shard iterator draws.
+const INVALID_SHARD_ITERATOR: &str = "Invalid ShardIterator";
+
+/// The whole sentence a request whose value is not written as a stream's ARN draws.
+const INVALID_STREAM_ARN: &str = "Invalid StreamArn";
+
+/// The `@length` ceiling the model declares on `ShardIterator`, from
+/// `smithy_query(query="operation", operation="GetRecords")`: 1..2048.
+const SHARD_ITERATOR_CEILING: usize = 2048;
+
 fn build() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -661,5 +671,172 @@ async fn a_future_timestamp_is_refused_only_where_the_iterator_type_reads_it() {
         page["Records"].as_array().map(Vec::len),
         Some(3),
         "an iterator at the trim horizon must deliver every retained record, got {page}"
+    );
+}
+
+/// The identifier a request ADDRESSES is judged before the page-width bound above it,
+/// so a request that is wrong in both ways is refused over the identifier.
+///
+/// The rule: a request that names no position this service can read — an undecodable
+/// shard iterator, a value that is not written as a stream's ARN — is refused with that
+/// identifier's own sentence whatever width it asked for, because the identifier is the
+/// fault the caller has to fix first; a client whose stored iterator has gone bad must
+/// be told to re-acquire one rather than to narrow its page. The page-width bound still
+/// bites for a request whose identifier IS readable.
+///
+/// The rows span what the rule generalises over: which operation and which identifier
+/// carried the fault, the form the bad value took, and how far past the operation's own
+/// width ceiling the `Limit` sat — against the two neighbouring classes, a bad
+/// identifier with a width inside the ceiling and a good identifier with one above it.
+#[tokio::test]
+async fn the_addressed_identifier_is_judged_before_the_page_width_bound() {
+    let (engine, router) = build();
+    let base = seconds_ago(3_600);
+    let stream_arn = register(&engine, "ledger", base);
+    append(&engine, &stream_arn, "item-0", base);
+    let shard_id = all_shard_ids(&router, &stream_arn)
+        .await
+        .first()
+        .cloned()
+        .expect("the stream serves a shard");
+    let (status, body) = call(
+        &router,
+        "GetShardIterator",
+        serde_json::json!({
+            "StreamArn": stream_arn,
+            "ShardId": shard_id,
+            "ShardIteratorType": "TRIM_HORIZON",
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "GetShardIterator answered {status}: {body}");
+    let iterator = body["ShardIterator"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no ShardIterator in {body}"))
+        .to_string();
+
+    // Values this service never minted an iterator as, each inside the modelled
+    // `ShardIterator` window of 1..2048 so every row reaches the handler rather than
+    // the length bound.
+    let unreadable_iterators: [(&str, String); 4] = [
+        ("plain text that is no token", "not-a-shard-iterator".to_string()),
+        (
+            "a token of the right shape that was never minted",
+            "0".repeat(64),
+        ),
+        (
+            "the minted token with its last character changed",
+            format!("{}x", &iterator[..iterator.len() - 1]),
+        ),
+        (
+            "a token at the modelled ceiling",
+            "a".repeat(SHARD_ITERATOR_CEILING),
+        ),
+    ];
+    // A value that is not written as a stream's ARN, inside the modelled `StreamArn`
+    // window of 37..1024 for the same reason.
+    let unreadable_arn = format!("arn:aws:dynamodb:{REGION}:000000000000:table/ledger");
+
+    // The widths each row pairs the bad identifier with: one past the operation's own
+    // ceiling, far past it, and the widest the member carries.
+    let over_get_records: [(&str, i64); 3] = [
+        ("one past the ceiling", i64::from(MAX_GET_RECORDS_LIMIT) + 1),
+        ("far past the ceiling", 50_000),
+        ("the widest the member carries", i64::from(i32::MAX)),
+    ];
+    let over_page: [(&str, i64); 3] = [
+        ("one past the ceiling", i64::from(MAX_PAGE_LIMIT) + 1),
+        ("far past the ceiling", 5_000),
+        ("the widest the member carries", i64::from(i32::MAX)),
+    ];
+
+    for (how, limit) in over_get_records {
+        for (form, token) in &unreadable_iterators {
+            let case = format!("GetRecords, {form}, with a Limit {how}");
+            let (status, body) = call(
+                &router,
+                "GetRecords",
+                serde_json::json!({ "ShardIterator": token, "Limit": limit }),
+            )
+            .await;
+            assert_refused(&case, status, &body, INVALID_SHARD_ITERATOR);
+        }
+    }
+
+    for (how, limit) in over_page {
+        let case = format!("DescribeStream, a malformed StreamArn, with a Limit {how}");
+        let (status, body) = call(
+            &router,
+            "DescribeStream",
+            serde_json::json!({ "StreamArn": unreadable_arn, "Limit": limit }),
+        )
+        .await;
+        assert_refused(&case, status, &body, INVALID_STREAM_ARN);
+
+        let case = format!("ListStreams, a malformed page boundary, with a Limit {how}");
+        let (status, body) = call(
+            &router,
+            "ListStreams",
+            serde_json::json!({ "ExclusiveStartStreamArn": unreadable_arn, "Limit": limit }),
+        )
+        .await;
+        assert_refused(&case, status, &body, INVALID_STREAM_ARN);
+    }
+
+    // The first neighbouring class: a bad identifier with a width the operation does
+    // serve draws the same identifier sentence, so the rows above are about the order
+    // of the two checks and not about the width.
+    for (form, token) in &unreadable_iterators {
+        let case = format!("GetRecords, {form}, with a Limit inside the ceiling");
+        let (status, body) = call(
+            &router,
+            "GetRecords",
+            serde_json::json!({ "ShardIterator": token, "Limit": 10 }),
+        )
+        .await;
+        assert_refused(&case, status, &body, INVALID_SHARD_ITERATOR);
+    }
+
+    // The second: a readable identifier with a width above the ceiling still draws the
+    // width refusal, so judging the identifier first did not retire the bound.
+    let (status, body) = call(
+        &router,
+        "GetRecords",
+        serde_json::json!({
+            "ShardIterator": iterator,
+            "Limit": i64::from(MAX_GET_RECORDS_LIMIT) + 1,
+        }),
+    )
+    .await;
+    assert_refused(
+        "GetRecords, the minted iterator, with a Limit one past the ceiling",
+        status,
+        &body,
+        GET_RECORDS_LIMIT_REFUSAL,
+    );
+    let (status, body) = call(
+        &router,
+        "DescribeStream",
+        serde_json::json!({ "StreamArn": stream_arn, "Limit": i64::from(MAX_PAGE_LIMIT) + 1 }),
+    )
+    .await;
+    assert_refused(
+        "DescribeStream, the registered stream, with a Limit one past the ceiling",
+        status,
+        &body,
+        DESCRIBE_STREAM_LIMIT_REFUSAL,
+    );
+
+    // And the request that is right in both ways is served.
+    let (status, body) = call(
+        &router,
+        "GetRecords",
+        serde_json::json!({ "ShardIterator": iterator, "Limit": MAX_GET_RECORDS_LIMIT }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case a readable iterator with a width the operation serves: expected 200, got \
+         {status} and {body}"
     );
 }

@@ -460,6 +460,11 @@ fn request_with(
 /// The neighbouring class the rule must not swallow: a member that was not in the
 /// request at all has no value to withhold, so it keeps the `null` an absent member is
 /// stated with — and a request inside every bound is served.
+///
+/// The rows are the required members this service does NOT address a position by. A
+/// request that omits the identifier it addresses — a stream ARN, a shard iterator —
+/// draws that identifier's own fixed sentence instead, which is pinned over the whole
+/// class in `identifier_shape_refusals.rs`.
 #[tokio::test]
 async fn an_absent_required_member_keeps_the_null_clause() {
     let (engine, router) = build();
@@ -467,24 +472,18 @@ async fn an_absent_required_member_keeps_the_null_clause() {
     let shard_id = only_shard_id(&router, &stream_arn).await;
 
     // (case, operation, the request, the member the walk reports absent)
-    let absent: [(&str, &str, serde_json::Value, &str); 3] = [
+    let absent: [(&str, &str, serde_json::Value, &str); 2] = [
         (
-            "GetRecords without its iterator",
-            "GetRecords",
-            serde_json::json!({ "Limit": 1 }),
-            "shardIterator",
-        ),
-        (
-            "GetShardIterator without its stream",
+            "GetShardIterator without its shard",
             "GetShardIterator",
-            serde_json::json!({ "ShardId": shard_id, "ShardIteratorType": "LATEST" }),
-            "streamArn",
+            serde_json::json!({ "StreamArn": stream_arn, "ShardIteratorType": "LATEST" }),
+            "shardId",
         ),
         (
-            "DescribeStream without its stream",
-            "DescribeStream",
-            serde_json::json!({ "Limit": 1 }),
-            "streamArn",
+            "GetShardIterator without its iterator type",
+            "GetShardIterator",
+            serde_json::json!({ "StreamArn": stream_arn, "ShardId": shard_id }),
+            "shardIteratorType",
         ),
     ];
 

@@ -115,11 +115,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // Two refusals of this service are worded by the service rather than by the
-        // framework, and neither carries anything of the request inside it. A TABLE
-        // NAME the model's own constraints do not admit draws a single sentence
-        // stating the window a name has to fit, with no constraint envelope around it
-        // ([`table_name_refusal`]), so it is asked first. Every other broken
+        // Three refusals of this service are worded by the service rather than by the
+        // framework, and none carries anything of the request inside it. A request that
+        // OMITS the identifier it addresses draws that identifier's own sentence
+        // ([`absent_identifier_refusal`]), so it is asked first: the request named no
+        // position at all, which is the same fault as naming one of the wrong form and
+        // not a constraint on a value. A TABLE NAME the model's own constraints do not
+        // admit draws a single sentence stating the window a name has to fit, with no
+        // constraint envelope around it ([`table_name_refusal`]). Every other broken
         // requirement draws the constraint envelope naming the member and the
         // requirement alone ([`validation::refused`]). Authentication keeps the
         // framework's wording: it is not an input failure, and its code and status
@@ -127,7 +130,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let Refusal::Invalid(violations) = refusal else {
             return None;
         };
-        table_name_refusal(violations).or_else(|| validation::refused(refusal))
+        absent_identifier_refusal(violations)
+            .or_else(|| table_name_refusal(violations))
+            .or_else(|| validation::refused(refusal))
     }
 
     fn override_routing_error(
@@ -163,6 +168,80 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 /// client branches on the code, and this service answers one code for every input
 /// refusal, so rewording a message never moves a caller onto another branch.
 const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// The identifiers this service's operations ADDRESS a position with, each paired with
+/// the one sentence a request that does not name it draws.
+///
+/// Each sentence is the service's own, stated once in [`crate::state`] and answered
+/// wherever the identifier is judged: the handlers answer it for a value that is not
+/// written as that identifier, and this front door answers the same sentence for a
+/// request that carried no value at all — one fault with one wording, because neither
+/// request names a position this service could read. They are keyed on the SHAPE the
+/// member targets, which is what the sentence names, so every member of that shape is
+/// refused alike; the members this model declares for them are named after it
+/// (`DescribeStream$StreamArn`, `GetShardIterator$StreamArn`, `GetRecords$ShardIterator`).
+///
+/// An identifier whose malformed value this service does NOT state a sentence of — a
+/// shard id, an iterator type — is absent from this table, so an omitted one keeps the
+/// framework's constraint envelope.
+const ADDRESSING_IDENTIFIERS: [(&str, &str); 2] = [
+    ("StreamArn", crate::state::INVALID_STREAM_ARN),
+    ("ShardIterator", crate::state::INVALID_SHARD_ITERATOR),
+];
+
+/// How this service refuses a request that NAMES NOTHING: a member carrying one of the
+/// identifiers above was not in the request at all.
+///
+/// `None` for a refusal that names no such member, which falls through to the wordings
+/// below. Nothing here is keyed to an operation: the member path the framework's walk
+/// reports is matched against the model's own member names, so an operation this model
+/// gains that addresses a stream or a shard iterator is refused the same way.
+fn absent_identifier_refusal(violations: &[Violation]) -> Option<Refused> {
+    let message = violations.iter().find_map(|violation| {
+        if !matches!(violation.kind, ViolationKind::MissingRequiredMember) {
+            return None;
+        }
+        addressing_identifier(&violation.path)
+    })?;
+    Some(Refused {
+        code: VALIDATION_EXCEPTION.to_string(),
+        message: message.to_string(),
+    })
+}
+
+/// The sentence the member refused at `refused_at` draws, if that member carries one of
+/// the identifiers this service addresses by.
+///
+/// The path is compared against the one the framework spells for the model's own member
+/// ([`path::member`]), rather than against text written out here, so the comparison
+/// cannot drift from either the model or the framework's walk.
+fn addressing_identifier(refused_at: &str) -> Option<&'static str> {
+    ADDRESSING_IDENTIFIERS
+        .iter()
+        .copied()
+        .find_map(|(identifier, message)| {
+            let member = input_member(identifier)?.member_name()?;
+            (path::member(member) == refused_at).then_some(message)
+        })
+}
+
+/// The member of one of this service's inputs named `name`, as the MODEL declares it.
+fn input_member(name: &str) -> Option<&'static Schema> {
+    INPUT_SCHEMAS
+        .iter()
+        .copied()
+        .flat_map(|input| input.members().iter().copied())
+        .find(|member| member.member_name() == Some(name))
+}
+
+/// Every input shape this service reads a request into, so a rule stated over its
+/// members covers the whole surface rather than one operation.
+const INPUT_SCHEMAS: [&Schema; 4] = [
+    crate::ops::types::DESCRIBE_STREAM_INPUT_SCHEMA,
+    crate::ops::types::GET_RECORDS_INPUT_SCHEMA,
+    crate::ops::types::GET_SHARD_ITERATOR_INPUT_SCHEMA,
+    crate::ops::types::LIST_STREAMS_INPUT_SCHEMA,
+];
 
 /// How this service refuses a TABLE NAME its model's own constraints do not admit:
 /// one sentence naming the member and the length window a name has to fit, and
