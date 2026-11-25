@@ -894,6 +894,16 @@ pub fn resource_not_found(resource_type: &str, resource_id: &str) -> ResourceNot
 /// whichever precondition refused the call.
 const VALIDATION_ERROR_PREFIX: &str = "Validation error detected: ";
 
+/// One precondition refusal's whole sentence: the scaffold above, the `clause` that says which
+/// precondition failed and over which resource, and the terminating `.` that closes it.
+///
+/// Every builder below states only its own clause and reaches the scaffold through here, so a
+/// clause cannot be worded into a sentence that opens or closes differently from its siblings'
+/// — whichever precondition, and whichever operation, refused the call.
+fn precondition_message(clause: impl ::std::fmt::Display) -> String {
+    format!("{VALIDATION_ERROR_PREFIX}{clause}.")
+}
+
 /// The sentence a call is refused with when a resource it names, or references, is not in the
 /// state that lets it be used: the prefix, the fixed clause `"Resource(s) are not active: "`,
 /// the ARN of that resource, and a terminating `.`.
@@ -903,12 +913,13 @@ const VALIDATION_ERROR_PREFIX: &str = "Validation error detected: ";
 /// `CreateChallenge` over the connector it mints a password under — so the two cannot state
 /// one precondition in two sentences.
 pub fn resources_not_active_message(resource_arn: &str) -> String {
-    format!("{VALIDATION_ERROR_PREFIX}Resource(s) are not active: {resource_arn}.")
+    precondition_message(format_args!("Resource(s) are not active: {resource_arn}"))
 }
 
 /// The sentence a tag change is refused with when the connector the resource hangs off has
-/// been accepted for teardown: the resource named, the connector whose status governs it, and
-/// the status that record is in.
+/// been accepted for teardown: the precondition scaffold ([`precondition_message`]) around a
+/// clause naming the resource, the connector whose status governs it, and the status that
+/// record is in.
 ///
 /// Two forms, one per resource kind, because the connector IS the resource for a connector ARN
 /// and is the owner for a challenge ARN ([`resource_type_of`]) — so the sentence names the
@@ -922,13 +933,15 @@ fn tags_cannot_be_changed_message(
     status: &str,
 ) -> String {
     if resource_arn == connector_arn {
-        format!("Connector {connector_arn} has status {status}; its tags cannot be changed")
+        precondition_message(format_args!(
+            "Connector {connector_arn} has status {status}; its tags cannot be changed"
+        ))
     } else {
-        format!(
+        precondition_message(format_args!(
             "{} {resource_arn} belongs to connector {connector_arn}, which has status {status}; \
              its tags cannot be changed",
             resource_type_of(resource_arn)
-        )
+        ))
     }
 }
 
@@ -939,7 +952,9 @@ fn tags_cannot_be_changed_message(
 /// The variable parts are the `ConnectorStatus` the record is in and the ARN the request
 /// named, both read from state rather than from the request's shape.
 pub fn resource_cannot_be_in_state_message(status: &str, resource_arn: &str) -> String {
-    format!("{VALIDATION_ERROR_PREFIX}Resource cannot be in state {status}: {resource_arn}.")
+    precondition_message(format_args!(
+        "Resource cannot be in state {status}: {resource_arn}"
+    ))
 }
 
 /// The Region segment every ARN of this service carries, as both `ConnectorArn`'s and

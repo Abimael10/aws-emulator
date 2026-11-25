@@ -16,6 +16,14 @@
 //! where both are accepted, and inside the teardown window, where both are refused — so the
 //! agreement is over an answer that is actually reached and is not vacuous.
 //!
+//! The second test here widens that to the rule those sentences are one instance of: whichever
+//! operation of this service refuses a well-formed request because a resource's STATUS does not
+//! admit the call — the `ValidationException` whose `Reason` is `INVALID_STATE` — words it
+//! inside ONE scaffold, the opening `"Validation error detected: "` and a terminating `.`
+//! around the clause that says which precondition failed. Its rows span the operations that
+//! have such a precondition and both resource kinds, so a tag write cannot carry a sentence
+//! shaped differently from a create's.
+//!
 //! The rows differ along what the rule generalises over: which of the two taggable resource
 //! kinds the write names (a connector, and a challenge hanging off one, which the sentence
 //! words differently), the status the connector's delete was accepted from, how many tags the
@@ -231,18 +239,26 @@ const PROBE: (&str, &str) = ("before-teardown", "accepted");
 /// probe changes nothing a later assertion depends on.
 const PROBE_ABSENT_KEY: &str = "never-set";
 
+/// The opening every precondition refusal of this service carries, spelled here as a wire
+/// expectation: a request whose input is well-formed but names a resource whose state does not
+/// admit the call is refused with this scaffold around the clause that says which precondition
+/// failed, and a terminating `.` closes the sentence.
+const PRECONDITION_PREFIX: &str = "Validation error detected: ";
+
 /// The sentence this service refuses a tag change on `resource_arn` with while the connector
 /// `connector_arn` is in `status`, spelled here as a wire expectation rather than read back out
 /// of the implementation. Two forms, because a connector ARN names the governing record itself
-/// while a challenge ARN names a resource that belongs to one.
+/// while a challenge ARN names a resource that belongs to one — each inside the one
+/// precondition scaffold every refusal of a resource's state carries.
 fn expected_message(kind: Kind, resource_arn: &str, connector_arn: &str, status: &str) -> String {
     match kind {
-        Kind::Connector => {
-            format!("Connector {connector_arn} has status {status}; its tags cannot be changed")
-        }
+        Kind::Connector => format!(
+            "{PRECONDITION_PREFIX}Connector {connector_arn} has status {status}; its tags cannot \
+             be changed."
+        ),
         Kind::Challenge => format!(
-            "{RESOURCE_TYPE_CHALLENGE} {resource_arn} belongs to connector {connector_arn}, \
-             which has status {status}; its tags cannot be changed"
+            "{PRECONDITION_PREFIX}{RESOURCE_TYPE_CHALLENGE} {resource_arn} belongs to connector \
+             {connector_arn}, which has status {status}; its tags cannot be changed."
         ),
     }
 }
@@ -404,5 +420,136 @@ async fn both_tagging_writes_answer_one_state_precondition_identically() {
         harness::assert_tagging_not_found(&gone_tag, name);
         let gone_untag = untag_resource(&router, &resource, case.remove).await;
         harness::assert_tagging_not_found(&gone_untag, name);
+    }
+}
+
+/// One `CreateChallenge` call, which is refused for the connector's status the same way a tag
+/// write is: the contrast row of the table below, from an operation that is not a tag write.
+async fn create_challenge_for(router: &MultiServiceRouter, connector: &str) -> Answer {
+    create_challenge(router, connector, &tags_member(&[])).await
+}
+
+/// A connector of this Region, left in the status its create starts it in because the
+/// transition the clock owes it is pinned undue rather than waited for.
+async fn creating_connector(
+    router: &MultiServiceRouter,
+    engine: &engine::InMemoryEngine,
+    case: &str,
+) -> String {
+    let created = create_connector(router, &tags_member(&[])).await;
+    assert_eq!(
+        created.status, 202,
+        "case {case:?}: expected 202 from CreateConnector, got {} / {:?}",
+        created.status, created.body
+    );
+    let arn = created.text("ConnectorArn");
+    harness::hold_pending(engine, &arn);
+    arn
+}
+
+#[tokio::test]
+async fn every_precondition_refusal_opens_with_the_service_scaffold() {
+    let (router, engine) = new_router();
+
+    // A connector accepted for teardown, with a challenge of its own hanging off it: the two
+    // taggable kinds, both governed by that connector's status. Every status below is pinned
+    // with the clock move, so no row waits for a transition span.
+    let connector = creating_connector(&router, &engine, "the connector under teardown").await;
+    harness::release_pending(&engine, &connector);
+    let created = create_challenge_for(&router, &connector).await;
+    assert_eq!(
+        created.status, 202,
+        "expected 202 from CreateChallenge over the settled connector, got {} / {:?}",
+        created.status, created.body
+    );
+    let challenge = created
+        .challenge("Arn")
+        .as_str()
+        .unwrap_or_else(|| panic!("expected a challenge Arn in {:?}", created.body))
+        .to_string();
+    let deleted = delete_connector(&router, &connector).await;
+    assert_eq!(
+        deleted.status, 202,
+        "expected 202 from DeleteConnector, got {} / {:?}",
+        deleted.status, deleted.body
+    );
+    harness::hold_pending(&engine, &connector);
+
+    // A second connector that never settled, so the refusal of a create over it is about a
+    // status no delete was asked for.
+    let still_creating = creating_connector(&router, &engine, "the connector still creating").await;
+
+    // The rows: each a well-formed request that one of this service's operations refuses
+    // because the status of the resource it names does not admit the call, with the ARN of the
+    // resource whose status refused it. They differ along what the rule generalises over —
+    // which operation refused the call, which of the two taggable kinds it named, and which
+    // non-serving status the governing connector was in.
+    let rows: Vec<(&str, &str, Answer)> = vec![
+        (
+            "TagResource over the connector under teardown",
+            &connector,
+            tag_resource(&router, &connector, &[("owner", "platform")]).await,
+        ),
+        (
+            "UntagResource over the connector under teardown",
+            &connector,
+            untag_resource(&router, &connector, &["owner"]).await,
+        ),
+        (
+            "TagResource over a challenge of that connector",
+            &challenge,
+            tag_resource(&router, &challenge, &[("owner", "platform")]).await,
+        ),
+        (
+            "UntagResource over a challenge of that connector",
+            &challenge,
+            untag_resource(&router, &challenge, &["owner", "absent"]).await,
+        ),
+        (
+            "CreateChallenge over the connector under teardown",
+            &connector,
+            create_challenge_for(&router, &connector).await,
+        ),
+        (
+            "CreateChallenge over a connector that is still creating",
+            &still_creating,
+            create_challenge_for(&router, &still_creating).await,
+        ),
+    ];
+
+    for (name, governing_arn, answer) in &rows {
+        assert_eq!(
+            (answer.status, answer.error_type.as_str()),
+            (400, "ValidationException"),
+            "case {name:?}: a precondition refusal is a 400 ValidationException, got {} / {:?}",
+            answer.status,
+            answer.body
+        );
+        assert_eq!(
+            &answer.body["Reason"],
+            &json!(REASON_INVALID_STATE),
+            "case {name:?}: expected Reason {REASON_INVALID_STATE}, got {:?}",
+            answer.body
+        );
+        let message = answer.message();
+        assert!(
+            message.starts_with(PRECONDITION_PREFIX),
+            "case {name:?}: expected the sentence to open with {PRECONDITION_PREFIX:?}, got \
+             {message:?}"
+        );
+        assert!(
+            message.ends_with('.'),
+            "case {name:?}: expected the sentence to close with a period, got {message:?}"
+        );
+        // What is left once the scaffold is taken off: the one clause this refusal states.
+        let clause = &message[PRECONDITION_PREFIX.len()..message.len() - 1];
+        assert!(
+            !clause.is_empty() && !clause.ends_with('.'),
+            "case {name:?}: expected one clause inside the scaffold, got {clause:?}"
+        );
+        assert!(
+            clause.contains(*governing_arn),
+            "case {name:?}: expected the clause to name {governing_arn:?}, got {clause:?}"
+        );
     }
 }
