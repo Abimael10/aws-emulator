@@ -74,12 +74,17 @@ impl Harness {
         if let Some(contact_id) = state.participant_tokens.get(participant_token) {
             return contact_id.clone();
         }
-        let session = participant::state::ChatSession::started(
+        let mut session = participant::state::ChatSession::started(
             participant::state::new_id(),
             participant::state::new_id(),
             Some(DISPLAY_NAME.to_string()),
             SystemTime::now() + participant::state::CONNECTION_TOKEN_TTL,
         );
+        // A chat shares attachments only while the Amazon Connect instance it belongs to
+        // is configured with somewhere to keep an attached file, which the component that
+        // starts the chat writes onto the session: this one is, exactly as
+        // `StartChatContact` on such an instance records.
+        session.attachments_shared = true;
         let contact_id = session.contact_id.clone();
         state.register_session(participant_token.to_string(), session);
         contact_id

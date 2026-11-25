@@ -182,7 +182,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // may upload. An AccessDeniedException can indicate that the participant may be a
         // CUSTOM_BOT, and it doesn't have access to attachments." The role is the session's,
         // so the same bot reading its own chat's transcript is still refused an attachment.
-        if session.participant_role == crate::state::PARTICIPANT_ROLE_CUSTOM_BOT {
+        //
+        // A chat of an instance configured with no attachment storage shares no files at
+        // all, so no download is served for one either, whatever role asks for it.
+        if session.participant_role == crate::state::PARTICIPANT_ROLE_CUSTOM_BOT
+            || !session.attachments_shared
+        {
             return Err(GetAttachmentErrorModeled::AccessDeniedException(
                 AccessDeniedException {
                     message: crate::state::ACCESS_DENIED_MESSAGE.to_string(),

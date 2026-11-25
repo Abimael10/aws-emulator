@@ -457,10 +457,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ends_at: now + crate::state::chat_duration(input.chat_duration_in_minutes),
         };
         instance.chat_contacts.insert(contact_id.clone(), record.clone());
+        let attachments_shared = instance.chat_attachments_shared();
 
         // The data-plane half: the session the participant token reaches, its rehydrated
         // transcript and the chat's first message.
-        let mut session = crate::state::chat_session_for(&record);
+        //
+        // Whether this instance's chats may share attachments travels with it: the
+        // attachment operations are the participant service's, the storage an attached
+        // file is kept in is associated HERE, and a chat file is uploaded to and
+        // downloaded from that storage — so what this instance is configured with is
+        // written where those operations read it.
+        let mut session = crate::state::chat_session_for(&record, attachments_shared);
         session.transcript = rehydrated;
         if let Some(message) = input.initial_message {
             session.append(

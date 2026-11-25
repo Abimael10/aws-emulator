@@ -175,6 +175,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // A chat of an instance configured with no attachment storage shares no files, so
+        // there is no upload of one to confirm — the same refusal the upload itself gets.
+        if !session.attachments_shared {
+            return Err(CompleteAttachmentUploadErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::ACCESS_DENIED_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
         let contact_id = session.contact_id.clone();
         let has_transcript_room = session.has_room();
 

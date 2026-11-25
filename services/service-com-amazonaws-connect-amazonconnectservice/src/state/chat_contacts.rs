@@ -148,7 +148,25 @@ impl ChatContactRecord {
     }
 }
 
+/// `InstanceStorageResourceType$ATTACHMENTS`, from `INSTANCE_STORAGE_RESOURCE_TYPE_VALUES`:
+/// the storage an instance keeps the files attached to its contacts in.
+///
+/// Associating it is what lets an instance's chats share attachments: a chat file is
+/// uploaded to, and downloaded from, that storage, so an instance associated with none
+/// shares no files and the participant service refuses its chats' attachment calls. What
+/// an instance is configured with is published onto the chat sessions that service serves
+/// ([`publish_chat_attachment_sharing`]), which is where those operations read it.
+pub const ATTACHMENTS_STORAGE_RESOURCE_TYPE: &str = "ATTACHMENTS";
+
 impl InstanceRecord {
+    /// Whether this instance's chats may share attachments: whether it is associated with
+    /// the storage an attached file is kept in.
+    #[must_use]
+    pub fn chat_attachments_shared(&self) -> bool {
+        self.storage_config_for_resource_type(ATTACHMENTS_STORAGE_RESOURCE_TYPE)
+            .is_some()
+    }
+
     /// The chat this instance started for `client_token`, if that token already started
     /// one. A repeat of a request reports the contact it made rather than making a
     /// second one.
@@ -272,15 +290,41 @@ pub fn chat_duration(minutes: Option<i32>) -> Duration {
 /// Retained until the chat's own end, which is what `ChatDurationInMinutes` sets: past
 /// it the chat is over, so neither the session nor a token that reaches it serves
 /// another request.
-pub fn chat_session_for(record: &ChatContactRecord) -> participant::state::ChatSession {
+pub fn chat_session_for(
+    record: &ChatContactRecord,
+    attachments_shared: bool,
+) -> participant::state::ChatSession {
     participant::state::ChatSession {
         initial_contact_id: record.initial_contact_id.clone(),
+        attachments_shared,
         ..participant::state::ChatSession::started(
             record.id.clone(),
             record.participant_id.clone(),
             Some(record.display_name.clone()),
             record.ends_at,
         )
+    }
+}
+
+/// Publish what `instance` is configured with onto the chats of it the Connect
+/// Participant Service is serving: whether each may share attachments.
+///
+/// The attachment operations are that service's, while the storage an attached file is
+/// kept in is associated HERE, so what a chat may do has to reach the session that
+/// service serves — including a chat already running when the association changes, which
+/// is why this is published rather than decided once at the start.
+///
+/// One pass over this instance's own chats, which [`CHAT_CONTACTS_PER_INSTANCE_QUOTA`]
+/// bounds, writing nothing for a chat whose session that service no longer holds.
+pub fn publish_chat_attachment_sharing(
+    instance: &InstanceRecord,
+    sessions: &mut participant::state::ComAmazonawsConnectparticipantAmazonconnectparticipantservicelambdaState,
+) {
+    let shared = instance.chat_attachments_shared();
+    for contact_id in instance.chat_contacts.keys() {
+        if let Some(session) = sessions.sessions.get_mut(contact_id) {
+            session.attachments_shared = shared;
+        }
     }
 }
 

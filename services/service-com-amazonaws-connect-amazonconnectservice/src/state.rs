@@ -38,9 +38,10 @@ pub use attached_files::{
 mod chat_contacts;
 pub use chat_contacts::{
     attributes_problem, chat_duration, chat_session_for, chat_session_state,
-    connection_token_expiry, ChatContactRecord, ChatStreaming,
-    CHAT_CONTACTS_PER_INSTANCE_QUOTA, CHAT_DURATION_DEFAULT_MINUTES, CHAT_MESSAGE_CONTENT_TYPES,
-    MAX_ATTRIBUTES_BYTES, REQUIRED_MESSAGING_CONTENT_TYPE, SUPPORTED_MESSAGING_CONTENT_TYPES,
+    connection_token_expiry, publish_chat_attachment_sharing, ChatContactRecord, ChatStreaming,
+    ATTACHMENTS_STORAGE_RESOURCE_TYPE, CHAT_CONTACTS_PER_INSTANCE_QUOTA,
+    CHAT_DURATION_DEFAULT_MINUTES, CHAT_MESSAGE_CONTENT_TYPES, MAX_ATTRIBUTES_BYTES,
+    REQUIRED_MESSAGING_CONTENT_TYPE, SUPPORTED_MESSAGING_CONTENT_TYPES,
 };
 
 /// The instance's feature toggles: what `UpdateInstanceAttribute` writes and

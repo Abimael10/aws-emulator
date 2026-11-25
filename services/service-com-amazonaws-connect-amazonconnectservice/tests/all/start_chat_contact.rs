@@ -16,6 +16,12 @@
 //! Each table spans what the rule generalises over (the display name, the content type,
 //! the requested connection types, the chat duration, the rehydration type), never one
 //! recorded call.
+//!
+//! The chat its instance hands over carries what that INSTANCE is configured with, which
+//! is the second rule asserted here: a participant may share attachments only while the
+//! instance the contact belongs to is associated with the storage an attached file is
+//! kept in, so the participant service's attachment call is served for a chat of a
+//! configured instance and refused `AccessDeniedException` for a chat of one that is not.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -28,7 +34,9 @@ use service_com_amazonaws_connect_amazonconnectservice::state::{
     self as connect_state, ChatContactRecord, CHAT_CONTACTS_PER_INSTANCE_QUOTA,
     MAX_ATTRIBUTES_BYTES,
 };
+use service_com_amazonaws_connect_amazonconnectservice::ops::types::INSTANCE_STORAGE_RESOURCE_TYPE_VALUES;
 use service_com_amazonaws_connect_amazonconnectservice::EmulatedService as Connect;
+use service_com_amazonaws_connectparticipant_amazonconnectparticipantservicelambda::state as participant_state;
 use service_com_amazonaws_connectparticipant_amazonconnectparticipantservicelambda::EmulatedService as Participant;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -1042,4 +1050,151 @@ async fn every_started_chat_is_its_own_session() {
             );
         }
     }
+}
+
+/// `AssociateInstanceStorageConfig` for the storage an attached file is kept in:
+/// `PUT /instance/{InstanceId}/storage-config`, with the resource type and the S3
+/// configuration in the body. The resource-type name is
+/// `com.amazonaws.connect#InstanceStorageResourceType$ATTACHMENTS`, which the service
+/// itself names in `connect_state::ATTACHMENTS_STORAGE_RESOURCE_TYPE`.
+async fn associate_attachment_storage(chat: &Chat, instance_id: &str, bucket: &str) -> Answer {
+    chat.send(
+        "PUT",
+        &format!("/instance/{instance_id}/storage-config"),
+        "connect",
+        None,
+        Some(json!({
+            "ResourceType": connect_state::ATTACHMENTS_STORAGE_RESOURCE_TYPE,
+            "StorageConfig": {
+                "StorageType": "S3",
+                "S3Config": {"BucketName": bucket, "BucketPrefix": "chat-attachments"},
+            },
+        })),
+    )
+    .await
+}
+
+/// `StartAttachmentUpload` on the participant service, for the chat reached with
+/// `connection_token`.
+async fn start_attachment_upload(chat: &Chat, connection_token: &str, client_token: &str) -> Answer {
+    chat.send(
+        "POST",
+        "/participant/start-attachment-upload",
+        "execute-api",
+        Some(connection_token),
+        Some(json!({
+            "AttachmentName": "notes.txt",
+            "AttachmentSizeInBytes": 11,
+            "ContentType": "text/plain",
+            "ClientToken": client_token,
+        })),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_chat_shares_attachments_only_when_its_instance_is_configured_for_them() {
+    // The rule: a chat file is kept in the storage the Amazon Connect instance the
+    // contact belongs to is associated with, so a participant may upload one only while
+    // its instance is associated with that storage; otherwise the participant service
+    // refuses the call with the modelled `AccessDeniedException`. Both halves of the chat
+    // are driven over HTTP: the association and the start here, the upload there.
+    let chat = Chat::new();
+    // The resource type this rule keys on is one `InstanceStorageResourceType` enumerates,
+    // so the constant the services share cannot drift from the modelled value set.
+    assert!(
+        INSTANCE_STORAGE_RESOURCE_TYPE_VALUES
+            .contains(&connect_state::ATTACHMENTS_STORAGE_RESOURCE_TYPE),
+        "expected InstanceStorageResourceType to name {:?}, it names \
+         {INSTANCE_STORAGE_RESOURCE_TYPE_VALUES:?}",
+        connect_state::ATTACHMENTS_STORAGE_RESOURCE_TYPE
+    );
+    let (configured_instance, configured_flow) = chat.instance("attachments-configured").await;
+    let (bare_instance, bare_flow) = chat.instance("attachments-bare").await;
+    let associated = associate_attachment_storage(
+        &chat,
+        &configured_instance,
+        "connect-chat-attachments-configured",
+    )
+    .await;
+    assert_eq!(
+        associated.status, 200,
+        "AssociateInstanceStorageConfig ATTACHMENTS: got {}",
+        associated.body
+    );
+
+    // (case, the instance the chat is started on, its flow, the expected status and error
+    // code of the upload). The rows differ in nothing else: each chat is freshly started
+    // and its participant connected, so the connection token authenticates a connected
+    // participant of a live chat in both.
+    let rows: [(&str, &str, &str, u16, &str); 2] = [
+        (
+            "a chat of an instance associated with attachment storage",
+            configured_instance.as_str(),
+            configured_flow.as_str(),
+            200,
+            "",
+        ),
+        (
+            "a chat of an instance associated with none",
+            bare_instance.as_str(),
+            bare_flow.as_str(),
+            403,
+            "AccessDeniedException",
+        ),
+    ];
+
+    let mut bare_connection = String::new();
+    for (case, instance_id, flow_id, expected_status, expected_code) in rows {
+        let answer = chat
+            .start_chat(start_body(instance_id, flow_id, "Customer Pat"))
+            .await;
+        let (_, _, participant_token) = started(&answer);
+        let connection_token = chat.connection_token(&participant_token).await;
+        if expected_status == 403 {
+            bare_connection = connection_token.clone();
+        }
+        let upload = start_attachment_upload(&chat, &connection_token, "sharing-start").await;
+        assert_eq!(
+            (upload.status, upload.error_code.as_str()),
+            (expected_status, expected_code),
+            "case {case:?}: expected HTTP {expected_status} {expected_code:?}, got {}",
+            upload.body
+        );
+        if expected_status == 200 {
+            assert!(
+                upload.body["AttachmentId"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty()),
+                "case {case:?}: expected an AttachmentId, got {}",
+                upload.body
+            );
+        } else {
+            assert_eq!(
+                upload.body["message"].as_str(),
+                Some(participant_state::ACCESS_DENIED_MESSAGE),
+                "case {case:?}: expected the message {:?}, got {}",
+                participant_state::ACCESS_DENIED_MESSAGE,
+                upload.body
+            );
+        }
+    }
+
+    // Associating the storage onto the instance that had none reaches the chat already
+    // running on it: what the participant service serves is the instance's configuration
+    // as it stands, not a verdict the chat was started with.
+    let associated =
+        associate_attachment_storage(&chat, &bare_instance, "connect-chat-attachments-late").await;
+    assert_eq!(
+        associated.status, 200,
+        "AssociateInstanceStorageConfig ATTACHMENTS on the bare instance: got {}",
+        associated.body
+    );
+    let upload = start_attachment_upload(&chat, &bare_connection, "sharing-start-late").await;
+    assert_eq!(
+        upload.status, 200,
+        "case \"the running chat once its instance is associated with attachment storage\": \
+         got {}",
+        upload.body
+    );
 }

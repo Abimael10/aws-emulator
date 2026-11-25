@@ -11,6 +11,11 @@
 //! [`ARTIFACT_STATUS_IN_PROGRESS`] and the second call is what moves it to
 //! [`ARTIFACT_STATUS_APPROVED`]; a download is served for the approved attachment alone.
 //!
+//! Whether a chat may share attachments AT ALL is its instance's: a chat file is kept in
+//! the storage the Amazon Connect instance is configured with, so a chat of an instance
+//! that has none shares no files, and every attachment operation of such a chat is refused
+//! ([`ChatSession::attachments_shared`]).
+//!
 //! Both URLs are addresses a CALLER follows, so each has to name a host this emulator
 //! answers on — no production AWS hostname resolves here. Each is therefore PRESIGNED
 //! against this emulator's own base URL ([`attachment_url`]) with the attachment's own

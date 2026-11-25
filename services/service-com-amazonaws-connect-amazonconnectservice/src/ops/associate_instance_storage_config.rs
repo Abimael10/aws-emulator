@@ -169,6 +169,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
+        // The chat-session store is resolved BEFORE anything is written, so an
+        // association that has to be published to it cannot be stored here and lost
+        // there. LOCK ORDER: this service's store first and that one second (the order
+        // `crate::state::chat_session_state` documents), so it is only locked below.
+        let chats = crate::state::chat_session_state(&*self.engine).ok_or_else(|| {
+            AssociateInstanceStorageConfigErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the chat-session store is unavailable".to_string()),
+                },
+            )
+        })?;
         let mut store = state.lock();
 
         // Minted before the instance is borrowed, so the borrow below is the only one.
@@ -237,6 +248,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The association id the response reports is the one the stored configuration
         // carries, whatever `AssociationId` the request's own configuration held.
         config.association_id = Some(association_id.clone());
+        let associates_attachments =
+            input.resource_type == crate::state::ATTACHMENTS_STORAGE_RESOURCE_TYPE;
         instance.storage_configs.insert(
             association_id.clone(),
             crate::state::StorageConfigRecord {
@@ -246,6 +259,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 client_token,
             },
         );
+
+        // Associating the storage an attached file is kept in is what lets this
+        // instance's chats share attachments, and those operations are the Connect
+        // Participant Service's: a chat file is uploaded to and downloaded from this
+        // storage, so what this instance is now configured with is written onto the chats
+        // of it that service is serving — the ones already running included.
+        if associates_attachments {
+            crate::state::publish_chat_attachment_sharing(instance, &mut chats.lock());
+        }
 
         Ok(AssociateInstanceStorageConfigOutput {
             association_id: Some(association_id),

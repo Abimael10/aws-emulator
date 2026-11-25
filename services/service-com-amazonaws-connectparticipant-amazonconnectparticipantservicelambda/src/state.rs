@@ -238,6 +238,18 @@ pub struct ShownView {
 pub struct ChatSession {
     /// The contact this session belongs to.
     pub contact_id: String,
+    /// Whether this chat may share attachments: whether the Amazon Connect instance its
+    /// contact belongs to is configured with somewhere to keep an attached file.
+    ///
+    /// A chat file is uploaded to, and downloaded from, the storage its instance is
+    /// configured with, so a chat of an instance that has none shares no files and every
+    /// attachment operation of it is refused. What an instance is configured with is
+    /// decided where the instance is CONFIGURED — the Amazon Connect service, whose
+    /// `AssociateInstanceStorageConfig` attaches the storage one resource type is kept in
+    /// — so that component writes this flag, both when it starts the chat and when it
+    /// changes what the instance is configured with, and the attachment operations only
+    /// read it.
+    pub attachments_shared: bool,
     /// `GetTranscriptResponse$InitialContactId`.
     pub initial_contact_id: String,
     /// The participant every item this session sends is attributed to.
@@ -291,6 +303,10 @@ impl ChatSession {
         Self {
             initial_contact_id: contact_id.clone(),
             contact_id,
+            // A chat shares attachments only where the component that starts it says its
+            // instance is configured for it, so the session a start registers shares
+            // none until that is written.
+            attachments_shared: false,
             participant_id,
             participant_role: PARTICIPANT_ROLE_CUSTOMER.to_string(),
             display_name,

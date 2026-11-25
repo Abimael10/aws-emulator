@@ -210,6 +210,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // An attachment is uploaded to the storage this chat's Amazon Connect instance is
+        // configured with, so a chat of an instance configured with none shares no files:
+        // no upload target is published for it, however well the connection token
+        // authenticates its caller.
+        if !session.attachments_shared {
+            return Err(StartAttachmentUploadErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::ACCESS_DENIED_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
         let contact_id = session.contact_id.clone();
 
         // A repeated `ClientToken` must answer with the attachment the first call minted —

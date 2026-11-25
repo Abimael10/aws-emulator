@@ -10,6 +10,12 @@
 //! that was uploaded to it. So each case drives the whole path over the wire, through the
 //! same `MultiServiceRouter` the production router dispatches with: the control-plane call,
 //! the `PUT` to the published target, the read back, and the `GET` of the download URL.
+//!
+//! Whether a chat may share attachments at all is a rule of its own, asserted at the end of
+//! this suite: a chat file is kept in the storage the Amazon Connect instance the contact
+//! belongs to is configured with, so a chat of an instance configured with none is refused
+//! every attachment operation (403 `AccessDeniedException`), and the answer follows that
+//! configuration as it stands at the time of the call.
 
 use std::sync::Arc;
 
@@ -68,21 +74,50 @@ impl Harness {
     /// Register the chat a `StartChatContact` would have started for `participant_token`,
     /// and answer its contact id. Registering one token twice keeps the session the first
     /// call registered, because a participant token names one participant of one contact.
+    ///
+    /// The chat is one of an Amazon Connect instance that IS configured with somewhere to
+    /// keep an attached file, which is what lets its participant share attachments at all
+    /// (see [`Harness::set_attachment_sharing`]).
     fn start_chat(&self, participant_token: &str) -> String {
+        self.start_chat_sharing(participant_token, true)
+    }
+
+    /// [`Harness::start_chat`], for a chat whose instance is configured with somewhere to
+    /// keep an attached file only when `attachments_shared`.
+    fn start_chat_sharing(&self, participant_token: &str, attachments_shared: bool) -> String {
         let store = store(&self.engine);
         let mut state = store.lock();
         if let Some(contact_id) = state.participant_tokens.get(participant_token) {
             return contact_id.clone();
         }
-        let session = participant::state::ChatSession::started(
+        let mut session = participant::state::ChatSession::started(
             participant::state::new_id(),
             participant::state::new_id(),
             Some("sim-customer".to_string()),
             std::time::SystemTime::now() + participant::state::CONNECTION_TOKEN_TTL,
         );
+        session.attachments_shared = attachments_shared;
         let contact_id = session.contact_id.clone();
         state.register_session(participant_token.to_string(), session);
         contact_id
+    }
+
+    /// Write whether the Amazon Connect instance the chat `contact_id` belongs to is
+    /// configured with somewhere to keep an attached file, exactly as the component that
+    /// associates (or drops) that storage publishes it onto this chat's session.
+    fn set_attachment_sharing(&self, contact_id: &str, shared: bool) {
+        let store = store(&self.engine);
+        let mut state = store.lock();
+        state
+            .sessions
+            .get_mut(contact_id)
+            .expect("the registered chat session")
+            .attachments_shared = shared;
+    }
+
+    /// How many attachments this store holds for `contact_id`.
+    fn attachments_held(&self, contact_id: &str) -> usize {
+        store(&self.engine).lock().attachment_count(contact_id)
     }
 }
 
@@ -103,6 +138,18 @@ async fn post(
     bearer: Option<&str>,
     body: &Value,
 ) -> (u16, Value) {
+    let (status, _, decoded) = post_answer(router, path, bearer, body).await;
+    (status, decoded)
+}
+
+/// [`post`], also answering the `x-amzn-errortype` header a refusal names its error shape
+/// in (the empty string when the response carries none).
+async fn post_answer(
+    router: &MultiServiceRouter,
+    path: &str,
+    bearer: Option<&str>,
+    body: &Value,
+) -> (u16, String, Value) {
     let mut request = http::Request::builder()
         .method("POST")
         .uri(format!("https://{HOST}{path}"))
@@ -119,13 +166,19 @@ async fn post(
         .expect("build the request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
+    let error_type = response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
     let bytes = response.into_body();
     let decoded = if bytes.is_empty() {
         Value::Null
     } else {
         serde_json::from_slice(&bytes).unwrap_or(Value::Null)
     };
-    (status, decoded)
+    (status, error_type, decoded)
 }
 
 /// What a request to a published attachment URL answered: the status, the body and the
@@ -227,6 +280,23 @@ fn query_param(url: &str, name: &str) -> Option<String> {
 /// `ConnectionToken`.
 async fn connect(harness: &Harness, participant_token: &str) -> String {
     harness.start_chat(participant_token);
+    open_connection(harness, participant_token).await
+}
+
+/// [`connect`], for a chat whose Amazon Connect instance is configured with somewhere to
+/// keep an attached file only when `attachments_shared`.
+async fn connect_sharing(
+    harness: &Harness,
+    participant_token: &str,
+    attachments_shared: bool,
+) -> String {
+    harness.start_chat_sharing(participant_token, attachments_shared);
+    open_connection(harness, participant_token).await
+}
+
+/// Open a connection for a chat already registered, answering the `ConnectionToken` every
+/// later call authenticates with.
+async fn open_connection(harness: &Harness, participant_token: &str) -> String {
     let (status, body) = post(
         harness,
         "/participant/connection",
@@ -1383,5 +1453,178 @@ async fn the_published_target_takes_only_the_upload_it_was_minted_for() {
         (404, Some("NoSuchKey")),
         "case \"an attachment nobody minted\": got {:?}",
         unknown.json()
+    );
+}
+
+/// One attachment call: the modelled path and a body satisfying every modelled constraint,
+/// so the only thing a refusal of it can be about is the rule under test.
+struct AttachmentCall {
+    case: &'static str,
+    path: &'static str,
+    body: Value,
+}
+
+/// The three attachment operations of one chat, each with a request a sharing chat
+/// answers. `attachment_id` is an id of the form this service mints, so a refusal cannot
+/// be the "no such attachment" validation either.
+fn attachment_calls(attachment_id: &str) -> [AttachmentCall; 3] {
+    [
+        AttachmentCall {
+            case: "StartAttachmentUpload",
+            path: "/participant/start-attachment-upload",
+            body: json!({
+                "AttachmentName": "notes.txt",
+                "AttachmentSizeInBytes": 11,
+                "ContentType": "text/plain",
+                "ClientToken": "sharing-start",
+            }),
+        },
+        AttachmentCall {
+            case: "CompleteAttachmentUpload",
+            path: "/participant/complete-attachment-upload",
+            body: json!({"AttachmentIds": [attachment_id], "ClientToken": "sharing-complete"}),
+        },
+        AttachmentCall {
+            case: "GetAttachment",
+            path: "/participant/attachment",
+            body: json!({"AttachmentId": attachment_id}),
+        },
+    ]
+}
+
+/// Assert `(status, error_type, body)` is this service's access-denied refusal: HTTP 403,
+/// the modelled error shape named in the `x-amzn-errortype` header and in the body, and
+/// the fixed access-denied text under the wire `message` key.
+fn assert_access_denied(case: &str, status: u16, header_error_type: &str, body: &Value) {
+    assert_eq!(
+        status, 403,
+        "case {case:?}: expected HTTP 403, got {status} with body {body:?}"
+    );
+    assert_eq!(
+        header_error_type, "AccessDeniedException",
+        "case {case:?}: expected the x-amzn-errortype header to name AccessDeniedException, \
+         got {header_error_type:?}"
+    );
+    assert_eq!(
+        error_type(body),
+        "AccessDeniedException",
+        "case {case:?}: expected the body to name AccessDeniedException, got {body:?}"
+    );
+    assert_eq!(
+        body["message"].as_str(),
+        Some(participant::state::ACCESS_DENIED_MESSAGE),
+        "case {case:?}: expected the message {:?}, got {body:?}",
+        participant::state::ACCESS_DENIED_MESSAGE
+    );
+}
+
+#[tokio::test]
+async fn a_chat_of_an_instance_with_no_attachment_storage_shares_no_files() {
+    // The rule: a chat file is kept in the storage the Amazon Connect instance the contact
+    // belongs to is configured with, so a participant of a chat whose instance is
+    // configured with none shares no files — every attachment operation is refused the
+    // modelled `AccessDeniedException` — while a participant of a chat whose instance IS
+    // configured for it is served. Two chats in one store, differing in that alone: the
+    // connection token is not what the rows differ in, since both authenticate a
+    // connected participant of a live chat.
+    let harness = router();
+    let denied_contact = harness.start_chat_sharing("denied-participant-token", false);
+    let denied_connection = connect_sharing(&harness, "denied-participant-token", false).await;
+    let served_connection = connect_sharing(&harness, "served-participant-token", true).await;
+
+    let unknown_attachment = "00000000-0000-4000-8000-000000000000";
+    let calls = attachment_calls(unknown_attachment);
+    for call in &calls {
+        let (status, error_type, body) =
+            post_answer(&harness, call.path, Some(&denied_connection), &call.body).await;
+        assert_access_denied(
+            &format!("{} for a chat of an instance with no attachment storage", call.case),
+            status,
+            &error_type,
+            &body,
+        );
+    }
+    assert_eq!(
+        harness.attachments_held(&denied_contact),
+        0,
+        "case \"the refused chat\": expected the refusals to mint no attachment, got {} held",
+        harness.attachments_held(&denied_contact)
+    );
+
+    // The same upload, from the chat whose instance IS configured for attachments, is
+    // served: the rule is the instance's configuration, not the request.
+    let (status, _, body) = post_answer(
+        &harness,
+        "/participant/start-attachment-upload",
+        Some(&served_connection),
+        &calls[0].body,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"StartAttachmentUpload for a chat of a configured instance\": got {body:?}"
+    );
+    assert!(
+        body["AttachmentId"].as_str().is_some_and(|id| !id.is_empty()),
+        "case \"StartAttachmentUpload for a chat of a configured instance\": expected an \
+         AttachmentId, got {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_instance_that_stops_sharing_attachments_stops_serving_its_chats_attachments() {
+    // What the attachment operations serve is what the Amazon Connect instance is
+    // configured with as it stands, not a verdict the chat was started with: the same
+    // live chat, with the same connection token and the same stored attachment, is
+    // served, then refused, then served again as its instance is configured, unconfigured
+    // and configured anew — each published onto this chat's session the way the
+    // association does.
+    let harness = router();
+    let contact_id = harness.start_chat_sharing("revoked-participant-token", true);
+    let connection = connect_sharing(&harness, "revoked-participant-token", true).await;
+
+    let started = start(
+        &harness,
+        &connection,
+        "a chat of a configured instance",
+        "notes.txt",
+        "text/plain",
+        11,
+        "revoked-start",
+    )
+    .await;
+    let (status, body) = complete(
+        &harness,
+        &connection,
+        &started.attachment_id,
+        "revoked-complete",
+    )
+    .await;
+    assert_eq!(status, 200, "CompleteAttachmentUpload got {body:?}");
+
+    harness.set_attachment_sharing(&contact_id, false);
+    let calls = attachment_calls(&started.attachment_id);
+    for call in &calls {
+        let (status, error_type, body) =
+            post_answer(&harness, call.path, Some(&connection), &call.body).await;
+        assert_access_denied(
+            &format!("{} after the instance stopped sharing attachments", call.case),
+            status,
+            &error_type,
+            &body,
+        );
+    }
+
+    harness.set_attachment_sharing(&contact_id, true);
+    let (status, body) = get_attachment(&harness, &connection, &started.attachment_id, None).await;
+    assert_eq!(
+        status, 200,
+        "case \"the stored attachment once its instance shares attachments again\": got {body:?}"
+    );
+    assert_eq!(
+        body["AttachmentSizeInBytes"].as_u64(),
+        Some(11),
+        "case \"the stored attachment once its instance shares attachments again\": expected \
+         the declared size 11, got {body:?}"
     );
 }
