@@ -540,6 +540,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => {}
         }
 
+        // WHO the restore reads that backup AS: `S3IngestionRoleArn` is "an IAM role with a
+        // trust policy and a permissions policy that allows Amazon RDS to access your Amazon
+        // S3 bucket", so the Amazon S3 reads the migration makes are authorized against that
+        // role's permissions rather than against the caller's own — and a role whose
+        // permissions withhold one of them leaves this restore unable to list or read the
+        // backup's files at all, which is what the refusal reports. It is decided BEFORE any
+        // instance state exists, and nothing is refused on evidence IAM did not give
+        // ([`crate::state::ingestion_role_is_unauthorized`]).
+        if crate::state::ingestion_role_is_unauthorized(
+            &*self.engine,
+            ctx,
+            &region,
+            &input.s3_ingestion_role_arn,
+            &input.s3_bucket_name,
+            input.s3_prefix.as_deref(),
+        )
+        .await
+        {
+            return Err(RestoreDBInstanceFromS3Error::invalid_parameter_value(
+                crate::state::ingestion_role_cannot_list_message(),
+            ));
+        }
+
         // `EnableCloudwatchLogsExports` is STORED on the restored instance, so the list's
         // length and each entry are bounded where they enter the handler, exactly as the
         // create of an instance bounds the same member.

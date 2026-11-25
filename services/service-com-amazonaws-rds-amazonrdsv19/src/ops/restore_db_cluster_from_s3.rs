@@ -607,6 +607,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => {}
         }
 
+        // WHO the restore reads that backup AS: `S3IngestionRoleArn` is the IAM role "that
+        // authorizes Amazon RDS to access the Amazon S3 bucket on your behalf", so the Amazon
+        // S3 reads the migration makes are authorized against that role's permissions rather
+        // than against the caller's own — and a role whose permissions withhold one of them
+        // leaves this restore unable to list or read the backup's files at all, which is what
+        // the refusal reports. It is decided BEFORE any cluster state exists, and nothing is
+        // refused on evidence IAM did not give
+        // ([`crate::state::ingestion_role_is_unauthorized`]).
+        if crate::state::ingestion_role_is_unauthorized(
+            &*self.engine,
+            ctx,
+            &region,
+            &input.s3_ingestion_role_arn,
+            &input.s3_bucket_name,
+            input.s3_prefix.as_deref(),
+        )
+        .await
+        {
+            return Err(RestoreDBClusterFromS3Error::invalid_parameter_value(
+                crate::state::ingestion_role_cannot_list_message(),
+            ));
+        }
+
         // No store means this service was mounted on an engine it has no state in, so it
         // cannot serve the operation at all. Unreachable with the engine the router builds;
         // 501 is the honest answer, never a fabricated cluster.

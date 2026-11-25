@@ -15,6 +15,13 @@
 //! alone, so it is answered before the bucket is read; the location is a resource of ANOTHER
 //! service, so it is resolved where that service holds it, and an emulator with no object
 //! store beside this one establishes nothing and refuses nothing.
+//!
+//! The third thing both are accepted against is the ROLE they read the backup UNDER:
+//! `S3IngestionRoleArn` is "an Amazon Web Services Identity and Access Management (IAM) role
+//! with a trust policy and a permissions policy that allows Amazon RDS to access your Amazon
+//! S3 bucket", so the Amazon S3 reads the migration makes are authorized against that role's
+//! permissions rather than against the caller's own
+//! ([`ingestion_role_is_unauthorized`]).
 
 /// The engine pair ONE restore-from-Amazon-S3 operation migrates between, as that operation's
 /// own members publish it.
@@ -99,6 +106,11 @@ impl S3RestorePair {
 /// named a bucket at all ([`IngestionLocationDefect`]), while what is wrong is the one thing
 /// this sentence reports — the location the restore cannot read a backup out of.
 ///
+/// Its second clause — "Amazon RDS isn't authorized to access the specified Amazon S3
+/// bucket" — is about the location being unreachable, and is NOT how a restore whose
+/// ingestion role withholds a read of a location that IS reachable is worded: that refusal
+/// reports the files it cannot list ([`ingestion_role_cannot_list_message`]).
+///
 /// It carries no variable part of its own: the bucket and the role are values the request
 /// already holds, and the sentence names the MEMBERS rather than their values.
 #[must_use]
@@ -162,4 +174,152 @@ pub fn ingestion_location_defect<Eng: Send + Sync + 'static>(
     let under = prefix.unwrap_or_default();
     let holds_a_file = held.objects().any(|(key, _)| key.starts_with(under));
     (!holds_a_file).then_some(IngestionLocationDefect::NoBackupUnderPrefix)
+}
+
+/// What a restore whose INGESTION ROLE cannot read the backup is refused with: the sentence
+/// Amazon RDS words a role that leaves the location unreadable in — "Files from the specified
+/// Amazon S3 bucket cannot be listed. Make sure that you have created an AWS Identity and
+/// Access Management (IAM) role that lets Amazon RDS access Amazon S3 for you." — under the
+/// Query API's `InvalidParameterValue`, since what the caller has to act on is the value
+/// `S3IngestionRoleArn` carried.
+///
+/// It carries no variable part: the sentence reports the one thing that is wrong — the files
+/// of the backup cannot be listed under the role the request named — and points at the role a
+/// caller has to create for Amazon RDS, rather than naming the bucket or the role's own value
+/// back.
+#[must_use]
+pub fn ingestion_role_cannot_list_message() -> String {
+    "Files from the specified Amazon S3 bucket cannot be listed. Make sure that you have \
+     created an AWS Identity and Access Management (IAM) role that lets Amazon RDS access \
+     Amazon S3 for you."
+        .to_string()
+}
+
+/// The Amazon S3 action a restore performs to FIND the backup's files: the listing of the
+/// bucket under the prefix the request named.
+///
+/// Source: the permissions policy the Amazon RDS User Guide asks an ingestion role to carry
+/// ("Creating an IAM role manually", Migrating data from MySQL by using an Amazon S3 bucket),
+/// whose statement allows `s3:ListBucket` on the bucket and `s3:GetObject` on its objects.
+pub const INGESTION_LIST_ACTION: &str = "s3:ListBucket";
+
+/// The Amazon S3 action a restore performs to READ each of the backup's files, from the same
+/// policy [`INGESTION_LIST_ACTION`] is taken from.
+pub const INGESTION_READ_ACTION: &str = "s3:GetObject";
+
+/// How many of the backup's files one restore asks IAM about. The migration reads them all,
+/// and a grant is per object, so the files under the prefix are asked about rather than
+/// assumed from one another — bounded here so a bucket holding a large backup costs a bounded
+/// number of decisions, with the first files in key order the ones asked about.
+const MAX_INGESTION_OBJECTS_CHECKED: usize = 8;
+
+/// Whether IAM ANSWERS that the ingestion role `role_arn` names may not perform an Amazon S3
+/// read this restore makes on the backup at `bucket`/`prefix`.
+///
+/// `S3IngestionRoleArn` is the role "that authorizes Amazon RDS to access the Amazon S3
+/// bucket on your behalf" — "a trust policy and a permissions policy that allows Amazon RDS
+/// to access your Amazon S3 bucket" — so the reads the migration makes are authorized against
+/// THAT role's permissions and not against the caller's own: the listing that finds the
+/// backup's files ([`INGESTION_LIST_ACTION`], on the bucket) and the read of each file it
+/// found ([`INGESTION_READ_ACTION`], on the object). A role whose permissions withhold one of
+/// them cannot read the backup, so the restore could never have run under it.
+///
+/// Nothing is refused on evidence this emulator does not have, the reading
+/// [`super::data_plane::engine_s3_role`] takes of the same question for an engine's own S3
+/// statement: an explicit `Deny` is an answer about the role whatever else it carries, while
+/// a policy set that merely STATES NOTHING about the read is an answer only where the role
+/// states permissions at all — a role provisioned out of band routinely carries none. A value
+/// that names no role of this account, a role this account's IAM holds nothing under, and an
+/// emulator with no IAM to ask all establish nothing and refuse nothing.
+///
+/// The questions go to IAM itself over the in-process hop
+/// ([`::service_common::iam_role::role_action_decision_through`]), so the documents in force
+/// are collected and decided by the service that holds them.
+pub async fn ingestion_role_is_unauthorized<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+    bucket: &str,
+    prefix: Option<&str>,
+) -> bool {
+    let mut reads = vec![(
+        INGESTION_LIST_ACTION,
+        ::service_com_amazonaws_s3_amazons3::state::bucket_arn(bucket),
+    )];
+    reads.extend(
+        backup_object_keys(engine, bucket, prefix)
+            .into_iter()
+            .map(|key| {
+                (
+                    INGESTION_READ_ACTION,
+                    ::service_com_amazonaws_s3_amazons3::state::object_arn(bucket, &key),
+                )
+            }),
+    );
+    for (action, resource) in reads {
+        if role_withholds_ingestion_read(ctx, region, role_arn, action, &resource).await {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the permissions in force on `role_arn` withhold `action` on `resource`, read as
+/// [`ingestion_role_is_unauthorized`] documents: an explicit deny always, an implicit one only
+/// from a role that states permissions at all.
+async fn role_withholds_ingestion_read(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+    action: &str,
+    resource: &str,
+) -> bool {
+    match ::service_common::iam_role::role_action_decision_through(
+        ctx.callback(),
+        region,
+        role_arn,
+        action,
+        resource,
+        &[],
+    )
+    .await
+    {
+        Some(::service_common::iam_authorization::Decision::Denied) => true,
+        Some(::service_common::iam_authorization::Decision::NotStated) => {
+            ::service_common::iam_role::role_states_permissions(ctx, region, role_arn).await
+        }
+        Some(::service_common::iam_authorization::Decision::Allowed) | None => false,
+    }
+}
+
+/// The files of the backup at `bucket`/`prefix`, in key order, bounded by
+/// [`MAX_INGESTION_OBJECTS_CHECKED`] — the objects the migration would read, as the object
+/// store beside this service holds them.
+///
+/// Empty where nothing can be read: no object store beside this service, no bucket of that
+/// name, or no file under the prefix. The store's guard is released before this returns, so
+/// the decisions the keys are used for are made with no lock held.
+fn backup_object_keys<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    bucket: &str,
+    prefix: Option<&str>,
+) -> Vec<String> {
+    let Some(state) = ::service_com_amazonaws_s3_amazons3::state::service_state(engine) else {
+        return Vec::new();
+    };
+    let store = state.lock();
+    let Some(held) = store.bucket(bucket) else {
+        return Vec::new();
+    };
+    let under = prefix.unwrap_or_default();
+    let mut keys: Vec<String> = held
+        .objects()
+        .map(|(key, _)| key)
+        .filter(|key| key.starts_with(under))
+        .map(str::to_string)
+        .collect();
+    keys.sort();
+    keys.truncate(MAX_INGESTION_OBJECTS_CHECKED);
+    keys
 }
