@@ -171,6 +171,13 @@
 //! ([`super::MAX_CONTAINER_LOG_LINES`]). The filesystem holds its own
 //! ([`super::container_filesystem`]).
 //!
+//! The bounds on the TEXT of ONE LINE — the program that carries it, the word that expands to
+//! it, the capture that collects it, the line being assembled, and the steps a program spends
+//! building it — are each stated ABOVE the longest message one log event carries
+//! ([`MAX_LINE_TEXT_BYTES`]), because a line longer than that is one the `awslogs` driver
+//! SPLITS into consecutive events rather than one the container may not write: a bound below
+//! it would give up on a program a client legitimately runs.
+//!
 //! # A duration the program STATES is not time this emulator spends
 //!
 //! The seconds in a `sleep` are a caller's word about how long its program took, so this
@@ -332,17 +339,37 @@ const SHELL_COMMAND_NAMES: [&str; 4] = ["sh", "bash", "dash", "ash"];
 /// instant commands would hold a thread of this emulator for as long as the process lives.
 /// Once it is spent the run is ABANDONED — no status is claimed for the container — rather
 /// than reported as having ended.
-pub const MAX_COMMANDS_PER_RUN: usize = 200_000;
+///
+/// Its size is a number of COMMANDS in its own right, and it is what a program that
+/// assembles one line of output a character at a time costs: such a program spends a handful
+/// of commands per character — the write, the counter, the condition and the iteration — and
+/// the longest line the `awslogs` driver delivers in ONE event is 262118 characters, so a
+/// budget of a couple of million steps is what lets a program writing a line that driver has
+/// to SPLIT run to its end instead of being given up on part of the way through it.
+pub const MAX_COMMANDS_PER_RUN: usize = 2_100_000;
 
 /// How many steps this session takes between handing the runtime back. THIS NUMBER IS THE
 /// EMULATOR'S: a program whose commands never wait would otherwise hold the executor thread
 /// it runs on for its whole budget.
 const COMMANDS_PER_YIELD: usize = 64;
 
+/// How many bytes of TEXT one line of a container's output may take up anywhere in this
+/// session. THIS NUMBER IS THE EMULATOR'S, and it is stated as a multiple of the longest
+/// message one log event carries ([`super::MAX_LOG_EVENT_MESSAGE_BYTES`]): the `awslogs`
+/// driver SPLITS a line longer than one event into consecutive events, so a line past that
+/// length is one a container legitimately writes, and every bound below — the program's text,
+/// one word's expansion, a capture, the line being assembled — is set above it so such a
+/// program RUNS instead of being given up on. FOUR times it, so a program has room to BUILD
+/// such a line (a value doubled until it is long enough ends up twice the length it passed)
+/// rather than only to write one.
+const MAX_LINE_TEXT_BYTES: usize = 4 * super::MAX_LOG_EVENT_MESSAGE_BYTES;
+
 /// The longest program text this session reads. THIS NUMBER IS THE EMULATOR'S, for the same
-/// reason as [`MAX_COMMANDS_PER_RUN`]: it bounds what one parse can cost, and is far above
-/// any real container command.
-const MAX_PROGRAM_BYTES: usize = 64 * 1024;
+/// reason as [`MAX_COMMANDS_PER_RUN`]: it bounds what one parse can cost. Its size is
+/// [`MAX_LINE_TEXT_BYTES`]: a program that writes a line the log driver has to split can
+/// carry that line as a word of its own, so a smaller bound would refuse the program for the
+/// length of what it writes.
+const MAX_PROGRAM_BYTES: usize = MAX_LINE_TEXT_BYTES;
 
 /// How many grouping indicators one program may carry before this session gives up on
 /// reading it. THIS NUMBER IS THE EMULATOR'S, and it is what keeps the grammar's own
@@ -390,13 +417,14 @@ const WORD_SEPARATORS: [char; 10] = [';', '&', '|', '(', ')', '{', '}', '<', '>'
 /// How many bytes one expansion may produce before this session gives up on the word. THIS
 /// NUMBER IS THE EMULATOR'S: a parameter expansion copies a value this session holds, so a
 /// word that expands several of them is how one command could grow what the next one copies
-/// again.
-const MAX_EXPANSION_BYTES: usize = 64 * 1024;
+/// again. Its size is [`MAX_LINE_TEXT_BYTES`]: a program that writes a line the log driver
+/// has to split holds that line in a variable and expands it to write it.
+const MAX_EXPANSION_BYTES: usize = MAX_LINE_TEXT_BYTES;
 
 /// How many bytes of variables one run's session may hold at once. THIS NUMBER IS THE
 /// EMULATOR'S, under [`MAX_EXPANSION_BYTES`]' rule applied to the session rather than to one
 /// word: past it a command that would set another variable is not performed.
-const MAX_SESSION_BYTES: usize = 1024 * 1024;
+const MAX_SESSION_BYTES: usize = 2 * MAX_LINE_TEXT_BYTES;
 
 /// How many variables one run's session may hold at once. THIS NUMBER IS THE EMULATOR'S:
 /// [`MAX_SESSION_BYTES`] bounds the store's SIZE and this bounds its cardinality.
@@ -404,7 +432,7 @@ const MAX_SESSION_VARIABLES: usize = 4096;
 
 /// How many bytes ONE command's expansions may materialise at once. THIS NUMBER IS THE
 /// EMULATOR'S: [`MAX_EXPANSION_BYTES`] bounds one word and this bounds their sum.
-const MAX_LINE_EXPANSION_BYTES: usize = 256 * 1024;
+const MAX_LINE_EXPANSION_BYTES: usize = 2 * MAX_EXPANSION_BYTES;
 
 /// How deeply a word's expansion is walked before this session gives up on it. THIS NUMBER
 /// IS THE EMULATOR'S, under [`MAX_COMMAND_NESTING`]'s rule, applied to the pieces a quoted
@@ -418,8 +446,11 @@ const MAX_TRAPS: usize = 64;
 
 /// How many bytes of output this session holds before the line it is assembling is
 /// delivered unterminated. THIS NUMBER IS THE EMULATOR'S: a program that writes without
-/// ever ending a line would otherwise grow this buffer without end.
-const MAX_PENDING_LINE_BYTES: usize = 256 * 1024;
+/// ever ending a line would otherwise grow this buffer without end. Its size is
+/// [`MAX_LINE_TEXT_BYTES`], so a line the program really ended is delivered AS one line and
+/// the SPLIT into events is the log driver's own
+/// ([`super::MAX_LOG_EVENT_MESSAGE_BYTES`]) rather than this buffer's.
+const MAX_PENDING_LINE_BYTES: usize = MAX_LINE_TEXT_BYTES;
 
 /// A future this session's own recursion goes through, so the mutually recursive walk over
 /// the grammar's tree has a size the compiler can work out.
@@ -441,13 +472,13 @@ struct LoopControl {
 /// command produced: past it the substitution has no value at all rather than a clipped one,
 /// and the pipeline carrying it ends rather than leaving the stage after it to answer for a
 /// stream nothing produced.
-const MAX_CAPTURED_BYTES: usize = 256 * 1024;
+const MAX_CAPTURED_BYTES: usize = MAX_LINE_TEXT_BYTES;
 
 /// How many bytes one REDIRECTED command's output is collected for the file it names. THIS
 /// NUMBER IS THE EMULATOR'S, under [`MAX_CAPTURED_BYTES`]' rule applied to a redirection;
 /// what the filesystem itself will hold is its own bound
 /// ([`super::container_filesystem::CONTAINER_LAYER_LIMITS`]).
-const MAX_REDIRECTED_BYTES: usize = 256 * 1024;
+const MAX_REDIRECTED_BYTES: usize = MAX_LINE_TEXT_BYTES;
 
 /// How many command substitutions one run performs. THIS NUMBER IS THE EMULATOR'S: each one
 /// performs a program of its own, so this is what bounds the work a program can reach by

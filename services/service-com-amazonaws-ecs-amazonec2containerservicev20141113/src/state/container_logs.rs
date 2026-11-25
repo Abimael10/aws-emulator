@@ -26,9 +26,10 @@
 //! Delivery is bounded by this emulator, not by AWS: one container's run may deliver at
 //! most [`MAX_CONTAINER_LOG_LINES`] lines totalling [`MAX_CONTAINER_LOG_BYTES`], after
 //! which nothing more is delivered for that container, so a program that writes without
-//! end cannot grow the log store without end. A line longer than the largest log event
-//! CloudWatch Logs holds is split into events of at most that size
-//! ([`MAX_LOG_EVENT_BYTES`]), which is what the driver does with a line past the ceiling.
+//! end cannot grow the log store without end. A line longer than the message one log event
+//! carries is split into consecutive events of at most that size
+//! ([`MAX_LOG_EVENT_MESSAGE_BYTES`]), which is what the driver does with a line past the
+//! ceiling it accounts its events against — the events concatenate back to the line.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -72,17 +73,24 @@ fn is_region_name(value: &str) -> bool {
             .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-')
 }
 
-/// The largest single log event CloudWatch Logs holds ("Each log event can be no larger
-/// than 1 MB", `PutLogEvents`), as the ceiling a longer line is split at.
-const MAX_LOG_EVENT_BYTES: usize = 1_048_576;
+/// The per-event ceiling the `awslogs` driver splits a line at: 256 KiB, the log-event size
+/// CloudWatch Logs states its own event quota at ("Event size: 256 KB maximum"), which is the
+/// figure the driver accounts each event it builds against.
+const MAX_LOG_EVENT_BYTES: usize = 256 * 1024;
 
 /// What `PutLogEvents` counts for each event BESIDE its message: a batch's size "is
 /// calculated as the sum of all event messages in UTF-8, plus 26 bytes for each log event",
 /// so the longest message one event may carry is [`MAX_LOG_EVENT_BYTES`] less this.
 const LOG_EVENT_OVERHEAD_BYTES: usize = 26;
 
-/// The longest MESSAGE one delivered event carries: see [`LOG_EVENT_OVERHEAD_BYTES`].
-const MAX_LOG_EVENT_MESSAGE_BYTES: usize = MAX_LOG_EVENT_BYTES - LOG_EVENT_OVERHEAD_BYTES;
+/// The longest MESSAGE one delivered event carries — 262118 bytes: see
+/// [`MAX_LOG_EVENT_BYTES`] and [`LOG_EVENT_OVERHEAD_BYTES`].
+///
+/// It is the longest line a container can write that reaches its stream in ONE event, so
+/// every bound the container's own session holds one line of output under is stated above it
+/// ([`super::container_shell`]): a program that writes a line this driver has to SPLIT is a
+/// program that runs, not one the session gives up on.
+pub const MAX_LOG_EVENT_MESSAGE_BYTES: usize = MAX_LOG_EVENT_BYTES - LOG_EVENT_OVERHEAD_BYTES;
 
 /// How many lines ONE container's run may deliver. THIS NUMBER IS THE EMULATOR'S, not an
 /// AWS quota: the events are held in this process by the emulated log service, and a
