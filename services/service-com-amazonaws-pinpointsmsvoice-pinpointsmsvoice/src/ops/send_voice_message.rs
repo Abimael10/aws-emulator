@@ -91,6 +91,10 @@ const MAX_RECORDED_VOICE_MESSAGES: usize = 10_000;
 /// — `CallInstructionsMessage`, `PlainTextMessage`, `SSMLMessage`), so the sentence names
 /// them. Entirely fixed text: it carries no part taken from the request, because every
 /// request that fails this way fails it the same way.
+///
+/// It is handed to `super::types::refusal_wording` as THIS class's own sentence
+/// (`Unusable::Worded`), so it is reported in the one refusal the request earns beside the
+/// parameters that refusal names, in the order the input binds them.
 const UNUSABLE_CONTENT_MESSAGE: &str = "Message is invalid. The message must have either a \
      plain text, SSML, or call instructions message";
 
@@ -168,7 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every parameter of this request this handler's own validation can reject is read
         // BEFORE anything is refused, and a finding is recorded for each in the order the
-        // input binds them (`ConfigurationSetName`, `DestinationPhoneNumber`,
+        // input binds them (`ConfigurationSetName`, `Content`, `DestinationPhoneNumber`,
         // `OriginationPhoneNumber` —
         // `smithy_query(query="operation",operation="SendVoiceMessage",model_path="services/service-com-amazonaws-pinpointsmsvoice-pinpointsmsvoice/smithy-model/com-amazonaws-pinpointsmsvoice-pinpointsmsvoice.json")`),
         // so the ONE refusal the request earns reports every one of them rather than
@@ -186,12 +190,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let destination = input
             .destination_phone_number
             .filter(|number| super::types::member_form::is_non_empty_string(number));
+
+        // `VoiceMessageContent` holds one message body of one kind: exactly one of
+        // `PlainTextMessage`, `SSMLMessage` and `CallInstructionsMessage`. None of them
+        // describes nothing to speak, and two of them describe no single message, so either
+        // way the message is not one this service can place — a parameter of this request
+        // its validation cannot use, recorded as a finding like the others. What is wrong is
+        // WHICH of the three bodies the request chose rather than which parameter it sent,
+        // so this class carries its own sentence ([`UNUSABLE_CONTENT_MESSAGE`]) in place of
+        // a name, and a request that also sent an unusable parameter is answered with both
+        // rather than having to be fixed and sent again to learn the second.
+        let content = input.content.unwrap_or_default();
+        let bodies = usize::from(content.plain_text_message.is_some())
+            + usize::from(content.ssml_message.is_some())
+            + usize::from(content.call_instructions_message.is_some());
+
         let unusable: Vec<(&str, super::types::refusal_wording::Unusable)> = [
             super::types::member_form::unusable_optional_member(
                 input.configuration_set_name.as_deref(),
                 super::types::member_form::is_word_characters_with_delimiters,
             )
             .map(|why| ("ConfigurationSetName", why)),
+            (bodies != 1).then_some((
+                "Content",
+                super::types::refusal_wording::Unusable::Worded(UNUSABLE_CONTENT_MESSAGE),
+            )),
             destination.is_none().then_some((
                 "DestinationPhoneNumber",
                 super::types::refusal_wording::Unusable::Unreadable,
@@ -208,7 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let destination = match destination {
             Some(number) if unusable.is_empty() => number,
-            // Any of those parameters unusable: ONE refusal, naming every one of them.
+            // Any of those parameters unusable: ONE refusal, reporting every one of them.
             _ => {
                 let message = super::types::refusal_wording::unusable_parameters(&unusable)
                     .and_then(|refusal| refusal.message);
@@ -218,24 +241,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         };
-
-        // `VoiceMessageContent` holds one message body of one kind: exactly one of
-        // `PlainTextMessage`, `SSMLMessage` and `CallInstructionsMessage`. None of them
-        // describes nothing to speak, and two of them describe no single message, so
-        // either way the message is not one this service can place — refused in this
-        // operation's own wording for that class ([`UNUSABLE_CONTENT_MESSAGE`]).
-        let content = input.content.unwrap_or_default();
-        let bodies = usize::from(content.plain_text_message.is_some())
-            + usize::from(content.ssml_message.is_some())
-            + usize::from(content.call_instructions_message.is_some());
-        if bodies != 1 {
-            return Err(SendVoiceMessageErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(UNUSABLE_CONTENT_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             SendVoiceMessageErrorModeled::InternalServiceErrorException(

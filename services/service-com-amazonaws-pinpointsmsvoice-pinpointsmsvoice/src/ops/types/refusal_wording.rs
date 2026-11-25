@@ -27,6 +27,16 @@
 //! [`unusable_required_labels`] is that same rule for a request whose only own-validation
 //! parameters are its `@required` URI labels.
 //!
+//! Within this service's own validation, the only thing that differs between its parameters
+//! is WHAT each contributes to that one sentence: most contribute their NAME to
+//! [`invalid_parameters`]'s list ([`Unusable::Unreadable`]); one whose class this service
+//! states a sentence of its own for contributes THAT sentence, in place of a name
+//! ([`Unusable::Worded`]); and one this service words not at all contributes nothing
+//! ([`Unusable::Unworded`]). A refusal several of them earned carries every contribution, in
+//! the order the input binds the parameter that earned it — dropping one would hide from the
+//! caller a fault it still has to fix, which is the whole reason a handler collects findings
+//! instead of returning on the first.
+//!
 //! WHICH values are unusable is the same question for a parameter this service merely has a
 //! default for, so it is answered here too: [`optional_parameter`] tells a value that bound
 //! NOTHING (so the default applies) from one that bound a BLANK value (so this service's
@@ -34,7 +44,7 @@
 //! an unusable value as an absent one.
 //!
 //! A parameter this service refuses with NO sentence at all ([`Unusable::Unworded`])
-//! contributes no name, so it can never silence a sentence another parameter of the same
+//! contributes nothing, so it can never silence a sentence another parameter of the same
 //! request earned: the refusal carries none only when every unusable parameter is of that
 //! class.
 //!
@@ -80,11 +90,24 @@ pub enum Unusable {
     /// it ([`invalid_parameters`], by the service's own spelling).
     Unreadable,
     /// The parameter reached this service's own validation carrying a value it cannot use,
+    /// and this service states a sentence of its OWN for that class of failure: what is
+    /// wrong is not that a parameter arrived unusable but WHICH value it chose, so the
+    /// sentence says that rather than naming the parameter. It contributes that sentence, in
+    /// place of a name, so a refusal several parameters earned carries it beside the list of
+    /// the parameters this service does name.
+    Worded(&'static str),
+    /// The parameter reached this service's own validation carrying a value it cannot use,
     /// and this service states NO sentence for that class of refusal: the code and the
-    /// status are the whole answer. It therefore contributes no NAME to the one sentence,
+    /// status are the whole answer. It therefore contributes nothing to the one sentence,
     /// and never silences a sentence another parameter of the same request earned.
     Unworded,
 }
+
+/// What separates the sentences of ONE refusal whose parameters contributed more than one.
+///
+/// Each contributed sentence is carried unchanged — this only joins them, in the order the
+/// input binds the parameters that earned them, so neither fault is hidden behind the other.
+const SENTENCE_SEPARATOR: &str = ". ";
 
 /// The ONE refusal a request earns for the parameters its layers cannot use.
 ///
@@ -102,13 +125,14 @@ pub struct ParameterRefusal {
 /// them — or `None` when the request carried no unusable parameter at all.
 ///
 /// This is the LAYER SPLIT the two sentences above belong to, stated once. A request is
-/// refused ONCE, so the one sentence names EVERY parameter unusable in the layer that
+/// refused ONCE, so the one refusal reports EVERY parameter unusable in the layer that
 /// refused it: the binding layer runs first, so if any parameter bound no value at all that
 /// layer's sentence lists all of them and this service's validation is never reached;
-/// otherwise the validation sentence lists every parameter it cannot read. Either way the
-/// names are listed in the order given, which is the order the input binds them — not the
-/// order a handler happened to look at them in, which is why a handler records a finding for
-/// every one of its own parameters before calling this.
+/// otherwise the refusal carries what every parameter that reached this service's own
+/// validation contributed — its name in the one list, or the sentence its own class states.
+/// Either way the contributions are reported in the order given, which is the order the
+/// input binds them — not the order a handler happened to look at them in, which is why a
+/// handler records a finding for every one of its own parameters before calling this.
 ///
 /// Only the layer differs — both are the modelled `BadRequestException` at HTTP 400, and
 /// both are answered before any state is read, so neither can be mistaken for the 404 a
@@ -132,12 +156,29 @@ pub fn unusable_parameters(findings: &[(&str, Unusable)]) -> Option<ParameterRef
             message: Some(missing_request_parameters(&unbound)),
         });
     }
-    // Every remaining finding reached this service's own validation. Those it has a name
-    // for are listed; one of the sentence-less class adds nothing, so a sentence is worded
-    // whenever ANY of them is nameable, and withheld only when none is.
+    // Every remaining finding reached this service's own validation, and the one sentence
+    // carries what each of them contributes, in the order given: the parameters this service
+    // NAMES are ONE list, worded where the earliest of them binds, and a parameter of a
+    // class this service states its own sentence for carries that sentence in place of a
+    // name. One of the sentence-less class adds nothing, so a sentence is worded whenever ANY
+    // finding contributes one and withheld only when none does.
     let unreadable = named(Unusable::Unreadable);
+    let mut listed = false;
+    let mut sentences: Vec<String> = Vec::new();
+    for (_, why) in findings {
+        match *why {
+            Unusable::Worded(sentence) => sentences.push(sentence.to_string()),
+            Unusable::Unreadable if !listed => {
+                listed = true;
+                sentences.push(invalid_parameters(&unreadable));
+            }
+            // A further named parameter is already in that one list, and neither the
+            // sentence-less class nor the binding layer (answered above) adds a sentence.
+            Unusable::Unreadable | Unusable::Unbound | Unusable::Unworded => {}
+        }
+    }
     Some(ParameterRefusal {
-        message: (!unreadable.is_empty()).then(|| invalid_parameters(&unreadable)),
+        message: (!sentences.is_empty()).then(|| sentences.join(SENTENCE_SEPARATOR)),
     })
 }
 
@@ -359,6 +400,97 @@ mod tests {
                 &[("First", Unusable::Unbound), ("Second", Unusable::Unbound)][..],
                 Some(Some(
                     "Missing required request parameters: [First, Second]".to_string(),
+                )),
+            ),
+        ] {
+            let answer = unusable_parameters(findings).map(|refusal| refusal.message);
+            assert_eq!(
+                answer, expected,
+                "case {case:?}: expected {expected:?}, got {answer:?}"
+            );
+        }
+    }
+
+    /// RULE: a parameter whose class this service states a sentence of its OWN for
+    /// contributes that sentence to the one refusal in place of a name, so a request that
+    /// also sent a parameter this service names is answered with BOTH, in the order the input
+    /// binds them — the names as one list, worded where the earliest of them binds.
+    ///
+    /// The rows differ along what the rule generalises over: how many parameters contribute a
+    /// sentence of their own, which sentence each carries, where they sit relative to the
+    /// named parameters and to the sentence-less class, and which layer the request failed in.
+    #[test]
+    fn an_own_sentence_is_reported_beside_the_parameters_the_refusal_names() {
+        /// Two different own-class sentences, so no row can pass on one being the only text
+        /// the code could produce.
+        const FIRST_SENTENCE: &str = "The first class says this";
+        const OTHER_SENTENCE: &str = "The other class says that";
+
+        for (case, findings, expected) in [
+            (
+                "an own sentence alone",
+                &[("First", Unusable::Worded(FIRST_SENTENCE))][..],
+                Some(Some(FIRST_SENTENCE.to_string())),
+            ),
+            (
+                "an own sentence before a parameter the refusal names",
+                &[
+                    ("First", Unusable::Worded(FIRST_SENTENCE)),
+                    ("Second", Unusable::Unreadable),
+                ][..],
+                Some(Some(format!(
+                    "{FIRST_SENTENCE}. \
+                     The following parameter is null, empty or invalid: ['second']"
+                ))),
+            ),
+            (
+                "an own sentence AFTER a parameter the refusal names",
+                &[
+                    ("First", Unusable::Unreadable),
+                    ("Second", Unusable::Worded(FIRST_SENTENCE)),
+                ][..],
+                Some(Some(format!(
+                    "The following parameter is null, empty or invalid: ['first']. \
+                     {FIRST_SENTENCE}"
+                ))),
+            ),
+            (
+                "an own sentence between two parameters the refusal names: the names are one \
+                 list, worded where the earliest of them binds",
+                &[
+                    ("First", Unusable::Unreadable),
+                    ("Second", Unusable::Worded(FIRST_SENTENCE)),
+                    ("Third", Unusable::Unreadable),
+                ][..],
+                Some(Some(format!(
+                    "The following parameter is null, empty or invalid: ['first', 'third']. \
+                     {FIRST_SENTENCE}"
+                ))),
+            ),
+            (
+                "two own sentences, in the order the input binds them",
+                &[
+                    ("First", Unusable::Worded(FIRST_SENTENCE)),
+                    ("Second", Unusable::Worded(OTHER_SENTENCE)),
+                ][..],
+                Some(Some(format!("{FIRST_SENTENCE}. {OTHER_SENTENCE}"))),
+            ),
+            (
+                "an own sentence beside the sentence-less class, which adds nothing",
+                &[
+                    ("First", Unusable::Unworded),
+                    ("Second", Unusable::Worded(OTHER_SENTENCE)),
+                ][..],
+                Some(Some(OTHER_SENTENCE.to_string())),
+            ),
+            (
+                "an own sentence beside an unbound parameter: the earlier layer answers alone",
+                &[
+                    ("First", Unusable::Worded(FIRST_SENTENCE)),
+                    ("Second", Unusable::Unbound),
+                ][..],
+                Some(Some(
+                    "Missing required request parameters: [Second]".to_string(),
                 )),
             ),
         ] {
