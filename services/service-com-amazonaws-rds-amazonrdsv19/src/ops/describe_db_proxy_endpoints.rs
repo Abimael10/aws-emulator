@@ -199,17 +199,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every endpoint of each proxy in scope: "RDS automatically creates one endpoint for
         // each DB proxy", the default endpoint that exists without a create
-        // ([`crate::state::default_proxy_endpoint`]). Each is keyed by the proxy it belongs
-        // to — one endpoint apiece, and the proxies are walked in their own key order — so
-        // the keys ascend in the order the report serves them and a marker resumes where the
-        // caller left off ([`crate::state::paginate`]).
+        // ([`crate::state::default_proxy_endpoint`]), and beside it the ones a caller added
+        // to that proxy ("you can associate additional endpoints with the same DB proxy"),
+        // each projected from its own stored record and the proxy it belongs to. Every
+        // endpoint of the account in a region carries a distinct name — a proxy's default
+        // endpoint is named after the proxy, and `CreateDBProxyEndpoint` admits no second
+        // endpoint under a name already taken — so the NAME is the key the report pages on,
+        // and the entries are served in that key's ascending order so that a marker resumes
+        // where the caller left off ([`crate::state::paginate`]).
         let mut reported: Vec<(String, DBProxyEndpoint)> = Vec::new();
         for proxy in proxies {
             reported.push((
                 proxy.name.clone(),
                 crate::state::default_proxy_endpoint(proxy),
             ));
+            for added in store.proxy_custom_endpoints_of(&region, &proxy.name) {
+                reported.push((added.name.clone(), added.to_wire(Some(proxy))));
+            }
         }
+        reported.sort_by(|(left, _), (right, _)| left.cmp(right));
 
         // "The name of a DB proxy endpoint to describe": a report narrowed to one endpoint
         // reports that endpoint alone, and a name that resolves none of the endpoints in

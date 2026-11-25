@@ -499,14 +499,29 @@ fn engine_now_of(
         SessionTarget::DbProxy {
             region,
             endpoint_label,
-        } => engine_now_of(
-            store,
-            &super::proxy_endpoint::proxied_session_target(store, region, endpoint_label)?,
-            // A proxy pools connections to the writer of the database it reaches
-            // (`DBProxyTarget$Role` reports `READ_WRITE` for the target it was registered
-            // against), so the session is served in that database's writing role.
-            &EndpointRole::Writer,
-        ),
+        } => {
+            let (runtime, database_reads_only) = engine_now_of(
+                store,
+                &super::proxy_endpoint::proxied_session_target(store, region, endpoint_label)?,
+                // A proxy pools connections to the writer of the database it reaches
+                // (`DBProxyTarget$Role` reports `READ_WRITE` for the target it was registered
+                // against), so the session is served in that database's writing role.
+                &EndpointRole::Writer,
+            )?;
+            // What the ENDPOINT the session arrived on serves is written over that: "a value
+            // that indicates whether the DB proxy endpoint can be used for read/write or
+            // read-only operations" (`DBProxyEndpoint$TargetRole`), so a session that arrived
+            // on a read-only endpoint serves no write whatever the database behind the proxy
+            // would have admitted — while a read/write endpoint, and the default endpoint
+            // that "always ha[s] read/write capability", leave the database's own answer as
+            // it stands.
+            let read_only = database_reads_only
+                || store
+                    .proxy_at_endpoint_label(region, endpoint_label)
+                    .and_then(|(_, added)| added)
+                    .is_some_and(crate::state::DbProxyCustomEndpointRecord::serves_reads_only);
+            Some((replaying(runtime, read_only), read_only))
+        }
     }
 }
 

@@ -753,6 +753,28 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     /// `CreateDBProxy` inserts one for every proxy whose `EngineFamily` names a wire this
     /// emulator speaks, and [`Self::settle_due_transitions`] drops it with the proxy.
     pub db_proxy_endpoints: BTreeMap<RegionalKey, DbProxyEndpoint>,
+    /// The endpoints a caller ADDED to a DB proxy, by `(region, DBProxyEndpointName)` — the
+    /// name "must be unique for all DB proxy endpoints owned by your Amazon Web Services
+    /// account in the specified Amazon Web Services Region"
+    /// (`DBProxyEndpointAlreadyExistsFault`), which is exactly what this key enforces.
+    /// Ordered, so `DescribeDBProxyEndpoints` pages deterministically within a region.
+    ///
+    /// `CreateDBProxyEndpoint` inserts here, bounded by
+    /// [`DB_PROXY_ENDPOINT_QUOTA_PER_PROXY`] endpoints per proxy — an entry exists only for a
+    /// proxy this store holds, so the per-region proxy quota and [`MAX_REGIONS`] bound the map
+    /// in total — and [`Self::settle_due_transitions`] drops an endpoint with the proxy it
+    /// belongs to.
+    pub db_proxy_custom_endpoints: BTreeMap<RegionalKey, DbProxyCustomEndpointRecord>,
+    /// The live LISTENER of each such endpoint that has one, by the same
+    /// `(region, DBProxyEndpointName)` key as [`Self::db_proxy_custom_endpoints`].
+    ///
+    /// The added endpoint's counterpart of [`Self::db_proxy_endpoints`], and the same
+    /// contract: this is where the listener lives, so an entry removed from here closes the
+    /// port and severs its sessions (see [`data_plane::proxy_endpoint`]). An entry exists only
+    /// for an endpoint this store holds whose proxy announced a wire this emulator speaks, so
+    /// the per-proxy endpoint allowance bounds it, and [`Self::settle_due_transitions`] drops
+    /// it with the endpoint — and with the proxy the endpoint fronts.
+    pub db_proxy_custom_endpoint_planes: BTreeMap<RegionalKey, DbProxyEndpoint>,
     /// Where the Aurora Serverless v2 CAPACITY series of each such cluster has got to, how
     /// long each has been idle, and the one in-process clock that advances both
     /// ([`serverless_capacity`]).
@@ -1020,6 +1042,40 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             // severs every session a client had open on it, so the address the proxy
             // published answers nothing once the proxy is gone.
             self.db_proxy_endpoints.remove(&key);
+            // And so do the endpoints a caller ADDED to that proxy: an endpoint "associated
+            // with a DB proxy" has no proxy to pool connections through once that proxy is
+            // gone, which is why it is removed here rather than left naming it — and the
+            // listener each of them published goes with it, which closes its port and severs
+            // its sessions.
+            let mut endpoints_gone: Vec<RegionalKey> = Vec::new();
+            self.db_proxy_custom_endpoints.retain(|endpoint_key, record| {
+                let belongs = endpoint_key.0 == key.0 && record.db_proxy_name == key.1;
+                if belongs {
+                    endpoints_gone.push(endpoint_key.clone());
+                }
+                !belongs
+            });
+            for endpoint_key in endpoints_gone {
+                self.db_proxy_custom_endpoint_planes.remove(&endpoint_key);
+            }
+        }
+        for (key, endpoint) in self
+            .db_proxy_custom_endpoints
+            .range_mut((region.to_string(), String::new())..)
+        {
+            if key.0 != region {
+                break;
+            }
+            if endpoint.settle(now) {
+                gone.push(key.clone());
+            }
+        }
+        for key in gone.drain(..) {
+            self.db_proxy_custom_endpoints.remove(&key);
+            // The endpoint is gone from the service, so the listener it published goes with
+            // it: dropping the record closes the port and severs every session on it, after
+            // which nothing answers at the address that endpoint published.
+            self.db_proxy_custom_endpoint_planes.remove(&key);
         }
         for (key, export_task) in self
             .export_tasks
@@ -1953,6 +2009,27 @@ impl ComAmazonawsRdsAmazonrdsv19State {
     /// The RDS proxies stored in `region`, in name order.
     pub fn db_proxies_in(&self, region: &str) -> Vec<&DbProxyRecord> {
         range_in(&self.db_proxies, region)
+    }
+
+    /// The endpoints callers ADDED to proxies of `region`, in endpoint-name order — the
+    /// order `DescribeDBProxyEndpoints` reports and pages them in.
+    pub fn proxy_custom_endpoints_in(&self, region: &str) -> Vec<&DbProxyCustomEndpointRecord> {
+        range_in(&self.db_proxy_custom_endpoints, region)
+    }
+
+    /// The endpoints added to the proxy `proxy_name` in `region`, in the same order.
+    ///
+    /// An ordered range over the region's own endpoints, so the work is bounded by what that
+    /// region may hold however many regions the store holds.
+    pub fn proxy_custom_endpoints_of(
+        &self,
+        region: &str,
+        proxy_name: &str,
+    ) -> Vec<&DbProxyCustomEndpointRecord> {
+        self.proxy_custom_endpoints_in(region)
+            .into_iter()
+            .filter(|endpoint| endpoint.db_proxy_name == proxy_name)
+            .collect()
     }
 
     /// What the proxy target `target` reports about the database behind it, read from that

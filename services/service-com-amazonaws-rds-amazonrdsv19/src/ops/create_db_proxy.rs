@@ -339,6 +339,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         region: region.clone(),
                         endpoint_label: record.endpoint_host.clone(),
                         wire,
+                        // The proxy's own `Endpoint` carries no port on AWS, so a client
+                        // completes the published host with the port its engine family is
+                        // dialled on: this endpoint answers there too.
+                        answers_engine_family_port: true,
                         callback: ctx.callback().clone(),
                     },
                 )

@@ -61,8 +61,8 @@ use tokio::sync::watch;
 use super::wire_session::{self, ServedSession, SessionTarget};
 use super::{pg_sessions, EndpointRole, EngineWire, ServedEndpoint};
 use crate::state::{
-    ComAmazonawsRdsAmazonrdsv19State, DB_PROXY_STATUS_AVAILABLE, ENGINE_FAMILY_MYSQL,
-    ENGINE_FAMILY_POSTGRESQL,
+    ComAmazonawsRdsAmazonrdsv19State, DB_PROXY_ENDPOINT_STATUS_AVAILABLE,
+    DB_PROXY_STATUS_AVAILABLE, ENGINE_FAMILY_MYSQL, ENGINE_FAMILY_POSTGRESQL,
 };
 
 /// What a DB PROXY answers a login that arrives in the clear while `RequireTLS` is on:
@@ -178,6 +178,15 @@ pub struct ProxyEndpointPlan {
     pub endpoint_label: String,
     /// The wire the proxy's `EngineFamily` speaks ([`proxy_engine_wire`]).
     pub wire: EngineWire,
+    /// Whether this endpoint also answers at the PORT the proxy's engine family is dialled
+    /// on, for the client that completes the published host with it ([`wire_engine_port`]).
+    ///
+    /// That port is one port of the one interface the core binds on, so only ONE endpoint can
+    /// answer there: a proxy's own endpoint does, which is the address `DBProxy$Endpoint`
+    /// publishes with no port of its own, while an endpoint a caller ADDED answers at the
+    /// authority it publishes — which carries its port — so adding one does not take the
+    /// family port away from the proxy that published it.
+    pub answers_engine_family_port: bool,
     /// The in-process callback of the operation opening this endpoint
     /// (`OperationContext::callback`), which every session on it is served with: a session
     /// has no request context of its own.
@@ -203,6 +212,7 @@ pub async fn open_proxy_endpoint<Eng: Send + Sync + 'static>(
         region,
         endpoint_label,
         wire,
+        answers_engine_family_port,
         callback,
     } = plan;
     let listeners = super::shared_engine(engine)
@@ -262,13 +272,15 @@ pub async fn open_proxy_endpoint<Eng: Send + Sync + 'static>(
     // (`data_plane_addressing::listener_authority`, which publishes a WILDCARD bind as
     // loopback), so the address recorded here is the host the control plane publishes and not
     // the interface the socket happens to be bound to.
-    let family = ::service_common::data_plane_addressing::host_port_authority(
-        ::service_common::data_plane_addressing::host_only(
-            &::service_common::data_plane_addressing::listener_authority(&listener),
-        ),
-        wire_engine_port(wire),
-    );
-    let dialable = super::dialable_plane_also_at(engine, &listener, [family], &plane);
+    let family = answers_engine_family_port.then(|| {
+        ::service_common::data_plane_addressing::host_port_authority(
+            ::service_common::data_plane_addressing::host_only(
+                &::service_common::data_plane_addressing::listener_authority(&listener),
+            ),
+            wire_engine_port(wire),
+        )
+    });
+    let dialable = super::dialable_plane_also_at(engine, &listener, family, &plane);
     Ok(DbProxyEndpoint {
         endpoint: ServedEndpoint {
             host: listener.host(),
@@ -302,15 +314,68 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             .find(|record| record.endpoint_host == endpoint_label)
     }
 
+    /// The endpoint a caller ADDED whose own listener carries the label `endpoint_label`, in
+    /// `region`.
+    ///
+    /// Each such endpoint is minted a label of its own
+    /// ([`crate::state::DbProxyCustomEndpointRecord::endpoint_label`]), so the address a
+    /// session arrived on says which endpoint it arrived on and therefore in which ROLE it is
+    /// served. Reads one region's ordered range, which the region's own endpoint allowance
+    /// bounds.
+    #[must_use]
+    pub fn proxy_custom_endpoint_by_label(
+        &self,
+        region: &str,
+        endpoint_label: &str,
+    ) -> Option<&crate::state::DbProxyCustomEndpointRecord> {
+        self.db_proxy_custom_endpoints
+            .range((region.to_string(), String::new())..)
+            .take_while(|((stored, _), _)| stored == region)
+            .map(|(_, record)| record)
+            .find(|record| record.endpoint_label == endpoint_label)
+    }
+
+    /// WHICH proxy a session that arrived on the address labelled `endpoint_label` is served
+    /// by, and the ADDED endpoint it arrived on where that label names one rather than a
+    /// proxy's own default endpoint.
+    ///
+    /// The one resolution of an arriving session's endpoint, so what admits the session
+    /// ([`proxy_session`]) and what serves its statements cannot disagree about which proxy —
+    /// or which of its endpoints — the client reached.
+    #[must_use]
+    pub fn proxy_at_endpoint_label(
+        &self,
+        region: &str,
+        endpoint_label: &str,
+    ) -> Option<(
+        &crate::state::DbProxyRecord,
+        Option<&crate::state::DbProxyCustomEndpointRecord>,
+    )> {
+        if let Some(proxy) = self.db_proxy_by_endpoint_label(region, endpoint_label) {
+            return Some((proxy, None));
+        }
+        let endpoint = self.proxy_custom_endpoint_by_label(region, endpoint_label)?;
+        let proxy = self
+            .db_proxies
+            .get(&(region.to_string(), endpoint.db_proxy_name.clone()))?;
+        Some((proxy, Some(endpoint)))
+    }
+
     /// The endpoint of the DB proxy `key` names, for the proxies that have one.
     #[must_use]
     pub fn proxy_endpoint(&self, key: &crate::state::RegionalKey) -> Option<&DbProxyEndpoint> {
         self.db_proxy_endpoints.get(key)
     }
 
-    /// Move a proxy's endpoint with the proxy when `ModifyDBProxy` renames it, so the
+    /// Move a proxy's endpoints with the proxy when `ModifyDBProxy` renames it, so the
     /// listener a client is connected to stays the endpoint the control plane publishes for
     /// that proxy.
+    ///
+    /// The proxy's own default endpoint is keyed by the PROXY, so it moves with it; the
+    /// endpoints a caller added are keyed by their own names and keep them, so each is
+    /// retargeted at the name the proxy now has — "the identifier for the DB proxy that is
+    /// associated with this DB proxy endpoint" (`DBProxyEndpoint$DBProxyName`) is the proxy as
+    /// it stands, so none of them is left naming a proxy this store no longer holds.
     pub fn move_proxy_endpoint(
         &mut self,
         from: &crate::state::RegionalKey,
@@ -321,6 +386,11 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         }
         if let Some(endpoint) = self.db_proxy_endpoints.remove(from) {
             self.db_proxy_endpoints.insert(to.clone(), endpoint);
+        }
+        for ((region, _), record) in self.db_proxy_custom_endpoints.iter_mut() {
+            if *region == from.0 && record.db_proxy_name == from.1 {
+                record.db_proxy_name = to.1.clone();
+            }
         }
     }
 }
@@ -336,6 +406,10 @@ impl ComAmazonawsRdsAmazonrdsv19State {
 /// * the proxy is not ready to pool connections yet: "a status of `available` means the
 ///   proxy is ready to handle requests", and one still coming up, applying a change or on
 ///   its way out is not;
+/// * the session arrived on an endpoint a caller ADDED and that endpoint is not ready
+///   either: "a status of `available` means the endpoint is ready to handle requests"
+///   (`DBProxyEndpoint$Status`), so one still being created or on its way out answers no
+///   session;
 /// * its target group holds no registration that is in force yet, so the proxy has no
 ///   database to pool connections to — a proxy is created with none, and a registration
 ///   comes into force a moment after it is made (`DBProxyTargetRecord::is_in_force`);
@@ -347,13 +421,29 @@ pub(super) fn proxy_session(
     region: &str,
     endpoint_label: &str,
 ) -> Option<ServedSession> {
-    let proxy = store.db_proxy_by_endpoint_label(region, endpoint_label)?;
+    let (proxy, added) = store.proxy_at_endpoint_label(region, endpoint_label)?;
     if proxy.status != DB_PROXY_STATUS_AVAILABLE {
         return None;
     }
+    // An endpoint a caller added is a resource of its own with a state of its own, so the
+    // session is admitted on ITS readiness as well as the proxy's.
+    if added.is_some_and(|endpoint| endpoint.status != DB_PROXY_ENDPOINT_STATUS_AVAILABLE) {
+        return None;
+    }
     let wire = proxy_engine_wire(&proxy.engine_family)?;
-    let served = proxy.served_endpoint.clone()?;
+    // The address the session arrived on is the one the ENDPOINT it arrived on publishes:
+    // that is the pair a client generates an IAM authentication token for, and the one a
+    // refusal names.
+    let served = match added {
+        Some(endpoint) => endpoint.served_endpoint.clone()?,
+        None => proxy.served_endpoint.clone()?,
+    };
     let require_tls = proxy.require_tls;
+    // "A value that indicates whether the DB proxy endpoint can be used for read/write or
+    // read-only operations" (`DBProxyEndpoint$TargetRole`): a session that arrived on a
+    // read-only endpoint writes nothing, whatever the database behind the proxy would have
+    // admitted, and the default endpoint "always ha[s] read/write capability".
+    let reads_only = added.is_some_and(crate::state::DbProxyCustomEndpointRecord::serves_reads_only);
     let target = proxied_session_target(store, region, endpoint_label)?;
     let (mut facts, database) = match &target {
         SessionTarget::DbInstance {
@@ -397,6 +487,11 @@ pub(super) fn proxy_session(
     // engine's. A database that requires an encrypted session keeps requiring one, since the
     // proxy presents its traffic to that database as it stands.
     facts.tls_required_by_proxy = require_tls;
+    // A read-only endpoint serves no writing statement, exactly as a reader endpoint of a DB
+    // cluster does ([`super::read_only`]); an endpoint that serves read/write work leaves the
+    // database's own answer as it stands, so a session on the writer of a cluster still
+    // writes.
+    facts.read_only = facts.read_only || reads_only;
     // The address this session arrived on is the PROXY's own endpoint: that is the pair a
     // client generates an IAM authentication token for, and the one a refusal names.
     facts.endpoint_host = served.host;
@@ -422,7 +517,7 @@ pub(super) fn proxied_session_target(
     region: &str,
     endpoint_label: &str,
 ) -> Option<SessionTarget> {
-    let proxy = store.db_proxy_by_endpoint_label(region, endpoint_label)?;
+    let (proxy, _) = store.proxy_at_endpoint_label(region, endpoint_label)?;
     let now = Instant::now();
     let target = proxy
         .targets

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDBProxyEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDBProxyEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Adds an ENDPOINT to an RDS proxy: another address, with a role and a network of its own,
+//! that database clients connect to the same proxy through. This is the ONLY file to touch
+//! for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDBProxyEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The proxy already publishes one endpoint — "RDS automatically creates one endpoint for
+//! each DB proxy" — and the endpoints this operation adds sit beside it: each is reported by
+//! `DescribeDBProxyEndpoints`, is read/write or read-only as the create asked, and is taken
+//! away with the proxy it belongs to.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +179,288 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDBProxyEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDBProxyEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let region =
+            crate::state::request_region(ctx).map_err(CreateDBProxyEndpointError::validation)?;
+        // Nothing caller-sized reaches the store unchecked: the subnet and security group
+        // lists are count-bounded and the tags are held to this service's tag rules. The
+        // endpoint's own name and the proxy's are length- and pattern-bounded by the model,
+        // so reaching here means both satisfy them.
+        crate::state::check_request_list_len(
+            "VpcSubnetIds",
+            input.vpc_subnet_ids.len(),
+            crate::state::MAX_SUBNETS_PER_DB_SUBNET_GROUP,
+        )
+        .map_err(CreateDBProxyEndpointError::invalid_parameter_value)?;
+        let security_groups = input.vpc_security_group_ids.unwrap_or_default();
+        crate::state::check_security_group_memberships("VpcSecurityGroupIds", &security_groups)
+            .map_err(CreateDBProxyEndpointError::invalid_parameter_value)?;
+        let tags = input.tags.unwrap_or_default();
+        crate::state::check_tags(&tags)
+            .map_err(CreateDBProxyEndpointError::invalid_parameter_value)?;
+        // "The VPC subnet IDs for the DB proxy endpoint that you create": a value that is not
+        // a subnet id names no subnet, which is the modelled `InvalidSubnet` — the same
+        // reading `CreateDBProxy` holds the subnets a proxy is placed in to.
+        for subnet_id in &input.vpc_subnet_ids {
+            if let Err(message) = crate::state::check_subnet_id(subnet_id) {
+                return Err(CreateDBProxyEndpointErrorModeled::InvalidSubnet(InvalidSubnet {
+                    message: Some(message),
+                })
+                .into());
+            }
+        }
+
+        // An endpoint is placed IN a VPC — it reports one `VpcId` and listens in the subnets
+        // the request names — so those subnets have to be subnets of ONE VPC for there to be
+        // a VPC to place it in. WHICH VPC each subnet belongs to is the fact of the service
+        // that owns subnets, so it is read off EC2's records before anything is written, and
+        // the VPC is the ENDPOINT's own rather than the proxy's: "they can also reside in
+        // different VPCs than the associated DB proxy". A hop that could not be answered
+        // establishes no VPC at all, so it refuses nothing.
+        let zones = crate::state::subnet_zones(ctx, &region, &input.vpc_subnet_ids).await;
+        let vpcs = zones.vpcs(input.vpc_subnet_ids.iter().map(String::as_str));
+        if vpcs.len() > 1 {
+            return Err(CreateDBProxyEndpointError::invalid_parameter_combination(
+                crate::state::subnets_span_several_vpcs_message(vpcs.iter().map(String::as_str)),
+            ));
+        }
+        let vpc_id = vpcs.into_iter().next();
+
+        // "The default is the default security group for the VPC": a request that names no
+        // group does not leave the endpoint outside every security group, so the group it is
+        // placed in is the one the owner of security groups created with that VPC. A VPC this
+        // service could not establish has no default group to read, and the endpoint then
+        // reports the groups the request named — none.
+        let security_groups = match (security_groups.is_empty(), vpc_id.as_deref()) {
+            (true, Some(vpc_id)) => {
+                crate::state::default_vpc_security_group(ctx, &region, vpc_id)
+                    .await
+                    .into_iter()
+                    .collect()
+            }
+            _ => security_groups,
+        };
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated endpoint.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let key = (region.clone(), input.db_proxy_endpoint_name.clone());
+        let proxy_key = (region.clone(), input.db_proxy_name.clone());
+        // Everything this create is REFUSED for, decided under one guard — which is then
+        // released, because the endpoint's own listener is bound asynchronously and the store
+        // cannot be held across that. NOTHING is written in this scope.
+        let (mut record, wire) = {
+            let mut store = state.lock();
+            store.settle_due_transitions(&region);
+
+            let proxy = admits_another_endpoint(
+                &store,
+                &region,
+                &input.db_proxy_name,
+                &input.db_proxy_endpoint_name,
+            )?;
+            // What the new endpoint takes from the proxy, read off that record before the
+            // store is touched again: the name it is stored under, the instant it becomes
+            // ready, and the wire its engine family announced.
+            let proxy_name = proxy.name.clone();
+            let proxy_available_at = proxy.available_at();
+            // The wire the PROXY announced is the protocol clients speak on this endpoint
+            // too: an endpoint is another address of that one proxy. `None` for a family
+            // whose wire this emulator does not speak, which gets no listener and keeps the
+            // DNS-form address.
+            let wire = crate::state::proxy_engine_wire(&proxy.engine_family);
+            let mint = store.next_mint();
+            // An endpoint is provisioned INTO the proxy it belongs to, so the span it owes
+            // the clock runs from the instant THAT proxy became ready rather than from this
+            // call: one span per dependency level. The create itself still answers
+            // `creating`, so a caller that polls it sees the transient state and the state
+            // errors that go with it.
+            let (provisioning, _) = crate::state::provisioning_to(
+                crate::state::DB_PROXY_ENDPOINT_STATUS_AVAILABLE,
+                Some(proxy_available_at),
+            );
+            let record = crate::state::DbProxyCustomEndpointRecord {
+                name: input.db_proxy_endpoint_name.clone(),
+                region: region.clone(),
+                db_proxy_name: proxy_name,
+                // "The role of the DB proxy endpoint ... The default is READ_WRITE."
+                target_role: input.target_role.clone().unwrap_or_else(|| {
+                    crate::state::DB_PROXY_ENDPOINT_TARGET_ROLE_READ_WRITE.to_string()
+                }),
+                vpc_subnet_ids: input.vpc_subnet_ids.clone(),
+                vpc_id,
+                vpc_security_group_ids: security_groups,
+                // "The network type of the DB proxy endpoint ... Default: IPV4."
+                endpoint_network_type: input
+                    .endpoint_network_type
+                    .clone()
+                    .unwrap_or_else(|| crate::state::NETWORK_TYPE_IPV4.to_string()),
+                endpoint_label: crate::state::mint_endpoint_host(mint),
+                served_endpoint: None,
+                status: crate::state::DB_PROXY_ENDPOINT_STATUS_CREATING.to_string(),
+                pending_status: Some(provisioning),
+                created_date: crate::state::now_as_wire_timestamp(),
+                tags,
+            };
+            (record, wire)
+        };
+
+        // The endpoint's OWN LISTENER, opened with the state lock released: binding is
+        // asynchronous and the core owns the socket, the bind interface and the port. It is
+        // opened AFTER every refusal above has been answered — so nothing binds for a create
+        // that was going to fail — and before the record is admitted to the store, so an
+        // endpoint this service holds is one whose address is already listening. The endpoint
+        // still reports `creating` until the clock makes `available` due, and a session
+        // opened before then is refused exactly as it is against an endpoint still coming up.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDBProxyEndpoint"))
+        // A listener of its OWN rather than a second publication of the proxy's address: a
+        // session that arrives here is served in the ROLE this endpoint has, which an address
+        // shared with the proxy's own endpoint could not express.
+        let endpoint = match wire {
+            Some(wire) => Some(
+                crate::state::open_proxy_endpoint(
+                    &*self.engine,
+                    &state,
+                    crate::state::ProxyEndpointPlan {
+                        region: region.clone(),
+                        endpoint_label: record.endpoint_label.clone(),
+                        wire,
+                        // The proxy's own endpoint answers at the engine family's port; this
+                        // one publishes an authority carrying its own port, so it does not
+                        // take that address away from the proxy.
+                        answers_engine_family_port: false,
+                        callback: ctx.callback().clone(),
+                    },
+                )
+                .await
+                .map_err(CreateDBProxyEndpointError::internal_failure)?,
+            ),
+            None => None,
+        };
+        record.served_endpoint = endpoint.as_ref().map(|endpoint| endpoint.endpoint.clone());
+
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+        // Every refusal about the STORE is decided AGAIN here, because the lock was released
+        // for the bind and the store may have moved under it: another request may have stored
+        // an endpoint under this name, carried the proxy to its allowance, or taken the PROXY
+        // away or out of a state it can take an endpoint in — which would otherwise leave an
+        // endpoint, and a listener, hanging off a proxy this store no longer holds. The
+        // listener this call opened is dropped with the endpoint it was going to publish,
+        // which closes its port.
+        admits_another_endpoint(
+            &store,
+            &region,
+            &input.db_proxy_name,
+            &input.db_proxy_endpoint_name,
+        )?;
+        store.db_proxy_custom_endpoints.insert(key.clone(), record);
+        // The listener is held in the store, which is what keeps its port open: it is dropped
+        // with the endpoint when the clock takes the endpoint away, and with the proxy.
+        if let Some(endpoint) = endpoint {
+            store
+                .db_proxy_custom_endpoint_planes
+                .insert(key.clone(), endpoint);
+        }
+        // Projected from the STORED record and the proxy beside it, so what this create
+        // answers is what a later read of the same endpoint reports.
+        let created = store
+            .db_proxy_custom_endpoints
+            .get(&key)
+            .map(|stored| stored.to_wire(store.db_proxies.get(&proxy_key)));
+        Ok(CreateDBProxyEndpointOutput {
+            db_proxy_endpoint: created,
+        })
     }
+}
+
+/// Whether the store admits another endpoint named `named` on the proxy `db_proxy_name` in
+/// `region`, and the PROXY it would be added to where it does — or the refusal that cause
+/// carries.
+///
+/// Decided under BOTH of this handler's critical sections, because the endpoint's listener is
+/// opened with the state lock released and another request may store an endpoint, or take the
+/// proxy away, in between: one reading, so the interleaving cannot admit two endpoints under
+/// one name or carry a proxy past the number of endpoints it may have.
+///
+/// * "The specified proxy name doesn't correspond to a proxy owned by your Amazon Web
+///   Services account in the specified Amazon Web Services Region" — the modelled
+///   `DBProxyNotFoundFault`, since an endpoint hangs off a proxy and there has to be one to
+///   add it to.
+/// * A proxy whose DELETE has been accepted is on its way out of this service, so there is
+///   nothing left for an endpoint to be added to: the modelled `InvalidDBProxyStateFault`, in
+///   the words Amazon RDS reports it with
+///   ([`crate::state::db_proxy_unsupported_state_message`]). A proxy that is still coming up,
+///   or applying a modification, is NOT refused — it exists, and the endpoint comes up with
+///   it, which is the reading `RegisterDBProxyTargets` and the rest of the proxy API hold.
+/// * The name identifies ONE endpoint of the account in the region — "the specified DB proxy
+///   endpoint name must be unique for all DB proxy endpoints owned by your Amazon Web
+///   Services account in the specified Amazon Web Services Region" — and the endpoint RDS
+///   creates with each proxy carries that proxy's own name
+///   ([`crate::state::default_proxy_endpoint`]), so a create under either a name an added
+///   endpoint holds or a name a proxy holds is the modelled
+///   `DBProxyEndpointAlreadyExistsFault`
+///   ([`crate::state::db_proxy_endpoint_already_exists_message`]) rather than a second
+///   endpoint no read could tell from the first.
+/// * "The DB proxy already has the maximum number of endpoints" is what the modelled
+///   `DBProxyEndpointQuotaExceededFault` reports, over the number of endpoints this service
+///   holds per proxy.
+fn admits_another_endpoint<'store>(
+    store: &'store crate::state::ComAmazonawsRdsAmazonrdsv19State,
+    region: &str,
+    db_proxy_name: &str,
+    named: &str,
+) -> Result<&'store crate::state::DbProxyRecord, CreateDBProxyEndpointError> {
+    // RDS is regional: only the region the request was signed for is in scope.
+    let Some(proxy) = store
+        .db_proxies
+        .get(&(region.to_string(), db_proxy_name.to_string()))
+    else {
+        return Err(CreateDBProxyEndpointErrorModeled::DBProxyNotFoundFault(
+            DBProxyNotFoundFault {
+                message: Some(crate::state::db_proxy_not_found_message(db_proxy_name)),
+            },
+        )
+        .into());
+    };
+    if proxy.is_deleting() {
+        return Err(
+            CreateDBProxyEndpointErrorModeled::InvalidDBProxyStateFault(InvalidDBProxyStateFault {
+                message: Some(crate::state::db_proxy_unsupported_state_message(
+                    db_proxy_name,
+                    &proxy.status,
+                )),
+            })
+            .into(),
+        );
+    }
+    if store
+        .db_proxy_custom_endpoints
+        .contains_key(&(region.to_string(), named.to_string()))
+        || store.db_proxies.contains_key(&(region.to_string(), named.to_string()))
+    {
+        return Err(
+            CreateDBProxyEndpointErrorModeled::DBProxyEndpointAlreadyExistsFault(
+                DBProxyEndpointAlreadyExistsFault {
+                    message: Some(crate::state::db_proxy_endpoint_already_exists_message(named)),
+                },
+            )
+            .into(),
+        );
+    }
+    if store.proxy_custom_endpoints_of(region, &proxy.name).len()
+        >= crate::state::DB_PROXY_ENDPOINT_QUOTA_PER_PROXY
+    {
+        return Err(
+            CreateDBProxyEndpointErrorModeled::DBProxyEndpointQuotaExceededFault(
+                DBProxyEndpointQuotaExceededFault {
+                    message: Some(crate::state::DB_PROXY_ENDPOINT_QUOTA_MESSAGE.to_string()),
+                },
+            )
+            .into(),
+        );
+    }
+    Ok(proxy)
 }
