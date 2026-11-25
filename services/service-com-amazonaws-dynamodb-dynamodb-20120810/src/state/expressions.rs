@@ -3666,6 +3666,22 @@ impl<'a> ExprParser<'a> {
         }
     }
 
+    /// Whether THIS operator or function relates one location to itself, noted for the
+    /// post-parse refusal ([`Self::check_distinct_first_operands`]) and answered here.
+    ///
+    /// Answered where the call is read because the rule is read BEFORE the kind and the
+    /// domain the signature declares for the remaining positions: two operands naming one
+    /// document path is what the expression's text states whatever those positions would
+    /// hold, so such a call is reported as the relation it states rather than as an operand
+    /// whose declared kind that very relation made impossible — a path repeated into a
+    /// position that takes a literal is not a caller writing the wrong kind of operand,
+    /// which is the distinction AWS's two sentences draw.
+    fn states_non_distinct(&mut self, operator: &str, first: &Operand, rest: &[&Operand]) -> bool {
+        let states = non_distinct_first_operand(first, rest).is_some();
+        self.note_non_distinct(operator, first, rest);
+        states
+    }
+
     /// Note that one operator or function states a first operand that is not distinct from
     /// its remaining ones ([`non_distinct_first_operand`]), keeping the FIRST such defect
     /// the expression states.
@@ -4116,8 +4132,18 @@ impl<'a> ExprParser<'a> {
             "attribute_type" => {
                 let path = self.function_path(name, closed)?;
                 self.expect(&ExprToken::Comma)?;
-                let wanted = self.function_operand(name, signature, 1, closed)?;
-                if closed {
+                let wanted = self.argument(|parser| parser.operand())?;
+                // A type test whose second operand reads the very location the first
+                // names relates that location to itself, which is the defect whatever
+                // the position would otherwise take ([`Self::states_non_distinct`]): the
+                // kind this position declares and the closed set of type codes are read
+                // only of a call that does not state it.
+                let non_distinct =
+                    self.states_non_distinct(name, &Operand::Path(path.clone()), &[&wanted]);
+                if closed && !non_distinct {
+                    if let Some(kind) = signature.get(1) {
+                        check_operand_kind(self.member, name, *kind, &wanted)?;
+                    }
                     check_attribute_type_name(self.member, &wanted)?;
                 }
                 ConditionNode::AttributeType(path, wanted)
@@ -4126,12 +4152,13 @@ impl<'a> ExprParser<'a> {
                 let value = self.function_operand(name, signature, 0, closed)?;
                 self.expect(&ExprToken::Comma)?;
                 let prefix = self.function_operand(name, signature, 1, closed)?;
-                if closed {
+                // A prefix read from the very location it is tested against is no prefix
+                // test, read on the same footing as the type test above: ahead of the
+                // domain this position holds a literal to ([`Self::states_non_distinct`]).
+                let non_distinct = self.states_non_distinct(name, &value, &[&prefix]);
+                if closed && !non_distinct {
                     check_begins_with_prefix(self.member, &prefix)?;
                 }
-                // A prefix read from the very location it is tested against is no prefix
-                // test ([`Self::check_distinct_first_operands`]).
-                self.note_non_distinct(name, &value, &[&prefix]);
                 ConditionNode::BeginsWith(value, prefix)
             }
             // The closed set above holds nothing else: `contains`, whose searched operand
