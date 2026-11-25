@@ -632,7 +632,10 @@ async fn rollback_puts_the_service_back_on_the_previous_revision() {
             );
         }
 
-        // The service runs the previous revision again, under the rollout that put it back.
+        // The service runs the previous revision again. The rollback that put it back is
+        // recorded on the rollout it UNDID rather than as a release of its own, so the
+        // service's current service deployment is still that rolled-back rollout and the
+        // revision it went back to is the one the rollback names.
         let stored = describe_service(&router, &name, case).await;
         assert_eq!(
             stored["taskDefinition"],
@@ -640,28 +643,22 @@ async fn rollback_puts_the_service_back_on_the_previous_revision() {
             "case {case:?}: expected the service back on the previous revision, got {stored}"
         );
         let current = string(&stored, "currentServiceDeployment", case);
-        assert_ne!(
+        assert_eq!(
             current, rolled_back,
-            "case {case:?}: expected the redeployment of the previous revision to be the \
-             service's current rollout"
+            "case {case:?}: expected the rolled-back rollout to stay the service's current \
+             service deployment, got {stored}"
         );
-        let redeployment = describe_deployment(&router, &current, case).await;
+        // And the `Deployment` the service is running the previous revision under is a
+        // rollout of its own, which the service reports beside that service deployment.
+        let primary = list(&stored, "deployments", case)
+            .into_iter()
+            .find(|deployment| deployment["status"] == json!("PRIMARY"))
+            .unwrap_or_else(|| panic!("case {case:?}: expected a PRIMARY deployment, got {stored}"));
         assert_eq!(
-            redeployment["targetServiceRevision"]["arn"],
-            json!(source_revision),
-            "case {case:?}: expected the redeployment to release the previous revision, got \
-             {redeployment}"
-        );
-        assert!(
-            list(&redeployment, "lifecycleHookDetails", case).is_empty(),
-            "case {case:?}: the redeployment of the previous revision waits at no hook of \
-             the rollout it undid, got {redeployment}"
-        );
-        let redeployment = poll_deployment_status(&router, &current, "SUCCESSFUL", case).await;
-        assert_eq!(
-            redeployment["status"],
-            json!("SUCCESSFUL"),
-            "case {case:?}: expected the redeployment to complete, got {redeployment}"
+            primary["taskDefinition"],
+            json!(first),
+            "case {case:?}: expected the redeployment to run the previous revision, got \
+             {primary}"
         );
     }
 }

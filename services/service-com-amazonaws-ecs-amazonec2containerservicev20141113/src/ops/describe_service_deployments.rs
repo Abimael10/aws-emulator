@@ -7,8 +7,9 @@
 //! configuration turned on — and a `MISSING` failure for every WELL-FORMED ARN that names
 //! no stored deployment, rather than refusing the batch; an ARN outside the form this
 //! service mints names nothing at all and is refused for its syntax before any of them is
-//! resolved, in the words of the kind of ARN the value itself is. A REPORTING operation
-//! (`@readonly`): nothing here changes what a later caller sees.
+//! resolved, in the words of the kind of ARN the value itself is, and so is a batch whose
+//! ARNs belong to two services, which no single service could report on. A REPORTING
+//! operation (`@readonly`): nothing here changes what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -203,6 +204,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 DescribeServiceDeploymentsErrorModeled::InvalidParameterException(
                     InvalidParameterException {
                         message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A service-deployment ARN carries the service whose rollout it records
+        // (`service-deployment/<cluster>/<service>/<id>`), and a service deployment is a
+        // rollout OF one service, so a batch naming ARNs of two services asks one call to
+        // report across services. That is a question about the ARNs the request carries
+        // rather than about what they name, so it is settled here — before any of them is
+        // resolved — in the one sentence Amazon ECS states it with
+        // ([`crate::state::CROSS_SERVICE_DEPLOYMENTS_MESSAGE`]).
+        if crate::state::spans_two_services(
+            input.service_deployment_arns.iter().map(String::as_str),
+            crate::state::SERVICE_DEPLOYMENT_RESOURCE_TYPE,
+        ) {
+            return Err(
+                DescribeServiceDeploymentsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::CROSS_SERVICE_DEPLOYMENTS_MESSAGE.to_string()),
                     },
                 )
                 .into(),

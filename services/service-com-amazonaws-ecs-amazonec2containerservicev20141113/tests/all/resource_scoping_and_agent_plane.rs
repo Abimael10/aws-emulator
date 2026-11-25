@@ -897,9 +897,12 @@ async fn a_deployment_read_resolves_the_cluster_its_arn_carries() {
         .expect("a service-revision ARN ends in its id")
         .to_string();
 
-    // Each row: the read, the member it takes its ARNs in, and how an ARN of this cluster
-    // and one of a cluster nothing created are built.
-    let rows: [(&str, &str, String, String); 2] = [
+    // Each row: the read, the member it takes its ARNs in, how an ARN of this cluster and
+    // one of a cluster nothing created are built, and the refusal a batch naming BOTH earns
+    // — an ARN of another cluster names another service, and the read whose batch has to
+    // name a single service refuses that batch for the request it is before it resolves any
+    // cluster at all.
+    let rows: [(&str, &str, String, String, &str); 2] = [
         (
             "DescribeServiceDeployments",
             "serviceDeploymentArns",
@@ -907,6 +910,7 @@ async fn a_deployment_read_resolves_the_cluster_its_arn_carries() {
             format!(
                 "arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:service-deployment/nosuchcluster/rolled/{deployment_id}"
             ),
+            "InvalidParameterException",
         ),
         (
             "DescribeServiceRevisions",
@@ -915,10 +919,11 @@ async fn a_deployment_read_resolves_the_cluster_its_arn_carries() {
             format!(
                 "arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:service-revision/nosuchcluster/rolled/{revision_id}"
             ),
+            "ClusterNotFoundException",
         ),
     ];
 
-    for (operation, member, held, foreign) in rows {
+    for (operation, member, held, foreign, mixed_batch) in rows {
         // An ARN under a cluster this account holds no record of leaves the read nothing to
         // report on at all.
         let case = &format!("{operation} under a cluster that was never created");
@@ -935,8 +940,9 @@ async fn a_deployment_read_resolves_the_cluster_its_arn_carries() {
             "case {case:?}: expected the cluster-not-found refusal, got {code} with {message:?}"
         );
 
-        // The same read is refused for the cluster even when an ARN it CAN resolve is named
-        // beside it: the cluster is resolved before anything is reported.
+        // The same read is refused whole even when an ARN it CAN resolve is named beside
+        // it: nothing is reported until every ARN of the batch is one this read can answer
+        // about.
         let case = &format!("{operation} with a foreign ARN beside a stored one");
         let (code, _) = refusal(
             &router,
@@ -946,8 +952,8 @@ async fn a_deployment_read_resolves_the_cluster_its_arn_carries() {
         )
         .await;
         assert_eq!(
-            code, "ClusterNotFoundException",
-            "case {case:?}: expected the cluster-not-found refusal, got {code}"
+            code, mixed_batch,
+            "case {case:?}: expected a {mixed_batch}, got {code}"
         );
 
         // An ARN under a cluster that IS there and names nothing stored stays a failure of

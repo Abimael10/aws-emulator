@@ -5,11 +5,11 @@
 //!
 //! The rule under test: a stop is taken on exactly the rollout the ARN names while that
 //! rollout is still ONGOING, and where it leaves the service is the stop type's — the stop
-//! type that rolls back runs the service revision the rollout before it released again,
-//! any other stop ends the rollout where it stands — while a request that names a rollout
-//! nothing recorded is refused, and so is one that names a rollout which reached an end
-//! nobody asked for, and a second request for a stop a caller already asked for is
-//! answered with the stop already in effect and changes nothing.
+//! type that rolls back, which is the one this API carries out, runs the service revision
+//! the rollout before it released again — while a request that names a rollout nothing
+//! recorded is refused, and so is one that names a rollout which reached an end nobody asked
+//! for, and a second request for a stop a caller already asked for is answered with the stop
+//! already in effect and changes nothing.
 //!
 //! The docs the rows are read off:
 //!
@@ -56,22 +56,28 @@ const ONE_SPAN: Duration = Duration::from_millis(900);
 /// The cluster every service below is created in.
 const CLUSTER: &str = "demo";
 
-/// One row of the stop table: the stop type a request names, the state the rollout is in
-/// when it is stopped, and where the stop leaves both.
+/// One row of the stop table: the stop type a request names and the state the rollout is in
+/// when it is stopped.
+///
+/// Every row names the one stop type this API carries out — `StopServiceDeployment$stopType`
+/// is "How you want Amazon ECS to stop the service. The valid values are ROLLBACK" — either
+/// by naming it or by naming none, so every row's stop puts the previous service revision
+/// back. The other modelled stop type is refused instead of carried out, which
+/// [`crate::service_deployment_stop_refusals`] is about.
 struct StopCase {
     case: &'static str,
     /// The `stopType` the request names, or `None` for a request that names none.
     stop_type: Option<&'static str>,
     /// The `PAUSE` lifecycle stages the stopped rollout waits at before it is stopped.
     hooked_stages: &'static [&'static str],
-    /// The `ServiceDeploymentStatus` the rollout reports while the stop is being carried
-    /// out.
-    requested_status: &'static str,
-    /// The status the rollout ends in.
-    final_status: &'static str,
-    /// Whether the stop puts the previous service revision back.
-    rolls_back: bool,
 }
+
+/// The `ServiceDeploymentStatus` a rollout reports while the stop it was asked for is still
+/// being carried out.
+const REQUESTED_STATUS: &str = "ROLLBACK_REQUESTED";
+
+/// The status such a rollout ends in, once the revision it was rolled back to is running.
+const FINAL_STATUS: &str = "ROLLBACK_SUCCESSFUL";
 
 /// A `PAUSE` lifecycle hook configured for `stages`.
 fn pause_hook(stages: &[&str]) -> Value {
@@ -179,6 +185,26 @@ async fn list_deployments(
         .collect()
 }
 
+/// The ARNs `ListServiceDeployments` reports for `name` under NO status filter: every
+/// release the service had, whatever end each of them reached.
+async fn list_all_deployments(
+    router: &MultiServiceRouter,
+    name: &str,
+    case: &str,
+) -> Vec<String> {
+    let body = ok(
+        router,
+        "ListServiceDeployments",
+        json!({ "cluster": CLUSTER, "service": name }),
+        case,
+    )
+    .await;
+    list(&body, "serviceDeployments", case)
+        .iter()
+        .map(|brief| string(brief, "serviceDeploymentArn", case))
+        .collect()
+}
+
 /// One successful `StopServiceDeployment`, with `stop_type` when the request names one.
 async fn stop_deployment(
     router: &MultiServiceRouter,
@@ -228,41 +254,21 @@ async fn the_stop_type_decides_where_a_stopped_rollout_leaves_the_service() {
             case: "ROLLBACK of an in-flight rollout",
             stop_type: Some("ROLLBACK"),
             hooked_stages: &[],
-            requested_status: "ROLLBACK_REQUESTED",
-            final_status: "ROLLBACK_SUCCESSFUL",
-            rolls_back: true,
         },
         StopCase {
             case: "a request that names no stop type",
             stop_type: None,
             hooked_stages: &[],
-            requested_status: "ROLLBACK_REQUESTED",
-            final_status: "ROLLBACK_SUCCESSFUL",
-            rolls_back: true,
-        },
-        StopCase {
-            case: "ABORT of an in-flight rollout",
-            stop_type: Some("ABORT"),
-            hooked_stages: &[],
-            requested_status: "STOP_REQUESTED",
-            final_status: "STOPPED",
-            rolls_back: false,
         },
         StopCase {
             case: "ROLLBACK of a rollout waiting at one hooked stage",
             stop_type: Some("ROLLBACK"),
             hooked_stages: &["POST_SCALE_UP"],
-            requested_status: "ROLLBACK_REQUESTED",
-            final_status: "ROLLBACK_SUCCESSFUL",
-            rolls_back: true,
         },
         StopCase {
-            case: "ABORT of a rollout waiting at the first of two hooked stages",
-            stop_type: Some("ABORT"),
+            case: "ROLLBACK of a rollout waiting at the first of two hooked stages",
+            stop_type: Some("ROLLBACK"),
             hooked_stages: &["PRE_SCALE_UP", "PRODUCTION_TRAFFIC_SHIFT"],
-            requested_status: "STOP_REQUESTED",
-            final_status: "STOPPED",
-            rolls_back: false,
         },
     ];
 
@@ -306,7 +312,7 @@ async fn the_stop_type_decides_where_a_stopped_rollout_leaves_the_service() {
         let deployment = describe_deployment(&router, &stopped, case).await;
         assert_eq!(
             deployment["status"],
-            json!(expectation.requested_status),
+            json!(REQUESTED_STATUS),
             "case {case:?}: expected the requested stop to be reported, got {deployment}"
         );
         assert!(
@@ -351,62 +357,54 @@ async fn the_stop_type_decides_where_a_stopped_rollout_leaves_the_service() {
         // type's.
         tokio::time::sleep(ONE_SPAN).await;
         let stored = describe_service(&router, &name, case).await;
-        let expected_definition = if expectation.rolls_back { &first } else { &second };
         assert_eq!(
             stored["taskDefinition"],
-            json!(expected_definition),
-            "case {case:?}: expected the service on {expected_definition}, got {stored}"
+            json!(first),
+            "case {case:?}: expected the service back on {first}, got {stored}"
         );
 
-        // A rollback runs its course once the revision it puts back is running again; a
-        // stop that puts nothing back is over as soon as it is carried out. Either end is
-        // the CLOCK's, so it is polled for rather than timed.
-        let deployment =
-            poll_deployment_status(&router, &stopped, expectation.final_status, case).await;
+        // A rollback runs its course once the revision it puts back is running again. That
+        // end is the CLOCK's, so it is polled for rather than timed.
+        let deployment = poll_deployment_status(&router, &stopped, FINAL_STATUS, case).await;
         assert_eq!(
             deployment["status"],
-            json!(expectation.final_status),
-            "case {case:?}: expected the stopped rollout to end in \
-             {:?}, got {deployment}",
-            expectation.final_status
+            json!(FINAL_STATUS),
+            "case {case:?}: expected the stopped rollout to end in {FINAL_STATUS:?}, got \
+             {deployment}"
         );
         assert!(
             !deployment["finishedAt"].is_null(),
             "case {case:?}: a rollout that has ended reports when it ended, got {deployment}"
         );
-        if expectation.rolls_back {
-            assert_eq!(
-                deployment["rollback"]["serviceRevisionArn"],
-                json!(source_revision),
-                "case {case:?}: expected the rollback to name the previous revision, got \
-                 {deployment}"
-            );
-            assert!(
-                !deployment["rollback"]["startedAt"].is_null(),
-                "case {case:?}: a rollback reports when it started, got {deployment}"
-            );
-            assert!(
-                deployment["stoppedAt"].is_null(),
-                "case {case:?}: a rolled-back rollout did not merely stop, got {deployment}"
-            );
-        } else {
-            assert_eq!(
-                deployment["stoppedAt"], deployment["finishedAt"],
-                "case {case:?}: a rollout stopped where it stood reports the instant it \
-                 stopped, got {deployment}"
-            );
-            assert!(
-                deployment["rollback"].is_null(),
-                "case {case:?}: a stop that put no revision back reports no rollback, got \
-                 {deployment}"
-            );
-        }
-        // The listing reads the same record, so it reports the same end.
-        let listed = list_deployments(&router, &name, expectation.final_status, case).await;
+        assert_eq!(
+            deployment["rollback"]["serviceRevisionArn"],
+            json!(source_revision),
+            "case {case:?}: expected the rollback to name the previous revision, got \
+             {deployment}"
+        );
         assert!(
-            listed.contains(&stopped),
-            "case {case:?}: expected {stopped} among the {:?} deployments, got {listed:?}",
-            expectation.final_status
+            !deployment["rollback"]["startedAt"].is_null(),
+            "case {case:?}: a rollback reports when it started, got {deployment}"
+        );
+        assert!(
+            deployment["stoppedAt"].is_null(),
+            "case {case:?}: a rolled-back rollout did not merely stop, got {deployment}"
+        );
+        // The listing reads the same record, so it reports the same end — and the rollback
+        // that ended this rollout is no release of its own, so the listing holds exactly the
+        // two releases this service had.
+        let listed = list_deployments(&router, &name, FINAL_STATUS, case).await;
+        assert_eq!(
+            listed,
+            vec![stopped.clone()],
+            "case {case:?}: expected the rolled-back rollout to be the only one that ended \
+             rolled back, got {listed:?}"
+        );
+        let released = list_all_deployments(&router, &name, case).await;
+        assert_eq!(
+            released.len(),
+            2,
+            "case {case:?}: expected the two releases this service had, got {released:?}"
         );
     }
 }
@@ -490,7 +488,7 @@ async fn stops_of_a_rollout_that_is_not_ongoing_are_refused() {
         (
             "a rollout a later deployment replaced",
             replaced.clone(),
-            Some("ABORT"),
+            Some("ROLLBACK"),
             "ConflictException",
             true,
         ),
@@ -604,7 +602,7 @@ async fn a_stop_already_asked_for_is_answered_with_the_stop_in_effect() {
 
     // And a stop of the rollout that stop already ended is answered with it too, leaving
     // the end it reached exactly where it was.
-    let answered = stop_deployment(&router, &stopped, Some("ABORT"), case).await;
+    let answered = stop_deployment(&router, &stopped, Some("ROLLBACK"), case).await;
     assert_eq!(
         answered, stopped,
         "case {case:?}: expected the stopped deployment's own ARN"
@@ -696,23 +694,36 @@ async fn a_rollback_with_no_earlier_revision_ends_the_rollout_as_failed() {
     );
 }
 
-/// The stop types this operation serves are exactly the ones the model declares, so a stop
-/// type the model adds cannot be served silently as the one that rolls back.
+/// The stop types this operation knows are exactly the ones the model declares, so a stop
+/// type the model adds cannot be served silently as the one that rolls back — and of those,
+/// exactly one is CARRIED OUT: `StopServiceDeployment$stopType` names ROLLBACK as the valid
+/// value, so the other modelled stop type is refused as the unsupported feature it is
+/// ([`crate::service_deployment_stop_refusals`] drives that refusal over the wire).
 #[test]
-fn the_served_stop_types_are_the_modelled_ones() {
+fn one_of_the_modelled_stop_types_is_carried_out_and_the_other_is_not() {
     let modelled =
         service_com_amazonaws_ecs_amazonec2containerservicev20141113::ops::types::STOP_SERVICE_DEPLOYMENT_STOP_TYPE_VALUES;
-    let served = [
-        service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::STOP_TYPE_ABORT,
-        service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::STOP_TYPE_ROLLBACK,
-    ];
+    let carried_out = service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::STOP_TYPE_ROLLBACK;
+    let unsupported = service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::STOP_TYPE_ABORT;
     let mut expected: Vec<&str> = modelled.to_vec();
     expected.sort_unstable();
-    let mut served: Vec<&str> = served.to_vec();
-    served.sort_unstable();
+    let mut known: Vec<&str> = vec![carried_out, unsupported];
+    known.sort_unstable();
     assert_eq!(
-        served, expected,
-        "case \"stop type catalog\": expected the served stop types to be the modelled \
-         ones, got {served:?} against {expected:?}"
+        known, expected,
+        "case \"stop type catalog\": expected the stop types this service knows to be the \
+         modelled ones, got {known:?} against {expected:?}"
+    );
+    assert!(
+        service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::is_supported_stop_type(
+            carried_out
+        ),
+        "case \"stop type catalog\": expected {carried_out} to be the stop type carried out"
+    );
+    assert!(
+        !service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::is_supported_stop_type(
+            unsupported
+        ),
+        "case \"stop type catalog\": expected {unsupported} not to be carried out"
     );
 }

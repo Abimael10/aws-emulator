@@ -79,6 +79,46 @@ pub fn foreign_cluster_reference<'a>(
     })
 }
 
+/// The SERVICE an ARN of a service-scoped resource carries: the cluster that holds it and
+/// the service inside that cluster (`<type>/<cluster>/<service>/<rest>`), or `None` when
+/// `arn` is not an ARN of this service naming a `resource_type` resource of a service.
+///
+/// A service is identified by both segments: one cluster's `web` and another's `web` are two
+/// services, so the scope is the PAIR and never the name alone.
+pub fn service_from_scoped_arn(arn: &str, resource_type: &str) -> Option<(String, String)> {
+    let parsed = ::service_common::arn::parse(arn)?;
+    if parsed.vendor != ARN_NAMESPACE {
+        return None;
+    }
+    let path = ::service_common::arn::resource_id_of_type(arn, resource_type)?;
+    let mut segments = path.split('/');
+    let cluster_name = segments.next()?;
+    let service_name = segments.next()?;
+    // A path that ends with the service names no resource OF that service.
+    segments
+        .next()
+        .is_some()
+        .then(|| (cluster_name.to_string(), service_name.to_string()))
+}
+
+/// Whether `references` — ARNs of `resource_type` resources of a service — name MORE than
+/// one service ([`service_from_scoped_arn`]).
+///
+/// The scope a batch read of a service's own resources acts in: every ARN of the batch has
+/// to belong to one service, so a batch that spans two is a request no single service could
+/// answer. Read from the ARNs alone, before any of them is resolved, and `false` for a batch
+/// whose entries name no service at all.
+pub fn spans_two_services<'a>(
+    references: impl IntoIterator<Item = &'a str>,
+    resource_type: &str,
+) -> bool {
+    let named: HashSet<(String, String)> = references
+        .into_iter()
+        .filter_map(|reference| service_from_scoped_arn(reference.trim(), resource_type))
+        .collect();
+    named.len() > 1
+}
+
 /// The refusal a `defaultCapacityProviderStrategy` earns when an entry of it names a
 /// provider the same request does NOT associate with the cluster, or `None` when every
 /// entry names one of `providers`.

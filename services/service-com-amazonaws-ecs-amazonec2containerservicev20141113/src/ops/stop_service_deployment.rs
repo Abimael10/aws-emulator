@@ -4,15 +4,16 @@
 //! Stops an ongoing service deployment.
 //!
 //! The rule: a stop is taken on exactly the rollout the ARN names while that rollout is
-//! still ONGOING, and where it leaves the service is the stop type's — `ROLLBACK` runs the
-//! service revision the rollout before it released again, any other stop ends the rollout
-//! where it stands; an ARN outside the form this service mints is refused for its SYNTAX, a
-//! well-formed one that names a rollout nothing recorded is refused as that rollout not
-//! existing, and so is one that names a rollout which reached an end nobody asked for, while
-//! a second request for a stop a caller already asked for is answered with the stop already
-//! in effect and changes nothing. The state it reads and writes is the service deployment in
-//! [`crate::state`]; the stop itself is a span the clock settles
-//! (`state::ServiceDeploymentRecord::stop_due_at`).
+//! still ONGOING, and where it leaves the service is the stop type's — `ROLLBACK`, the one
+//! stop type this API carries out, runs the service revision the rollout before it released
+//! again, while a stop type the model declares beside it is refused as the unsupported
+//! feature it is, before any rollout is resolved; an ARN outside the form this service mints
+//! is refused for its SYNTAX, a well-formed one that names a rollout nothing recorded is
+//! refused as that rollout not existing, and so is one that names a rollout which reached an
+//! end nobody asked for, while a second request for a stop a caller already asked for is
+//! answered with the stop already in effect and changes nothing. The state it reads and
+//! writes is the service deployment in [`crate::state`]; the stop itself is a span the clock
+//! settles (`state::ServiceDeploymentRecord::stop_due_at`).
 //!
 //! ## Shape of an operation
 //!
@@ -197,6 +198,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .stop_type
             .clone()
             .unwrap_or_else(|| crate::state::STOP_TYPE_ROLLBACK.to_string());
+        // WHETHER this API carries out the stop type asked for is settled before any rollout
+        // is resolved and so before its state is weighed: a stop type the API does not
+        // support is unavailable whatever state the rollout named is in, which is the
+        // condition `UnsupportedFeatureException` states rather than a conflict with that
+        // state ([`crate::state::is_supported_stop_type`]).
+        if !crate::state::is_supported_stop_type(&stop_type) {
+            return Err(
+                StopServiceDeploymentErrorModeled::UnsupportedFeatureException(
+                    UnsupportedFeatureException {
+                        message: Some(crate::state::unsupported_stop_type_message(&stop_type)),
+                    },
+                )
+                .into(),
+            );
+        }
 
         let mut guard = state.lock();
         let now = ::std::time::SystemTime::now();

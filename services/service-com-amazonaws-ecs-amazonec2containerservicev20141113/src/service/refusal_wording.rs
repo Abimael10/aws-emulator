@@ -36,6 +36,9 @@
 //!   publishes them.
 //! * **A target type outside its set on an attribute LISTING**, whose sentence ECHOES the
 //!   value the request carried instead of listing the kinds the member takes.
+//! * **A stop type outside its set on a request to STOP a rollout**, which Amazon ECS states
+//!   as one fixed sentence naming the member in its own spelling, listing neither the stop
+//!   types it takes nor the value it was given.
 //! * **A status filter whose entries are outside the set**, reported against the LIST — the
 //!   whole list as the value, the list under the name the API prints for it, and the
 //!   element's own requirement nested inside the list's ([`crate::state::list_member_constraint_message`]),
@@ -167,6 +170,17 @@ const TASKS_EMPTY_MESSAGE: &str = "Tasks cannot be empty.";
 
 /// The member an attribute LISTING names the kind of resource it reports the attributes of.
 const TARGET_TYPE_MEMBER: &str = "targetType";
+
+/// `InvalidParameterException$message` for a `stopType` outside the set the member takes
+/// (`smithy_query(query="shape",shape="StopServiceDeploymentStopType")`: ABORT, ROLLBACK).
+///
+/// The whole sentence is fixed text naming the member in the API's OWN spelling of it, and
+/// echoes neither the value the request carried nor the stop types the member takes —
+/// RECORDED behaviour, which is why it belongs to this operation rather than to the
+/// framework's clause about the member. A stop type that IS in the set and that this API
+/// does not carry out is another refusal entirely, and the operation states it itself
+/// ([`crate::state::unsupported_stop_type_message`]).
+const INVALID_STOP_TYPE_MESSAGE: &str = "The StopType is invalid.";
 
 /// The sentence this service refuses `req` with before any handler runs, or `None` when the
 /// request earns no refusal of its own here — which leaves it to the framework's walk and to
@@ -410,6 +424,14 @@ fn operation_condition_refusal(
                 .is_empty()
                 .then(|| TASKS_EMPTY_MESSAGE.to_string())
         }
+        "StopServiceDeployment" => {
+            let input = read_input::<StopServiceDeploymentInput>(
+                protocol,
+                STOP_SERVICE_DEPLOYMENT_INPUT_SCHEMA,
+                req,
+            )?;
+            stop_type_refusal(input.stop_type.as_deref())
+        }
         _ => None,
     }
 }
@@ -464,6 +486,19 @@ fn deployment_strategy_refusal(configuration: Option<&DeploymentConfiguration>) 
 fn target_type_refusal(requested: &str) -> Option<String> {
     (!TARGET_TYPE_VALUES.contains(&requested))
         .then(|| format!("Unexpected {TARGET_TYPE_MEMBER} '{requested}'."))
+}
+
+/// The sentence a `stopType` outside the modelled set earns, or `None` when the request
+/// names a stop type the member takes (or names none at all, which is the stop type the
+/// member documents as valid).
+///
+/// The set a value is CHECKED against is the member's modelled one
+/// ([`STOP_SERVICE_DEPLOYMENT_STOP_TYPE_VALUES`]), so no request's outcome changes here —
+/// only the words the refusal carries ([`INVALID_STOP_TYPE_MESSAGE`]).
+fn stop_type_refusal(requested: Option<&str>) -> Option<String> {
+    let requested = requested?;
+    (!STOP_SERVICE_DEPLOYMENT_STOP_TYPE_VALUES.contains(&requested))
+        .then(|| INVALID_STOP_TYPE_MESSAGE.to_string())
 }
 
 /// The sentence a LISTING's `schedulingStrategy` outside its set earns, naming the member

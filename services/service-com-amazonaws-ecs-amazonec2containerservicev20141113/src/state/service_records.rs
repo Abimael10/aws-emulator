@@ -426,7 +426,10 @@ impl ServiceRecord {
 /// [`Self::deployment_id`] is the `Deployment$id` the service reports, so the status this
 /// record carries and the `rolloutState` the service's `Deployment` carries are two views
 /// of one rollout and settle on the same instant (see
-/// [`ComAmazonawsEcsAmazonec2containerservicev20141113State::settle_services`]).
+/// [`ComAmazonawsEcsAmazonec2containerservicev20141113State::settle_services`]). The one
+/// `Deployment` of a service no record carries the id of is the redeployment a ROLLBACK
+/// performs, which belongs to the deployment being rolled back rather than to one of its
+/// own ([`Self::rollback_deployment_id`]).
 #[derive(Debug, Clone)]
 pub struct ServiceDeploymentRecord {
     /// `arn:aws:ecs:<region>:<account>:service-deployment/<cluster>/<service>/<id>`.

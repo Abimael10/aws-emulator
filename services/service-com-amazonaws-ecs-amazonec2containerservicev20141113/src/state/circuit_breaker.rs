@@ -446,8 +446,12 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         };
         // A rollout a caller already asked to stop ends where that stop takes it: the
         // operator asked first, so the breaker records the failed rollout state and leaves
-        // the rollout's own record to the stop.
-        if record.is_finished() || record.stop_requested() {
+        // the rollout's own record to the stop. The same holds for one that is already
+        // ending under a stop or a rollback the clock has not settled yet
+        // ([`ServiceDeploymentRecord::is_stopping`]): the end it is heading for is that
+        // one's, and a failure of the redeployment a rollback is performing is a failure of
+        // the rollout putting the revision back, not of the rollout being put back.
+        if record.is_finished() || record.stop_requested() || record.is_stopping() {
             return;
         }
         // WHICH monitor detected the failure, kept on the rollout's own record: the alarms

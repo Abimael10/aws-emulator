@@ -1582,6 +1582,26 @@ pub fn service_deployment_not_ongoing_message(arn: &str) -> String {
     format!("ServiceDeployment is stopping or has already finished for arn: {arn}")
 }
 
+/// `UnsupportedFeatureException$message` for a stop type `StopServiceDeployment` does not
+/// carry out.
+///
+/// `StopServiceDeploymentStopType` declares two stop types, and the member's own doc names
+/// only one of them as valid ("How you want Amazon ECS to stop the service. The valid values
+/// are ROLLBACK"), so the other is a stop type the API models and does not support — which
+/// is the condition `UnsupportedFeatureException` states, not a conflict with the rollout's
+/// state. The sentence names the API and the stop type asked for; the rest is fixed text.
+pub fn unsupported_stop_type_message(stop_type: &str) -> String {
+    format!("ECS StopServiceDeployment API with {stop_type} stopType is not supported.")
+}
+
+/// Whether `stop_type` is one `StopServiceDeployment` carries out: the rollback is the one
+/// stop the member documents as valid ([`STOP_TYPE_ROLLBACK`]), and a stop type the model
+/// declares beside it is answered as the unsupported feature it is
+/// ([`unsupported_stop_type_message`]).
+pub fn is_supported_stop_type(stop_type: &str) -> bool {
+    stop_type == STOP_TYPE_ROLLBACK
+}
+
 /// `Rollback$reason` ("The reason the rollback happened") of a rollback the action taken on
 /// a paused lifecycle hook asked for.
 pub(super) fn hook_rollback_reason() -> String {
@@ -1980,6 +2000,18 @@ pub fn invalid_service_deployment_arn_message() -> String {
 /// not even claim to be an ARN of that kind ([`claims_resource_type`]), so the only identity
 /// left to read it as is the service's own.
 pub const SERVICE_ARN_INVALID_MESSAGE: &str = "The Service ARN provided is invalid.";
+
+/// `InvalidParameterException$message` for a batch read of SERVICE DEPLOYMENTS whose ARNs
+/// belong to more than one service.
+///
+/// `DescribeServiceDeployments$serviceDeploymentArns` takes up to 20 ARNs, and a service
+/// deployment is a rollout OF one service, so a batch spanning two services asks one call to
+/// report across services. Amazon ECS refuses that request rather than answering part of it,
+/// and states it as one sentence about the request: the whole text is fixed, including the
+/// absence of a trailing period, and it names neither of the services the batch spanned.
+pub const CROSS_SERVICE_DEPLOYMENTS_MESSAGE: &str =
+    "Cross service requests are not allowed. All requested service deployments must be for a \
+     single service";
 
 /// The sentence a `serviceDeploymentArn` outside the form this service mints earns
 /// ([`is_service_deployment_arn`] is that question), decided by the KIND of identifier the
